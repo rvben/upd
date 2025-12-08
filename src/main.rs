@@ -6,8 +6,8 @@ use upd::cache::Cache;
 use upd::cli::{Cli, Command};
 use upd::registry::{NpmRegistry, PyPiRegistry};
 use upd::updater::{
-    discover_files, FileType, PackageJsonUpdater, PyProjectUpdater, RequirementsUpdater,
-    UpdateResult, Updater,
+    FileType, PackageJsonUpdater, PyProjectUpdater, RequirementsUpdater, UpdateResult, Updater,
+    discover_files,
 };
 
 /// Parse version components
@@ -114,17 +114,9 @@ async fn run_update(cli: &Cli) -> Result<()> {
         }
 
         let result = match file_type {
-            FileType::Requirements => {
-                requirements_updater
-                    .update(&path, &pypi, cli.dry_run)
-                    .await
-            }
-            FileType::PyProject => {
-                pyproject_updater.update(&path, &pypi, cli.dry_run).await
-            }
-            FileType::PackageJson => {
-                package_json_updater.update(&path, &npm, cli.dry_run).await
-            }
+            FileType::Requirements => requirements_updater.update(&path, &pypi, cli.dry_run).await,
+            FileType::PyProject => pyproject_updater.update(&path, &pypi, cli.dry_run).await,
+            FileType::PackageJson => package_json_updater.update(&path, &npm, cli.dry_run).await,
         };
 
         match result {
@@ -188,16 +180,18 @@ fn print_summary(result: &UpdateResult, file_count: usize, dry_run: bool) {
     let action = if dry_run { "Would update" } else { "Updated" };
 
     // Count by update type
-    let (major_count, minor_count, patch_count) = result
-        .updated
-        .iter()
-        .fold((0, 0, 0), |(major, minor, patch), (_, old, new)| {
-            match classify_update(old, new) {
-                UpdateType::Major => (major + 1, minor, patch),
-                UpdateType::Minor => (major, minor + 1, patch),
-                UpdateType::Patch => (major, minor, patch + 1),
-            }
-        });
+    let (major_count, minor_count, patch_count) =
+        result
+            .updated
+            .iter()
+            .fold(
+                (0, 0, 0),
+                |(major, minor, patch), (_, old, new)| match classify_update(old, new) {
+                    UpdateType::Major => (major + 1, minor, patch),
+                    UpdateType::Minor => (major, minor + 1, patch),
+                    UpdateType::Patch => (major, minor, patch + 1),
+                },
+            );
 
     if result.updated.is_empty() {
         println!(

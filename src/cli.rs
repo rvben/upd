@@ -3,7 +3,11 @@ use std::path::PathBuf;
 
 #[derive(Parser)]
 #[command(name = "upd")]
-#[command(author, version, about = "A fast dependency updater for Python and Node.js projects")]
+#[command(
+    author,
+    version,
+    about = "A fast dependency updater for Python and Node.js projects"
+)]
 pub struct Cli {
     #[command(subcommand)]
     pub command: Option<Command>,

@@ -1,6 +1,6 @@
 use super::{FileType, UpdateResult, Updater};
 use crate::registry::Registry;
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use regex::Regex;
 use std::fs;
 use std::path::Path;
@@ -64,11 +64,9 @@ impl PyProjectUpdater {
                             Ok(latest_version) => {
                                 if latest_version != current_version {
                                     let updated = self.update_dependency(s, &latest_version);
-                                    result.updated.push((
-                                        package,
-                                        current_version,
-                                        latest_version,
-                                    ));
+                                    result
+                                        .updated
+                                        .push((package, current_version, latest_version));
                                     updates.push((i, updated));
                                 } else {
                                     result.unchanged += 1;
@@ -117,13 +115,12 @@ impl PyProjectUpdater {
                 let version_str = s.value().to_string();
 
                 // Poetry uses ^ and ~ prefixes
-                let (prefix, version) = if version_str.starts_with('^')
-                    || version_str.starts_with('~')
-                {
-                    (&version_str[..1], version_str[1..].to_string())
-                } else {
-                    ("", version_str.clone())
-                };
+                let (prefix, version) =
+                    if version_str.starts_with('^') || version_str.starts_with('~') {
+                        (&version_str[..1], version_str[1..].to_string())
+                    } else {
+                        ("", version_str.clone())
+                    };
 
                 match registry.get_latest_version(&key).await {
                     Ok(latest_version) => {

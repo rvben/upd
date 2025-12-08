@@ -1,5 +1,5 @@
 use super::Registry;
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use async_trait::async_trait;
 use pep440_rs::{Version, VersionSpecifiers};
 use reqwest::Client;
@@ -125,7 +125,11 @@ impl Registry for PyPiRegistry {
 
         // Parse constraints (e.g., ">=2.8.0,<9" or ">=1.0.0")
         let specifiers = VersionSpecifiers::from_str(constraints).map_err(|e| {
-            anyhow!("Failed to parse version constraints '{}': {}", constraints, e)
+            anyhow!(
+                "Failed to parse version constraints '{}': {}",
+                constraints,
+                e
+            )
         })?;
 
         // Find the highest version that matches all constraints

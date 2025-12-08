@@ -39,10 +39,7 @@ impl PackageJsonUpdater {
         let escaped_version = regex::escape(old_version);
 
         // Match: "package": "version" with flexible whitespace
-        let pattern = format!(
-            r#""{}"\s*:\s*"{}""#,
-            escaped_package, escaped_version
-        );
+        let pattern = format!(r#""{}"\s*:\s*"{}""#, escaped_package, escaped_version);
 
         let re = Regex::new(&pattern).expect("Invalid pattern");
 
@@ -72,7 +69,12 @@ impl Updater for PackageJsonUpdater {
         let mut new_content = content.clone();
 
         // Process dependencies and devDependencies
-        for section in ["dependencies", "devDependencies", "peerDependencies", "optionalDependencies"] {
+        for section in [
+            "dependencies",
+            "devDependencies",
+            "peerDependencies",
+            "optionalDependencies",
+        ] {
             if let Some(deps) = json.get(section).and_then(|v| v.as_object()) {
                 for (package, version_value) in deps {
                     if let Some(version_str) = version_value.as_str() {

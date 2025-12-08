@@ -78,7 +78,10 @@ impl Cache {
 
         entries.insert(
             package.to_string(),
-            CacheEntry { version, fetched_at },
+            CacheEntry {
+                version,
+                fetched_at,
+            },
         );
     }
 
@@ -114,8 +117,10 @@ impl Cache {
 
     /// Prune expired entries from the cache
     pub fn prune(&mut self) {
-        self.pypi.retain(|_, entry| !Self::is_expired(entry.fetched_at));
-        self.npm.retain(|_, entry| !Self::is_expired(entry.fetched_at));
+        self.pypi
+            .retain(|_, entry| !Self::is_expired(entry.fetched_at));
+        self.npm
+            .retain(|_, entry| !Self::is_expired(entry.fetched_at));
     }
 }
 
@@ -153,8 +158,7 @@ impl<R: crate::registry::Registry> CachedRegistry<R> {
 
         // Update cache if enabled
         if self.enabled {
-            self.cache
-                .set(self.registry_name, package, version.clone());
+            self.cache.set(self.registry_name, package, version.clone());
             // Best effort save - don't fail the operation if cache save fails
             let _ = self.cache.save();
         }

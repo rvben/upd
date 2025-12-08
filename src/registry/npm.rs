@@ -1,5 +1,5 @@
 use super::Registry;
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use async_trait::async_trait;
 use reqwest::Client;
 use serde::Deserialize;
@@ -132,7 +132,11 @@ impl Registry for NpmRegistry {
 
         // Parse npm-style version requirements (^1.0.0, ~2.0.0, >=1.0.0 <2.0.0, etc.)
         let req = semver::VersionReq::parse(constraints).map_err(|e| {
-            anyhow!("Failed to parse version constraints '{}': {}", constraints, e)
+            anyhow!(
+                "Failed to parse version constraints '{}': {}",
+                constraints,
+                e
+            )
         })?;
 
         // Find the highest version that matches

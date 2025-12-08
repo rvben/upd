@@ -1,0 +1,45 @@
+# mise configuration for upd development environment
+
+[env]
+RUST_BACKTRACE = "1"
+
+[tools]
+# Rust toolchain - version matches rust-toolchain.toml
+rust = "1.91.0"
+
+# Python for maturin/python bindings
+python = "3.12"
+
+# UV - Fast Python package manager
+uv = "latest"
+
+# Development tools installed via cargo
+"cargo:maturin" = "latest"
+"cargo:cargo-zigbuild" = "latest"
+
+# Zig for cross-compilation
+zig = "0.13"
+
+[settings]
+cargo_binstall = true
+experimental = true
+idiomatic_version_file_enable_tools = ["rust"]
+
+[tasks.setup]
+description = "Set up the development environment"
+run = """
+echo "Setting up upd development environment..."
+mise install
+uv tool install twine
+echo "Setup complete!"
+mise list
+"""
+
+[tasks.verify]
+description = "Verify all tools are installed"
+run = """
+echo "Rust: $(rustc --version)"
+echo "Cargo: $(cargo --version)"
+echo "Python: $(python --version)"
+echo "maturin: $(maturin --version)"
+"""

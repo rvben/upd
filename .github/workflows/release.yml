@@ -25,16 +25,25 @@ on:
 env:
   CARGO_TERM_COLOR: always
 
+permissions:
+  contents: write
+
 jobs:
   test:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+      - uses: jdx/mise-action@v2
         with:
-          components: rustfmt, clippy
+          experimental: true
+          install: true
+
+      - name: Install mise tools
+        run: mise install --yes
+
+      - name: Install Rust components
+        run: rustup component add rustfmt clippy
 
       - name: Run tests
         run: make check
@@ -44,27 +53,21 @@ jobs:
     strategy:
       matrix:
         include:
-          # Linux x86_64 (glibc)
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
             archive: tar.gz
-          # Linux x86_64 (musl - static)
           - os: ubuntu-latest
             target: x86_64-unknown-linux-musl
             archive: tar.gz
-          # Linux ARM64 (glibc)
           - os: ubuntu-latest
             target: aarch64-unknown-linux-gnu
             archive: tar.gz
-          # macOS x86_64
           - os: macos-latest
             target: x86_64-apple-darwin
             archive: tar.gz
-          # macOS ARM64
           - os: macos-latest
             target: aarch64-apple-darwin
             archive: tar.gz
-          # Windows x86_64
           - os: windows-latest
             target: x86_64-pc-windows-msvc
             archive: zip
@@ -73,10 +76,16 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+      - uses: jdx/mise-action@v2
         with:
-          targets: ${{ matrix.target }}
+          experimental: true
+          install: true
+
+      - name: Install mise tools
+        run: mise install --yes
+
+      - name: Install Rust target
+        run: rustup target add ${{ matrix.target }}
 
       - name: Install cross-compilation tools (Linux)
         if: matrix.os == 'ubuntu-latest'
@@ -88,10 +97,13 @@ jobs:
             sudo apt-get install -y gcc-aarch64-linux-gnu
           fi
 
-      - name: Build binary
+      - name: Build binary (Linux with zig)
+        if: matrix.os == 'ubuntu-latest'
+        run: mise exec -- cargo zigbuild --release --target ${{ matrix.target }}
+
+      - name: Build binary (macOS/Windows)
+        if: matrix.os != 'ubuntu-latest'
         run: cargo build --release --target ${{ matrix.target }}
-        env:
-          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
 
       - name: Create archive (Unix)
         if: matrix.archive == 'tar.gz'
@@ -141,34 +153,24 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install Python
-        uses: actions/setup-python@v5
+      - uses: jdx/mise-action@v2
         with:
-          python-version: "3.12"
+          experimental: true
+          install: true
 
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: ${{ matrix.target }}
+      - name: Install mise tools
+        run: mise install --yes
 
-      - name: Install maturin
-        run: pip install maturin
-
-      - name: Install zig (for cross-compilation)
-        if: matrix.os == 'ubuntu-latest'
-        uses: goto-bus-stop/setup-zig@v2
-        with:
-          version: 0.13.0
+      - name: Install Rust target
+        run: rustup target add ${{ matrix.target }}
 
       - name: Build wheel (Linux with zig)
         if: matrix.os == 'ubuntu-latest'
-        run: |
-          pip install cargo-zigbuild
-          maturin build --release --target ${{ matrix.target }} --zig --compatibility ${{ matrix.manylinux }}
+        run: mise exec -- maturin build --release --target ${{ matrix.target }} --zig --compatibility ${{ matrix.manylinux }}
 
       - name: Build wheel (macOS/Windows)
         if: matrix.os != 'ubuntu-latest'
-        run: maturin build --release --target ${{ matrix.target }}
+        run: mise exec -- maturin build --release --target ${{ matrix.target }}
 
       - name: Upload wheel
         uses: actions/upload-artifact@v4
@@ -182,16 +184,16 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install Python
-        uses: actions/setup-python@v5
+      - uses: jdx/mise-action@v2
         with:
-          python-version: "3.12"
+          experimental: true
+          install: true
 
-      - name: Install maturin
-        run: pip install maturin
+      - name: Install mise tools
+        run: mise install --yes
 
       - name: Build sdist
-        run: maturin sdist
+        run: mise exec -- maturin sdist
 
       - name: Upload sdist
         uses: actions/upload-artifact@v4
@@ -202,18 +204,21 @@ jobs:
   release:
     needs: [build, build-wheels, build-sdist]
     runs-on: ubuntu-latest
-    permissions:
-      contents: write
     steps:
       - uses: actions/checkout@v4
+
+      - uses: jdx/mise-action@v2
+        with:
+          experimental: true
+          install: true
+
+      - name: Install mise tools
+        run: mise install --yes
 
       - name: Download all artifacts
         uses: actions/download-artifact@v4
         with:
           path: artifacts
-
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
 
       - name: Publish to crates.io
         if: ${{ !inputs.dry_run && !inputs.skip_crates_io }}
@@ -225,33 +230,24 @@ jobs:
         if: ${{ inputs.dry_run && !inputs.skip_crates_io }}
         run: cargo publish --locked --dry-run
 
-      - name: Install Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-
-      - name: Install twine
-        run: pip install twine
-
       - name: Publish to PyPI
         if: ${{ !inputs.dry_run && !inputs.skip_pypi }}
         env:
           TWINE_USERNAME: __token__
           TWINE_PASSWORD: ${{ secrets.PYPI_API_TOKEN }}
         run: |
-          twine upload artifacts/wheel-*/*.whl artifacts/sdist/*.tar.gz
+          uv tool run twine upload artifacts/wheel-*/*.whl artifacts/sdist/*.tar.gz
 
       - name: Dry run PyPI
         if: ${{ inputs.dry_run && !inputs.skip_pypi }}
         run: |
-          twine check artifacts/wheel-*/*.whl artifacts/sdist/*.tar.gz
+          uv tool run twine check artifacts/wheel-*/*.whl artifacts/sdist/*.tar.gz
 
       - name: Extract release notes
         id: release_notes
         run: |
           VERSION=${GITHUB_REF#refs/tags/v}
           if [ -f CHANGELOG.md ]; then
-            # Extract section for this version
             NOTES=$(sed -n "/^## \[${VERSION}\]/,/^## \[/p" CHANGELOG.md | sed '$d')
             if [ -z "$NOTES" ]; then
               NOTES="Release v${VERSION}"
