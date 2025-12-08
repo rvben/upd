@@ -2,7 +2,8 @@ use anyhow::Result;
 use clap::Parser;
 use colored::Colorize;
 
-use upd::cache::Cache;
+use std::sync::Arc;
+use upd::cache::{Cache, CachedRegistry};
 use upd::cli::{Cli, Command};
 use upd::registry::{CratesIoRegistry, GoProxyRegistry, NpmRegistry, PyPiRegistry};
 use upd::updater::{
@@ -90,11 +91,14 @@ async fn run_update(cli: &Cli) -> Result<()> {
         );
     }
 
-    // Create registries
-    let pypi = PyPiRegistry::new();
-    let npm = NpmRegistry::new();
-    let crates_io = CratesIoRegistry::new();
-    let go_proxy = GoProxyRegistry::new();
+    // Create shared cache and wrap registries with caching layer
+    let cache = Cache::new_shared();
+    let cache_enabled = !cli.no_cache;
+
+    let pypi = CachedRegistry::new(PyPiRegistry::new(), Arc::clone(&cache), cache_enabled);
+    let npm = CachedRegistry::new(NpmRegistry::new(), Arc::clone(&cache), cache_enabled);
+    let crates_io = CachedRegistry::new(CratesIoRegistry::new(), Arc::clone(&cache), cache_enabled);
+    let go_proxy = CachedRegistry::new(GoProxyRegistry::new(), Arc::clone(&cache), cache_enabled);
 
     // Create updaters
     let requirements_updater = RequirementsUpdater::new();
@@ -102,13 +106,6 @@ async fn run_update(cli: &Cli) -> Result<()> {
     let package_json_updater = PackageJsonUpdater::new();
     let cargo_toml_updater = CargoTomlUpdater::new();
     let go_mod_updater = GoModUpdater::new();
-
-    // Load cache if enabled
-    let mut cache = if !cli.no_cache {
-        Cache::load().ok()
-    } else {
-        None
-    };
 
     let mut total_result = UpdateResult::default();
 
@@ -143,9 +140,9 @@ async fn run_update(cli: &Cli) -> Result<()> {
         }
     }
 
-    // Save cache
-    if let Some(ref mut cache) = cache {
-        let _ = cache.save();
+    // Save cache to disk
+    if cache_enabled {
+        let _ = Cache::save_shared(&cache);
     }
 
     // Print summary

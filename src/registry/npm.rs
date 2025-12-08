@@ -3,28 +3,27 @@ use anyhow::{Result, anyhow};
 use async_trait::async_trait;
 use reqwest::Client;
 use serde::Deserialize;
-use std::collections::HashMap;
+use serde_json::Value;
+use std::time::Duration;
 
 pub struct NpmRegistry {
     client: Client,
     registry_url: String,
 }
 
+/// Abbreviated npm response (smaller, faster)
+/// Uses Accept: application/vnd.npm.install-v1+json
 #[derive(Debug, Deserialize)]
-struct NpmResponse {
+struct NpmAbbreviatedResponse {
     #[serde(rename = "dist-tags")]
     dist_tags: DistTags,
-    versions: HashMap<String, VersionInfo>,
+    /// Version keys only (we parse them dynamically to avoid large struct)
+    versions: Value,
 }
 
 #[derive(Debug, Deserialize)]
 struct DistTags {
     latest: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-struct VersionInfo {
-    deprecated: Option<String>,
 }
 
 impl NpmRegistry {
@@ -36,6 +35,8 @@ impl NpmRegistry {
         let client = Client::builder()
             .gzip(true)
             .user_agent("upd/0.1.0")
+            .timeout(Duration::from_secs(30))
+            .connect_timeout(Duration::from_secs(10))
             .build()
             .expect("Failed to create HTTP client");
 
@@ -50,10 +51,18 @@ impl NpmRegistry {
         std::env::var("NPM_REGISTRY").ok().filter(|s| !s.is_empty())
     }
 
-    /// Fetch package metadata from npm
-    async fn fetch_package(&self, package: &str) -> Result<NpmResponse> {
+    /// Fetch abbreviated package metadata from npm
+    /// Uses the install-v1 format which is smaller and faster
+    async fn fetch_package(&self, package: &str) -> Result<NpmAbbreviatedResponse> {
         let url = format!("{}/{}", self.registry_url, package);
-        let response = self.client.get(&url).send().await?;
+
+        // Use abbreviated metadata format (much smaller for large packages like react)
+        let response = self
+            .client
+            .get(&url)
+            .header("Accept", "application/vnd.npm.install-v1+json")
+            .send()
+            .await?;
 
         if !response.status().is_success() {
             return Err(anyhow!(
@@ -63,16 +72,24 @@ impl NpmRegistry {
             ));
         }
 
-        Ok(response.json().await?)
+        response
+            .json()
+            .await
+            .map_err(|e| anyhow!("Failed to parse npm response for '{}': {}", package, e))
     }
 
-    /// Get all stable (non-prerelease, non-deprecated) versions sorted descending
-    fn get_stable_versions(data: &NpmResponse) -> Vec<(semver::Version, String)> {
-        let mut versions: Vec<_> = data
-            .versions
-            .iter()
-            .filter(|(_, info)| info.deprecated.is_none())
-            .filter_map(|(ver_str, _)| {
+    /// Get all stable (non-prerelease) versions sorted descending
+    /// Note: abbreviated metadata doesn't include deprecated info, but dist-tags.latest
+    /// is authoritative for the recommended version
+    fn get_stable_versions(data: &NpmAbbreviatedResponse) -> Vec<(semver::Version, String)> {
+        let versions_obj = match data.versions.as_object() {
+            Some(obj) => obj,
+            None => return Vec::new(),
+        };
+
+        let mut versions: Vec<_> = versions_obj
+            .keys()
+            .filter_map(|ver_str| {
                 semver::Version::parse(ver_str).ok().and_then(|v| {
                     // Skip pre-release versions
                     if v.pre.is_empty() {
@@ -100,17 +117,15 @@ impl Registry for NpmRegistry {
     async fn get_latest_version(&self, package: &str) -> Result<String> {
         let data = self.fetch_package(package).await?;
 
-        // Use the 'latest' dist-tag first
+        // Use the 'latest' dist-tag (this is the authoritative answer from npm)
         if let Some(latest) = &data.dist_tags.latest
-            && let Some(version_info) = data.versions.get(latest)
-            && version_info.deprecated.is_none()
             && let Ok(v) = semver::Version::parse(latest)
             && v.pre.is_empty()
         {
             return Ok(latest.clone());
         }
 
-        // Fall back to finding the latest stable version
+        // Fall back to finding the latest stable version from the versions list
         let versions = Self::get_stable_versions(&data);
         versions
             .first()
