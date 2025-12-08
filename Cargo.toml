@@ -1,0 +1,45 @@
+[package]
+name = "upd"
+version = "0.1.0"
+edition = "2024"
+description = "A fast dependency updater for Python and Node.js projects"
+license = "MIT"
+repository = "https://github.com/rvben/upd"
+authors = ["Ruben Jongejan <ruben.jongejan@gmail.com>"]
+keywords = ["dependencies", "update", "python", "nodejs", "pypi", "npm"]
+categories = ["command-line-utilities", "development-tools"]
+
+[dependencies]
+# CLI
+clap = { version = "4", features = ["derive"] }
+
+# Async runtime + HTTP
+tokio = { version = "1", features = ["full"] }
+reqwest = { version = "0.12", features = ["json", "gzip"] }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml_edit = "0.22"
+
+# Version parsing
+pep440_rs = "0.7"
+semver = "1"
+
+# File handling
+ignore = "0.4"
+directories = "5"
+
+# Error handling
+anyhow = "1"
+thiserror = "1"
+
+# Misc
+regex = "1"
+colored = "2"
+async-trait = "0.1"
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true
