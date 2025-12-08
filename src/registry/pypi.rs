@@ -1,0 +1,131 @@
+use super::Registry;
+use anyhow::{anyhow, Result};
+use async_trait::async_trait;
+use pep440_rs::Version;
+use reqwest::Client;
+use serde::Deserialize;
+use std::collections::HashMap;
+
+pub struct PyPiRegistry {
+    client: Client,
+    index_url: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct PyPiResponse {
+    releases: HashMap<String, Vec<ReleaseFile>>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ReleaseFile {
+    yanked: Option<bool>,
+}
+
+impl PyPiRegistry {
+    pub fn new() -> Self {
+        Self::with_index_url("https://pypi.org/pypi".to_string())
+    }
+
+    pub fn with_index_url(index_url: String) -> Self {
+        let client = Client::builder()
+            .gzip(true)
+            .user_agent("upd/0.1.0")
+            .build()
+            .expect("Failed to create HTTP client");
+
+        Self { client, index_url }
+    }
+
+    /// Detect custom index URL from environment or config
+    pub fn detect_index_url() -> Option<String> {
+        // Check environment variables in order of precedence
+        for var in ["UV_INDEX_URL", "PIP_INDEX_URL", "PYTHON_INDEX_URL"] {
+            if let Ok(url) = std::env::var(var) {
+                if !url.is_empty() {
+                    return Some(url);
+                }
+            }
+        }
+        None
+    }
+
+    fn is_stable_version(version_str: &str) -> bool {
+        if let Ok(version) = version_str.parse::<Version>() {
+            // Exclude pre-releases (alpha, beta, rc, dev)
+            !version.is_pre() && !version.is_dev()
+        } else {
+            false
+        }
+    }
+}
+
+impl Default for PyPiRegistry {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[async_trait]
+impl Registry for PyPiRegistry {
+    async fn get_latest_version(&self, package: &str) -> Result<String> {
+        // Normalize package name (PEP 503)
+        let normalized = package.to_lowercase().replace('_', "-");
+        let url = format!("{}/{}/json", self.index_url, normalized);
+
+        let response = self.client.get(&url).send().await?;
+
+        if !response.status().is_success() {
+            return Err(anyhow!(
+                "Failed to fetch package '{}': HTTP {}",
+                package,
+                response.status()
+            ));
+        }
+
+        let data: PyPiResponse = response.json().await?;
+
+        // Find the latest non-yanked, stable version
+        let mut versions: Vec<(Version, &str)> = data
+            .releases
+            .iter()
+            .filter(|(ver_str, files)| {
+                // Skip yanked releases
+                let is_yanked = files.iter().all(|f| f.yanked.unwrap_or(false));
+                if is_yanked {
+                    return false;
+                }
+                // Skip pre-releases
+                Self::is_stable_version(ver_str)
+            })
+            .filter_map(|(ver_str, _)| {
+                ver_str.parse::<Version>().ok().map(|v| (v, ver_str.as_str()))
+            })
+            .collect();
+
+        versions.sort_by(|a, b| b.0.cmp(&a.0));
+
+        versions
+            .first()
+            .map(|(_, s)| (*s).to_string())
+            .ok_or_else(|| anyhow!("No stable versions found for package '{}'", package))
+    }
+
+    fn name(&self) -> &'static str {
+        "pypi"
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_stable_version_detection() {
+        assert!(PyPiRegistry::is_stable_version("1.0.0"));
+        assert!(PyPiRegistry::is_stable_version("2.31.0"));
+        assert!(!PyPiRegistry::is_stable_version("1.0.0a1"));
+        assert!(!PyPiRegistry::is_stable_version("1.0.0b2"));
+        assert!(!PyPiRegistry::is_stable_version("1.0.0rc1"));
+        assert!(!PyPiRegistry::is_stable_version("1.0.0.dev1"));
+    }
+}
