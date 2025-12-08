@@ -61,6 +61,20 @@ impl PyPiRegistry {
 
     /// Fetch all available stable versions for a package
     async fn fetch_versions(&self, package: &str) -> Result<Vec<(Version, String)>> {
+        self.fetch_versions_internal(package, false).await
+    }
+
+    /// Fetch all versions including pre-releases
+    async fn fetch_all_versions(&self, package: &str) -> Result<Vec<(Version, String)>> {
+        self.fetch_versions_internal(package, true).await
+    }
+
+    /// Internal method to fetch versions with optional pre-release inclusion
+    async fn fetch_versions_internal(
+        &self,
+        package: &str,
+        include_prereleases: bool,
+    ) -> Result<Vec<(Version, String)>> {
         let normalized = package.to_lowercase().replace('_', "-");
         let url = format!("{}/{}/json", self.index_url, normalized);
 
@@ -84,7 +98,7 @@ impl PyPiRegistry {
                 if is_yanked {
                     return false;
                 }
-                Self::is_stable_version(ver_str)
+                include_prereleases || Self::is_stable_version(ver_str)
             })
             .filter_map(|(ver_str, _)| {
                 ver_str
@@ -114,6 +128,15 @@ impl Registry for PyPiRegistry {
             .first()
             .map(|(_, s)| s.clone())
             .ok_or_else(|| anyhow!("No stable versions found for package '{}'", package))
+    }
+
+    async fn get_latest_version_including_prereleases(&self, package: &str) -> Result<String> {
+        let versions = self.fetch_all_versions(package).await?;
+
+        versions
+            .first()
+            .map(|(_, s)| s.clone())
+            .ok_or_else(|| anyhow!("No versions found for package '{}'", package))
     }
 
     async fn get_latest_version_matching(

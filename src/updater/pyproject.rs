@@ -1,5 +1,6 @@
 use super::{FileType, UpdateResult, Updater};
 use crate::registry::Registry;
+use crate::version::is_stable_pep440;
 use anyhow::{Result, anyhow};
 use regex::Regex;
 use std::fs;
@@ -60,7 +61,16 @@ impl PyProjectUpdater {
             if let Some(item) = array.get(i) {
                 if let Some(s) = item.as_str() {
                     if let Some((package, current_version)) = self.parse_dependency(s) {
-                        match registry.get_latest_version(&package).await {
+                        // If current version is a pre-release, include pre-releases in lookup
+                        let version_result = if is_stable_pep440(&current_version) {
+                            registry.get_latest_version(&package).await
+                        } else {
+                            registry
+                                .get_latest_version_including_prereleases(&package)
+                                .await
+                        };
+
+                        match version_result {
                             Ok(latest_version) => {
                                 if latest_version != current_version {
                                     let updated = self.update_dependency(s, &latest_version);
@@ -122,7 +132,16 @@ impl PyProjectUpdater {
                         ("", version_str.clone())
                     };
 
-                match registry.get_latest_version(&key).await {
+                // If current version is a pre-release, include pre-releases in lookup
+                let version_result = if is_stable_pep440(&version) {
+                    registry.get_latest_version(&key).await
+                } else {
+                    registry
+                        .get_latest_version_including_prereleases(&key)
+                        .await
+                };
+
+                match version_result {
                     Ok(latest_version) => {
                         if latest_version != version {
                             let new_val = format!("{}{}", prefix, latest_version);

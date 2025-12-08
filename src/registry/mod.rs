@@ -12,6 +12,13 @@ pub trait Registry: Send + Sync {
     /// Get the latest stable version of a package
     async fn get_latest_version(&self, package: &str) -> Result<String>;
 
+    /// Get the latest version including pre-releases
+    /// Used when the user's current version is a pre-release
+    async fn get_latest_version_including_prereleases(&self, package: &str) -> Result<String> {
+        // Default: fall back to stable-only
+        self.get_latest_version(package).await
+    }
+
     /// Get the latest version matching the given constraints (e.g., ">=2.8.0,<9")
     /// Default implementation falls back to get_latest_version
     async fn get_latest_version_matching(
