@@ -4,7 +4,7 @@ use anyhow::{anyhow, Result};
 use regex::Regex;
 use std::fs;
 use std::path::Path;
-use toml_edit::{DocumentMut, Item, Value};
+use toml_edit::{DocumentMut, Formatted, Item, Value};
 
 pub struct PyProjectUpdater {
     // Regex to extract version from dependency string
@@ -83,10 +83,18 @@ impl PyProjectUpdater {
             }
         }
 
-        // Apply updates
+        // Apply updates, preserving decoration (comments, whitespace)
         for (i, updated) in updates {
             if let Some(item) = array.get_mut(i) {
-                *item = Value::from(updated);
+                // Preserve the original decoration (prefix/suffix whitespace and comments)
+                if let Value::String(formatted) = item {
+                    let decor = formatted.decor().clone();
+                    let mut new_formatted = Formatted::new(updated);
+                    *new_formatted.decor_mut() = decor;
+                    *formatted = new_formatted;
+                } else {
+                    *item = Value::from(updated);
+                }
             }
         }
     }
@@ -123,8 +131,14 @@ impl PyProjectUpdater {
                             let new_val = format!("{}{}", prefix, latest_version);
                             result.updated.push((key.clone(), version, latest_version));
 
-                            if let Some(item) = deps_table.get_mut(&key) {
-                                *item = Item::Value(Value::from(new_val));
+                            // Preserve decoration when updating
+                            if let Some(Item::Value(Value::String(formatted))) =
+                                deps_table.get_mut(&key)
+                            {
+                                let decor = formatted.decor().clone();
+                                let mut new_formatted = Formatted::new(new_val);
+                                *new_formatted.decor_mut() = decor;
+                                *formatted = new_formatted;
                             }
                         } else {
                             result.unchanged += 1;
