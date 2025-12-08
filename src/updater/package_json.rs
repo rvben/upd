@@ -18,8 +18,8 @@ impl PackageJsonUpdater {
         let prefixes = [">=", "<=", "~>", "^", "~", ">", "<"];
 
         for prefix in prefixes {
-            if version_str.starts_with(prefix) {
-                return (prefix.to_string(), version_str[prefix.len()..].to_string());
+            if let Some(stripped) = version_str.strip_prefix(prefix) {
+                return (prefix.to_string(), stripped.to_string());
             }
         }
 

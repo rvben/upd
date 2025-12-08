@@ -1,10 +1,11 @@
 use super::Registry;
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
-use pep440_rs::Version;
+use pep440_rs::{Version, VersionSpecifiers};
 use reqwest::Client;
 use serde::Deserialize;
 use std::collections::HashMap;
+use std::str::FromStr;
 
 pub struct PyPiRegistry {
     client: Client,
@@ -57,18 +58,9 @@ impl PyPiRegistry {
             false
         }
     }
-}
 
-impl Default for PyPiRegistry {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-#[async_trait]
-impl Registry for PyPiRegistry {
-    async fn get_latest_version(&self, package: &str) -> Result<String> {
-        // Normalize package name (PEP 503)
+    /// Fetch all available stable versions for a package
+    async fn fetch_versions(&self, package: &str) -> Result<Vec<(Version, String)>> {
         let normalized = package.to_lowercase().replace('_', "-");
         let url = format!("{}/{}/json", self.index_url, normalized);
 
@@ -84,30 +76,70 @@ impl Registry for PyPiRegistry {
 
         let data: PyPiResponse = response.json().await?;
 
-        // Find the latest non-yanked, stable version
-        let mut versions: Vec<(Version, &str)> = data
+        let mut versions: Vec<(Version, String)> = data
             .releases
             .iter()
             .filter(|(ver_str, files)| {
-                // Skip yanked releases
                 let is_yanked = files.iter().all(|f| f.yanked.unwrap_or(false));
                 if is_yanked {
                     return false;
                 }
-                // Skip pre-releases
                 Self::is_stable_version(ver_str)
             })
             .filter_map(|(ver_str, _)| {
-                ver_str.parse::<Version>().ok().map(|v| (v, ver_str.as_str()))
+                ver_str
+                    .parse::<Version>()
+                    .ok()
+                    .map(|v| (v, ver_str.clone()))
             })
             .collect();
 
         versions.sort_by(|a, b| b.0.cmp(&a.0));
+        Ok(versions)
+    }
+}
+
+impl Default for PyPiRegistry {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[async_trait]
+impl Registry for PyPiRegistry {
+    async fn get_latest_version(&self, package: &str) -> Result<String> {
+        let versions = self.fetch_versions(package).await?;
 
         versions
             .first()
-            .map(|(_, s)| (*s).to_string())
+            .map(|(_, s)| s.clone())
             .ok_or_else(|| anyhow!("No stable versions found for package '{}'", package))
+    }
+
+    async fn get_latest_version_matching(
+        &self,
+        package: &str,
+        constraints: &str,
+    ) -> Result<String> {
+        let versions = self.fetch_versions(package).await?;
+
+        // Parse constraints (e.g., ">=2.8.0,<9" or ">=1.0.0")
+        let specifiers = VersionSpecifiers::from_str(constraints).map_err(|e| {
+            anyhow!("Failed to parse version constraints '{}': {}", constraints, e)
+        })?;
+
+        // Find the highest version that matches all constraints
+        for (version, version_str) in versions {
+            if specifiers.contains(&version) {
+                return Ok(version_str);
+            }
+        }
+
+        Err(anyhow!(
+            "No version of '{}' matches constraints '{}'",
+            package,
+            constraints
+        ))
     }
 
     fn name(&self) -> &'static str {

@@ -1,13 +1,32 @@
 [package]
 name = "upd"
-version = "0.1.0"
+version = "0.0.1"
 edition = "2024"
+rust-version = "1.85.0"
 description = "A fast dependency updater for Python and Node.js projects"
 license = "MIT"
 repository = "https://github.com/rvben/upd"
+homepage = "https://github.com/rvben/upd"
+documentation = "https://github.com/rvben/upd#readme"
 authors = ["Ruben Jongejan <ruben.jongejan@gmail.com>"]
 keywords = ["dependencies", "update", "python", "nodejs", "pypi", "npm"]
 categories = ["command-line-utilities", "development-tools"]
+readme = "README.md"
+exclude = [
+    ".github/*",
+    ".gitignore",
+    "scripts/*",
+    "target/*",
+]
+
+[lib]
+name = "upd"
+path = "src/lib.rs"
+crate-type = ["cdylib", "rlib"]
+
+[[bin]]
+name = "upd"
+path = "src/main.rs"
 
 [dependencies]
 # CLI

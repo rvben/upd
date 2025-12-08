@@ -50,14 +50,35 @@ impl FileType {
             return Some(FileType::PackageJson);
         }
 
-        // Requirements file patterns
-        if file_name == "requirements.txt"
-            || file_name.starts_with("requirements-")
-            || file_name.starts_with("requirements_")
-            || file_name.ends_with("-requirements.txt")
-            || file_name.ends_with("_requirements.txt")
-            || file_name.ends_with(".requirements.txt")
-        {
+        // Requirements file patterns (.txt and .in extensions)
+        let is_requirements = |name: &str| -> bool {
+            // Exact matches
+            if name == "requirements.txt" || name == "requirements.in" {
+                return true;
+            }
+
+            // Pattern: requirements-*.txt, requirements-*.in
+            if (name.starts_with("requirements-") || name.starts_with("requirements_"))
+                && (name.ends_with(".txt") || name.ends_with(".in"))
+            {
+                return true;
+            }
+
+            // Pattern: *-requirements.txt, *_requirements.txt, *.requirements.txt
+            if name.ends_with("-requirements.txt")
+                || name.ends_with("_requirements.txt")
+                || name.ends_with(".requirements.txt")
+                || name.ends_with("-requirements.in")
+                || name.ends_with("_requirements.in")
+                || name.ends_with(".requirements.in")
+            {
+                return true;
+            }
+
+            false
+        };
+
+        if is_requirements(file_name) {
             return Some(FileType::Requirements);
         }
 
@@ -110,4 +131,72 @@ pub fn discover_files(paths: &[PathBuf]) -> Vec<(PathBuf, FileType)> {
     }
 
     files
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_file_type_detection() {
+        // PyProject
+        assert_eq!(
+            FileType::detect(Path::new("pyproject.toml")),
+            Some(FileType::PyProject)
+        );
+        assert_eq!(
+            FileType::detect(Path::new("/some/path/pyproject.toml")),
+            Some(FileType::PyProject)
+        );
+
+        // Package.json
+        assert_eq!(
+            FileType::detect(Path::new("package.json")),
+            Some(FileType::PackageJson)
+        );
+        assert_eq!(
+            FileType::detect(Path::new("/some/path/package.json")),
+            Some(FileType::PackageJson)
+        );
+
+        // Requirements.txt patterns
+        assert_eq!(
+            FileType::detect(Path::new("requirements.txt")),
+            Some(FileType::Requirements)
+        );
+        assert_eq!(
+            FileType::detect(Path::new("requirements.in")),
+            Some(FileType::Requirements)
+        );
+        assert_eq!(
+            FileType::detect(Path::new("requirements-dev.txt")),
+            Some(FileType::Requirements)
+        );
+        assert_eq!(
+            FileType::detect(Path::new("requirements_dev.txt")),
+            Some(FileType::Requirements)
+        );
+        assert_eq!(
+            FileType::detect(Path::new("requirements-dev.in")),
+            Some(FileType::Requirements)
+        );
+        assert_eq!(
+            FileType::detect(Path::new("dev-requirements.txt")),
+            Some(FileType::Requirements)
+        );
+        assert_eq!(
+            FileType::detect(Path::new("dev_requirements.txt")),
+            Some(FileType::Requirements)
+        );
+        assert_eq!(
+            FileType::detect(Path::new("dev.requirements.txt")),
+            Some(FileType::Requirements)
+        );
+
+        // Non-matching patterns
+        assert_eq!(FileType::detect(Path::new("requirements")), None);
+        assert_eq!(FileType::detect(Path::new("requirements-dev")), None);
+        assert_eq!(FileType::detect(Path::new("setup.py")), None);
+        assert_eq!(FileType::detect(Path::new("Cargo.toml")), None);
+    }
 }

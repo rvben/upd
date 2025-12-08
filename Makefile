@@ -1,7 +1,17 @@
-.PHONY: build release test lint fmt check clean run install version-get version-major version-minor version-patch version-push release-major release-minor release-patch
+.PHONY: build release test lint fmt check clean run install version-get version-major version-minor version-patch version-push release-major release-minor release-patch build-wheel verify-release
 
 # Get version from Cargo.toml
 VERSION := $(shell grep '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)"/\1/')
+
+# Verify release is ready
+verify-release:
+	@echo "Verifying release readiness..."
+	@./scripts/verify-release-ready.sh
+
+# Build Python wheel locally
+build-wheel:
+	@echo "Building Python wheel..."
+	maturin build --release
 
 # Build debug binary
 build:

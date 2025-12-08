@@ -10,6 +10,40 @@ use upd::updater::{
     UpdateResult, Updater,
 };
 
+/// Parse version components
+fn parse_version(v: &str) -> Option<(u64, u64, u64)> {
+    let v = v.trim_start_matches('v');
+    let parts: Vec<&str> = v.split('.').collect();
+    let major = parts.first()?.parse().ok()?;
+    let minor = parts.get(1).and_then(|s| s.parse().ok()).unwrap_or(0);
+    let patch = parts.get(2).and_then(|s| s.parse().ok()).unwrap_or(0);
+    Some((major, minor, patch))
+}
+
+/// Classify an update as major, minor, or patch
+fn classify_update(old: &str, new: &str) -> UpdateType {
+    if let (Some((old_major, old_minor, _)), Some((new_major, new_minor, _))) =
+        (parse_version(old), parse_version(new))
+    {
+        if new_major > old_major {
+            return UpdateType::Major;
+        }
+        if new_minor > old_minor {
+            return UpdateType::Minor;
+        }
+        UpdateType::Patch
+    } else {
+        UpdateType::Patch
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UpdateType {
+    Major,
+    Minor,
+    Patch,
+}
+
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 #[tokio::main]
@@ -42,6 +76,7 @@ async fn main() -> Result<()> {
 async fn run_update(cli: &Cli) -> Result<()> {
     let paths = cli.get_paths();
     let files = discover_files(&paths);
+    let file_count = files.len();
 
     if files.is_empty() {
         println!("{}", "No dependency files found.".yellow());
@@ -51,7 +86,7 @@ async fn run_update(cli: &Cli) -> Result<()> {
     if cli.verbose {
         println!(
             "{}",
-            format!("Found {} dependency file(s)", files.len()).cyan()
+            format!("Found {} dependency file(s)", file_count).cyan()
         );
     }
 
@@ -113,7 +148,7 @@ async fn run_update(cli: &Cli) -> Result<()> {
 
     // Print summary
     println!();
-    print_summary(&total_result, cli.dry_run);
+    print_summary(&total_result, file_count, cli.dry_run);
 
     Ok(())
 }
@@ -128,12 +163,19 @@ fn print_file_result(path: &str, result: &UpdateResult, dry_run: bool) {
     let action = if dry_run { "Would update" } else { "Updated" };
 
     for (package, old, new) in &result.updated {
+        let type_indicator = match classify_update(old, new) {
+            UpdateType::Major => " (MAJOR)".yellow().bold().to_string(),
+            UpdateType::Minor => String::new(),
+            UpdateType::Patch => String::new(),
+        };
+
         println!(
-            "  {} {} {} → {}",
+            "  {} {} {} → {}{}",
             action.green(),
             package.bold(),
             old.dimmed(),
-            new.green()
+            new.green(),
+            type_indicator
         );
     }
 
@@ -142,16 +184,55 @@ fn print_file_result(path: &str, result: &UpdateResult, dry_run: bool) {
     }
 }
 
-fn print_summary(result: &UpdateResult, dry_run: bool) {
+fn print_summary(result: &UpdateResult, file_count: usize, dry_run: bool) {
     let action = if dry_run { "Would update" } else { "Updated" };
 
+    // Count by update type
+    let (major_count, minor_count, patch_count) = result
+        .updated
+        .iter()
+        .fold((0, 0, 0), |(major, minor, patch), (_, old, new)| {
+            match classify_update(old, new) {
+                UpdateType::Major => (major + 1, minor, patch),
+                UpdateType::Minor => (major, minor + 1, patch),
+                UpdateType::Patch => (major, minor, patch + 1),
+            }
+        });
+
     if result.updated.is_empty() {
-        println!("{}", "All dependencies are up to date.".green());
-    } else {
         println!(
-            "{} {} package(s), {} already up to date",
+            "{} Scanned {} file(s), all dependencies up to date",
+            "✓".green(),
+            file_count
+        );
+    } else {
+        // Build breakdown string
+        let mut parts = Vec::new();
+        if major_count > 0 {
+            parts.push(format!(
+                "{} {}",
+                major_count.to_string().yellow().bold(),
+                "major".yellow()
+            ));
+        }
+        if minor_count > 0 {
+            parts.push(format!("{} minor", minor_count));
+        }
+        if patch_count > 0 {
+            parts.push(format!("{} patch", patch_count));
+        }
+        let breakdown = if parts.is_empty() {
+            String::new()
+        } else {
+            format!(" ({})", parts.join(", "))
+        };
+
+        println!(
+            "{} {} package(s){} in {} file(s), {} up to date",
             action,
             result.updated.len().to_string().green().bold(),
+            breakdown,
+            file_count,
             result.unchanged
         );
     }
