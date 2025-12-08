@@ -168,3 +168,68 @@ impl Registry for NpmRegistry {
         "npm"
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_get_stable_versions() {
+        // Create a mock response with versions
+        let json = serde_json::json!({
+            "dist-tags": {
+                "latest": "2.0.0"
+            },
+            "versions": {
+                "1.0.0": {},
+                "1.1.0": {},
+                "2.0.0": {},
+                "2.1.0-beta.1": {},
+                "2.1.0-alpha.1": {}
+            }
+        });
+
+        let response: NpmAbbreviatedResponse = serde_json::from_value(json).unwrap();
+        let versions = NpmRegistry::get_stable_versions(&response);
+
+        // Should only include stable versions, sorted descending
+        assert_eq!(versions.len(), 3);
+        assert_eq!(versions[0].1, "2.0.0");
+        assert_eq!(versions[1].1, "1.1.0");
+        assert_eq!(versions[2].1, "1.0.0");
+    }
+
+    #[test]
+    fn test_get_stable_versions_filters_prereleases() {
+        let json = serde_json::json!({
+            "dist-tags": {
+                "latest": "1.0.0"
+            },
+            "versions": {
+                "1.0.0": {},
+                "2.0.0-rc.1": {},
+                "2.0.0-beta.5": {},
+                "2.0.0-alpha.1": {}
+            }
+        });
+
+        let response: NpmAbbreviatedResponse = serde_json::from_value(json).unwrap();
+        let versions = NpmRegistry::get_stable_versions(&response);
+
+        // Only stable version should be included
+        assert_eq!(versions.len(), 1);
+        assert_eq!(versions[0].1, "1.0.0");
+    }
+
+    #[test]
+    fn test_registry_name() {
+        let registry = NpmRegistry::new();
+        assert_eq!(registry.name(), "npm");
+    }
+
+    #[test]
+    fn test_with_registry_url() {
+        let registry = NpmRegistry::with_registry_url("https://custom.registry.com".to_string());
+        assert_eq!(registry.registry_url, "https://custom.registry.com");
+    }
+}

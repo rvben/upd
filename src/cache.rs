@@ -235,3 +235,143 @@ impl<R: Registry> Registry for CachedRegistry<R> {
         self.inner.name()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn test_cache_get_set() {
+        let mut cache = Cache::default();
+
+        // Initially empty
+        assert!(cache.get("pypi", "requests").is_none());
+
+        // Set and retrieve
+        cache.set("pypi", "requests", "2.31.0".to_string());
+        assert_eq!(cache.get("pypi", "requests"), Some("2.31.0".to_string()));
+
+        // Different registries are isolated
+        assert!(cache.get("npm", "requests").is_none());
+
+        // Set for different registries
+        cache.set("npm", "lodash", "4.17.21".to_string());
+        cache.set("crates.io", "serde", "1.0.200".to_string());
+        cache.set("go-proxy", "golang.org/x/sync", "v0.7.0".to_string());
+
+        assert_eq!(cache.get("npm", "lodash"), Some("4.17.21".to_string()));
+        assert_eq!(cache.get("crates.io", "serde"), Some("1.0.200".to_string()));
+        assert_eq!(
+            cache.get("go-proxy", "golang.org/x/sync"),
+            Some("v0.7.0".to_string())
+        );
+    }
+
+    #[test]
+    fn test_cache_expiration() {
+        let mut cache = Cache::default();
+
+        // Set with current timestamp
+        cache.set("pypi", "fresh", "1.0.0".to_string());
+
+        // Should be retrievable (not expired)
+        assert_eq!(cache.get("pypi", "fresh"), Some("1.0.0".to_string()));
+
+        // Manually insert an expired entry (25 hours ago)
+        let expired_time = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            - (25 * 3600);
+
+        cache.pypi.insert(
+            "old".to_string(),
+            CacheEntry {
+                version: "0.1.0".to_string(),
+                fetched_at: expired_time,
+            },
+        );
+
+        // Expired entry should return None
+        assert!(cache.get("pypi", "old").is_none());
+    }
+
+    #[test]
+    fn test_cache_prune() {
+        let mut cache = Cache::default();
+
+        // Add fresh entry
+        cache.set("pypi", "fresh", "1.0.0".to_string());
+
+        // Add expired entry
+        let expired_time = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            - (25 * 3600);
+
+        cache.pypi.insert(
+            "old".to_string(),
+            CacheEntry {
+                version: "0.1.0".to_string(),
+                fetched_at: expired_time,
+            },
+        );
+
+        // Before prune: both entries exist in the map
+        assert!(cache.pypi.contains_key("fresh"));
+        assert!(cache.pypi.contains_key("old"));
+
+        // Prune removes expired entries
+        cache.prune();
+
+        assert!(cache.pypi.contains_key("fresh"));
+        assert!(!cache.pypi.contains_key("old"));
+    }
+
+    #[test]
+    fn test_cache_unknown_registry() {
+        let mut cache = Cache::default();
+
+        // Unknown registry returns None
+        assert!(cache.get("unknown", "package").is_none());
+
+        // Setting for unknown registry is a no-op
+        cache.set("unknown", "package", "1.0.0".to_string());
+        assert!(cache.get("unknown", "package").is_none());
+    }
+
+    #[test]
+    fn test_shared_cache() {
+        let cache = Cache::new_shared();
+
+        // Set value through lock
+        {
+            let mut c = cache.lock().unwrap();
+            c.set("npm", "react", "18.2.0".to_string());
+        }
+
+        // Retrieve through a new lock
+        {
+            let c = cache.lock().unwrap();
+            assert_eq!(c.get("npm", "react"), Some("18.2.0".to_string()));
+        }
+    }
+
+    #[test]
+    fn test_cache_serialization() {
+        let mut cache = Cache::default();
+        cache.set("pypi", "requests", "2.31.0".to_string());
+        cache.set("npm", "lodash", "4.17.21".to_string());
+
+        // Serialize to JSON
+        let json = serde_json::to_string(&cache).unwrap();
+
+        // Deserialize back
+        let restored: Cache = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(restored.get("pypi", "requests"), Some("2.31.0".to_string()));
+        assert_eq!(restored.get("npm", "lodash"), Some("4.17.21".to_string()));
+    }
+}

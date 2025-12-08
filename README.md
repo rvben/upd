@@ -1,31 +1,32 @@
 # upd
 
-A fast dependency updater for Python and Node.js projects, written in Rust.
+A fast dependency updater for Python, Node.js, Rust, and Go projects,
+written in Rust.
 
 ## Features
 
-- **Multi-format support**: Updates `requirements.txt`, `pyproject.toml`, and `package.json`
-- **Constraint-aware**: Respects version constraints (e.g., `>=2.0,<3` won't update to v3.x)
-- **Major version warnings**: Highlights breaking changes with `(MAJOR)` indicator
-- **Format-preserving**: Keeps your file formatting, comments, and structure intact
-- **Pre-release filtering**: Excludes alpha, beta, and release candidate versions
-- **Gitignore-aware**: Respects `.gitignore` patterns when discovering files
-- **Fast**: Async HTTP requests with caching for quick subsequent runs
+- **Multi-ecosystem**: Python, Node.js, Rust, and Go dependencies
+- **Constraint-aware**: Respects version constraints like `>=2.0,<3`
+- **Smart caching**: 24-hour version cache for faster subsequent runs
+- **Major warnings**: Highlights breaking changes with `(MAJOR)`
+- **Format-preserving**: Keeps formatting, comments, and structure
+- **Pre-release aware**: Updates pre-releases to newer pre-releases
+- **Gitignore-aware**: Respects `.gitignore` when discovering files
 
 ## Installation
-
-### From PyPI
-
-```bash
-pip install upd
-# or with uv
-uv pip install upd
-```
 
 ### From crates.io
 
 ```bash
 cargo install upd
+```
+
+### From PyPI
+
+```bash
+pip install upd-cli
+# or with uv
+uv pip install upd-cli
 ```
 
 ### From source
@@ -56,7 +57,7 @@ upd --verbose
 # Disable colored output
 upd --no-color
 
-# Disable caching
+# Disable caching (force fresh lookups)
 upd --no-cache
 ```
 
@@ -80,24 +81,32 @@ upd clean-cache
 - `requirements.txt`, `requirements-dev.txt`, `requirements-*.txt`
 - `requirements.in`, `requirements-dev.in`, `requirements-*.in`
 - `dev-requirements.txt`, `*-requirements.txt`, `*_requirements.txt`
-- `pyproject.toml` (`[project.dependencies]` and `[project.optional-dependencies]`)
+- `pyproject.toml` (PEP 621 and Poetry formats)
 
 ### Node.js
 
 - `package.json` (`dependencies` and `devDependencies`)
 
+### Rust
+
+- `Cargo.toml` (`[dependencies]`, `[dev-dependencies]`, `[build-dependencies]`)
+
+### Go
+
+- `go.mod` (`require` blocks)
+
 ## Example Output
 
-```
+```text
 pyproject.toml
   Would update requests 2.28.0 → 2.31.0
   Would update flask 2.2.0 → 3.0.0 (MAJOR)
 
-requirements.txt
-  Would update pytest 7.2.0 → 7.4.3
-  Would update black 23.1.0 → 23.12.1
+Cargo.toml
+  Would update serde 1.0.180 → 1.0.200
+  Would update tokio 1.28.0 → 1.35.0
 
-Would update 4 package(s) (1 major, 2 minor, 1 patch) in 2 file(s), 15 up to date
+Would update 4 package(s) in 2 file(s), 15 up to date
 ```
 
 ## Version Constraints
@@ -107,10 +116,30 @@ Would update 4 package(s) (1 major, 2 minor, 1 patch) in 2 file(s), 15 up to dat
 | Constraint | Behavior |
 |------------|----------|
 | `>=2.0,<3` | Updates within 2.x range only |
-| `^2.0.0` | Updates within 2.x range (npm) |
+| `^2.0.0` | Updates within 2.x range (npm/Cargo) |
 | `~2.0.0` | Updates within 2.0.x range (npm) |
 | `>=2.0` | Updates to any version >= 2.0 |
 | `==2.0.0` | No updates (pinned) |
+
+## Caching
+
+Version lookups are cached for 24 hours in:
+
+- macOS: `~/Library/Caches/upd/versions.json`
+- Linux: `~/.cache/upd/versions.json`
+- Windows: `%LOCALAPPDATA%\upd\versions.json`
+
+Use `upd clean-cache` to clear the cache, or `upd --no-cache` to bypass it.
+
+## Environment Variables
+
+| Variable | Description |
+|----------|-------------|
+| `UV_INDEX_URL` | Custom PyPI index URL |
+| `PIP_INDEX_URL` | Custom PyPI index URL (fallback) |
+| `NPM_REGISTRY` | Custom npm registry URL |
+| `GOPROXY` | Custom Go module proxy URL |
+| `UPD_CACHE_DIR` | Custom cache directory |
 
 ## Development
 
