@@ -1,8 +1,9 @@
-use super::Registry;
+use super::{Registry, get_with_retry};
 use anyhow::{Result, anyhow};
 use async_trait::async_trait;
 use reqwest::Client;
 use serde::Deserialize;
+use std::time::Duration;
 
 pub struct CratesIoRegistry {
     client: Client,
@@ -37,6 +38,8 @@ impl CratesIoRegistry {
             .gzip(true)
             // crates.io requires a descriptive User-Agent
             .user_agent("upd/0.1.0 (https://github.com/rvben/upd)")
+            .timeout(Duration::from_secs(30))
+            .connect_timeout(Duration::from_secs(10))
             .build()
             .expect("Failed to create HTTP client");
 
@@ -55,7 +58,7 @@ impl CratesIoRegistry {
 
     async fn fetch_crate(&self, name: &str) -> Result<CratesResponse> {
         let url = format!("{}/{}", self.registry_url, name);
-        let response = self.client.get(&url).send().await?;
+        let response = get_with_retry(&self.client, &url).await?;
 
         if !response.status().is_success() {
             return Err(anyhow!(

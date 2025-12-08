@@ -1,8 +1,9 @@
-use super::Registry;
+use super::{Registry, get_with_retry};
 use anyhow::{Result, anyhow};
 use async_trait::async_trait;
 use reqwest::Client;
 use serde::Deserialize;
+use std::time::Duration;
 
 pub struct GoProxyRegistry {
     client: Client,
@@ -24,6 +25,8 @@ impl GoProxyRegistry {
         let client = Client::builder()
             .gzip(true)
             .user_agent("upd/0.1.0")
+            .timeout(Duration::from_secs(30))
+            .connect_timeout(Duration::from_secs(10))
             .build()
             .expect("Failed to create HTTP client");
 
@@ -49,7 +52,7 @@ impl GoProxyRegistry {
         let escaped = Self::escape_module_path(module);
         let url = format!("{}/{}/@v/list", self.proxy_url, escaped);
 
-        let response = self.client.get(&url).send().await?;
+        let response = get_with_retry(&self.client, &url).await?;
 
         if !response.status().is_success() {
             return Err(anyhow!(
@@ -110,7 +113,7 @@ impl Registry for GoProxyRegistry {
         let escaped = Self::escape_module_path(package);
         let url = format!("{}/{}/@latest", self.proxy_url, escaped);
 
-        if let Ok(response) = self.client.get(&url).send().await
+        if let Ok(response) = get_with_retry(&self.client, &url).await
             && response.status().is_success()
             && let Ok(data) = response.json::<LatestResponse>().await
         {

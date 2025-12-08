@@ -79,6 +79,36 @@ impl GoModUpdater {
             .map(|v| !v.pre.is_empty())
             .unwrap_or(false)
     }
+
+    /// Check if a version is a pseudo-version (commit-based, not a real tag).
+    /// Pseudo-versions have the format: v0.0.0-YYYYMMDDHHMMSS-abcdefabcdef
+    /// Or for pre-release: v1.2.4-0.YYYYMMDDHHMMSS-abcdefabcdef
+    /// These modules have no semver tags (or point to commits), so updating them via registry fails.
+    fn is_pseudo_version(version: &str) -> bool {
+        // Pseudo-version patterns:
+        // 1. v0.0.0-20241217172646-ca3f786aa774 (base version is 0.0.0)
+        // 2. v1.2.4-0.20220331215641-2d8c0ab7ef04 (pre-release pseudo after real version)
+        //
+        // Look for timestamp pattern: 14 digits (YYYYMMDDHHMMSS)
+        let contains_timestamp = |s: &str| s.len() == 14 && s.chars().all(|c| c.is_ascii_digit());
+
+        // Split by dash and look for the timestamp part
+        let parts: Vec<&str> = version.split('-').collect();
+
+        for part in &parts {
+            if contains_timestamp(part) {
+                return true;
+            }
+            // Handle "0.20220331215641" format (pre-release pseudo)
+            if let Some(after_dot) = part.strip_prefix("0.")
+                && contains_timestamp(after_dot)
+            {
+                return true;
+            }
+        }
+
+        false
+    }
 }
 
 impl Default for GoModUpdater {
@@ -144,6 +174,13 @@ impl Updater for GoModUpdater {
 
                 // Skip replaced modules
                 if replaced_modules.contains(module) {
+                    new_lines.push(line.to_string());
+                    result.unchanged += 1;
+                    continue;
+                }
+
+                // Skip pseudo-versions (commit-based, no semver tags available)
+                if Self::is_pseudo_version(current_version) {
                     new_lines.push(line.to_string());
                     result.unchanged += 1;
                     continue;
@@ -275,5 +312,28 @@ replace (
         assert!(GoModUpdater::is_prerelease("v1.0.0-alpha.1"));
         assert!(GoModUpdater::is_prerelease("v1.0.0-rc1"));
         assert!(GoModUpdater::is_prerelease("v1.0.0-beta"));
+    }
+
+    #[test]
+    fn test_is_pseudo_version() {
+        // Standard pseudo-versions (commit-based, no semver tags)
+        assert!(GoModUpdater::is_pseudo_version(
+            "v0.0.0-20241217172646-ca3f786aa774"
+        ));
+        assert!(GoModUpdater::is_pseudo_version(
+            "v0.0.0-20220331215641-2d8c0ab7ef04"
+        ));
+
+        // Pre-release pseudo-versions (e.g., for modules with tagged releases)
+        assert!(GoModUpdater::is_pseudo_version(
+            "v1.2.4-0.20220331215641-2d8c0ab7ef04"
+        ));
+
+        // Normal versions should NOT be detected as pseudo-versions
+        assert!(!GoModUpdater::is_pseudo_version("v1.0.0"));
+        assert!(!GoModUpdater::is_pseudo_version("v1.0.0-alpha.1"));
+        assert!(!GoModUpdater::is_pseudo_version("v1.0.0-rc1"));
+        assert!(!GoModUpdater::is_pseudo_version("v2.0.0+incompatible"));
+        assert!(!GoModUpdater::is_pseudo_version("v1.0.0-beta"));
     }
 }

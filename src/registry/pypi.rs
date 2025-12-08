@@ -1,4 +1,4 @@
-use super::Registry;
+use super::{Registry, get_with_retry};
 use anyhow::{Result, anyhow};
 use async_trait::async_trait;
 use pep440_rs::{Version, VersionSpecifiers};
@@ -6,6 +6,7 @@ use reqwest::Client;
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::str::FromStr;
+use std::time::Duration;
 
 pub struct PyPiRegistry {
     client: Client,
@@ -31,6 +32,8 @@ impl PyPiRegistry {
         let client = Client::builder()
             .gzip(true)
             .user_agent("upd/0.1.0")
+            .timeout(Duration::from_secs(30))
+            .connect_timeout(Duration::from_secs(10))
             .build()
             .expect("Failed to create HTTP client");
 
@@ -78,7 +81,7 @@ impl PyPiRegistry {
         let normalized = package.to_lowercase().replace('_', "-");
         let url = format!("{}/{}/json", self.index_url, normalized);
 
-        let response = self.client.get(&url).send().await?;
+        let response = get_with_retry(&self.client, &url).await?;
 
         if !response.status().is_success() {
             return Err(anyhow!(

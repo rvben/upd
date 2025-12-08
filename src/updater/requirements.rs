@@ -83,9 +83,27 @@ impl RequirementsUpdater {
         None
     }
 
-    /// Check if constraint is a simple single-version constraint (==, >=, etc. without upper bound)
+    /// Check if constraint is a simple single-version constraint that doesn't need
+    /// constraint-aware lookup (i.e., no upper bounds that could be violated)
     fn is_simple_constraint(constraint: &str) -> bool {
-        !constraint.contains(',')
+        // If there are multiple constraints (comma-separated), need constraint-aware lookup
+        if constraint.contains(',') {
+            return false;
+        }
+
+        // If the constraint has an upper-bound operator, need constraint-aware lookup
+        // Examples: "<4.2", "<=2.0", "~=1.4" (compatible release - allows only patch updates)
+        if constraint.starts_with('<') || constraint.starts_with("<=") || constraint.starts_with("~=") {
+            return false;
+        }
+
+        // Also check for != which could affect version selection
+        if constraint.starts_with("!=") {
+            return false;
+        }
+
+        // Simple constraints like "==1.0.0", ">=1.0.0", ">1.0.0" are fine
+        true
     }
 
     fn update_line(&self, line: &str, new_version: &str) -> String {
@@ -232,10 +250,22 @@ mod tests {
 
     #[test]
     fn test_is_simple_constraint() {
+        // Simple constraints - no upper bound, no exclusions
         assert!(RequirementsUpdater::is_simple_constraint("==1.0.0"));
         assert!(RequirementsUpdater::is_simple_constraint(">=1.0.0"));
+        assert!(RequirementsUpdater::is_simple_constraint(">1.0.0"));
+
+        // Multiple constraints with comma
         assert!(!RequirementsUpdater::is_simple_constraint(">=1.0.0,<2.0.0"));
         assert!(!RequirementsUpdater::is_simple_constraint(">=2.8.0,<9"));
+
+        // Upper-bound operators (need constraint-aware lookup)
+        assert!(!RequirementsUpdater::is_simple_constraint("<4.2"));
+        assert!(!RequirementsUpdater::is_simple_constraint("<=2.0"));
+        assert!(!RequirementsUpdater::is_simple_constraint("~=1.4"));
+
+        // Exclusion operator
+        assert!(!RequirementsUpdater::is_simple_constraint("!=1.5.0"));
     }
 
     #[test]
