@@ -1,7 +1,11 @@
+mod cargo_toml;
+mod go_mod;
 mod package_json;
 mod pyproject;
 mod requirements;
 
+pub use cargo_toml::CargoTomlUpdater;
+pub use go_mod::GoModUpdater;
 pub use package_json::PackageJsonUpdater;
 pub use pyproject::PyProjectUpdater;
 pub use requirements::RequirementsUpdater;
@@ -36,6 +40,8 @@ pub enum FileType {
     Requirements,
     PyProject,
     PackageJson,
+    CargoToml,
+    GoMod,
 }
 
 impl FileType {
@@ -48,6 +54,14 @@ impl FileType {
 
         if file_name == "package.json" {
             return Some(FileType::PackageJson);
+        }
+
+        if file_name == "Cargo.toml" {
+            return Some(FileType::CargoToml);
+        }
+
+        if file_name == "go.mod" {
+            return Some(FileType::GoMod);
         }
 
         // Requirements file patterns (.txt and .in extensions)
@@ -106,10 +120,10 @@ pub fn discover_files(paths: &[PathBuf]) -> Vec<(PathBuf, FileType)> {
     let mut files = Vec::new();
 
     for path in paths {
-        if path.is_file() {
-            if let Some(file_type) = FileType::detect(path) {
-                files.push((path.clone(), file_type));
-            }
+        if path.is_file()
+            && let Some(file_type) = FileType::detect(path)
+        {
+            files.push((path.clone(), file_type));
         } else if path.is_dir() {
             // Walk directory respecting .gitignore
             let walker = WalkBuilder::new(path)
@@ -121,10 +135,10 @@ pub fn discover_files(paths: &[PathBuf]) -> Vec<(PathBuf, FileType)> {
 
             for entry in walker.flatten() {
                 let entry_path = entry.path();
-                if entry_path.is_file() {
-                    if let Some(file_type) = FileType::detect(entry_path) {
-                        files.push((entry_path.to_path_buf(), file_type));
-                    }
+                if entry_path.is_file()
+                    && let Some(file_type) = FileType::detect(entry_path)
+                {
+                    files.push((entry_path.to_path_buf(), file_type));
                 }
             }
         }
@@ -193,10 +207,27 @@ mod tests {
             Some(FileType::Requirements)
         );
 
+        // Cargo.toml
+        assert_eq!(
+            FileType::detect(Path::new("Cargo.toml")),
+            Some(FileType::CargoToml)
+        );
+        assert_eq!(
+            FileType::detect(Path::new("/some/path/Cargo.toml")),
+            Some(FileType::CargoToml)
+        );
+
+        // go.mod
+        assert_eq!(FileType::detect(Path::new("go.mod")), Some(FileType::GoMod));
+        assert_eq!(
+            FileType::detect(Path::new("/some/path/go.mod")),
+            Some(FileType::GoMod)
+        );
+
         // Non-matching patterns
         assert_eq!(FileType::detect(Path::new("requirements")), None);
         assert_eq!(FileType::detect(Path::new("requirements-dev")), None);
         assert_eq!(FileType::detect(Path::new("setup.py")), None);
-        assert_eq!(FileType::detect(Path::new("Cargo.toml")), None);
+        assert_eq!(FileType::detect(Path::new("cargo.toml")), None); // lowercase doesn't match
     }
 }

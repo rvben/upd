@@ -101,17 +101,13 @@ impl Registry for NpmRegistry {
         let data = self.fetch_package(package).await?;
 
         // Use the 'latest' dist-tag first
-        if let Some(latest) = &data.dist_tags.latest {
-            // Check if it's a pre-release or deprecated
-            if let Some(version_info) = data.versions.get(latest) {
-                if version_info.deprecated.is_none() {
-                    if let Ok(v) = semver::Version::parse(latest) {
-                        if v.pre.is_empty() {
-                            return Ok(latest.clone());
-                        }
-                    }
-                }
-            }
+        if let Some(latest) = &data.dist_tags.latest
+            && let Some(version_info) = data.versions.get(latest)
+            && version_info.deprecated.is_none()
+            && let Ok(v) = semver::Version::parse(latest)
+            && v.pre.is_empty()
+        {
+            return Ok(latest.clone());
         }
 
         // Fall back to finding the latest stable version

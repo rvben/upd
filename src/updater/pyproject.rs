@@ -58,34 +58,33 @@ impl PyProjectUpdater {
         let mut updates: Vec<(usize, String)> = Vec::new();
 
         for i in 0..array.len() {
-            if let Some(item) = array.get(i) {
-                if let Some(s) = item.as_str() {
-                    if let Some((package, current_version)) = self.parse_dependency(s) {
-                        // If current version is a pre-release, include pre-releases in lookup
-                        let version_result = if is_stable_pep440(&current_version) {
-                            registry.get_latest_version(&package).await
-                        } else {
-                            registry
-                                .get_latest_version_including_prereleases(&package)
-                                .await
-                        };
+            if let Some(item) = array.get(i)
+                && let Some(s) = item.as_str()
+                && let Some((package, current_version)) = self.parse_dependency(s)
+            {
+                // If current version is a pre-release, include pre-releases in lookup
+                let version_result = if is_stable_pep440(&current_version) {
+                    registry.get_latest_version(&package).await
+                } else {
+                    registry
+                        .get_latest_version_including_prereleases(&package)
+                        .await
+                };
 
-                        match version_result {
-                            Ok(latest_version) => {
-                                if latest_version != current_version {
-                                    let updated = self.update_dependency(s, &latest_version);
-                                    result
-                                        .updated
-                                        .push((package, current_version, latest_version));
-                                    updates.push((i, updated));
-                                } else {
-                                    result.unchanged += 1;
-                                }
-                            }
-                            Err(e) => {
-                                result.errors.push(format!("{}: {}", package, e));
-                            }
+                match version_result {
+                    Ok(latest_version) => {
+                        if latest_version != current_version {
+                            let updated = self.update_dependency(s, &latest_version);
+                            result
+                                .updated
+                                .push((package, current_version, latest_version));
+                            updates.push((i, updated));
+                        } else {
+                            result.unchanged += 1;
                         }
+                    }
+                    Err(e) => {
+                        result.errors.push(format!("{}: {}", package, e));
                     }
                 }
             }
@@ -219,15 +218,15 @@ impl Updater for PyProjectUpdater {
         }
 
         // Update [tool.poetry.dependencies] and [tool.poetry.dev-dependencies]
-        if let Some(Item::Table(tool)) = doc.get_mut("tool") {
-            if let Some(Item::Table(poetry)) = tool.get_mut("poetry") {
-                if let Some(Item::Table(deps)) = poetry.get_mut("dependencies") {
-                    self.update_poetry_deps(deps, registry, &mut result).await;
-                }
+        if let Some(Item::Table(tool)) = doc.get_mut("tool")
+            && let Some(Item::Table(poetry)) = tool.get_mut("poetry")
+        {
+            if let Some(Item::Table(deps)) = poetry.get_mut("dependencies") {
+                self.update_poetry_deps(deps, registry, &mut result).await;
+            }
 
-                if let Some(Item::Table(deps)) = poetry.get_mut("dev-dependencies") {
-                    self.update_poetry_deps(deps, registry, &mut result).await;
-                }
+            if let Some(Item::Table(deps)) = poetry.get_mut("dev-dependencies") {
+                self.update_poetry_deps(deps, registry, &mut result).await;
             }
         }
 

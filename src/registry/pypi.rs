@@ -41,10 +41,10 @@ impl PyPiRegistry {
     pub fn detect_index_url() -> Option<String> {
         // Check environment variables in order of precedence
         for var in ["UV_INDEX_URL", "PIP_INDEX_URL", "PYTHON_INDEX_URL"] {
-            if let Ok(url) = std::env::var(var) {
-                if !url.is_empty() {
-                    return Some(url);
-                }
+            if let Ok(url) = std::env::var(var)
+                && !url.is_empty()
+            {
+                return Some(url);
             }
         }
         None

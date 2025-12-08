@@ -4,10 +4,10 @@ use colored::Colorize;
 
 use upd::cache::Cache;
 use upd::cli::{Cli, Command};
-use upd::registry::{NpmRegistry, PyPiRegistry};
+use upd::registry::{CratesIoRegistry, GoProxyRegistry, NpmRegistry, PyPiRegistry};
 use upd::updater::{
-    FileType, PackageJsonUpdater, PyProjectUpdater, RequirementsUpdater, UpdateResult, Updater,
-    discover_files,
+    CargoTomlUpdater, FileType, GoModUpdater, PackageJsonUpdater, PyProjectUpdater,
+    RequirementsUpdater, UpdateResult, Updater, discover_files,
 };
 
 /// Parse version components
@@ -93,11 +93,15 @@ async fn run_update(cli: &Cli) -> Result<()> {
     // Create registries
     let pypi = PyPiRegistry::new();
     let npm = NpmRegistry::new();
+    let crates_io = CratesIoRegistry::new();
+    let go_proxy = GoProxyRegistry::new();
 
     // Create updaters
     let requirements_updater = RequirementsUpdater::new();
     let pyproject_updater = PyProjectUpdater::new();
     let package_json_updater = PackageJsonUpdater::new();
+    let cargo_toml_updater = CargoTomlUpdater::new();
+    let go_mod_updater = GoModUpdater::new();
 
     // Load cache if enabled
     let mut cache = if !cli.no_cache {
@@ -117,6 +121,12 @@ async fn run_update(cli: &Cli) -> Result<()> {
             FileType::Requirements => requirements_updater.update(&path, &pypi, cli.dry_run).await,
             FileType::PyProject => pyproject_updater.update(&path, &pypi, cli.dry_run).await,
             FileType::PackageJson => package_json_updater.update(&path, &npm, cli.dry_run).await,
+            FileType::CargoToml => {
+                cargo_toml_updater
+                    .update(&path, &crates_io, cli.dry_run)
+                    .await
+            }
+            FileType::GoMod => go_mod_updater.update(&path, &go_proxy, cli.dry_run).await,
         };
 
         match result {

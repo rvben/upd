@@ -14,6 +14,10 @@ pub struct Cache {
     pypi: HashMap<String, CacheEntry>,
     #[serde(default)]
     npm: HashMap<String, CacheEntry>,
+    #[serde(default, rename = "crates.io")]
+    crates_io: HashMap<String, CacheEntry>,
+    #[serde(default, rename = "go-proxy")]
+    go_proxy: HashMap<String, CacheEntry>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -52,6 +56,8 @@ impl Cache {
         let entries = match registry {
             "pypi" => &self.pypi,
             "npm" => &self.npm,
+            "crates.io" => &self.crates_io,
+            "go-proxy" => &self.go_proxy,
             _ => return None,
         };
 
@@ -68,6 +74,8 @@ impl Cache {
         let entries = match registry {
             "pypi" => &mut self.pypi,
             "npm" => &mut self.npm,
+            "crates.io" => &mut self.crates_io,
+            "go-proxy" => &mut self.go_proxy,
             _ => return,
         };
 
@@ -121,6 +129,10 @@ impl Cache {
             .retain(|_, entry| !Self::is_expired(entry.fetched_at));
         self.npm
             .retain(|_, entry| !Self::is_expired(entry.fetched_at));
+        self.crates_io
+            .retain(|_, entry| !Self::is_expired(entry.fetched_at));
+        self.go_proxy
+            .retain(|_, entry| !Self::is_expired(entry.fetched_at));
     }
 }
 
@@ -147,10 +159,10 @@ impl<R: crate::registry::Registry> CachedRegistry<R> {
 
     pub async fn get_latest_version(&mut self, package: &str) -> anyhow::Result<String> {
         // Check cache first if enabled
-        if self.enabled {
-            if let Some(version) = self.cache.get(self.registry_name, package) {
-                return Ok(version);
-            }
+        if self.enabled
+            && let Some(version) = self.cache.get(self.registry_name, package)
+        {
+            return Ok(version);
         }
 
         // Fetch from registry

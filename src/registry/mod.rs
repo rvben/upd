@@ -1,6 +1,10 @@
+mod crates_io;
+mod go_proxy;
 mod npm;
 mod pypi;
 
+pub use crates_io::CratesIoRegistry;
+pub use go_proxy::GoProxyRegistry;
 pub use npm::NpmRegistry;
 pub use pypi::PyPiRegistry;
 
