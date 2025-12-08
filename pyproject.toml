@@ -1,18 +1,15 @@
 [build-system]
-requires = ["maturin>=1.0,<2.0"]
+requires = ["maturin>=1.4,<2.0"]
 build-backend = "maturin"
 
 [project]
-name = "upd"
+name = "upd-cli"
 dynamic = ["version"]
 description = "A fast dependency updater for Python and Node.js projects"
 readme = "README.md"
 license = { text = "MIT" }
-requires-python = ">=3.8"
-authors = [
-    { name = "Ruben Jongejan", email = "ruben.jongejan@gmail.com" }
-]
-keywords = ["dependencies", "update", "pypi", "npm", "requirements", "pyproject"]
+authors = [{ name = "Ruben Jongejan", email = "ruben.jongejan@gmail.com" }]
+keywords = ["dependencies", "update", "python", "nodejs", "npm"]
 classifiers = [
     "Development Status :: 4 - Beta",
     "Environment :: Console",
@@ -20,21 +17,18 @@ classifiers = [
     "License :: OSI Approved :: MIT License",
     "Operating System :: OS Independent",
     "Programming Language :: Python :: 3",
-    "Programming Language :: Python :: 3.8",
-    "Programming Language :: Python :: 3.9",
-    "Programming Language :: Python :: 3.10",
-    "Programming Language :: Python :: 3.11",
-    "Programming Language :: Python :: 3.12",
     "Programming Language :: Rust",
     "Topic :: Software Development :: Build Tools",
-    "Topic :: System :: Software Distribution",
 ]
+requires-python = ">=3.8"
 
 [project.urls]
 Homepage = "https://github.com/rvben/upd"
 Repository = "https://github.com/rvben/upd"
-Issues = "https://github.com/rvben/upd/issues"
+Documentation = "https://github.com/rvben/upd#readme"
 
 [tool.maturin]
 bindings = "bin"
+manifest-path = "Cargo.toml"
+python-packages = ["python/upd_cli"]
 strip = true

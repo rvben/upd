@@ -1,0 +1,77 @@
+# Pre-commit hooks for upd
+# Install with:
+#   pre-commit install                    # Install commit hooks
+#   pre-commit install --hook-type pre-push  # Install push hooks
+# Run manually:
+#   pre-commit run --all-files           # Run commit hooks
+#   pre-commit run --hook-stage push --all-files  # Run push hooks
+
+repos:
+  # Rust formatting and linting
+  - repo: local
+    hooks:
+      - id: cargo-fmt
+        name: cargo fmt
+        entry: cargo fmt --all --
+        language: system
+        types: [rust]
+        pass_filenames: false
+
+      - id: cargo-clippy
+        name: cargo clippy
+        entry: cargo clippy -- -D warnings
+        language: system
+        types: [rust]
+        pass_filenames: false
+
+      - id: cargo-test
+        name: cargo test
+        entry: cargo test --lib
+        language: system
+        types: [rust]
+        pass_filenames: false
+        stages: [pre-commit]
+
+  # General file quality checks
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v4.6.0
+    hooks:
+      - id: trailing-whitespace
+        exclude: \.md$
+      - id: end-of-file-fixer
+        exclude: \.md$
+      - id: check-yaml
+      - id: check-toml
+      - id: check-json
+      - id: check-merge-conflict
+      - id: check-case-conflict
+      - id: mixed-line-ending
+        args: [--fix=lf]
+
+  # Markdown linting using rumdl
+  - repo: https://github.com/rvben/rumdl-pre-commit
+    rev: v0.0.45
+    hooks:
+      - id: rumdl
+        exclude: ^CHANGELOG\.md$
+
+  # Pre-push hooks for comprehensive validation
+  - repo: local
+    hooks:
+      - id: cargo-test-full
+        name: cargo test (full suite)
+        entry: cargo test
+        language: system
+        types: [rust]
+        pass_filenames: false
+        stages: [pre-push]
+        verbose: true
+
+      - id: cargo-doc-check
+        name: cargo doc (check)
+        entry: cargo doc --no-deps --all-features
+        language: system
+        types: [rust]
+        pass_filenames: false
+        stages: [pre-push]
+        verbose: true
