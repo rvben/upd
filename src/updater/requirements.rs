@@ -93,7 +93,10 @@ impl RequirementsUpdater {
 
         // If the constraint has an upper-bound operator, need constraint-aware lookup
         // Examples: "<4.2", "<=2.0", "~=1.4" (compatible release - allows only patch updates)
-        if constraint.starts_with('<') || constraint.starts_with("<=") || constraint.starts_with("~=") {
+        if constraint.starts_with('<')
+            || constraint.starts_with("<=")
+            || constraint.starts_with("~=")
+        {
             return false;
         }
 

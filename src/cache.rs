@@ -55,7 +55,7 @@ impl Cache {
         Ok(())
     }
 
-    /// Create a shared cache wrapped in Arc<Mutex> for thread-safe access
+    /// Create a shared cache wrapped in `Arc<Mutex>` for thread-safe access
     pub fn new_shared() -> Arc<Mutex<Self>> {
         Arc::new(Mutex::new(Self::load().unwrap_or_default()))
     }
