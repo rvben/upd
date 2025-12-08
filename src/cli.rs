@@ -13,7 +13,7 @@ pub struct Cli {
     pub paths: Vec<PathBuf>,
 
     /// Verify dependency compatibility after update
-    #[arg(short = 'V', long, global = true)]
+    #[arg(long, global = true)]
     pub verify: bool,
 
     /// Show what would change without writing
