@@ -91,6 +91,9 @@ async fn run_update(cli: &Cli) -> Result<()> {
         );
     }
 
+    // Create filter from CLI flags
+    let filter = UpdateFilter::new(cli.major, cli.minor, cli.patch);
+
     // Create shared cache and wrap registries with caching layer
     let cache = Cache::new_shared();
     let cache_enabled = !cli.no_cache;
@@ -128,7 +131,12 @@ async fn run_update(cli: &Cli) -> Result<()> {
 
         match result {
             Ok(file_result) => {
-                print_file_result(&path.display().to_string(), &file_result, cli.dry_run);
+                print_file_result(
+                    &path.display().to_string(),
+                    &file_result,
+                    cli.dry_run,
+                    filter,
+                );
                 total_result.merge(file_result);
             }
             Err(e) => {
@@ -147,12 +155,47 @@ async fn run_update(cli: &Cli) -> Result<()> {
 
     // Print summary
     println!();
-    print_summary(&total_result, file_count, cli.dry_run);
+    print_summary(&total_result, file_count, cli.dry_run, filter);
 
     Ok(())
 }
 
-fn print_file_result(path: &str, result: &UpdateResult, dry_run: bool) {
+/// Filter configuration for update types
+#[derive(Clone, Copy)]
+struct UpdateFilter {
+    major: bool,
+    minor: bool,
+    patch: bool,
+}
+
+impl UpdateFilter {
+    fn new(major: bool, minor: bool, patch: bool) -> Self {
+        // If no filter specified, show all
+        if !major && !minor && !patch {
+            Self {
+                major: true,
+                minor: true,
+                patch: true,
+            }
+        } else {
+            Self {
+                major,
+                minor,
+                patch,
+            }
+        }
+    }
+
+    fn matches(&self, update_type: UpdateType) -> bool {
+        match update_type {
+            UpdateType::Major => self.major,
+            UpdateType::Minor => self.minor,
+            UpdateType::Patch => self.patch,
+        }
+    }
+}
+
+fn print_file_result(path: &str, result: &UpdateResult, dry_run: bool, filter: UpdateFilter) {
     if result.updated.is_empty() && result.errors.is_empty() {
         return;
     }
@@ -160,13 +203,20 @@ fn print_file_result(path: &str, result: &UpdateResult, dry_run: bool) {
     let action = if dry_run { "Would update" } else { "Updated" };
 
     for (package, old, new, line_num) in &result.updated {
+        let update_type = classify_update(old, new);
+
+        // Skip if filtered out
+        if !filter.matches(update_type) {
+            continue;
+        }
+
         // Format location as "file:line:" (blue + underline for clickability)
         let location = match line_num {
             Some(n) => format!("{}:{}:", path, n),
             None => format!("{}:", path),
         };
 
-        let type_indicator = match classify_update(old, new) {
+        let type_indicator = match update_type {
             UpdateType::Major => " (MAJOR)".yellow().bold().to_string(),
             UpdateType::Minor => String::new(),
             UpdateType::Patch => String::new(),
@@ -194,24 +244,27 @@ fn print_file_result(path: &str, result: &UpdateResult, dry_run: bool) {
     }
 }
 
-fn print_summary(result: &UpdateResult, file_count: usize, dry_run: bool) {
+fn print_summary(result: &UpdateResult, file_count: usize, dry_run: bool, filter: UpdateFilter) {
     let action = if dry_run { "Would update" } else { "Updated" };
 
-    // Count by update type
-    let (major_count, minor_count, patch_count) =
-        result
-            .updated
-            .iter()
-            .fold(
-                (0, 0, 0),
-                |(major, minor, patch), (_, old, new, _)| match classify_update(old, new) {
-                    UpdateType::Major => (major + 1, minor, patch),
-                    UpdateType::Minor => (major, minor + 1, patch),
-                    UpdateType::Patch => (major, minor, patch + 1),
-                },
-            );
+    // Count by update type, respecting filter
+    let (major_count, minor_count, patch_count, filtered_total) = result.updated.iter().fold(
+        (0, 0, 0, 0),
+        |(major, minor, patch, total), (_, old, new, _)| {
+            let update_type = classify_update(old, new);
+            if filter.matches(update_type) {
+                match update_type {
+                    UpdateType::Major => (major + 1, minor, patch, total + 1),
+                    UpdateType::Minor => (major, minor + 1, patch, total + 1),
+                    UpdateType::Patch => (major, minor, patch + 1, total + 1),
+                }
+            } else {
+                (major, minor, patch, total)
+            }
+        },
+    );
 
-    if result.updated.is_empty() {
+    if filtered_total == 0 {
         println!(
             "{} Scanned {} file(s), all dependencies up to date",
             "✓".green(),
@@ -242,7 +295,7 @@ fn print_summary(result: &UpdateResult, file_count: usize, dry_run: bool) {
         println!(
             "{} {} package(s){} in {} file(s), {} up to date",
             action,
-            result.updated.len().to_string().green().bold(),
+            filtered_total.to_string().green().bold(),
             breakdown,
             file_count,
             result.unchanged

@@ -6,8 +6,10 @@ written in Rust.
 ## Features
 
 - **Multi-ecosystem**: Python, Node.js, Rust, and Go dependencies
+- **Fast**: Parallel registry requests for all dependencies
 - **Constraint-aware**: Respects version constraints like `>=2.0,<3`
 - **Smart caching**: 24-hour version cache for faster subsequent runs
+- **Update filters**: Filter by `--major`, `--minor`, or `--patch` updates
 - **Major warnings**: Highlights breaking changes with `(MAJOR)`
 - **Format-preserving**: Keeps formatting, comments, and structure
 - **Pre-release aware**: Updates pre-releases to newer pre-releases
@@ -59,6 +61,14 @@ upd --no-color
 
 # Disable caching (force fresh lookups)
 upd --no-cache
+
+# Filter by update type
+upd --major      # Show only major (breaking) updates
+upd --minor      # Show only minor updates
+upd --patch      # Show only patch updates
+
+# Combine filters
+upd --major --minor  # Show major and minor updates only
 ```
 
 ### Commands

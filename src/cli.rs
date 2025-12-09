@@ -35,6 +35,18 @@ pub struct Cli {
     /// Verbose output
     #[arg(short, long, global = true)]
     pub verbose: bool,
+
+    /// Only show/apply major updates
+    #[arg(long, global = true)]
+    pub major: bool,
+
+    /// Only show/apply minor updates
+    #[arg(long, global = true)]
+    pub minor: bool,
+
+    /// Only show/apply patch updates
+    #[arg(long, global = true)]
+    pub patch: bool,
 }
 
 #[derive(Subcommand)]

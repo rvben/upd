@@ -1,6 +1,7 @@
 use super::{FileType, UpdateResult, Updater};
 use crate::registry::Registry;
 use anyhow::Result;
+use futures::future::join_all;
 use regex::Regex;
 use serde_json::Value;
 use std::fs;
@@ -81,7 +82,9 @@ impl Updater for PackageJsonUpdater {
         let mut result = UpdateResult::default();
         let mut new_content = content.clone();
 
-        // Process dependencies and devDependencies
+        // First pass: collect all packages to check
+        let mut packages_to_check: Vec<(String, String, String, String)> = Vec::new();
+
         for section in [
             "dependencies",
             "devDependencies",
@@ -109,33 +112,53 @@ impl Updater for PackageJsonUpdater {
                             continue;
                         }
 
-                        match registry.get_latest_version(package).await {
-                            Ok(latest_version) => {
-                                if latest_version != current_version {
-                                    let line_num = self.find_package_line(&content, package);
-                                    result.updated.push((
-                                        package.clone(),
-                                        current_version.clone(),
-                                        latest_version.clone(),
-                                        line_num,
-                                    ));
-
-                                    // Update in content preserving formatting
-                                    new_content = self.update_version_in_content(
-                                        &new_content,
-                                        package,
-                                        version_str,
-                                        &format!("{}{}", prefix, latest_version),
-                                    );
-                                } else {
-                                    result.unchanged += 1;
-                                }
-                            }
-                            Err(e) => {
-                                result.errors.push(format!("{}: {}", package, e));
-                            }
-                        }
+                        packages_to_check.push((
+                            package.clone(),
+                            version_str.to_string(),
+                            prefix,
+                            current_version,
+                        ));
                     }
+                }
+            }
+        }
+
+        // Fetch all versions in parallel
+        let version_futures: Vec<_> = packages_to_check
+            .iter()
+            .map(|(package, _, _, _)| registry.get_latest_version(package))
+            .collect();
+
+        let version_results = join_all(version_futures).await;
+
+        // Process results
+        for ((package, version_str, prefix, current_version), version_result) in
+            packages_to_check.into_iter().zip(version_results)
+        {
+            match version_result {
+                Ok(latest_version) => {
+                    if latest_version != current_version {
+                        let line_num = self.find_package_line(&content, &package);
+                        result.updated.push((
+                            package.clone(),
+                            current_version.clone(),
+                            latest_version.clone(),
+                            line_num,
+                        ));
+
+                        // Update in content preserving formatting
+                        new_content = self.update_version_in_content(
+                            &new_content,
+                            &package,
+                            &version_str,
+                            &format!("{}{}", prefix, latest_version),
+                        );
+                    } else {
+                        result.unchanged += 1;
+                    }
+                }
+                Err(e) => {
+                    result.errors.push(format!("{}: {}", package, e));
                 }
             }
         }

@@ -2,6 +2,7 @@ use super::{FileType, UpdateResult, Updater};
 use crate::registry::Registry;
 use crate::version::is_stable_pep440;
 use anyhow::{Result, anyhow};
+use futures::future::join_all;
 use regex::Regex;
 use std::fs;
 use std::path::Path;
@@ -111,49 +112,59 @@ impl PyProjectUpdater {
         result: &mut UpdateResult,
         original_content: &str,
     ) {
-        // Collect all updates first, then apply them
-        let mut updates: Vec<(usize, String)> = Vec::new();
+        // First pass: collect all dependencies that need version checks
+        let mut deps_to_check: Vec<(usize, String, String, String, String)> = Vec::new();
 
         for i in 0..array.len() {
             if let Some(item) = array.get(i)
                 && let Some(s) = item.as_str()
                 && let Some((package, current_version, full_constraint)) = self.parse_dependency(s)
             {
-                // Determine which lookup method to use based on constraint complexity
-                let version_result = if !is_stable_pep440(&current_version) {
-                    // Pre-release: include pre-releases in lookup
-                    registry
-                        .get_latest_version_including_prereleases(&package)
-                        .await
-                } else if Self::is_simple_constraint(&full_constraint) {
-                    // Simple constraint: just get latest stable
-                    registry.get_latest_version(&package).await
-                } else {
-                    // Complex constraint with upper bounds: use constraint-aware lookup
-                    registry
-                        .get_latest_version_matching(&package, &full_constraint)
-                        .await
-                };
+                deps_to_check.push((i, s.to_string(), package, current_version, full_constraint));
+            }
+        }
 
-                match version_result {
-                    Ok(latest_version) => {
-                        if latest_version != current_version {
-                            let updated = self.update_dependency(s, &latest_version);
-                            let line_num = Self::find_dependency_line(original_content, &package);
-                            result.updated.push((
-                                package,
-                                current_version,
-                                latest_version,
-                                line_num,
-                            ));
-                            updates.push((i, updated));
-                        } else {
-                            result.unchanged += 1;
-                        }
+        // Fetch all versions in parallel
+        let version_futures: Vec<_> = deps_to_check
+            .iter()
+            .map(|(_, _, package, current_version, full_constraint)| async {
+                if !is_stable_pep440(current_version) {
+                    registry
+                        .get_latest_version_including_prereleases(package)
+                        .await
+                } else if Self::is_simple_constraint(full_constraint) {
+                    registry.get_latest_version(package).await
+                } else {
+                    registry
+                        .get_latest_version_matching(package, full_constraint)
+                        .await
+                }
+            })
+            .collect();
+
+        let version_results = join_all(version_futures).await;
+
+        // Process results and collect updates
+        let mut updates: Vec<(usize, String)> = Vec::new();
+
+        for ((i, dep_str, package, current_version, _), version_result) in
+            deps_to_check.into_iter().zip(version_results)
+        {
+            match version_result {
+                Ok(latest_version) => {
+                    if latest_version != current_version {
+                        let updated = self.update_dependency(&dep_str, &latest_version);
+                        let line_num = Self::find_dependency_line(original_content, &package);
+                        result
+                            .updated
+                            .push((package, current_version, latest_version, line_num));
+                        updates.push((i, updated));
+                    } else {
+                        result.unchanged += 1;
                     }
-                    Err(e) => {
-                        result.errors.push(format!("{}: {}", package, e));
-                    }
+                }
+                Err(e) => {
+                    result.errors.push(format!("{}: {}", package, e));
                 }
             }
         }
@@ -181,59 +192,69 @@ impl PyProjectUpdater {
         result: &mut UpdateResult,
         original_content: &str,
     ) {
-        // Collect keys first to avoid borrow issues
-        let keys: Vec<String> = deps_table.iter().map(|(k, _)| k.to_string()).collect();
+        // First pass: collect dependencies to check
+        let mut deps_to_check: Vec<(String, String, String)> = Vec::new();
 
-        for key in keys {
+        for (key, item) in deps_table.iter() {
             if key == "python" {
-                continue; // Skip python version constraint
+                continue;
             }
 
-            if let Some(Item::Value(Value::String(s))) = deps_table.get(&key) {
+            if let Item::Value(Value::String(s)) = item {
                 let version_str = s.value().to_string();
-
-                // Poetry uses ^ and ~ prefixes
                 let (prefix, version) =
                     if version_str.starts_with('^') || version_str.starts_with('~') {
-                        (&version_str[..1], version_str[1..].to_string())
+                        (version_str[..1].to_string(), version_str[1..].to_string())
                     } else {
-                        ("", version_str.clone())
+                        (String::new(), version_str.clone())
                     };
 
-                // If current version is a pre-release, include pre-releases in lookup
-                let version_result = if is_stable_pep440(&version) {
-                    registry.get_latest_version(&key).await
+                deps_to_check.push((key.to_string(), prefix, version));
+            }
+        }
+
+        // Fetch all versions in parallel
+        let version_futures: Vec<_> = deps_to_check
+            .iter()
+            .map(|(key, _, version)| async {
+                if is_stable_pep440(version) {
+                    registry.get_latest_version(key).await
                 } else {
-                    registry
-                        .get_latest_version_including_prereleases(&key)
-                        .await
-                };
+                    registry.get_latest_version_including_prereleases(key).await
+                }
+            })
+            .collect();
 
-                match version_result {
-                    Ok(latest_version) => {
-                        if latest_version != version {
-                            let new_val = format!("{}{}", prefix, latest_version);
-                            let line_num = Self::find_dependency_line(original_content, &key);
-                            result
-                                .updated
-                                .push((key.clone(), version, latest_version, line_num));
+        let version_results = join_all(version_futures).await;
 
-                            // Preserve decoration when updating
-                            if let Some(Item::Value(Value::String(formatted))) =
-                                deps_table.get_mut(&key)
-                            {
-                                let decor = formatted.decor().clone();
-                                let mut new_formatted = Formatted::new(new_val);
-                                *new_formatted.decor_mut() = decor;
-                                *formatted = new_formatted;
-                            }
-                        } else {
-                            result.unchanged += 1;
+        // Process results
+        for ((key, prefix, version), version_result) in
+            deps_to_check.into_iter().zip(version_results)
+        {
+            match version_result {
+                Ok(latest_version) => {
+                    if latest_version != version {
+                        let new_val = format!("{}{}", prefix, latest_version);
+                        let line_num = Self::find_dependency_line(original_content, &key);
+                        result
+                            .updated
+                            .push((key.clone(), version, latest_version, line_num));
+
+                        // Preserve decoration when updating
+                        if let Some(Item::Value(Value::String(formatted))) =
+                            deps_table.get_mut(&key)
+                        {
+                            let decor = formatted.decor().clone();
+                            let mut new_formatted = Formatted::new(new_val);
+                            *new_formatted.decor_mut() = decor;
+                            *formatted = new_formatted;
                         }
+                    } else {
+                        result.unchanged += 1;
                     }
-                    Err(e) => {
-                        result.errors.push(format!("{}: {}", key, e));
-                    }
+                }
+                Err(e) => {
+                    result.errors.push(format!("{}: {}", key, e));
                 }
             }
         }

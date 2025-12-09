@@ -1,8 +1,9 @@
 use super::{FileType, UpdateResult, Updater};
 use crate::registry::Registry;
 use anyhow::Result;
+use futures::future::join_all;
 use regex::Regex;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::Path;
 
@@ -131,9 +132,90 @@ impl Updater for GoModUpdater {
         // Find modules with replace directives (we'll skip these)
         let replaced_modules = self.find_replaced_modules(&content);
 
-        // Process the file line by line
-        let mut new_lines: Vec<String> = Vec::new();
+        // First pass: collect all modules that need version checks
+        // Store: (line_idx, module, current_version, is_prerelease)
+        let mut modules_to_check: Vec<(usize, String, String, bool)> = Vec::new();
         let mut in_require_block = false;
+
+        for (line_idx, line) in content.lines().enumerate() {
+            let trimmed = line.trim();
+
+            // Track require block state
+            if trimmed.starts_with("require (") || trimmed == "require (" {
+                in_require_block = true;
+                continue;
+            }
+
+            if in_require_block && trimmed == ")" {
+                in_require_block = false;
+                continue;
+            }
+
+            // Check if this line is a require statement (inside block or single-line)
+            let is_require_line = in_require_block
+                || (trimmed.starts_with("require ") && !trimmed.starts_with("require ("));
+
+            if !is_require_line {
+                continue;
+            }
+
+            // Try to parse as a module requirement
+            let line_to_parse = if in_require_block {
+                line
+            } else {
+                // Single-line require: "require github.com/foo/bar v1.0.0"
+                &line[line.find("require").map(|i| i + 7).unwrap_or(0)..]
+            };
+
+            if let Some(caps) = self.require_re.captures(line_to_parse) {
+                let module = caps.get(1).unwrap().as_str();
+                let current_version = caps.get(2).unwrap().as_str();
+
+                // Skip replaced modules and pseudo-versions
+                if replaced_modules.contains(module) || Self::is_pseudo_version(current_version) {
+                    continue;
+                }
+
+                modules_to_check.push((
+                    line_idx,
+                    module.to_string(),
+                    current_version.to_string(),
+                    Self::is_prerelease(current_version),
+                ));
+            }
+        }
+
+        // Fetch all versions in parallel
+        let version_futures: Vec<_> = modules_to_check
+            .iter()
+            .map(|(_, module, _, is_prerelease)| async {
+                if *is_prerelease {
+                    registry
+                        .get_latest_version_including_prereleases(module)
+                        .await
+                } else {
+                    registry.get_latest_version(module).await
+                }
+            })
+            .collect();
+
+        let version_results = join_all(version_futures).await;
+
+        // Build a map of line_idx to version result
+        let mut version_map: HashMap<usize, Result<String, anyhow::Error>> = HashMap::new();
+        for ((line_idx, _, _, _), version_result) in modules_to_check.iter().zip(version_results) {
+            version_map.insert(*line_idx, version_result);
+        }
+
+        // Create a map from line_idx to (module, current_version) for easy lookup
+        let module_info: HashMap<usize, (String, String)> = modules_to_check
+            .into_iter()
+            .map(|(idx, module, version, _)| (idx, (module, version)))
+            .collect();
+
+        // Second pass: apply updates while preserving line structure
+        let mut new_lines: Vec<String> = Vec::new();
+        in_require_block = false;
 
         for (line_idx, line) in content.lines().enumerate() {
             let line_num = line_idx + 1; // 1-indexed for display
@@ -152,59 +234,19 @@ impl Updater for GoModUpdater {
                 continue;
             }
 
-            // Check if this line is a require statement (inside block or single-line)
-            let is_require_line = in_require_block
-                || (trimmed.starts_with("require ") && !trimmed.starts_with("require ("));
-
-            if !is_require_line {
-                new_lines.push(line.to_string());
-                continue;
-            }
-
-            // Try to parse as a module requirement
-            let line_to_parse = if in_require_block {
-                line
-            } else {
-                // Single-line require: "require github.com/foo/bar v1.0.0"
-                &line[line.find("require").map(|i| i + 7).unwrap_or(0)..]
-            };
-
-            if let Some(caps) = self.require_re.captures(line_to_parse) {
-                let module = caps.get(1).unwrap().as_str();
-                let current_version = caps.get(2).unwrap().as_str();
-
-                // Skip replaced modules
-                if replaced_modules.contains(module) {
-                    new_lines.push(line.to_string());
-                    result.unchanged += 1;
-                    continue;
-                }
-
-                // Skip pseudo-versions (commit-based, no semver tags available)
-                if Self::is_pseudo_version(current_version) {
-                    new_lines.push(line.to_string());
-                    result.unchanged += 1;
-                    continue;
-                }
-
-                // Fetch latest version
-                let version_result = if Self::is_prerelease(current_version) {
-                    registry
-                        .get_latest_version_including_prereleases(module)
-                        .await
-                } else {
-                    registry.get_latest_version(module).await
-                };
+            // Check if we have a version result for this line
+            if let Some(version_result) = version_map.remove(&line_idx) {
+                let (module, current_version) = module_info.get(&line_idx).unwrap();
 
                 match version_result {
                     Ok(latest_version) => {
-                        if latest_version != current_version {
+                        if latest_version != *current_version {
                             // Replace version in the line, preserving everything else
                             let new_line = line.replace(current_version, &latest_version);
                             new_lines.push(new_line);
                             result.updated.push((
-                                module.to_string(),
-                                current_version.to_string(),
+                                module.clone(),
+                                current_version.clone(),
                                 latest_version,
                                 Some(line_num),
                             ));
@@ -219,7 +261,30 @@ impl Updater for GoModUpdater {
                     }
                 }
             } else {
+                // Line doesn't need version update (not a module, replaced, or pseudo-version)
                 new_lines.push(line.to_string());
+
+                // Count skipped modules as unchanged
+                let is_require_line = in_require_block
+                    || (trimmed.starts_with("require ") && !trimmed.starts_with("require ("));
+
+                if is_require_line {
+                    let line_to_parse = if in_require_block {
+                        line
+                    } else {
+                        &line[line.find("require").map(|i| i + 7).unwrap_or(0)..]
+                    };
+
+                    if let Some(caps) = self.require_re.captures(line_to_parse) {
+                        let module = caps.get(1).unwrap().as_str();
+                        let current_version = caps.get(2).unwrap().as_str();
+                        if replaced_modules.contains(module)
+                            || Self::is_pseudo_version(current_version)
+                        {
+                            result.unchanged += 1;
+                        }
+                    }
+                }
             }
         }
 

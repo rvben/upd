@@ -57,6 +57,7 @@ thiserror = "2.0.17"
 regex = "1.12.2"
 colored = "3.0.0"
 async-trait = "0.1.89"
+futures = "0.3.31"
 
 [profile.release]
 lto = true

@@ -2,6 +2,7 @@ use super::{FileType, UpdateResult, Updater};
 use crate::registry::Registry;
 use crate::version::is_stable_semver;
 use anyhow::{Result, anyhow};
+use futures::future::join_all;
 use std::fs;
 use std::path::Path;
 use toml_edit::{DocumentMut, Formatted, Item, Table, Value};
@@ -99,14 +100,10 @@ impl CargoTomlUpdater {
         result: &mut UpdateResult,
         original_content: &str,
     ) {
-        // Collect keys to avoid borrow issues
-        let keys: Vec<String> = table.iter().map(|(k, _)| k.to_string()).collect();
+        // First pass: collect dependencies to check
+        let mut deps_to_check: Vec<(String, String, String)> = Vec::new();
 
-        for key in keys {
-            let Some(item) = table.get_mut(&key) else {
-                continue;
-            };
-
+        for (key, item) in table.iter() {
             // Skip path/git dependencies (they have no version to update from registry)
             if let Item::Value(Value::InlineTable(t)) = item
                 && (t.contains_key("path") || t.contains_key("git"))
@@ -124,21 +121,34 @@ impl CargoTomlUpdater {
             };
 
             let (prefix, current_version) = Self::parse_version_req(&version_req);
+            deps_to_check.push((key.to_string(), prefix, current_version));
+        }
 
-            // If current version is a pre-release, include pre-releases in lookup
-            let version_result = if is_stable_semver(&current_version) {
-                registry.get_latest_version(&key).await
-            } else {
-                registry
-                    .get_latest_version_including_prereleases(&key)
-                    .await
-            };
+        // Fetch all versions in parallel
+        let version_futures: Vec<_> = deps_to_check
+            .iter()
+            .map(|(key, _, current_version)| async {
+                if is_stable_semver(current_version) {
+                    registry.get_latest_version(key).await
+                } else {
+                    registry.get_latest_version_including_prereleases(key).await
+                }
+            })
+            .collect();
 
+        let version_results = join_all(version_futures).await;
+
+        // Process results
+        for ((key, prefix, current_version), version_result) in
+            deps_to_check.into_iter().zip(version_results)
+        {
             match version_result {
                 Ok(latest_version) => {
                     if latest_version != current_version {
                         let new_version_req = format!("{}{}", prefix, latest_version);
-                        Self::set_version(item, &new_version_req);
+                        if let Some(item) = table.get_mut(&key) {
+                            Self::set_version(item, &new_version_req);
+                        }
                         let line_num = Self::find_dependency_line(original_content, &key);
                         result.updated.push((
                             key.clone(),

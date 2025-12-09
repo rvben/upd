@@ -1,6 +1,7 @@
 use super::{FileType, UpdateResult, Updater};
 use crate::registry::Registry;
 use anyhow::Result;
+use futures::future::join_all;
 use regex::Regex;
 use std::fs;
 use std::path::Path;
@@ -145,41 +146,72 @@ impl Updater for RequirementsUpdater {
     ) -> Result<UpdateResult> {
         let content = fs::read_to_string(path)?;
         let mut result = UpdateResult::default();
-        let mut new_lines = Vec::new();
-        let mut modified = false;
 
-        for (line_idx, line) in content.lines().enumerate() {
-            let line_num = line_idx + 1; // 1-indexed for display
+        // First pass: collect all packages that need version checks
+        let lines: Vec<&str> = content.lines().collect();
+        let mut parsed_deps: Vec<(usize, &str, ParsedDep)> = Vec::new();
+
+        for (line_idx, line) in lines.iter().enumerate() {
             if let Some(parsed) = self.parse_line(line) {
-                // Use constraint-aware lookup if there are upper bounds, otherwise use simple lookup
-                let version_result = if Self::is_simple_constraint(&parsed.full_constraint) {
+                parsed_deps.push((line_idx, line, parsed));
+            }
+        }
+
+        // Fetch all versions in parallel
+        let version_futures: Vec<_> = parsed_deps
+            .iter()
+            .map(|(_, _, parsed)| async {
+                if Self::is_simple_constraint(&parsed.full_constraint) {
                     registry.get_latest_version(&parsed.package).await
                 } else {
                     registry
                         .get_latest_version_matching(&parsed.package, &parsed.full_constraint)
                         .await
-                };
+                }
+            })
+            .collect();
 
-                match version_result {
-                    Ok(latest_version) => {
-                        if latest_version != parsed.first_version {
-                            result.updated.push((
-                                parsed.package.clone(),
-                                parsed.first_version.clone(),
-                                latest_version.clone(),
-                                Some(line_num),
-                            ));
-                            new_lines.push(self.update_line(line, &latest_version));
-                            modified = true;
-                        } else {
-                            result.unchanged += 1;
+        let version_results = join_all(version_futures).await;
+
+        // Build a map of line index to version result
+        let mut version_map: std::collections::HashMap<usize, Result<String, anyhow::Error>> =
+            std::collections::HashMap::new();
+        for ((line_idx, _, _), version_result) in parsed_deps.iter().zip(version_results) {
+            version_map.insert(*line_idx, version_result);
+        }
+
+        // Second pass: apply updates
+        let mut new_lines = Vec::new();
+        let mut modified = false;
+
+        for (line_idx, line) in lines.iter().enumerate() {
+            let line_num = line_idx + 1; // 1-indexed for display
+
+            if let Some(parsed) = self.parse_line(line) {
+                if let Some(version_result) = version_map.remove(&line_idx) {
+                    match version_result {
+                        Ok(latest_version) => {
+                            if latest_version != parsed.first_version {
+                                result.updated.push((
+                                    parsed.package.clone(),
+                                    parsed.first_version.clone(),
+                                    latest_version.clone(),
+                                    Some(line_num),
+                                ));
+                                new_lines.push(self.update_line(line, &latest_version));
+                                modified = true;
+                            } else {
+                                result.unchanged += 1;
+                                new_lines.push(line.to_string());
+                            }
+                        }
+                        Err(e) => {
+                            result.errors.push(format!("{}: {}", parsed.package, e));
                             new_lines.push(line.to_string());
                         }
                     }
-                    Err(e) => {
-                        result.errors.push(format!("{}: {}", parsed.package, e));
-                        new_lines.push(line.to_string());
-                    }
+                } else {
+                    new_lines.push(line.to_string());
                 }
             } else {
                 new_lines.push(line.to_string());
