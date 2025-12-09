@@ -135,7 +135,8 @@ impl Updater for GoModUpdater {
         let mut new_lines: Vec<String> = Vec::new();
         let mut in_require_block = false;
 
-        for line in content.lines() {
+        for (line_idx, line) in content.lines().enumerate() {
+            let line_num = line_idx + 1; // 1-indexed for display
             let trimmed = line.trim();
 
             // Track require block state
@@ -205,6 +206,7 @@ impl Updater for GoModUpdater {
                                 module.to_string(),
                                 current_version.to_string(),
                                 latest_version,
+                                Some(line_num),
                             ));
                         } else {
                             new_lines.push(line.to_string());

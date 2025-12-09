@@ -148,7 +148,8 @@ impl Updater for RequirementsUpdater {
         let mut new_lines = Vec::new();
         let mut modified = false;
 
-        for line in content.lines() {
+        for (line_idx, line) in content.lines().enumerate() {
+            let line_num = line_idx + 1; // 1-indexed for display
             if let Some(parsed) = self.parse_line(line) {
                 // Use constraint-aware lookup if there are upper bounds, otherwise use simple lookup
                 let version_result = if Self::is_simple_constraint(&parsed.full_constraint) {
@@ -166,6 +167,7 @@ impl Updater for RequirementsUpdater {
                                 parsed.package.clone(),
                                 parsed.first_version.clone(),
                                 latest_version.clone(),
+                                Some(line_num),
                             ));
                             new_lines.push(self.update_line(line, &latest_version));
                             modified = true;

@@ -77,6 +77,16 @@ impl PyProjectUpdater {
         true
     }
 
+    /// Find the line number where a dependency string appears
+    fn find_dependency_line(content: &str, dep_substring: &str) -> Option<usize> {
+        for (line_idx, line) in content.lines().enumerate() {
+            if line.contains(dep_substring) {
+                return Some(line_idx + 1); // 1-indexed
+            }
+        }
+        None
+    }
+
     fn update_dependency(&self, dep: &str, new_version: &str) -> String {
         if let Some(caps) = self.version_re.captures(dep) {
             let full_match = caps.get(0).unwrap();
@@ -99,6 +109,7 @@ impl PyProjectUpdater {
         array: &mut toml_edit::Array,
         registry: &dyn Registry,
         result: &mut UpdateResult,
+        original_content: &str,
     ) {
         // Collect all updates first, then apply them
         let mut updates: Vec<(usize, String)> = Vec::new();
@@ -128,9 +139,13 @@ impl PyProjectUpdater {
                     Ok(latest_version) => {
                         if latest_version != current_version {
                             let updated = self.update_dependency(s, &latest_version);
-                            result
-                                .updated
-                                .push((package, current_version, latest_version));
+                            let line_num = Self::find_dependency_line(original_content, &package);
+                            result.updated.push((
+                                package,
+                                current_version,
+                                latest_version,
+                                line_num,
+                            ));
                             updates.push((i, updated));
                         } else {
                             result.unchanged += 1;
@@ -164,6 +179,7 @@ impl PyProjectUpdater {
         deps_table: &mut toml_edit::Table,
         registry: &dyn Registry,
         result: &mut UpdateResult,
+        original_content: &str,
     ) {
         // Collect keys first to avoid borrow issues
         let keys: Vec<String> = deps_table.iter().map(|(k, _)| k.to_string()).collect();
@@ -197,7 +213,10 @@ impl PyProjectUpdater {
                     Ok(latest_version) => {
                         if latest_version != version {
                             let new_val = format!("{}{}", prefix, latest_version);
-                            result.updated.push((key.clone(), version, latest_version));
+                            let line_num = Self::find_dependency_line(original_content, &key);
+                            result
+                                .updated
+                                .push((key.clone(), version, latest_version, line_num));
 
                             // Preserve decoration when updating
                             if let Some(Item::Value(Value::String(formatted))) =
@@ -245,7 +264,8 @@ impl Updater for PyProjectUpdater {
         // Update [project.dependencies]
         if let Some(Item::Table(project)) = doc.get_mut("project") {
             if let Some(Item::Value(Value::Array(deps))) = project.get_mut("dependencies") {
-                self.update_array_deps(deps, registry, &mut result).await;
+                self.update_array_deps(deps, registry, &mut result, &content)
+                    .await;
             }
 
             // Update [project.optional-dependencies.*]
@@ -254,7 +274,8 @@ impl Updater for PyProjectUpdater {
                 let keys: Vec<String> = opt_deps.iter().map(|(k, _)| k.to_string()).collect();
                 for key in keys {
                     if let Some(Item::Value(Value::Array(deps))) = opt_deps.get_mut(&key) {
-                        self.update_array_deps(deps, registry, &mut result).await;
+                        self.update_array_deps(deps, registry, &mut result, &content)
+                            .await;
                     }
                 }
             }
@@ -265,7 +286,8 @@ impl Updater for PyProjectUpdater {
             let keys: Vec<String> = groups.iter().map(|(k, _)| k.to_string()).collect();
             for key in keys {
                 if let Some(Item::Value(Value::Array(deps))) = groups.get_mut(&key) {
-                    self.update_array_deps(deps, registry, &mut result).await;
+                    self.update_array_deps(deps, registry, &mut result, &content)
+                        .await;
                 }
             }
         }
@@ -275,11 +297,13 @@ impl Updater for PyProjectUpdater {
             && let Some(Item::Table(poetry)) = tool.get_mut("poetry")
         {
             if let Some(Item::Table(deps)) = poetry.get_mut("dependencies") {
-                self.update_poetry_deps(deps, registry, &mut result).await;
+                self.update_poetry_deps(deps, registry, &mut result, &content)
+                    .await;
             }
 
             if let Some(Item::Table(deps)) = poetry.get_mut("dev-dependencies") {
-                self.update_poetry_deps(deps, registry, &mut result).await;
+                self.update_poetry_deps(deps, registry, &mut result, &content)
+                    .await;
             }
         }
 

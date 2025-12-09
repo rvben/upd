@@ -157,11 +157,15 @@ fn print_file_result(path: &str, result: &UpdateResult, dry_run: bool) {
         return;
     }
 
-    println!("{}", path.bold());
-
     let action = if dry_run { "Would update" } else { "Updated" };
 
-    for (package, old, new) in &result.updated {
+    for (package, old, new, line_num) in &result.updated {
+        // Format location as "file:line:" (blue + underline for clickability)
+        let location = match line_num {
+            Some(n) => format!("{}:{}:", path, n),
+            None => format!("{}:", path),
+        };
+
         let type_indicator = match classify_update(old, new) {
             UpdateType::Major => " (MAJOR)".yellow().bold().to_string(),
             UpdateType::Minor => String::new(),
@@ -169,7 +173,8 @@ fn print_file_result(path: &str, result: &UpdateResult, dry_run: bool) {
         };
 
         println!(
-            "  {} {} {} → {}{}",
+            "{} {} {} {} → {}{}",
+            location.blue().underline(),
             action.green(),
             package.bold(),
             old.dimmed(),
@@ -179,7 +184,13 @@ fn print_file_result(path: &str, result: &UpdateResult, dry_run: bool) {
     }
 
     for error in &result.errors {
-        println!("  {} {}", "Error:".red(), error);
+        let location = format!("{}:", path);
+        println!(
+            "{} {} {}",
+            location.blue().underline(),
+            "Error:".red(),
+            error
+        );
     }
 }
 
@@ -193,7 +204,7 @@ fn print_summary(result: &UpdateResult, file_count: usize, dry_run: bool) {
             .iter()
             .fold(
                 (0, 0, 0),
-                |(major, minor, patch), (_, old, new)| match classify_update(old, new) {
+                |(major, minor, patch), (_, old, new, _)| match classify_update(old, new) {
                     UpdateType::Major => (major + 1, minor, patch),
                     UpdateType::Minor => (major, minor + 1, patch),
                     UpdateType::Patch => (major, minor, patch + 1),

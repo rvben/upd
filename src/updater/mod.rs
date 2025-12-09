@@ -18,8 +18,8 @@ use std::path::{Path, PathBuf};
 /// Result of updating a single file
 #[derive(Debug, Default)]
 pub struct UpdateResult {
-    /// Packages that were updated: (name, old_version, new_version)
-    pub updated: Vec<(String, String, String)>,
+    /// Packages that were updated: (name, old_version, new_version, line_number)
+    pub updated: Vec<(String, String, String, Option<usize>)>,
     /// Number of packages that were already at latest version
     pub unchanged: usize,
     /// Errors encountered during update

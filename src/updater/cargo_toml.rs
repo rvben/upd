@@ -59,6 +59,22 @@ impl CargoTomlUpdater {
         }
     }
 
+    /// Find the line number where a dependency is defined
+    fn find_dependency_line(content: &str, dep_name: &str) -> Option<usize> {
+        for (line_idx, line) in content.lines().enumerate() {
+            // Look for lines that contain the dependency name as a key
+            // This handles: dep_name = "version", dep_name = { version = "..." }, [dependencies.dep_name]
+            if line.contains(dep_name)
+                && (line.trim().starts_with(dep_name)
+                    || line.contains(&format!(".{}", dep_name))
+                    || line.contains(&format!("[dependencies.{}]", dep_name)))
+            {
+                return Some(line_idx + 1); // 1-indexed
+            }
+        }
+        None
+    }
+
     /// Parse version requirement to extract the actual version number
     /// Handles: "1.0", "^1.0", "~1.0", ">=1.0", "=1.0", etc.
     fn parse_version_req(version_req: &str) -> (String, String) {
@@ -81,6 +97,7 @@ impl CargoTomlUpdater {
         table: &mut Table,
         registry: &dyn Registry,
         result: &mut UpdateResult,
+        original_content: &str,
     ) {
         // Collect keys to avoid borrow issues
         let keys: Vec<String> = table.iter().map(|(k, _)| k.to_string()).collect();
@@ -122,9 +139,13 @@ impl CargoTomlUpdater {
                     if latest_version != current_version {
                         let new_version_req = format!("{}{}", prefix, latest_version);
                         Self::set_version(item, &new_version_req);
-                        result
-                            .updated
-                            .push((key.clone(), current_version, latest_version));
+                        let line_num = Self::find_dependency_line(original_content, &key);
+                        result.updated.push((
+                            key.clone(),
+                            current_version,
+                            latest_version,
+                            line_num,
+                        ));
                     } else {
                         result.unchanged += 1;
                     }
@@ -143,13 +164,15 @@ impl CargoTomlUpdater {
         deps_item: &mut Item,
         registry: &dyn Registry,
         result: &mut UpdateResult,
+        original_content: &str,
     ) {
         let table = match deps_item {
             Item::Table(t) => t,
             _ => return,
         };
 
-        self.update_deps_table(table, registry, result).await;
+        self.update_deps_table(table, registry, result, original_content)
+            .await;
     }
 }
 
@@ -176,24 +199,27 @@ impl Updater for CargoTomlUpdater {
 
         // Update [dependencies]
         if let Some(Item::Table(deps)) = doc.get_mut("dependencies") {
-            self.update_deps_table(deps, registry, &mut result).await;
+            self.update_deps_table(deps, registry, &mut result, &content)
+                .await;
         }
 
         // Update [dev-dependencies]
         if let Some(Item::Table(deps)) = doc.get_mut("dev-dependencies") {
-            self.update_deps_table(deps, registry, &mut result).await;
+            self.update_deps_table(deps, registry, &mut result, &content)
+                .await;
         }
 
         // Update [build-dependencies]
         if let Some(Item::Table(deps)) = doc.get_mut("build-dependencies") {
-            self.update_deps_table(deps, registry, &mut result).await;
+            self.update_deps_table(deps, registry, &mut result, &content)
+                .await;
         }
 
         // Update [workspace.dependencies]
         if let Some(Item::Table(workspace)) = doc.get_mut("workspace")
             && let Some(deps) = workspace.get_mut("dependencies")
         {
-            self.update_workspace_deps(deps, registry, &mut result)
+            self.update_workspace_deps(deps, registry, &mut result, &content)
                 .await;
         }
 
@@ -205,13 +231,16 @@ impl Updater for CargoTomlUpdater {
                 if let Some(Item::Table(target_table)) = target.get_mut(&target_key) {
                     // Update dependencies for this target
                     if let Some(Item::Table(deps)) = target_table.get_mut("dependencies") {
-                        self.update_deps_table(deps, registry, &mut result).await;
+                        self.update_deps_table(deps, registry, &mut result, &content)
+                            .await;
                     }
                     if let Some(Item::Table(deps)) = target_table.get_mut("dev-dependencies") {
-                        self.update_deps_table(deps, registry, &mut result).await;
+                        self.update_deps_table(deps, registry, &mut result, &content)
+                            .await;
                     }
                     if let Some(Item::Table(deps)) = target_table.get_mut("build-dependencies") {
-                        self.update_deps_table(deps, registry, &mut result).await;
+                        self.update_deps_table(deps, registry, &mut result, &content)
+                            .await;
                     }
                 }
             }

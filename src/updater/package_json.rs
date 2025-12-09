@@ -27,6 +27,19 @@ impl PackageJsonUpdater {
         (String::new(), version_str.to_string())
     }
 
+    /// Find the line number where a package is defined
+    fn find_package_line(&self, content: &str, package: &str) -> Option<usize> {
+        let pattern = format!(r#""{}""#, regex::escape(package));
+        let re = Regex::new(&pattern).ok()?;
+
+        for (line_idx, line) in content.lines().enumerate() {
+            if re.is_match(line) {
+                return Some(line_idx + 1); // 1-indexed
+            }
+        }
+        None
+    }
+
     fn update_version_in_content(
         &self,
         content: &str,
@@ -99,10 +112,12 @@ impl Updater for PackageJsonUpdater {
                         match registry.get_latest_version(package).await {
                             Ok(latest_version) => {
                                 if latest_version != current_version {
+                                    let line_num = self.find_package_line(&content, package);
                                     result.updated.push((
                                         package.clone(),
                                         current_version.clone(),
                                         latest_version.clone(),
+                                        line_num,
                                     ));
 
                                     // Update in content preserving formatting
