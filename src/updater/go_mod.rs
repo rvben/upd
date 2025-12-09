@@ -325,6 +325,9 @@ impl Updater for GoModUpdater {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::registry::MockRegistry;
+    use std::io::Write;
+    use tempfile::NamedTempFile;
 
     #[test]
     fn test_require_regex() {
@@ -409,5 +412,248 @@ replace (
         assert!(!GoModUpdater::is_pseudo_version("v1.0.0-rc1"));
         assert!(!GoModUpdater::is_pseudo_version("v2.0.0+incompatible"));
         assert!(!GoModUpdater::is_pseudo_version("v1.0.0-beta"));
+    }
+
+    #[tokio::test]
+    async fn test_update_go_mod_file() {
+        let mut file = NamedTempFile::new().unwrap();
+        write!(
+            file,
+            r#"module example.com/mymodule
+
+go 1.21
+
+require (
+	github.com/foo/bar v1.0.0
+	github.com/baz/qux v2.0.0
+)
+"#
+        )
+        .unwrap();
+
+        let registry = MockRegistry::new("go-proxy")
+            .with_version("github.com/foo/bar", "v1.5.0")
+            .with_version("github.com/baz/qux", "v2.3.0");
+
+        let updater = GoModUpdater::new();
+        let options = UpdateOptions {
+            dry_run: false,
+            full_precision: false,
+        };
+
+        let result = updater
+            .update(file.path(), &registry, options)
+            .await
+            .unwrap();
+
+        assert_eq!(result.updated.len(), 2);
+        assert_eq!(result.unchanged, 0);
+
+        let content = fs::read_to_string(file.path()).unwrap();
+        assert!(content.contains("v1.5.0"));
+        assert!(content.contains("v2.3.0"));
+    }
+
+    #[tokio::test]
+    async fn test_update_go_mod_dry_run() {
+        let mut file = NamedTempFile::new().unwrap();
+        let original = r#"module example.com/mymodule
+
+require github.com/foo/bar v1.0.0
+"#;
+        write!(file, "{}", original).unwrap();
+
+        let registry = MockRegistry::new("go-proxy").with_version("github.com/foo/bar", "v1.5.0");
+
+        let updater = GoModUpdater::new();
+        let options = UpdateOptions {
+            dry_run: true,
+            full_precision: false,
+        };
+
+        let result = updater
+            .update(file.path(), &registry, options)
+            .await
+            .unwrap();
+
+        assert_eq!(result.updated.len(), 1);
+
+        // Verify file was NOT updated (dry run)
+        let content = fs::read_to_string(file.path()).unwrap();
+        assert_eq!(content, original);
+    }
+
+    #[tokio::test]
+    async fn test_update_go_mod_skips_replaced_modules() {
+        let mut file = NamedTempFile::new().unwrap();
+        write!(
+            file,
+            r#"module example.com/mymodule
+
+require (
+	github.com/foo/bar v1.0.0
+	github.com/baz/qux v2.0.0
+)
+
+replace github.com/foo/bar => ../local-bar
+"#
+        )
+        .unwrap();
+
+        let registry = MockRegistry::new("go-proxy")
+            .with_version("github.com/foo/bar", "v1.5.0")
+            .with_version("github.com/baz/qux", "v2.3.0");
+
+        let updater = GoModUpdater::new();
+        let options = UpdateOptions {
+            dry_run: false,
+            full_precision: false,
+        };
+
+        let result = updater
+            .update(file.path(), &registry, options)
+            .await
+            .unwrap();
+
+        // Only baz/qux should be updated (foo/bar has a replace directive)
+        assert_eq!(result.updated.len(), 1);
+        assert_eq!(result.updated[0].0, "github.com/baz/qux");
+        assert_eq!(result.unchanged, 1); // foo/bar is counted as unchanged
+    }
+
+    #[tokio::test]
+    async fn test_update_go_mod_skips_pseudo_versions() {
+        let mut file = NamedTempFile::new().unwrap();
+        write!(
+            file,
+            r#"module example.com/mymodule
+
+require (
+	github.com/foo/bar v0.0.0-20241217172646-ca3f786aa774
+	github.com/baz/qux v2.0.0
+)
+"#
+        )
+        .unwrap();
+
+        let registry = MockRegistry::new("go-proxy")
+            .with_version("github.com/foo/bar", "v1.5.0")
+            .with_version("github.com/baz/qux", "v2.3.0");
+
+        let updater = GoModUpdater::new();
+        let options = UpdateOptions {
+            dry_run: false,
+            full_precision: false,
+        };
+
+        let result = updater
+            .update(file.path(), &registry, options)
+            .await
+            .unwrap();
+
+        // Only baz/qux should be updated (foo/bar has a pseudo-version)
+        assert_eq!(result.updated.len(), 1);
+        assert_eq!(result.updated[0].0, "github.com/baz/qux");
+        assert_eq!(result.unchanged, 1); // foo/bar is counted as unchanged
+    }
+
+    #[tokio::test]
+    async fn test_update_go_mod_preserves_comments() {
+        let mut file = NamedTempFile::new().unwrap();
+        write!(
+            file,
+            r#"module example.com/mymodule
+
+require (
+	github.com/foo/bar v1.0.0 // indirect
+	github.com/baz/qux v2.0.0
+)
+"#
+        )
+        .unwrap();
+
+        let registry = MockRegistry::new("go-proxy")
+            .with_version("github.com/foo/bar", "v1.5.0")
+            .with_version("github.com/baz/qux", "v2.3.0");
+
+        let updater = GoModUpdater::new();
+        let options = UpdateOptions {
+            dry_run: false,
+            full_precision: false,
+        };
+
+        updater
+            .update(file.path(), &registry, options)
+            .await
+            .unwrap();
+
+        let content = fs::read_to_string(file.path()).unwrap();
+        // Comment should be preserved
+        assert!(content.contains("// indirect"));
+        assert!(content.contains("v1.5.0"));
+    }
+
+    #[tokio::test]
+    async fn test_update_go_mod_line_numbers() {
+        let mut file = NamedTempFile::new().unwrap();
+        write!(
+            file,
+            r#"module example.com/mymodule
+
+go 1.21
+
+require github.com/foo/bar v1.0.0
+"#
+        )
+        .unwrap();
+
+        let registry = MockRegistry::new("go-proxy").with_version("github.com/foo/bar", "v1.5.0");
+
+        let updater = GoModUpdater::new();
+        let options = UpdateOptions {
+            dry_run: true,
+            full_precision: false,
+        };
+
+        let result = updater
+            .update(file.path(), &registry, options)
+            .await
+            .unwrap();
+
+        assert_eq!(result.updated.len(), 1);
+        // Line number should be found (require is on line 5)
+        assert!(result.updated[0].3.is_some());
+        assert_eq!(result.updated[0].3, Some(5));
+    }
+
+    #[tokio::test]
+    async fn test_update_go_mod_registry_error() {
+        let mut file = NamedTempFile::new().unwrap();
+        write!(
+            file,
+            r#"module example.com/mymodule
+
+require github.com/nonexistent/module v1.0.0
+"#
+        )
+        .unwrap();
+
+        // Registry without the module
+        let registry = MockRegistry::new("go-proxy");
+
+        let updater = GoModUpdater::new();
+        let options = UpdateOptions {
+            dry_run: true,
+            full_precision: false,
+        };
+
+        let result = updater
+            .update(file.path(), &registry, options)
+            .await
+            .unwrap();
+
+        assert_eq!(result.updated.len(), 0);
+        assert_eq!(result.errors.len(), 1);
+        assert!(result.errors[0].contains("github.com/nonexistent/module"));
     }
 }
