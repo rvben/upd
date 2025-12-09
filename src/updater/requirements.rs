@@ -254,6 +254,9 @@ impl Updater for RequirementsUpdater {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::registry::MockRegistry;
+    use std::io::Write;
+    use tempfile::NamedTempFile;
 
     #[test]
     fn test_parse_line() {
@@ -330,5 +333,259 @@ mod tests {
             updater.update_line("uvicorn[standard]==0.20.0", "0.24.0"),
             "uvicorn[standard]==0.24.0"
         );
+    }
+
+    // Integration tests using MockRegistry and temp files
+
+    #[tokio::test]
+    async fn test_update_requirements_file() {
+        let mut file = NamedTempFile::new().unwrap();
+        writeln!(file, "requests==2.28.0").unwrap();
+        writeln!(file, "flask>=2.0.0").unwrap();
+        writeln!(file, "# A comment").unwrap();
+        writeln!(file, "django>=4.0").unwrap();
+
+        let registry = MockRegistry::new("PyPI")
+            .with_version("requests", "2.31.0")
+            .with_version("flask", "3.0.0")
+            .with_version("django", "5.0.0");
+
+        let updater = RequirementsUpdater::new();
+        let options = UpdateOptions {
+            dry_run: false,
+            full_precision: false,
+        };
+
+        let result = updater
+            .update(file.path(), &registry, options)
+            .await
+            .unwrap();
+
+        assert_eq!(result.updated.len(), 3);
+        assert_eq!(result.unchanged, 0);
+        assert!(result.errors.is_empty());
+
+        // Verify file contents
+        let contents = std::fs::read_to_string(file.path()).unwrap();
+        assert!(contents.contains("requests==2.31.0"));
+        assert!(contents.contains("flask>=3.0.0"));
+        assert!(contents.contains("django>=5.0"));
+        assert!(contents.contains("# A comment"));
+    }
+
+    #[tokio::test]
+    async fn test_update_requirements_dry_run() {
+        let mut file = NamedTempFile::new().unwrap();
+        writeln!(file, "requests==2.28.0").unwrap();
+
+        let registry = MockRegistry::new("PyPI").with_version("requests", "2.31.0");
+
+        let updater = RequirementsUpdater::new();
+        let options = UpdateOptions {
+            dry_run: true,
+            full_precision: false,
+        };
+
+        let result = updater
+            .update(file.path(), &registry, options)
+            .await
+            .unwrap();
+
+        assert_eq!(result.updated.len(), 1);
+
+        // File should NOT be modified in dry-run mode
+        let contents = std::fs::read_to_string(file.path()).unwrap();
+        assert!(contents.contains("requests==2.28.0"));
+        assert!(!contents.contains("2.31.0"));
+    }
+
+    #[tokio::test]
+    async fn test_update_requirements_full_precision() {
+        let mut file = NamedTempFile::new().unwrap();
+        writeln!(file, "flask>=2.0").unwrap();
+
+        let registry = MockRegistry::new("PyPI").with_version("flask", "3.1.5");
+
+        let updater = RequirementsUpdater::new();
+
+        // Without full precision - should preserve 2-component format
+        let options = UpdateOptions {
+            dry_run: false,
+            full_precision: false,
+        };
+        updater
+            .update(file.path(), &registry, options)
+            .await
+            .unwrap();
+        let contents = std::fs::read_to_string(file.path()).unwrap();
+        assert!(
+            contents.contains("flask>=3.1"),
+            "Should have 2-component version"
+        );
+        assert!(
+            !contents.contains("3.1.5"),
+            "Should not have full precision"
+        );
+
+        // Reset file
+        file.reopen().unwrap();
+        let mut file2 = std::fs::File::create(file.path()).unwrap();
+        writeln!(file2, "flask>=2.0").unwrap();
+        drop(file2);
+
+        // With full precision - should output full version
+        let options = UpdateOptions {
+            dry_run: false,
+            full_precision: true,
+        };
+        let result = updater
+            .update(file.path(), &registry, options)
+            .await
+            .unwrap();
+        assert_eq!(result.updated.len(), 1);
+        let contents = std::fs::read_to_string(file.path()).unwrap();
+        assert!(
+            contents.contains("flask>=3.1.5"),
+            "Should have full precision"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_update_requirements_preserves_comments() {
+        let mut file = NamedTempFile::new().unwrap();
+        writeln!(file, "# Python dependencies").unwrap();
+        writeln!(file, "requests==2.28.0  # HTTP library").unwrap();
+        writeln!(file, "").unwrap();
+        writeln!(file, "# Web framework").unwrap();
+        writeln!(file, "flask>=2.0.0").unwrap();
+
+        let registry = MockRegistry::new("PyPI")
+            .with_version("requests", "2.31.0")
+            .with_version("flask", "3.0.0");
+
+        let updater = RequirementsUpdater::new();
+        let options = UpdateOptions {
+            dry_run: false,
+            full_precision: false,
+        };
+
+        updater
+            .update(file.path(), &registry, options)
+            .await
+            .unwrap();
+
+        let contents = std::fs::read_to_string(file.path()).unwrap();
+        assert!(contents.contains("# Python dependencies"));
+        assert!(contents.contains("# HTTP library"));
+        assert!(contents.contains("# Web framework"));
+    }
+
+    #[tokio::test]
+    async fn test_update_requirements_unchanged_packages() {
+        let mut file = NamedTempFile::new().unwrap();
+        writeln!(file, "requests==2.31.0").unwrap();
+
+        // Registry returns same version - no update needed
+        let registry = MockRegistry::new("PyPI").with_version("requests", "2.31.0");
+
+        let updater = RequirementsUpdater::new();
+        let options = UpdateOptions {
+            dry_run: false,
+            full_precision: false,
+        };
+
+        let result = updater
+            .update(file.path(), &registry, options)
+            .await
+            .unwrap();
+
+        assert_eq!(result.updated.len(), 0);
+        assert_eq!(result.unchanged, 1);
+    }
+
+    #[tokio::test]
+    async fn test_update_requirements_with_extras() {
+        let mut file = NamedTempFile::new().unwrap();
+        writeln!(file, "uvicorn[standard]==0.20.0").unwrap();
+
+        let registry = MockRegistry::new("PyPI").with_version("uvicorn", "0.24.0");
+
+        let updater = RequirementsUpdater::new();
+        let options = UpdateOptions {
+            dry_run: false,
+            full_precision: false,
+        };
+
+        let result = updater
+            .update(file.path(), &registry, options)
+            .await
+            .unwrap();
+
+        assert_eq!(result.updated.len(), 1);
+
+        let contents = std::fs::read_to_string(file.path()).unwrap();
+        assert!(contents.contains("uvicorn[standard]==0.24.0"));
+    }
+
+    #[tokio::test]
+    async fn test_update_requirements_line_numbers() {
+        let mut file = NamedTempFile::new().unwrap();
+        writeln!(file, "# Header comment").unwrap();
+        writeln!(file, "requests==2.28.0").unwrap();
+        writeln!(file, "flask>=2.0.0").unwrap();
+
+        let registry = MockRegistry::new("PyPI")
+            .with_version("requests", "2.31.0")
+            .with_version("flask", "3.0.0");
+
+        let updater = RequirementsUpdater::new();
+        let options = UpdateOptions {
+            dry_run: false,
+            full_precision: false,
+        };
+
+        let result = updater
+            .update(file.path(), &registry, options)
+            .await
+            .unwrap();
+
+        // Verify line numbers are tracked (1-indexed)
+        let requests_update = result
+            .updated
+            .iter()
+            .find(|(name, _, _, _)| name == "requests")
+            .unwrap();
+        assert_eq!(requests_update.3, Some(2)); // Line 2
+
+        let flask_update = result
+            .updated
+            .iter()
+            .find(|(name, _, _, _)| name == "flask")
+            .unwrap();
+        assert_eq!(flask_update.3, Some(3)); // Line 3
+    }
+
+    #[tokio::test]
+    async fn test_update_requirements_registry_error() {
+        let mut file = NamedTempFile::new().unwrap();
+        writeln!(file, "nonexistent-package==1.0.0").unwrap();
+
+        // Registry doesn't have this package
+        let registry = MockRegistry::new("PyPI");
+
+        let updater = RequirementsUpdater::new();
+        let options = UpdateOptions {
+            dry_run: false,
+            full_precision: false,
+        };
+
+        let result = updater
+            .update(file.path(), &registry, options)
+            .await
+            .unwrap();
+
+        assert_eq!(result.updated.len(), 0);
+        assert_eq!(result.errors.len(), 1);
+        assert!(result.errors[0].contains("nonexistent-package"));
     }
 }

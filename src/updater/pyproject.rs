@@ -387,6 +387,9 @@ impl Updater for PyProjectUpdater {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::registry::MockRegistry;
+    use std::io::Write;
+    use tempfile::NamedTempFile;
 
     #[test]
     fn test_parse_dependency() {
@@ -444,5 +447,224 @@ mod tests {
             updater.update_dependency("uvicorn[standard]>=0.20.0", "0.24.0"),
             "uvicorn[standard]>=0.24.0"
         );
+    }
+
+    // Integration tests using MockRegistry and temp files
+
+    #[tokio::test]
+    async fn test_update_pyproject_pep621() {
+        let mut file = NamedTempFile::with_suffix(".toml").unwrap();
+        write!(
+            file,
+            r#"[project]
+name = "myproject"
+version = "1.0.0"
+dependencies = [
+    "requests>=2.28.0",
+    "flask>=2.0.0",
+]
+"#
+        )
+        .unwrap();
+
+        let registry = MockRegistry::new("PyPI")
+            .with_version("requests", "2.31.0")
+            .with_version("flask", "3.0.0");
+
+        let updater = PyProjectUpdater::new();
+        let options = UpdateOptions {
+            dry_run: false,
+            full_precision: false,
+        };
+
+        let result = updater
+            .update(file.path(), &registry, options)
+            .await
+            .unwrap();
+
+        assert_eq!(result.updated.len(), 2);
+        assert!(result.errors.is_empty());
+
+        let contents = std::fs::read_to_string(file.path()).unwrap();
+        assert!(contents.contains("requests>=2.31.0"));
+        assert!(contents.contains("flask>=3.0.0"));
+    }
+
+    #[tokio::test]
+    async fn test_update_pyproject_poetry() {
+        // Poetry uses table format: key = "version"
+        // The version can be ^2.28.0, >=2.0.0, 2.0.0, etc.
+        let mut file = NamedTempFile::with_suffix(".toml").unwrap();
+        write!(
+            file,
+            r#"[tool.poetry]
+name = "myproject"
+version = "1.0.0"
+
+[tool.poetry.dependencies]
+python = "^3.9"
+requests = "2.28.0"
+flask = "2.0.0"
+"#
+        )
+        .unwrap();
+
+        let registry = MockRegistry::new("PyPI")
+            .with_version("requests", "2.31.0")
+            .with_version("flask", "3.0.0");
+
+        let updater = PyProjectUpdater::new();
+        let options = UpdateOptions {
+            dry_run: false,
+            full_precision: false,
+        };
+
+        let result = updater
+            .update(file.path(), &registry, options)
+            .await
+            .unwrap();
+
+        // Poetry table-style dependencies with bare versions should be updated
+        assert_eq!(result.updated.len(), 2);
+
+        let contents = std::fs::read_to_string(file.path()).unwrap();
+        assert!(contents.contains("[tool.poetry.dependencies]"));
+        // Both should be updated to new versions
+        assert!(contents.contains("requests = \"2.31.0\""));
+        assert!(contents.contains("flask = \"3.0.0\""));
+    }
+
+    #[tokio::test]
+    async fn test_update_pyproject_dry_run() {
+        let mut file = NamedTempFile::with_suffix(".toml").unwrap();
+        write!(
+            file,
+            r#"[project]
+name = "myproject"
+dependencies = ["requests>=2.28.0"]
+"#
+        )
+        .unwrap();
+
+        let registry = MockRegistry::new("PyPI").with_version("requests", "2.31.0");
+
+        let updater = PyProjectUpdater::new();
+        let options = UpdateOptions {
+            dry_run: true,
+            full_precision: false,
+        };
+
+        let result = updater
+            .update(file.path(), &registry, options)
+            .await
+            .unwrap();
+
+        assert_eq!(result.updated.len(), 1);
+
+        // File should NOT be modified in dry-run mode
+        let contents = std::fs::read_to_string(file.path()).unwrap();
+        assert!(contents.contains("requests>=2.28.0"));
+        assert!(!contents.contains("2.31.0"));
+    }
+
+    #[tokio::test]
+    async fn test_update_pyproject_preserves_formatting() {
+        let mut file = NamedTempFile::with_suffix(".toml").unwrap();
+        write!(
+            file,
+            r#"[project]
+name = "myproject"  # Project name
+version = "1.0.0"
+
+# Main dependencies
+dependencies = [
+    "requests>=2.28.0",
+]
+"#
+        )
+        .unwrap();
+
+        let registry = MockRegistry::new("PyPI").with_version("requests", "2.31.0");
+
+        let updater = PyProjectUpdater::new();
+        let options = UpdateOptions {
+            dry_run: false,
+            full_precision: false,
+        };
+
+        updater
+            .update(file.path(), &registry, options)
+            .await
+            .unwrap();
+
+        let contents = std::fs::read_to_string(file.path()).unwrap();
+        // toml_edit should preserve comments
+        assert!(contents.contains("# Project name") || contents.contains("# Main dependencies"));
+    }
+
+    #[tokio::test]
+    async fn test_update_pyproject_optional_dependencies() {
+        let mut file = NamedTempFile::with_suffix(".toml").unwrap();
+        write!(
+            file,
+            r#"[project]
+name = "myproject"
+dependencies = ["requests>=2.28.0"]
+
+[project.optional-dependencies]
+dev = ["pytest>=7.0.0"]
+"#
+        )
+        .unwrap();
+
+        let registry = MockRegistry::new("PyPI")
+            .with_version("requests", "2.31.0")
+            .with_version("pytest", "8.0.0");
+
+        let updater = PyProjectUpdater::new();
+        let options = UpdateOptions {
+            dry_run: false,
+            full_precision: false,
+        };
+
+        let result = updater
+            .update(file.path(), &registry, options)
+            .await
+            .unwrap();
+
+        assert_eq!(result.updated.len(), 2);
+
+        let contents = std::fs::read_to_string(file.path()).unwrap();
+        assert!(contents.contains("requests>=2.31.0"));
+        assert!(contents.contains("pytest>=8.0.0"));
+    }
+
+    #[tokio::test]
+    async fn test_update_pyproject_unchanged_packages() {
+        let mut file = NamedTempFile::with_suffix(".toml").unwrap();
+        write!(
+            file,
+            r#"[project]
+name = "myproject"
+dependencies = ["requests>=2.31.0"]
+"#
+        )
+        .unwrap();
+
+        let registry = MockRegistry::new("PyPI").with_version("requests", "2.31.0");
+
+        let updater = PyProjectUpdater::new();
+        let options = UpdateOptions {
+            dry_run: false,
+            full_precision: false,
+        };
+
+        let result = updater
+            .update(file.path(), &registry, options)
+            .await
+            .unwrap();
+
+        assert_eq!(result.updated.len(), 0);
+        assert_eq!(result.unchanged, 1);
     }
 }

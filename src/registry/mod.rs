@@ -1,10 +1,14 @@
 mod crates_io;
 mod go_proxy;
+#[cfg(test)]
+pub mod mock;
 mod npm;
 mod pypi;
 
 pub use crates_io::CratesIoRegistry;
 pub use go_proxy::GoProxyRegistry;
+#[cfg(test)]
+pub use mock::MockRegistry;
 pub use npm::NpmRegistry;
 pub use pypi::PyPiRegistry;
 
