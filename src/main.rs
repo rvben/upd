@@ -372,3 +372,105 @@ async fn self_update() -> Result<()> {
 
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_parse_version() {
+        assert_eq!(parse_version("1.2.3"), Some((1, 2, 3)));
+        assert_eq!(parse_version("v1.2.3"), Some((1, 2, 3)));
+        assert_eq!(parse_version("1.2"), Some((1, 2, 0)));
+        assert_eq!(parse_version("1"), Some((1, 0, 0)));
+        assert_eq!(parse_version("10.20.30"), Some((10, 20, 30)));
+    }
+
+    #[test]
+    fn test_parse_version_invalid() {
+        assert_eq!(parse_version(""), None);
+        assert_eq!(parse_version("abc"), None);
+        assert_eq!(parse_version("a.b.c"), None);
+    }
+
+    #[test]
+    fn test_classify_update_major() {
+        assert_eq!(classify_update("1.0.0", "2.0.0"), UpdateType::Major);
+        assert_eq!(classify_update("1.5.3", "2.0.0"), UpdateType::Major);
+        assert_eq!(classify_update("0.9.0", "1.0.0"), UpdateType::Major);
+    }
+
+    #[test]
+    fn test_classify_update_minor() {
+        assert_eq!(classify_update("1.0.0", "1.1.0"), UpdateType::Minor);
+        assert_eq!(classify_update("1.5.3", "1.6.0"), UpdateType::Minor);
+        assert_eq!(classify_update("2.0.0", "2.5.0"), UpdateType::Minor);
+    }
+
+    #[test]
+    fn test_classify_update_patch() {
+        assert_eq!(classify_update("1.0.0", "1.0.1"), UpdateType::Patch);
+        assert_eq!(classify_update("1.5.3", "1.5.4"), UpdateType::Patch);
+        assert_eq!(classify_update("2.0.0", "2.0.10"), UpdateType::Patch);
+    }
+
+    #[test]
+    fn test_classify_update_invalid_versions() {
+        // Invalid versions default to Patch
+        assert_eq!(classify_update("abc", "1.0.0"), UpdateType::Patch);
+        assert_eq!(classify_update("1.0.0", "abc"), UpdateType::Patch);
+    }
+
+    #[test]
+    fn test_update_filter_defaults_to_all() {
+        let filter = UpdateFilter::new(false, false, false);
+        assert!(filter.major);
+        assert!(filter.minor);
+        assert!(filter.patch);
+    }
+
+    #[test]
+    fn test_update_filter_major_only() {
+        let filter = UpdateFilter::new(true, false, false);
+        assert!(filter.major);
+        assert!(!filter.minor);
+        assert!(!filter.patch);
+    }
+
+    #[test]
+    fn test_update_filter_minor_only() {
+        let filter = UpdateFilter::new(false, true, false);
+        assert!(!filter.major);
+        assert!(filter.minor);
+        assert!(!filter.patch);
+    }
+
+    #[test]
+    fn test_update_filter_patch_only() {
+        let filter = UpdateFilter::new(false, false, true);
+        assert!(!filter.major);
+        assert!(!filter.minor);
+        assert!(filter.patch);
+    }
+
+    #[test]
+    fn test_update_filter_combined() {
+        let filter = UpdateFilter::new(true, true, false);
+        assert!(filter.major);
+        assert!(filter.minor);
+        assert!(!filter.patch);
+    }
+
+    #[test]
+    fn test_update_filter_matches() {
+        let filter = UpdateFilter::new(true, false, false);
+        assert!(filter.matches(UpdateType::Major));
+        assert!(!filter.matches(UpdateType::Minor));
+        assert!(!filter.matches(UpdateType::Patch));
+
+        let filter = UpdateFilter::new(false, true, true);
+        assert!(!filter.matches(UpdateType::Major));
+        assert!(filter.matches(UpdateType::Minor));
+        assert!(filter.matches(UpdateType::Patch));
+    }
+}
