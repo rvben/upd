@@ -69,6 +69,9 @@ upd --patch      # Show only patch updates
 
 # Combine filters
 upd --major --minor  # Show major and minor updates only
+
+# Version precision
+upd --full-precision  # Output full versions (e.g., 3.1.5 instead of 3.1)
 ```
 
 ### Commands
@@ -117,6 +120,28 @@ Cargo.toml
   Would update tokio 1.28.0 → 1.35.0
 
 Would update 4 package(s) in 2 file(s), 15 up to date
+```
+
+## Version Precision
+
+By default, `upd` preserves version precision from the original file:
+
+```text
+# Original file has 2-component versions
+flask>=2.0        →  flask>=3.1        (not 3.1.5)
+django>=4         →  django>=6         (not 6.0.0)
+
+# Original file has 3-component versions
+requests>=2.0.0   →  requests>=2.32.5
+```
+
+Use `--full-precision` to always output full semver versions:
+
+```text
+upd --full-precision
+flask>=2.0        →  flask>=3.1.5
+django>=4         →  django>=6.0.0
+requests>=2.0.0   →  requests>=2.32.5
 ```
 
 ## Version Constraints
