@@ -1,4 +1,4 @@
-use super::{FileType, UpdateResult, Updater};
+use super::{FileType, UpdateOptions, UpdateResult, Updater};
 use crate::registry::Registry;
 use crate::version::{is_stable_semver, match_version_precision};
 use anyhow::{Result, anyhow};
@@ -99,6 +99,7 @@ impl CargoTomlUpdater {
         registry: &dyn Registry,
         result: &mut UpdateResult,
         original_content: &str,
+        full_precision: bool,
     ) {
         // First pass: collect dependencies to check
         let mut deps_to_check: Vec<(String, String, String)> = Vec::new();
@@ -144,9 +145,12 @@ impl CargoTomlUpdater {
         {
             match version_result {
                 Ok(latest_version) => {
-                    // Match the precision of the original version
-                    let matched_version =
-                        match_version_precision(&current_version, &latest_version);
+                    // Match the precision of the original version (unless full precision requested)
+                    let matched_version = if full_precision {
+                        latest_version.clone()
+                    } else {
+                        match_version_precision(&current_version, &latest_version)
+                    };
                     if matched_version != current_version {
                         let new_version_req = format!("{}{}", prefix, matched_version);
                         if let Some(item) = table.get_mut(&key) {
@@ -178,13 +182,14 @@ impl CargoTomlUpdater {
         registry: &dyn Registry,
         result: &mut UpdateResult,
         original_content: &str,
+        full_precision: bool,
     ) {
         let table = match deps_item {
             Item::Table(t) => t,
             _ => return,
         };
 
-        self.update_deps_table(table, registry, result, original_content)
+        self.update_deps_table(table, registry, result, original_content, full_precision)
             .await;
     }
 }
@@ -201,7 +206,7 @@ impl Updater for CargoTomlUpdater {
         &self,
         path: &Path,
         registry: &dyn Registry,
-        dry_run: bool,
+        options: UpdateOptions,
     ) -> Result<UpdateResult> {
         let content = fs::read_to_string(path)?;
         let mut doc: DocumentMut = content
@@ -212,28 +217,52 @@ impl Updater for CargoTomlUpdater {
 
         // Update [dependencies]
         if let Some(Item::Table(deps)) = doc.get_mut("dependencies") {
-            self.update_deps_table(deps, registry, &mut result, &content)
-                .await;
+            self.update_deps_table(
+                deps,
+                registry,
+                &mut result,
+                &content,
+                options.full_precision,
+            )
+            .await;
         }
 
         // Update [dev-dependencies]
         if let Some(Item::Table(deps)) = doc.get_mut("dev-dependencies") {
-            self.update_deps_table(deps, registry, &mut result, &content)
-                .await;
+            self.update_deps_table(
+                deps,
+                registry,
+                &mut result,
+                &content,
+                options.full_precision,
+            )
+            .await;
         }
 
         // Update [build-dependencies]
         if let Some(Item::Table(deps)) = doc.get_mut("build-dependencies") {
-            self.update_deps_table(deps, registry, &mut result, &content)
-                .await;
+            self.update_deps_table(
+                deps,
+                registry,
+                &mut result,
+                &content,
+                options.full_precision,
+            )
+            .await;
         }
 
         // Update [workspace.dependencies]
         if let Some(Item::Table(workspace)) = doc.get_mut("workspace")
             && let Some(deps) = workspace.get_mut("dependencies")
         {
-            self.update_workspace_deps(deps, registry, &mut result, &content)
-                .await;
+            self.update_workspace_deps(
+                deps,
+                registry,
+                &mut result,
+                &content,
+                options.full_precision,
+            )
+            .await;
         }
 
         // Update [target.'cfg(...)'.dependencies] sections
@@ -244,22 +273,40 @@ impl Updater for CargoTomlUpdater {
                 if let Some(Item::Table(target_table)) = target.get_mut(&target_key) {
                     // Update dependencies for this target
                     if let Some(Item::Table(deps)) = target_table.get_mut("dependencies") {
-                        self.update_deps_table(deps, registry, &mut result, &content)
-                            .await;
+                        self.update_deps_table(
+                            deps,
+                            registry,
+                            &mut result,
+                            &content,
+                            options.full_precision,
+                        )
+                        .await;
                     }
                     if let Some(Item::Table(deps)) = target_table.get_mut("dev-dependencies") {
-                        self.update_deps_table(deps, registry, &mut result, &content)
-                            .await;
+                        self.update_deps_table(
+                            deps,
+                            registry,
+                            &mut result,
+                            &content,
+                            options.full_precision,
+                        )
+                        .await;
                     }
                     if let Some(Item::Table(deps)) = target_table.get_mut("build-dependencies") {
-                        self.update_deps_table(deps, registry, &mut result, &content)
-                            .await;
+                        self.update_deps_table(
+                            deps,
+                            registry,
+                            &mut result,
+                            &content,
+                            options.full_precision,
+                        )
+                        .await;
                     }
                 }
             }
         }
 
-        if !result.updated.is_empty() && !dry_run {
+        if !result.updated.is_empty() && !options.dry_run {
             fs::write(path, doc.to_string())?;
         }
 

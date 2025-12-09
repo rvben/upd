@@ -1,4 +1,4 @@
-use super::{FileType, UpdateResult, Updater};
+use super::{FileType, UpdateOptions, UpdateResult, Updater};
 use crate::registry::Registry;
 use crate::version::match_version_precision;
 use anyhow::Result;
@@ -76,7 +76,7 @@ impl Updater for PackageJsonUpdater {
         &self,
         path: &Path,
         registry: &dyn Registry,
-        dry_run: bool,
+        options: UpdateOptions,
     ) -> Result<UpdateResult> {
         let content = fs::read_to_string(path)?;
         let json: Value = serde_json::from_str(&content)?;
@@ -138,9 +138,12 @@ impl Updater for PackageJsonUpdater {
         {
             match version_result {
                 Ok(latest_version) => {
-                    // Match the precision of the original version
-                    let matched_version =
-                        match_version_precision(&current_version, &latest_version);
+                    // Match the precision of the original version (unless full precision requested)
+                    let matched_version = if options.full_precision {
+                        latest_version.clone()
+                    } else {
+                        match_version_precision(&current_version, &latest_version)
+                    };
                     if matched_version != current_version {
                         let line_num = self.find_package_line(&content, &package);
                         result.updated.push((
@@ -167,7 +170,7 @@ impl Updater for PackageJsonUpdater {
             }
         }
 
-        if !result.updated.is_empty() && !dry_run {
+        if !result.updated.is_empty() && !options.dry_run {
             fs::write(path, new_content)?;
         }
 

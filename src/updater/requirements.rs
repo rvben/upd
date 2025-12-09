@@ -1,4 +1,4 @@
-use super::{FileType, UpdateResult, Updater};
+use super::{FileType, UpdateOptions, UpdateResult, Updater};
 use crate::registry::Registry;
 use crate::version::match_version_precision;
 use anyhow::Result;
@@ -143,7 +143,7 @@ impl Updater for RequirementsUpdater {
         &self,
         path: &Path,
         registry: &dyn Registry,
-        dry_run: bool,
+        options: UpdateOptions,
     ) -> Result<UpdateResult> {
         let content = fs::read_to_string(path)?;
         let mut result = UpdateResult::default();
@@ -192,9 +192,12 @@ impl Updater for RequirementsUpdater {
                 if let Some(version_result) = version_map.remove(&line_idx) {
                     match version_result {
                         Ok(latest_version) => {
-                            // Match the precision of the original version
-                            let matched_version =
-                                match_version_precision(&parsed.first_version, &latest_version);
+                            // Match the precision of the original version (unless full precision requested)
+                            let matched_version = if options.full_precision {
+                                latest_version.clone()
+                            } else {
+                                match_version_precision(&parsed.first_version, &latest_version)
+                            };
                             if matched_version != parsed.first_version {
                                 result.updated.push((
                                     parsed.package.clone(),
@@ -222,7 +225,7 @@ impl Updater for RequirementsUpdater {
             }
         }
 
-        if modified && !dry_run {
+        if modified && !options.dry_run {
             // Preserve original line ending style
             let line_ending = if content.contains("\r\n") {
                 "\r\n"

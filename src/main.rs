@@ -8,7 +8,7 @@ use upd::cli::{Cli, Command};
 use upd::registry::{CratesIoRegistry, GoProxyRegistry, NpmRegistry, PyPiRegistry};
 use upd::updater::{
     CargoTomlUpdater, FileType, GoModUpdater, PackageJsonUpdater, PyProjectUpdater,
-    RequirementsUpdater, UpdateResult, Updater, discover_files,
+    RequirementsUpdater, UpdateOptions, UpdateResult, Updater, discover_files,
 };
 
 /// Parse version components
@@ -110,6 +110,12 @@ async fn run_update(cli: &Cli) -> Result<()> {
     let cargo_toml_updater = CargoTomlUpdater::new();
     let go_mod_updater = GoModUpdater::new();
 
+    // Create update options
+    let update_options = UpdateOptions {
+        dry_run: cli.dry_run,
+        full_precision: cli.full_precision,
+    };
+
     let mut total_result = UpdateResult::default();
 
     for (path, file_type) in files {
@@ -118,15 +124,27 @@ async fn run_update(cli: &Cli) -> Result<()> {
         }
 
         let result = match file_type {
-            FileType::Requirements => requirements_updater.update(&path, &pypi, cli.dry_run).await,
-            FileType::PyProject => pyproject_updater.update(&path, &pypi, cli.dry_run).await,
-            FileType::PackageJson => package_json_updater.update(&path, &npm, cli.dry_run).await,
-            FileType::CargoToml => {
-                cargo_toml_updater
-                    .update(&path, &crates_io, cli.dry_run)
+            FileType::Requirements => {
+                requirements_updater
+                    .update(&path, &pypi, update_options)
                     .await
             }
-            FileType::GoMod => go_mod_updater.update(&path, &go_proxy, cli.dry_run).await,
+            FileType::PyProject => pyproject_updater.update(&path, &pypi, update_options).await,
+            FileType::PackageJson => {
+                package_json_updater
+                    .update(&path, &npm, update_options)
+                    .await
+            }
+            FileType::CargoToml => {
+                cargo_toml_updater
+                    .update(&path, &crates_io, update_options)
+                    .await
+            }
+            FileType::GoMod => {
+                go_mod_updater
+                    .update(&path, &go_proxy, update_options)
+                    .await
+            }
         };
 
         match result {

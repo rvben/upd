@@ -1,4 +1,4 @@
-use super::{FileType, UpdateResult, Updater};
+use super::{FileType, UpdateOptions, UpdateResult, Updater};
 use crate::registry::Registry;
 use crate::version::match_version_precision;
 use anyhow::Result;
@@ -125,7 +125,7 @@ impl Updater for GoModUpdater {
         &self,
         path: &Path,
         registry: &dyn Registry,
-        dry_run: bool,
+        options: UpdateOptions,
     ) -> Result<UpdateResult> {
         let content = fs::read_to_string(path)?;
         let mut result = UpdateResult::default();
@@ -241,9 +241,12 @@ impl Updater for GoModUpdater {
 
                 match version_result {
                     Ok(latest_version) => {
-                        // Match the precision of the original version
-                        let matched_version =
-                            match_version_precision(current_version, &latest_version);
+                        // Match the precision of the original version (unless full precision requested)
+                        let matched_version = if options.full_precision {
+                            latest_version.clone()
+                        } else {
+                            match_version_precision(current_version, &latest_version)
+                        };
                         if matched_version != *current_version {
                             // Replace version in the line, preserving everything else
                             let new_line = line.replace(current_version, &matched_version);
@@ -292,7 +295,7 @@ impl Updater for GoModUpdater {
             }
         }
 
-        if !result.updated.is_empty() && !dry_run {
+        if !result.updated.is_empty() && !options.dry_run {
             // Preserve original line ending
             let line_ending = if content.contains("\r\n") {
                 "\r\n"

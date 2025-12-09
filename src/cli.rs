@@ -47,6 +47,10 @@ pub struct Cli {
     /// Only show/apply patch updates
     #[arg(long, global = true)]
     pub patch: bool,
+
+    /// Use full version precision (e.g., 3.1.5 instead of 3.1)
+    #[arg(long, global = true)]
+    pub full_precision: bool,
 }
 
 #[derive(Subcommand)]

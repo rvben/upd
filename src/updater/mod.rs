@@ -15,6 +15,15 @@ use anyhow::Result;
 use ignore::WalkBuilder;
 use std::path::{Path, PathBuf};
 
+/// Options for updating dependencies
+#[derive(Debug, Clone, Copy, Default)]
+pub struct UpdateOptions {
+    /// Dry run - don't write changes
+    pub dry_run: bool,
+    /// Use full version precision instead of matching original
+    pub full_precision: bool,
+}
+
 /// Result of updating a single file
 #[derive(Debug, Default)]
 pub struct UpdateResult {
@@ -108,7 +117,7 @@ pub trait Updater: Send + Sync {
         &self,
         path: &Path,
         registry: &dyn Registry,
-        dry_run: bool,
+        options: UpdateOptions,
     ) -> Result<UpdateResult>;
 
     /// Check if this updater handles the given file type

@@ -1,4 +1,4 @@
-use super::{FileType, UpdateResult, Updater};
+use super::{FileType, UpdateOptions, UpdateResult, Updater};
 use crate::registry::Registry;
 use crate::version::{is_stable_pep440, match_version_precision};
 use anyhow::{Result, anyhow};
@@ -111,6 +111,7 @@ impl PyProjectUpdater {
         registry: &dyn Registry,
         result: &mut UpdateResult,
         original_content: &str,
+        full_precision: bool,
     ) {
         // First pass: collect all dependencies that need version checks
         let mut deps_to_check: Vec<(usize, String, String, String, String)> = Vec::new();
@@ -152,9 +153,12 @@ impl PyProjectUpdater {
         {
             match version_result {
                 Ok(latest_version) => {
-                    // Match the precision of the original version
-                    let matched_version =
-                        match_version_precision(&current_version, &latest_version);
+                    // Match the precision of the original version (unless full precision requested)
+                    let matched_version = if full_precision {
+                        latest_version.clone()
+                    } else {
+                        match_version_precision(&current_version, &latest_version)
+                    };
                     if matched_version != current_version {
                         let updated = self.update_dependency(&dep_str, &matched_version);
                         let line_num = Self::find_dependency_line(original_content, &package);
@@ -194,6 +198,7 @@ impl PyProjectUpdater {
         registry: &dyn Registry,
         result: &mut UpdateResult,
         original_content: &str,
+        full_precision: bool,
     ) {
         // First pass: collect dependencies to check
         let mut deps_to_check: Vec<(String, String, String)> = Vec::new();
@@ -236,8 +241,12 @@ impl PyProjectUpdater {
         {
             match version_result {
                 Ok(latest_version) => {
-                    // Match the precision of the original version
-                    let matched_version = match_version_precision(&version, &latest_version);
+                    // Match the precision of the original version (unless full precision requested)
+                    let matched_version = if full_precision {
+                        latest_version.clone()
+                    } else {
+                        match_version_precision(&version, &latest_version)
+                    };
                     if matched_version != version {
                         let new_val = format!("{}{}", prefix, matched_version);
                         let line_num = Self::find_dependency_line(original_content, &key);
@@ -278,7 +287,7 @@ impl Updater for PyProjectUpdater {
         &self,
         path: &Path,
         registry: &dyn Registry,
-        dry_run: bool,
+        options: UpdateOptions,
     ) -> Result<UpdateResult> {
         let content = fs::read_to_string(path)?;
         let mut doc: DocumentMut = content
@@ -290,8 +299,14 @@ impl Updater for PyProjectUpdater {
         // Update [project.dependencies]
         if let Some(Item::Table(project)) = doc.get_mut("project") {
             if let Some(Item::Value(Value::Array(deps))) = project.get_mut("dependencies") {
-                self.update_array_deps(deps, registry, &mut result, &content)
-                    .await;
+                self.update_array_deps(
+                    deps,
+                    registry,
+                    &mut result,
+                    &content,
+                    options.full_precision,
+                )
+                .await;
             }
 
             // Update [project.optional-dependencies.*]
@@ -300,8 +315,14 @@ impl Updater for PyProjectUpdater {
                 let keys: Vec<String> = opt_deps.iter().map(|(k, _)| k.to_string()).collect();
                 for key in keys {
                     if let Some(Item::Value(Value::Array(deps))) = opt_deps.get_mut(&key) {
-                        self.update_array_deps(deps, registry, &mut result, &content)
-                            .await;
+                        self.update_array_deps(
+                            deps,
+                            registry,
+                            &mut result,
+                            &content,
+                            options.full_precision,
+                        )
+                        .await;
                     }
                 }
             }
@@ -312,8 +333,14 @@ impl Updater for PyProjectUpdater {
             let keys: Vec<String> = groups.iter().map(|(k, _)| k.to_string()).collect();
             for key in keys {
                 if let Some(Item::Value(Value::Array(deps))) = groups.get_mut(&key) {
-                    self.update_array_deps(deps, registry, &mut result, &content)
-                        .await;
+                    self.update_array_deps(
+                        deps,
+                        registry,
+                        &mut result,
+                        &content,
+                        options.full_precision,
+                    )
+                    .await;
                 }
             }
         }
@@ -323,17 +350,29 @@ impl Updater for PyProjectUpdater {
             && let Some(Item::Table(poetry)) = tool.get_mut("poetry")
         {
             if let Some(Item::Table(deps)) = poetry.get_mut("dependencies") {
-                self.update_poetry_deps(deps, registry, &mut result, &content)
-                    .await;
+                self.update_poetry_deps(
+                    deps,
+                    registry,
+                    &mut result,
+                    &content,
+                    options.full_precision,
+                )
+                .await;
             }
 
             if let Some(Item::Table(deps)) = poetry.get_mut("dev-dependencies") {
-                self.update_poetry_deps(deps, registry, &mut result, &content)
-                    .await;
+                self.update_poetry_deps(
+                    deps,
+                    registry,
+                    &mut result,
+                    &content,
+                    options.full_precision,
+                )
+                .await;
             }
         }
 
-        if !result.updated.is_empty() && !dry_run {
+        if !result.updated.is_empty() && !options.dry_run {
             fs::write(path, doc.to_string())?;
         }
 
