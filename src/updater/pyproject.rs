@@ -11,6 +11,9 @@ pub struct PyProjectUpdater {
     // Regex to extract version from dependency string
     // Matches: package==1.0.0, package>=1.0.0, package[extra]>=1.0.0, etc.
     version_re: Regex,
+    // Regex to capture the full constraint including additional constraints after commas
+    // E.g., ">=2.8.0,<9" or ">=1.0.0,!=1.5.0,<2.0.0"
+    constraint_re: Regex,
 }
 
 impl PyProjectUpdater {
@@ -20,15 +23,58 @@ impl PyProjectUpdater {
         )
         .expect("Invalid regex");
 
-        Self { version_re }
+        // Match the full constraint including additional constraints after commas
+        // E.g., ">=2.8.0,<9" or ">=1.0.0,!=1.5.0,<2.0.0"
+        let constraint_re = Regex::new(
+            r"^([a-zA-Z0-9][-a-zA-Z0-9._]*)(\[[^\]]+\])?\s*((?:==|>=|<=|~=|!=|>|<)[^\s;]+(?:\s*,\s*(?:==|>=|<=|~=|!=|>|<)[^\s;,]+)*)",
+        )
+        .expect("Invalid regex");
+
+        Self {
+            version_re,
+            constraint_re,
+        }
     }
 
-    fn parse_dependency(&self, dep: &str) -> Option<(String, String)> {
+    /// Parse dependency string and return (package, first_version, full_constraint)
+    fn parse_dependency(&self, dep: &str) -> Option<(String, String, String)> {
+        // First get the full constraint
+        let full_constraint = self
+            .constraint_re
+            .captures(dep)
+            .and_then(|c| c.get(3))
+            .map(|m| m.as_str().to_string())
+            .unwrap_or_default();
+
         self.version_re.captures(dep).map(|caps| {
             let package = caps.get(1).unwrap().as_str().to_string();
             let version = caps.get(4).unwrap().as_str().to_string();
-            (package, version)
+            (package, version, full_constraint)
         })
+    }
+
+    /// Check if constraint is simple (no upper bounds that could be violated)
+    fn is_simple_constraint(constraint: &str) -> bool {
+        // If there are multiple constraints (comma-separated), need constraint-aware lookup
+        if constraint.contains(',') {
+            return false;
+        }
+
+        // If the constraint has an upper-bound operator, need constraint-aware lookup
+        if constraint.starts_with('<')
+            || constraint.starts_with("<=")
+            || constraint.starts_with("~=")
+        {
+            return false;
+        }
+
+        // Also check for != which could affect version selection
+        if constraint.starts_with("!=") {
+            return false;
+        }
+
+        // Simple constraints like "==1.0.0", ">=1.0.0", ">1.0.0" are fine
+        true
     }
 
     fn update_dependency(&self, dep: &str, new_version: &str) -> String {
@@ -60,14 +106,21 @@ impl PyProjectUpdater {
         for i in 0..array.len() {
             if let Some(item) = array.get(i)
                 && let Some(s) = item.as_str()
-                && let Some((package, current_version)) = self.parse_dependency(s)
+                && let Some((package, current_version, full_constraint)) = self.parse_dependency(s)
             {
-                // If current version is a pre-release, include pre-releases in lookup
-                let version_result = if is_stable_pep440(&current_version) {
-                    registry.get_latest_version(&package).await
-                } else {
+                // Determine which lookup method to use based on constraint complexity
+                let version_result = if !is_stable_pep440(&current_version) {
+                    // Pre-release: include pre-releases in lookup
                     registry
                         .get_latest_version_including_prereleases(&package)
+                        .await
+                } else if Self::is_simple_constraint(&full_constraint) {
+                    // Simple constraint: just get latest stable
+                    registry.get_latest_version(&package).await
+                } else {
+                    // Complex constraint with upper bounds: use constraint-aware lookup
+                    registry
+                        .get_latest_version_matching(&package, &full_constraint)
                         .await
                 };
 
@@ -250,15 +303,43 @@ mod tests {
     fn test_parse_dependency() {
         let updater = PyProjectUpdater::new();
 
-        let (pkg, ver) = updater.parse_dependency("requests>=2.28.0").unwrap();
+        let (pkg, ver, constraint) = updater.parse_dependency("requests>=2.28.0").unwrap();
         assert_eq!(pkg, "requests");
         assert_eq!(ver, "2.28.0");
+        assert_eq!(constraint, ">=2.28.0");
 
-        let (pkg, ver) = updater
+        let (pkg, ver, constraint) = updater
             .parse_dependency("uvicorn[standard]>=0.20.0")
             .unwrap();
         assert_eq!(pkg, "uvicorn");
         assert_eq!(ver, "0.20.0");
+        assert_eq!(constraint, ">=0.20.0");
+
+        // Test constraint with upper bound
+        let (pkg, ver, constraint) = updater.parse_dependency("flask>=2.0.0,<3.0.0").unwrap();
+        assert_eq!(pkg, "flask");
+        assert_eq!(ver, "2.0.0");
+        assert_eq!(constraint, ">=2.0.0,<3.0.0");
+    }
+
+    #[test]
+    fn test_is_simple_constraint() {
+        // Simple constraints - no upper bound, no exclusions
+        assert!(PyProjectUpdater::is_simple_constraint("==1.0.0"));
+        assert!(PyProjectUpdater::is_simple_constraint(">=1.0.0"));
+        assert!(PyProjectUpdater::is_simple_constraint(">1.0.0"));
+
+        // Multiple constraints with comma
+        assert!(!PyProjectUpdater::is_simple_constraint(">=1.0.0,<2.0.0"));
+        assert!(!PyProjectUpdater::is_simple_constraint(">=2.8.0,<9"));
+
+        // Upper-bound operators (need constraint-aware lookup)
+        assert!(!PyProjectUpdater::is_simple_constraint("<4.2"));
+        assert!(!PyProjectUpdater::is_simple_constraint("<=2.0"));
+        assert!(!PyProjectUpdater::is_simple_constraint("~=1.4"));
+
+        // Exclusion operator
+        assert!(!PyProjectUpdater::is_simple_constraint("!=1.5.0"));
     }
 
     #[test]
