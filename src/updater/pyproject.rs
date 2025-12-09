@@ -667,4 +667,151 @@ dependencies = ["requests>=2.31.0"]
         assert_eq!(result.updated.len(), 0);
         assert_eq!(result.unchanged, 1);
     }
+
+    // Error path tests
+
+    #[tokio::test]
+    async fn test_update_pyproject_invalid_toml() {
+        let mut file = NamedTempFile::with_suffix(".toml").unwrap();
+        write!(
+            file,
+            r#"[project
+name = "invalid toml - missing bracket"
+"#
+        )
+        .unwrap();
+
+        let registry = MockRegistry::new("PyPI");
+
+        let updater = PyProjectUpdater::new();
+        let options = UpdateOptions {
+            dry_run: false,
+            full_precision: false,
+        };
+
+        let result = updater.update(file.path(), &registry, options).await;
+
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("Failed to parse TOML"));
+    }
+
+    #[tokio::test]
+    async fn test_update_pyproject_file_not_found() {
+        let registry = MockRegistry::new("PyPI");
+
+        let updater = PyProjectUpdater::new();
+        let options = UpdateOptions {
+            dry_run: false,
+            full_precision: false,
+        };
+
+        let result = updater
+            .update(
+                Path::new("/nonexistent/path/pyproject.toml"),
+                &registry,
+                options,
+            )
+            .await;
+
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_update_pyproject_registry_error_for_package() {
+        let mut file = NamedTempFile::with_suffix(".toml").unwrap();
+        write!(
+            file,
+            r#"[project]
+name = "myproject"
+dependencies = [
+    "requests>=2.28.0",
+    "nonexistent-pkg>=1.0.0",
+]
+"#
+        )
+        .unwrap();
+
+        // Registry only has requests - nonexistent-pkg will cause an error
+        let registry = MockRegistry::new("PyPI").with_version("requests", "2.31.0");
+
+        let updater = PyProjectUpdater::new();
+        let options = UpdateOptions {
+            dry_run: false,
+            full_precision: false,
+        };
+
+        let result = updater
+            .update(file.path(), &registry, options)
+            .await
+            .unwrap();
+
+        // One package updated successfully
+        assert_eq!(result.updated.len(), 1);
+        assert_eq!(result.updated[0].0, "requests");
+
+        // One error for the nonexistent package
+        assert_eq!(result.errors.len(), 1);
+        assert!(result.errors[0].contains("nonexistent-pkg"));
+    }
+
+    #[tokio::test]
+    async fn test_update_pyproject_empty_dependencies() {
+        let mut file = NamedTempFile::with_suffix(".toml").unwrap();
+        write!(
+            file,
+            r#"[project]
+name = "myproject"
+dependencies = []
+"#
+        )
+        .unwrap();
+
+        let registry = MockRegistry::new("PyPI");
+
+        let updater = PyProjectUpdater::new();
+        let options = UpdateOptions {
+            dry_run: false,
+            full_precision: false,
+        };
+
+        let result = updater
+            .update(file.path(), &registry, options)
+            .await
+            .unwrap();
+
+        assert_eq!(result.updated.len(), 0);
+        assert_eq!(result.unchanged, 0);
+        assert!(result.errors.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_update_pyproject_no_dependencies_section() {
+        let mut file = NamedTempFile::with_suffix(".toml").unwrap();
+        write!(
+            file,
+            r#"[project]
+name = "myproject"
+version = "1.0.0"
+"#
+        )
+        .unwrap();
+
+        let registry = MockRegistry::new("PyPI");
+
+        let updater = PyProjectUpdater::new();
+        let options = UpdateOptions {
+            dry_run: false,
+            full_precision: false,
+        };
+
+        let result = updater
+            .update(file.path(), &registry, options)
+            .await
+            .unwrap();
+
+        assert_eq!(result.updated.len(), 0);
+        assert_eq!(result.unchanged, 0);
+        assert!(result.errors.is_empty());
+    }
 }

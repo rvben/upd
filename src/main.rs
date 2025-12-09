@@ -213,6 +213,29 @@ impl UpdateFilter {
     }
 }
 
+/// Counts updates by type, respecting the filter.
+/// Returns (major_count, minor_count, patch_count, filtered_total)
+fn count_updates_by_type(
+    updates: &[(String, String, String, Option<usize>)],
+    filter: UpdateFilter,
+) -> (usize, usize, usize, usize) {
+    updates.iter().fold(
+        (0, 0, 0, 0),
+        |(major, minor, patch, total), (_, old, new, _)| {
+            let update_type = classify_update(old, new);
+            if filter.matches(update_type) {
+                match update_type {
+                    UpdateType::Major => (major + 1, minor, patch, total + 1),
+                    UpdateType::Minor => (major, minor + 1, patch, total + 1),
+                    UpdateType::Patch => (major, minor, patch + 1, total + 1),
+                }
+            } else {
+                (major, minor, patch, total)
+            }
+        },
+    )
+}
+
 fn print_file_result(path: &str, result: &UpdateResult, dry_run: bool, filter: UpdateFilter) {
     if result.updated.is_empty() && result.errors.is_empty() {
         return;
@@ -266,21 +289,8 @@ fn print_summary(result: &UpdateResult, file_count: usize, dry_run: bool, filter
     let action = if dry_run { "Would update" } else { "Updated" };
 
     // Count by update type, respecting filter
-    let (major_count, minor_count, patch_count, filtered_total) = result.updated.iter().fold(
-        (0, 0, 0, 0),
-        |(major, minor, patch, total), (_, old, new, _)| {
-            let update_type = classify_update(old, new);
-            if filter.matches(update_type) {
-                match update_type {
-                    UpdateType::Major => (major + 1, minor, patch, total + 1),
-                    UpdateType::Minor => (major, minor + 1, patch, total + 1),
-                    UpdateType::Patch => (major, minor, patch + 1, total + 1),
-                }
-            } else {
-                (major, minor, patch, total)
-            }
-        },
-    );
+    let (major_count, minor_count, patch_count, filtered_total) =
+        count_updates_by_type(&result.updated, filter);
 
     if filtered_total == 0 {
         println!(
@@ -472,5 +482,82 @@ mod tests {
         assert!(!filter.matches(UpdateType::Major));
         assert!(filter.matches(UpdateType::Minor));
         assert!(filter.matches(UpdateType::Patch));
+    }
+
+    #[test]
+    fn test_count_updates_by_type_empty() {
+        let updates: Vec<(String, String, String, Option<usize>)> = vec![];
+        let filter = UpdateFilter::new(false, false, false); // show all
+
+        let (major, minor, patch, total) = count_updates_by_type(&updates, filter);
+        assert_eq!(major, 0);
+        assert_eq!(minor, 0);
+        assert_eq!(patch, 0);
+        assert_eq!(total, 0);
+    }
+
+    #[test]
+    fn test_count_updates_by_type_mixed() {
+        let updates = vec![
+            ("pkg1".into(), "1.0.0".into(), "2.0.0".into(), Some(1)), // major
+            ("pkg2".into(), "1.0.0".into(), "1.1.0".into(), Some(2)), // minor
+            ("pkg3".into(), "1.0.0".into(), "1.0.1".into(), Some(3)), // patch
+            ("pkg4".into(), "2.0.0".into(), "3.0.0".into(), Some(4)), // major
+            ("pkg5".into(), "1.5.0".into(), "1.5.1".into(), Some(5)), // patch
+        ];
+        let filter = UpdateFilter::new(false, false, false); // show all
+
+        let (major, minor, patch, total) = count_updates_by_type(&updates, filter);
+        assert_eq!(major, 2);
+        assert_eq!(minor, 1);
+        assert_eq!(patch, 2);
+        assert_eq!(total, 5);
+    }
+
+    #[test]
+    fn test_count_updates_by_type_with_filter_major_only() {
+        let updates = vec![
+            ("pkg1".into(), "1.0.0".into(), "2.0.0".into(), Some(1)), // major
+            ("pkg2".into(), "1.0.0".into(), "1.1.0".into(), Some(2)), // minor (filtered out)
+            ("pkg3".into(), "1.0.0".into(), "1.0.1".into(), Some(3)), // patch (filtered out)
+        ];
+        let filter = UpdateFilter::new(true, false, false); // major only
+
+        let (major, minor, patch, total) = count_updates_by_type(&updates, filter);
+        assert_eq!(major, 1);
+        assert_eq!(minor, 0);
+        assert_eq!(patch, 0);
+        assert_eq!(total, 1);
+    }
+
+    #[test]
+    fn test_count_updates_by_type_with_filter_minor_and_patch() {
+        let updates = vec![
+            ("pkg1".into(), "1.0.0".into(), "2.0.0".into(), Some(1)), // major (filtered out)
+            ("pkg2".into(), "1.0.0".into(), "1.1.0".into(), Some(2)), // minor
+            ("pkg3".into(), "1.0.0".into(), "1.0.1".into(), Some(3)), // patch
+        ];
+        let filter = UpdateFilter::new(false, true, true); // minor + patch
+
+        let (major, minor, patch, total) = count_updates_by_type(&updates, filter);
+        assert_eq!(major, 0);
+        assert_eq!(minor, 1);
+        assert_eq!(patch, 1);
+        assert_eq!(total, 2);
+    }
+
+    #[test]
+    fn test_count_updates_by_type_no_line_numbers() {
+        let updates = vec![
+            ("pkg1".into(), "1.0.0".into(), "2.0.0".into(), None), // major, no line
+            ("pkg2".into(), "1.0.0".into(), "1.1.0".into(), None), // minor, no line
+        ];
+        let filter = UpdateFilter::new(false, false, false); // show all
+
+        let (major, minor, patch, total) = count_updates_by_type(&updates, filter);
+        assert_eq!(major, 1);
+        assert_eq!(minor, 1);
+        assert_eq!(patch, 0);
+        assert_eq!(total, 2);
     }
 }

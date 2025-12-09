@@ -203,4 +203,67 @@ mod tests {
         let response = get_with_retry(&client, &url).await.unwrap();
         assert!(response.status().is_success());
     }
+
+    // Tests for Registry trait default implementations
+    // Create a minimal registry that only implements required methods
+    // to test that default implementations work correctly
+
+    struct MinimalRegistry {
+        version: String,
+    }
+
+    impl MinimalRegistry {
+        fn new(version: &str) -> Self {
+            Self {
+                version: version.to_string(),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl Registry for MinimalRegistry {
+        async fn get_latest_version(&self, _package: &str) -> Result<String> {
+            Ok(self.version.clone())
+        }
+
+        fn name(&self) -> &'static str {
+            "Minimal"
+        }
+        // Note: we intentionally DON'T override the default methods
+        // to test that the default implementations work
+    }
+
+    #[tokio::test]
+    async fn test_registry_default_prereleases_falls_back_to_stable() {
+        let registry = MinimalRegistry::new("2.31.0");
+
+        // The default implementation should fall back to get_latest_version
+        let version = registry
+            .get_latest_version_including_prereleases("anypackage")
+            .await
+            .unwrap();
+
+        assert_eq!(version, "2.31.0");
+    }
+
+    #[tokio::test]
+    async fn test_registry_default_matching_ignores_constraints() {
+        let registry = MinimalRegistry::new("5.0.0");
+
+        // The default implementation ignores constraints and returns latest
+        let version = registry
+            .get_latest_version_matching("anypackage", ">=3.0,<4")
+            .await
+            .unwrap();
+
+        // Should return 5.0.0 even though it doesn't match constraints
+        // (real implementations would respect constraints)
+        assert_eq!(version, "5.0.0");
+    }
+
+    #[tokio::test]
+    async fn test_registry_name() {
+        let registry = MinimalRegistry::new("1.0.0");
+        assert_eq!(registry.name(), "Minimal");
+    }
 }
