@@ -159,6 +159,135 @@ pub fn discover_files(paths: &[PathBuf]) -> Vec<(PathBuf, FileType)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
+    use tempfile::tempdir;
+
+    #[test]
+    fn test_update_result_merge() {
+        let mut result1 = UpdateResult {
+            updated: vec![(
+                "pkg1".to_string(),
+                "1.0".to_string(),
+                "2.0".to_string(),
+                Some(1),
+            )],
+            unchanged: 5,
+            errors: vec!["error1".to_string()],
+        };
+
+        let result2 = UpdateResult {
+            updated: vec![(
+                "pkg2".to_string(),
+                "2.0".to_string(),
+                "3.0".to_string(),
+                Some(2),
+            )],
+            unchanged: 3,
+            errors: vec!["error2".to_string()],
+        };
+
+        result1.merge(result2);
+
+        assert_eq!(result1.updated.len(), 2);
+        assert_eq!(result1.unchanged, 8);
+        assert_eq!(result1.errors.len(), 2);
+        assert_eq!(result1.updated[0].0, "pkg1");
+        assert_eq!(result1.updated[1].0, "pkg2");
+    }
+
+    #[test]
+    fn test_update_result_default() {
+        let result = UpdateResult::default();
+        assert!(result.updated.is_empty());
+        assert_eq!(result.unchanged, 0);
+        assert!(result.errors.is_empty());
+    }
+
+    #[test]
+    fn test_discover_files_single_file() {
+        let temp = tempdir().unwrap();
+        let req_path = temp.path().join("requirements.txt");
+        fs::write(&req_path, "flask>=2.0").unwrap();
+
+        let files = discover_files(&[req_path.clone()]);
+
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].0, req_path);
+        assert_eq!(files[0].1, FileType::Requirements);
+    }
+
+    #[test]
+    fn test_discover_files_directory() {
+        let temp = tempdir().unwrap();
+
+        // Create various dependency files
+        fs::write(temp.path().join("requirements.txt"), "flask>=2.0").unwrap();
+        fs::write(
+            temp.path().join("pyproject.toml"),
+            "[project]\nname = \"test\"",
+        )
+        .unwrap();
+        fs::write(temp.path().join("package.json"), "{}").unwrap();
+
+        // Create a non-matching file
+        fs::write(temp.path().join("README.md"), "# Test").unwrap();
+
+        let files = discover_files(&[temp.path().to_path_buf()]);
+
+        assert_eq!(files.len(), 3);
+
+        // Check that all expected file types are present
+        let types: Vec<_> = files.iter().map(|(_, ft)| *ft).collect();
+        assert!(types.contains(&FileType::Requirements));
+        assert!(types.contains(&FileType::PyProject));
+        assert!(types.contains(&FileType::PackageJson));
+    }
+
+    #[test]
+    fn test_discover_files_multiple_requirements() {
+        let temp = tempdir().unwrap();
+
+        fs::write(temp.path().join("requirements.txt"), "flask>=2.0").unwrap();
+        fs::write(temp.path().join("requirements-dev.txt"), "pytest>=7.0").unwrap();
+        fs::write(temp.path().join("requirements.in"), "django>=4.0").unwrap();
+
+        let files = discover_files(&[temp.path().to_path_buf()]);
+
+        assert_eq!(files.len(), 3);
+        assert!(files.iter().all(|(_, ft)| *ft == FileType::Requirements));
+    }
+
+    #[test]
+    fn test_discover_files_empty_directory() {
+        let temp = tempdir().unwrap();
+        let files = discover_files(&[temp.path().to_path_buf()]);
+        assert!(files.is_empty());
+    }
+
+    #[test]
+    fn test_discover_files_nonexistent_path() {
+        let files = discover_files(&[PathBuf::from("/nonexistent/path")]);
+        assert!(files.is_empty());
+    }
+
+    #[test]
+    fn test_discover_files_mixed_paths() {
+        let temp = tempdir().unwrap();
+
+        // Create a file directly in temp
+        let direct_file = temp.path().join("requirements.txt");
+        fs::write(&direct_file, "flask>=2.0").unwrap();
+
+        // Create a subdirectory with a file
+        let subdir = temp.path().join("subdir");
+        fs::create_dir(&subdir).unwrap();
+        fs::write(subdir.join("package.json"), "{}").unwrap();
+
+        // Discover from both paths
+        let files = discover_files(&[direct_file.clone(), subdir.clone()]);
+
+        assert_eq!(files.len(), 2);
+    }
 
     #[test]
     fn test_file_type_detection() {
