@@ -374,4 +374,162 @@ mod tests {
         assert_eq!(restored.get("pypi", "requests"), Some("2.31.0".to_string()));
         assert_eq!(restored.get("npm", "lodash"), Some("4.17.21".to_string()));
     }
+
+    #[test]
+    fn test_cache_file_operations() {
+        use tempfile::tempdir;
+
+        // Use a temp directory for cache
+        let temp = tempdir().unwrap();
+        let cache_dir = temp.path().join("upd-test-cache");
+        // SAFETY: This is a single-threaded test and we restore the var at the end
+        unsafe {
+            std::env::set_var("UPD_CACHE_DIR", &cache_dir);
+        }
+
+        // Initially cache doesn't exist, load returns default
+        let cache = Cache::load().unwrap();
+        assert!(cache.pypi.is_empty());
+
+        // Save cache with data
+        let mut cache = Cache::default();
+        cache.set("pypi", "test-pkg", "1.0.0".to_string());
+        cache.save().unwrap();
+
+        // Reload and verify
+        let loaded = Cache::load().unwrap();
+        assert_eq!(loaded.get("pypi", "test-pkg"), Some("1.0.0".to_string()));
+
+        // Clean cache
+        Cache::clean().unwrap();
+
+        // After clean, load returns default
+        let after_clean = Cache::load().unwrap();
+        assert!(after_clean.pypi.is_empty());
+
+        // Clean up
+        // SAFETY: Restoring the environment variable after test
+        unsafe {
+            std::env::remove_var("UPD_CACHE_DIR");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_cached_registry_caches_results() {
+        use crate::registry::MockRegistry;
+
+        let mock = MockRegistry::new("pypi").with_version("flask", "3.0.0");
+        let cache = Cache::new_shared();
+        let cached = CachedRegistry::new(mock, cache.clone(), true);
+
+        // First call - not in cache, should fetch from registry
+        let version = cached.get_latest_version("flask").await.unwrap();
+        assert_eq!(version, "3.0.0");
+
+        // Verify it was cached
+        let c = cache.lock().unwrap();
+        assert_eq!(c.get("pypi", "flask"), Some("3.0.0".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_cached_registry_returns_cached_value() {
+        use crate::registry::MockRegistry;
+
+        // Pre-populate cache
+        let cache = Cache::new_shared();
+        {
+            let mut c = cache.lock().unwrap();
+            c.set("pypi", "requests", "2.31.0".to_string());
+        }
+
+        // Create registry WITHOUT the package - only cache has it
+        let mock = MockRegistry::new("pypi");
+        let cached = CachedRegistry::new(mock, cache, true);
+
+        // Should return cached value without hitting registry
+        let version = cached.get_latest_version("requests").await.unwrap();
+        assert_eq!(version, "2.31.0");
+    }
+
+    #[tokio::test]
+    async fn test_cached_registry_disabled() {
+        use crate::registry::MockRegistry;
+
+        let mock = MockRegistry::new("pypi").with_version("django", "5.0.0");
+        let cache = Cache::new_shared();
+
+        // Create cached registry with caching DISABLED
+        let cached = CachedRegistry::new(mock, cache.clone(), false);
+
+        // Should fetch from registry
+        let version = cached.get_latest_version("django").await.unwrap();
+        assert_eq!(version, "5.0.0");
+
+        // Cache should NOT be populated when disabled
+        let c = cache.lock().unwrap();
+        assert!(c.get("pypi", "django").is_none());
+    }
+
+    #[tokio::test]
+    async fn test_cached_registry_prerelease_separate_cache() {
+        use crate::registry::MockRegistry;
+
+        let mock = MockRegistry::new("pypi")
+            .with_version("ty", "1.0.0")
+            .with_prerelease("ty", "1.0.0", "1.1.0a5");
+        let cache = Cache::new_shared();
+        let cached = CachedRegistry::new(mock, cache.clone(), true);
+
+        // Fetch stable version
+        let stable = cached.get_latest_version("ty").await.unwrap();
+        assert_eq!(stable, "1.0.0");
+
+        // Fetch prerelease version (should use separate cache key)
+        let prerelease = cached
+            .get_latest_version_including_prereleases("ty")
+            .await
+            .unwrap();
+        assert_eq!(prerelease, "1.1.0a5");
+
+        // Both should be cached separately
+        let c = cache.lock().unwrap();
+        assert_eq!(c.get("pypi", "ty"), Some("1.0.0".to_string()));
+        assert_eq!(c.get("pypi", "ty:prerelease"), Some("1.1.0a5".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_cached_registry_constraint_matching() {
+        use crate::registry::MockRegistry;
+
+        let mock = MockRegistry::new("pypi")
+            .with_version("click", "8.1.7")
+            .with_constrained("click", ">=7.0,<8.0", "7.1.2");
+        let cache = Cache::new_shared();
+        let cached = CachedRegistry::new(mock, cache.clone(), true);
+
+        // Fetch with constraints
+        let constrained = cached
+            .get_latest_version_matching("click", ">=7.0,<8.0")
+            .await
+            .unwrap();
+        assert_eq!(constrained, "7.1.2");
+
+        // Should be cached with constraint key
+        let c = cache.lock().unwrap();
+        assert_eq!(
+            c.get("pypi", "click:match:>=7.0,<8.0"),
+            Some("7.1.2".to_string())
+        );
+    }
+
+    #[test]
+    fn test_cached_registry_name() {
+        use crate::registry::MockRegistry;
+
+        let mock = MockRegistry::new("npm");
+        let cache = Cache::new_shared();
+        let cached = CachedRegistry::new(mock, cache, true);
+
+        assert_eq!(cached.name(), "npm");
+    }
 }
