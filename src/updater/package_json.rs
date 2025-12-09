@@ -185,6 +185,9 @@ impl Updater for PackageJsonUpdater {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::registry::MockRegistry;
+    use std::io::Write;
+    use tempfile::NamedTempFile;
 
     #[test]
     fn test_extract_version_info() {
@@ -209,5 +212,252 @@ mod tests {
             updater.extract_version_info("1.0.0"),
             ("".to_string(), "1.0.0".to_string())
         );
+    }
+
+    #[tokio::test]
+    async fn test_update_package_json_file() {
+        let mut file = NamedTempFile::with_suffix(".json").unwrap();
+        write!(
+            file,
+            r#"{{
+  "name": "test-project",
+  "dependencies": {{
+    "react": "^17.0.0",
+    "lodash": "~4.17.0"
+  }}
+}}"#
+        )
+        .unwrap();
+
+        let registry = MockRegistry::new("npm")
+            .with_version("react", "18.2.0")
+            .with_version("lodash", "4.17.21");
+
+        let updater = PackageJsonUpdater::new();
+        let options = UpdateOptions {
+            dry_run: false,
+            full_precision: false,
+        };
+
+        let result = updater
+            .update(file.path(), &registry, options)
+            .await
+            .unwrap();
+
+        assert_eq!(result.updated.len(), 2);
+        assert_eq!(result.unchanged, 0);
+
+        // Verify file was updated
+        let content = fs::read_to_string(file.path()).unwrap();
+        assert!(content.contains("^18.2.0"));
+        assert!(content.contains("~4.17.21"));
+    }
+
+    #[tokio::test]
+    async fn test_update_package_json_dry_run() {
+        let mut file = NamedTempFile::with_suffix(".json").unwrap();
+        let original = r#"{
+  "dependencies": {
+    "express": "^4.17.0"
+  }
+}"#;
+        write!(file, "{}", original).unwrap();
+
+        let registry = MockRegistry::new("npm").with_version("express", "4.18.2");
+
+        let updater = PackageJsonUpdater::new();
+        let options = UpdateOptions {
+            dry_run: true,
+            full_precision: false,
+        };
+
+        let result = updater
+            .update(file.path(), &registry, options)
+            .await
+            .unwrap();
+
+        assert_eq!(result.updated.len(), 1);
+
+        // Verify file was NOT updated (dry run)
+        let content = fs::read_to_string(file.path()).unwrap();
+        assert_eq!(content, original);
+    }
+
+    #[tokio::test]
+    async fn test_update_package_json_preserves_prefix() {
+        let mut file = NamedTempFile::with_suffix(".json").unwrap();
+        write!(
+            file,
+            r#"{{
+  "dependencies": {{
+    "caret": "^1.0.0",
+    "tilde": "~1.0.0",
+    "exact": "1.0.0",
+    "gte": ">=1.0.0"
+  }}
+}}"#
+        )
+        .unwrap();
+
+        let registry = MockRegistry::new("npm")
+            .with_version("caret", "2.0.0")
+            .with_version("tilde", "2.0.0")
+            .with_version("exact", "2.0.0")
+            .with_version("gte", "2.0.0");
+
+        let updater = PackageJsonUpdater::new();
+        let options = UpdateOptions {
+            dry_run: false,
+            full_precision: false,
+        };
+
+        let result = updater
+            .update(file.path(), &registry, options)
+            .await
+            .unwrap();
+
+        assert_eq!(result.updated.len(), 4);
+
+        let content = fs::read_to_string(file.path()).unwrap();
+        assert!(content.contains("\"^2.0.0\""));
+        assert!(content.contains("\"~2.0.0\""));
+        assert!(content.contains("\"2.0.0\"")); // exact version
+        assert!(content.contains("\">=2.0.0\""));
+    }
+
+    #[tokio::test]
+    async fn test_update_package_json_dev_dependencies() {
+        let mut file = NamedTempFile::with_suffix(".json").unwrap();
+        write!(
+            file,
+            r#"{{
+  "devDependencies": {{
+    "typescript": "^4.9.0",
+    "jest": "^29.0.0"
+  }}
+}}"#
+        )
+        .unwrap();
+
+        let registry = MockRegistry::new("npm")
+            .with_version("typescript", "5.3.3")
+            .with_version("jest", "29.7.0");
+
+        let updater = PackageJsonUpdater::new();
+        let options = UpdateOptions {
+            dry_run: false,
+            full_precision: false,
+        };
+
+        let result = updater
+            .update(file.path(), &registry, options)
+            .await
+            .unwrap();
+
+        assert_eq!(result.updated.len(), 2);
+
+        let content = fs::read_to_string(file.path()).unwrap();
+        assert!(content.contains("^5.3.3"));
+        assert!(content.contains("^29.7.0"));
+    }
+
+    #[tokio::test]
+    async fn test_update_package_json_skips_special_versions() {
+        let mut file = NamedTempFile::with_suffix(".json").unwrap();
+        write!(
+            file,
+            r#"{{
+  "dependencies": {{
+    "local-pkg": "file:../local",
+    "git-pkg": "git+https://github.com/user/repo.git",
+    "any-version": "*",
+    "latest-version": "latest",
+    "normal-pkg": "^1.0.0"
+  }}
+}}"#
+        )
+        .unwrap();
+
+        let registry = MockRegistry::new("npm").with_version("normal-pkg", "2.0.0");
+
+        let updater = PackageJsonUpdater::new();
+        let options = UpdateOptions {
+            dry_run: false,
+            full_precision: false,
+        };
+
+        let result = updater
+            .update(file.path(), &registry, options)
+            .await
+            .unwrap();
+
+        // Only normal-pkg should be updated
+        assert_eq!(result.updated.len(), 1);
+        assert_eq!(result.updated[0].0, "normal-pkg");
+    }
+
+    #[tokio::test]
+    async fn test_update_package_json_line_numbers() {
+        let mut file = NamedTempFile::with_suffix(".json").unwrap();
+        write!(
+            file,
+            r#"{{
+  "name": "test",
+  "dependencies": {{
+    "react": "^17.0.0"
+  }}
+}}"#
+        )
+        .unwrap();
+
+        let registry = MockRegistry::new("npm").with_version("react", "18.2.0");
+
+        let updater = PackageJsonUpdater::new();
+        let options = UpdateOptions {
+            dry_run: true,
+            full_precision: false,
+        };
+
+        let result = updater
+            .update(file.path(), &registry, options)
+            .await
+            .unwrap();
+
+        assert_eq!(result.updated.len(), 1);
+        // Line number should be found (react is on line 4)
+        assert!(result.updated[0].3.is_some());
+        assert_eq!(result.updated[0].3, Some(4));
+    }
+
+    #[tokio::test]
+    async fn test_update_package_json_registry_error() {
+        let mut file = NamedTempFile::with_suffix(".json").unwrap();
+        write!(
+            file,
+            r#"{{
+  "dependencies": {{
+    "nonexistent-pkg": "^1.0.0"
+  }}
+}}"#
+        )
+        .unwrap();
+
+        // Registry without the package
+        let registry = MockRegistry::new("npm");
+
+        let updater = PackageJsonUpdater::new();
+        let options = UpdateOptions {
+            dry_run: true,
+            full_precision: false,
+        };
+
+        let result = updater
+            .update(file.path(), &registry, options)
+            .await
+            .unwrap();
+
+        assert_eq!(result.updated.len(), 0);
+        assert_eq!(result.errors.len(), 1);
+        assert!(result.errors[0].contains("nonexistent-pkg"));
     }
 }

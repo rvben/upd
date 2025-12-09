@@ -321,6 +321,9 @@ impl Updater for CargoTomlUpdater {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::registry::MockRegistry;
+    use std::io::Write;
+    use tempfile::NamedTempFile;
     use toml_edit::InlineTable;
 
     #[test]
@@ -370,5 +373,282 @@ mod tests {
             CargoTomlUpdater::get_version(&item),
             Some("1.0.0".to_string())
         );
+    }
+
+    #[tokio::test]
+    async fn test_update_cargo_toml_file() {
+        let mut file = NamedTempFile::with_suffix(".toml").unwrap();
+        write!(
+            file,
+            r#"[package]
+name = "test-crate"
+version = "0.1.0"
+
+[dependencies]
+serde = "1.0.0"
+tokio = {{ version = "1.28.0", features = ["full"] }}
+"#
+        )
+        .unwrap();
+
+        let registry = MockRegistry::new("crates.io")
+            .with_version("serde", "1.0.195")
+            .with_version("tokio", "1.35.0");
+
+        let updater = CargoTomlUpdater::new();
+        let options = UpdateOptions {
+            dry_run: false,
+            full_precision: false,
+        };
+
+        let result = updater
+            .update(file.path(), &registry, options)
+            .await
+            .unwrap();
+
+        assert_eq!(result.updated.len(), 2);
+        assert_eq!(result.unchanged, 0);
+
+        let content = fs::read_to_string(file.path()).unwrap();
+        assert!(content.contains("1.0.195"));
+        assert!(content.contains("1.35.0"));
+    }
+
+    #[tokio::test]
+    async fn test_update_cargo_toml_dry_run() {
+        let mut file = NamedTempFile::with_suffix(".toml").unwrap();
+        let original = r#"[package]
+name = "test-crate"
+version = "0.1.0"
+
+[dependencies]
+serde = "1.0.0"
+"#;
+        write!(file, "{}", original).unwrap();
+
+        let registry = MockRegistry::new("crates.io").with_version("serde", "1.0.195");
+
+        let updater = CargoTomlUpdater::new();
+        let options = UpdateOptions {
+            dry_run: true,
+            full_precision: false,
+        };
+
+        let result = updater
+            .update(file.path(), &registry, options)
+            .await
+            .unwrap();
+
+        assert_eq!(result.updated.len(), 1);
+
+        // Verify file was NOT updated (dry run)
+        let content = fs::read_to_string(file.path()).unwrap();
+        assert_eq!(content, original);
+    }
+
+    #[tokio::test]
+    async fn test_update_cargo_toml_preserves_prefix() {
+        let mut file = NamedTempFile::with_suffix(".toml").unwrap();
+        write!(
+            file,
+            r#"[dependencies]
+caret = "^1.0.0"
+tilde = "~1.0.0"
+exact = "=1.0.0"
+gte = ">=1.0.0"
+"#
+        )
+        .unwrap();
+
+        let registry = MockRegistry::new("crates.io")
+            .with_version("caret", "2.0.0")
+            .with_version("tilde", "2.0.0")
+            .with_version("exact", "2.0.0")
+            .with_version("gte", "2.0.0");
+
+        let updater = CargoTomlUpdater::new();
+        let options = UpdateOptions {
+            dry_run: false,
+            full_precision: false,
+        };
+
+        let result = updater
+            .update(file.path(), &registry, options)
+            .await
+            .unwrap();
+
+        assert_eq!(result.updated.len(), 4);
+
+        let content = fs::read_to_string(file.path()).unwrap();
+        assert!(content.contains("\"^2.0.0\""));
+        assert!(content.contains("\"~2.0.0\""));
+        assert!(content.contains("\"=2.0.0\""));
+        assert!(content.contains("\">=2.0.0\""));
+    }
+
+    #[tokio::test]
+    async fn test_update_cargo_toml_dev_dependencies() {
+        let mut file = NamedTempFile::with_suffix(".toml").unwrap();
+        write!(
+            file,
+            r#"[dev-dependencies]
+tempfile = "3.8.0"
+criterion = "0.5.0"
+"#
+        )
+        .unwrap();
+
+        let registry = MockRegistry::new("crates.io")
+            .with_version("tempfile", "3.10.0")
+            .with_version("criterion", "0.5.1");
+
+        let updater = CargoTomlUpdater::new();
+        let options = UpdateOptions {
+            dry_run: false,
+            full_precision: false,
+        };
+
+        let result = updater
+            .update(file.path(), &registry, options)
+            .await
+            .unwrap();
+
+        assert_eq!(result.updated.len(), 2);
+
+        let content = fs::read_to_string(file.path()).unwrap();
+        assert!(content.contains("3.10.0"));
+        assert!(content.contains("0.5.1"));
+    }
+
+    #[tokio::test]
+    async fn test_update_cargo_toml_skips_path_and_git() {
+        let mut file = NamedTempFile::with_suffix(".toml").unwrap();
+        write!(
+            file,
+            r#"[dependencies]
+local-crate = {{ path = "../local" }}
+git-crate = {{ git = "https://github.com/user/repo" }}
+normal-crate = "1.0.0"
+"#
+        )
+        .unwrap();
+
+        let registry = MockRegistry::new("crates.io").with_version("normal-crate", "2.0.0");
+
+        let updater = CargoTomlUpdater::new();
+        let options = UpdateOptions {
+            dry_run: false,
+            full_precision: false,
+        };
+
+        let result = updater
+            .update(file.path(), &registry, options)
+            .await
+            .unwrap();
+
+        // Only normal-crate should be updated
+        assert_eq!(result.updated.len(), 1);
+        assert_eq!(result.updated[0].0, "normal-crate");
+    }
+
+    #[tokio::test]
+    async fn test_update_cargo_toml_workspace_dependencies() {
+        let mut file = NamedTempFile::with_suffix(".toml").unwrap();
+        write!(
+            file,
+            r#"[workspace]
+members = ["crate-a", "crate-b"]
+
+[workspace.dependencies]
+serde = "1.0.0"
+tokio = "1.28.0"
+"#
+        )
+        .unwrap();
+
+        let registry = MockRegistry::new("crates.io")
+            .with_version("serde", "1.0.195")
+            .with_version("tokio", "1.35.0");
+
+        let updater = CargoTomlUpdater::new();
+        let options = UpdateOptions {
+            dry_run: false,
+            full_precision: false,
+        };
+
+        let result = updater
+            .update(file.path(), &registry, options)
+            .await
+            .unwrap();
+
+        assert_eq!(result.updated.len(), 2);
+
+        let content = fs::read_to_string(file.path()).unwrap();
+        assert!(content.contains("1.0.195"));
+        assert!(content.contains("1.35.0"));
+    }
+
+    #[tokio::test]
+    async fn test_update_cargo_toml_preserves_formatting() {
+        let mut file = NamedTempFile::with_suffix(".toml").unwrap();
+        write!(
+            file,
+            r#"[package]
+name = "test-crate"
+version = "0.1.0"
+
+# This is a comment
+[dependencies]
+serde = "1.0.0"  # inline comment
+"#
+        )
+        .unwrap();
+
+        let registry = MockRegistry::new("crates.io").with_version("serde", "1.0.195");
+
+        let updater = CargoTomlUpdater::new();
+        let options = UpdateOptions {
+            dry_run: false,
+            full_precision: false,
+        };
+
+        updater
+            .update(file.path(), &registry, options)
+            .await
+            .unwrap();
+
+        let content = fs::read_to_string(file.path()).unwrap();
+        // Comments should be preserved
+        assert!(content.contains("# This is a comment"));
+    }
+
+    #[tokio::test]
+    async fn test_update_cargo_toml_registry_error() {
+        let mut file = NamedTempFile::with_suffix(".toml").unwrap();
+        write!(
+            file,
+            r#"[dependencies]
+nonexistent-crate = "1.0.0"
+"#
+        )
+        .unwrap();
+
+        // Registry without the crate
+        let registry = MockRegistry::new("crates.io");
+
+        let updater = CargoTomlUpdater::new();
+        let options = UpdateOptions {
+            dry_run: true,
+            full_precision: false,
+        };
+
+        let result = updater
+            .update(file.path(), &registry, options)
+            .await
+            .unwrap();
+
+        assert_eq!(result.updated.len(), 0);
+        assert_eq!(result.errors.len(), 1);
+        assert!(result.errors[0].contains("nonexistent-crate"));
     }
 }
