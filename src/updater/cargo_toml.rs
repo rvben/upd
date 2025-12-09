@@ -1,6 +1,6 @@
 use super::{FileType, UpdateResult, Updater};
 use crate::registry::Registry;
-use crate::version::is_stable_semver;
+use crate::version::{is_stable_semver, match_version_precision};
 use anyhow::{Result, anyhow};
 use futures::future::join_all;
 use std::fs;
@@ -144,8 +144,11 @@ impl CargoTomlUpdater {
         {
             match version_result {
                 Ok(latest_version) => {
-                    if latest_version != current_version {
-                        let new_version_req = format!("{}{}", prefix, latest_version);
+                    // Match the precision of the original version
+                    let matched_version =
+                        match_version_precision(&current_version, &latest_version);
+                    if matched_version != current_version {
+                        let new_version_req = format!("{}{}", prefix, matched_version);
                         if let Some(item) = table.get_mut(&key) {
                             Self::set_version(item, &new_version_req);
                         }
@@ -153,7 +156,7 @@ impl CargoTomlUpdater {
                         result.updated.push((
                             key.clone(),
                             current_version,
-                            latest_version,
+                            matched_version,
                             line_num,
                         ));
                     } else {

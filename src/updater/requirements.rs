@@ -1,5 +1,6 @@
 use super::{FileType, UpdateResult, Updater};
 use crate::registry::Registry;
+use crate::version::match_version_precision;
 use anyhow::Result;
 use futures::future::join_all;
 use regex::Regex;
@@ -191,14 +192,17 @@ impl Updater for RequirementsUpdater {
                 if let Some(version_result) = version_map.remove(&line_idx) {
                     match version_result {
                         Ok(latest_version) => {
-                            if latest_version != parsed.first_version {
+                            // Match the precision of the original version
+                            let matched_version =
+                                match_version_precision(&parsed.first_version, &latest_version);
+                            if matched_version != parsed.first_version {
                                 result.updated.push((
                                     parsed.package.clone(),
                                     parsed.first_version.clone(),
-                                    latest_version.clone(),
+                                    matched_version.clone(),
                                     Some(line_num),
                                 ));
-                                new_lines.push(self.update_line(line, &latest_version));
+                                new_lines.push(self.update_line(line, &matched_version));
                                 modified = true;
                             } else {
                                 result.unchanged += 1;

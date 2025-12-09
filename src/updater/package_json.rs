@@ -1,5 +1,6 @@
 use super::{FileType, UpdateResult, Updater};
 use crate::registry::Registry;
+use crate::version::match_version_precision;
 use anyhow::Result;
 use futures::future::join_all;
 use regex::Regex;
@@ -137,12 +138,15 @@ impl Updater for PackageJsonUpdater {
         {
             match version_result {
                 Ok(latest_version) => {
-                    if latest_version != current_version {
+                    // Match the precision of the original version
+                    let matched_version =
+                        match_version_precision(&current_version, &latest_version);
+                    if matched_version != current_version {
                         let line_num = self.find_package_line(&content, &package);
                         result.updated.push((
                             package.clone(),
                             current_version.clone(),
-                            latest_version.clone(),
+                            matched_version.clone(),
                             line_num,
                         ));
 
@@ -151,7 +155,7 @@ impl Updater for PackageJsonUpdater {
                             &new_content,
                             &package,
                             &version_str,
-                            &format!("{}{}", prefix, latest_version),
+                            &format!("{}{}", prefix, matched_version),
                         );
                     } else {
                         result.unchanged += 1;

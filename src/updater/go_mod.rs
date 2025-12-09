@@ -1,5 +1,6 @@
 use super::{FileType, UpdateResult, Updater};
 use crate::registry::Registry;
+use crate::version::match_version_precision;
 use anyhow::Result;
 use futures::future::join_all;
 use regex::Regex;
@@ -240,14 +241,17 @@ impl Updater for GoModUpdater {
 
                 match version_result {
                     Ok(latest_version) => {
-                        if latest_version != *current_version {
+                        // Match the precision of the original version
+                        let matched_version =
+                            match_version_precision(current_version, &latest_version);
+                        if matched_version != *current_version {
                             // Replace version in the line, preserving everything else
-                            let new_line = line.replace(current_version, &latest_version);
+                            let new_line = line.replace(current_version, &matched_version);
                             new_lines.push(new_line);
                             result.updated.push((
                                 module.clone(),
                                 current_version.clone(),
-                                latest_version,
+                                matched_version,
                                 Some(line_num),
                             ));
                         } else {

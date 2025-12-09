@@ -1,6 +1,6 @@
 use super::{FileType, UpdateResult, Updater};
 use crate::registry::Registry;
-use crate::version::is_stable_pep440;
+use crate::version::{is_stable_pep440, match_version_precision};
 use anyhow::{Result, anyhow};
 use futures::future::join_all;
 use regex::Regex;
@@ -152,12 +152,15 @@ impl PyProjectUpdater {
         {
             match version_result {
                 Ok(latest_version) => {
-                    if latest_version != current_version {
-                        let updated = self.update_dependency(&dep_str, &latest_version);
+                    // Match the precision of the original version
+                    let matched_version =
+                        match_version_precision(&current_version, &latest_version);
+                    if matched_version != current_version {
+                        let updated = self.update_dependency(&dep_str, &matched_version);
                         let line_num = Self::find_dependency_line(original_content, &package);
                         result
                             .updated
-                            .push((package, current_version, latest_version, line_num));
+                            .push((package, current_version, matched_version, line_num));
                         updates.push((i, updated));
                     } else {
                         result.unchanged += 1;
@@ -233,12 +236,14 @@ impl PyProjectUpdater {
         {
             match version_result {
                 Ok(latest_version) => {
-                    if latest_version != version {
-                        let new_val = format!("{}{}", prefix, latest_version);
+                    // Match the precision of the original version
+                    let matched_version = match_version_precision(&version, &latest_version);
+                    if matched_version != version {
+                        let new_val = format!("{}{}", prefix, matched_version);
                         let line_num = Self::find_dependency_line(original_content, &key);
                         result
                             .updated
-                            .push((key.clone(), version, latest_version, line_num));
+                            .push((key.clone(), version, matched_version, line_num));
 
                         // Preserve decoration when updating
                         if let Some(Item::Value(Value::String(formatted))) =
