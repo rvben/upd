@@ -3,6 +3,19 @@
 A fast dependency updater for Python, Node.js, Rust, and Go projects,
 written in Rust.
 
+## Quick Start
+
+```bash
+# Run without installing (using uv)
+uvx upd-cli
+
+# Or with pipx
+pipx run upd-cli
+
+# Preview changes without modifying files
+uvx upd-cli -n
+```
+
 ## Features
 
 - **Multi-ecosystem**: Python, Node.js, Rust, and Go dependencies
@@ -21,6 +34,9 @@ written in Rust.
 
 ```bash
 cargo install upd
+
+# or with cargo-binstall (faster, pre-built binary)
+cargo binstall upd
 ```
 
 ### From PyPI
@@ -111,16 +127,15 @@ upd clean-cache
 ## Example Output
 
 ```text
-pyproject.toml
-  Would update requests 2.28.0 → 2.31.0
-  Would update flask 2.2.0 → 3.0.0 (MAJOR)
-
-Cargo.toml
-  Would update serde 1.0.180 → 1.0.200
-  Would update tokio 1.28.0 → 1.35.0
+pyproject.toml:12: Would update requests 2.28.0 → 2.31.0
+pyproject.toml:13: Would update flask 2.2.0 → 3.0.0 (MAJOR)
+Cargo.toml:8: Would update serde 1.0.180 → 1.0.200
+Cargo.toml:9: Would update tokio 1.28.0 → 1.35.0
 
 Would update 4 package(s) in 2 file(s), 15 up to date
 ```
+
+Output includes clickable `file:line:` locations (recognized by VS Code, iTerm2, and modern terminals).
 
 ## Version Precision
 
