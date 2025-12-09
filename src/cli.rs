@@ -16,10 +16,6 @@ pub struct Cli {
     #[arg(global = true)]
     pub paths: Vec<PathBuf>,
 
-    /// Verify dependency compatibility after update
-    #[arg(long, global = true)]
-    pub verify: bool,
-
     /// Show what would change without writing
     #[arg(short = 'n', long, global = true)]
     pub dry_run: bool,
