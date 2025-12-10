@@ -1,4 +1,4 @@
-.PHONY: build release test lint fmt check clean run install version-get version-major version-minor version-patch version-push release-major release-minor release-patch build-wheel verify-release
+.PHONY: build release test lint fmt check clean run install version-get version-major version-minor version-patch version-push release-major release-minor release-patch build-wheel verify-release pre-commit-update
 
 # Get version from Cargo.toml
 VERSION := $(shell grep '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)"/\1/')
@@ -121,3 +121,7 @@ version-push:
 release-major: version-major version-push
 release-minor: version-minor version-push
 release-patch: version-patch version-push
+
+# Update pre-commit hooks to latest versions
+pre-commit-update:
+	pre-commit autoupdate
