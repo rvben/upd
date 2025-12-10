@@ -76,7 +76,7 @@ async fn main() -> Result<()> {
 
 async fn run_update(cli: &Cli) -> Result<()> {
     let paths = cli.get_paths();
-    let files = discover_files(&paths);
+    let files = discover_files(&paths, &cli.langs);
     let file_count = files.len();
 
     if files.is_empty() {

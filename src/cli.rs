@@ -1,3 +1,4 @@
+use crate::updater::Lang;
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
@@ -47,6 +48,10 @@ pub struct Cli {
     /// Use full version precision (e.g., 3.1.5 instead of 3.1)
     #[arg(long, global = true)]
     pub full_precision: bool,
+
+    /// Filter by language/ecosystem (can be specified multiple times)
+    #[arg(short = 'l', long = "lang", value_name = "LANG", global = true)]
+    pub langs: Vec<Lang>,
 }
 
 #[derive(Subcommand)]
@@ -207,5 +212,35 @@ mod tests {
         assert!(cli.no_cache);
         assert!(cli.major);
         assert_eq!(cli.paths, vec![PathBuf::from("path1")]);
+    }
+
+    #[test]
+    fn test_cli_parses_lang_single() {
+        let cli = Cli::try_parse_from(["upd", "--lang", "python"]).unwrap();
+        assert_eq!(cli.langs.len(), 1);
+        assert_eq!(cli.langs[0], Lang::Python);
+
+        let cli = Cli::try_parse_from(["upd", "-l", "node"]).unwrap();
+        assert_eq!(cli.langs.len(), 1);
+        assert_eq!(cli.langs[0], Lang::Node);
+    }
+
+    #[test]
+    fn test_cli_parses_lang_multiple() {
+        let cli = Cli::try_parse_from(["upd", "--lang", "python", "--lang", "rust"]).unwrap();
+        assert_eq!(cli.langs.len(), 2);
+        assert_eq!(cli.langs[0], Lang::Python);
+        assert_eq!(cli.langs[1], Lang::Rust);
+
+        let cli = Cli::try_parse_from(["upd", "-l", "go", "-l", "node"]).unwrap();
+        assert_eq!(cli.langs.len(), 2);
+        assert_eq!(cli.langs[0], Lang::Go);
+        assert_eq!(cli.langs[1], Lang::Node);
+    }
+
+    #[test]
+    fn test_cli_parses_lang_empty() {
+        let cli = Cli::try_parse_from(["upd"]).unwrap();
+        assert!(cli.langs.is_empty());
     }
 }

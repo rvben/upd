@@ -86,6 +86,11 @@ upd --patch      # Show only patch updates
 # Combine filters
 upd --major --minor  # Show major and minor updates only
 
+# Filter by language/ecosystem
+upd --lang python           # Update only Python dependencies
+upd -l rust                 # Short form
+upd --lang python --lang go # Update Python and Go only
+
 # Version precision
 upd --full-precision  # Output full versions (e.g., 3.1.5 instead of 3.1)
 ```

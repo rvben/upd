@@ -43,6 +43,15 @@ impl UpdateResult {
     }
 }
 
+/// Language/ecosystem type for filtering
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum Lang {
+    Python,
+    Node,
+    Rust,
+    Go,
+}
+
 /// Type of dependency file
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FileType {
@@ -51,6 +60,18 @@ pub enum FileType {
     PackageJson,
     CargoToml,
     GoMod,
+}
+
+impl FileType {
+    /// Get the language/ecosystem for this file type
+    pub fn lang(&self) -> Lang {
+        match self {
+            FileType::Requirements | FileType::PyProject => Lang::Python,
+            FileType::PackageJson => Lang::Node,
+            FileType::CargoToml => Lang::Rust,
+            FileType::GoMod => Lang::Go,
+        }
+    }
 }
 
 impl FileType {
@@ -124,15 +145,17 @@ pub trait Updater: Send + Sync {
     fn handles(&self, file_type: FileType) -> bool;
 }
 
-/// Discover dependency files in the given paths
-pub fn discover_files(paths: &[PathBuf]) -> Vec<(PathBuf, FileType)> {
+/// Discover dependency files in the given paths, optionally filtered by language
+pub fn discover_files(paths: &[PathBuf], langs: &[Lang]) -> Vec<(PathBuf, FileType)> {
     let mut files = Vec::new();
 
     for path in paths {
         if path.is_file()
             && let Some(file_type) = FileType::detect(path)
         {
-            files.push((path.clone(), file_type));
+            if langs.is_empty() || langs.contains(&file_type.lang()) {
+                files.push((path.clone(), file_type));
+            }
         } else if path.is_dir() {
             // Walk directory respecting .gitignore
             let walker = WalkBuilder::new(path)
@@ -146,6 +169,7 @@ pub fn discover_files(paths: &[PathBuf]) -> Vec<(PathBuf, FileType)> {
                 let entry_path = entry.path();
                 if entry_path.is_file()
                     && let Some(file_type) = FileType::detect(entry_path)
+                    && (langs.is_empty() || langs.contains(&file_type.lang()))
                 {
                     files.push((entry_path.to_path_buf(), file_type));
                 }
@@ -209,7 +233,7 @@ mod tests {
         let req_path = temp.path().join("requirements.txt");
         fs::write(&req_path, "flask>=2.0").unwrap();
 
-        let files = discover_files(&[req_path.clone()]);
+        let files = discover_files(&[req_path.clone()], &[]);
 
         assert_eq!(files.len(), 1);
         assert_eq!(files[0].0, req_path);
@@ -232,7 +256,7 @@ mod tests {
         // Create a non-matching file
         fs::write(temp.path().join("README.md"), "# Test").unwrap();
 
-        let files = discover_files(&[temp.path().to_path_buf()]);
+        let files = discover_files(&[temp.path().to_path_buf()], &[]);
 
         assert_eq!(files.len(), 3);
 
@@ -251,7 +275,7 @@ mod tests {
         fs::write(temp.path().join("requirements-dev.txt"), "pytest>=7.0").unwrap();
         fs::write(temp.path().join("requirements.in"), "django>=4.0").unwrap();
 
-        let files = discover_files(&[temp.path().to_path_buf()]);
+        let files = discover_files(&[temp.path().to_path_buf()], &[]);
 
         assert_eq!(files.len(), 3);
         assert!(files.iter().all(|(_, ft)| *ft == FileType::Requirements));
@@ -260,13 +284,13 @@ mod tests {
     #[test]
     fn test_discover_files_empty_directory() {
         let temp = tempdir().unwrap();
-        let files = discover_files(&[temp.path().to_path_buf()]);
+        let files = discover_files(&[temp.path().to_path_buf()], &[]);
         assert!(files.is_empty());
     }
 
     #[test]
     fn test_discover_files_nonexistent_path() {
-        let files = discover_files(&[PathBuf::from("/nonexistent/path")]);
+        let files = discover_files(&[PathBuf::from("/nonexistent/path")], &[]);
         assert!(files.is_empty());
     }
 
@@ -284,7 +308,7 @@ mod tests {
         fs::write(subdir.join("package.json"), "{}").unwrap();
 
         // Discover from both paths
-        let files = discover_files(&[direct_file.clone(), subdir.clone()]);
+        let files = discover_files(&[direct_file.clone(), subdir.clone()], &[]);
 
         assert_eq!(files.len(), 2);
     }
@@ -367,5 +391,53 @@ mod tests {
         assert_eq!(FileType::detect(Path::new("requirements-dev")), None);
         assert_eq!(FileType::detect(Path::new("setup.py")), None);
         assert_eq!(FileType::detect(Path::new("cargo.toml")), None); // lowercase doesn't match
+    }
+
+    #[test]
+    fn test_file_type_lang_mapping() {
+        assert_eq!(FileType::Requirements.lang(), Lang::Python);
+        assert_eq!(FileType::PyProject.lang(), Lang::Python);
+        assert_eq!(FileType::PackageJson.lang(), Lang::Node);
+        assert_eq!(FileType::CargoToml.lang(), Lang::Rust);
+        assert_eq!(FileType::GoMod.lang(), Lang::Go);
+    }
+
+    #[test]
+    fn test_discover_files_with_lang_filter() {
+        let temp = tempdir().unwrap();
+
+        // Create files for different ecosystems
+        fs::write(temp.path().join("requirements.txt"), "flask>=2.0").unwrap();
+        fs::write(temp.path().join("package.json"), "{}").unwrap();
+        fs::write(temp.path().join("Cargo.toml"), "[package]\nname = \"test\"").unwrap();
+        fs::write(temp.path().join("go.mod"), "module test").unwrap();
+
+        // No filter - should get all 4
+        let files = discover_files(&[temp.path().to_path_buf()], &[]);
+        assert_eq!(files.len(), 4);
+
+        // Filter for Python only
+        let files = discover_files(&[temp.path().to_path_buf()], &[Lang::Python]);
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].1, FileType::Requirements);
+
+        // Filter for Node only
+        let files = discover_files(&[temp.path().to_path_buf()], &[Lang::Node]);
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].1, FileType::PackageJson);
+
+        // Filter for Rust only
+        let files = discover_files(&[temp.path().to_path_buf()], &[Lang::Rust]);
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].1, FileType::CargoToml);
+
+        // Filter for Go only
+        let files = discover_files(&[temp.path().to_path_buf()], &[Lang::Go]);
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].1, FileType::GoMod);
+
+        // Filter for Python and Rust
+        let files = discover_files(&[temp.path().to_path_buf()], &[Lang::Python, Lang::Rust]);
+        assert_eq!(files.len(), 2);
     }
 }
