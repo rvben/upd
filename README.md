@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="assets/logo-wide.svg" alt="upd logo" width="400">
+</p>
+
 # upd
 
 A fast dependency updater for Python, Node.js, Rust, and Go projects,
@@ -23,6 +27,7 @@ uvx upd-cli -n
 - **Constraint-aware**: Respects version constraints like `>=2.0,<3`
 - **Smart caching**: 24-hour version cache for faster subsequent runs
 - **Update filters**: Filter by `--major`, `--minor`, or `--patch` updates
+- **Interactive mode**: Approve updates individually with `-i`
 - **Major warnings**: Highlights breaking changes with `(MAJOR)`
 - **Format-preserving**: Keeps formatting, comments, and structure
 - **Pre-release aware**: Updates pre-releases to newer pre-releases
@@ -85,6 +90,10 @@ upd --patch      # Show only patch updates
 
 # Combine filters
 upd --major --minor  # Show major and minor updates only
+
+# Interactive mode - approve updates one by one
+upd -i
+upd --interactive
 
 # Filter by language/ecosystem
 upd --lang python           # Update only Python dependencies

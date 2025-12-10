@@ -50,7 +50,7 @@ repos:
 
   # Markdown linting using rumdl
   - repo: https://github.com/rvben/rumdl-pre-commit
-    rev: v0.0.45
+    rev: v0.0.192
     hooks:
       - id: rumdl
         exclude: ^CHANGELOG\.md$
