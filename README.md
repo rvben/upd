@@ -28,6 +28,7 @@ uvx upd-cli -n
 - **Smart caching**: 24-hour version cache for faster subsequent runs
 - **Update filters**: Filter by `--major`, `--minor`, or `--patch` updates
 - **Interactive mode**: Approve updates individually with `-i`
+- **Check mode**: Exit with code 1 if updates available (for CI/pre-commit)
 - **Major warnings**: Highlights breaking changes with `(MAJOR)`
 - **Format-preserving**: Keeps formatting, comments, and structure
 - **Pre-release aware**: Updates pre-releases to newer pre-releases
@@ -102,6 +103,11 @@ upd --lang python --lang go # Update Python and Go only
 
 # Version precision
 upd --full-precision  # Output full versions (e.g., 3.1.5 instead of 3.1)
+
+# Check mode - exit with code 1 if updates available (for CI/pre-commit)
+upd --check
+upd -c
+upd --check --lang python  # Check only Python dependencies
 ```
 
 ### Commands

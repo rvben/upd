@@ -33,6 +33,10 @@ pub struct Cli {
     #[arg(short, long, global = true)]
     pub verbose: bool,
 
+    /// Interactive mode - approve each update individually
+    #[arg(short, long, global = true)]
+    pub interactive: bool,
+
     /// Only show/apply major updates
     #[arg(long, global = true)]
     pub major: bool,
@@ -52,6 +56,10 @@ pub struct Cli {
     /// Filter by language/ecosystem (can be specified multiple times)
     #[arg(short = 'l', long = "lang", value_name = "LANG", global = true)]
     pub langs: Vec<Lang>,
+
+    /// Check mode: exit with code 1 if updates are available (implies --dry-run)
+    #[arg(short = 'c', long, global = true)]
+    pub check: bool,
 }
 
 #[derive(Subcommand)]
@@ -94,10 +102,12 @@ mod tests {
         assert!(!cli.dry_run);
         assert!(!cli.no_cache);
         assert!(!cli.verbose);
+        assert!(!cli.interactive);
         assert!(!cli.major);
         assert!(!cli.minor);
         assert!(!cli.patch);
         assert!(!cli.full_precision);
+        assert!(!cli.check);
         assert!(cli.paths.is_empty());
         assert!(cli.command.is_none());
     }
@@ -124,6 +134,15 @@ mod tests {
 
         let cli = Cli::try_parse_from(["upd", "--verbose"]).unwrap();
         assert!(cli.verbose);
+    }
+
+    #[test]
+    fn test_cli_parses_interactive() {
+        let cli = Cli::try_parse_from(["upd", "-i"]).unwrap();
+        assert!(cli.interactive);
+
+        let cli = Cli::try_parse_from(["upd", "--interactive"]).unwrap();
+        assert!(cli.interactive);
     }
 
     #[test]
@@ -242,5 +261,22 @@ mod tests {
     fn test_cli_parses_lang_empty() {
         let cli = Cli::try_parse_from(["upd"]).unwrap();
         assert!(cli.langs.is_empty());
+    }
+
+    #[test]
+    fn test_cli_parses_check() {
+        let cli = Cli::try_parse_from(["upd", "-c"]).unwrap();
+        assert!(cli.check);
+
+        let cli = Cli::try_parse_from(["upd", "--check"]).unwrap();
+        assert!(cli.check);
+    }
+
+    #[test]
+    fn test_cli_parses_check_with_lang() {
+        let cli = Cli::try_parse_from(["upd", "--check", "--lang", "python"]).unwrap();
+        assert!(cli.check);
+        assert_eq!(cli.langs.len(), 1);
+        assert_eq!(cli.langs[0], Lang::Python);
     }
 }

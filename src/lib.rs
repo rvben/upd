@@ -1,5 +1,6 @@
 pub mod cache;
 pub mod cli;
+pub mod interactive;
 pub mod registry;
 pub mod updater;
 pub mod version;

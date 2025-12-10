@@ -2,9 +2,11 @@ use anyhow::Result;
 use clap::Parser;
 use colored::Colorize;
 
+use std::collections::HashSet;
 use std::sync::Arc;
 use upd::cache::{Cache, CachedRegistry};
 use upd::cli::{Cli, Command};
+use upd::interactive::{PendingUpdate, prompt_all};
 use upd::registry::{CratesIoRegistry, GoProxyRegistry, NpmRegistry, PyPiRegistry};
 use upd::updater::{
     CargoTomlUpdater, FileType, GoModUpdater, PackageJsonUpdater, PyProjectUpdater,
@@ -110,9 +112,32 @@ async fn run_update(cli: &Cli) -> Result<()> {
     let cargo_toml_updater = CargoTomlUpdater::new();
     let go_mod_updater = GoModUpdater::new();
 
-    // Create update options
+    // Interactive mode: first discover updates, then prompt, then apply approved ones
+    if cli.interactive {
+        return run_interactive_update(
+            cli,
+            &files,
+            filter,
+            &pypi,
+            &npm,
+            &crates_io,
+            &go_proxy,
+            &requirements_updater,
+            &pyproject_updater,
+            &package_json_updater,
+            &cargo_toml_updater,
+            &go_mod_updater,
+            &cache,
+            cache_enabled,
+        )
+        .await;
+    }
+
+    // Non-interactive mode: process files directly
+    // Create update options (--check implies --dry-run)
+    let dry_run = cli.dry_run || cli.check;
     let update_options = UpdateOptions {
-        dry_run: cli.dry_run,
+        dry_run,
         full_precision: cli.full_precision,
     };
 
@@ -149,12 +174,7 @@ async fn run_update(cli: &Cli) -> Result<()> {
 
         match result {
             Ok(file_result) => {
-                print_file_result(
-                    &path.display().to_string(),
-                    &file_result,
-                    cli.dry_run,
-                    filter,
-                );
+                print_file_result(&path.display().to_string(), &file_result, dry_run, filter);
                 total_result.merge(file_result);
             }
             Err(e) => {
@@ -173,7 +193,181 @@ async fn run_update(cli: &Cli) -> Result<()> {
 
     // Print summary
     println!();
-    print_summary(&total_result, file_count, cli.dry_run, filter);
+    print_summary(&total_result, file_count, dry_run, filter);
+
+    // In check mode, exit with code 1 if any updates are available
+    if cli.check {
+        let (_, _, _, filtered_total) = count_updates_by_type(&total_result.updated, filter);
+        if filtered_total > 0 {
+            std::process::exit(1);
+        }
+    }
+
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_interactive_update(
+    cli: &Cli,
+    files: &[(std::path::PathBuf, FileType)],
+    filter: UpdateFilter,
+    pypi: &CachedRegistry<PyPiRegistry>,
+    npm: &CachedRegistry<NpmRegistry>,
+    crates_io: &CachedRegistry<CratesIoRegistry>,
+    go_proxy: &CachedRegistry<GoProxyRegistry>,
+    requirements_updater: &RequirementsUpdater,
+    pyproject_updater: &PyProjectUpdater,
+    package_json_updater: &PackageJsonUpdater,
+    cargo_toml_updater: &CargoTomlUpdater,
+    go_mod_updater: &GoModUpdater,
+    cache: &Arc<std::sync::Mutex<Cache>>,
+    cache_enabled: bool,
+) -> Result<()> {
+    // Phase 1: Discover all available updates (dry-run)
+    let dry_run_options = UpdateOptions {
+        dry_run: true,
+        full_precision: cli.full_precision,
+    };
+
+    let mut pending_updates: Vec<PendingUpdate> = Vec::new();
+
+    for (path, file_type) in files {
+        if cli.verbose {
+            println!("{}", format!("Scanning: {}", path.display()).cyan());
+        }
+
+        let result = match file_type {
+            FileType::Requirements => {
+                requirements_updater
+                    .update(path, pypi, dry_run_options)
+                    .await
+            }
+            FileType::PyProject => pyproject_updater.update(path, pypi, dry_run_options).await,
+            FileType::PackageJson => {
+                package_json_updater
+                    .update(path, npm, dry_run_options)
+                    .await
+            }
+            FileType::CargoToml => {
+                cargo_toml_updater
+                    .update(path, crates_io, dry_run_options)
+                    .await
+            }
+            FileType::GoMod => go_mod_updater.update(path, go_proxy, dry_run_options).await,
+        };
+
+        if let Ok(file_result) = result {
+            for (package, old_version, new_version, line_num) in file_result.updated {
+                let update_type = classify_update(&old_version, &new_version);
+
+                // Apply filter
+                if !filter.matches(update_type) {
+                    continue;
+                }
+
+                pending_updates.push(PendingUpdate::new(
+                    path.display().to_string(),
+                    line_num,
+                    package,
+                    old_version,
+                    new_version,
+                    update_type == UpdateType::Major,
+                ));
+            }
+        }
+    }
+
+    if pending_updates.is_empty() {
+        println!(
+            "{} Scanned {} file(s), all dependencies up to date",
+            "✓".green(),
+            files.len()
+        );
+        return Ok(());
+    }
+
+    // Phase 2: Prompt user for each update
+    let updates_with_decisions = prompt_all(pending_updates)?;
+
+    // Build set of approved packages per file
+    let approved: HashSet<(String, String)> = updates_with_decisions
+        .iter()
+        .filter(|u| u.approved)
+        .map(|u| (u.file.clone(), u.package.clone()))
+        .collect();
+
+    let approved_count = approved.len();
+
+    if approved_count == 0 {
+        println!("\n{}", "No updates applied.".yellow());
+        return Ok(());
+    }
+
+    // Phase 3: Apply approved updates
+    println!(
+        "\n{}",
+        format!("Applying {} update(s)...", approved_count).cyan()
+    );
+
+    let apply_options = UpdateOptions {
+        dry_run: false,
+        full_precision: cli.full_precision,
+    };
+
+    let mut total_applied = 0;
+
+    for (path, file_type) in files {
+        // Check if any approved updates are for this file
+        let file_str = path.display().to_string();
+        let has_approved = approved.iter().any(|(f, _)| f == &file_str);
+        if !has_approved {
+            continue;
+        }
+
+        let result = match file_type {
+            FileType::Requirements => requirements_updater.update(path, pypi, apply_options).await,
+            FileType::PyProject => pyproject_updater.update(path, pypi, apply_options).await,
+            FileType::PackageJson => package_json_updater.update(path, npm, apply_options).await,
+            FileType::CargoToml => {
+                cargo_toml_updater
+                    .update(path, crates_io, apply_options)
+                    .await
+            }
+            FileType::GoMod => go_mod_updater.update(path, go_proxy, apply_options).await,
+        };
+
+        if let Ok(file_result) = result {
+            for (package, old_version, new_version, line_num) in &file_result.updated {
+                // Only count if it was approved
+                if approved.contains(&(file_str.clone(), package.clone())) {
+                    total_applied += 1;
+                    let location = match line_num {
+                        Some(n) => format!("{}:{}:", file_str, n),
+                        None => format!("{}:", file_str),
+                    };
+                    println!(
+                        "{} {} {} {} → {}",
+                        location.blue().underline(),
+                        "Updated".green(),
+                        package.bold(),
+                        old_version.dimmed(),
+                        new_version.green(),
+                    );
+                }
+            }
+        }
+    }
+
+    // Save cache to disk
+    if cache_enabled {
+        let _ = Cache::save_shared(cache);
+    }
+
+    println!(
+        "\n{} {} package(s)",
+        "Updated".green(),
+        total_applied.to_string().green().bold()
+    );
 
     Ok(())
 }
