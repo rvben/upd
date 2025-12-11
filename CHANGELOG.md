@@ -5,6 +5,43 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.0.9] - 2025-12-11
+
+### Added
+
+- Private repository authentication support for all registries:
+  - PyPI: Basic Auth via environment variables, `~/.netrc`, or inline URL credentials
+  - npm: Bearer token via `NPM_TOKEN`, `NODE_AUTH_TOKEN`, or `.npmrc`
+  - Cargo: Token via `CARGO_REGISTRY_TOKEN` or `~/.cargo/credentials.toml`
+  - Go: Basic Auth via `GOPROXY_USERNAME`/`GOPROXY_PASSWORD` or `~/.netrc`
+- Inline index URL support in `requirements.txt` (`--index-url`, `-i`)
+
+### Fixed
+
+- Upper-bound-only constraints like `django<6` are now skipped (not incorrectly narrowed)
+- Constraints with upper bounds now preserve the upper bound during updates
+  - `django>=4.0,<6` → `django>=5.2,<6` (previously dropped the `<6`)
+
+## [0.0.8] - 2025-12-10
+
+### Added
+
+- `--check` / `-c` flag for CI integration (exit code 1 if updates available)
+- Interactive mode (`-i`) for approving updates one by one
+
+## [0.0.7] - 2025-12-10
+
+### Added
+
+- `align` subcommand to align package versions across multiple files in a monorepo
+
+## [0.0.6] - 2025-12-09
+
+### Added
+
+- `--lang` / `-l` flag to filter updates by language/ecosystem
+- Update type filters: `--major`, `--minor`, `--patch`
+
 ## [0.0.5] - 2025-12-09
 
 ### Added
@@ -81,6 +118,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Concurrent dependency lookups
 - Release binary with LTO optimization
 
+[0.0.9]: https://github.com/rvben/upd/releases/tag/v0.0.9
+[0.0.8]: https://github.com/rvben/upd/releases/tag/v0.0.8
+[0.0.7]: https://github.com/rvben/upd/releases/tag/v0.0.7
+[0.0.6]: https://github.com/rvben/upd/releases/tag/v0.0.6
 [0.0.5]: https://github.com/rvben/upd/releases/tag/v0.0.5
 [0.0.4]: https://github.com/rvben/upd/releases/tag/v0.0.4
 [0.0.3]: https://github.com/rvben/upd/releases/tag/v0.0.3
