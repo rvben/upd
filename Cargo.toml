@@ -1,6 +1,6 @@
 [package]
 name = "upd"
-version = "0.0.7"
+version = "0.0.8"
 edition = "2024"
 rust-version = "1.91.1"
 description = "A fast dependency updater for Python, Node.js, Rust, and Go projects"
@@ -60,7 +60,7 @@ async-trait = "0.1.89"
 futures = "0.3.31"
 
 [dev-dependencies]
-tempfile = "3.20.0"
+tempfile = "3.23.0"
 wiremock = "0.6"
 
 [profile.release]

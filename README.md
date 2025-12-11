@@ -33,6 +33,7 @@ uvx --from upd-cli upd -n
 - **Format-preserving**: Keeps formatting, comments, and structure
 - **Pre-release aware**: Updates pre-releases to newer pre-releases
 - **Gitignore-aware**: Respects `.gitignore` when discovering files
+- **Version alignment**: Align package versions across multiple files
 
 ## Installation
 
@@ -121,6 +122,10 @@ upd self-update
 
 # Clear version cache
 upd clean-cache
+
+# Align versions across files (use highest version found)
+upd align
+upd align --check  # Exit 1 if misalignments found (for CI)
 ```
 
 ## Supported Files
@@ -178,6 +183,36 @@ flask>=2.0        →  flask>=3.1.5
 django>=4         →  django>=6.0.0
 requests>=2.0.0   →  requests>=2.32.5
 ```
+
+## Version Alignment
+
+In monorepos or projects with multiple dependency files, the same package might have different versions:
+
+```text
+# requirements.txt
+requests==2.28.0
+
+# requirements-dev.txt
+requests==2.31.0
+
+# services/api/requirements.txt
+requests==2.25.0
+```
+
+Use `upd align` to update all occurrences to the highest version found:
+
+```bash
+upd align              # Align all packages to highest version
+upd align --dry-run    # Preview changes
+upd align --check      # Exit 1 if misalignments (for CI)
+upd align --lang python # Align only Python packages
+```
+
+**Behavior:**
+
+- Only aligns packages within the same ecosystem (Python with Python, etc.)
+- Skips packages with upper bound constraints (e.g., `>=2.0,<3.0`) to avoid breaking them
+- Ignores pre-release versions when finding the highest version
 
 ## Version Constraints
 
