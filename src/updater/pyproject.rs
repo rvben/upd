@@ -100,15 +100,12 @@ impl PyProjectUpdater {
 
     fn update_dependency(&self, dep: &str, new_version: &str) -> String {
         if let Some(caps) = self.version_re.captures(dep) {
-            let full_match = caps.get(0).unwrap();
-            let package = caps.get(1).unwrap().as_str();
-            let extras = caps.get(2).map_or("", |m| m.as_str());
-            let operator = caps.get(3).unwrap().as_str();
-
-            let new_spec = format!("{}{}{}{}", package, extras, operator, new_version);
+            // Only replace the version number itself, preserving everything else
+            // (package name, extras, operator, AND any additional constraints like ,<6)
+            let version_match = caps.get(4).unwrap();
 
             let mut result = dep.to_string();
-            result.replace_range(full_match.range(), &new_spec);
+            result.replace_range(version_match.range(), new_version);
             result
         } else {
             dep.to_string()
@@ -565,6 +562,23 @@ mod tests {
         assert_eq!(
             updater.update_dependency("uvicorn[standard]>=0.20.0", "0.24.0"),
             "uvicorn[standard]>=0.24.0"
+        );
+
+        // Constraint preservation - upper bound should be kept
+        assert_eq!(
+            updater.update_dependency("django>=4.0,<6", "5.2"),
+            "django>=5.2,<6"
+        );
+
+        assert_eq!(
+            updater.update_dependency("pytest>=2.8.0,<9", "8.0.0"),
+            "pytest>=8.0.0,<9"
+        );
+
+        // Multiple constraints should all be preserved
+        assert_eq!(
+            updater.update_dependency("foo>=1.0.0,!=1.5.0,<2.0.0", "1.8.0"),
+            "foo>=1.8.0,!=1.5.0,<2.0.0"
         );
     }
 

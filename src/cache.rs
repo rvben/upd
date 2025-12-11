@@ -455,19 +455,24 @@ mod tests {
     async fn test_cached_registry_disabled() {
         use crate::registry::MockRegistry;
 
-        let mock = MockRegistry::new("pypi").with_version("django", "5.0.0");
-        let cache = Cache::new_shared();
+        // Use a unique package name to avoid interference from other tests
+        // that may have populated the shared cache
+        let unique_pkg = "test-pkg-disabled-cache-xyz";
+        let mock = MockRegistry::new("pypi").with_version(unique_pkg, "5.0.0");
+
+        // Create a fresh cache (not shared) to ensure test isolation
+        let cache = Arc::new(Mutex::new(Cache::default()));
 
         // Create cached registry with caching DISABLED
         let cached = CachedRegistry::new(mock, cache.clone(), false);
 
         // Should fetch from registry
-        let version = cached.get_latest_version("django").await.unwrap();
+        let version = cached.get_latest_version(unique_pkg).await.unwrap();
         assert_eq!(version, "5.0.0");
 
         // Cache should NOT be populated when disabled
         let c = cache.lock().unwrap();
-        assert!(c.get("pypi", "django").is_none());
+        assert!(c.get("pypi", unique_pkg).is_none());
     }
 
     #[tokio::test]

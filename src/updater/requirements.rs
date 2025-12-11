@@ -187,17 +187,12 @@ impl RequirementsUpdater {
 
     fn update_line(&self, line: &str, new_version: &str) -> String {
         if let Some(caps) = self.package_re.captures(line) {
-            let full_match = caps.get(0).unwrap();
-            let package = caps.get(1).unwrap().as_str();
-            let extras = caps.get(2).map_or("", |m| m.as_str());
-            let operator = caps.get(3).unwrap().as_str();
+            // Only replace the version number itself, preserving everything else
+            // (package name, extras, operator, AND any additional constraints like ,<6)
+            let version_match = caps.get(4).unwrap();
 
-            // Reconstruct the package spec with new version
-            let new_spec = format!("{}{}{}{}", package, extras, operator, new_version);
-
-            // Replace in original line to preserve trailing comments and whitespace
             let mut result = line.to_string();
-            result.replace_range(full_match.range(), &new_spec);
+            result.replace_range(version_match.range(), new_version);
             result
         } else {
             line.to_string()
@@ -548,6 +543,23 @@ flask>=2.0.0
         assert_eq!(
             updater.update_line("uvicorn[standard]==0.20.0", "0.24.0"),
             "uvicorn[standard]==0.24.0"
+        );
+
+        // Constraint preservation - upper bound should be kept
+        assert_eq!(
+            updater.update_line("django>=4.0,<6", "5.2"),
+            "django>=5.2,<6"
+        );
+
+        assert_eq!(
+            updater.update_line("pytest>=2.8.0,<9", "8.0.0"),
+            "pytest>=8.0.0,<9"
+        );
+
+        // Multiple constraints should all be preserved
+        assert_eq!(
+            updater.update_line("foo>=1.0.0,!=1.5.0,<2.0.0", "1.8.0"),
+            "foo>=1.8.0,!=1.5.0,<2.0.0"
         );
     }
 
