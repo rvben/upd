@@ -1,10 +1,9 @@
-use super::{FileType, UpdateOptions, UpdateResult, Updater};
+use super::{FileType, UpdateOptions, UpdateResult, Updater, read_file_safe, write_file_atomic};
 use crate::registry::Registry;
 use crate::version::match_version_precision;
 use anyhow::Result;
 use futures::future::join_all;
 use regex::Regex;
-use std::fs;
 use std::path::Path;
 
 pub struct RequirementsUpdater {
@@ -145,7 +144,7 @@ impl Updater for RequirementsUpdater {
         registry: &dyn Registry,
         options: UpdateOptions,
     ) -> Result<UpdateResult> {
-        let content = fs::read_to_string(path)?;
+        let content = read_file_safe(path)?;
         let mut result = UpdateResult::default();
 
         // First pass: collect all packages that need version checks
@@ -240,7 +239,7 @@ impl Updater for RequirementsUpdater {
                 new_content.push_str(line_ending);
             }
 
-            fs::write(path, new_content)?;
+            write_file_atomic(path, &new_content)?;
         }
 
         Ok(result)
@@ -255,6 +254,7 @@ impl Updater for RequirementsUpdater {
 mod tests {
     use super::*;
     use crate::registry::MockRegistry;
+    use std::fs;
     use std::io::Write;
     use tempfile::NamedTempFile;
 
@@ -427,11 +427,8 @@ mod tests {
             "Should not have full precision"
         );
 
-        // Reset file
-        file.reopen().unwrap();
-        let mut file2 = std::fs::File::create(file.path()).unwrap();
-        writeln!(file2, "flask>=2.0").unwrap();
-        drop(file2);
+        // Reset file content for second test
+        std::fs::write(file.path(), "flask>=2.0\n").unwrap();
 
         // With full precision - should output full version
         let options = UpdateOptions {

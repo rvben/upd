@@ -11,9 +11,55 @@ pub use pyproject::PyProjectUpdater;
 pub use requirements::RequirementsUpdater;
 
 use crate::registry::Registry;
-use anyhow::Result;
+use anyhow::{Result, anyhow};
 use ignore::WalkBuilder;
 use std::path::{Path, PathBuf};
+
+/// Maximum file size allowed for dependency files (10 MB)
+const MAX_FILE_SIZE: u64 = 10 * 1024 * 1024;
+
+/// UTF-8 BOM character
+const UTF8_BOM: char = '\u{feff}';
+
+/// Read a file safely, handling BOM and enforcing size limits
+pub fn read_file_safe(path: &Path) -> Result<String> {
+    let metadata = std::fs::metadata(path)?;
+    if metadata.len() > MAX_FILE_SIZE {
+        return Err(anyhow!(
+            "File too large: {} bytes (max {} MB)",
+            metadata.len(),
+            MAX_FILE_SIZE / 1024 / 1024
+        ));
+    }
+
+    let content = std::fs::read_to_string(path)?;
+    // Strip UTF-8 BOM if present (common in Windows-created files)
+    let content = content.strip_prefix(UTF8_BOM).unwrap_or(&content);
+    Ok(content.to_string())
+}
+
+/// Write a file atomically (write to temp file, then rename)
+pub fn write_file_atomic(path: &Path, content: &str) -> Result<()> {
+    use std::io::Write;
+
+    // Create temp file in same directory to ensure atomic rename works
+    let parent = path.parent().unwrap_or(Path::new("."));
+    let file_name = path
+        .file_name()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_else(|| "temp".to_string());
+    let tmp_path = parent.join(format!(".{}.upd.tmp", file_name));
+
+    // Write to temporary file
+    let mut file = std::fs::File::create(&tmp_path)?;
+    file.write_all(content.as_bytes())?;
+    file.sync_all()?;
+
+    // Atomically rename to target path
+    std::fs::rename(&tmp_path, path)?;
+
+    Ok(())
+}
 
 /// Options for updating dependencies
 #[derive(Debug, Clone, Copy, Default)]

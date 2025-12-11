@@ -1,11 +1,10 @@
-use super::{FileType, UpdateOptions, UpdateResult, Updater};
+use super::{FileType, UpdateOptions, UpdateResult, Updater, read_file_safe, write_file_atomic};
 use crate::registry::Registry;
 use crate::version::match_version_precision;
 use anyhow::Result;
 use futures::future::join_all;
 use regex::Regex;
 use serde_json::Value;
-use std::fs;
 use std::path::Path;
 
 pub struct PackageJsonUpdater;
@@ -78,7 +77,7 @@ impl Updater for PackageJsonUpdater {
         registry: &dyn Registry,
         options: UpdateOptions,
     ) -> Result<UpdateResult> {
-        let content = fs::read_to_string(path)?;
+        let content = read_file_safe(path)?;
         let json: Value = serde_json::from_str(&content)?;
         let mut result = UpdateResult::default();
         let mut new_content = content.clone();
@@ -171,7 +170,7 @@ impl Updater for PackageJsonUpdater {
         }
 
         if !result.updated.is_empty() && !options.dry_run {
-            fs::write(path, new_content)?;
+            write_file_atomic(path, &new_content)?;
         }
 
         Ok(result)
@@ -186,6 +185,7 @@ impl Updater for PackageJsonUpdater {
 mod tests {
     use super::*;
     use crate::registry::MockRegistry;
+    use std::fs;
     use std::io::Write;
     use tempfile::NamedTempFile;
 

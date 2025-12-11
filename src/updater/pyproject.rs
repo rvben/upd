@@ -1,10 +1,9 @@
-use super::{FileType, UpdateOptions, UpdateResult, Updater};
+use super::{FileType, UpdateOptions, UpdateResult, Updater, read_file_safe, write_file_atomic};
 use crate::registry::Registry;
 use crate::version::{is_stable_pep440, match_version_precision};
 use anyhow::{Result, anyhow};
 use futures::future::join_all;
 use regex::Regex;
-use std::fs;
 use std::path::Path;
 use toml_edit::{DocumentMut, Formatted, Item, Value};
 
@@ -289,7 +288,7 @@ impl Updater for PyProjectUpdater {
         registry: &dyn Registry,
         options: UpdateOptions,
     ) -> Result<UpdateResult> {
-        let content = fs::read_to_string(path)?;
+        let content = read_file_safe(path)?;
         let mut doc: DocumentMut = content
             .parse()
             .map_err(|e| anyhow!("Failed to parse TOML: {}", e))?;
@@ -373,7 +372,7 @@ impl Updater for PyProjectUpdater {
         }
 
         if !result.updated.is_empty() && !options.dry_run {
-            fs::write(path, doc.to_string())?;
+            write_file_atomic(path, &doc.to_string())?;
         }
 
         Ok(result)
@@ -388,6 +387,7 @@ impl Updater for PyProjectUpdater {
 mod tests {
     use super::*;
     use crate::registry::MockRegistry;
+    use std::fs;
     use std::io::Write;
     use tempfile::NamedTempFile;
 

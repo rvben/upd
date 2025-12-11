@@ -34,7 +34,7 @@ impl NpmRegistry {
     pub fn with_registry_url(registry_url: String) -> Self {
         let client = Client::builder()
             .gzip(true)
-            .user_agent("upd/0.1.0")
+            .user_agent(concat!("upd/", env!("CARGO_PKG_VERSION")))
             .timeout(Duration::from_secs(30))
             .connect_timeout(Duration::from_secs(10))
             .build()

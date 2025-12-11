@@ -1,11 +1,10 @@
-use super::{FileType, UpdateOptions, UpdateResult, Updater};
+use super::{FileType, UpdateOptions, UpdateResult, Updater, read_file_safe, write_file_atomic};
 use crate::registry::Registry;
 use crate::version::match_version_precision;
 use anyhow::Result;
 use futures::future::join_all;
 use regex::Regex;
 use std::collections::{HashMap, HashSet};
-use std::fs;
 use std::path::Path;
 
 pub struct GoModUpdater {
@@ -127,7 +126,7 @@ impl Updater for GoModUpdater {
         registry: &dyn Registry,
         options: UpdateOptions,
     ) -> Result<UpdateResult> {
-        let content = fs::read_to_string(path)?;
+        let content = read_file_safe(path)?;
         let mut result = UpdateResult::default();
 
         // Find modules with replace directives (we'll skip these)
@@ -311,7 +310,7 @@ impl Updater for GoModUpdater {
                 new_content
             };
 
-            fs::write(path, final_content)?;
+            write_file_atomic(path, &final_content)?;
         }
 
         Ok(result)
@@ -326,6 +325,7 @@ impl Updater for GoModUpdater {
 mod tests {
     use super::*;
     use crate::registry::MockRegistry;
+    use std::fs;
     use std::io::Write;
     use tempfile::NamedTempFile;
 

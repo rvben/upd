@@ -37,7 +37,11 @@ impl CratesIoRegistry {
         let client = Client::builder()
             .gzip(true)
             // crates.io requires a descriptive User-Agent
-            .user_agent("upd/0.1.0 (https://github.com/rvben/upd)")
+            .user_agent(concat!(
+                "upd/",
+                env!("CARGO_PKG_VERSION"),
+                " (https://github.com/rvben/upd)"
+            ))
             .timeout(Duration::from_secs(30))
             .connect_timeout(Duration::from_secs(10))
             .build()
