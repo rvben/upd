@@ -80,6 +80,14 @@ impl PyProjectUpdater {
         true
     }
 
+    /// Check if constraint is an upper-bound-only constraint (e.g., "<6", "<=5.0")
+    /// These should never be "updated" because they define a ceiling, not a floor.
+    /// Updating them would only make the constraint more restrictive.
+    fn is_upper_bound_only(constraint: &str) -> bool {
+        let trimmed = constraint.trim();
+        (trimmed.starts_with('<') || trimmed.starts_with("<=")) && !trimmed.contains(',') // No other constraints (like >=x,<y)
+    }
+
     /// Find the line number where a dependency string appears
     fn find_dependency_line(content: &str, dep_substring: &str) -> Option<usize> {
         for (line_idx, line) in content.lines().enumerate() {
@@ -150,9 +158,16 @@ impl PyProjectUpdater {
         // Process results and collect updates
         let mut updates: Vec<(usize, String)> = Vec::new();
 
-        for ((i, dep_str, package, current_version, _), version_result) in
+        for ((i, dep_str, package, current_version, full_constraint), version_result) in
             deps_to_check.into_iter().zip(version_results)
         {
+            // Skip upper-bound-only constraints (e.g., "<6", "<=5.0")
+            // These define a ceiling, not a floor - updating them would only restrict versions
+            if Self::is_upper_bound_only(&full_constraint) {
+                result.unchanged += 1;
+                continue;
+            }
+
             match version_result {
                 Ok(latest_version) => {
                     // Match the precision of the original version (unless full precision requested)
@@ -518,6 +533,24 @@ mod tests {
 
         // Exclusion operator
         assert!(!PyProjectUpdater::is_simple_constraint("!=1.5.0"));
+    }
+
+    #[test]
+    fn test_is_upper_bound_only() {
+        // Upper-bound-only constraints - should not be updated
+        assert!(PyProjectUpdater::is_upper_bound_only("<6"));
+        assert!(PyProjectUpdater::is_upper_bound_only("<4.2"));
+        assert!(PyProjectUpdater::is_upper_bound_only("<=5.0"));
+        assert!(PyProjectUpdater::is_upper_bound_only("<=2.0.0"));
+
+        // NOT upper-bound-only (have lower bounds or are pinned)
+        assert!(!PyProjectUpdater::is_upper_bound_only(">=1.0.0,<2.0.0")); // Has lower bound
+        assert!(!PyProjectUpdater::is_upper_bound_only(">=2.8.0,<9")); // Has lower bound
+        assert!(!PyProjectUpdater::is_upper_bound_only("==1.0.0")); // Pinned
+        assert!(!PyProjectUpdater::is_upper_bound_only(">=1.0.0")); // Lower bound only
+        assert!(!PyProjectUpdater::is_upper_bound_only(">1.0.0")); // Lower bound only
+        assert!(!PyProjectUpdater::is_upper_bound_only("~=1.4")); // Compatible release
+        assert!(!PyProjectUpdater::is_upper_bound_only("!=1.5.0")); // Exclusion
     }
 
     #[test]

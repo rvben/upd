@@ -176,6 +176,15 @@ impl RequirementsUpdater {
         true
     }
 
+    /// Check if constraint is an upper-bound-only constraint (e.g., "<6", "<=5.0")
+    /// These should never be "updated" because they define a ceiling, not a floor.
+    /// Updating them would only make the constraint more restrictive.
+    fn is_upper_bound_only(constraint: &str) -> bool {
+        // Upper-bound-only constraints start with < or <= and have no lower bound
+        let trimmed = constraint.trim();
+        (trimmed.starts_with('<') || trimmed.starts_with("<=")) && !trimmed.contains(',') // No other constraints (like >=x,<y)
+    }
+
     fn update_line(&self, line: &str, new_version: &str) -> String {
         if let Some(caps) = self.package_re.captures(line) {
             let full_match = caps.get(0).unwrap();
@@ -266,6 +275,14 @@ impl Updater for RequirementsUpdater {
             let line_num = line_idx + 1; // 1-indexed for display
 
             if let Some(parsed) = self.parse_line(line) {
+                // Skip upper-bound-only constraints (e.g., "<6", "<=5.0")
+                // These define a ceiling, not a floor - updating them would only restrict versions
+                if Self::is_upper_bound_only(&parsed.full_constraint) {
+                    result.unchanged += 1;
+                    new_lines.push(line.to_string());
+                    continue;
+                }
+
                 if let Some(version_result) = version_map.remove(&line_idx) {
                     match version_result {
                         Ok(latest_version) => {
@@ -494,6 +511,24 @@ flask>=2.0.0
 
         // Exclusion operator
         assert!(!RequirementsUpdater::is_simple_constraint("!=1.5.0"));
+    }
+
+    #[test]
+    fn test_is_upper_bound_only() {
+        // Upper-bound-only constraints - should not be updated
+        assert!(RequirementsUpdater::is_upper_bound_only("<6"));
+        assert!(RequirementsUpdater::is_upper_bound_only("<4.2"));
+        assert!(RequirementsUpdater::is_upper_bound_only("<=5.0"));
+        assert!(RequirementsUpdater::is_upper_bound_only("<=2.0.0"));
+
+        // NOT upper-bound-only (have lower bounds or are pinned)
+        assert!(!RequirementsUpdater::is_upper_bound_only(">=1.0.0,<2.0.0")); // Has lower bound
+        assert!(!RequirementsUpdater::is_upper_bound_only(">=2.8.0,<9")); // Has lower bound
+        assert!(!RequirementsUpdater::is_upper_bound_only("==1.0.0")); // Pinned
+        assert!(!RequirementsUpdater::is_upper_bound_only(">=1.0.0")); // Lower bound only
+        assert!(!RequirementsUpdater::is_upper_bound_only(">1.0.0")); // Lower bound only
+        assert!(!RequirementsUpdater::is_upper_bound_only("~=1.4")); // Compatible release
+        assert!(!RequirementsUpdater::is_upper_bound_only("!=1.5.0")); // Exclusion
     }
 
     #[test]
@@ -765,5 +800,86 @@ flask>=2.0.0
         assert_eq!(result.updated.len(), 0);
         assert_eq!(result.errors.len(), 1);
         assert!(result.errors[0].contains("nonexistent-package"));
+    }
+
+    #[tokio::test]
+    async fn test_upper_bound_only_constraint_not_updated() {
+        // Regression test: upper-bound-only constraints like "<6" should NOT be updated
+        // because that would only restrict the version range, not expand it
+        let mut file = NamedTempFile::new().unwrap();
+        writeln!(file, "django<6").unwrap();
+        writeln!(file, "flask<=3.0").unwrap();
+
+        let registry = MockRegistry::new("PyPI")
+            .with_version("django", "5.2")
+            .with_version("flask", "2.3.0");
+
+        let updater = RequirementsUpdater::new();
+        let options = UpdateOptions {
+            dry_run: false,
+            full_precision: false,
+        };
+
+        let result = updater
+            .update(file.path(), &registry, options)
+            .await
+            .unwrap();
+
+        // Neither package should be updated - they have upper-bound-only constraints
+        assert_eq!(
+            result.updated.len(),
+            0,
+            "Upper-bound-only constraints should not be updated"
+        );
+        assert_eq!(
+            result.unchanged, 2,
+            "Both packages should be marked as unchanged"
+        );
+
+        // Verify file contents were NOT modified
+        let contents = std::fs::read_to_string(file.path()).unwrap();
+        assert!(
+            contents.contains("django<6"),
+            "django constraint should remain unchanged"
+        );
+        assert!(
+            contents.contains("flask<=3.0"),
+            "flask constraint should remain unchanged"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_upper_bound_with_lower_bound_is_updated() {
+        // Constraints with BOTH upper AND lower bounds should be updated
+        // (the lower bound defines what we're updating)
+        let mut file = NamedTempFile::new().unwrap();
+        writeln!(file, "django>=4.0,<6").unwrap();
+
+        let registry = MockRegistry::new("PyPI").with_constrained("django", ">=4.0,<6", "5.2");
+
+        let updater = RequirementsUpdater::new();
+        let options = UpdateOptions {
+            dry_run: false,
+            full_precision: false,
+        };
+
+        let result = updater
+            .update(file.path(), &registry, options)
+            .await
+            .unwrap();
+
+        // This SHOULD be updated because it has a lower bound (>=4.0)
+        assert_eq!(
+            result.updated.len(),
+            1,
+            "Constraint with lower bound should be updated"
+        );
+
+        // Verify the version was updated
+        let contents = std::fs::read_to_string(file.path()).unwrap();
+        assert!(
+            contents.contains("django>=5.2"),
+            "Version should be updated to 5.2"
+        );
     }
 }
