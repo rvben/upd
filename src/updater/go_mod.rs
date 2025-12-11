@@ -1,4 +1,7 @@
-use super::{FileType, UpdateOptions, UpdateResult, Updater, read_file_safe, write_file_atomic};
+use super::{
+    FileType, ParsedDependency, UpdateOptions, UpdateResult, Updater, read_file_safe,
+    write_file_atomic,
+};
 use crate::registry::Registry;
 use crate::version::match_version_precision;
 use anyhow::Result;
@@ -318,6 +321,65 @@ impl Updater for GoModUpdater {
 
     fn handles(&self, file_type: FileType) -> bool {
         file_type == FileType::GoMod
+    }
+
+    fn parse_dependencies(&self, path: &Path) -> Result<Vec<ParsedDependency>> {
+        let content = read_file_safe(path)?;
+        let mut deps = Vec::new();
+
+        // Find modules with replace directives (we'll skip these)
+        let replaced_modules = self.find_replaced_modules(&content);
+        let mut in_require_block = false;
+
+        for (line_idx, line) in content.lines().enumerate() {
+            let trimmed = line.trim();
+
+            // Track require block state
+            if trimmed.starts_with("require (") || trimmed == "require (" {
+                in_require_block = true;
+                continue;
+            }
+
+            if in_require_block && trimmed == ")" {
+                in_require_block = false;
+                continue;
+            }
+
+            // Check if this line is a require statement (inside block or single-line)
+            let is_require_line = in_require_block
+                || (trimmed.starts_with("require ") && !trimmed.starts_with("require ("));
+
+            if !is_require_line {
+                continue;
+            }
+
+            // Try to parse as a module requirement
+            let line_to_parse = if in_require_block {
+                line
+            } else {
+                // Single-line require: "require github.com/foo/bar v1.0.0"
+                &line[line.find("require").map(|i| i + 7).unwrap_or(0)..]
+            };
+
+            if let Some(caps) = self.require_re.captures(line_to_parse) {
+                let module = caps.get(1).unwrap().as_str();
+                let current_version = caps.get(2).unwrap().as_str();
+
+                // Skip replaced modules and pseudo-versions
+                if replaced_modules.contains(module) || Self::is_pseudo_version(current_version) {
+                    continue;
+                }
+
+                deps.push(ParsedDependency {
+                    name: module.to_string(),
+                    version: current_version.to_string(),
+                    line_number: Some(line_idx + 1),
+                    has_upper_bound: false, // Go doesn't have explicit upper bounds
+                });
+            }
+        }
+
+        Ok(deps)
     }
 }
 

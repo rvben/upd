@@ -1,4 +1,7 @@
-use super::{FileType, UpdateOptions, UpdateResult, Updater, read_file_safe, write_file_atomic};
+use super::{
+    FileType, ParsedDependency, UpdateOptions, UpdateResult, Updater, read_file_safe,
+    write_file_atomic,
+};
 use crate::registry::Registry;
 use crate::version::match_version_precision;
 use anyhow::Result;
@@ -248,13 +251,31 @@ impl Updater for RequirementsUpdater {
     fn handles(&self, file_type: FileType) -> bool {
         file_type == FileType::Requirements
     }
+
+    fn parse_dependencies(&self, path: &Path) -> Result<Vec<ParsedDependency>> {
+        let content = read_file_safe(path)?;
+        let mut deps = Vec::new();
+
+        for (line_idx, line) in content.lines().enumerate() {
+            if let Some(parsed) = self.parse_line(line) {
+                let has_upper_bound = !Self::is_simple_constraint(&parsed.full_constraint);
+                deps.push(ParsedDependency {
+                    name: parsed.package,
+                    version: parsed.first_version,
+                    line_number: Some(line_idx + 1),
+                    has_upper_bound,
+                });
+            }
+        }
+
+        Ok(deps)
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::registry::MockRegistry;
-    use std::fs;
     use std::io::Write;
     use tempfile::NamedTempFile;
 

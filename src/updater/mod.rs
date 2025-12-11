@@ -70,6 +70,19 @@ pub struct UpdateOptions {
     pub full_precision: bool,
 }
 
+/// A parsed dependency from a file (for alignment purposes)
+#[derive(Debug, Clone)]
+pub struct ParsedDependency {
+    /// Package name
+    pub name: String,
+    /// Version string (the first/primary version number)
+    pub version: String,
+    /// Line number in the file (1-indexed)
+    pub line_number: Option<usize>,
+    /// Whether this dependency has upper bound constraints (e.g., <3.0)
+    pub has_upper_bound: bool,
+}
+
 /// Result of updating a single file
 #[derive(Debug, Default)]
 pub struct UpdateResult {
@@ -90,7 +103,7 @@ impl UpdateResult {
 }
 
 /// Language/ecosystem type for filtering
-#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, clap::ValueEnum)]
 pub enum Lang {
     Python,
     Node,
@@ -189,6 +202,9 @@ pub trait Updater: Send + Sync {
 
     /// Check if this updater handles the given file type
     fn handles(&self, file_type: FileType) -> bool;
+
+    /// Parse dependencies from a file (for alignment purposes)
+    fn parse_dependencies(&self, path: &Path) -> Result<Vec<ParsedDependency>>;
 }
 
 /// Discover dependency files in the given paths, optionally filtered by language

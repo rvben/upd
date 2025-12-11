@@ -4,14 +4,17 @@ use colored::Colorize;
 
 use std::collections::HashSet;
 use std::sync::Arc;
+use upd::align::{PackageAlignment, find_alignments, scan_packages};
 use upd::cache::{Cache, CachedRegistry};
 use upd::cli::{Cli, Command};
 use upd::interactive::{PendingUpdate, prompt_all};
 use upd::registry::{CratesIoRegistry, GoProxyRegistry, NpmRegistry, PyPiRegistry};
 use upd::updater::{
-    CargoTomlUpdater, FileType, GoModUpdater, PackageJsonUpdater, PyProjectUpdater,
-    RequirementsUpdater, UpdateOptions, UpdateResult, Updater, discover_files,
+    CargoTomlUpdater, FileType, GoModUpdater, Lang, PackageJsonUpdater, PyProjectUpdater,
+    RequirementsUpdater, UpdateOptions, UpdateResult, Updater, discover_files, read_file_safe,
+    write_file_atomic,
 };
+use upd::version::match_version_precision;
 
 /// Parse version components
 fn parse_version(v: &str) -> Option<(u64, u64, u64)> {
@@ -67,6 +70,9 @@ async fn main() -> Result<()> {
         }
         Some(Command::SelfUpdate) => {
             self_update().await?;
+        }
+        Some(Command::Align { .. }) => {
+            run_align(&cli).await?;
         }
         Some(Command::Update { .. }) | None => {
             run_update(&cli).await?;
@@ -370,6 +376,314 @@ async fn run_interactive_update(
     );
 
     Ok(())
+}
+
+async fn run_align(cli: &Cli) -> Result<()> {
+    let paths = cli.get_paths();
+    let files = discover_files(&paths, &cli.langs);
+    let file_count = files.len();
+
+    if files.is_empty() {
+        println!("{}", "No dependency files found.".yellow());
+        return Ok(());
+    }
+
+    if cli.verbose {
+        println!(
+            "{}",
+            format!("Scanning {} dependency file(s) for alignment", file_count).cyan()
+        );
+    }
+
+    // Scan all files for packages
+    let packages = match scan_packages(&files) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("{}", format!("Error scanning files: {}", e).red());
+            return Err(e);
+        }
+    };
+
+    // Find alignments
+    let align_result = find_alignments(packages);
+
+    // Filter to only misaligned packages
+    let misaligned: Vec<&PackageAlignment> = align_result
+        .packages
+        .iter()
+        .filter(|p| p.has_misalignment())
+        .collect();
+
+    if misaligned.is_empty() {
+        println!(
+            "{} Scanned {} file(s), all packages are aligned",
+            "✓".green(),
+            file_count
+        );
+        return Ok(());
+    }
+
+    // Display misalignments
+    let dry_run = cli.dry_run || cli.check;
+    let action_prefix = if dry_run { "Would align" } else { "Aligning" };
+
+    println!(
+        "\n{} {} misaligned package(s) across {} file(s):\n",
+        action_prefix,
+        misaligned.len().to_string().yellow().bold(),
+        file_count
+    );
+
+    for alignment in &misaligned {
+        print_alignment(alignment, dry_run);
+    }
+
+    // Apply alignments if not dry-run
+    if !dry_run {
+        let updated_count = apply_alignments(&misaligned, cli.full_precision)?;
+        println!(
+            "\n{} {} package occurrence(s)",
+            "Aligned".green(),
+            updated_count.to_string().green().bold()
+        );
+    } else {
+        let total_misaligned: usize = misaligned
+            .iter()
+            .map(|a| a.misaligned_occurrences().len())
+            .sum();
+        println!(
+            "\n{} {} package occurrence(s) to align",
+            "Found".yellow(),
+            total_misaligned.to_string().yellow().bold()
+        );
+    }
+
+    // In check mode, exit with code 1 if any misalignments exist
+    if cli.check && !misaligned.is_empty() {
+        std::process::exit(1);
+    }
+
+    Ok(())
+}
+
+fn print_alignment(alignment: &PackageAlignment, _dry_run: bool) {
+    let lang_indicator = match alignment.lang {
+        Lang::Python => "",
+        Lang::Node => " (npm)",
+        Lang::Rust => " (cargo)",
+        Lang::Go => " (go)",
+    };
+
+    println!(
+        "  {}{}",
+        alignment.package_name.bold(),
+        lang_indicator.dimmed()
+    );
+    println!("    → {} (highest)", alignment.highest_version.green());
+
+    for occurrence in &alignment.occurrences {
+        let location = match occurrence.line_number {
+            Some(n) => format!("{}:{}", occurrence.file_path.display(), n),
+            None => occurrence.file_path.display().to_string(),
+        };
+
+        if occurrence.has_upper_bound {
+            println!(
+                "    {} {} {} {}",
+                "├──".dimmed(),
+                location.blue(),
+                occurrence.version.dimmed(),
+                "(constrained, skipped)".yellow()
+            );
+        } else if occurrence.version == alignment.highest_version {
+            println!(
+                "    {} {} {} {}",
+                "├──".dimmed(),
+                location.blue(),
+                occurrence.version.green(),
+                "(already aligned)".dimmed()
+            );
+        } else {
+            println!(
+                "    {} {} {} → {}",
+                "├──".dimmed(),
+                location.blue(),
+                occurrence.version.red(),
+                alignment.highest_version.green()
+            );
+        }
+    }
+
+    println!();
+}
+
+fn apply_alignments(alignments: &[&PackageAlignment], full_precision: bool) -> Result<usize> {
+    use std::collections::HashMap;
+
+    // Group updates by file path
+    let mut updates_by_file: HashMap<&std::path::Path, Vec<(&str, &str, &str)>> = HashMap::new();
+
+    for alignment in alignments {
+        for occurrence in alignment.misaligned_occurrences() {
+            updates_by_file
+                .entry(occurrence.file_path.as_path())
+                .or_default()
+                .push((
+                    &alignment.package_name,
+                    &occurrence.version,
+                    &alignment.highest_version,
+                ));
+        }
+    }
+
+    let mut total_updated = 0;
+
+    for (path, updates) in updates_by_file {
+        let content = read_file_safe(path)?;
+        let file_type = FileType::detect(path).unwrap();
+
+        let new_content = apply_version_updates(&content, &updates, file_type, full_precision);
+
+        if new_content != content {
+            write_file_atomic(path, &new_content)?;
+            total_updated += updates.len();
+        }
+    }
+
+    Ok(total_updated)
+}
+
+fn apply_version_updates(
+    content: &str,
+    updates: &[(&str, &str, &str)],
+    file_type: FileType,
+    full_precision: bool,
+) -> String {
+    let mut result = content.to_string();
+
+    for (package, old_version, new_version) in updates {
+        let target_version = if full_precision {
+            (*new_version).to_string()
+        } else {
+            match_version_precision(old_version, new_version)
+        };
+
+        result = match file_type {
+            FileType::Requirements => {
+                replace_requirements_version(&result, package, old_version, &target_version)
+            }
+            FileType::PyProject => {
+                replace_pyproject_version(&result, package, old_version, &target_version)
+            }
+            FileType::PackageJson => {
+                replace_package_json_version(&result, package, old_version, &target_version)
+            }
+            FileType::CargoToml => {
+                replace_cargo_toml_version(&result, package, old_version, &target_version)
+            }
+            FileType::GoMod => {
+                replace_go_mod_version(&result, package, old_version, &target_version)
+            }
+        };
+    }
+
+    result
+}
+
+fn replace_requirements_version(content: &str, package: &str, old: &str, new: &str) -> String {
+    // Pattern: package_name followed by version specifier and old version
+    let pattern = format!(
+        r"(?m)^({}(?:\[[^\]]*\])?\s*(?:==|>=|~=))\s*{}",
+        regex::escape(package),
+        regex::escape(old)
+    );
+    let re = regex::Regex::new(&pattern).unwrap();
+    re.replace_all(content, format!("${{1}}{}", new))
+        .to_string()
+}
+
+fn replace_pyproject_version(content: &str, package: &str, old: &str, new: &str) -> String {
+    // For pyproject.toml, we need to handle both PEP 621 array format and Poetry table format
+    let mut result = content.to_string();
+
+    // PEP 621: "package>=old" -> "package>=new"
+    let pattern = format!(
+        r#""({}(?:\[[^\]]*\])?\s*(?:==|>=|~=|<=|!=|>|<)\s*){}""#,
+        regex::escape(package),
+        regex::escape(old)
+    );
+    let re = regex::Regex::new(&pattern).unwrap();
+    result = re
+        .replace_all(&result, format!(r#""${{1}}{}""#, new))
+        .to_string();
+
+    // Poetry: version = "^old" or "old"
+    // This is trickier - need to preserve the constraint operator
+    let pattern = format!(
+        r#"(\[tool\.poetry(?:\.[^\]]+)?\](?:[^\[]*?{}\s*=\s*(?:\{{[^}}]*version\s*=\s*)?")[~^>=<]*){}""#,
+        regex::escape(package),
+        regex::escape(old)
+    );
+    if let Ok(re) = regex::Regex::new(&pattern) {
+        result = re
+            .replace_all(&result, format!(r#"${{1}}{}""#, new))
+            .to_string();
+    }
+
+    result
+}
+
+fn replace_package_json_version(content: &str, package: &str, old: &str, new: &str) -> String {
+    // Pattern: "package": "^old" or "~old" etc.
+    let pattern = format!(
+        r#"("{}"\s*:\s*"[\^~>=<]*){}""#,
+        regex::escape(package),
+        regex::escape(old)
+    );
+    let re = regex::Regex::new(&pattern).unwrap();
+    re.replace_all(content, format!(r#"${{1}}{}""#, new))
+        .to_string()
+}
+
+fn replace_cargo_toml_version(content: &str, package: &str, old: &str, new: &str) -> String {
+    let mut result = content.to_string();
+
+    // Simple format: package = "version"
+    let pattern = format!(
+        r#"({}\s*=\s*")[~^>=<]*{}""#,
+        regex::escape(package),
+        regex::escape(old)
+    );
+    let re = regex::Regex::new(&pattern).unwrap();
+    result = re
+        .replace_all(&result, format!(r#"${{1}}{}""#, new))
+        .to_string();
+
+    // Table format: package = { version = "old" }
+    let pattern = format!(
+        r#"({}\s*=\s*\{{[^}}]*version\s*=\s*")[~^>=<]*{}""#,
+        regex::escape(package),
+        regex::escape(old)
+    );
+    if let Ok(re) = regex::Regex::new(&pattern) {
+        result = re
+            .replace_all(&result, format!(r#"${{1}}{}""#, new))
+            .to_string();
+    }
+
+    result
+}
+
+fn replace_go_mod_version(content: &str, package: &str, old: &str, new: &str) -> String {
+    // Pattern: module/path vOLD
+    let pattern = format!(
+        r"({}\s+){}(\s|$)",
+        regex::escape(package),
+        regex::escape(old)
+    );
+    let re = regex::Regex::new(&pattern).unwrap();
+    re.replace_all(content, format!("${{1}}{}${{2}}", new))
+        .to_string()
 }
 
 /// Filter configuration for update types

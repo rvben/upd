@@ -1,4 +1,7 @@
-use super::{FileType, UpdateOptions, UpdateResult, Updater, read_file_safe, write_file_atomic};
+use super::{
+    FileType, ParsedDependency, UpdateOptions, UpdateResult, Updater, read_file_safe,
+    write_file_atomic,
+};
 use crate::registry::Registry;
 use crate::version::{is_stable_pep440, match_version_precision};
 use anyhow::{Result, anyhow};
@@ -381,13 +384,96 @@ impl Updater for PyProjectUpdater {
     fn handles(&self, file_type: FileType) -> bool {
         file_type == FileType::PyProject
     }
+
+    fn parse_dependencies(&self, path: &Path) -> Result<Vec<ParsedDependency>> {
+        let content = read_file_safe(path)?;
+        let doc: DocumentMut = content
+            .parse()
+            .map_err(|e| anyhow!("Failed to parse TOML: {}", e))?;
+
+        let mut deps = Vec::new();
+
+        // Parse [project.dependencies]
+        if let Some(Item::Table(project)) = doc.get("project") {
+            if let Some(Item::Value(Value::Array(arr))) = project.get("dependencies") {
+                for item in arr.iter() {
+                    if let Some(s) = item.as_str()
+                        && let Some((name, version, constraint)) = self.parse_dependency(s)
+                    {
+                        let has_upper_bound = !Self::is_simple_constraint(&constraint);
+                        let line_num = Self::find_dependency_line(&content, &name);
+                        deps.push(ParsedDependency {
+                            name,
+                            version,
+                            line_number: line_num,
+                            has_upper_bound,
+                        });
+                    }
+                }
+            }
+
+            // Parse [project.optional-dependencies.*]
+            if let Some(Item::Table(opt_deps)) = project.get("optional-dependencies") {
+                for (_, group_deps) in opt_deps.iter() {
+                    if let Some(arr) = group_deps.as_array() {
+                        for item in arr.iter() {
+                            if let Some(s) = item.as_str()
+                                && let Some((name, version, constraint)) = self.parse_dependency(s)
+                            {
+                                let has_upper_bound = !Self::is_simple_constraint(&constraint);
+                                let line_num = Self::find_dependency_line(&content, &name);
+                                deps.push(ParsedDependency {
+                                    name,
+                                    version,
+                                    line_number: line_num,
+                                    has_upper_bound,
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Parse [tool.poetry.dependencies] and [tool.poetry.dev-dependencies]
+        if let Some(Item::Table(tool)) = doc.get("tool")
+            && let Some(Item::Table(poetry)) = tool.get("poetry")
+        {
+            for section in ["dependencies", "dev-dependencies"] {
+                if let Some(Item::Table(section_deps)) = poetry.get(section) {
+                    for (key, item) in section_deps.iter() {
+                        if key == "python" {
+                            continue;
+                        }
+                        if let Item::Value(Value::String(s)) = item {
+                            let version_str = s.value().to_string();
+                            let version =
+                                if version_str.starts_with('^') || version_str.starts_with('~') {
+                                    version_str[1..].to_string()
+                                } else {
+                                    version_str
+                                };
+                            let line_num = Self::find_dependency_line(&content, key);
+                            deps.push(ParsedDependency {
+                                name: key.to_string(),
+                                version,
+                                line_number: line_num,
+                                has_upper_bound: false,
+                            });
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(deps)
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::registry::MockRegistry;
-    use std::fs;
     use std::io::Write;
     use tempfile::NamedTempFile;
 

@@ -1,4 +1,7 @@
-use super::{FileType, UpdateOptions, UpdateResult, Updater, read_file_safe, write_file_atomic};
+use super::{
+    FileType, ParsedDependency, UpdateOptions, UpdateResult, Updater, read_file_safe,
+    write_file_atomic,
+};
 use crate::registry::Registry;
 use crate::version::match_version_precision;
 use anyhow::Result;
@@ -178,6 +181,53 @@ impl Updater for PackageJsonUpdater {
 
     fn handles(&self, file_type: FileType) -> bool {
         file_type == FileType::PackageJson
+    }
+
+    fn parse_dependencies(&self, path: &Path) -> Result<Vec<ParsedDependency>> {
+        let content = read_file_safe(path)?;
+        let json: Value = serde_json::from_str(&content)?;
+        let mut deps = Vec::new();
+
+        for section in [
+            "dependencies",
+            "devDependencies",
+            "peerDependencies",
+            "optionalDependencies",
+        ] {
+            if let Some(section_deps) = json.get(section).and_then(|v| v.as_object()) {
+                for (package, version_value) in section_deps {
+                    if let Some(version_str) = version_value.as_str() {
+                        // Skip non-version values (git urls, file paths, etc.)
+                        if version_str.starts_with("git")
+                            || version_str.starts_with("http")
+                            || version_str.starts_with("file:")
+                            || version_str.contains('/')
+                            || version_str == "*"
+                            || version_str == "latest"
+                        {
+                            continue;
+                        }
+
+                        let (_, current_version) = self.extract_version_info(version_str);
+
+                        // Skip invalid versions
+                        if semver::Version::parse(&current_version).is_err() {
+                            continue;
+                        }
+
+                        let line_num = self.find_package_line(&content, package);
+                        deps.push(ParsedDependency {
+                            name: package.clone(),
+                            version: current_version,
+                            line_number: line_num,
+                            has_upper_bound: false, // npm versions don't have explicit upper bounds like Python
+                        });
+                    }
+                }
+            }
+        }
+
+        Ok(deps)
     }
 }
 

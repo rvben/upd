@@ -71,6 +71,13 @@ pub enum Command {
         paths: Vec<PathBuf>,
     },
 
+    /// Align all packages to the highest version found in the repository
+    Align {
+        /// Paths to scan and align
+        #[arg()]
+        paths: Vec<PathBuf>,
+    },
+
     /// Show version information
     Version,
 
@@ -85,6 +92,7 @@ impl Cli {
     pub fn get_paths(&self) -> Vec<PathBuf> {
         match &self.command {
             Some(Command::Update { paths }) if !paths.is_empty() => paths.clone(),
+            Some(Command::Align { paths }) if !paths.is_empty() => paths.clone(),
             _ if !self.paths.is_empty() => self.paths.clone(),
             _ => vec![PathBuf::from(".")],
         }
@@ -278,5 +286,31 @@ mod tests {
         assert!(cli.check);
         assert_eq!(cli.langs.len(), 1);
         assert_eq!(cli.langs[0], Lang::Python);
+    }
+
+    #[test]
+    fn test_cli_parses_align_command() {
+        let cli = Cli::try_parse_from(["upd", "align"]).unwrap();
+        assert!(matches!(cli.command, Some(Command::Align { .. })));
+    }
+
+    #[test]
+    fn test_cli_parses_align_command_with_paths() {
+        let cli = Cli::try_parse_from(["upd", "align", "path1", "path2"]).unwrap();
+        match cli.command {
+            Some(Command::Align { paths }) => {
+                assert_eq!(paths.len(), 2);
+                assert_eq!(paths[0], PathBuf::from("path1"));
+                assert_eq!(paths[1], PathBuf::from("path2"));
+            }
+            _ => panic!("Expected Align command"),
+        }
+    }
+
+    #[test]
+    fn test_get_paths_uses_align_command_paths() {
+        let cli = Cli::try_parse_from(["upd", "align", "cmd_path"]).unwrap();
+        let paths = cli.get_paths();
+        assert_eq!(paths, vec![PathBuf::from("cmd_path")]);
     }
 }

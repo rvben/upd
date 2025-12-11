@@ -1,4 +1,7 @@
-use super::{FileType, UpdateOptions, UpdateResult, Updater, read_file_safe, write_file_atomic};
+use super::{
+    FileType, ParsedDependency, UpdateOptions, UpdateResult, Updater, read_file_safe,
+    write_file_atomic,
+};
 use crate::registry::Registry;
 use crate::version::{is_stable_semver, match_version_precision};
 use anyhow::{Result, anyhow};
@@ -314,6 +317,84 @@ impl Updater for CargoTomlUpdater {
 
     fn handles(&self, file_type: FileType) -> bool {
         file_type == FileType::CargoToml
+    }
+
+    fn parse_dependencies(&self, path: &Path) -> Result<Vec<ParsedDependency>> {
+        let content = read_file_safe(path)?;
+        let doc: DocumentMut = content
+            .parse()
+            .map_err(|e| anyhow!("Failed to parse Cargo.toml: {}", e))?;
+
+        let mut deps = Vec::new();
+
+        // Helper to parse dependencies from a table
+        let parse_table = |table: &toml_edit::Table, deps: &mut Vec<ParsedDependency>| {
+            for (key, item) in table.iter() {
+                // Skip path/git dependencies
+                if let Item::Value(Value::InlineTable(t)) = item
+                    && (t.contains_key("path") || t.contains_key("git"))
+                {
+                    continue;
+                }
+                if let Item::Table(t) = item
+                    && (t.contains_key("path") || t.contains_key("git"))
+                {
+                    continue;
+                }
+
+                if let Some(version_req) = Self::get_version(item) {
+                    let (_, version) = Self::parse_version_req(&version_req);
+                    let line_num = Self::find_dependency_line(&content, key);
+                    deps.push(ParsedDependency {
+                        name: key.to_string(),
+                        version,
+                        line_number: line_num,
+                        has_upper_bound: false, // Cargo.toml doesn't use same constraint syntax as Python
+                    });
+                }
+            }
+        };
+
+        // Parse [dependencies]
+        if let Some(Item::Table(table)) = doc.get("dependencies") {
+            parse_table(table, &mut deps);
+        }
+
+        // Parse [dev-dependencies]
+        if let Some(Item::Table(table)) = doc.get("dev-dependencies") {
+            parse_table(table, &mut deps);
+        }
+
+        // Parse [build-dependencies]
+        if let Some(Item::Table(table)) = doc.get("build-dependencies") {
+            parse_table(table, &mut deps);
+        }
+
+        // Parse [workspace.dependencies]
+        if let Some(Item::Table(workspace)) = doc.get("workspace")
+            && let Some(Item::Table(table)) = workspace.get("dependencies")
+        {
+            parse_table(table, &mut deps);
+        }
+
+        // Parse [target.'cfg(...)'.dependencies] sections
+        if let Some(Item::Table(target)) = doc.get("target") {
+            for (_, target_item) in target.iter() {
+                if let Item::Table(target_table) = target_item {
+                    if let Some(Item::Table(table)) = target_table.get("dependencies") {
+                        parse_table(table, &mut deps);
+                    }
+                    if let Some(Item::Table(table)) = target_table.get("dev-dependencies") {
+                        parse_table(table, &mut deps);
+                    }
+                    if let Some(Item::Table(table)) = target_table.get("build-dependencies") {
+                        parse_table(table, &mut deps);
+                    }
+                }
+            }
+        }
+
+        Ok(deps)
     }
 }
 
