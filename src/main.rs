@@ -106,10 +106,57 @@ async fn run_update(cli: &Cli) -> Result<()> {
     let cache = Cache::new_shared();
     let cache_enabled = !cli.no_cache;
 
-    let pypi = CachedRegistry::new(PyPiRegistry::new(), Arc::clone(&cache), cache_enabled);
-    let npm = CachedRegistry::new(NpmRegistry::new(), Arc::clone(&cache), cache_enabled);
-    let crates_io = CachedRegistry::new(CratesIoRegistry::new(), Arc::clone(&cache), cache_enabled);
-    let go_proxy = CachedRegistry::new(GoProxyRegistry::new(), Arc::clone(&cache), cache_enabled);
+    // Create PyPI registry with optional credentials
+    let pypi_registry = {
+        let index_url =
+            PyPiRegistry::detect_index_url().unwrap_or_else(|| "https://pypi.org/pypi".to_string());
+        let credentials = PyPiRegistry::detect_credentials(&index_url);
+        if cli.verbose && credentials.is_some() {
+            println!("{}", "Using authenticated PyPI access".cyan());
+        }
+        PyPiRegistry::with_index_url_and_credentials(index_url, credentials)
+    };
+
+    let pypi = CachedRegistry::new(pypi_registry, Arc::clone(&cache), cache_enabled);
+
+    // Create npm registry with optional credentials
+    let npm_registry = {
+        let registry_url = NpmRegistry::detect_registry_url()
+            .unwrap_or_else(|| "https://registry.npmjs.org".to_string());
+        let credentials = NpmRegistry::detect_credentials(&registry_url);
+        if cli.verbose && credentials.is_some() {
+            println!("{}", "Using authenticated npm access".cyan());
+        }
+        NpmRegistry::with_registry_url_and_credentials(registry_url, credentials)
+    };
+
+    let npm = CachedRegistry::new(npm_registry, Arc::clone(&cache), cache_enabled);
+
+    // Create Cargo registry with optional credentials
+    let crates_io_registry = {
+        let registry_url = CratesIoRegistry::detect_registry_url()
+            .unwrap_or_else(|| "https://crates.io/api/v1/crates".to_string());
+        let credentials = CratesIoRegistry::detect_credentials("crates-io");
+        if cli.verbose && credentials.is_some() {
+            println!("{}", "Using authenticated crates.io access".cyan());
+        }
+        CratesIoRegistry::with_registry_url_and_credentials(registry_url, credentials)
+    };
+
+    let crates_io = CachedRegistry::new(crates_io_registry, Arc::clone(&cache), cache_enabled);
+
+    // Create Go proxy registry with optional credentials
+    let go_proxy_registry = {
+        let proxy_url = GoProxyRegistry::detect_proxy_url()
+            .unwrap_or_else(|| "https://proxy.golang.org".to_string());
+        let credentials = GoProxyRegistry::detect_credentials(&proxy_url);
+        if cli.verbose && credentials.is_some() {
+            println!("{}", "Using authenticated Go proxy access".cyan());
+        }
+        GoProxyRegistry::with_proxy_url_and_credentials(proxy_url, credentials)
+    };
+
+    let go_proxy = CachedRegistry::new(go_proxy_registry, Arc::clone(&cache), cache_enabled);
 
     // Create updaters
     let requirements_updater = RequirementsUpdater::new();

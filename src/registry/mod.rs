@@ -4,13 +4,14 @@ mod go_proxy;
 pub mod mock;
 mod npm;
 mod pypi;
+mod utils;
 
-pub use crates_io::CratesIoRegistry;
-pub use go_proxy::GoProxyRegistry;
+pub use crates_io::{CargoCredentials, CratesIoRegistry};
+pub use go_proxy::{GoCredentials, GoProxyRegistry};
 #[cfg(test)]
 pub use mock::MockRegistry;
-pub use npm::NpmRegistry;
-pub use pypi::PyPiRegistry;
+pub use npm::{NpmCredentials, NpmRegistry};
+pub use pypi::{PyPiCredentials, PyPiRegistry};
 
 use anyhow::Result;
 use async_trait::async_trait;
@@ -265,5 +266,124 @@ mod tests {
     async fn test_registry_name() {
         let registry = MinimalRegistry::new("1.0.0");
         assert_eq!(registry.name(), "Minimal");
+    }
+
+    // Integration tests for authentication headers
+    mod auth_tests {
+        use super::super::*;
+        use wiremock::matchers::{header, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        #[tokio::test]
+        async fn test_pypi_sends_basic_auth_header() {
+            let mock_server = MockServer::start().await;
+
+            // Verify that Basic Auth header is sent
+            // "testuser:testpass" base64 encoded is "dGVzdHVzZXI6dGVzdHBhc3M="
+            Mock::given(method("GET"))
+                .and(path("/testpkg/json"))
+                .and(header("Authorization", "Basic dGVzdHVzZXI6dGVzdHBhc3M="))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .set_body_string(r#"{"releases": {"1.0.0": [{"yanked": false}]}}"#),
+                )
+                .expect(1)
+                .mount(&mock_server)
+                .await;
+
+            let creds = PyPiCredentials {
+                username: "testuser".to_string(),
+                password: "testpass".to_string(),
+            };
+
+            let registry =
+                PyPiRegistry::with_index_url_and_credentials(mock_server.uri(), Some(creds));
+
+            let version = registry.get_latest_version("testpkg").await.unwrap();
+            assert_eq!(version, "1.0.0");
+        }
+
+        #[tokio::test]
+        async fn test_npm_sends_bearer_token_header() {
+            let mock_server = MockServer::start().await;
+
+            // Verify that Bearer token header is sent
+            Mock::given(method("GET"))
+                .and(path("/testpkg"))
+                .and(header("Authorization", "Bearer my-secret-token"))
+                .respond_with(ResponseTemplate::new(200).set_body_string(
+                    r#"{"dist-tags": {"latest": "2.0.0"}, "versions": {"2.0.0": {}}}"#,
+                ))
+                .expect(1)
+                .mount(&mock_server)
+                .await;
+
+            let creds = NpmCredentials {
+                token: "my-secret-token".to_string(),
+            };
+
+            let registry =
+                NpmRegistry::with_registry_url_and_credentials(mock_server.uri(), Some(creds));
+
+            let version = registry.get_latest_version("testpkg").await.unwrap();
+            assert_eq!(version, "2.0.0");
+        }
+
+        #[tokio::test]
+        async fn test_crates_io_sends_bearer_token_header() {
+            let mock_server = MockServer::start().await;
+
+            // Verify that Bearer token header is sent (Cargo uses Bearer tokens)
+            Mock::given(method("GET"))
+                .and(path("/testcrate"))
+                .and(header("Authorization", "cargo-token-123"))
+                .respond_with(ResponseTemplate::new(200).set_body_string(
+                    r#"{"crate": {"max_stable_version": "3.0.0"}, "versions": [{"num": "3.0.0", "yanked": false}]}"#,
+                ))
+                .expect(1)
+                .mount(&mock_server)
+                .await;
+
+            let creds = CargoCredentials {
+                token: "cargo-token-123".to_string(),
+            };
+
+            let registry =
+                CratesIoRegistry::with_registry_url_and_credentials(mock_server.uri(), Some(creds));
+
+            let version = registry.get_latest_version("testcrate").await.unwrap();
+            assert_eq!(version, "3.0.0");
+        }
+
+        #[tokio::test]
+        async fn test_go_proxy_sends_basic_auth_header() {
+            let mock_server = MockServer::start().await;
+
+            // Verify that Basic Auth header is sent
+            // "gouser:gopass" base64 encoded is "Z291c2VyOmdvcGFzcw=="
+            Mock::given(method("GET"))
+                .and(path("/github.com/test/module/@latest"))
+                .and(header("Authorization", "Basic Z291c2VyOmdvcGFzcw=="))
+                .respond_with(
+                    ResponseTemplate::new(200).set_body_string(r#"{"Version": "v1.0.0"}"#),
+                )
+                .expect(1)
+                .mount(&mock_server)
+                .await;
+
+            let creds = GoCredentials {
+                username: "gouser".to_string(),
+                password: "gopass".to_string(),
+            };
+
+            let registry =
+                GoProxyRegistry::with_proxy_url_and_credentials(mock_server.uri(), Some(creds));
+
+            let version = registry
+                .get_latest_version("github.com/test/module")
+                .await
+                .unwrap();
+            assert_eq!(version, "v1.0.0");
+        }
     }
 }

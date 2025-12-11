@@ -2,12 +2,13 @@ use super::{
     FileType, ParsedDependency, UpdateOptions, UpdateResult, Updater, read_file_safe,
     write_file_atomic,
 };
-use crate::registry::Registry;
+use crate::registry::{PyPiRegistry, Registry};
 use crate::version::match_version_precision;
 use anyhow::Result;
 use futures::future::join_all;
 use regex::Regex;
 use std::path::Path;
+use std::sync::Arc;
 
 pub struct RequirementsUpdater {
     // Regex to match package specifications
@@ -50,6 +51,68 @@ impl RequirementsUpdater {
             package_re,
             constraint_re,
         }
+    }
+
+    /// Parse index URL from a line (--index-url or -i)
+    fn parse_index_url(line: &str) -> Option<String> {
+        let trimmed = line.trim();
+
+        // Check for --index-url URL or --index-url=URL
+        if let Some(rest) = trimmed.strip_prefix("--index-url") {
+            let rest = rest.trim_start();
+            if let Some(url) = rest.strip_prefix('=') {
+                return Some(url.trim().to_string());
+            }
+            if !rest.is_empty() && !rest.starts_with('-') {
+                return Some(rest.split_whitespace().next()?.to_string());
+            }
+        }
+
+        // Check for -i URL
+        if let Some(rest) = trimmed.strip_prefix("-i") {
+            let rest = rest.trim_start();
+            if !rest.is_empty() && !rest.starts_with('-') {
+                return Some(rest.split_whitespace().next()?.to_string());
+            }
+        }
+
+        None
+    }
+
+    /// Parse extra index URLs from a line (--extra-index-url)
+    fn parse_extra_index_url(line: &str) -> Option<String> {
+        let trimmed = line.trim();
+
+        // Check for --extra-index-url URL or --extra-index-url=URL
+        if let Some(rest) = trimmed.strip_prefix("--extra-index-url") {
+            let rest = rest.trim_start();
+            if let Some(url) = rest.strip_prefix('=') {
+                return Some(url.trim().to_string());
+            }
+            if !rest.is_empty() && !rest.starts_with('-') {
+                return Some(rest.split_whitespace().next()?.to_string());
+            }
+        }
+
+        None
+    }
+
+    /// Extract all index URLs from a requirements file content
+    /// Returns (primary_index_url, extra_index_urls)
+    fn extract_index_urls(content: &str) -> (Option<String>, Vec<String>) {
+        let mut primary_index: Option<String> = None;
+        let mut extra_indexes: Vec<String> = Vec::new();
+
+        for line in content.lines() {
+            if let Some(url) = Self::parse_index_url(line) {
+                primary_index = Some(url);
+            }
+            if let Some(url) = Self::parse_extra_index_url(line) {
+                extra_indexes.push(url);
+            }
+        }
+
+        (primary_index, extra_indexes)
     }
 
     fn parse_line(&self, line: &str) -> Option<ParsedDep> {
@@ -150,6 +213,18 @@ impl Updater for RequirementsUpdater {
         let content = read_file_safe(path)?;
         let mut result = UpdateResult::default();
 
+        // Check for inline index URL in the requirements file
+        let (inline_index, _extra_indexes) = Self::extract_index_urls(&content);
+
+        // Use inline index URL if present, otherwise use provided registry
+        let inline_registry: Option<Arc<PyPiRegistry>> =
+            inline_index.map(|url| Arc::new(PyPiRegistry::from_url(&url)));
+
+        let effective_registry: &dyn Registry = match &inline_registry {
+            Some(r) => r.as_ref(),
+            None => registry,
+        };
+
         // First pass: collect all packages that need version checks
         let lines: Vec<&str> = content.lines().collect();
         let mut parsed_deps: Vec<(usize, &str, ParsedDep)> = Vec::new();
@@ -165,9 +240,9 @@ impl Updater for RequirementsUpdater {
             .iter()
             .map(|(_, _, parsed)| async {
                 if Self::is_simple_constraint(&parsed.full_constraint) {
-                    registry.get_latest_version(&parsed.package).await
+                    effective_registry.get_latest_version(&parsed.package).await
                 } else {
-                    registry
+                    effective_registry
                         .get_latest_version_matching(&parsed.package, &parsed.full_constraint)
                         .await
                 }
@@ -314,6 +389,91 @@ mod tests {
         assert!(updater.parse_line("# comment").is_none());
         assert!(updater.parse_line("").is_none());
         assert!(updater.parse_line("-r other.txt").is_none());
+    }
+
+    #[test]
+    fn test_parse_index_url() {
+        // --index-url with space
+        assert_eq!(
+            RequirementsUpdater::parse_index_url("--index-url https://pypi.example.com/simple"),
+            Some("https://pypi.example.com/simple".to_string())
+        );
+
+        // --index-url with equals
+        assert_eq!(
+            RequirementsUpdater::parse_index_url("--index-url=https://pypi.example.com/simple"),
+            Some("https://pypi.example.com/simple".to_string())
+        );
+
+        // -i short form
+        assert_eq!(
+            RequirementsUpdater::parse_index_url("-i https://pypi.example.com/simple"),
+            Some("https://pypi.example.com/simple".to_string())
+        );
+
+        // URL with credentials
+        assert_eq!(
+            RequirementsUpdater::parse_index_url(
+                "--index-url https://user:pass@pypi.example.com/simple"
+            ),
+            Some("https://user:pass@pypi.example.com/simple".to_string())
+        );
+
+        // Non-index lines
+        assert!(RequirementsUpdater::parse_index_url("requests==2.28.0").is_none());
+        assert!(RequirementsUpdater::parse_index_url("# comment").is_none());
+        assert!(RequirementsUpdater::parse_index_url("-r other.txt").is_none());
+    }
+
+    #[test]
+    fn test_parse_extra_index_url() {
+        // --extra-index-url with space
+        assert_eq!(
+            RequirementsUpdater::parse_extra_index_url(
+                "--extra-index-url https://extra.example.com/simple"
+            ),
+            Some("https://extra.example.com/simple".to_string())
+        );
+
+        // --extra-index-url with equals
+        assert_eq!(
+            RequirementsUpdater::parse_extra_index_url(
+                "--extra-index-url=https://extra.example.com/simple"
+            ),
+            Some("https://extra.example.com/simple".to_string())
+        );
+
+        // Non-extra-index lines
+        assert!(
+            RequirementsUpdater::parse_extra_index_url(
+                "--index-url https://pypi.example.com/simple"
+            )
+            .is_none()
+        );
+        assert!(RequirementsUpdater::parse_extra_index_url("requests==2.28.0").is_none());
+    }
+
+    #[test]
+    fn test_extract_index_urls() {
+        let content = r#"
+--index-url https://pypi.example.com/simple
+--extra-index-url https://extra1.example.com/simple
+--extra-index-url https://extra2.example.com/simple
+requests==2.28.0
+flask>=2.0.0
+"#;
+
+        let (primary, extra) = RequirementsUpdater::extract_index_urls(content);
+        assert_eq!(primary, Some("https://pypi.example.com/simple".to_string()));
+        assert_eq!(extra.len(), 2);
+        assert_eq!(extra[0], "https://extra1.example.com/simple");
+        assert_eq!(extra[1], "https://extra2.example.com/simple");
+
+        // No index URLs
+        let content = "requests==2.28.0\nflask>=2.0.0";
+        let (primary, extra) = RequirementsUpdater::extract_index_urls(content);
+        assert!(primary.is_none());
+        assert!(extra.is_empty());
     }
 
     #[test]

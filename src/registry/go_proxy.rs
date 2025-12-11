@@ -1,9 +1,35 @@
-use super::{Registry, get_with_retry};
+use super::Registry;
+use super::utils::{base64_encode, read_netrc_credentials};
 use anyhow::{Result, anyhow};
 use async_trait::async_trait;
-use reqwest::Client;
+use reqwest::header::{AUTHORIZATION, HeaderMap, HeaderValue};
+use reqwest::{Client, Response};
 use serde::Deserialize;
 use std::time::Duration;
+
+/// Maximum number of retry attempts for failed HTTP requests
+const MAX_RETRIES: u32 = 3;
+
+/// Base delay for exponential backoff (100ms, 200ms, 400ms)
+const BASE_DELAY_MS: u64 = 100;
+
+/// Credentials for authenticating with a Go proxy or private module host
+#[derive(Clone)]
+pub struct GoCredentials {
+    /// Username for Basic Auth
+    pub username: String,
+    /// Password for Basic Auth
+    pub password: String,
+}
+
+impl std::fmt::Debug for GoCredentials {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GoCredentials")
+            .field("username", &self.username)
+            .field("password", &"[REDACTED]")
+            .finish()
+    }
+}
 
 pub struct GoProxyRegistry {
     client: Client,
@@ -22,11 +48,30 @@ impl GoProxyRegistry {
     }
 
     pub fn with_proxy_url(proxy_url: String) -> Self {
+        Self::with_proxy_url_and_credentials(proxy_url, None)
+    }
+
+    pub fn with_proxy_url_and_credentials(
+        proxy_url: String,
+        credentials: Option<GoCredentials>,
+    ) -> Self {
+        let mut headers = HeaderMap::new();
+
+        // Add Basic Auth header if credentials are provided
+        if let Some(ref creds) = credentials {
+            let auth = format!("{}:{}", creds.username, creds.password);
+            let encoded = base64_encode(&auth);
+            if let Ok(header_value) = HeaderValue::from_str(&format!("Basic {}", encoded)) {
+                headers.insert(AUTHORIZATION, header_value);
+            }
+        }
+
         let client = Client::builder()
             .gzip(true)
             .user_agent(concat!("upd/", env!("CARGO_PKG_VERSION")))
             .timeout(Duration::from_secs(30))
             .connect_timeout(Duration::from_secs(10))
+            .default_headers(headers)
             .build()
             .expect("Failed to create HTTP client");
 
@@ -47,12 +92,68 @@ impl GoProxyRegistry {
             .filter(|s| !s.is_empty())
     }
 
+    /// Detect credentials from environment variables or netrc
+    pub fn detect_credentials(proxy_url: &str) -> Option<GoCredentials> {
+        // Try GOPROXY_USERNAME and GOPROXY_PASSWORD environment variables
+        if let (Ok(username), Ok(password)) = (
+            std::env::var("GOPROXY_USERNAME"),
+            std::env::var("GOPROXY_PASSWORD"),
+        ) && !username.is_empty()
+            && !password.is_empty()
+        {
+            return Some(GoCredentials { username, password });
+        }
+
+        // Extract host from proxy URL and try netrc
+        if let Ok(url) = url::Url::parse(proxy_url)
+            && let Some(host) = url.host_str()
+            && let Some(creds) = read_netrc_credentials(host)
+        {
+            return Some(GoCredentials {
+                username: creds.login,
+                password: creds.password,
+            });
+        }
+
+        None
+    }
+
+    /// Execute a GET request with retry
+    async fn get_with_retry(&self, url: &str) -> Result<Response, reqwest::Error> {
+        let mut last_error = None;
+
+        for attempt in 0..MAX_RETRIES {
+            match self.client.get(url).send().await {
+                Ok(response) => {
+                    if response.status().is_client_error() || response.status().is_success() {
+                        return Ok(response);
+                    }
+                    if response.status().is_server_error() && attempt < MAX_RETRIES - 1 {
+                        let delay = Duration::from_millis(BASE_DELAY_MS * (1 << attempt));
+                        tokio::time::sleep(delay).await;
+                        continue;
+                    }
+                    return Ok(response);
+                }
+                Err(e) => {
+                    last_error = Some(e);
+                    if attempt < MAX_RETRIES - 1 {
+                        let delay = Duration::from_millis(BASE_DELAY_MS * (1 << attempt));
+                        tokio::time::sleep(delay).await;
+                    }
+                }
+            }
+        }
+
+        Err(last_error.unwrap())
+    }
+
     /// Fetch list of all versions for a module
     async fn fetch_versions(&self, module: &str) -> Result<Vec<String>> {
         let escaped = Self::escape_module_path(module);
         let url = format!("{}/{}/@v/list", self.proxy_url, escaped);
 
-        let response = get_with_retry(&self.client, &url).await?;
+        let response = self.get_with_retry(&url).await?;
 
         if !response.status().is_success() {
             return Err(anyhow!(
@@ -113,7 +214,7 @@ impl Registry for GoProxyRegistry {
         let escaped = Self::escape_module_path(package);
         let url = format!("{}/{}/@latest", self.proxy_url, escaped);
 
-        if let Ok(response) = get_with_retry(&self.client, &url).await
+        if let Ok(response) = self.get_with_retry(&url).await
             && response.status().is_success()
             && let Ok(data) = response.json::<LatestResponse>().await
         {
@@ -271,5 +372,88 @@ mod tests {
         unsafe {
             std::env::remove_var("GOPROXY");
         }
+    }
+
+    #[test]
+    fn test_detect_credentials_from_env() {
+        // SAFETY: Tests run single-threaded by default, no concurrent reads
+        unsafe {
+            std::env::set_var("GOPROXY_USERNAME", "test-user");
+            std::env::set_var("GOPROXY_PASSWORD", "test-pass");
+        }
+
+        let creds = GoProxyRegistry::detect_credentials("https://proxy.example.com");
+        assert!(creds.is_some());
+        let creds = creds.unwrap();
+        assert_eq!(creds.username, "test-user");
+        assert_eq!(creds.password, "test-pass");
+
+        // SAFETY: Tests run single-threaded by default, no concurrent reads
+        unsafe {
+            std::env::remove_var("GOPROXY_USERNAME");
+            std::env::remove_var("GOPROXY_PASSWORD");
+        }
+    }
+
+    #[test]
+    fn test_base64_encode() {
+        // Test standard RFC 4648 encoding
+        assert_eq!(base64_encode(""), "");
+        assert_eq!(base64_encode("f"), "Zg==");
+        assert_eq!(base64_encode("fo"), "Zm8=");
+        assert_eq!(base64_encode("foo"), "Zm9v");
+        assert_eq!(base64_encode("foob"), "Zm9vYg==");
+        assert_eq!(base64_encode("fooba"), "Zm9vYmE=");
+        assert_eq!(base64_encode("foobar"), "Zm9vYmFy");
+        // Test credential-like strings
+        assert_eq!(base64_encode("user:pass"), "dXNlcjpwYXNz");
+    }
+
+    #[test]
+    fn test_read_netrc_credentials() {
+        use std::io::Write;
+        use tempfile::NamedTempFile;
+
+        // Create a temp netrc file
+        let mut netrc_file = NamedTempFile::new().unwrap();
+        writeln!(
+            netrc_file,
+            "machine proxy.example.com login myuser password mypassword"
+        )
+        .unwrap();
+
+        let netrc_path = netrc_file.path().to_str().unwrap().to_string();
+        // SAFETY: Test runs in isolation
+        unsafe {
+            std::env::set_var("NETRC", &netrc_path);
+        }
+
+        let creds = read_netrc_credentials("proxy.example.com");
+        assert!(creds.is_some());
+        let creds = creds.unwrap();
+        assert_eq!(creds.login, "myuser");
+        assert_eq!(creds.password, "mypassword");
+
+        // Test non-existent host
+        let creds = read_netrc_credentials("nonexistent.example.com");
+        assert!(creds.is_none());
+
+        // SAFETY: Test runs in isolation
+        unsafe {
+            std::env::remove_var("NETRC");
+        }
+    }
+
+    #[test]
+    fn test_registry_with_credentials() {
+        let creds = GoCredentials {
+            username: "test-user".to_string(),
+            password: "test-pass".to_string(),
+        };
+        // Verify that the registry can be created with credentials
+        let _registry = GoProxyRegistry::with_proxy_url_and_credentials(
+            "https://proxy.example.com".to_string(),
+            Some(creds),
+        );
     }
 }

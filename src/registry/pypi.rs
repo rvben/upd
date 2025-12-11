@@ -1,12 +1,36 @@
-use super::{Registry, get_with_retry};
+use super::Registry;
+use super::utils::{base64_encode, read_netrc_credentials};
 use anyhow::{Result, anyhow};
 use async_trait::async_trait;
 use pep440_rs::{Version, VersionSpecifiers};
-use reqwest::Client;
+use reqwest::header::{AUTHORIZATION, HeaderMap, HeaderValue};
+use reqwest::{Client, Response};
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::str::FromStr;
 use std::time::Duration;
+
+/// Maximum number of retry attempts for failed HTTP requests
+const MAX_RETRIES: u32 = 3;
+
+/// Base delay for exponential backoff (100ms, 200ms, 400ms)
+const BASE_DELAY_MS: u64 = 100;
+
+/// Credentials for authenticating with a PyPI registry
+#[derive(Clone)]
+pub struct PyPiCredentials {
+    pub username: String,
+    pub password: String,
+}
+
+impl std::fmt::Debug for PyPiCredentials {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PyPiCredentials")
+            .field("username", &self.username)
+            .field("password", &"[REDACTED]")
+            .finish()
+    }
+}
 
 pub struct PyPiRegistry {
     client: Client,
@@ -29,11 +53,30 @@ impl PyPiRegistry {
     }
 
     pub fn with_index_url(index_url: String) -> Self {
+        Self::with_index_url_and_credentials(index_url, None)
+    }
+
+    pub fn with_index_url_and_credentials(
+        index_url: String,
+        credentials: Option<PyPiCredentials>,
+    ) -> Self {
+        let mut headers = HeaderMap::new();
+
+        // Add Basic Auth header if credentials are provided
+        if let Some(ref creds) = credentials {
+            let auth = format!("{}:{}", creds.username, creds.password);
+            let encoded = base64_encode(&auth);
+            if let Ok(header_value) = HeaderValue::from_str(&format!("Basic {}", encoded)) {
+                headers.insert(AUTHORIZATION, header_value);
+            }
+        }
+
         let client = Client::builder()
             .gzip(true)
             .user_agent(concat!("upd/", env!("CARGO_PKG_VERSION")))
             .timeout(Duration::from_secs(30))
             .connect_timeout(Duration::from_secs(10))
+            .default_headers(headers)
             .build()
             .expect("Failed to create HTTP client");
 
@@ -51,6 +94,121 @@ impl PyPiRegistry {
             }
         }
         None
+    }
+
+    /// Create a registry from a URL that may contain embedded credentials
+    /// Supports URLs like: https://user:pass@private.pypi.com/simple
+    pub fn from_url(url: &str) -> Self {
+        if let Ok(parsed) = url::Url::parse(url) {
+            let username = parsed.username();
+            let password = parsed.password().unwrap_or("");
+
+            if !username.is_empty() {
+                // URL has embedded credentials - extract them and create clean URL
+                let mut clean_url = parsed.clone();
+                clean_url.set_username("").ok();
+                clean_url.set_password(None).ok();
+
+                let credentials = PyPiCredentials {
+                    username: username.to_string(),
+                    password: password.to_string(),
+                };
+
+                return Self::with_index_url_and_credentials(
+                    clean_url.to_string().trim_end_matches('/').to_string(),
+                    Some(credentials),
+                );
+            }
+
+            // No embedded credentials - try to detect from netrc
+            let host = parsed.host_str().unwrap_or("");
+            let credentials = read_netrc_credentials(host).map(|c| PyPiCredentials {
+                username: c.login,
+                password: c.password,
+            });
+
+            Self::with_index_url_and_credentials(url.trim_end_matches('/').to_string(), credentials)
+        } else {
+            // Invalid URL - create without credentials
+            Self::with_index_url(url.trim_end_matches('/').to_string())
+        }
+    }
+
+    /// Get the index URL this registry is configured for
+    pub fn index_url(&self) -> &str {
+        &self.index_url
+    }
+
+    /// Detect credentials from environment variables or netrc
+    pub fn detect_credentials(index_url: &str) -> Option<PyPiCredentials> {
+        // Try environment variables first (uv-style)
+        if let (Ok(username), Ok(password)) = (
+            std::env::var("UV_INDEX_USERNAME"),
+            std::env::var("UV_INDEX_PASSWORD"),
+        ) && !username.is_empty()
+            && !password.is_empty()
+        {
+            return Some(PyPiCredentials { username, password });
+        }
+
+        // Try PIP-style environment variables
+        if let (Ok(username), Ok(password)) = (
+            std::env::var("PIP_INDEX_USERNAME"),
+            std::env::var("PIP_INDEX_PASSWORD"),
+        ) && !username.is_empty()
+            && !password.is_empty()
+        {
+            return Some(PyPiCredentials { username, password });
+        }
+
+        // Extract host from index URL and try netrc
+        if let Ok(url) = url::Url::parse(index_url)
+            && let Some(host) = url.host_str()
+            && let Some(creds) = read_netrc_credentials(host)
+        {
+            return Some(PyPiCredentials {
+                username: creds.login,
+                password: creds.password,
+            });
+        }
+
+        None
+    }
+
+    /// Execute a GET request with retry and authentication
+    async fn get_with_retry(&self, url: &str) -> Result<Response, reqwest::Error> {
+        let mut last_error = None;
+
+        for attempt in 0..MAX_RETRIES {
+            match self.client.get(url).send().await {
+                Ok(response) => {
+                    // Don't retry client errors (4xx) - they won't succeed on retry
+                    if response.status().is_client_error() || response.status().is_success() {
+                        return Ok(response);
+                    }
+
+                    // Retry server errors (5xx)
+                    if response.status().is_server_error() && attempt < MAX_RETRIES - 1 {
+                        let delay = Duration::from_millis(BASE_DELAY_MS * (1 << attempt));
+                        tokio::time::sleep(delay).await;
+                        continue;
+                    }
+
+                    return Ok(response);
+                }
+                Err(e) => {
+                    last_error = Some(e);
+
+                    // Don't retry on the last attempt
+                    if attempt < MAX_RETRIES - 1 {
+                        let delay = Duration::from_millis(BASE_DELAY_MS * (1 << attempt));
+                        tokio::time::sleep(delay).await;
+                    }
+                }
+            }
+        }
+
+        Err(last_error.unwrap())
     }
 
     fn is_stable_version(version_str: &str) -> bool {
@@ -81,7 +239,7 @@ impl PyPiRegistry {
         let normalized = package.to_lowercase().replace('_', "-");
         let url = format!("{}/{}/json", self.index_url, normalized);
 
-        let response = get_with_retry(&self.client, &url).await?;
+        let response = self.get_with_retry(&url).await?;
 
         if !response.status().is_success() {
             return Err(anyhow!(
@@ -180,6 +338,8 @@ impl Registry for PyPiRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write;
+    use tempfile::NamedTempFile;
 
     #[test]
     fn test_stable_version_detection() {
@@ -189,5 +349,138 @@ mod tests {
         assert!(!PyPiRegistry::is_stable_version("1.0.0b2"));
         assert!(!PyPiRegistry::is_stable_version("1.0.0rc1"));
         assert!(!PyPiRegistry::is_stable_version("1.0.0.dev1"));
+    }
+
+    #[test]
+    fn test_base64_encode() {
+        assert_eq!(base64_encode("hello"), "aGVsbG8=");
+        assert_eq!(base64_encode("user:pass"), "dXNlcjpwYXNz");
+        assert_eq!(base64_encode("a"), "YQ==");
+        assert_eq!(base64_encode("ab"), "YWI=");
+        assert_eq!(base64_encode("abc"), "YWJj");
+        assert_eq!(base64_encode(""), "");
+    }
+
+    #[test]
+    fn test_read_netrc_credentials() {
+        // Create a temp netrc file
+        let mut netrc_file = NamedTempFile::new().unwrap();
+        writeln!(
+            netrc_file,
+            "machine pypi.example.com login testuser password testpass"
+        )
+        .unwrap();
+        writeln!(
+            netrc_file,
+            "machine other.example.com login other password otherpass"
+        )
+        .unwrap();
+
+        // Set NETRC env var to point to temp file
+        let netrc_path = netrc_file.path().to_str().unwrap().to_string();
+        // SAFETY: Test runs in isolation, no other threads accessing this env var
+        unsafe {
+            std::env::set_var("NETRC", &netrc_path);
+        }
+
+        let creds = read_netrc_credentials("pypi.example.com");
+        assert!(creds.is_some());
+        let creds = creds.unwrap();
+        assert_eq!(creds.login, "testuser");
+        assert_eq!(creds.password, "testpass");
+
+        // Test non-existent host
+        let creds = read_netrc_credentials("nonexistent.example.com");
+        assert!(creds.is_none());
+
+        // Clean up
+        // SAFETY: Test runs in isolation
+        unsafe {
+            std::env::remove_var("NETRC");
+        }
+    }
+
+    #[test]
+    fn test_read_netrc_multiline() {
+        // Create a temp netrc file with multiline format
+        let mut netrc_file = NamedTempFile::new().unwrap();
+        writeln!(netrc_file, "machine pypi.example.com").unwrap();
+        writeln!(netrc_file, "  login testuser").unwrap();
+        writeln!(netrc_file, "  password testpass").unwrap();
+
+        let netrc_path = netrc_file.path().to_str().unwrap().to_string();
+        // SAFETY: Test runs in isolation
+        unsafe {
+            std::env::set_var("NETRC", &netrc_path);
+        }
+
+        let creds = read_netrc_credentials("pypi.example.com");
+        assert!(creds.is_some());
+        let creds = creds.unwrap();
+        assert_eq!(creds.login, "testuser");
+        assert_eq!(creds.password, "testpass");
+
+        // SAFETY: Test runs in isolation
+        unsafe {
+            std::env::remove_var("NETRC");
+        }
+    }
+
+    #[test]
+    fn test_detect_credentials_from_env() {
+        // Set UV_INDEX_* credentials
+        // SAFETY: Test runs in isolation
+        unsafe {
+            std::env::set_var("UV_INDEX_USERNAME", "uvuser");
+            std::env::set_var("UV_INDEX_PASSWORD", "uvpass");
+        }
+
+        let creds = PyPiRegistry::detect_credentials("https://pypi.example.com/simple");
+        assert!(creds.is_some());
+        let creds = creds.unwrap();
+        assert_eq!(creds.username, "uvuser");
+        assert_eq!(creds.password, "uvpass");
+
+        // SAFETY: Test runs in isolation
+        unsafe {
+            std::env::remove_var("UV_INDEX_USERNAME");
+            std::env::remove_var("UV_INDEX_PASSWORD");
+        }
+    }
+
+    #[test]
+    fn test_registry_with_credentials() {
+        let creds = PyPiCredentials {
+            username: "testuser".to_string(),
+            password: "testpass".to_string(),
+        };
+        // Just verify that the registry can be created with credentials
+        let _registry = PyPiRegistry::with_index_url_and_credentials(
+            "https://pypi.example.com/simple".to_string(),
+            Some(creds),
+        );
+        // The credentials are used to set default headers in the client,
+        // we can't easily verify them without making a request
+    }
+
+    #[test]
+    fn test_from_url_with_embedded_credentials() {
+        // URL with embedded credentials
+        let registry = PyPiRegistry::from_url("https://user:pass@pypi.example.com/simple");
+        // The URL should be cleaned (credentials removed from URL itself)
+        assert_eq!(registry.index_url(), "https://pypi.example.com/simple");
+    }
+
+    #[test]
+    fn test_from_url_without_credentials() {
+        // URL without credentials
+        let registry = PyPiRegistry::from_url("https://pypi.example.com/simple");
+        assert_eq!(registry.index_url(), "https://pypi.example.com/simple");
+    }
+
+    #[test]
+    fn test_from_url_strips_trailing_slash() {
+        let registry = PyPiRegistry::from_url("https://pypi.example.com/simple/");
+        assert_eq!(registry.index_url(), "https://pypi.example.com/simple");
     }
 }

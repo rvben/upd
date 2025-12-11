@@ -236,14 +236,109 @@ Version lookups are cached for 24 hours in:
 
 Use `upd clean-cache` to clear the cache, or `upd --no-cache` to bypass it.
 
+## Private Repositories
+
+`upd` supports private package registries for all ecosystems. Credentials are automatically detected from environment variables and configuration files.
+
+### PyPI / Private Python Index
+
+```bash
+# Option 1: Environment variables
+export UV_INDEX_URL=https://my-private-pypi.com/simple
+export UV_INDEX_USERNAME=myuser
+export UV_INDEX_PASSWORD=mypassword
+
+# Option 2: PIP-style environment variables
+export PIP_INDEX_URL=https://my-private-pypi.com/simple
+export PIP_INDEX_USERNAME=myuser
+export PIP_INDEX_PASSWORD=mypassword
+
+# Option 3: ~/.netrc file
+# machine my-private-pypi.com
+# login myuser
+# password mypassword
+
+# Option 4: Inline in requirements.txt (with credentials)
+# --index-url https://user:pass@my-private-pypi.com/simple
+# or just the URL (credentials from netrc):
+# --index-url https://my-private-pypi.com/simple
+```
+
+**Inline index URLs**: When a `requirements.txt` file contains `--index-url` or `-i`,
+`upd` automatically uses that index instead of the default PyPI. Credentials can be
+embedded in the URL (`https://user:pass@host/simple`) or looked up from `~/.netrc`.
+
+### npm / Private Registry
+
+```bash
+# Option 1: Environment variables
+export NPM_REGISTRY=https://npm.mycompany.com
+export NPM_TOKEN=your-auth-token
+
+# Option 2: NODE_AUTH_TOKEN (GitHub Actions)
+export NODE_AUTH_TOKEN=your-auth-token
+
+# Option 3: ~/.npmrc file
+//npm.mycompany.com/:_authToken=your-auth-token
+# Or for environment variable reference:
+//npm.mycompany.com/:_authToken=${NPM_TOKEN}
+```
+
+### Cargo / Private Registry
+
+```bash
+# Option 1: Environment variables
+export CARGO_REGISTRY_TOKEN=your-token  # For crates.io default
+export CARGO_REGISTRIES_MY_REGISTRY_TOKEN=your-token  # For named registry
+
+# Option 2: ~/.cargo/credentials.toml
+[registry]
+token = "your-crates-io-token"
+
+[registries.my-private-registry]
+token = "your-private-token"
+```
+
+### Go / Private Module Proxy
+
+```bash
+# Option 1: Environment variables
+export GOPROXY=https://proxy.mycompany.com
+export GOPROXY_USERNAME=myuser
+export GOPROXY_PASSWORD=mypassword
+
+# Option 2: ~/.netrc file (commonly used with go modules)
+# machine proxy.mycompany.com
+# login myuser
+# password mypassword
+```
+
+Use `--verbose` to see when authenticated access is being used:
+
+```bash
+upd --verbose
+# Output: Using authenticated PyPI access
+# Output: Using authenticated npm access
+```
+
 ## Environment Variables
 
 | Variable | Description |
 |----------|-------------|
 | `UV_INDEX_URL` | Custom PyPI index URL |
 | `PIP_INDEX_URL` | Custom PyPI index URL (fallback) |
+| `UV_INDEX_USERNAME` | PyPI username (with UV_INDEX_URL) |
+| `UV_INDEX_PASSWORD` | PyPI password (with UV_INDEX_URL) |
+| `PIP_INDEX_USERNAME` | PyPI username (with PIP_INDEX_URL) |
+| `PIP_INDEX_PASSWORD` | PyPI password (with PIP_INDEX_URL) |
 | `NPM_REGISTRY` | Custom npm registry URL |
+| `NPM_TOKEN` | npm authentication token |
+| `NODE_AUTH_TOKEN` | npm token (GitHub Actions compatible) |
+| `CARGO_REGISTRY_TOKEN` | crates.io authentication token |
+| `CARGO_REGISTRIES_<NAME>_TOKEN` | Named registry token |
 | `GOPROXY` | Custom Go module proxy URL |
+| `GOPROXY_USERNAME` | Go proxy username |
+| `GOPROXY_PASSWORD` | Go proxy password |
 | `UPD_CACHE_DIR` | Custom cache directory |
 
 ## Development
