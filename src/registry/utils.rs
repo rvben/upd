@@ -53,7 +53,15 @@ pub struct NetrcCredentials {
 
 /// Get the path to the user's netrc file
 pub fn get_netrc_path() -> Option<PathBuf> {
-    // Try ~/.netrc first (Unix-style)
+    // Check NETRC environment variable first (allows overriding default locations)
+    if let Ok(path) = std::env::var("NETRC") {
+        let path = PathBuf::from(path);
+        if path.exists() {
+            return Some(path);
+        }
+    }
+
+    // Try ~/.netrc (Unix-style)
     if let Some(home) = home_dir() {
         let netrc = home.join(".netrc");
         if netrc.exists() {
@@ -67,23 +75,22 @@ pub fn get_netrc_path() -> Option<PathBuf> {
         }
     }
 
-    // Check NETRC environment variable
-    if let Ok(path) = std::env::var("NETRC") {
-        let path = PathBuf::from(path);
-        if path.exists() {
-            return Some(path);
-        }
-    }
-
     None
 }
 
 /// Read credentials from ~/.netrc for a given host
 pub fn read_netrc_credentials(host: &str) -> Option<NetrcCredentials> {
     let netrc_path = get_netrc_path()?;
+    read_netrc_credentials_from_path(&netrc_path, host)
+}
 
+/// Read credentials from a specific netrc file path for a given host
+pub fn read_netrc_credentials_from_path(
+    netrc_path: &PathBuf,
+    host: &str,
+) -> Option<NetrcCredentials> {
     // Check file size to prevent DoS
-    if let Ok(metadata) = std::fs::metadata(&netrc_path)
+    if let Ok(metadata) = std::fs::metadata(netrc_path)
         && metadata.len() > MAX_CREDENTIAL_FILE_SIZE
     {
         return None;
@@ -197,26 +204,17 @@ mod tests {
         )
         .unwrap();
 
-        let netrc_path = netrc_file.path().to_str().unwrap().to_string();
-        // SAFETY: Test runs in isolation
-        unsafe {
-            std::env::set_var("NETRC", &netrc_path);
-        }
+        let netrc_path = netrc_file.path().to_path_buf();
 
-        let creds = read_netrc_credentials("example.com");
+        let creds = read_netrc_credentials_from_path(&netrc_path, "example.com");
         assert!(creds.is_some());
         let creds = creds.unwrap();
         assert_eq!(creds.login, "testuser");
         assert_eq!(creds.password, "testpass");
 
         // Non-existent host
-        let creds = read_netrc_credentials("nonexistent.com");
+        let creds = read_netrc_credentials_from_path(&netrc_path, "nonexistent.com");
         assert!(creds.is_none());
-
-        // SAFETY: Test cleanup
-        unsafe {
-            std::env::remove_var("NETRC");
-        }
     }
 
     #[test]
@@ -226,22 +224,13 @@ mod tests {
         writeln!(netrc_file, "  login testuser").unwrap();
         writeln!(netrc_file, "  password testpass").unwrap();
 
-        let netrc_path = netrc_file.path().to_str().unwrap().to_string();
-        // SAFETY: Test runs in isolation
-        unsafe {
-            std::env::set_var("NETRC", &netrc_path);
-        }
+        let netrc_path = netrc_file.path().to_path_buf();
 
-        let creds = read_netrc_credentials("example.com");
+        let creds = read_netrc_credentials_from_path(&netrc_path, "example.com");
         assert!(creds.is_some());
         let creds = creds.unwrap();
         assert_eq!(creds.login, "testuser");
         assert_eq!(creds.password, "testpass");
-
-        // SAFETY: Test cleanup
-        unsafe {
-            std::env::remove_var("NETRC");
-        }
     }
 
     #[test]
@@ -249,21 +238,12 @@ mod tests {
         let mut netrc_file = NamedTempFile::new().unwrap();
         writeln!(netrc_file, "default login defaultuser password defaultpass").unwrap();
 
-        let netrc_path = netrc_file.path().to_str().unwrap().to_string();
-        // SAFETY: Test runs in isolation
-        unsafe {
-            std::env::set_var("NETRC", &netrc_path);
-        }
+        let netrc_path = netrc_file.path().to_path_buf();
 
-        let creds = read_netrc_credentials("anyhost.com");
+        let creds = read_netrc_credentials_from_path(&netrc_path, "anyhost.com");
         assert!(creds.is_some());
         let creds = creds.unwrap();
         assert_eq!(creds.login, "defaultuser");
         assert_eq!(creds.password, "defaultpass");
-
-        // SAFETY: Test cleanup
-        unsafe {
-            std::env::remove_var("NETRC");
-        }
     }
 }

@@ -1,4 +1,6 @@
 use super::Registry;
+#[cfg(test)]
+use super::utils::read_netrc_credentials_from_path;
 use super::utils::{base64_encode, read_netrc_credentials};
 use anyhow::{Result, anyhow};
 use async_trait::async_trait;
@@ -376,28 +378,17 @@ mod tests {
         )
         .unwrap();
 
-        // Set NETRC env var to point to temp file
-        let netrc_path = netrc_file.path().to_str().unwrap().to_string();
-        // SAFETY: Test runs in isolation, no other threads accessing this env var
-        unsafe {
-            std::env::set_var("NETRC", &netrc_path);
-        }
+        let netrc_path = netrc_file.path().to_path_buf();
 
-        let creds = read_netrc_credentials("pypi.example.com");
+        let creds = read_netrc_credentials_from_path(&netrc_path, "pypi.example.com");
         assert!(creds.is_some());
         let creds = creds.unwrap();
         assert_eq!(creds.login, "testuser");
         assert_eq!(creds.password, "testpass");
 
         // Test non-existent host
-        let creds = read_netrc_credentials("nonexistent.example.com");
+        let creds = read_netrc_credentials_from_path(&netrc_path, "nonexistent.example.com");
         assert!(creds.is_none());
-
-        // Clean up
-        // SAFETY: Test runs in isolation
-        unsafe {
-            std::env::remove_var("NETRC");
-        }
     }
 
     #[test]
@@ -408,22 +399,13 @@ mod tests {
         writeln!(netrc_file, "  login testuser").unwrap();
         writeln!(netrc_file, "  password testpass").unwrap();
 
-        let netrc_path = netrc_file.path().to_str().unwrap().to_string();
-        // SAFETY: Test runs in isolation
-        unsafe {
-            std::env::set_var("NETRC", &netrc_path);
-        }
+        let netrc_path = netrc_file.path().to_path_buf();
 
-        let creds = read_netrc_credentials("pypi.example.com");
+        let creds = read_netrc_credentials_from_path(&netrc_path, "pypi.example.com");
         assert!(creds.is_some());
         let creds = creds.unwrap();
         assert_eq!(creds.login, "testuser");
         assert_eq!(creds.password, "testpass");
-
-        // SAFETY: Test runs in isolation
-        unsafe {
-            std::env::remove_var("NETRC");
-        }
     }
 
     #[test]
