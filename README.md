@@ -11,13 +11,13 @@ written in Rust.
 
 ```bash
 # Run without installing (using uv)
-uvx upd-cli
+uvx --from upd-cli upd
 
 # Or with pipx
-pipx run upd-cli
+pipx run --spec upd-cli upd
 
 # Preview changes without modifying files
-uvx upd-cli -n
+uvx --from upd-cli upd -n
 ```
 
 ## Features
