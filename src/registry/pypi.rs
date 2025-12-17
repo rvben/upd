@@ -247,26 +247,46 @@ impl PyPiRegistry {
     }
 
     /// Internal method to fetch versions with optional pre-release inclusion
+    /// Tries JSON API first, falls back to Simple API for private registries
     async fn fetch_versions_internal(
         &self,
         package: &str,
         include_prereleases: bool,
     ) -> Result<Vec<(Version, String)>> {
         let normalized = package.to_lowercase().replace('_', "-");
-        let url = format!("{}/{}/json", self.index_url, normalized);
 
-        let response = self.get_with_retry(&url).await?;
+        // Try JSON API first (PyPI.org style)
+        let json_url = format!("{}/{}/json", self.index_url, normalized);
+        let response = self.get_with_retry(&json_url).await?;
 
-        if !response.status().is_success() {
-            return Err(anyhow!(
-                "Failed to fetch package '{}': HTTP {}",
-                package,
-                response.status()
-            ));
+        if response.status().is_success() {
+            // JSON API succeeded
+            let data: PyPiResponse = response.json().await?;
+            return self.parse_json_response(data, include_prereleases);
         }
 
-        let data: PyPiResponse = response.json().await?;
+        // JSON API failed - try Simple API (private registries like Nexus)
+        let simple_url = format!("{}/simple/{}/", self.index_url, normalized);
+        let simple_response = self.get_with_retry(&simple_url).await?;
 
+        if simple_response.status().is_success() {
+            let html = simple_response.text().await?;
+            return self.parse_simple_api_response(&html, package, include_prereleases);
+        }
+
+        Err(anyhow!(
+            "Failed to fetch package '{}': HTTP {}",
+            package,
+            simple_response.status()
+        ))
+    }
+
+    /// Parse JSON API response from PyPI
+    fn parse_json_response(
+        &self,
+        data: PyPiResponse,
+        include_prereleases: bool,
+    ) -> Result<Vec<(Version, String)>> {
         let mut versions: Vec<(Version, String)> = data
             .releases
             .iter()
@@ -287,6 +307,94 @@ impl PyPiRegistry {
 
         versions.sort_by(|a, b| b.0.cmp(&a.0));
         Ok(versions)
+    }
+
+    /// Parse Simple API HTML response (for private registries)
+    /// Extracts versions from package filenames in anchor tags
+    fn parse_simple_api_response(
+        &self,
+        html: &str,
+        package: &str,
+        include_prereleases: bool,
+    ) -> Result<Vec<(Version, String)>> {
+        let mut versions: Vec<(Version, String)> = Vec::new();
+        let normalized = package.to_lowercase().replace('_', "-");
+
+        // Extract versions from href attributes in anchor tags
+        // Format: <a href="...">package-version.tar.gz</a> or package-version-py3-none-any.whl
+        for line in html.lines() {
+            let Some(start) = line.find('>') else {
+                continue;
+            };
+            let Some(end) = line[start..].find('<') else {
+                continue;
+            };
+            let filename = &line[start + 1..start + end];
+            let Some(version_str) = Self::extract_version_from_filename(filename, &normalized)
+            else {
+                continue;
+            };
+
+            if !include_prereleases && !Self::is_stable_version(&version_str) {
+                continue;
+            }
+
+            let Ok(version) = version_str.parse::<Version>() else {
+                continue;
+            };
+
+            // Avoid duplicates
+            if !versions.iter().any(|(_, v)| v == &version_str) {
+                versions.push((version, version_str));
+            }
+        }
+
+        if versions.is_empty() {
+            return Err(anyhow!("No versions found for package '{}'", package));
+        }
+
+        versions.sort_by(|a, b| b.0.cmp(&a.0));
+        Ok(versions)
+    }
+
+    /// Extract version from a package filename
+    /// Handles: package-1.0.0.tar.gz, package-1.0.0-py3-none-any.whl, etc.
+    fn extract_version_from_filename(filename: &str, normalized_package: &str) -> Option<String> {
+        // Remove file extension
+        let name = filename
+            .trim_end_matches(".tar.gz")
+            .trim_end_matches(".zip")
+            .trim_end_matches(".whl")
+            .trim_end_matches(".egg");
+
+        // Package name can have - or _ replaced, normalize for matching
+        let name_lower = name.to_lowercase();
+        let pkg_with_dash = normalized_package;
+        let pkg_with_underscore = normalized_package.replace('-', "_");
+
+        // Find where the version starts (after package name and separator)
+        let version_start = if name_lower.starts_with(&format!("{}-", pkg_with_dash)) {
+            Some(pkg_with_dash.len() + 1)
+        } else if name_lower.starts_with(&format!("{}-", pkg_with_underscore)) {
+            Some(pkg_with_underscore.len() + 1)
+        } else {
+            None
+        };
+
+        if let Some(start) = version_start {
+            let rest = &name[start..];
+            // For wheel files, version ends at first '-' after version
+            // For source dists, version is the rest of the name
+            let version = if filename.ends_with(".whl") {
+                // Wheel format: {distribution}-{version}(-{build tag})?-{python tag}-{abi tag}-{platform tag}.whl
+                rest.split('-').next().unwrap_or(rest)
+            } else {
+                rest
+            };
+            Some(version.to_string())
+        } else {
+            None
+        }
     }
 }
 
@@ -498,6 +606,83 @@ mod tests {
         assert!(!PyPiRegistry::is_stable_version("1.0.0b2"));
         assert!(!PyPiRegistry::is_stable_version("1.0.0rc1"));
         assert!(!PyPiRegistry::is_stable_version("1.0.0.dev1"));
+    }
+
+    #[test]
+    fn test_extract_version_from_filename() {
+        // Source distributions
+        assert_eq!(
+            PyPiRegistry::extract_version_from_filename("my-package-1.2.3.tar.gz", "my-package"),
+            Some("1.2.3".to_string())
+        );
+        assert_eq!(
+            PyPiRegistry::extract_version_from_filename("my_package-1.2.3.tar.gz", "my-package"),
+            Some("1.2.3".to_string())
+        );
+        assert_eq!(
+            PyPiRegistry::extract_version_from_filename("requests-2.31.0.tar.gz", "requests"),
+            Some("2.31.0".to_string())
+        );
+
+        // Wheel files
+        assert_eq!(
+            PyPiRegistry::extract_version_from_filename(
+                "my_package-1.2.3-py3-none-any.whl",
+                "my-package"
+            ),
+            Some("1.2.3".to_string())
+        );
+        assert_eq!(
+            PyPiRegistry::extract_version_from_filename(
+                "requests-2.31.0-py3-none-any.whl",
+                "requests"
+            ),
+            Some("2.31.0".to_string())
+        );
+
+        // Pre-release versions
+        assert_eq!(
+            PyPiRegistry::extract_version_from_filename("mypackage-1.0.0a1.tar.gz", "mypackage"),
+            Some("1.0.0a1".to_string())
+        );
+
+        // Non-matching package
+        assert_eq!(
+            PyPiRegistry::extract_version_from_filename("other-package-1.0.0.tar.gz", "mypackage"),
+            None
+        );
+    }
+
+    #[test]
+    fn test_parse_simple_api_response() {
+        let registry = PyPiRegistry::new();
+        let html = r#"
+<!DOCTYPE html>
+<html>
+  <head><title>Links for my-package</title></head>
+  <body>
+    <a href="../../packages/my_package-1.0.0.tar.gz">my_package-1.0.0.tar.gz</a>
+    <a href="../../packages/my_package-1.1.0.tar.gz">my_package-1.1.0.tar.gz</a>
+    <a href="../../packages/my_package-1.2.0-py3-none-any.whl">my_package-1.2.0-py3-none-any.whl</a>
+    <a href="../../packages/my_package-2.0.0a1.tar.gz">my_package-2.0.0a1.tar.gz</a>
+  </body>
+</html>
+"#;
+        // Stable versions only
+        let versions = registry
+            .parse_simple_api_response(html, "my-package", false)
+            .unwrap();
+        assert_eq!(versions.len(), 3);
+        assert_eq!(versions[0].1, "1.2.0"); // Highest stable
+        assert_eq!(versions[1].1, "1.1.0");
+        assert_eq!(versions[2].1, "1.0.0");
+
+        // Including prereleases
+        let versions_with_pre = registry
+            .parse_simple_api_response(html, "my-package", true)
+            .unwrap();
+        assert_eq!(versions_with_pre.len(), 4);
+        assert_eq!(versions_with_pre[0].1, "2.0.0a1"); // Highest including prerelease
     }
 
     #[test]
