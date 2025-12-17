@@ -322,7 +322,13 @@ impl PyPiRegistry {
 
         // Extract versions from href attributes in anchor tags
         // Format: <a href="...">package-version.tar.gz</a> or package-version-py3-none-any.whl
+        // Yanked packages have data-yanked attribute: <a href="..." data-yanked="">...</a>
         for line in html.lines() {
+            // Skip yanked packages (marked with data-yanked attribute)
+            if line.contains("data-yanked") {
+                continue;
+            }
+
             let Some(start) = line.find('>') else {
                 continue;
             };
@@ -683,6 +689,29 @@ mod tests {
             .unwrap();
         assert_eq!(versions_with_pre.len(), 4);
         assert_eq!(versions_with_pre[0].1, "2.0.0a1"); // Highest including prerelease
+    }
+
+    #[test]
+    fn test_parse_simple_api_response_skips_yanked() {
+        let registry = PyPiRegistry::new();
+        let html = r#"
+<!DOCTYPE html>
+<html>
+  <body>
+    <a href="../../packages/my_package-1.0.0.tar.gz">my_package-1.0.0.tar.gz</a>
+    <a href="../../packages/my_package-1.1.0.tar.gz" data-yanked="">my_package-1.1.0.tar.gz</a>
+    <a href="../../packages/my_package-1.2.0.tar.gz" data-yanked="security issue">my_package-1.2.0.tar.gz</a>
+    <a href="../../packages/my_package-1.3.0.tar.gz">my_package-1.3.0.tar.gz</a>
+  </body>
+</html>
+"#;
+        let versions = registry
+            .parse_simple_api_response(html, "my-package", false)
+            .unwrap();
+        // Should only have 1.0.0 and 1.3.0 (1.1.0 and 1.2.0 are yanked)
+        assert_eq!(versions.len(), 2);
+        assert_eq!(versions[0].1, "1.3.0");
+        assert_eq!(versions[1].1, "1.0.0");
     }
 
     #[test]
