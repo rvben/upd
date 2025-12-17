@@ -2,7 +2,7 @@ use super::{
     FileType, ParsedDependency, UpdateOptions, UpdateResult, Updater, read_file_safe,
     write_file_atomic,
 };
-use crate::registry::{PyPiRegistry, Registry};
+use crate::registry::{MultiPyPiRegistry, PyPiRegistry, Registry};
 use crate::version::match_version_precision;
 use anyhow::Result;
 use futures::future::join_all;
@@ -217,12 +217,25 @@ impl Updater for RequirementsUpdater {
         let content = read_file_safe(path)?;
         let mut result = UpdateResult::default();
 
-        // Check for inline index URL in the requirements file
-        let (inline_index, _extra_indexes) = Self::extract_index_urls(&content);
+        // Check for inline index URLs in the requirements file
+        let (inline_index, extra_indexes) = Self::extract_index_urls(&content);
 
-        // Use inline index URL if present, otherwise use provided registry
-        let inline_registry: Option<Arc<PyPiRegistry>> =
-            inline_index.map(|url| Arc::new(PyPiRegistry::from_url(&url)));
+        // Build effective registry based on inline index configuration
+        // If file has --index-url, use that (with any --extra-index-url) instead of env vars
+        let inline_registry: Option<Arc<dyn Registry + Send + Sync>> =
+            if let Some(primary_url) = inline_index {
+                let primary = PyPiRegistry::from_url(&primary_url);
+                if extra_indexes.is_empty() {
+                    Some(Arc::new(primary))
+                } else {
+                    Some(Arc::new(MultiPyPiRegistry::from_primary_and_extras(
+                        primary,
+                        extra_indexes,
+                    )))
+                }
+            } else {
+                None
+            };
 
         let effective_registry: &dyn Registry = match &inline_registry {
             Some(r) => r.as_ref(),

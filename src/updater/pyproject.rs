@@ -2,12 +2,13 @@ use super::{
     FileType, ParsedDependency, UpdateOptions, UpdateResult, Updater, read_file_safe,
     write_file_atomic,
 };
-use crate::registry::Registry;
+use crate::registry::{MultiPyPiRegistry, PyPiRegistry, Registry};
 use crate::version::{is_stable_pep440, match_version_precision};
 use anyhow::{Result, anyhow};
 use futures::future::join_all;
 use regex::Regex;
 use std::path::Path;
+use std::sync::Arc;
 use toml_edit::{DocumentMut, Formatted, Item, Value};
 
 pub struct PyProjectUpdater {
@@ -109,6 +110,85 @@ impl PyProjectUpdater {
             result
         } else {
             dep.to_string()
+        }
+    }
+
+    /// Extract index URLs from pyproject.toml for Poetry and PDM configurations
+    /// Poetry uses [[tool.poetry.source]] with url field
+    /// PDM uses [[tool.pdm.source]] with url field
+    /// Returns (primary_url, extra_urls) where primary is the first found or default PyPI
+    fn extract_index_urls(doc: &DocumentMut) -> (Option<String>, Vec<String>) {
+        let mut urls: Vec<String> = Vec::new();
+
+        // Check [[tool.poetry.source]]
+        if let Some(Item::Table(tool)) = doc.get("tool")
+            && let Some(Item::Table(poetry)) = tool.get("poetry")
+            && let Some(Item::ArrayOfTables(sources)) = poetry.get("source")
+        {
+            for source in sources.iter() {
+                if let Some(Item::Value(Value::String(url))) = source.get("url") {
+                    let url_str = url.value().to_string();
+                    if !url_str.is_empty() {
+                        urls.push(url_str);
+                    }
+                }
+            }
+        }
+
+        // Check [[tool.pdm.source]]
+        if let Some(Item::Table(tool)) = doc.get("tool")
+            && let Some(Item::Table(pdm)) = tool.get("pdm")
+            && let Some(Item::ArrayOfTables(sources)) = pdm.get("source")
+        {
+            for source in sources.iter() {
+                if let Some(Item::Value(Value::String(url))) = source.get("url") {
+                    let url_str = url.value().to_string();
+                    if !url_str.is_empty() && !urls.contains(&url_str) {
+                        urls.push(url_str);
+                    }
+                }
+            }
+        }
+
+        // Also check for uv's [[tool.uv.index]] format
+        if let Some(Item::Table(tool)) = doc.get("tool")
+            && let Some(Item::Table(uv)) = tool.get("uv")
+            && let Some(Item::ArrayOfTables(indexes)) = uv.get("index")
+        {
+            for index in indexes.iter() {
+                if let Some(Item::Value(Value::String(url))) = index.get("url") {
+                    let url_str = url.value().to_string();
+                    if !url_str.is_empty() && !urls.contains(&url_str) {
+                        urls.push(url_str);
+                    }
+                }
+            }
+        }
+
+        if urls.is_empty() {
+            (None, Vec::new())
+        } else {
+            let primary = urls.remove(0);
+            (Some(primary), urls)
+        }
+    }
+
+    /// Create a registry from the pyproject.toml index configuration
+    /// If no index URLs are found, returns None to use the default registry
+    fn create_registry_from_config(doc: &DocumentMut) -> Option<Arc<dyn Registry + Send + Sync>> {
+        let (primary_url, extra_urls) = Self::extract_index_urls(doc);
+
+        if let Some(url) = primary_url {
+            let primary = PyPiRegistry::from_url(&url);
+            if extra_urls.is_empty() {
+                Some(Arc::new(primary))
+            } else {
+                Some(Arc::new(MultiPyPiRegistry::from_primary_and_extras(
+                    primary, extra_urls,
+                )))
+            }
+        } else {
+            None
         }
     }
 
@@ -310,12 +390,21 @@ impl Updater for PyProjectUpdater {
 
         let mut result = UpdateResult::default();
 
+        // Check for inline index configuration (Poetry/PDM/uv)
+        // If found, use that registry instead of the default
+        let inline_registry = Self::create_registry_from_config(&doc);
+        let effective_registry: &dyn Registry = if let Some(ref inline) = inline_registry {
+            inline.as_ref()
+        } else {
+            registry
+        };
+
         // Update [project.dependencies]
         if let Some(Item::Table(project)) = doc.get_mut("project") {
             if let Some(Item::Value(Value::Array(deps))) = project.get_mut("dependencies") {
                 self.update_array_deps(
                     deps,
-                    registry,
+                    effective_registry,
                     &mut result,
                     &content,
                     options.full_precision,
@@ -331,7 +420,7 @@ impl Updater for PyProjectUpdater {
                     if let Some(Item::Value(Value::Array(deps))) = opt_deps.get_mut(&key) {
                         self.update_array_deps(
                             deps,
-                            registry,
+                            effective_registry,
                             &mut result,
                             &content,
                             options.full_precision,
@@ -349,7 +438,7 @@ impl Updater for PyProjectUpdater {
                 if let Some(Item::Value(Value::Array(deps))) = groups.get_mut(&key) {
                     self.update_array_deps(
                         deps,
-                        registry,
+                        effective_registry,
                         &mut result,
                         &content,
                         options.full_precision,
@@ -366,7 +455,7 @@ impl Updater for PyProjectUpdater {
             if let Some(Item::Table(deps)) = poetry.get_mut("dependencies") {
                 self.update_poetry_deps(
                     deps,
-                    registry,
+                    effective_registry,
                     &mut result,
                     &content,
                     options.full_precision,
@@ -377,7 +466,7 @@ impl Updater for PyProjectUpdater {
             if let Some(Item::Table(deps)) = poetry.get_mut("dev-dependencies") {
                 self.update_poetry_deps(
                     deps,
-                    registry,
+                    effective_registry,
                     &mut result,
                     &content,
                     options.full_precision,
@@ -946,5 +1035,123 @@ version = "1.0.0"
         assert_eq!(result.updated.len(), 0);
         assert_eq!(result.unchanged, 0);
         assert!(result.errors.is_empty());
+    }
+
+    // Tests for index URL extraction
+
+    #[test]
+    fn test_extract_poetry_source_urls() {
+        let content = r#"
+[tool.poetry]
+name = "myproject"
+
+[[tool.poetry.source]]
+name = "private"
+url = "https://private.pypi.com/simple"
+
+[[tool.poetry.source]]
+name = "extra"
+url = "https://extra.pypi.com/simple"
+"#;
+        let doc: DocumentMut = content.parse().unwrap();
+        let (primary, extras) = PyProjectUpdater::extract_index_urls(&doc);
+
+        assert_eq!(primary, Some("https://private.pypi.com/simple".to_string()));
+        assert_eq!(extras.len(), 1);
+        assert_eq!(extras[0], "https://extra.pypi.com/simple");
+    }
+
+    #[test]
+    fn test_extract_pdm_source_urls() {
+        let content = r#"
+[tool.pdm]
+name = "myproject"
+
+[[tool.pdm.source]]
+name = "private"
+url = "https://private.pypi.com/simple"
+"#;
+        let doc: DocumentMut = content.parse().unwrap();
+        let (primary, extras) = PyProjectUpdater::extract_index_urls(&doc);
+
+        assert_eq!(primary, Some("https://private.pypi.com/simple".to_string()));
+        assert!(extras.is_empty());
+    }
+
+    #[test]
+    fn test_extract_uv_index_urls() {
+        let content = r#"
+[tool.uv]
+
+[[tool.uv.index]]
+name = "pytorch"
+url = "https://download.pytorch.org/whl/cpu"
+
+[[tool.uv.index]]
+name = "private"
+url = "https://private.pypi.com/simple"
+"#;
+        let doc: DocumentMut = content.parse().unwrap();
+        let (primary, extras) = PyProjectUpdater::extract_index_urls(&doc);
+
+        assert_eq!(
+            primary,
+            Some("https://download.pytorch.org/whl/cpu".to_string())
+        );
+        assert_eq!(extras.len(), 1);
+        assert_eq!(extras[0], "https://private.pypi.com/simple");
+    }
+
+    #[test]
+    fn test_extract_no_sources() {
+        let content = r#"
+[project]
+name = "myproject"
+dependencies = ["requests>=2.0.0"]
+"#;
+        let doc: DocumentMut = content.parse().unwrap();
+        let (primary, extras) = PyProjectUpdater::extract_index_urls(&doc);
+
+        assert!(primary.is_none());
+        assert!(extras.is_empty());
+    }
+
+    #[test]
+    fn test_extract_combined_sources() {
+        // Poetry and PDM sources in the same file (unlikely but should handle)
+        let content = r#"
+[[tool.poetry.source]]
+name = "poetry-private"
+url = "https://poetry.pypi.com/simple"
+
+[[tool.pdm.source]]
+name = "pdm-private"
+url = "https://pdm.pypi.com/simple"
+"#;
+        let doc: DocumentMut = content.parse().unwrap();
+        let (primary, extras) = PyProjectUpdater::extract_index_urls(&doc);
+
+        assert_eq!(primary, Some("https://poetry.pypi.com/simple".to_string()));
+        assert_eq!(extras.len(), 1);
+        assert_eq!(extras[0], "https://pdm.pypi.com/simple");
+    }
+
+    #[test]
+    fn test_extract_skips_duplicate_urls() {
+        let content = r#"
+[[tool.poetry.source]]
+name = "private1"
+url = "https://private.pypi.com/simple"
+
+[[tool.pdm.source]]
+name = "private2"
+url = "https://private.pypi.com/simple"
+"#;
+        let doc: DocumentMut = content.parse().unwrap();
+        let (primary, extras) = PyProjectUpdater::extract_index_urls(&doc);
+
+        // Should only have one unique URL
+        assert_eq!(primary, Some("https://private.pypi.com/simple".to_string()));
+        assert!(extras.is_empty());
     }
 }

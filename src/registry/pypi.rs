@@ -35,6 +35,15 @@ impl std::fmt::Debug for PyPiCredentials {
     }
 }
 
+/// Authentication method for PyPI registries
+#[derive(Clone)]
+pub enum PyPiAuth {
+    /// Basic authentication with username and password
+    Basic(PyPiCredentials),
+    /// Bearer token authentication (GitLab, Azure, JFrog, etc.)
+    Bearer(String),
+}
+
 pub struct PyPiRegistry {
     client: Client,
     index_url: String,
@@ -43,6 +52,19 @@ pub struct PyPiRegistry {
 #[derive(Debug, Deserialize)]
 struct PyPiResponse {
     releases: HashMap<String, Vec<ReleaseFile>>,
+}
+
+/// PEP 691 JSON Simple API response format
+#[derive(Debug, Clone, Deserialize)]
+struct SimpleApiResponse {
+    files: Vec<SimpleApiFile>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct SimpleApiFile {
+    filename: String,
+    #[serde(default)]
+    yanked: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -75,14 +97,34 @@ impl PyPiRegistry {
         index_url: String,
         credentials: Option<PyPiCredentials>,
     ) -> Self {
+        let auth = credentials.map(PyPiAuth::Basic);
+        Self::with_index_url_and_auth(index_url, auth)
+    }
+
+    /// Create a registry with a bearer token for authentication
+    pub fn with_index_url_and_bearer_token(index_url: String, token: String) -> Self {
+        Self::with_index_url_and_auth(index_url, Some(PyPiAuth::Bearer(token)))
+    }
+
+    /// Create a registry with any authentication method
+    pub fn with_index_url_and_auth(index_url: String, auth: Option<PyPiAuth>) -> Self {
         let mut headers = HeaderMap::new();
 
-        // Add Basic Auth header if credentials are provided
-        if let Some(ref creds) = credentials {
-            let auth = format!("{}:{}", creds.username, creds.password);
-            let encoded = base64_encode(&auth);
-            if let Ok(header_value) = HeaderValue::from_str(&format!("Basic {}", encoded)) {
-                headers.insert(AUTHORIZATION, header_value);
+        // Add authentication header if provided
+        if let Some(ref auth_method) = auth {
+            match auth_method {
+                PyPiAuth::Basic(creds) => {
+                    let auth = format!("{}:{}", creds.username, creds.password);
+                    let encoded = base64_encode(&auth);
+                    if let Ok(header_value) = HeaderValue::from_str(&format!("Basic {}", encoded)) {
+                        headers.insert(AUTHORIZATION, header_value);
+                    }
+                }
+                PyPiAuth::Bearer(token) => {
+                    if let Ok(header_value) = HeaderValue::from_str(&format!("Bearer {}", token)) {
+                        headers.insert(AUTHORIZATION, header_value);
+                    }
+                }
             }
         }
 
@@ -114,6 +156,7 @@ impl PyPiRegistry {
 
     /// Create a registry from a URL that may contain embedded credentials
     /// Supports URLs like: <https://user:pass@private.pypi.com/simple>
+    /// Also detects bearer tokens from environment variables
     /// Automatically converts Simple API URLs to JSON API format
     pub fn from_url(url: &str) -> Self {
         if let Ok(parsed) = url::Url::parse(url) {
@@ -135,15 +178,10 @@ impl PyPiRegistry {
                 return Self::with_index_url_and_credentials(normalized, Some(credentials));
             }
 
-            // No embedded credentials - try to detect from netrc
-            let host = parsed.host_str().unwrap_or("");
-            let credentials = read_netrc_credentials(host).map(|c| PyPiCredentials {
-                username: c.login,
-                password: c.password,
-            });
-
+            // No embedded credentials - try to detect auth (bearer token or basic auth)
             let normalized = Self::normalize_index_url(url);
-            Self::with_index_url_and_credentials(normalized, credentials)
+            let auth = Self::detect_auth(&normalized);
+            Self::with_index_url_and_auth(normalized, auth)
         } else {
             // Invalid URL - create without credentials
             Self::with_index_url(Self::normalize_index_url(url))
@@ -191,12 +229,72 @@ impl PyPiRegistry {
         None
     }
 
+    /// Detect bearer token from environment variables
+    /// Supports common environment variable names used by various tools:
+    /// - UV_INDEX_TOKEN (uv)
+    /// - PIP_INDEX_TOKEN (pip-like)
+    /// - PYPI_TOKEN (generic)
+    /// - POETRY_HTTP_BASIC_PYPI_PASSWORD with empty username (Poetry)
+    pub fn detect_bearer_token() -> Option<String> {
+        // Check common token environment variables
+        for var in [
+            "UV_INDEX_TOKEN",
+            "PIP_INDEX_TOKEN",
+            "PYPI_TOKEN",
+            "POETRY_PYPI_TOKEN_PYPI",
+        ] {
+            if let Ok(token) = std::env::var(var)
+                && !token.is_empty()
+            {
+                return Some(token);
+            }
+        }
+
+        // Poetry uses POETRY_HTTP_BASIC_<NAME>_PASSWORD with empty username as token
+        if let Ok(token) = std::env::var("POETRY_HTTP_BASIC_PYPI_PASSWORD")
+            && !token.is_empty()
+            && std::env::var("POETRY_HTTP_BASIC_PYPI_USERNAME")
+                .map(|u| u.is_empty() || u == "__token__")
+                .unwrap_or(true)
+        {
+            return Some(token);
+        }
+
+        None
+    }
+
+    /// Detect any form of authentication (Bearer token or Basic auth)
+    /// Bearer tokens take precedence over Basic auth
+    pub fn detect_auth(index_url: &str) -> Option<PyPiAuth> {
+        // Check for bearer token first
+        if let Some(token) = Self::detect_bearer_token() {
+            return Some(PyPiAuth::Bearer(token));
+        }
+
+        // Fall back to basic auth
+        Self::detect_credentials(index_url).map(PyPiAuth::Basic)
+    }
+
     /// Execute a GET request with retry and authentication
     async fn get_with_retry(&self, url: &str) -> Result<Response, reqwest::Error> {
+        self.get_with_retry_and_headers(url, None).await
+    }
+
+    /// Execute a GET request with retry, authentication, and custom headers
+    async fn get_with_retry_and_headers(
+        &self,
+        url: &str,
+        headers: Option<HeaderMap>,
+    ) -> Result<Response, reqwest::Error> {
         let mut last_error = None;
 
         for attempt in 0..MAX_RETRIES {
-            match self.client.get(url).send().await {
+            let mut request = self.client.get(url);
+            if let Some(ref h) = headers {
+                request = request.headers(h.clone());
+            }
+
+            match request.send().await {
                 Ok(response) => {
                     // Don't retry client errors (4xx) - they won't succeed on retry
                     if response.status().is_client_error() || response.status().is_success() {
@@ -247,7 +345,7 @@ impl PyPiRegistry {
     }
 
     /// Internal method to fetch versions with optional pre-release inclusion
-    /// Tries JSON API first, falls back to Simple API for private registries
+    /// Tries Simple API with PEP 691 content negotiation first, falls back to legacy JSON API
     async fn fetch_versions_internal(
         &self,
         package: &str,
@@ -255,29 +353,55 @@ impl PyPiRegistry {
     ) -> Result<Vec<(Version, String)>> {
         let normalized = package.to_lowercase().replace('_', "-");
 
-        // Try JSON API first (PyPI.org style)
+        // Try Simple API with PEP 691 content negotiation
+        // Request JSON format, but accept HTML as fallback
+        let simple_url = format!("{}/simple/{}/", self.index_url, normalized);
+
+        let mut headers = HeaderMap::new();
+        // PEP 691: Request JSON format with HTML fallback
+        if let Ok(accept) = HeaderValue::from_str(
+            "application/vnd.pypi.simple.v1+json, application/vnd.pypi.simple.v1+html;q=0.9, text/html;q=0.8",
+        ) {
+            headers.insert(reqwest::header::ACCEPT, accept);
+        }
+
+        let simple_response = self
+            .get_with_retry_and_headers(&simple_url, Some(headers))
+            .await?;
+
+        if simple_response.status().is_success() {
+            // Check Content-Type to determine response format
+            let content_type = simple_response
+                .headers()
+                .get(reqwest::header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("");
+
+            if content_type.contains("application/vnd.pypi.simple") && content_type.contains("json")
+            {
+                // PEP 691 JSON format
+                let data: SimpleApiResponse = simple_response.json().await?;
+                return self.parse_simple_api_json_response(data, package, include_prereleases);
+            } else {
+                // HTML format (standard Simple API or PEP 691 HTML)
+                let html = simple_response.text().await?;
+                return self.parse_simple_api_response(&html, package, include_prereleases);
+            }
+        }
+
+        // Simple API failed - try legacy JSON API (PyPI.org style)
         let json_url = format!("{}/{}/json", self.index_url, normalized);
         let response = self.get_with_retry(&json_url).await?;
 
         if response.status().is_success() {
-            // JSON API succeeded
             let data: PyPiResponse = response.json().await?;
             return self.parse_json_response(data, include_prereleases);
-        }
-
-        // JSON API failed - try Simple API (private registries like Nexus)
-        let simple_url = format!("{}/simple/{}/", self.index_url, normalized);
-        let simple_response = self.get_with_retry(&simple_url).await?;
-
-        if simple_response.status().is_success() {
-            let html = simple_response.text().await?;
-            return self.parse_simple_api_response(&html, package, include_prereleases);
         }
 
         Err(anyhow!(
             "Failed to fetch package '{}': HTTP {}",
             package,
-            simple_response.status()
+            response.status()
         ))
     }
 
@@ -304,6 +428,51 @@ impl PyPiRegistry {
                     .map(|v| (v, ver_str.clone()))
             })
             .collect();
+
+        versions.sort_by(|a, b| b.0.cmp(&a.0));
+        Ok(versions)
+    }
+
+    /// Parse PEP 691 JSON Simple API response
+    /// Extracts versions from file list, skipping yanked packages
+    fn parse_simple_api_json_response(
+        &self,
+        data: SimpleApiResponse,
+        package: &str,
+        include_prereleases: bool,
+    ) -> Result<Vec<(Version, String)>> {
+        let mut versions: Vec<(Version, String)> = Vec::new();
+        let normalized = package.to_lowercase().replace('_', "-");
+
+        for file in &data.files {
+            // Skip yanked packages
+            if file.yanked.unwrap_or(false) {
+                continue;
+            }
+
+            let Some(version_str) =
+                Self::extract_version_from_filename(&file.filename, &normalized)
+            else {
+                continue;
+            };
+
+            if !include_prereleases && !Self::is_stable_version(&version_str) {
+                continue;
+            }
+
+            let Ok(version) = version_str.parse::<Version>() else {
+                continue;
+            };
+
+            // Avoid duplicates
+            if !versions.iter().any(|(_, v)| v == &version_str) {
+                versions.push((version, version_str));
+            }
+        }
+
+        if versions.is_empty() {
+            return Err(anyhow!("No versions found for package '{}'", package));
+        }
 
         versions.sort_by(|a, b| b.0.cmp(&a.0));
         Ok(versions)
@@ -715,6 +884,80 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_simple_api_json_response() {
+        let registry = PyPiRegistry::new();
+        let data = SimpleApiResponse {
+            files: vec![
+                SimpleApiFile {
+                    filename: "my_package-1.0.0.tar.gz".to_string(),
+                    yanked: Some(false),
+                },
+                SimpleApiFile {
+                    filename: "my_package-1.1.0.tar.gz".to_string(),
+                    yanked: None,
+                },
+                SimpleApiFile {
+                    filename: "my_package-1.2.0-py3-none-any.whl".to_string(),
+                    yanked: Some(false),
+                },
+                SimpleApiFile {
+                    filename: "my_package-2.0.0a1.tar.gz".to_string(),
+                    yanked: Some(false),
+                },
+            ],
+        };
+
+        // Stable versions only
+        let versions = registry
+            .parse_simple_api_json_response(data.clone(), "my-package", false)
+            .unwrap();
+        assert_eq!(versions.len(), 3);
+        assert_eq!(versions[0].1, "1.2.0"); // Highest stable
+        assert_eq!(versions[1].1, "1.1.0");
+        assert_eq!(versions[2].1, "1.0.0");
+
+        // Including prereleases
+        let versions_with_pre = registry
+            .parse_simple_api_json_response(data, "my-package", true)
+            .unwrap();
+        assert_eq!(versions_with_pre.len(), 4);
+        assert_eq!(versions_with_pre[0].1, "2.0.0a1"); // Highest including prerelease
+    }
+
+    #[test]
+    fn test_parse_simple_api_json_response_skips_yanked() {
+        let registry = PyPiRegistry::new();
+        let data = SimpleApiResponse {
+            files: vec![
+                SimpleApiFile {
+                    filename: "my_package-1.0.0.tar.gz".to_string(),
+                    yanked: Some(false),
+                },
+                SimpleApiFile {
+                    filename: "my_package-1.1.0.tar.gz".to_string(),
+                    yanked: Some(true), // Yanked
+                },
+                SimpleApiFile {
+                    filename: "my_package-1.2.0.tar.gz".to_string(),
+                    yanked: Some(true), // Yanked
+                },
+                SimpleApiFile {
+                    filename: "my_package-1.3.0.tar.gz".to_string(),
+                    yanked: Some(false),
+                },
+            ],
+        };
+
+        let versions = registry
+            .parse_simple_api_json_response(data, "my-package", false)
+            .unwrap();
+        // Should only have 1.0.0 and 1.3.0 (1.1.0 and 1.2.0 are yanked)
+        assert_eq!(versions.len(), 2);
+        assert_eq!(versions[0].1, "1.3.0");
+        assert_eq!(versions[1].1, "1.0.0");
+    }
+
+    #[test]
     fn test_base64_encode() {
         assert_eq!(base64_encode("hello"), "aGVsbG8=");
         assert_eq!(base64_encode("user:pass"), "dXNlcjpwYXNz");
@@ -790,6 +1033,137 @@ mod tests {
             std::env::remove_var("UV_INDEX_USERNAME");
             std::env::remove_var("UV_INDEX_PASSWORD");
         }
+    }
+
+    #[test]
+    #[serial]
+    fn test_detect_bearer_token_uv() {
+        // SAFETY: Test runs in isolation with #[serial]
+        unsafe {
+            std::env::set_var("UV_INDEX_TOKEN", "test-token-123");
+            std::env::remove_var("PIP_INDEX_TOKEN");
+            std::env::remove_var("PYPI_TOKEN");
+        }
+
+        let token = PyPiRegistry::detect_bearer_token();
+        assert!(token.is_some());
+        assert_eq!(token.unwrap(), "test-token-123");
+
+        // SAFETY: Cleanup
+        unsafe {
+            std::env::remove_var("UV_INDEX_TOKEN");
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn test_detect_bearer_token_pip() {
+        // SAFETY: Test runs in isolation with #[serial]
+        unsafe {
+            std::env::remove_var("UV_INDEX_TOKEN");
+            std::env::set_var("PIP_INDEX_TOKEN", "pip-token-456");
+            std::env::remove_var("PYPI_TOKEN");
+        }
+
+        let token = PyPiRegistry::detect_bearer_token();
+        assert!(token.is_some());
+        assert_eq!(token.unwrap(), "pip-token-456");
+
+        // SAFETY: Cleanup
+        unsafe {
+            std::env::remove_var("PIP_INDEX_TOKEN");
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn test_detect_bearer_token_pypi() {
+        // SAFETY: Test runs in isolation with #[serial]
+        unsafe {
+            std::env::remove_var("UV_INDEX_TOKEN");
+            std::env::remove_var("PIP_INDEX_TOKEN");
+            std::env::set_var("PYPI_TOKEN", "pypi-token-789");
+        }
+
+        let token = PyPiRegistry::detect_bearer_token();
+        assert!(token.is_some());
+        assert_eq!(token.unwrap(), "pypi-token-789");
+
+        // SAFETY: Cleanup
+        unsafe {
+            std::env::remove_var("PYPI_TOKEN");
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn test_detect_bearer_token_none() {
+        // SAFETY: Test runs in isolation with #[serial]
+        unsafe {
+            std::env::remove_var("UV_INDEX_TOKEN");
+            std::env::remove_var("PIP_INDEX_TOKEN");
+            std::env::remove_var("PYPI_TOKEN");
+            std::env::remove_var("POETRY_PYPI_TOKEN_PYPI");
+            std::env::remove_var("POETRY_HTTP_BASIC_PYPI_PASSWORD");
+        }
+
+        let token = PyPiRegistry::detect_bearer_token();
+        assert!(token.is_none());
+    }
+
+    #[test]
+    #[serial]
+    fn test_detect_auth_prefers_bearer() {
+        // SAFETY: Test runs in isolation with #[serial]
+        unsafe {
+            // Set both bearer token and basic auth
+            std::env::set_var("UV_INDEX_TOKEN", "bearer-token");
+            std::env::set_var("UV_INDEX_USERNAME", "username");
+            std::env::set_var("UV_INDEX_PASSWORD", "password");
+        }
+
+        let auth = PyPiRegistry::detect_auth("https://pypi.example.com");
+        assert!(matches!(auth, Some(PyPiAuth::Bearer(_))));
+
+        // SAFETY: Cleanup
+        unsafe {
+            std::env::remove_var("UV_INDEX_TOKEN");
+            std::env::remove_var("UV_INDEX_USERNAME");
+            std::env::remove_var("UV_INDEX_PASSWORD");
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn test_detect_auth_falls_back_to_basic() {
+        // SAFETY: Test runs in isolation with #[serial]
+        unsafe {
+            // No bearer token, only basic auth
+            std::env::remove_var("UV_INDEX_TOKEN");
+            std::env::remove_var("PIP_INDEX_TOKEN");
+            std::env::remove_var("PYPI_TOKEN");
+            std::env::set_var("UV_INDEX_USERNAME", "username");
+            std::env::set_var("UV_INDEX_PASSWORD", "password");
+        }
+
+        let auth = PyPiRegistry::detect_auth("https://pypi.example.com");
+        assert!(matches!(auth, Some(PyPiAuth::Basic(_))));
+
+        // SAFETY: Cleanup
+        unsafe {
+            std::env::remove_var("UV_INDEX_USERNAME");
+            std::env::remove_var("UV_INDEX_PASSWORD");
+        }
+    }
+
+    #[test]
+    fn test_registry_with_bearer_token() {
+        // Just verify that the registry can be created with a bearer token
+        let _registry = PyPiRegistry::with_index_url_and_bearer_token(
+            "https://pypi.example.com".to_string(),
+            "test-token".to_string(),
+        );
+        // The token is used to set default headers in the client
     }
 
     #[test]
@@ -1257,6 +1631,78 @@ mod tests {
                 .unwrap();
 
             assert_eq!(version, "1.5.0");
+        }
+
+        #[tokio::test]
+        async fn test_pep691_json_format() {
+            let mock_server = MockServer::start().await;
+
+            // Server responds with PEP 691 JSON format
+            // Use set_body_raw to properly set Content-Type (insert_header doesn't work after set_body_string)
+            let json_body = r#"{"files": [{"filename": "testpkg-1.0.0.tar.gz", "yanked": false}, {"filename": "testpkg-2.0.0.tar.gz", "yanked": false}]}"#;
+            Mock::given(method("GET"))
+                .and(path("/simple/testpkg/"))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .set_body_raw(json_body.as_bytes(), "application/vnd.pypi.simple.v1+json"),
+                )
+                .expect(1)
+                .mount(&mock_server)
+                .await;
+
+            let registry = PyPiRegistry::with_index_url(mock_server.uri());
+            let version = registry.get_latest_version("testpkg").await.unwrap();
+
+            assert_eq!(version, "2.0.0");
+        }
+
+        #[tokio::test]
+        async fn test_pep691_json_skips_yanked() {
+            let mock_server = MockServer::start().await;
+
+            // Server responds with PEP 691 JSON format including yanked versions
+            let json_body = r#"{"files": [{"filename": "testpkg-1.0.0.tar.gz", "yanked": false}, {"filename": "testpkg-2.0.0.tar.gz", "yanked": true}]}"#;
+            Mock::given(method("GET"))
+                .and(path("/simple/testpkg/"))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .set_body_raw(json_body.as_bytes(), "application/vnd.pypi.simple.v1+json"),
+                )
+                .expect(1)
+                .mount(&mock_server)
+                .await;
+
+            let registry = PyPiRegistry::with_index_url(mock_server.uri());
+            let version = registry.get_latest_version("testpkg").await.unwrap();
+
+            // Should return 1.0.0 since 2.0.0 is yanked
+            assert_eq!(version, "1.0.0");
+        }
+
+        #[tokio::test]
+        async fn test_simple_api_html_fallback() {
+            let mock_server = MockServer::start().await;
+
+            // Server responds with HTML (no PEP 691 support)
+            // Each <a> tag needs to be on its own line for the parser
+            let html = r#"<!DOCTYPE html>
+<html>
+<body>
+<a href="testpkg-1.0.0.tar.gz">testpkg-1.0.0.tar.gz</a>
+<a href="testpkg-2.0.0.tar.gz">testpkg-2.0.0.tar.gz</a>
+</body>
+</html>"#;
+            Mock::given(method("GET"))
+                .and(path("/simple/testpkg/"))
+                .respond_with(ResponseTemplate::new(200).set_body_raw(html.as_bytes(), "text/html"))
+                .expect(1)
+                .mount(&mock_server)
+                .await;
+
+            let registry = PyPiRegistry::with_index_url(mock_server.uri());
+            let version = registry.get_latest_version("testpkg").await.unwrap();
+
+            assert_eq!(version, "2.0.0");
         }
     }
 }
