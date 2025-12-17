@@ -10,6 +10,7 @@ use reqwest::{Client, Response};
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::str::FromStr;
+use std::sync::Arc;
 use std::time::Duration;
 
 /// Maximum number of retry attempts for failed HTTP requests
@@ -282,6 +283,138 @@ impl Default for PyPiRegistry {
     }
 }
 
+impl PyPiRegistry {
+    /// Detect extra index URLs from environment variables
+    /// Supports UV_EXTRA_INDEX_URL and PIP_EXTRA_INDEX_URL (space or newline separated)
+    pub fn detect_extra_index_urls() -> Vec<String> {
+        let mut urls = Vec::new();
+
+        for var in ["UV_EXTRA_INDEX_URL", "PIP_EXTRA_INDEX_URL"] {
+            if let Ok(value) = std::env::var(var) {
+                for url in value.split([' ', '\n']) {
+                    let trimmed = url.trim();
+                    if !trimmed.is_empty() {
+                        urls.push(trimmed.to_string());
+                    }
+                }
+            }
+        }
+
+        urls
+    }
+}
+
+/// A registry that queries multiple PyPI indexes using first-match strategy.
+/// Queries indexes in order (primary first, then extras) and returns the first successful result.
+/// This is safer than "highest version wins" as it avoids dependency confusion attacks.
+pub struct MultiPyPiRegistry {
+    registries: Vec<Arc<PyPiRegistry>>,
+}
+
+impl MultiPyPiRegistry {
+    /// Create a new multi-index registry from a list of registries
+    pub fn new(registries: Vec<Arc<PyPiRegistry>>) -> Self {
+        Self { registries }
+    }
+
+    /// Create from a primary registry and extra index URLs
+    pub fn from_primary_and_extras(primary: PyPiRegistry, extra_urls: Vec<String>) -> Self {
+        let mut registries: Vec<Arc<PyPiRegistry>> = vec![Arc::new(primary)];
+
+        for url in extra_urls {
+            registries.push(Arc::new(PyPiRegistry::from_url(&url)));
+        }
+
+        Self { registries }
+    }
+
+    /// Get all registries
+    pub fn registries(&self) -> &[Arc<PyPiRegistry>] {
+        &self.registries
+    }
+}
+
+#[async_trait]
+impl Registry for MultiPyPiRegistry {
+    async fn get_latest_version(&self, package: &str) -> Result<String> {
+        if self.registries.is_empty() {
+            return Err(anyhow!("No registries configured"));
+        }
+
+        // First-match strategy: query indexes in order, return first success
+        let mut last_error: Option<anyhow::Error> = None;
+
+        for registry in &self.registries {
+            match registry.get_latest_version(package).await {
+                Ok(version) => return Ok(version),
+                Err(e) => {
+                    last_error = Some(e);
+                }
+            }
+        }
+
+        Err(last_error.unwrap_or_else(|| anyhow!("No versions found for package '{}'", package)))
+    }
+
+    async fn get_latest_version_including_prereleases(&self, package: &str) -> Result<String> {
+        if self.registries.is_empty() {
+            return Err(anyhow!("No registries configured"));
+        }
+
+        let mut last_error: Option<anyhow::Error> = None;
+
+        for registry in &self.registries {
+            match registry
+                .get_latest_version_including_prereleases(package)
+                .await
+            {
+                Ok(version) => return Ok(version),
+                Err(e) => {
+                    last_error = Some(e);
+                }
+            }
+        }
+
+        Err(last_error.unwrap_or_else(|| anyhow!("No versions found for package '{}'", package)))
+    }
+
+    async fn get_latest_version_matching(
+        &self,
+        package: &str,
+        constraints: &str,
+    ) -> Result<String> {
+        if self.registries.is_empty() {
+            return Err(anyhow!("No registries configured"));
+        }
+
+        let mut last_error: Option<anyhow::Error> = None;
+
+        for registry in &self.registries {
+            match registry
+                .get_latest_version_matching(package, constraints)
+                .await
+            {
+                Ok(version) => return Ok(version),
+                Err(e) => {
+                    last_error = Some(e);
+                }
+            }
+        }
+
+        Err(last_error.unwrap_or_else(|| {
+            anyhow!(
+                "No version of '{}' matches constraints '{}'",
+                package,
+                constraints
+            )
+        }))
+    }
+
+    fn name(&self) -> &'static str {
+        "pypi"
+    }
+}
+
 #[async_trait]
 impl Registry for PyPiRegistry {
     async fn get_latest_version(&self, package: &str) -> Result<String> {
@@ -340,6 +473,7 @@ impl Registry for PyPiRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serial_test::serial;
     use std::io::Write;
     use tempfile::NamedTempFile;
 
@@ -409,9 +543,10 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_detect_credentials_from_env() {
         // Set UV_INDEX_* credentials
-        // SAFETY: Test runs in isolation
+        // SAFETY: Test runs in isolation with #[serial]
         unsafe {
             std::env::set_var("UV_INDEX_USERNAME", "uvuser");
             std::env::set_var("UV_INDEX_PASSWORD", "uvpass");
@@ -423,7 +558,7 @@ mod tests {
         assert_eq!(creds.username, "uvuser");
         assert_eq!(creds.password, "uvpass");
 
-        // SAFETY: Test runs in isolation
+        // SAFETY: Cleanup
         unsafe {
             std::env::remove_var("UV_INDEX_USERNAME");
             std::env::remove_var("UV_INDEX_PASSWORD");
@@ -464,5 +599,391 @@ mod tests {
     fn test_from_url_strips_trailing_slash() {
         let registry = PyPiRegistry::from_url("https://pypi.example.com/simple/");
         assert_eq!(registry.index_url(), "https://pypi.example.com/simple");
+    }
+
+    // Tests for extra index URLs functionality
+
+    #[test]
+    #[serial]
+    fn test_detect_extra_index_urls_empty() {
+        // Ensure env vars are unset
+        // SAFETY: Test runs in isolation with #[serial]
+        unsafe {
+            std::env::remove_var("UV_EXTRA_INDEX_URL");
+            std::env::remove_var("PIP_EXTRA_INDEX_URL");
+        }
+
+        let urls = PyPiRegistry::detect_extra_index_urls();
+        assert!(urls.is_empty());
+    }
+
+    #[test]
+    #[serial]
+    fn test_detect_extra_index_urls_single() {
+        // SAFETY: Test runs in isolation with #[serial]
+        unsafe {
+            std::env::set_var("UV_EXTRA_INDEX_URL", "https://extra1.pypi.org/simple");
+            std::env::remove_var("PIP_EXTRA_INDEX_URL");
+        }
+
+        let urls = PyPiRegistry::detect_extra_index_urls();
+        assert_eq!(urls.len(), 1);
+        assert_eq!(urls[0], "https://extra1.pypi.org/simple");
+
+        // SAFETY: Cleanup
+        unsafe {
+            std::env::remove_var("UV_EXTRA_INDEX_URL");
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn test_detect_extra_index_urls_space_separated() {
+        // SAFETY: Test runs in isolation with #[serial]
+        unsafe {
+            std::env::set_var(
+                "UV_EXTRA_INDEX_URL",
+                "https://extra1.pypi.org/simple https://extra2.pypi.org/simple",
+            );
+            std::env::remove_var("PIP_EXTRA_INDEX_URL");
+        }
+
+        let urls = PyPiRegistry::detect_extra_index_urls();
+        assert_eq!(urls.len(), 2);
+        assert_eq!(urls[0], "https://extra1.pypi.org/simple");
+        assert_eq!(urls[1], "https://extra2.pypi.org/simple");
+
+        // SAFETY: Cleanup
+        unsafe {
+            std::env::remove_var("UV_EXTRA_INDEX_URL");
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn test_detect_extra_index_urls_newline_separated() {
+        // SAFETY: Test runs in isolation with #[serial]
+        unsafe {
+            std::env::set_var(
+                "PIP_EXTRA_INDEX_URL",
+                "https://extra1.pypi.org/simple\nhttps://extra2.pypi.org/simple",
+            );
+            std::env::remove_var("UV_EXTRA_INDEX_URL");
+        }
+
+        let urls = PyPiRegistry::detect_extra_index_urls();
+        assert_eq!(urls.len(), 2);
+        assert_eq!(urls[0], "https://extra1.pypi.org/simple");
+        assert_eq!(urls[1], "https://extra2.pypi.org/simple");
+
+        // SAFETY: Cleanup
+        unsafe {
+            std::env::remove_var("PIP_EXTRA_INDEX_URL");
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn test_detect_extra_index_urls_combined() {
+        // SAFETY: Test runs in isolation with #[serial]
+        unsafe {
+            std::env::set_var("UV_EXTRA_INDEX_URL", "https://uv-extra.pypi.org/simple");
+            std::env::set_var("PIP_EXTRA_INDEX_URL", "https://pip-extra.pypi.org/simple");
+        }
+
+        let urls = PyPiRegistry::detect_extra_index_urls();
+        assert_eq!(urls.len(), 2);
+        assert!(urls.contains(&"https://uv-extra.pypi.org/simple".to_string()));
+        assert!(urls.contains(&"https://pip-extra.pypi.org/simple".to_string()));
+
+        // SAFETY: Cleanup
+        unsafe {
+            std::env::remove_var("UV_EXTRA_INDEX_URL");
+            std::env::remove_var("PIP_EXTRA_INDEX_URL");
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn test_detect_extra_index_urls_trims_whitespace() {
+        // SAFETY: Test runs in isolation with #[serial]
+        unsafe {
+            std::env::set_var(
+                "UV_EXTRA_INDEX_URL",
+                "  https://extra1.pypi.org/simple  \n  https://extra2.pypi.org/simple  ",
+            );
+            std::env::remove_var("PIP_EXTRA_INDEX_URL");
+        }
+
+        let urls = PyPiRegistry::detect_extra_index_urls();
+        assert_eq!(urls.len(), 2);
+        assert_eq!(urls[0], "https://extra1.pypi.org/simple");
+        assert_eq!(urls[1], "https://extra2.pypi.org/simple");
+
+        // SAFETY: Cleanup
+        unsafe {
+            std::env::remove_var("UV_EXTRA_INDEX_URL");
+        }
+    }
+
+    // Tests for MultiPyPiRegistry
+
+    #[test]
+    fn test_multi_registry_from_primary_and_extras() {
+        let primary = PyPiRegistry::new();
+        let extras = vec![
+            "https://extra1.pypi.org/simple".to_string(),
+            "https://extra2.pypi.org/simple".to_string(),
+        ];
+
+        let multi = MultiPyPiRegistry::from_primary_and_extras(primary, extras);
+        assert_eq!(multi.registries().len(), 3); // 1 primary + 2 extras
+    }
+
+    #[test]
+    fn test_multi_registry_no_extras() {
+        let primary = PyPiRegistry::new();
+        let extras: Vec<String> = vec![];
+
+        let multi = MultiPyPiRegistry::from_primary_and_extras(primary, extras);
+        assert_eq!(multi.registries().len(), 1); // Just the primary
+    }
+
+    #[test]
+    fn test_multi_registry_name() {
+        let primary = PyPiRegistry::new();
+        let multi = MultiPyPiRegistry::from_primary_and_extras(primary, vec![]);
+        assert_eq!(multi.name(), "pypi");
+    }
+
+    mod multi_registry_integration {
+        use super::*;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        #[tokio::test]
+        async fn test_multi_registry_first_match_returns_primary() {
+            let mock_server1 = MockServer::start().await;
+
+            // Server 1 (primary) has version 1.0.0
+            Mock::given(method("GET"))
+                .and(path("/testpkg/json"))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .set_body_string(r#"{"releases": {"1.0.0": [{"yanked": false}]}}"#),
+                )
+                .expect(1) // Should be called exactly once
+                .mount(&mock_server1)
+                .await;
+
+            // Extra index URL that won't be queried (first-match stops at primary)
+            let primary = PyPiRegistry::with_index_url(mock_server1.uri());
+            let extras = vec!["https://unused-extra.example.com/simple".to_string()];
+
+            let multi = MultiPyPiRegistry::from_primary_and_extras(primary, extras);
+            let version = multi.get_latest_version("testpkg").await.unwrap();
+
+            // First-match: returns primary's version, extra not queried
+            assert_eq!(version, "1.0.0");
+        }
+
+        #[tokio::test]
+        async fn test_multi_registry_falls_back_on_failure() {
+            let mock_server1 = MockServer::start().await;
+            let mock_server2 = MockServer::start().await;
+
+            // Server 1 (primary) returns 404 (package not found)
+            Mock::given(method("GET"))
+                .and(path("/testpkg/json"))
+                .respond_with(ResponseTemplate::new(404))
+                .expect(1) // Primary is tried first
+                .mount(&mock_server1)
+                .await;
+
+            // Server 2 (extra) has version 1.5.0
+            Mock::given(method("GET"))
+                .and(path("/testpkg/json"))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .set_body_string(r#"{"releases": {"1.5.0": [{"yanked": false}]}}"#),
+                )
+                .expect(1) // Falls back to extra when primary fails
+                .mount(&mock_server2)
+                .await;
+
+            let primary = PyPiRegistry::with_index_url(mock_server1.uri());
+            let extras = vec![mock_server2.uri()];
+
+            let multi = MultiPyPiRegistry::from_primary_and_extras(primary, extras);
+            let version = multi.get_latest_version("testpkg").await.unwrap();
+
+            // First-match with fallback: returns extra's version when primary fails
+            assert_eq!(version, "1.5.0");
+        }
+
+        #[tokio::test]
+        async fn test_multi_registry_all_fail_returns_error() {
+            let mock_server1 = MockServer::start().await;
+            let mock_server2 = MockServer::start().await;
+
+            // Both servers return 404
+            Mock::given(method("GET"))
+                .and(path("/testpkg/json"))
+                .respond_with(ResponseTemplate::new(404))
+                .mount(&mock_server1)
+                .await;
+
+            Mock::given(method("GET"))
+                .and(path("/testpkg/json"))
+                .respond_with(ResponseTemplate::new(404))
+                .mount(&mock_server2)
+                .await;
+
+            let primary = PyPiRegistry::with_index_url(mock_server1.uri());
+            let extras = vec![mock_server2.uri()];
+
+            let multi = MultiPyPiRegistry::from_primary_and_extras(primary, extras);
+            let result = multi.get_latest_version("testpkg").await;
+
+            assert!(result.is_err());
+        }
+
+        #[tokio::test]
+        async fn test_multi_registry_empty_fails() {
+            let multi = MultiPyPiRegistry::new(vec![]);
+            let result = multi.get_latest_version("testpkg").await;
+
+            assert!(result.is_err());
+            assert!(
+                result
+                    .unwrap_err()
+                    .to_string()
+                    .contains("No registries configured")
+            );
+        }
+
+        #[tokio::test]
+        async fn test_multi_registry_prereleases_first_match() {
+            let mock_server1 = MockServer::start().await;
+
+            // Server 1 (primary) has prerelease version
+            Mock::given(method("GET"))
+                .and(path("/testpkg/json"))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .set_body_string(r#"{"releases": {"2.0.0a1": [{"yanked": false}]}}"#),
+                )
+                .expect(1)
+                .mount(&mock_server1)
+                .await;
+
+            let primary = PyPiRegistry::with_index_url(mock_server1.uri());
+            let extras = vec!["https://unused-extra.example.com/simple".to_string()];
+
+            let multi = MultiPyPiRegistry::from_primary_and_extras(primary, extras);
+            let version = multi
+                .get_latest_version_including_prereleases("testpkg")
+                .await
+                .unwrap();
+
+            assert_eq!(version, "2.0.0a1");
+        }
+
+        #[tokio::test]
+        async fn test_multi_registry_prereleases_fallback() {
+            let mock_server1 = MockServer::start().await;
+            let mock_server2 = MockServer::start().await;
+
+            // Server 1 (primary) returns 404
+            Mock::given(method("GET"))
+                .and(path("/testpkg/json"))
+                .respond_with(ResponseTemplate::new(404))
+                .expect(1)
+                .mount(&mock_server1)
+                .await;
+
+            // Server 2 (extra) has prerelease version
+            Mock::given(method("GET"))
+                .and(path("/testpkg/json"))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .set_body_string(r#"{"releases": {"3.0.0b2": [{"yanked": false}]}}"#),
+                )
+                .expect(1)
+                .mount(&mock_server2)
+                .await;
+
+            let primary = PyPiRegistry::with_index_url(mock_server1.uri());
+            let extras = vec![mock_server2.uri()];
+
+            let multi = MultiPyPiRegistry::from_primary_and_extras(primary, extras);
+            let version = multi
+                .get_latest_version_including_prereleases("testpkg")
+                .await
+                .unwrap();
+
+            assert_eq!(version, "3.0.0b2");
+        }
+
+        #[tokio::test]
+        async fn test_multi_registry_matching_first_match() {
+            let mock_server1 = MockServer::start().await;
+
+            // Server 1 (primary) has versions 1.0.0 and 2.0.0
+            Mock::given(method("GET"))
+                .and(path("/testpkg/json"))
+                .respond_with(ResponseTemplate::new(200).set_body_string(
+                    r#"{"releases": {"1.0.0": [{"yanked": false}], "2.0.0": [{"yanked": false}]}}"#,
+                ))
+                .expect(1)
+                .mount(&mock_server1)
+                .await;
+
+            let primary = PyPiRegistry::with_index_url(mock_server1.uri());
+            let extras = vec!["https://unused-extra.example.com/simple".to_string()];
+
+            let multi = MultiPyPiRegistry::from_primary_and_extras(primary, extras);
+            let version = multi
+                .get_latest_version_matching("testpkg", ">=1.0.0,<2.0.0")
+                .await
+                .unwrap();
+
+            assert_eq!(version, "1.0.0");
+        }
+
+        #[tokio::test]
+        async fn test_multi_registry_matching_fallback() {
+            let mock_server1 = MockServer::start().await;
+            let mock_server2 = MockServer::start().await;
+
+            // Server 1 (primary) returns 404
+            Mock::given(method("GET"))
+                .and(path("/testpkg/json"))
+                .respond_with(ResponseTemplate::new(404))
+                .expect(1)
+                .mount(&mock_server1)
+                .await;
+
+            // Server 2 (extra) has version that matches constraint
+            Mock::given(method("GET"))
+                .and(path("/testpkg/json"))
+                .respond_with(ResponseTemplate::new(200).set_body_string(
+                    r#"{"releases": {"1.5.0": [{"yanked": false}], "3.0.0": [{"yanked": false}]}}"#,
+                ))
+                .expect(1)
+                .mount(&mock_server2)
+                .await;
+
+            let primary = PyPiRegistry::with_index_url(mock_server1.uri());
+            let extras = vec![mock_server2.uri()];
+
+            let multi = MultiPyPiRegistry::from_primary_and_extras(primary, extras);
+            let version = multi
+                .get_latest_version_matching("testpkg", ">=1.0.0,<2.0.0")
+                .await
+                .unwrap();
+
+            assert_eq!(version, "1.5.0");
+        }
     }
 }

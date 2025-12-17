@@ -11,7 +11,7 @@ pub use go_proxy::{GoCredentials, GoProxyRegistry};
 #[cfg(test)]
 pub use mock::MockRegistry;
 pub use npm::{NpmCredentials, NpmRegistry};
-pub use pypi::{PyPiCredentials, PyPiRegistry};
+pub use pypi::{MultiPyPiRegistry, PyPiCredentials, PyPiRegistry};
 
 use anyhow::Result;
 use async_trait::async_trait;

@@ -9,7 +9,9 @@ use upd::audit::{Ecosystem, OsvClient, Package as AuditPackage};
 use upd::cache::{Cache, CachedRegistry};
 use upd::cli::{Cli, Command};
 use upd::interactive::{PendingUpdate, prompt_all};
-use upd::registry::{CratesIoRegistry, GoProxyRegistry, NpmRegistry, PyPiRegistry};
+use upd::registry::{
+    CratesIoRegistry, GoProxyRegistry, MultiPyPiRegistry, NpmRegistry, PyPiRegistry,
+};
 use upd::updater::{
     CargoTomlUpdater, FileType, GoModUpdater, Lang, PackageJsonUpdater, PyProjectUpdater,
     RequirementsUpdater, UpdateOptions, UpdateResult, Updater, discover_files, read_file_safe,
@@ -110,7 +112,7 @@ async fn run_update(cli: &Cli) -> Result<()> {
     let cache = Cache::new_shared();
     let cache_enabled = !cli.no_cache;
 
-    // Create PyPI registry with optional credentials
+    // Create PyPI registry with optional credentials and extra index URLs
     let pypi_registry = {
         let index_url =
             PyPiRegistry::detect_index_url().unwrap_or_else(|| "https://pypi.org/pypi".to_string());
@@ -118,7 +120,18 @@ async fn run_update(cli: &Cli) -> Result<()> {
         if cli.verbose && credentials.is_some() {
             println!("{}", "Using authenticated PyPI access".cyan());
         }
-        PyPiRegistry::with_index_url_and_credentials(index_url, credentials)
+        let primary = PyPiRegistry::with_index_url_and_credentials(index_url, credentials);
+
+        // Check for extra index URLs (UV_EXTRA_INDEX_URL, PIP_EXTRA_INDEX_URL)
+        let extra_urls = PyPiRegistry::detect_extra_index_urls();
+        if cli.verbose && !extra_urls.is_empty() {
+            println!(
+                "{}",
+                format!("Using {} extra PyPI index(es)", extra_urls.len()).cyan()
+            );
+        }
+
+        MultiPyPiRegistry::from_primary_and_extras(primary, extra_urls)
     };
 
     let pypi = CachedRegistry::new(pypi_registry, Arc::clone(&cache), cache_enabled);
@@ -268,7 +281,7 @@ async fn run_interactive_update(
     cli: &Cli,
     files: &[(std::path::PathBuf, FileType)],
     filter: UpdateFilter,
-    pypi: &CachedRegistry<PyPiRegistry>,
+    pypi: &CachedRegistry<MultiPyPiRegistry>,
     npm: &CachedRegistry<NpmRegistry>,
     crates_io: &CachedRegistry<CratesIoRegistry>,
     go_proxy: &CachedRegistry<GoProxyRegistry>,
