@@ -60,6 +60,10 @@ pub struct Cli {
     /// Check mode: exit with code 1 if updates are available (implies --dry-run)
     #[arg(short = 'c', long, global = true)]
     pub check: bool,
+
+    /// Regenerate lockfiles after updating (runs poetry lock, npm install, etc.)
+    #[arg(long, global = true)]
+    pub lock: bool,
 }
 
 #[derive(Subcommand)]
@@ -124,8 +128,15 @@ mod tests {
         assert!(!cli.patch);
         assert!(!cli.full_precision);
         assert!(!cli.check);
+        assert!(!cli.lock);
         assert!(cli.paths.is_empty());
         assert!(cli.command.is_none());
+    }
+
+    #[test]
+    fn test_cli_parses_lock() {
+        let cli = Cli::try_parse_from(["upd", "--lock"]).unwrap();
+        assert!(cli.lock);
     }
 
     #[test]

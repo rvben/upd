@@ -1,14 +1,17 @@
 use anyhow::Result;
 use clap::Parser;
 use colored::Colorize;
+use futures::stream::{self, StreamExt};
 
 use std::collections::HashSet;
+use std::path::PathBuf;
 use std::sync::Arc;
 use upd::align::{PackageAlignment, find_alignments, scan_packages};
 use upd::audit::{Ecosystem, OsvClient, Package as AuditPackage};
 use upd::cache::{Cache, CachedRegistry};
 use upd::cli::{Cli, Command};
 use upd::interactive::{PendingUpdate, prompt_all};
+use upd::lockfile::regenerate_lockfiles;
 use upd::registry::{
     CratesIoRegistry, GoProxyRegistry, MultiPyPiRegistry, NpmRegistry, PyPiRegistry,
 };
@@ -175,12 +178,18 @@ async fn run_update(cli: &Cli) -> Result<()> {
 
     let go_proxy = CachedRegistry::new(go_proxy_registry, Arc::clone(&cache), cache_enabled);
 
-    // Create updaters
-    let requirements_updater = RequirementsUpdater::new();
-    let pyproject_updater = PyProjectUpdater::new();
-    let package_json_updater = PackageJsonUpdater::new();
-    let cargo_toml_updater = CargoTomlUpdater::new();
-    let go_mod_updater = GoModUpdater::new();
+    // Create updaters wrapped in Arc for parallel processing
+    let requirements_updater = Arc::new(RequirementsUpdater::new());
+    let pyproject_updater = Arc::new(PyProjectUpdater::new());
+    let package_json_updater = Arc::new(PackageJsonUpdater::new());
+    let cargo_toml_updater = Arc::new(CargoTomlUpdater::new());
+    let go_mod_updater = Arc::new(GoModUpdater::new());
+
+    // Wrap registries in Arc for parallel processing
+    let pypi = Arc::new(pypi);
+    let npm = Arc::new(npm);
+    let crates_io = Arc::new(crates_io);
+    let go_proxy = Arc::new(go_proxy);
 
     // Interactive mode: first discover updates, then prompt, then apply approved ones
     if cli.interactive {
@@ -203,7 +212,7 @@ async fn run_update(cli: &Cli) -> Result<()> {
         .await;
     }
 
-    // Non-interactive mode: process files directly
+    // Non-interactive mode: process files in parallel
     // Create update options (--check implies --dry-run)
     let dry_run = cli.dry_run || cli.check;
     let update_options = UpdateOptions {
@@ -211,39 +220,73 @@ async fn run_update(cli: &Cli) -> Result<()> {
         full_precision: cli.full_precision,
     };
 
+    let verbose = cli.verbose;
+
+    // Process files in parallel with a concurrency limit
+    let concurrency_limit = 8; // Process up to 8 files concurrently
+
+    let results: Vec<(PathBuf, Result<UpdateResult, String>)> = stream::iter(files)
+        .map(|(path, file_type)| {
+            let pypi = Arc::clone(&pypi);
+            let npm = Arc::clone(&npm);
+            let crates_io = Arc::clone(&crates_io);
+            let go_proxy = Arc::clone(&go_proxy);
+            let requirements_updater = Arc::clone(&requirements_updater);
+            let pyproject_updater = Arc::clone(&pyproject_updater);
+            let package_json_updater = Arc::clone(&package_json_updater);
+            let cargo_toml_updater = Arc::clone(&cargo_toml_updater);
+            let go_mod_updater = Arc::clone(&go_mod_updater);
+
+            async move {
+                let result = match file_type {
+                    FileType::Requirements => {
+                        requirements_updater
+                            .update(&path, pypi.as_ref(), update_options)
+                            .await
+                    }
+                    FileType::PyProject => {
+                        pyproject_updater
+                            .update(&path, pypi.as_ref(), update_options)
+                            .await
+                    }
+                    FileType::PackageJson => {
+                        package_json_updater
+                            .update(&path, npm.as_ref(), update_options)
+                            .await
+                    }
+                    FileType::CargoToml => {
+                        cargo_toml_updater
+                            .update(&path, crates_io.as_ref(), update_options)
+                            .await
+                    }
+                    FileType::GoMod => {
+                        go_mod_updater
+                            .update(&path, go_proxy.as_ref(), update_options)
+                            .await
+                    }
+                };
+                (path, result.map_err(|e| e.to_string()))
+            }
+        })
+        .buffer_unordered(concurrency_limit)
+        .collect()
+        .await;
+
+    // Process results in order and merge
     let mut total_result = UpdateResult::default();
+    let mut updated_files: Vec<PathBuf> = Vec::new();
 
-    for (path, file_type) in files {
-        if cli.verbose {
-            println!("{}", format!("Processing: {}", path.display()).cyan());
+    for (path, result) in results {
+        if verbose {
+            println!("{}", format!("Processed: {}", path.display()).cyan());
         }
-
-        let result = match file_type {
-            FileType::Requirements => {
-                requirements_updater
-                    .update(&path, &pypi, update_options)
-                    .await
-            }
-            FileType::PyProject => pyproject_updater.update(&path, &pypi, update_options).await,
-            FileType::PackageJson => {
-                package_json_updater
-                    .update(&path, &npm, update_options)
-                    .await
-            }
-            FileType::CargoToml => {
-                cargo_toml_updater
-                    .update(&path, &crates_io, update_options)
-                    .await
-            }
-            FileType::GoMod => {
-                go_mod_updater
-                    .update(&path, &go_proxy, update_options)
-                    .await
-            }
-        };
 
         match result {
             Ok(file_result) => {
+                // Track files that were actually updated (not just checked)
+                if !dry_run && !file_result.updated.is_empty() {
+                    updated_files.push(path.clone());
+                }
                 print_file_result(&path.display().to_string(), &file_result, dry_run, filter);
                 total_result.merge(file_result);
             }
@@ -252,6 +295,29 @@ async fn run_update(cli: &Cli) -> Result<()> {
                     "{}",
                     format!("Error processing {}: {}", path.display(), e).red()
                 );
+            }
+        }
+    }
+
+    // Regenerate lockfiles if requested and files were updated
+    if cli.lock && !dry_run && !updated_files.is_empty() {
+        println!();
+        println!("{}", "Regenerating lockfiles...".cyan());
+
+        // Deduplicate directories (multiple files in same dir should only regenerate once)
+        let mut processed_dirs: HashSet<PathBuf> = HashSet::new();
+
+        for path in &updated_files {
+            if let Some(dir) = path.parent() {
+                let dir_path = dir.to_path_buf();
+                if processed_dirs.insert(dir_path) {
+                    let results = regenerate_lockfiles(path, verbose);
+                    for result in results {
+                        if let Err(e) = result {
+                            eprintln!("{}", format!("Warning: {}", e).yellow());
+                        }
+                    }
+                }
             }
         }
     }
@@ -281,15 +347,15 @@ async fn run_interactive_update(
     cli: &Cli,
     files: &[(std::path::PathBuf, FileType)],
     filter: UpdateFilter,
-    pypi: &CachedRegistry<MultiPyPiRegistry>,
-    npm: &CachedRegistry<NpmRegistry>,
-    crates_io: &CachedRegistry<CratesIoRegistry>,
-    go_proxy: &CachedRegistry<GoProxyRegistry>,
-    requirements_updater: &RequirementsUpdater,
-    pyproject_updater: &PyProjectUpdater,
-    package_json_updater: &PackageJsonUpdater,
-    cargo_toml_updater: &CargoTomlUpdater,
-    go_mod_updater: &GoModUpdater,
+    pypi: &Arc<CachedRegistry<MultiPyPiRegistry>>,
+    npm: &Arc<CachedRegistry<NpmRegistry>>,
+    crates_io: &Arc<CachedRegistry<CratesIoRegistry>>,
+    go_proxy: &Arc<CachedRegistry<GoProxyRegistry>>,
+    requirements_updater: &Arc<RequirementsUpdater>,
+    pyproject_updater: &Arc<PyProjectUpdater>,
+    package_json_updater: &Arc<PackageJsonUpdater>,
+    cargo_toml_updater: &Arc<CargoTomlUpdater>,
+    go_mod_updater: &Arc<GoModUpdater>,
     cache: &Arc<std::sync::Mutex<Cache>>,
     cache_enabled: bool,
 ) -> Result<()> {
@@ -309,21 +375,29 @@ async fn run_interactive_update(
         let result = match file_type {
             FileType::Requirements => {
                 requirements_updater
-                    .update(path, pypi, dry_run_options)
+                    .update(path, pypi.as_ref(), dry_run_options)
                     .await
             }
-            FileType::PyProject => pyproject_updater.update(path, pypi, dry_run_options).await,
+            FileType::PyProject => {
+                pyproject_updater
+                    .update(path, pypi.as_ref(), dry_run_options)
+                    .await
+            }
             FileType::PackageJson => {
                 package_json_updater
-                    .update(path, npm, dry_run_options)
+                    .update(path, npm.as_ref(), dry_run_options)
                     .await
             }
             FileType::CargoToml => {
                 cargo_toml_updater
-                    .update(path, crates_io, dry_run_options)
+                    .update(path, crates_io.as_ref(), dry_run_options)
                     .await
             }
-            FileType::GoMod => go_mod_updater.update(path, go_proxy, dry_run_options).await,
+            FileType::GoMod => {
+                go_mod_updater
+                    .update(path, go_proxy.as_ref(), dry_run_options)
+                    .await
+            }
         };
 
         if let Ok(file_result) = result {
@@ -385,6 +459,7 @@ async fn run_interactive_update(
     };
 
     let mut total_applied = 0;
+    let mut updated_files: Vec<std::path::PathBuf> = Vec::new();
 
     for (path, file_type) in files {
         // Check if any approved updates are for this file
@@ -395,22 +470,40 @@ async fn run_interactive_update(
         }
 
         let result = match file_type {
-            FileType::Requirements => requirements_updater.update(path, pypi, apply_options).await,
-            FileType::PyProject => pyproject_updater.update(path, pypi, apply_options).await,
-            FileType::PackageJson => package_json_updater.update(path, npm, apply_options).await,
-            FileType::CargoToml => {
-                cargo_toml_updater
-                    .update(path, crates_io, apply_options)
+            FileType::Requirements => {
+                requirements_updater
+                    .update(path, pypi.as_ref(), apply_options)
                     .await
             }
-            FileType::GoMod => go_mod_updater.update(path, go_proxy, apply_options).await,
+            FileType::PyProject => {
+                pyproject_updater
+                    .update(path, pypi.as_ref(), apply_options)
+                    .await
+            }
+            FileType::PackageJson => {
+                package_json_updater
+                    .update(path, npm.as_ref(), apply_options)
+                    .await
+            }
+            FileType::CargoToml => {
+                cargo_toml_updater
+                    .update(path, crates_io.as_ref(), apply_options)
+                    .await
+            }
+            FileType::GoMod => {
+                go_mod_updater
+                    .update(path, go_proxy.as_ref(), apply_options)
+                    .await
+            }
         };
 
         if let Ok(file_result) = result {
+            let mut file_had_updates = false;
             for (package, old_version, new_version, line_num) in &file_result.updated {
                 // Only count if it was approved
                 if approved.contains(&(file_str.clone(), package.clone())) {
                     total_applied += 1;
+                    file_had_updates = true;
                     let location = match line_num {
                         Some(n) => format!("{}:{}:", file_str, n),
                         None => format!("{}:", file_str),
@@ -423,6 +516,31 @@ async fn run_interactive_update(
                         old_version.dimmed(),
                         new_version.green(),
                     );
+                }
+            }
+            if file_had_updates {
+                updated_files.push(path.clone());
+            }
+        }
+    }
+
+    // Regenerate lockfiles if requested and files were updated
+    if cli.lock && !updated_files.is_empty() {
+        println!();
+        println!("{}", "Regenerating lockfiles...".cyan());
+
+        let mut processed_dirs: HashSet<std::path::PathBuf> = HashSet::new();
+
+        for path in &updated_files {
+            if let Some(dir) = path.parent() {
+                let dir_path = dir.to_path_buf();
+                if processed_dirs.insert(dir_path) {
+                    let results = regenerate_lockfiles(path, cli.verbose);
+                    for result in results {
+                        if let Err(e) = result {
+                            eprintln!("{}", format!("Warning: {}", e).yellow());
+                        }
+                    }
                 }
             }
         }
