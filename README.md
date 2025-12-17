@@ -410,6 +410,31 @@ upd --verbose
 | `GOPROXY_PASSWORD` | Go proxy password |
 | `UPD_CACHE_DIR` | Custom cache directory |
 
+## Pre-commit Integration
+
+Add `upd` to your `.pre-commit-config.yaml`:
+
+```yaml
+repos:
+  - repo: https://github.com/rvben/upd
+    rev: v0.0.17  # Use the latest version
+    hooks:
+      - id: upd-check
+        # Optional: only check specific ecosystems
+        # args: ['--lang', 'python']
+```
+
+Available hooks:
+
+| Hook ID | Description |
+|---------|-------------|
+| `upd-check` | Fail if any dependencies are outdated |
+| `upd-check-major` | Fail only on major (breaking) updates |
+
+Both hooks run on `pre-push` by default and trigger when dependency files change.
+
+**Note:** Requires `upd` to be installed and available in PATH.
+
 ## Development
 
 ```bash

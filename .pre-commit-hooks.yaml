@@ -1,0 +1,17 @@
+- id: upd-check
+  name: Check for outdated dependencies
+  description: Check if any dependencies have available updates
+  entry: upd --check
+  language: system
+  pass_filenames: false
+  files: (requirements.*\.txt|pyproject\.toml|package\.json|Cargo\.toml|go\.mod)$
+  stages: [pre-push]
+
+- id: upd-check-major
+  name: Check for major dependency updates
+  description: Check if any dependencies have major updates available
+  entry: upd --check --major
+  language: system
+  pass_filenames: false
+  files: (requirements.*\.txt|pyproject\.toml|package\.json|Cargo\.toml|go\.mod)$
+  stages: [pre-push]
