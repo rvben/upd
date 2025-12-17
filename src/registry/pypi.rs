@@ -810,10 +810,10 @@ mod tests {
     fn test_from_url_nexus_style() {
         // Nexus Repository Manager style URL
         let registry =
-            PyPiRegistry::from_url("https://nexus.example.com/repository/hda-pypi/simple");
+            PyPiRegistry::from_url("https://nexus.example.com/repository/pypi-private/simple");
         assert_eq!(
             registry.index_url(),
-            "https://nexus.example.com/repository/hda-pypi"
+            "https://nexus.example.com/repository/pypi-private"
         );
     }
 
