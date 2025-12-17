@@ -21,6 +21,8 @@ pub enum LockfileType {
     YarnLock,
     /// pnpm-lock.yaml - regenerated with `pnpm install`
     PnpmLock,
+    /// bun.lockb - regenerated with `bun install`
+    BunLock,
 }
 
 impl LockfileType {
@@ -32,6 +34,7 @@ impl LockfileType {
             LockfileType::PackageLockJson => "package-lock.json",
             LockfileType::YarnLock => "yarn.lock",
             LockfileType::PnpmLock => "pnpm-lock.yaml",
+            LockfileType::BunLock => "bun.lockb",
         }
     }
 
@@ -43,6 +46,7 @@ impl LockfileType {
             LockfileType::PackageLockJson => ("npm", &["install"]),
             LockfileType::YarnLock => ("yarn", &["install"]),
             LockfileType::PnpmLock => ("pnpm", &["install"]),
+            LockfileType::BunLock => ("bun", &["install"]),
         }
     }
 
@@ -50,9 +54,10 @@ impl LockfileType {
     pub fn manifest(&self) -> &'static str {
         match self {
             LockfileType::PoetryLock | LockfileType::UvLock => "pyproject.toml",
-            LockfileType::PackageLockJson | LockfileType::YarnLock | LockfileType::PnpmLock => {
-                "package.json"
-            }
+            LockfileType::PackageLockJson
+            | LockfileType::YarnLock
+            | LockfileType::PnpmLock
+            | LockfileType::BunLock => "package.json",
         }
     }
 }
@@ -90,6 +95,9 @@ pub fn detect_lockfiles(manifest_path: &Path) -> Vec<LockfileType> {
         }
         if dir.join("pnpm-lock.yaml").exists() {
             lockfiles.push(LockfileType::PnpmLock);
+        }
+        if dir.join("bun.lockb").exists() {
+            lockfiles.push(LockfileType::BunLock);
         }
     }
 
@@ -175,6 +183,7 @@ mod tests {
         );
         assert_eq!(LockfileType::YarnLock.filename(), "yarn.lock");
         assert_eq!(LockfileType::PnpmLock.filename(), "pnpm-lock.yaml");
+        assert_eq!(LockfileType::BunLock.filename(), "bun.lockb");
     }
 
     #[test]
@@ -190,6 +199,10 @@ mod tests {
         let (cmd, args) = LockfileType::PackageLockJson.command();
         assert_eq!(cmd, "npm");
         assert_eq!(args, &["install"]);
+
+        let (cmd, args) = LockfileType::BunLock.command();
+        assert_eq!(cmd, "bun");
+        assert_eq!(args, &["install"]);
     }
 
     #[test]
@@ -199,6 +212,7 @@ mod tests {
         assert_eq!(LockfileType::PackageLockJson.manifest(), "package.json");
         assert_eq!(LockfileType::YarnLock.manifest(), "package.json");
         assert_eq!(LockfileType::PnpmLock.manifest(), "package.json");
+        assert_eq!(LockfileType::BunLock.manifest(), "package.json");
     }
 
     #[test]
@@ -269,6 +283,20 @@ mod tests {
         let detected = detect_lockfiles(&manifest);
         assert_eq!(detected.len(), 1);
         assert_eq!(detected[0], LockfileType::PnpmLock);
+    }
+
+    #[test]
+    fn test_detect_lockfiles_bun() {
+        let dir = tempdir().unwrap();
+        let manifest = dir.path().join("package.json");
+        let lockfile = dir.path().join("bun.lockb");
+
+        fs::write(&manifest, "{}").unwrap();
+        fs::write(&lockfile, "").unwrap();
+
+        let detected = detect_lockfiles(&manifest);
+        assert_eq!(detected.len(), 1);
+        assert_eq!(detected[0], LockfileType::BunLock);
     }
 
     #[test]
