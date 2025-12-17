@@ -34,6 +34,7 @@ uvx --from upd-cli upd -n
 - **Pre-release aware**: Updates pre-releases to newer pre-releases
 - **Gitignore-aware**: Respects `.gitignore` when discovering files
 - **Version alignment**: Align package versions across multiple files
+- **Security auditing**: Check dependencies for known vulnerabilities via OSV
 
 ## Installation
 
@@ -126,6 +127,10 @@ upd clean-cache
 # Align versions across files (use highest version found)
 upd align
 upd align --check  # Exit 1 if misalignments found (for CI)
+
+# Check for security vulnerabilities
+upd audit
+upd audit --check  # Exit 1 if vulnerabilities found (for CI)
 ```
 
 ## Supported Files
@@ -213,6 +218,70 @@ upd align --lang python # Align only Python packages
 - Only aligns packages within the same ecosystem (Python with Python, etc.)
 - Skips packages with upper bound constraints (e.g., `>=2.0,<3.0`) to avoid breaking them
 - Ignores pre-release versions when finding the highest version
+
+## Security Auditing
+
+Check your dependencies for known security vulnerabilities using the [OSV (Open Source Vulnerabilities)](https://osv.dev/) database:
+
+```bash
+upd audit              # Scan all dependency files
+upd audit --dry-run    # Same as audit (read-only operation)
+upd audit --check      # Exit 1 if vulnerabilities found (for CI)
+upd audit --lang python # Audit only Python packages
+upd audit ./services   # Audit specific directory
+```
+
+**Example output:**
+
+```text
+Checking 42 unique package(s) for vulnerabilities...
+
+⚠ Found 3 vulnerability/ies in 2 package(s):
+
+  ● requests@2.19.0 (PyPI)
+    ├── GHSA-j8r2-6x86-q33q [CVSS:3.1/AV:N/AC:H/PR:N/UI:R/S:C/C:H/I:N/A:N] Unintended leak of Proxy-Authorization header
+    │   Fixed in: 2.31.0
+    │   https://github.com/psf/requests/security/advisories/GHSA-j8r2-6x86-q33q
+
+  ● flask@0.12.2 (PyPI)
+    ├── GHSA-562c-5r94-xh97 [CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:N/I:N/A:H] Denial of Service vulnerability
+    │   Fixed in: 0.12.3
+    │   https://nvd.nist.gov/vuln/detail/CVE-2018-1000656
+    ├── GHSA-m2qf-hxjv-5gpq [CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:N/A:N] Session cookie disclosure
+    │   Fixed in: 2.3.2
+    │   https://github.com/pallets/flask/security/advisories/GHSA-m2qf-hxjv-5gpq
+
+Summary: 2 vulnerable package(s), 3 total vulnerability/ies
+```
+
+**Features:**
+
+- Queries the OSV API (free, no API key required)
+- Supports all ecosystems: PyPI, npm, crates.io, Go
+- Deduplicates packages across files
+- Shows severity scores (CVSS), descriptions, and fixed versions
+- Batch queries for efficiency (up to 1000 packages per request)
+
+**CI/CD Integration:**
+
+```yaml
+# GitHub Actions example
+- name: Check for vulnerabilities
+  run: upd audit --check
+```
+
+```yaml
+# Pre-commit hook (.pre-commit-config.yaml)
+repos:
+  - repo: local
+    hooks:
+      - id: upd-audit
+        name: security audit
+        entry: upd audit --check
+        language: system
+        pass_filenames: false
+        stages: [pre-push]
+```
 
 ## Version Constraints
 

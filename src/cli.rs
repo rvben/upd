@@ -78,6 +78,13 @@ pub enum Command {
         paths: Vec<PathBuf>,
     },
 
+    /// Check dependencies for known security vulnerabilities
+    Audit {
+        /// Paths to scan
+        #[arg()]
+        paths: Vec<PathBuf>,
+    },
+
     /// Show version information
     Version,
 
@@ -93,6 +100,7 @@ impl Cli {
         match &self.command {
             Some(Command::Update { paths }) if !paths.is_empty() => paths.clone(),
             Some(Command::Align { paths }) if !paths.is_empty() => paths.clone(),
+            Some(Command::Audit { paths }) if !paths.is_empty() => paths.clone(),
             _ if !self.paths.is_empty() => self.paths.clone(),
             _ => vec![PathBuf::from(".")],
         }
@@ -312,5 +320,46 @@ mod tests {
         let cli = Cli::try_parse_from(["upd", "align", "cmd_path"]).unwrap();
         let paths = cli.get_paths();
         assert_eq!(paths, vec![PathBuf::from("cmd_path")]);
+    }
+
+    #[test]
+    fn test_cli_parses_audit_command() {
+        let cli = Cli::try_parse_from(["upd", "audit"]).unwrap();
+        assert!(matches!(cli.command, Some(Command::Audit { .. })));
+    }
+
+    #[test]
+    fn test_cli_parses_audit_command_with_paths() {
+        let cli = Cli::try_parse_from(["upd", "audit", "path1", "path2"]).unwrap();
+        match cli.command {
+            Some(Command::Audit { paths }) => {
+                assert_eq!(paths.len(), 2);
+                assert_eq!(paths[0], PathBuf::from("path1"));
+                assert_eq!(paths[1], PathBuf::from("path2"));
+            }
+            _ => panic!("Expected Audit command"),
+        }
+    }
+
+    #[test]
+    fn test_get_paths_uses_audit_command_paths() {
+        let cli = Cli::try_parse_from(["upd", "audit", "cmd_path"]).unwrap();
+        let paths = cli.get_paths();
+        assert_eq!(paths, vec![PathBuf::from("cmd_path")]);
+    }
+
+    #[test]
+    fn test_cli_parses_audit_with_check() {
+        let cli = Cli::try_parse_from(["upd", "audit", "--check"]).unwrap();
+        assert!(matches!(cli.command, Some(Command::Audit { .. })));
+        assert!(cli.check);
+    }
+
+    #[test]
+    fn test_cli_parses_audit_with_lang_filter() {
+        let cli = Cli::try_parse_from(["upd", "audit", "--lang", "python"]).unwrap();
+        assert!(matches!(cli.command, Some(Command::Audit { .. })));
+        assert_eq!(cli.langs.len(), 1);
+        assert_eq!(cli.langs[0], Lang::Python);
     }
 }

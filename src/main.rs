@@ -5,6 +5,7 @@ use colored::Colorize;
 use std::collections::HashSet;
 use std::sync::Arc;
 use upd::align::{PackageAlignment, find_alignments, scan_packages};
+use upd::audit::{Ecosystem, OsvClient, Package as AuditPackage};
 use upd::cache::{Cache, CachedRegistry};
 use upd::cli::{Cli, Command};
 use upd::interactive::{PendingUpdate, prompt_all};
@@ -73,6 +74,9 @@ async fn main() -> Result<()> {
         }
         Some(Command::Align { .. }) => {
             run_align(&cli).await?;
+        }
+        Some(Command::Audit { .. }) => {
+            run_audit(&cli).await?;
         }
         Some(Command::Update { .. }) | None => {
             run_update(&cli).await?;
@@ -507,6 +511,191 @@ async fn run_align(cli: &Cli) -> Result<()> {
 
     // In check mode, exit with code 1 if any misalignments exist
     if cli.check && !misaligned.is_empty() {
+        std::process::exit(1);
+    }
+
+    Ok(())
+}
+
+async fn run_audit(cli: &Cli) -> Result<()> {
+    let paths = cli.get_paths();
+    let files = discover_files(&paths, &cli.langs);
+    let file_count = files.len();
+
+    if files.is_empty() {
+        println!("{}", "No dependency files found.".yellow());
+        return Ok(());
+    }
+
+    if cli.verbose {
+        println!(
+            "{}",
+            format!(
+                "Scanning {} dependency file(s) for vulnerabilities",
+                file_count
+            )
+            .cyan()
+        );
+    }
+
+    // Scan all files for packages
+    let packages = match scan_packages(&files) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("{}", format!("Error scanning files: {}", e).red());
+            return Err(e);
+        }
+    };
+
+    // Convert to audit packages (deduplicate by name+version+ecosystem)
+    let mut audit_packages: Vec<AuditPackage> = Vec::new();
+    let mut seen: std::collections::HashSet<(String, String, String)> =
+        std::collections::HashSet::new();
+
+    for ((name, lang), occurrences) in &packages {
+        let ecosystem = match lang {
+            Lang::Python => Ecosystem::PyPI,
+            Lang::Node => Ecosystem::Npm,
+            Lang::Rust => Ecosystem::CratesIo,
+            Lang::Go => Ecosystem::Go,
+        };
+
+        for occurrence in occurrences {
+            let key = (
+                name.clone(),
+                occurrence.version.clone(),
+                ecosystem.as_str().to_string(),
+            );
+            if seen.insert(key) {
+                audit_packages.push(AuditPackage {
+                    name: name.clone(),
+                    version: occurrence.version.clone(),
+                    ecosystem,
+                });
+            }
+        }
+    }
+
+    if audit_packages.is_empty() {
+        println!(
+            "{} Scanned {} file(s), no packages found",
+            "✓".green(),
+            file_count
+        );
+        return Ok(());
+    }
+
+    println!(
+        "{}",
+        format!(
+            "Checking {} unique package(s) for vulnerabilities...",
+            audit_packages.len()
+        )
+        .cyan()
+    );
+
+    // Query OSV API
+    let osv_client = OsvClient::new();
+    let audit_result = osv_client.check_packages(&audit_packages).await?;
+
+    // Display results
+    if audit_result.vulnerable.is_empty() {
+        println!(
+            "\n{} No vulnerabilities found in {} package(s)",
+            "✓".green(),
+            audit_packages.len()
+        );
+    } else {
+        println!(
+            "\n{} Found {} vulnerability/ies in {} package(s):\n",
+            "⚠".yellow().bold(),
+            audit_result
+                .total_vulnerabilities()
+                .to_string()
+                .red()
+                .bold(),
+            audit_result
+                .vulnerable_packages()
+                .to_string()
+                .yellow()
+                .bold()
+        );
+
+        for pkg_result in &audit_result.vulnerable {
+            let ecosystem_str = match pkg_result.package.ecosystem {
+                Ecosystem::PyPI => "(PyPI)",
+                Ecosystem::Npm => "(npm)",
+                Ecosystem::CratesIo => "(crates.io)",
+                Ecosystem::Go => "(Go)",
+            };
+
+            println!(
+                "  {} {}@{} {}",
+                "●".red(),
+                pkg_result.package.name.bold(),
+                pkg_result.package.version.dimmed(),
+                ecosystem_str.dimmed()
+            );
+
+            for vuln in &pkg_result.vulnerabilities {
+                let severity_str = vuln
+                    .severity
+                    .as_ref()
+                    .map(|s| format!("[{}]", s).red().to_string())
+                    .unwrap_or_default();
+
+                let summary = vuln
+                    .summary
+                    .as_ref()
+                    .map(|s| {
+                        if s.len() > 60 {
+                            format!("{}...", &s[..57])
+                        } else {
+                            s.clone()
+                        }
+                    })
+                    .unwrap_or_else(|| "No description".to_string());
+
+                println!(
+                    "    {} {} {} {}",
+                    "├──".dimmed(),
+                    vuln.id.yellow(),
+                    severity_str,
+                    summary.dimmed()
+                );
+
+                if let Some(fixed) = &vuln.fixed_version {
+                    println!(
+                        "    {}   {} {}",
+                        "│".dimmed(),
+                        "Fixed in:".dimmed(),
+                        fixed.green()
+                    );
+                }
+
+                if let Some(url) = &vuln.url {
+                    println!("    {}   {}", "│".dimmed(), url.blue().underline());
+                }
+            }
+            println!();
+        }
+
+        // Print summary
+        println!(
+            "{} {} vulnerable package(s), {} total vulnerability/ies",
+            "Summary:".bold(),
+            audit_result.vulnerable_packages().to_string().yellow(),
+            audit_result.total_vulnerabilities().to_string().red()
+        );
+    }
+
+    // Print errors if any
+    for error in &audit_result.errors {
+        eprintln!("{} {}", "Error:".red(), error);
+    }
+
+    // In check mode, exit with code 1 if any vulnerabilities found
+    if cli.check && !audit_result.vulnerable.is_empty() {
         std::process::exit(1);
     }
 
