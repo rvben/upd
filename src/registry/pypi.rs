@@ -59,6 +59,18 @@ impl PyPiRegistry {
         Self::with_index_url_and_credentials(index_url, None)
     }
 
+    /// Convert a Simple API URL to JSON API URL format
+    /// Strips "/simple" suffix since JSON API uses base path + /{package}/json
+    /// e.g., "https://example.com/repository/pypi/simple" -> "https://example.com/repository/pypi"
+    fn normalize_index_url(url: &str) -> String {
+        let trimmed = url.trim_end_matches('/');
+        if let Some(stripped) = trimmed.strip_suffix("/simple") {
+            stripped.to_string()
+        } else {
+            trimmed.to_string()
+        }
+    }
+
     pub fn with_index_url_and_credentials(
         index_url: String,
         credentials: Option<PyPiCredentials>,
@@ -87,20 +99,22 @@ impl PyPiRegistry {
     }
 
     /// Detect custom index URL from environment or config
+    /// Automatically converts Simple API URLs to JSON API format
     pub fn detect_index_url() -> Option<String> {
         // Check environment variables in order of precedence
         for var in ["UV_INDEX_URL", "PIP_INDEX_URL", "PYTHON_INDEX_URL"] {
             if let Ok(url) = std::env::var(var)
                 && !url.is_empty()
             {
-                return Some(url);
+                return Some(Self::normalize_index_url(&url));
             }
         }
         None
     }
 
     /// Create a registry from a URL that may contain embedded credentials
-    /// Supports URLs like: https://user:pass@private.pypi.com/simple
+    /// Supports URLs like: <https://user:pass@private.pypi.com/simple>
+    /// Automatically converts Simple API URLs to JSON API format
     pub fn from_url(url: &str) -> Self {
         if let Ok(parsed) = url::Url::parse(url) {
             let username = parsed.username();
@@ -117,10 +131,8 @@ impl PyPiRegistry {
                     password: password.to_string(),
                 };
 
-                return Self::with_index_url_and_credentials(
-                    clean_url.to_string().trim_end_matches('/').to_string(),
-                    Some(credentials),
-                );
+                let normalized = Self::normalize_index_url(clean_url.as_str());
+                return Self::with_index_url_and_credentials(normalized, Some(credentials));
             }
 
             // No embedded credentials - try to detect from netrc
@@ -130,10 +142,11 @@ impl PyPiRegistry {
                 password: c.password,
             });
 
-            Self::with_index_url_and_credentials(url.trim_end_matches('/').to_string(), credentials)
+            let normalized = Self::normalize_index_url(url);
+            Self::with_index_url_and_credentials(normalized, credentials)
         } else {
             // Invalid URL - create without credentials
-            Self::with_index_url(url.trim_end_matches('/').to_string())
+            Self::with_index_url(Self::normalize_index_url(url))
         }
     }
 
@@ -582,23 +595,69 @@ mod tests {
 
     #[test]
     fn test_from_url_with_embedded_credentials() {
-        // URL with embedded credentials
+        // URL with embedded credentials - /simple suffix stripped
         let registry = PyPiRegistry::from_url("https://user:pass@pypi.example.com/simple");
-        // The URL should be cleaned (credentials removed from URL itself)
-        assert_eq!(registry.index_url(), "https://pypi.example.com/simple");
+        // The URL should be cleaned (credentials removed) and normalized
+        assert_eq!(registry.index_url(), "https://pypi.example.com");
     }
 
     #[test]
     fn test_from_url_without_credentials() {
-        // URL without credentials
+        // URL without credentials - /simple suffix stripped
         let registry = PyPiRegistry::from_url("https://pypi.example.com/simple");
-        assert_eq!(registry.index_url(), "https://pypi.example.com/simple");
+        assert_eq!(registry.index_url(), "https://pypi.example.com");
     }
 
     #[test]
     fn test_from_url_strips_trailing_slash() {
         let registry = PyPiRegistry::from_url("https://pypi.example.com/simple/");
-        assert_eq!(registry.index_url(), "https://pypi.example.com/simple");
+        assert_eq!(registry.index_url(), "https://pypi.example.com");
+    }
+
+    #[test]
+    fn test_from_url_already_json_api() {
+        // URL already in JSON API format should not be changed
+        let registry = PyPiRegistry::from_url("https://pypi.example.com/pypi");
+        assert_eq!(registry.index_url(), "https://pypi.example.com/pypi");
+    }
+
+    #[test]
+    fn test_from_url_nexus_style() {
+        // Nexus Repository Manager style URL
+        let registry =
+            PyPiRegistry::from_url("https://nexus.example.com/repository/hda-pypi/simple");
+        assert_eq!(
+            registry.index_url(),
+            "https://nexus.example.com/repository/hda-pypi"
+        );
+    }
+
+    #[test]
+    fn test_normalize_index_url() {
+        // Simple API -> strips /simple suffix
+        assert_eq!(
+            PyPiRegistry::normalize_index_url("https://example.com/simple"),
+            "https://example.com"
+        );
+        assert_eq!(
+            PyPiRegistry::normalize_index_url("https://example.com/simple/"),
+            "https://example.com"
+        );
+        // Nexus-style path
+        assert_eq!(
+            PyPiRegistry::normalize_index_url("https://nexus.example.com/repository/pypi/simple"),
+            "https://nexus.example.com/repository/pypi"
+        );
+        // Already without /simple - unchanged
+        assert_eq!(
+            PyPiRegistry::normalize_index_url("https://example.com/pypi"),
+            "https://example.com/pypi"
+        );
+        // Other paths - unchanged
+        assert_eq!(
+            PyPiRegistry::normalize_index_url("https://example.com/custom"),
+            "https://example.com/custom"
+        );
     }
 
     // Tests for extra index URLs functionality
