@@ -23,6 +23,10 @@ pub enum LockfileType {
     PnpmLock,
     /// bun.lockb - regenerated with `bun install`
     BunLock,
+    /// Cargo.lock - regenerated with `cargo update`
+    CargoLock,
+    /// go.sum - regenerated with `go mod tidy`
+    GoSum,
 }
 
 impl LockfileType {
@@ -35,6 +39,8 @@ impl LockfileType {
             LockfileType::YarnLock => "yarn.lock",
             LockfileType::PnpmLock => "pnpm-lock.yaml",
             LockfileType::BunLock => "bun.lockb",
+            LockfileType::CargoLock => "Cargo.lock",
+            LockfileType::GoSum => "go.sum",
         }
     }
 
@@ -47,6 +53,8 @@ impl LockfileType {
             LockfileType::YarnLock => ("yarn", &["install"]),
             LockfileType::PnpmLock => ("pnpm", &["install"]),
             LockfileType::BunLock => ("bun", &["install"]),
+            LockfileType::CargoLock => ("cargo", &["update"]),
+            LockfileType::GoSum => ("go", &["mod", "tidy"]),
         }
     }
 
@@ -58,6 +66,8 @@ impl LockfileType {
             | LockfileType::YarnLock
             | LockfileType::PnpmLock
             | LockfileType::BunLock => "package.json",
+            LockfileType::CargoLock => "Cargo.toml",
+            LockfileType::GoSum => "go.mod",
         }
     }
 }
@@ -99,6 +109,26 @@ pub fn detect_lockfiles(manifest_path: &Path) -> Vec<LockfileType> {
         if dir.join("bun.lockb").exists() {
             lockfiles.push(LockfileType::BunLock);
         }
+    }
+
+    // Check for Rust lockfile (only if manifest is Cargo.toml)
+    if manifest_path
+        .file_name()
+        .map(|n| n == "Cargo.toml")
+        .unwrap_or(false)
+        && dir.join("Cargo.lock").exists()
+    {
+        lockfiles.push(LockfileType::CargoLock);
+    }
+
+    // Check for Go sum file (only if manifest is go.mod)
+    if manifest_path
+        .file_name()
+        .map(|n| n == "go.mod")
+        .unwrap_or(false)
+        && dir.join("go.sum").exists()
+    {
+        lockfiles.push(LockfileType::GoSum);
     }
 
     lockfiles
@@ -184,6 +214,8 @@ mod tests {
         assert_eq!(LockfileType::YarnLock.filename(), "yarn.lock");
         assert_eq!(LockfileType::PnpmLock.filename(), "pnpm-lock.yaml");
         assert_eq!(LockfileType::BunLock.filename(), "bun.lockb");
+        assert_eq!(LockfileType::CargoLock.filename(), "Cargo.lock");
+        assert_eq!(LockfileType::GoSum.filename(), "go.sum");
     }
 
     #[test]
@@ -203,6 +235,14 @@ mod tests {
         let (cmd, args) = LockfileType::BunLock.command();
         assert_eq!(cmd, "bun");
         assert_eq!(args, &["install"]);
+
+        let (cmd, args) = LockfileType::CargoLock.command();
+        assert_eq!(cmd, "cargo");
+        assert_eq!(args, &["update"]);
+
+        let (cmd, args) = LockfileType::GoSum.command();
+        assert_eq!(cmd, "go");
+        assert_eq!(args, &["mod", "tidy"]);
     }
 
     #[test]
@@ -213,6 +253,8 @@ mod tests {
         assert_eq!(LockfileType::YarnLock.manifest(), "package.json");
         assert_eq!(LockfileType::PnpmLock.manifest(), "package.json");
         assert_eq!(LockfileType::BunLock.manifest(), "package.json");
+        assert_eq!(LockfileType::CargoLock.manifest(), "Cargo.toml");
+        assert_eq!(LockfileType::GoSum.manifest(), "go.mod");
     }
 
     #[test]
@@ -297,6 +339,34 @@ mod tests {
         let detected = detect_lockfiles(&manifest);
         assert_eq!(detected.len(), 1);
         assert_eq!(detected[0], LockfileType::BunLock);
+    }
+
+    #[test]
+    fn test_detect_lockfiles_cargo() {
+        let dir = tempdir().unwrap();
+        let manifest = dir.path().join("Cargo.toml");
+        let lockfile = dir.path().join("Cargo.lock");
+
+        fs::write(&manifest, "[package]").unwrap();
+        fs::write(&lockfile, "").unwrap();
+
+        let detected = detect_lockfiles(&manifest);
+        assert_eq!(detected.len(), 1);
+        assert_eq!(detected[0], LockfileType::CargoLock);
+    }
+
+    #[test]
+    fn test_detect_lockfiles_go() {
+        let dir = tempdir().unwrap();
+        let manifest = dir.path().join("go.mod");
+        let lockfile = dir.path().join("go.sum");
+
+        fs::write(&manifest, "module example").unwrap();
+        fs::write(&lockfile, "").unwrap();
+
+        let detected = detect_lockfiles(&manifest);
+        assert_eq!(detected.len(), 1);
+        assert_eq!(detected[0], LockfileType::GoSum);
     }
 
     #[test]
