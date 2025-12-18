@@ -5,6 +5,86 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.0.18] - 2025-12-18
+
+### Added
+
+- **Configuration file support** (`.updrc.toml`, `upd.toml`, `.updrc`)
+  - `ignore`: List of packages to skip during updates
+  - `pin`: Map of packages to pinned versions (bypasses registry lookup)
+  - Config file discovery walks up directory tree to find project root config
+  - Use `--config` flag to specify a custom config file path
+- **Enhanced private registry authentication**:
+  - PyPI: Read `pip.conf` / `pip.ini` for `index-url` and `extra-index-url`
+  - npm: Support for scoped registries in `.npmrc` (`@scope:registry=...`)
+  - Cargo: Read `~/.cargo/config.toml` for custom registry URLs
+  - Go: Support `GOPRIVATE`, `GONOPROXY`, `GONOSUMDB` environment variables
+
+### Changed
+
+- Verbose output now shows ignored and pinned packages
+- Summary output shows counts of pinned and ignored packages
+
+## [0.0.17] - 2025-12-17
+
+### Added
+
+- Pre-commit hook support via `.pre-commit-hooks.yaml`
+  - `upd-check`: Fail if any dependencies are outdated
+  - `upd-check-major`: Fail only on major (breaking) updates
+- Lockfile regeneration with `--lock` flag:
+  - `Cargo.lock` via `cargo generate-lockfile`
+  - `go.sum` via `go mod tidy`
+  - `bun.lockb` via `bun install`
+  - `package-lock.json` via `npm install`
+  - `poetry.lock` via `poetry lock`
+
+## [0.0.16] - 2025-12-17
+
+### Added
+
+- Parallel file processing for faster updates across multiple files
+- `--lock` flag to regenerate lockfiles after updating dependencies
+
+### Fixed
+
+- CLI description now mentions Rust and Go ecosystems
+
+## [0.0.15] - 2025-12-17
+
+### Added
+
+- Private registry compatibility improvements for enterprise PyPI servers
+- Better handling of non-standard Simple API responses
+
+## [0.0.14] - 2025-12-17
+
+### Fixed
+
+- Skip yanked packages when fetching versions from Simple API responses
+- Prevents updates to withdrawn/yanked package versions
+
+## [0.0.13] - 2025-12-17
+
+### Added
+
+- Simple API fallback for private PyPI servers that don't support JSON API
+- Automatic detection and parsing of HTML Simple API responses
+
+## [0.0.12] - 2025-12-17
+
+### Fixed
+
+- Normalize Simple API URLs to JSON API format for consistent handling
+- Better URL handling for various private PyPI server configurations
+
+## [0.0.11] - 2025-12-17
+
+### Added
+
+- `UV_EXTRA_INDEX_URL` and `PIP_EXTRA_INDEX_URL` environment variable support
+- Query multiple package indexes when primary index doesn't have the package
+
 ## [0.0.10] - 2025-12-17
 
 ### Added
@@ -131,6 +211,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Concurrent dependency lookups
 - Release binary with LTO optimization
 
+[0.0.18]: https://github.com/rvben/upd/releases/tag/v0.0.18
+[0.0.17]: https://github.com/rvben/upd/releases/tag/v0.0.17
+[0.0.16]: https://github.com/rvben/upd/releases/tag/v0.0.16
+[0.0.15]: https://github.com/rvben/upd/releases/tag/v0.0.15
+[0.0.14]: https://github.com/rvben/upd/releases/tag/v0.0.14
+[0.0.13]: https://github.com/rvben/upd/releases/tag/v0.0.13
+[0.0.12]: https://github.com/rvben/upd/releases/tag/v0.0.12
+[0.0.11]: https://github.com/rvben/upd/releases/tag/v0.0.11
+[0.0.10]: https://github.com/rvben/upd/releases/tag/v0.0.10
 [0.0.9]: https://github.com/rvben/upd/releases/tag/v0.0.9
 [0.0.8]: https://github.com/rvben/upd/releases/tag/v0.0.8
 [0.0.7]: https://github.com/rvben/upd/releases/tag/v0.0.7
