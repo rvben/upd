@@ -35,6 +35,8 @@ uvx --from upd-cli upd -n
 - **Gitignore-aware**: Respects `.gitignore` when discovering files
 - **Version alignment**: Align package versions across multiple files
 - **Security auditing**: Check dependencies for known vulnerabilities via OSV
+- **Config file support**: Ignore or pin packages via `.updrc.toml`
+- **Private registries**: Authentication for PyPI, npm, Cargo, and Go
 
 ## Installation
 
@@ -110,6 +112,10 @@ upd --full-precision  # Output full versions (e.g., 3.1.5 instead of 3.1)
 upd --check
 upd -c
 upd --check --lang python  # Check only Python dependencies
+
+# Use a specific config file
+upd --config /path/to/config.toml
+upd --config .updrc.toml
 ```
 
 ### Commands
@@ -295,6 +301,90 @@ repos:
 | `>=2.0` | Updates to any version >= 2.0 |
 | `==2.0.0` | No updates (pinned) |
 
+## Configuration File
+
+`upd` supports configuration files to customize update behavior on a per-project basis.
+
+### File Discovery
+
+`upd` searches for configuration files in the following order (first found wins):
+
+1. `.updrc.toml` - Recommended, explicit config file
+2. `upd.toml` - Alternative name
+3. `.updrc` - Minimal name (TOML format)
+
+The search starts from the target directory and walks up to parent directories, allowing you to place a config file at the repository root.
+
+### Configuration Options
+
+```toml
+# .updrc.toml
+
+# Packages to ignore during updates (never updated)
+ignore = [
+    "legacy-package",
+    "internal-tool",
+]
+
+# Pin packages to specific versions (bypasses registry lookup)
+[pin]
+flask = "2.3.0"
+django = "4.2.0"
+```
+
+### Options
+
+| Option | Type | Description |
+|--------|------|-------------|
+| `ignore` | `string[]` | List of package names to skip during updates |
+| `pin` | `table` | Map of package names to pinned versions |
+
+### Example Configurations
+
+**Ignore unstable packages:**
+
+```toml
+# .updrc.toml
+ignore = [
+    "experimental-api",
+    "beta-feature",
+]
+```
+
+**Pin critical dependencies:**
+
+```toml
+# .updrc.toml
+[pin]
+django = "4.2.0"      # LTS version
+sqlalchemy = "2.0.0"  # Major version boundary
+```
+
+**Combined configuration:**
+
+```toml
+# .updrc.toml
+ignore = ["internal-utils"]
+
+[pin]
+requests = "2.31.0"
+flask = "3.0.0"
+```
+
+### Verbose Output
+
+Use `--verbose` to see which packages are ignored or pinned:
+
+```bash
+upd --verbose
+# Output:
+# Using config from: .updrc.toml
+#   Ignoring 2 package(s)
+#   Pinning 3 package(s)
+# pyproject.toml:12: Pinned flask 2.2.0 → 3.0.0 (pinned)
+# pyproject.toml:13: Skipped internal-utils 1.0.0 (ignored)
+```
+
 ## Caching
 
 Version lookups are cached for 24 hours in:
@@ -327,11 +417,26 @@ export PIP_INDEX_PASSWORD=mypassword
 # login myuser
 # password mypassword
 
-# Option 4: Inline in requirements.txt (with credentials)
+# Option 4: pip.conf / pip.ini
+# ~/.config/pip/pip.conf (Linux/macOS)
+# %APPDATA%\pip\pip.ini (Windows)
+[global]
+index-url = https://my-private-pypi.com/simple
+extra-index-url = https://pypi.org/simple
+
+# Option 5: Inline in requirements.txt (with credentials)
 # --index-url https://user:pass@my-private-pypi.com/simple
 # or just the URL (credentials from netrc):
 # --index-url https://my-private-pypi.com/simple
 ```
+
+**pip.conf locations** (searched in order):
+
+1. `$PIP_CONFIG_FILE` environment variable
+2. `$VIRTUAL_ENV/pip.conf` (if in a virtual environment)
+3. `$XDG_CONFIG_HOME/pip/pip.conf` or `~/.config/pip/pip.conf`
+4. `~/.pip/pip.conf`
+5. `/etc/pip.conf` (system-wide)
 
 **Inline index URLs**: When a `requirements.txt` file contains `--index-url` or `-i`,
 `upd` automatically uses that index instead of the default PyPI. Credentials can be
@@ -347,11 +452,21 @@ export NPM_TOKEN=your-auth-token
 # Option 2: NODE_AUTH_TOKEN (GitHub Actions)
 export NODE_AUTH_TOKEN=your-auth-token
 
-# Option 3: ~/.npmrc file
+# Option 3: ~/.npmrc file (global registry)
+registry=https://npm.mycompany.com
 //npm.mycompany.com/:_authToken=your-auth-token
 # Or for environment variable reference:
 //npm.mycompany.com/:_authToken=${NPM_TOKEN}
+
+# Option 4: ~/.npmrc file (scoped registries)
+@mycompany:registry=https://npm.mycompany.com
+//npm.mycompany.com/:_authToken=your-auth-token
+@another-scope:registry=https://another.registry.com
 ```
+
+**Scoped registries**: Packages with scopes (e.g., `@mycompany/package`) will use the
+registry configured for that scope in `.npmrc`. This allows mixing public and private
+packages in the same project.
 
 ### Cargo / Private Registry
 
@@ -366,7 +481,16 @@ token = "your-crates-io-token"
 
 [registries.my-private-registry]
 token = "your-private-token"
+
+# Option 3: ~/.cargo/config.toml (registry URLs)
+[registries.my-private-registry]
+index = "https://my-registry.com/git/index"
+# or sparse registry:
+index = "sparse+https://my-registry.com/index/"
 ```
+
+**Custom registries**: `upd` reads `~/.cargo/config.toml` to discover custom registry
+URLs. Combine with `credentials.toml` for authenticated access.
 
 ### Go / Private Module Proxy
 
@@ -376,11 +500,20 @@ export GOPROXY=https://proxy.mycompany.com
 export GOPROXY_USERNAME=myuser
 export GOPROXY_PASSWORD=mypassword
 
-# Option 2: ~/.netrc file (commonly used with go modules)
-# machine proxy.mycompany.com
+# Option 2: Private module patterns
+export GOPRIVATE=github.com/mycompany/*,gitlab.mycompany.com/*
+export GONOPROXY=github.com/mycompany/*
+export GONOSUMDB=github.com/mycompany/*
+
+# Option 3: ~/.netrc file (commonly used with go modules)
+# machine github.com
 # login myuser
-# password mypassword
+# password mytoken
 ```
+
+**Private modules**: Set `GOPRIVATE` to specify module patterns that should bypass
+the public proxy. `upd` respects these patterns and will attempt direct access
+for matching modules.
 
 Use `--verbose` to see when authenticated access is being used:
 
@@ -396,6 +529,7 @@ upd --verbose
 |----------|-------------|
 | `UV_INDEX_URL` | Custom PyPI index URL |
 | `PIP_INDEX_URL` | Custom PyPI index URL (fallback) |
+| `PIP_CONFIG_FILE` | Path to pip configuration file |
 | `UV_INDEX_USERNAME` | PyPI username (with UV_INDEX_URL) |
 | `UV_INDEX_PASSWORD` | PyPI password (with UV_INDEX_URL) |
 | `PIP_INDEX_USERNAME` | PyPI username (with PIP_INDEX_URL) |
@@ -408,6 +542,9 @@ upd --verbose
 | `GOPROXY` | Custom Go module proxy URL |
 | `GOPROXY_USERNAME` | Go proxy username |
 | `GOPROXY_PASSWORD` | Go proxy password |
+| `GOPRIVATE` | Comma-separated private module patterns |
+| `GONOPROXY` | Modules to exclude from proxy |
+| `GONOSUMDB` | Modules to exclude from checksum DB |
 | `UPD_CACHE_DIR` | Custom cache directory |
 
 ## Pre-commit Integration
