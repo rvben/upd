@@ -10,10 +10,12 @@ pub use package_json::PackageJsonUpdater;
 pub use pyproject::PyProjectUpdater;
 pub use requirements::RequirementsUpdater;
 
+use crate::config::UpdConfig;
 use crate::registry::Registry;
 use anyhow::{Result, anyhow};
 use ignore::WalkBuilder;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 /// Maximum file size allowed for dependency files (10 MB)
 const MAX_FILE_SIZE: u64 = 10 * 1024 * 1024;
@@ -62,12 +64,46 @@ pub fn write_file_atomic(path: &Path, content: &str) -> Result<()> {
 }
 
 /// Options for updating dependencies
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Default)]
 pub struct UpdateOptions {
     /// Dry run - don't write changes
     pub dry_run: bool,
     /// Use full version precision instead of matching original
     pub full_precision: bool,
+    /// Configuration for ignoring/pinning packages
+    pub config: Option<Arc<UpdConfig>>,
+}
+
+impl UpdateOptions {
+    /// Create new options with the given dry_run and full_precision settings
+    pub fn new(dry_run: bool, full_precision: bool) -> Self {
+        Self {
+            dry_run,
+            full_precision,
+            config: None,
+        }
+    }
+
+    /// Set the configuration
+    pub fn with_config(mut self, config: Arc<UpdConfig>) -> Self {
+        self.config = Some(config);
+        self
+    }
+
+    /// Check if a package should be ignored
+    pub fn should_ignore(&self, package: &str) -> bool {
+        self.config
+            .as_ref()
+            .map(|c| c.should_ignore(package))
+            .unwrap_or(false)
+    }
+
+    /// Get the pinned version for a package (if any)
+    pub fn get_pinned_version(&self, package: &str) -> Option<&str> {
+        self.config
+            .as_ref()
+            .and_then(|c| c.get_pinned_version(package))
+    }
 }
 
 /// A parsed dependency from a file (for alignment purposes)
@@ -92,6 +128,10 @@ pub struct UpdateResult {
     pub unchanged: usize,
     /// Errors encountered during update
     pub errors: Vec<String>,
+    /// Packages that were ignored due to config: (name, current_version, line_number)
+    pub ignored: Vec<(String, String, Option<usize>)>,
+    /// Packages that were pinned to a specific version: (name, current_version, pinned_version, line_number)
+    pub pinned: Vec<(String, String, String, Option<usize>)>,
 }
 
 impl UpdateResult {
@@ -99,6 +139,8 @@ impl UpdateResult {
         self.updated.extend(other.updated);
         self.unchanged += other.unchanged;
         self.errors.extend(other.errors);
+        self.ignored.extend(other.ignored);
+        self.pinned.extend(other.pinned);
     }
 }
 
@@ -259,6 +301,13 @@ mod tests {
             )],
             unchanged: 5,
             errors: vec!["error1".to_string()],
+            ignored: vec![("ignored1".to_string(), "1.0".to_string(), Some(3))],
+            pinned: vec![(
+                "pinned1".to_string(),
+                "1.0".to_string(),
+                "1.5".to_string(),
+                Some(4),
+            )],
         };
 
         let result2 = UpdateResult {
@@ -270,6 +319,13 @@ mod tests {
             )],
             unchanged: 3,
             errors: vec!["error2".to_string()],
+            ignored: vec![("ignored2".to_string(), "2.0".to_string(), Some(5))],
+            pinned: vec![(
+                "pinned2".to_string(),
+                "2.0".to_string(),
+                "2.5".to_string(),
+                Some(6),
+            )],
         };
 
         result1.merge(result2);
@@ -277,8 +333,14 @@ mod tests {
         assert_eq!(result1.updated.len(), 2);
         assert_eq!(result1.unchanged, 8);
         assert_eq!(result1.errors.len(), 2);
+        assert_eq!(result1.ignored.len(), 2);
+        assert_eq!(result1.pinned.len(), 2);
         assert_eq!(result1.updated[0].0, "pkg1");
         assert_eq!(result1.updated[1].0, "pkg2");
+        assert_eq!(result1.ignored[0].0, "ignored1");
+        assert_eq!(result1.ignored[1].0, "ignored2");
+        assert_eq!(result1.pinned[0].0, "pinned1");
+        assert_eq!(result1.pinned[1].0, "pinned2");
     }
 
     #[test]

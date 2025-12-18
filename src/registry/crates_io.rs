@@ -53,6 +53,151 @@ struct VersionInfo {
     yanked: bool,
 }
 
+/// Cargo registry configuration from config.toml
+#[derive(Debug, Clone, Default)]
+pub struct CargoConfig {
+    /// Named registries (e.g., my-registry -> sparse+https://my-registry.com/index/)
+    pub registries: std::collections::HashMap<String, String>,
+    /// Default registry name (if not crates-io)
+    pub default_registry: Option<String>,
+}
+
+/// Read cargo configuration from ~/.cargo/config.toml
+pub fn read_cargo_config() -> CargoConfig {
+    let mut config = CargoConfig::default();
+
+    // Check for config.toml (newer) or config (older) in ~/.cargo
+    let config_paths = if let Some(home) = home_dir() {
+        vec![
+            home.join(".cargo").join("config.toml"),
+            home.join(".cargo").join("config"),
+        ]
+    } else {
+        vec![]
+    };
+
+    for path in config_paths {
+        if let Some(parsed) = read_cargo_config_from_path(&path) {
+            // Merge registries
+            for (name, url) in parsed.registries {
+                config.registries.entry(name).or_insert(url);
+            }
+            // First default wins
+            if config.default_registry.is_none() {
+                config.default_registry = parsed.default_registry;
+            }
+        }
+    }
+
+    config
+}
+
+/// Read cargo configuration from a specific file path
+fn read_cargo_config_from_path(path: &PathBuf) -> Option<CargoConfig> {
+    let content = std::fs::read_to_string(path).ok()?;
+    let mut config = CargoConfig::default();
+
+    // Simple TOML parsing for registries
+    let mut in_registries_section = false;
+    let mut current_registry_name: Option<String> = None;
+
+    for line in content.lines() {
+        let line = line.trim();
+
+        // Skip comments and empty lines
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+
+        // Check for section headers
+        if line.starts_with('[') && line.ends_with(']') {
+            let section = &line[1..line.len() - 1];
+
+            // Check for [registries.name] sections
+            if let Some(name) = section.strip_prefix("registries.") {
+                in_registries_section = true;
+                current_registry_name = Some(name.to_string());
+                continue;
+            }
+
+            // Check for [registry] section (for default)
+            if section == "registry" {
+                in_registries_section = false;
+                current_registry_name = None;
+                // Look for default = "name" in subsequent lines
+                continue;
+            }
+
+            // Check for [registries] section (table format)
+            if section == "registries" {
+                in_registries_section = true;
+                current_registry_name = None;
+                continue;
+            }
+
+            // Other section
+            in_registries_section = false;
+            current_registry_name = None;
+            continue;
+        }
+
+        // Parse key = value pairs
+        if let Some((key, value)) = line.split_once('=') {
+            let key = key.trim();
+            let value = value.trim().trim_matches('"').trim_matches('\'');
+
+            // Handle [registries.name] index = "url"
+            if in_registries_section
+                && key == "index"
+                && let Some(ref name) = current_registry_name
+            {
+                config.registries.insert(name.clone(), value.to_string());
+            }
+
+            // Handle [registry] default = "name"
+            if !in_registries_section && key == "default" && config.default_registry.is_none() {
+                config.default_registry = Some(value.to_string());
+            }
+
+            // Handle inline table format: name = { index = "url" }
+            if in_registries_section && current_registry_name.is_none() && value.contains("index") {
+                // Parse { index = "url" } format
+                if let Some(index_start) = value.find("index")
+                    && let Some(eq_pos) = value[index_start..].find('=')
+                {
+                    let after_eq = &value[index_start + eq_pos + 1..];
+                    let url = after_eq.trim().trim_matches(|c| {
+                        c == '"' || c == '\'' || c == '{' || c == '}' || c == ' '
+                    });
+                    if !url.is_empty() {
+                        config.registries.insert(key.to_string(), url.to_string());
+                    }
+                }
+            }
+        }
+    }
+
+    if !config.registries.is_empty() || config.default_registry.is_some() {
+        Some(config)
+    } else {
+        None
+    }
+}
+
+/// Convert a sparse registry index URL to an API URL
+/// sparse+https://my-registry.com/index/ -> https://my-registry.com/api/v1/crates
+fn sparse_index_to_api_url(index_url: &str) -> String {
+    let url = index_url
+        .strip_prefix("sparse+")
+        .unwrap_or(index_url)
+        .trim_end_matches('/');
+
+    // Remove /index suffix if present
+    let base = url.strip_suffix("/index").unwrap_or(url);
+
+    format!("{}/api/v1/crates", base)
+}
+
 /// Read token from ~/.cargo/credentials.toml
 fn read_cargo_credentials(registry_name: &str) -> Option<CargoCredentials> {
     let credentials_path = home_dir()?.join(".cargo").join("credentials.toml");
@@ -160,11 +305,40 @@ impl CratesIoRegistry {
         }
     }
 
-    /// Detect custom registry URL from environment
+    /// Detect custom registry URL from environment or config.toml
     pub fn detect_registry_url() -> Option<String> {
-        std::env::var("CARGO_REGISTRIES_CRATES_IO_INDEX")
-            .ok()
-            .filter(|s| !s.is_empty())
+        // Check environment variable first
+        if let Ok(url) = std::env::var("CARGO_REGISTRIES_CRATES_IO_INDEX")
+            && !url.is_empty()
+        {
+            return Some(sparse_index_to_api_url(&url));
+        }
+
+        // Check config.toml for default registry
+        let config = read_cargo_config();
+        if let Some(default_name) = config.default_registry
+            && let Some(index_url) = config.registries.get(&default_name)
+        {
+            return Some(sparse_index_to_api_url(index_url));
+        }
+
+        None
+    }
+
+    /// Get the registry URL for a named registry from config.toml
+    pub fn get_named_registry_url(registry_name: &str) -> Option<String> {
+        let config = read_cargo_config();
+        config
+            .registries
+            .get(registry_name)
+            .map(|url| sparse_index_to_api_url(url))
+    }
+
+    /// Create a registry for a specific named registry from config.toml
+    pub fn for_named_registry(registry_name: &str) -> Option<Self> {
+        let url = Self::get_named_registry_url(registry_name)?;
+        let credentials = Self::detect_credentials(registry_name);
+        Some(Self::with_registry_url_and_credentials(url, credentials))
     }
 
     /// Detect credentials from environment variables or credentials.toml
@@ -425,6 +599,121 @@ mod tests {
         let _registry = CratesIoRegistry::with_registry_url_and_credentials(
             "https://crates.io/api/v1/crates".to_string(),
             Some(creds),
+        );
+    }
+
+    #[test]
+    fn test_read_cargo_config_registries_section() {
+        let mut config_file = NamedTempFile::new().unwrap();
+        writeln!(config_file, "[registries.my-registry]").unwrap();
+        writeln!(
+            config_file,
+            "index = \"sparse+https://my-registry.com/index/\""
+        )
+        .unwrap();
+
+        let path = config_file.path().to_path_buf();
+        let config = read_cargo_config_from_path(&path).unwrap();
+
+        assert_eq!(config.registries.len(), 1);
+        assert_eq!(
+            config.registries.get("my-registry"),
+            Some(&"sparse+https://my-registry.com/index/".to_string())
+        );
+    }
+
+    #[test]
+    fn test_read_cargo_config_default_registry() {
+        let mut config_file = NamedTempFile::new().unwrap();
+        writeln!(config_file, "[registry]").unwrap();
+        writeln!(config_file, "default = \"my-registry\"").unwrap();
+
+        let path = config_file.path().to_path_buf();
+        let config = read_cargo_config_from_path(&path).unwrap();
+
+        assert_eq!(config.default_registry, Some("my-registry".to_string()));
+    }
+
+    #[test]
+    fn test_read_cargo_config_mixed() {
+        let mut config_file = NamedTempFile::new().unwrap();
+        writeln!(config_file, "[registry]").unwrap();
+        writeln!(config_file, "default = \"private\"").unwrap();
+        writeln!(config_file, "").unwrap();
+        writeln!(config_file, "[registries.private]").unwrap();
+        writeln!(
+            config_file,
+            "index = \"sparse+https://private.registry.com/index/\""
+        )
+        .unwrap();
+        writeln!(config_file, "").unwrap();
+        writeln!(config_file, "[registries.other]").unwrap();
+        writeln!(
+            config_file,
+            "index = \"sparse+https://other.registry.com/index/\""
+        )
+        .unwrap();
+
+        let path = config_file.path().to_path_buf();
+        let config = read_cargo_config_from_path(&path).unwrap();
+
+        assert_eq!(config.default_registry, Some("private".to_string()));
+        assert_eq!(config.registries.len(), 2);
+        assert_eq!(
+            config.registries.get("private"),
+            Some(&"sparse+https://private.registry.com/index/".to_string())
+        );
+        assert_eq!(
+            config.registries.get("other"),
+            Some(&"sparse+https://other.registry.com/index/".to_string())
+        );
+    }
+
+    #[test]
+    fn test_read_cargo_config_with_comments() {
+        let mut config_file = NamedTempFile::new().unwrap();
+        writeln!(config_file, "# This is a comment").unwrap();
+        writeln!(config_file, "[registries.my-registry]").unwrap();
+        writeln!(config_file, "# Index URL below").unwrap();
+        writeln!(
+            config_file,
+            "index = \"sparse+https://my-registry.com/index/\""
+        )
+        .unwrap();
+
+        let path = config_file.path().to_path_buf();
+        let config = read_cargo_config_from_path(&path).unwrap();
+
+        assert_eq!(config.registries.len(), 1);
+    }
+
+    #[test]
+    fn test_read_cargo_config_empty_file() {
+        let config_file = NamedTempFile::new().unwrap();
+        let path = config_file.path().to_path_buf();
+        let config = read_cargo_config_from_path(&path);
+
+        assert!(config.is_none());
+    }
+
+    #[test]
+    fn test_sparse_index_to_api_url() {
+        assert_eq!(
+            sparse_index_to_api_url("sparse+https://my-registry.com/index/"),
+            "https://my-registry.com/api/v1/crates"
+        );
+        assert_eq!(
+            sparse_index_to_api_url("sparse+https://my-registry.com/index"),
+            "https://my-registry.com/api/v1/crates"
+        );
+        assert_eq!(
+            sparse_index_to_api_url("https://my-registry.com/index/"),
+            "https://my-registry.com/api/v1/crates"
+        );
+        // Without /index suffix
+        assert_eq!(
+            sparse_index_to_api_url("sparse+https://my-registry.com/"),
+            "https://my-registry.com/api/v1/crates"
         );
     }
 }

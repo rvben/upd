@@ -198,9 +198,11 @@ impl PyProjectUpdater {
         registry: &dyn Registry,
         result: &mut UpdateResult,
         original_content: &str,
-        full_precision: bool,
+        options: &UpdateOptions,
     ) {
-        // First pass: collect all dependencies that need version checks
+        // First pass: collect all dependencies and separate by config status
+        let mut ignored_deps: Vec<(String, String)> = Vec::new();
+        let mut pinned_deps: Vec<(usize, String, String, String, String)> = Vec::new();
         let mut deps_to_check: Vec<(usize, String, String, String, String)> = Vec::new();
 
         for i in 0..array.len() {
@@ -208,11 +210,56 @@ impl PyProjectUpdater {
                 && let Some(s) = item.as_str()
                 && let Some((package, current_version, full_constraint)) = self.parse_dependency(s)
             {
+                // Check if package should be ignored
+                if options.should_ignore(&package) {
+                    ignored_deps.push((package, current_version));
+                    continue;
+                }
+
+                // Check if package has a pinned version
+                if let Some(pinned_version) = options.get_pinned_version(&package) {
+                    pinned_deps.push((
+                        i,
+                        s.to_string(),
+                        package,
+                        current_version,
+                        pinned_version.to_string(),
+                    ));
+                    continue;
+                }
+
                 deps_to_check.push((i, s.to_string(), package, current_version, full_constraint));
             }
         }
 
-        // Fetch all versions in parallel
+        // Record ignored packages
+        for (package, version) in ignored_deps {
+            let line_num = Self::find_dependency_line(original_content, &package);
+            result.ignored.push((package, version, line_num));
+        }
+
+        // Process pinned packages (no registry fetch needed)
+        let mut updates: Vec<(usize, String)> = Vec::new();
+        for (i, dep_str, package, current_version, pinned_version) in pinned_deps {
+            let matched_version = if options.full_precision {
+                pinned_version.clone()
+            } else {
+                match_version_precision(&current_version, &pinned_version)
+            };
+
+            if matched_version != current_version {
+                let updated = self.update_dependency(&dep_str, &matched_version);
+                let line_num = Self::find_dependency_line(original_content, &package);
+                result
+                    .pinned
+                    .push((package, current_version, matched_version.clone(), line_num));
+                updates.push((i, updated));
+            } else {
+                result.unchanged += 1;
+            }
+        }
+
+        // Fetch versions for remaining deps in parallel
         let version_futures: Vec<_> = deps_to_check
             .iter()
             .map(|(_, _, package, current_version, full_constraint)| async {
@@ -233,8 +280,6 @@ impl PyProjectUpdater {
         let version_results = join_all(version_futures).await;
 
         // Process results and collect updates
-        let mut updates: Vec<(usize, String)> = Vec::new();
-
         for ((i, dep_str, package, current_version, full_constraint), version_result) in
             deps_to_check.into_iter().zip(version_results)
         {
@@ -248,7 +293,7 @@ impl PyProjectUpdater {
             match version_result {
                 Ok(latest_version) => {
                     // Match the precision of the original version (unless full precision requested)
-                    let matched_version = if full_precision {
+                    let matched_version = if options.full_precision {
                         latest_version.clone()
                     } else {
                         match_version_precision(&current_version, &latest_version)
@@ -292,9 +337,11 @@ impl PyProjectUpdater {
         registry: &dyn Registry,
         result: &mut UpdateResult,
         original_content: &str,
-        full_precision: bool,
+        options: &UpdateOptions,
     ) {
-        // First pass: collect dependencies to check
+        // First pass: collect dependencies and separate by config status
+        let mut ignored_deps: Vec<(String, String)> = Vec::new();
+        let mut pinned_deps: Vec<(String, String, String, String)> = Vec::new();
         let mut deps_to_check: Vec<(String, String, String)> = Vec::new();
 
         for (key, item) in deps_table.iter() {
@@ -311,11 +358,58 @@ impl PyProjectUpdater {
                         (String::new(), version_str.clone())
                     };
 
-                deps_to_check.push((key.to_string(), prefix, version));
+                let package = key.to_string();
+
+                // Check if package should be ignored
+                if options.should_ignore(&package) {
+                    ignored_deps.push((package, version));
+                    continue;
+                }
+
+                // Check if package has a pinned version
+                if let Some(pinned_version) = options.get_pinned_version(&package) {
+                    pinned_deps.push((package, prefix, version, pinned_version.to_string()));
+                    continue;
+                }
+
+                deps_to_check.push((package, prefix, version));
             }
         }
 
-        // Fetch all versions in parallel
+        // Record ignored packages
+        for (package, version) in ignored_deps {
+            let line_num = Self::find_dependency_line(original_content, &package);
+            result.ignored.push((package, version, line_num));
+        }
+
+        // Process pinned packages (no registry fetch needed)
+        for (key, prefix, version, pinned_version) in pinned_deps {
+            let matched_version = if options.full_precision {
+                pinned_version.clone()
+            } else {
+                match_version_precision(&version, &pinned_version)
+            };
+
+            if matched_version != version {
+                let new_val = format!("{}{}", prefix, matched_version);
+                let line_num = Self::find_dependency_line(original_content, &key);
+                result
+                    .pinned
+                    .push((key.clone(), version, matched_version.clone(), line_num));
+
+                // Preserve decoration when updating
+                if let Some(Item::Value(Value::String(formatted))) = deps_table.get_mut(&key) {
+                    let decor = formatted.decor().clone();
+                    let mut new_formatted = Formatted::new(new_val);
+                    *new_formatted.decor_mut() = decor;
+                    *formatted = new_formatted;
+                }
+            } else {
+                result.unchanged += 1;
+            }
+        }
+
+        // Fetch versions for remaining deps in parallel
         let version_futures: Vec<_> = deps_to_check
             .iter()
             .map(|(key, _, version)| async {
@@ -336,7 +430,7 @@ impl PyProjectUpdater {
             match version_result {
                 Ok(latest_version) => {
                     // Match the precision of the original version (unless full precision requested)
-                    let matched_version = if full_precision {
+                    let matched_version = if options.full_precision {
                         latest_version.clone()
                     } else {
                         match_version_precision(&version, &latest_version)
@@ -402,14 +496,8 @@ impl Updater for PyProjectUpdater {
         // Update [project.dependencies]
         if let Some(Item::Table(project)) = doc.get_mut("project") {
             if let Some(Item::Value(Value::Array(deps))) = project.get_mut("dependencies") {
-                self.update_array_deps(
-                    deps,
-                    effective_registry,
-                    &mut result,
-                    &content,
-                    options.full_precision,
-                )
-                .await;
+                self.update_array_deps(deps, effective_registry, &mut result, &content, &options)
+                    .await;
             }
 
             // Update [project.optional-dependencies.*]
@@ -423,7 +511,7 @@ impl Updater for PyProjectUpdater {
                             effective_registry,
                             &mut result,
                             &content,
-                            options.full_precision,
+                            &options,
                         )
                         .await;
                     }
@@ -441,7 +529,7 @@ impl Updater for PyProjectUpdater {
                         effective_registry,
                         &mut result,
                         &content,
-                        options.full_precision,
+                        &options,
                     )
                     .await;
                 }
@@ -453,29 +541,17 @@ impl Updater for PyProjectUpdater {
             && let Some(Item::Table(poetry)) = tool.get_mut("poetry")
         {
             if let Some(Item::Table(deps)) = poetry.get_mut("dependencies") {
-                self.update_poetry_deps(
-                    deps,
-                    effective_registry,
-                    &mut result,
-                    &content,
-                    options.full_precision,
-                )
-                .await;
+                self.update_poetry_deps(deps, effective_registry, &mut result, &content, &options)
+                    .await;
             }
 
             if let Some(Item::Table(deps)) = poetry.get_mut("dev-dependencies") {
-                self.update_poetry_deps(
-                    deps,
-                    effective_registry,
-                    &mut result,
-                    &content,
-                    options.full_precision,
-                )
-                .await;
+                self.update_poetry_deps(deps, effective_registry, &mut result, &content, &options)
+                    .await;
             }
         }
 
-        if !result.updated.is_empty() && !options.dry_run {
+        if (!result.updated.is_empty() || !result.pinned.is_empty()) && !options.dry_run {
             write_file_atomic(path, &doc.to_string())?;
         }
 
@@ -694,10 +770,7 @@ dependencies = [
             .with_version("flask", "3.0.0");
 
         let updater = PyProjectUpdater::new();
-        let options = UpdateOptions {
-            dry_run: false,
-            full_precision: false,
-        };
+        let options = UpdateOptions::new(false, false);
 
         let result = updater
             .update(file.path(), &registry, options)
@@ -736,10 +809,7 @@ flask = "2.0.0"
             .with_version("flask", "3.0.0");
 
         let updater = PyProjectUpdater::new();
-        let options = UpdateOptions {
-            dry_run: false,
-            full_precision: false,
-        };
+        let options = UpdateOptions::new(false, false);
 
         let result = updater
             .update(file.path(), &registry, options)
@@ -771,10 +841,7 @@ dependencies = ["requests>=2.28.0"]
         let registry = MockRegistry::new("PyPI").with_version("requests", "2.31.0");
 
         let updater = PyProjectUpdater::new();
-        let options = UpdateOptions {
-            dry_run: true,
-            full_precision: false,
-        };
+        let options = UpdateOptions::new(true, false);
 
         let result = updater
             .update(file.path(), &registry, options)
@@ -809,10 +876,7 @@ dependencies = [
         let registry = MockRegistry::new("PyPI").with_version("requests", "2.31.0");
 
         let updater = PyProjectUpdater::new();
-        let options = UpdateOptions {
-            dry_run: false,
-            full_precision: false,
-        };
+        let options = UpdateOptions::new(false, false);
 
         updater
             .update(file.path(), &registry, options)
@@ -844,10 +908,7 @@ dev = ["pytest>=7.0.0"]
             .with_version("pytest", "8.0.0");
 
         let updater = PyProjectUpdater::new();
-        let options = UpdateOptions {
-            dry_run: false,
-            full_precision: false,
-        };
+        let options = UpdateOptions::new(false, false);
 
         let result = updater
             .update(file.path(), &registry, options)
@@ -876,10 +937,7 @@ dependencies = ["requests>=2.31.0"]
         let registry = MockRegistry::new("PyPI").with_version("requests", "2.31.0");
 
         let updater = PyProjectUpdater::new();
-        let options = UpdateOptions {
-            dry_run: false,
-            full_precision: false,
-        };
+        let options = UpdateOptions::new(false, false);
 
         let result = updater
             .update(file.path(), &registry, options)
@@ -906,10 +964,7 @@ name = "invalid toml - missing bracket"
         let registry = MockRegistry::new("PyPI");
 
         let updater = PyProjectUpdater::new();
-        let options = UpdateOptions {
-            dry_run: false,
-            full_precision: false,
-        };
+        let options = UpdateOptions::new(false, false);
 
         let result = updater.update(file.path(), &registry, options).await;
 
@@ -923,10 +978,7 @@ name = "invalid toml - missing bracket"
         let registry = MockRegistry::new("PyPI");
 
         let updater = PyProjectUpdater::new();
-        let options = UpdateOptions {
-            dry_run: false,
-            full_precision: false,
-        };
+        let options = UpdateOptions::new(false, false);
 
         let result = updater
             .update(
@@ -958,10 +1010,7 @@ dependencies = [
         let registry = MockRegistry::new("PyPI").with_version("requests", "2.31.0");
 
         let updater = PyProjectUpdater::new();
-        let options = UpdateOptions {
-            dry_run: false,
-            full_precision: false,
-        };
+        let options = UpdateOptions::new(false, false);
 
         let result = updater
             .update(file.path(), &registry, options)
@@ -992,10 +1041,7 @@ dependencies = []
         let registry = MockRegistry::new("PyPI");
 
         let updater = PyProjectUpdater::new();
-        let options = UpdateOptions {
-            dry_run: false,
-            full_precision: false,
-        };
+        let options = UpdateOptions::new(false, false);
 
         let result = updater
             .update(file.path(), &registry, options)
@@ -1022,10 +1068,7 @@ version = "1.0.0"
         let registry = MockRegistry::new("PyPI");
 
         let updater = PyProjectUpdater::new();
-        let options = UpdateOptions {
-            dry_run: false,
-            full_precision: false,
-        };
+        let options = UpdateOptions::new(false, false);
 
         let result = updater
             .update(file.path(), &registry, options)
@@ -1153,5 +1196,356 @@ url = "https://private.pypi.com/simple"
         // Should only have one unique URL
         assert_eq!(primary, Some("https://private.pypi.com/simple".to_string()));
         assert!(extras.is_empty());
+    }
+
+    // Tests for config-based ignore/pin functionality
+
+    #[tokio::test]
+    async fn test_update_pyproject_pep621_with_config_ignore() {
+        use crate::config::UpdConfig;
+
+        let mut file = NamedTempFile::with_suffix(".toml").unwrap();
+        write!(
+            file,
+            r#"[project]
+name = "myproject"
+dependencies = [
+    "requests>=2.28.0",
+    "flask>=2.0.0",
+    "django>=4.0.0",
+]
+"#
+        )
+        .unwrap();
+
+        let registry = MockRegistry::new("PyPI")
+            .with_version("requests", "2.31.0")
+            .with_version("flask", "3.0.0")
+            .with_version("django", "5.0.0");
+
+        // Create config that ignores flask
+        let config = UpdConfig {
+            ignore: vec!["flask".to_string()],
+            pin: std::collections::HashMap::new(),
+        };
+
+        let updater = PyProjectUpdater::new();
+        let options = UpdateOptions::new(false, false).with_config(Arc::new(config));
+
+        let result = updater
+            .update(file.path(), &registry, options)
+            .await
+            .unwrap();
+
+        // 2 packages updated (requests, django), 1 ignored (flask)
+        assert_eq!(result.updated.len(), 2);
+        assert_eq!(result.ignored.len(), 1);
+        assert_eq!(result.ignored[0].0, "flask");
+        assert_eq!(result.ignored[0].1, "2.0.0");
+
+        // Verify file was updated only for non-ignored packages
+        let contents = std::fs::read_to_string(file.path()).unwrap();
+        assert!(contents.contains("requests>=2.31.0"));
+        assert!(contents.contains("flask>=2.0.0")); // unchanged
+        assert!(contents.contains("django>=5.0.0"));
+    }
+
+    #[tokio::test]
+    async fn test_update_pyproject_pep621_with_config_pin() {
+        use crate::config::UpdConfig;
+
+        let mut file = NamedTempFile::with_suffix(".toml").unwrap();
+        write!(
+            file,
+            r#"[project]
+name = "myproject"
+dependencies = [
+    "requests>=2.28.0",
+    "flask>=2.0.0",
+]
+"#
+        )
+        .unwrap();
+
+        let registry = MockRegistry::new("PyPI")
+            .with_version("requests", "2.31.0")
+            .with_version("flask", "3.0.0");
+
+        // Create config that pins flask to 2.3.0
+        let mut pin = std::collections::HashMap::new();
+        pin.insert("flask".to_string(), "2.3.0".to_string());
+        let config = UpdConfig {
+            ignore: Vec::new(),
+            pin,
+        };
+
+        let updater = PyProjectUpdater::new();
+        let options = UpdateOptions::new(false, false).with_config(Arc::new(config));
+
+        let result = updater
+            .update(file.path(), &registry, options)
+            .await
+            .unwrap();
+
+        // 1 package updated from registry, 1 pinned
+        assert_eq!(result.updated.len(), 1);
+        assert_eq!(result.updated[0].0, "requests");
+        assert_eq!(result.pinned.len(), 1);
+        assert_eq!(result.pinned[0].0, "flask");
+        assert_eq!(result.pinned[0].1, "2.0.0"); // old
+        assert_eq!(result.pinned[0].2, "2.3.0"); // new (pinned)
+
+        // Verify file was updated with pinned version
+        let contents = std::fs::read_to_string(file.path()).unwrap();
+        assert!(contents.contains("requests>=2.31.0"));
+        assert!(contents.contains("flask>=2.3.0"));
+    }
+
+    #[tokio::test]
+    async fn test_update_pyproject_poetry_with_config_ignore() {
+        use crate::config::UpdConfig;
+
+        let mut file = NamedTempFile::with_suffix(".toml").unwrap();
+        write!(
+            file,
+            r#"[tool.poetry]
+name = "myproject"
+version = "1.0.0"
+
+[tool.poetry.dependencies]
+python = "^3.9"
+requests = "^2.28.0"
+flask = "^2.0.0"
+"#
+        )
+        .unwrap();
+
+        let registry = MockRegistry::new("PyPI")
+            .with_version("requests", "2.31.0")
+            .with_version("flask", "3.0.0");
+
+        // Create config that ignores requests
+        let config = UpdConfig {
+            ignore: vec!["requests".to_string()],
+            pin: std::collections::HashMap::new(),
+        };
+
+        let updater = PyProjectUpdater::new();
+        let options = UpdateOptions::new(false, false).with_config(Arc::new(config));
+
+        let result = updater
+            .update(file.path(), &registry, options)
+            .await
+            .unwrap();
+
+        // 1 package updated (flask), 1 ignored (requests)
+        assert_eq!(result.updated.len(), 1);
+        assert_eq!(result.updated[0].0, "flask");
+        assert_eq!(result.ignored.len(), 1);
+        assert_eq!(result.ignored[0].0, "requests");
+
+        let contents = std::fs::read_to_string(file.path()).unwrap();
+        assert!(contents.contains("requests = \"^2.28.0\"")); // unchanged
+        assert!(contents.contains("flask = \"^3.0.0\""));
+    }
+
+    #[tokio::test]
+    async fn test_update_pyproject_poetry_with_config_pin() {
+        use crate::config::UpdConfig;
+
+        let mut file = NamedTempFile::with_suffix(".toml").unwrap();
+        write!(
+            file,
+            r#"[tool.poetry]
+name = "myproject"
+version = "1.0.0"
+
+[tool.poetry.dependencies]
+python = "^3.9"
+requests = "^2.28.0"
+"#
+        )
+        .unwrap();
+
+        let registry = MockRegistry::new("PyPI").with_version("requests", "2.31.0");
+
+        // Create config that pins requests to 2.29.0
+        let mut pin = std::collections::HashMap::new();
+        pin.insert("requests".to_string(), "2.29.0".to_string());
+        let config = UpdConfig {
+            ignore: Vec::new(),
+            pin,
+        };
+
+        let updater = PyProjectUpdater::new();
+        let options = UpdateOptions::new(false, false).with_config(Arc::new(config));
+
+        let result = updater
+            .update(file.path(), &registry, options)
+            .await
+            .unwrap();
+
+        // 1 pinned
+        assert_eq!(result.updated.len(), 0);
+        assert_eq!(result.pinned.len(), 1);
+        assert_eq!(result.pinned[0].0, "requests");
+        assert_eq!(result.pinned[0].2, "2.29.0");
+
+        let contents = std::fs::read_to_string(file.path()).unwrap();
+        assert!(contents.contains("requests = \"^2.29.0\""));
+    }
+
+    #[tokio::test]
+    async fn test_update_pyproject_with_config_ignore_and_pin() {
+        use crate::config::UpdConfig;
+
+        let mut file = NamedTempFile::with_suffix(".toml").unwrap();
+        write!(
+            file,
+            r#"[project]
+name = "myproject"
+dependencies = [
+    "requests>=2.28.0",
+    "flask>=2.0.0",
+    "django>=4.0.0",
+    "pytest>=7.0.0",
+]
+"#
+        )
+        .unwrap();
+
+        let registry = MockRegistry::new("PyPI")
+            .with_version("requests", "2.31.0")
+            .with_version("flask", "3.0.0")
+            .with_version("django", "5.0.0")
+            .with_version("pytest", "8.0.0");
+
+        // Config: ignore flask, pin django to 4.2.0
+        let mut pin = std::collections::HashMap::new();
+        pin.insert("django".to_string(), "4.2.0".to_string());
+        let config = UpdConfig {
+            ignore: vec!["flask".to_string()],
+            pin,
+        };
+
+        let updater = PyProjectUpdater::new();
+        let options = UpdateOptions::new(false, false).with_config(Arc::new(config));
+
+        let result = updater
+            .update(file.path(), &registry, options)
+            .await
+            .unwrap();
+
+        // 2 updated from registry (requests, pytest), 1 ignored (flask), 1 pinned (django)
+        assert_eq!(result.updated.len(), 2);
+        assert_eq!(result.ignored.len(), 1);
+        assert_eq!(result.pinned.len(), 1);
+
+        // Verify ignored
+        assert_eq!(result.ignored[0].0, "flask");
+
+        // Verify pinned
+        assert_eq!(result.pinned[0].0, "django");
+        assert_eq!(result.pinned[0].2, "4.2.0");
+
+        let contents = std::fs::read_to_string(file.path()).unwrap();
+        assert!(contents.contains("requests>=2.31.0"));
+        assert!(contents.contains("flask>=2.0.0")); // unchanged (ignored)
+        assert!(contents.contains("django>=4.2.0")); // pinned version
+        assert!(contents.contains("pytest>=8.0.0"));
+    }
+
+    #[tokio::test]
+    async fn test_update_pyproject_optional_deps_with_config() {
+        use crate::config::UpdConfig;
+
+        let mut file = NamedTempFile::with_suffix(".toml").unwrap();
+        write!(
+            file,
+            r#"[project]
+name = "myproject"
+dependencies = ["requests>=2.28.0"]
+
+[project.optional-dependencies]
+dev = ["pytest>=7.0.0", "black>=23.0.0"]
+"#
+        )
+        .unwrap();
+
+        let registry = MockRegistry::new("PyPI")
+            .with_version("requests", "2.31.0")
+            .with_version("pytest", "8.0.0")
+            .with_version("black", "24.0.0");
+
+        // Config: ignore pytest
+        let config = UpdConfig {
+            ignore: vec!["pytest".to_string()],
+            pin: std::collections::HashMap::new(),
+        };
+
+        let updater = PyProjectUpdater::new();
+        let options = UpdateOptions::new(false, false).with_config(Arc::new(config));
+
+        let result = updater
+            .update(file.path(), &registry, options)
+            .await
+            .unwrap();
+
+        // 2 updated (requests, black), 1 ignored (pytest)
+        assert_eq!(result.updated.len(), 2);
+        assert_eq!(result.ignored.len(), 1);
+        assert_eq!(result.ignored[0].0, "pytest");
+
+        let contents = std::fs::read_to_string(file.path()).unwrap();
+        assert!(contents.contains("requests>=2.31.0"));
+        assert!(contents.contains("pytest>=7.0.0")); // unchanged
+        assert!(contents.contains("black>=24.0.0"));
+    }
+
+    #[tokio::test]
+    async fn test_update_pyproject_pin_preserves_prefix() {
+        use crate::config::UpdConfig;
+
+        let mut file = NamedTempFile::with_suffix(".toml").unwrap();
+        write!(
+            file,
+            r#"[tool.poetry]
+name = "myproject"
+
+[tool.poetry.dependencies]
+python = "^3.9"
+requests = "^2.28.0"
+flask = "~2.0.0"
+"#
+        )
+        .unwrap();
+
+        let registry = MockRegistry::new("PyPI")
+            .with_version("requests", "2.31.0")
+            .with_version("flask", "3.0.0");
+
+        // Pin both with different prefixes
+        let mut pin = std::collections::HashMap::new();
+        pin.insert("requests".to_string(), "2.30.0".to_string());
+        pin.insert("flask".to_string(), "2.5.0".to_string());
+        let config = UpdConfig {
+            ignore: Vec::new(),
+            pin,
+        };
+
+        let updater = PyProjectUpdater::new();
+        let options = UpdateOptions::new(false, false).with_config(Arc::new(config));
+
+        let result = updater
+            .update(file.path(), &registry, options)
+            .await
+            .unwrap();
+
+        assert_eq!(result.pinned.len(), 2);
+
+        let contents = std::fs::read_to_string(file.path()).unwrap();
+        // Prefixes should be preserved
+        assert!(contents.contains("requests = \"^2.30.0\""));
+        assert!(contents.contains("flask = \"~2.5.0\""));
     }
 }

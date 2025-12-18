@@ -64,6 +64,10 @@ pub struct Cli {
     /// Regenerate lockfiles after updating (runs poetry lock, npm install, etc.)
     #[arg(long, global = true)]
     pub lock: bool,
+
+    /// Path to config file (default: auto-discover .updrc.toml, upd.toml, or .updrc)
+    #[arg(long, global = true, value_name = "FILE")]
+    pub config: Option<PathBuf>,
 }
 
 #[derive(Subcommand)]
@@ -372,5 +376,25 @@ mod tests {
         assert!(matches!(cli.command, Some(Command::Audit { .. })));
         assert_eq!(cli.langs.len(), 1);
         assert_eq!(cli.langs[0], Lang::Python);
+    }
+
+    #[test]
+    fn test_cli_parses_config_flag() {
+        let cli = Cli::try_parse_from(["upd", "--config", "/path/to/config.toml"]).unwrap();
+        assert_eq!(cli.config, Some(PathBuf::from("/path/to/config.toml")));
+    }
+
+    #[test]
+    fn test_cli_parses_config_flag_with_command() {
+        let cli =
+            Cli::try_parse_from(["upd", "update", "--config", "custom.toml", "path1"]).unwrap();
+        assert_eq!(cli.config, Some(PathBuf::from("custom.toml")));
+        assert!(matches!(cli.command, Some(Command::Update { .. })));
+    }
+
+    #[test]
+    fn test_cli_config_flag_is_optional() {
+        let cli = Cli::try_parse_from(["upd"]).unwrap();
+        assert!(cli.config.is_none());
     }
 }

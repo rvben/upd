@@ -135,8 +135,10 @@ impl Updater for GoModUpdater {
         // Find modules with replace directives (we'll skip these)
         let replaced_modules = self.find_replaced_modules(&content);
 
-        // First pass: collect all modules that need version checks
+        // First pass: collect all modules and separate by config status
         // Store: (line_idx, module, current_version, is_prerelease)
+        let mut ignored_modules: Vec<(usize, String, String)> = Vec::new();
+        let mut pinned_modules: Vec<(usize, String, String, String)> = Vec::new();
         let mut modules_to_check: Vec<(usize, String, String, bool)> = Vec::new();
         let mut in_require_block = false;
 
@@ -179,6 +181,27 @@ impl Updater for GoModUpdater {
                     continue;
                 }
 
+                // Check if module should be ignored
+                if options.should_ignore(module) {
+                    ignored_modules.push((
+                        line_idx,
+                        module.to_string(),
+                        current_version.to_string(),
+                    ));
+                    continue;
+                }
+
+                // Check if module has a pinned version
+                if let Some(pinned_version) = options.get_pinned_version(module) {
+                    pinned_modules.push((
+                        line_idx,
+                        module.to_string(),
+                        current_version.to_string(),
+                        pinned_version.to_string(),
+                    ));
+                    continue;
+                }
+
                 modules_to_check.push((
                     line_idx,
                     module.to_string(),
@@ -188,7 +211,12 @@ impl Updater for GoModUpdater {
             }
         }
 
-        // Fetch all versions in parallel
+        // Record ignored modules
+        for (line_idx, module, version) in ignored_modules {
+            result.ignored.push((module, version, Some(line_idx + 1)));
+        }
+
+        // Fetch all versions in parallel for non-ignored, non-pinned modules
         let version_futures: Vec<_> = modules_to_check
             .iter()
             .map(|(_, module, _, is_prerelease)| async {
@@ -210,11 +238,21 @@ impl Updater for GoModUpdater {
             version_map.insert(*line_idx, version_result);
         }
 
-        // Create a map from line_idx to (module, current_version) for easy lookup
-        let module_info: HashMap<usize, (String, String)> = modules_to_check
+        // Add pinned modules to version_map with their pinned version
+        for (line_idx, _, _, pinned_version) in &pinned_modules {
+            version_map.insert(*line_idx, Ok(pinned_version.clone()));
+        }
+
+        // Create a map from line_idx to (module, current_version, is_pinned) for easy lookup
+        let mut module_info: HashMap<usize, (String, String, bool)> = modules_to_check
             .into_iter()
-            .map(|(idx, module, version, _)| (idx, (module, version)))
+            .map(|(idx, module, version, _)| (idx, (module, version, false)))
             .collect();
+
+        // Add pinned modules to module_info
+        for (line_idx, module, current_version, _) in pinned_modules {
+            module_info.insert(line_idx, (module, current_version, true));
+        }
 
         // Second pass: apply updates while preserving line structure
         let mut new_lines: Vec<String> = Vec::new();
@@ -239,7 +277,7 @@ impl Updater for GoModUpdater {
 
             // Check if we have a version result for this line
             if let Some(version_result) = version_map.remove(&line_idx) {
-                let (module, current_version) = module_info.get(&line_idx).unwrap();
+                let (module, current_version, is_pinned) = module_info.get(&line_idx).unwrap();
 
                 match version_result {
                     Ok(latest_version) => {
@@ -253,12 +291,23 @@ impl Updater for GoModUpdater {
                             // Replace version in the line, preserving everything else
                             let new_line = line.replace(current_version, &matched_version);
                             new_lines.push(new_line);
-                            result.updated.push((
-                                module.clone(),
-                                current_version.clone(),
-                                matched_version,
-                                Some(line_num),
-                            ));
+
+                            if *is_pinned {
+                                // Record as pinned (bypassed registry lookup)
+                                result.pinned.push((
+                                    module.clone(),
+                                    current_version.clone(),
+                                    matched_version,
+                                    Some(line_num),
+                                ));
+                            } else {
+                                result.updated.push((
+                                    module.clone(),
+                                    current_version.clone(),
+                                    matched_version,
+                                    Some(line_num),
+                                ));
+                            }
                         } else {
                             new_lines.push(line.to_string());
                             result.unchanged += 1;
@@ -297,7 +346,7 @@ impl Updater for GoModUpdater {
             }
         }
 
-        if !result.updated.is_empty() && !options.dry_run {
+        if (!result.updated.is_empty() || !result.pinned.is_empty()) && !options.dry_run {
             // Preserve original line ending
             let line_ending = if content.contains("\r\n") {
                 "\r\n"
@@ -498,10 +547,7 @@ require (
             .with_version("github.com/baz/qux", "v2.3.0");
 
         let updater = GoModUpdater::new();
-        let options = UpdateOptions {
-            dry_run: false,
-            full_precision: false,
-        };
+        let options = UpdateOptions::new(false, false);
 
         let result = updater
             .update(file.path(), &registry, options)
@@ -528,10 +574,7 @@ require github.com/foo/bar v1.0.0
         let registry = MockRegistry::new("go-proxy").with_version("github.com/foo/bar", "v1.5.0");
 
         let updater = GoModUpdater::new();
-        let options = UpdateOptions {
-            dry_run: true,
-            full_precision: false,
-        };
+        let options = UpdateOptions::new(true, false);
 
         let result = updater
             .update(file.path(), &registry, options)
@@ -567,10 +610,7 @@ replace github.com/foo/bar => ../local-bar
             .with_version("github.com/baz/qux", "v2.3.0");
 
         let updater = GoModUpdater::new();
-        let options = UpdateOptions {
-            dry_run: false,
-            full_precision: false,
-        };
+        let options = UpdateOptions::new(false, false);
 
         let result = updater
             .update(file.path(), &registry, options)
@@ -603,10 +643,7 @@ require (
             .with_version("github.com/baz/qux", "v2.3.0");
 
         let updater = GoModUpdater::new();
-        let options = UpdateOptions {
-            dry_run: false,
-            full_precision: false,
-        };
+        let options = UpdateOptions::new(false, false);
 
         let result = updater
             .update(file.path(), &registry, options)
@@ -639,10 +676,7 @@ require (
             .with_version("github.com/baz/qux", "v2.3.0");
 
         let updater = GoModUpdater::new();
-        let options = UpdateOptions {
-            dry_run: false,
-            full_precision: false,
-        };
+        let options = UpdateOptions::new(false, false);
 
         updater
             .update(file.path(), &registry, options)
@@ -672,10 +706,7 @@ require github.com/foo/bar v1.0.0
         let registry = MockRegistry::new("go-proxy").with_version("github.com/foo/bar", "v1.5.0");
 
         let updater = GoModUpdater::new();
-        let options = UpdateOptions {
-            dry_run: true,
-            full_precision: false,
-        };
+        let options = UpdateOptions::new(true, false);
 
         let result = updater
             .update(file.path(), &registry, options)
@@ -704,10 +735,7 @@ require github.com/nonexistent/module v1.0.0
         let registry = MockRegistry::new("go-proxy");
 
         let updater = GoModUpdater::new();
-        let options = UpdateOptions {
-            dry_run: true,
-            full_precision: false,
-        };
+        let options = UpdateOptions::new(true, false);
 
         let result = updater
             .update(file.path(), &registry, options)
@@ -717,5 +745,293 @@ require github.com/nonexistent/module v1.0.0
         assert_eq!(result.updated.len(), 0);
         assert_eq!(result.errors.len(), 1);
         assert!(result.errors[0].contains("github.com/nonexistent/module"));
+    }
+
+    // ==================== Config Tests ====================
+
+    #[tokio::test]
+    async fn test_config_ignore_module() {
+        use crate::config::UpdConfig;
+        use std::sync::Arc;
+
+        let mut file = NamedTempFile::new().unwrap();
+        write!(
+            file,
+            r#"module example.com/mymodule
+
+require (
+	github.com/foo/bar v1.0.0
+	github.com/baz/qux v2.0.0
+)
+"#
+        )
+        .unwrap();
+
+        let registry = MockRegistry::new("go-proxy")
+            .with_version("github.com/foo/bar", "v1.5.0")
+            .with_version("github.com/baz/qux", "v2.3.0");
+
+        // Configure to ignore github.com/foo/bar
+        let config = UpdConfig {
+            ignore: vec!["github.com/foo/bar".to_string()],
+            pin: std::collections::HashMap::new(),
+        };
+
+        let updater = GoModUpdater::new();
+        let options = UpdateOptions::new(false, false).with_config(Arc::new(config));
+
+        let result = updater
+            .update(file.path(), &registry, options)
+            .await
+            .unwrap();
+
+        // foo/bar should be ignored, baz/qux should be updated
+        assert_eq!(result.updated.len(), 1);
+        assert_eq!(result.updated[0].0, "github.com/baz/qux");
+        assert_eq!(result.ignored.len(), 1);
+        assert_eq!(result.ignored[0].0, "github.com/foo/bar");
+
+        let content = fs::read_to_string(file.path()).unwrap();
+        assert!(content.contains("v1.0.0")); // foo/bar unchanged
+        assert!(content.contains("v2.3.0")); // baz/qux updated
+    }
+
+    #[tokio::test]
+    async fn test_config_pin_module() {
+        use crate::config::UpdConfig;
+        use std::sync::Arc;
+
+        let mut file = NamedTempFile::new().unwrap();
+        write!(
+            file,
+            r#"module example.com/mymodule
+
+require (
+	github.com/foo/bar v1.0.0
+	github.com/baz/qux v2.0.0
+)
+"#
+        )
+        .unwrap();
+
+        let registry = MockRegistry::new("go-proxy")
+            .with_version("github.com/foo/bar", "v1.5.0")
+            .with_version("github.com/baz/qux", "v2.3.0");
+
+        // Configure to pin github.com/foo/bar to v1.2.0
+        let mut pins = std::collections::HashMap::new();
+        pins.insert("github.com/foo/bar".to_string(), "v1.2.0".to_string());
+
+        let config = UpdConfig {
+            ignore: vec![],
+            pin: pins,
+        };
+
+        let updater = GoModUpdater::new();
+        let options = UpdateOptions::new(false, false).with_config(Arc::new(config));
+
+        let result = updater
+            .update(file.path(), &registry, options)
+            .await
+            .unwrap();
+
+        // foo/bar should be pinned to v1.2.0, baz/qux should be updated from registry
+        assert_eq!(result.updated.len(), 1);
+        assert_eq!(result.updated[0].0, "github.com/baz/qux");
+        assert_eq!(result.pinned.len(), 1);
+        assert_eq!(result.pinned[0].0, "github.com/foo/bar");
+        assert_eq!(result.pinned[0].2, "v1.2.0"); // new pinned version
+
+        let content = fs::read_to_string(file.path()).unwrap();
+        assert!(content.contains("v1.2.0")); // foo/bar pinned
+        assert!(content.contains("v2.3.0")); // baz/qux updated
+    }
+
+    #[tokio::test]
+    async fn test_config_pin_only_writes_file() {
+        use crate::config::UpdConfig;
+        use std::sync::Arc;
+
+        let mut file = NamedTempFile::new().unwrap();
+        write!(
+            file,
+            r#"module example.com/mymodule
+
+require github.com/foo/bar v1.0.0
+"#
+        )
+        .unwrap();
+
+        // No registry needed since we're only pinning
+        let registry = MockRegistry::new("go-proxy");
+
+        let mut pins = std::collections::HashMap::new();
+        pins.insert("github.com/foo/bar".to_string(), "v1.2.0".to_string());
+
+        let config = UpdConfig {
+            ignore: vec![],
+            pin: pins,
+        };
+
+        let updater = GoModUpdater::new();
+        let options = UpdateOptions::new(false, false).with_config(Arc::new(config));
+
+        let result = updater
+            .update(file.path(), &registry, options)
+            .await
+            .unwrap();
+
+        // Only pinned, no registry updates
+        assert_eq!(result.updated.len(), 0);
+        assert_eq!(result.pinned.len(), 1);
+
+        // File should still be written with pinned version
+        let content = fs::read_to_string(file.path()).unwrap();
+        assert!(content.contains("v1.2.0"));
+    }
+
+    #[tokio::test]
+    async fn test_config_mixed_ignore_pin_update() {
+        use crate::config::UpdConfig;
+        use std::sync::Arc;
+
+        let mut file = NamedTempFile::new().unwrap();
+        write!(
+            file,
+            r#"module example.com/mymodule
+
+require (
+	github.com/ignored/mod v1.0.0
+	github.com/pinned/mod v2.0.0
+	github.com/updated/mod v3.0.0
+)
+"#
+        )
+        .unwrap();
+
+        let registry = MockRegistry::new("go-proxy")
+            .with_version("github.com/ignored/mod", "v1.5.0")
+            .with_version("github.com/pinned/mod", "v2.5.0")
+            .with_version("github.com/updated/mod", "v3.5.0");
+
+        let mut pins = std::collections::HashMap::new();
+        pins.insert("github.com/pinned/mod".to_string(), "v2.3.0".to_string());
+
+        let config = UpdConfig {
+            ignore: vec!["github.com/ignored/mod".to_string()],
+            pin: pins,
+        };
+
+        let updater = GoModUpdater::new();
+        let options = UpdateOptions::new(false, false).with_config(Arc::new(config));
+
+        let result = updater
+            .update(file.path(), &registry, options)
+            .await
+            .unwrap();
+
+        assert_eq!(result.ignored.len(), 1);
+        assert_eq!(result.ignored[0].0, "github.com/ignored/mod");
+
+        assert_eq!(result.pinned.len(), 1);
+        assert_eq!(result.pinned[0].0, "github.com/pinned/mod");
+        assert_eq!(result.pinned[0].2, "v2.3.0");
+
+        assert_eq!(result.updated.len(), 1);
+        assert_eq!(result.updated[0].0, "github.com/updated/mod");
+        assert_eq!(result.updated[0].2, "v3.5.0");
+
+        let content = fs::read_to_string(file.path()).unwrap();
+        assert!(content.contains("v1.0.0")); // ignored - unchanged
+        assert!(content.contains("v2.3.0")); // pinned
+        assert!(content.contains("v3.5.0")); // updated from registry
+    }
+
+    #[tokio::test]
+    async fn test_config_single_line_require() {
+        use crate::config::UpdConfig;
+        use std::sync::Arc;
+
+        let mut file = NamedTempFile::new().unwrap();
+        write!(
+            file,
+            r#"module example.com/mymodule
+
+require github.com/foo/bar v1.0.0
+require github.com/baz/qux v2.0.0
+"#
+        )
+        .unwrap();
+
+        let registry = MockRegistry::new("go-proxy")
+            .with_version("github.com/foo/bar", "v1.5.0")
+            .with_version("github.com/baz/qux", "v2.3.0");
+
+        let mut pins = std::collections::HashMap::new();
+        pins.insert("github.com/foo/bar".to_string(), "v1.2.0".to_string());
+
+        let config = UpdConfig {
+            ignore: vec!["github.com/baz/qux".to_string()],
+            pin: pins,
+        };
+
+        let updater = GoModUpdater::new();
+        let options = UpdateOptions::new(false, false).with_config(Arc::new(config));
+
+        let result = updater
+            .update(file.path(), &registry, options)
+            .await
+            .unwrap();
+
+        assert_eq!(result.pinned.len(), 1);
+        assert_eq!(result.pinned[0].0, "github.com/foo/bar");
+        assert_eq!(result.ignored.len(), 1);
+        assert_eq!(result.ignored[0].0, "github.com/baz/qux");
+        assert_eq!(result.updated.len(), 0);
+
+        let content = fs::read_to_string(file.path()).unwrap();
+        assert!(content.contains("v1.2.0")); // pinned
+        assert!(content.contains("v2.0.0")); // ignored - unchanged
+    }
+
+    #[tokio::test]
+    async fn test_config_preserves_comments_with_pin() {
+        use crate::config::UpdConfig;
+        use std::sync::Arc;
+
+        let mut file = NamedTempFile::new().unwrap();
+        write!(
+            file,
+            r#"module example.com/mymodule
+
+require (
+	github.com/foo/bar v1.0.0 // indirect
+)
+"#
+        )
+        .unwrap();
+
+        let registry = MockRegistry::new("go-proxy");
+
+        let mut pins = std::collections::HashMap::new();
+        pins.insert("github.com/foo/bar".to_string(), "v1.2.0".to_string());
+
+        let config = UpdConfig {
+            ignore: vec![],
+            pin: pins,
+        };
+
+        let updater = GoModUpdater::new();
+        let options = UpdateOptions::new(false, false).with_config(Arc::new(config));
+
+        let result = updater
+            .update(file.path(), &registry, options)
+            .await
+            .unwrap();
+
+        assert_eq!(result.pinned.len(), 1);
+
+        let content = fs::read_to_string(file.path()).unwrap();
+        assert!(content.contains("v1.2.0 // indirect")); // version updated, comment preserved
     }
 }

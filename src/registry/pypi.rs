@@ -1,7 +1,7 @@
 use super::Registry;
 #[cfg(test)]
 use super::utils::read_netrc_credentials_from_path;
-use super::utils::{base64_encode, read_netrc_credentials};
+use super::utils::{base64_encode, read_netrc_credentials, read_pip_config};
 use anyhow::{Result, anyhow};
 use async_trait::async_trait;
 use pep440_rs::{Version, VersionSpecifiers};
@@ -142,6 +142,7 @@ impl PyPiRegistry {
 
     /// Detect custom index URL from environment or config
     /// Automatically converts Simple API URLs to JSON API format
+    /// Checks (in order): env vars, pip.conf/pip.ini files
     pub fn detect_index_url() -> Option<String> {
         // Check environment variables in order of precedence
         for var in ["UV_INDEX_URL", "PIP_INDEX_URL", "PYTHON_INDEX_URL"] {
@@ -151,6 +152,13 @@ impl PyPiRegistry {
                 return Some(Self::normalize_index_url(&url));
             }
         }
+
+        // Check pip.conf/pip.ini files
+        let pip_config = read_pip_config();
+        if let Some(url) = pip_config.index_url {
+            return Some(Self::normalize_index_url(&url));
+        }
+
         None
     }
 
@@ -580,11 +588,12 @@ impl Default for PyPiRegistry {
 }
 
 impl PyPiRegistry {
-    /// Detect extra index URLs from environment variables
+    /// Detect extra index URLs from environment variables and pip.conf
     /// Supports UV_EXTRA_INDEX_URL and PIP_EXTRA_INDEX_URL (space or newline separated)
     pub fn detect_extra_index_urls() -> Vec<String> {
         let mut urls = Vec::new();
 
+        // Check environment variables first
         for var in ["UV_EXTRA_INDEX_URL", "PIP_EXTRA_INDEX_URL"] {
             if let Ok(value) = std::env::var(var) {
                 for url in value.split([' ', '\n']) {
@@ -593,6 +602,14 @@ impl PyPiRegistry {
                         urls.push(trimmed.to_string());
                     }
                 }
+            }
+        }
+
+        // Also check pip.conf/pip.ini files
+        let pip_config = read_pip_config();
+        for url in pip_config.extra_index_urls {
+            if !urls.contains(&url) {
+                urls.push(url);
             }
         }
 

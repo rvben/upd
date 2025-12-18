@@ -45,6 +45,94 @@ struct DistTags {
     latest: Option<String>,
 }
 
+/// Scoped registry configuration from .npmrc
+#[derive(Debug, Clone, Default)]
+pub struct NpmrcConfig {
+    /// Scope-to-registry mappings (e.g., @mycompany -> https://npm.mycompany.com)
+    pub scoped_registries: std::collections::HashMap<String, String>,
+    /// Default registry URL (if specified)
+    pub default_registry: Option<String>,
+}
+
+/// Read scoped registry configuration from .npmrc files
+/// Format: @scope:registry=https://registry.example.com
+pub fn read_npmrc_config() -> NpmrcConfig {
+    let mut config = NpmrcConfig::default();
+
+    let mut search_paths = Vec::new();
+
+    // Check current directory first
+    if let Ok(cwd) = std::env::current_dir() {
+        search_paths.push(cwd.join(".npmrc"));
+    }
+
+    // Check user's home directory
+    if let Some(home) = home_dir() {
+        search_paths.push(home.join(".npmrc"));
+    }
+
+    // Check NPM_CONFIG_USERCONFIG environment variable
+    if let Ok(config_path) = std::env::var("NPM_CONFIG_USERCONFIG") {
+        search_paths.push(PathBuf::from(config_path));
+    }
+
+    for path in search_paths {
+        if let Some(parsed) = read_npmrc_config_from_path(&path) {
+            // Merge: first value wins for scoped registries
+            for (scope, url) in parsed.scoped_registries {
+                config.scoped_registries.entry(scope).or_insert(url);
+            }
+            // First default registry wins
+            if config.default_registry.is_none() {
+                config.default_registry = parsed.default_registry;
+            }
+        }
+    }
+
+    config
+}
+
+/// Read scoped registry configuration from a specific .npmrc file
+fn read_npmrc_config_from_path(path: &PathBuf) -> Option<NpmrcConfig> {
+    let file = std::fs::File::open(path).ok()?;
+    let reader = std::io::BufReader::new(file);
+
+    let mut config = NpmrcConfig::default();
+
+    for line in reader.lines().map_while(Result::ok) {
+        let line = line.trim();
+
+        // Skip comments and empty lines
+        if line.is_empty() || line.starts_with('#') || line.starts_with(';') {
+            continue;
+        }
+
+        // Parse @scope:registry=url format
+        if line.starts_with('@') && line.contains(":registry=") {
+            if let Some((scope_part, url)) = line.split_once(":registry=") {
+                let scope = scope_part.trim().to_string();
+                let url = url.trim().to_string();
+                if !scope.is_empty() && !url.is_empty() {
+                    config.scoped_registries.insert(scope, url);
+                }
+            }
+        }
+        // Parse registry=url format (default registry)
+        else if let Some(url) = line.strip_prefix("registry=") {
+            let url = url.trim().to_string();
+            if !url.is_empty() && config.default_registry.is_none() {
+                config.default_registry = Some(url);
+            }
+        }
+    }
+
+    if !config.scoped_registries.is_empty() || config.default_registry.is_some() {
+        Some(config)
+    } else {
+        None
+    }
+}
+
 /// Read token from .npmrc files
 /// .npmrc format supports registry-scoped tokens:
 /// //registry.npmjs.org/:_authToken=token-value
@@ -172,9 +260,47 @@ impl NpmRegistry {
         }
     }
 
-    /// Detect custom registry URL from environment
+    /// Detect custom registry URL from environment or .npmrc
     pub fn detect_registry_url() -> Option<String> {
-        std::env::var("NPM_REGISTRY").ok().filter(|s| !s.is_empty())
+        // Check environment variable first
+        if let Ok(url) = std::env::var("NPM_REGISTRY")
+            && !url.is_empty()
+        {
+            return Some(url);
+        }
+
+        // Check .npmrc for default registry
+        let config = read_npmrc_config();
+        config.default_registry
+    }
+
+    /// Get the registry URL for a specific package (handles scoped packages)
+    /// For @scope/package, looks up the scoped registry from .npmrc
+    /// Returns None if the package should use the default registry
+    pub fn get_scoped_registry_url(package: &str) -> Option<String> {
+        if !package.starts_with('@') {
+            return None;
+        }
+
+        // Extract scope from @scope/package
+        let scope = package.split('/').next()?;
+        if scope.is_empty() {
+            return None;
+        }
+
+        let config = read_npmrc_config();
+        config.scoped_registries.get(scope).cloned()
+    }
+
+    /// Create a registry for a specific scoped package
+    /// Returns a new NpmRegistry configured for the scope's registry, or None for default
+    pub fn for_scoped_package(package: &str) -> Option<Self> {
+        let scoped_url = Self::get_scoped_registry_url(package)?;
+        let credentials = Self::detect_credentials(&scoped_url);
+        Some(Self::with_registry_url_and_credentials(
+            scoped_url,
+            credentials,
+        ))
     }
 
     /// Detect credentials from environment variables or .npmrc
@@ -438,5 +564,107 @@ mod tests {
             "https://registry.npmjs.org".to_string(),
             Some(creds),
         );
+    }
+
+    #[test]
+    fn test_read_npmrc_config_scoped_registries() {
+        let mut npmrc_file = NamedTempFile::new().unwrap();
+        writeln!(npmrc_file, "@mycompany:registry=https://npm.mycompany.com").unwrap();
+        writeln!(npmrc_file, "@other:registry=https://npm.other.com").unwrap();
+
+        let path = npmrc_file.path().to_path_buf();
+        let config = read_npmrc_config_from_path(&path).unwrap();
+
+        assert_eq!(config.scoped_registries.len(), 2);
+        assert_eq!(
+            config.scoped_registries.get("@mycompany"),
+            Some(&"https://npm.mycompany.com".to_string())
+        );
+        assert_eq!(
+            config.scoped_registries.get("@other"),
+            Some(&"https://npm.other.com".to_string())
+        );
+    }
+
+    #[test]
+    fn test_read_npmrc_config_default_registry() {
+        let mut npmrc_file = NamedTempFile::new().unwrap();
+        writeln!(npmrc_file, "registry=https://custom.registry.com").unwrap();
+
+        let path = npmrc_file.path().to_path_buf();
+        let config = read_npmrc_config_from_path(&path).unwrap();
+
+        assert_eq!(
+            config.default_registry,
+            Some("https://custom.registry.com".to_string())
+        );
+    }
+
+    #[test]
+    fn test_read_npmrc_config_mixed() {
+        let mut npmrc_file = NamedTempFile::new().unwrap();
+        writeln!(npmrc_file, "registry=https://default.registry.com").unwrap();
+        writeln!(npmrc_file, "@private:registry=https://private.registry.com").unwrap();
+        writeln!(
+            npmrc_file,
+            "//private.registry.com/:_authToken=secret-token"
+        )
+        .unwrap();
+
+        let path = npmrc_file.path().to_path_buf();
+        let config = read_npmrc_config_from_path(&path).unwrap();
+
+        assert_eq!(
+            config.default_registry,
+            Some("https://default.registry.com".to_string())
+        );
+        assert_eq!(config.scoped_registries.len(), 1);
+        assert_eq!(
+            config.scoped_registries.get("@private"),
+            Some(&"https://private.registry.com".to_string())
+        );
+    }
+
+    #[test]
+    fn test_read_npmrc_config_with_comments() {
+        let mut npmrc_file = NamedTempFile::new().unwrap();
+        writeln!(npmrc_file, "# This is a comment").unwrap();
+        writeln!(npmrc_file, "; Another comment").unwrap();
+        writeln!(npmrc_file, "@mycompany:registry=https://npm.mycompany.com").unwrap();
+
+        let path = npmrc_file.path().to_path_buf();
+        let config = read_npmrc_config_from_path(&path).unwrap();
+
+        assert_eq!(config.scoped_registries.len(), 1);
+        assert_eq!(
+            config.scoped_registries.get("@mycompany"),
+            Some(&"https://npm.mycompany.com".to_string())
+        );
+    }
+
+    #[test]
+    fn test_read_npmrc_config_empty_file() {
+        let npmrc_file = NamedTempFile::new().unwrap();
+        let path = npmrc_file.path().to_path_buf();
+        let config = read_npmrc_config_from_path(&path);
+
+        assert!(config.is_none());
+    }
+
+    #[test]
+    fn test_get_scoped_registry_url_non_scoped() {
+        // Non-scoped packages should return None
+        assert!(NpmRegistry::get_scoped_registry_url("lodash").is_none());
+        assert!(NpmRegistry::get_scoped_registry_url("react").is_none());
+    }
+
+    #[test]
+    fn test_get_scoped_registry_url_scoped_no_config() {
+        // Scoped package but no config should return None
+        // (can't easily test this without mocking file system)
+        // This test just verifies the function doesn't crash
+        let result = NpmRegistry::get_scoped_registry_url("@unknown/package");
+        // Result depends on local .npmrc files, but shouldn't crash
+        let _ = result;
     }
 }

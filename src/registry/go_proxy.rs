@@ -15,6 +15,112 @@ const MAX_RETRIES: u32 = 3;
 /// Base delay for exponential backoff (100ms, 200ms, 400ms)
 const BASE_DELAY_MS: u64 = 100;
 
+/// Configuration for Go private modules from environment variables
+#[derive(Debug, Clone, Default)]
+pub struct GoPrivateConfig {
+    /// Module path patterns from GOPRIVATE (bypass both proxy and sumdb)
+    pub private_patterns: Vec<String>,
+    /// Module path patterns from GONOPROXY (bypass proxy only)
+    pub noproxy_patterns: Vec<String>,
+    /// Module path patterns from GONOSUMDB (bypass sumdb only)
+    pub nosumdb_patterns: Vec<String>,
+}
+
+impl GoPrivateConfig {
+    /// Read Go private module configuration from environment variables
+    pub fn from_env() -> Self {
+        let private_patterns = std::env::var("GOPRIVATE")
+            .ok()
+            .map(|s| Self::parse_patterns(&s))
+            .unwrap_or_default();
+
+        let noproxy_patterns = std::env::var("GONOPROXY")
+            .ok()
+            .map(|s| Self::parse_patterns(&s))
+            .unwrap_or_default();
+
+        let nosumdb_patterns = std::env::var("GONOSUMDB")
+            .ok()
+            .map(|s| Self::parse_patterns(&s))
+            .unwrap_or_default();
+
+        Self {
+            private_patterns,
+            noproxy_patterns,
+            nosumdb_patterns,
+        }
+    }
+
+    /// Parse comma-separated glob patterns
+    fn parse_patterns(s: &str) -> Vec<String> {
+        s.split(',')
+            .map(|p| p.trim().to_string())
+            .filter(|p| !p.is_empty())
+            .collect()
+    }
+
+    /// Check if a module path matches a glob pattern
+    /// Supports * for glob matching (e.g., "github.com/myorg/*")
+    fn matches_pattern(module: &str, pattern: &str) -> bool {
+        if pattern.is_empty() {
+            return false;
+        }
+
+        // Handle glob patterns with *
+        if let Some(prefix) = pattern.strip_suffix("/*") {
+            // Pattern like "github.com/myorg/*" matches "github.com/myorg/foo"
+            // and "github.com/myorg/foo/bar"
+            module.starts_with(prefix)
+                && module.len() > prefix.len()
+                && module.chars().nth(prefix.len()) == Some('/')
+        } else if let Some(prefix) = pattern.strip_suffix('*') {
+            // Pattern like "github.com/myorg*" matches anything starting with that
+            module.starts_with(prefix)
+        } else {
+            // Exact match or prefix match (Go's default behavior)
+            // "github.com/myorg" matches "github.com/myorg" and "github.com/myorg/foo"
+            module == pattern || module.starts_with(&format!("{}/", pattern))
+        }
+    }
+
+    /// Check if a module should bypass the proxy (GOPRIVATE or GONOPROXY)
+    pub fn should_bypass_proxy(&self, module: &str) -> bool {
+        // Check GOPRIVATE patterns first (they apply to both proxy and sumdb)
+        for pattern in &self.private_patterns {
+            if Self::matches_pattern(module, pattern) {
+                return true;
+            }
+        }
+        // Check GONOPROXY patterns
+        for pattern in &self.noproxy_patterns {
+            if Self::matches_pattern(module, pattern) {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Check if a module is considered private (matches GOPRIVATE)
+    pub fn is_private(&self, module: &str) -> bool {
+        for pattern in &self.private_patterns {
+            if Self::matches_pattern(module, pattern) {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Check if there are any private module patterns configured
+    pub fn has_private_patterns(&self) -> bool {
+        !self.private_patterns.is_empty() || !self.noproxy_patterns.is_empty()
+    }
+}
+
+/// Read Go private module configuration from environment variables
+pub fn read_go_private_config() -> GoPrivateConfig {
+    GoPrivateConfig::from_env()
+}
+
 /// Credentials for authenticating with a Go proxy or private module host
 #[derive(Clone)]
 pub struct GoCredentials {
@@ -448,5 +554,151 @@ mod tests {
             "https://proxy.example.com".to_string(),
             Some(creds),
         );
+    }
+
+    #[test]
+    fn test_go_private_config_parse_patterns() {
+        let patterns = GoPrivateConfig::parse_patterns("github.com/myorg, gitlab.com/myteam");
+        assert_eq!(patterns.len(), 2);
+        assert_eq!(patterns[0], "github.com/myorg");
+        assert_eq!(patterns[1], "gitlab.com/myteam");
+
+        let empty = GoPrivateConfig::parse_patterns("");
+        assert!(empty.is_empty());
+
+        let single = GoPrivateConfig::parse_patterns("github.com/myorg");
+        assert_eq!(single.len(), 1);
+    }
+
+    #[test]
+    fn test_go_private_config_matches_pattern_exact() {
+        // Exact match
+        assert!(GoPrivateConfig::matches_pattern(
+            "github.com/myorg",
+            "github.com/myorg"
+        ));
+        // Prefix match (Go's default behavior)
+        assert!(GoPrivateConfig::matches_pattern(
+            "github.com/myorg/foo",
+            "github.com/myorg"
+        ));
+        assert!(GoPrivateConfig::matches_pattern(
+            "github.com/myorg/foo/bar",
+            "github.com/myorg"
+        ));
+        // No match
+        assert!(!GoPrivateConfig::matches_pattern(
+            "github.com/otherorg",
+            "github.com/myorg"
+        ));
+        assert!(!GoPrivateConfig::matches_pattern(
+            "github.com/myorgfoo",
+            "github.com/myorg"
+        ));
+    }
+
+    #[test]
+    fn test_go_private_config_matches_pattern_glob() {
+        // Glob with /*
+        assert!(GoPrivateConfig::matches_pattern(
+            "github.com/myorg/foo",
+            "github.com/myorg/*"
+        ));
+        assert!(GoPrivateConfig::matches_pattern(
+            "github.com/myorg/foo/bar",
+            "github.com/myorg/*"
+        ));
+        // The org itself doesn't match the /* pattern
+        assert!(!GoPrivateConfig::matches_pattern(
+            "github.com/myorg",
+            "github.com/myorg/*"
+        ));
+
+        // Glob with trailing *
+        assert!(GoPrivateConfig::matches_pattern(
+            "github.com/myorgfoo",
+            "github.com/myorg*"
+        ));
+        assert!(GoPrivateConfig::matches_pattern(
+            "github.com/myorg/foo",
+            "github.com/myorg*"
+        ));
+    }
+
+    #[test]
+    fn test_go_private_config_should_bypass_proxy() {
+        let config = GoPrivateConfig {
+            private_patterns: vec!["github.com/myorg".to_string()],
+            noproxy_patterns: vec!["gitlab.com/myteam".to_string()],
+            nosumdb_patterns: vec![],
+        };
+
+        // Matches GOPRIVATE
+        assert!(config.should_bypass_proxy("github.com/myorg/foo"));
+        // Matches GONOPROXY
+        assert!(config.should_bypass_proxy("gitlab.com/myteam/bar"));
+        // No match
+        assert!(!config.should_bypass_proxy("github.com/otherorg/foo"));
+    }
+
+    #[test]
+    fn test_go_private_config_is_private() {
+        let config = GoPrivateConfig {
+            private_patterns: vec!["github.com/myorg".to_string()],
+            noproxy_patterns: vec!["gitlab.com/myteam".to_string()],
+            nosumdb_patterns: vec![],
+        };
+
+        // Only GOPRIVATE modules are considered "private"
+        assert!(config.is_private("github.com/myorg/foo"));
+        // GONOPROXY modules are not considered "private" (just bypass proxy)
+        assert!(!config.is_private("gitlab.com/myteam/bar"));
+    }
+
+    #[test]
+    fn test_go_private_config_has_private_patterns() {
+        let empty = GoPrivateConfig::default();
+        assert!(!empty.has_private_patterns());
+
+        let with_private = GoPrivateConfig {
+            private_patterns: vec!["github.com/myorg".to_string()],
+            noproxy_patterns: vec![],
+            nosumdb_patterns: vec![],
+        };
+        assert!(with_private.has_private_patterns());
+
+        let with_noproxy = GoPrivateConfig {
+            private_patterns: vec![],
+            noproxy_patterns: vec!["gitlab.com/myteam".to_string()],
+            nosumdb_patterns: vec![],
+        };
+        assert!(with_noproxy.has_private_patterns());
+    }
+
+    #[test]
+    fn test_go_private_config_from_env() {
+        // SAFETY: Tests run single-threaded by default
+        unsafe {
+            std::env::set_var("GOPRIVATE", "github.com/myorg,gitlab.com/myteam");
+            std::env::set_var("GONOPROXY", "github.com/noproxy");
+            std::env::set_var("GONOSUMDB", "github.com/nosumdb");
+        }
+
+        let config = GoPrivateConfig::from_env();
+
+        assert_eq!(config.private_patterns.len(), 2);
+        assert_eq!(config.private_patterns[0], "github.com/myorg");
+        assert_eq!(config.private_patterns[1], "gitlab.com/myteam");
+        assert_eq!(config.noproxy_patterns.len(), 1);
+        assert_eq!(config.noproxy_patterns[0], "github.com/noproxy");
+        assert_eq!(config.nosumdb_patterns.len(), 1);
+        assert_eq!(config.nosumdb_patterns[0], "github.com/nosumdb");
+
+        // Clean up
+        unsafe {
+            std::env::remove_var("GOPRIVATE");
+            std::env::remove_var("GONOPROXY");
+            std::env::remove_var("GONOSUMDB");
+        }
     }
 }

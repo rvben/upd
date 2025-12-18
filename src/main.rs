@@ -10,6 +10,7 @@ use upd::align::{PackageAlignment, find_alignments, scan_packages};
 use upd::audit::{Ecosystem, OsvClient, Package as AuditPackage};
 use upd::cache::{Cache, CachedRegistry};
 use upd::cli::{Cli, Command};
+use upd::config::UpdConfig;
 use upd::interactive::{PendingUpdate, prompt_all};
 use upd::lockfile::regenerate_lockfiles;
 use upd::registry::{
@@ -100,6 +101,66 @@ async fn run_update(cli: &Cli) -> Result<()> {
         println!("{}", "No dependency files found.".yellow());
         return Ok(());
     }
+
+    // Load configuration from file or auto-discover
+    let config: Option<Arc<UpdConfig>> = if let Some(config_path) = &cli.config {
+        // Load from specified path
+        if let Some(config) = UpdConfig::load_from_path(config_path) {
+            if cli.verbose {
+                println!(
+                    "{}",
+                    format!("Using config from: {}", config_path.display()).cyan()
+                );
+            }
+            Some(Arc::new(config))
+        } else {
+            eprintln!(
+                "{}",
+                format!(
+                    "Warning: Could not load config from {}",
+                    config_path.display()
+                )
+                .yellow()
+            );
+            None
+        }
+    } else {
+        // Auto-discover from current directory
+        let start_dir = paths
+            .first()
+            .map(|p| {
+                if p.is_file() {
+                    p.parent().unwrap_or(p.as_path())
+                } else {
+                    p.as_path()
+                }
+            })
+            .unwrap_or(std::path::Path::new("."));
+
+        if let Some((config, path)) = UpdConfig::discover(start_dir) {
+            if cli.verbose && config.has_config() {
+                println!(
+                    "{}",
+                    format!("Using config from: {}", path.display()).cyan()
+                );
+                if !config.ignore.is_empty() {
+                    println!(
+                        "{}",
+                        format!("  Ignoring {} package(s)", config.ignore.len()).dimmed()
+                    );
+                }
+                if !config.pin.is_empty() {
+                    println!(
+                        "{}",
+                        format!("  Pinning {} package(s)", config.pin.len()).dimmed()
+                    );
+                }
+            }
+            Some(Arc::new(config))
+        } else {
+            None
+        }
+    };
 
     if cli.verbose {
         println!(
@@ -197,6 +258,7 @@ async fn run_update(cli: &Cli) -> Result<()> {
             cli,
             &files,
             filter,
+            &config,
             &pypi,
             &npm,
             &crates_io,
@@ -215,9 +277,12 @@ async fn run_update(cli: &Cli) -> Result<()> {
     // Non-interactive mode: process files in parallel
     // Create update options (--check implies --dry-run)
     let dry_run = cli.dry_run || cli.check;
-    let update_options = UpdateOptions {
-        dry_run,
-        full_precision: cli.full_precision,
+    let update_options = {
+        let mut opts = UpdateOptions::new(dry_run, cli.full_precision);
+        if let Some(ref cfg) = config {
+            opts = opts.with_config(Arc::clone(cfg));
+        }
+        opts
     };
 
     let verbose = cli.verbose;
@@ -236,32 +301,33 @@ async fn run_update(cli: &Cli) -> Result<()> {
             let package_json_updater = Arc::clone(&package_json_updater);
             let cargo_toml_updater = Arc::clone(&cargo_toml_updater);
             let go_mod_updater = Arc::clone(&go_mod_updater);
+            let update_options = update_options.clone();
 
             async move {
                 let result = match file_type {
                     FileType::Requirements => {
                         requirements_updater
-                            .update(&path, pypi.as_ref(), update_options)
+                            .update(&path, pypi.as_ref(), update_options.clone())
                             .await
                     }
                     FileType::PyProject => {
                         pyproject_updater
-                            .update(&path, pypi.as_ref(), update_options)
+                            .update(&path, pypi.as_ref(), update_options.clone())
                             .await
                     }
                     FileType::PackageJson => {
                         package_json_updater
-                            .update(&path, npm.as_ref(), update_options)
+                            .update(&path, npm.as_ref(), update_options.clone())
                             .await
                     }
                     FileType::CargoToml => {
                         cargo_toml_updater
-                            .update(&path, crates_io.as_ref(), update_options)
+                            .update(&path, crates_io.as_ref(), update_options.clone())
                             .await
                     }
                     FileType::GoMod => {
                         go_mod_updater
-                            .update(&path, go_proxy.as_ref(), update_options)
+                            .update(&path, go_proxy.as_ref(), update_options.clone())
                             .await
                     }
                 };
@@ -287,7 +353,13 @@ async fn run_update(cli: &Cli) -> Result<()> {
                 if !dry_run && !file_result.updated.is_empty() {
                     updated_files.push(path.clone());
                 }
-                print_file_result(&path.display().to_string(), &file_result, dry_run, filter);
+                print_file_result(
+                    &path.display().to_string(),
+                    &file_result,
+                    dry_run,
+                    filter,
+                    verbose,
+                );
                 total_result.merge(file_result);
             }
             Err(e) => {
@@ -347,6 +419,7 @@ async fn run_interactive_update(
     cli: &Cli,
     files: &[(std::path::PathBuf, FileType)],
     filter: UpdateFilter,
+    config: &Option<Arc<UpdConfig>>,
     pypi: &Arc<CachedRegistry<MultiPyPiRegistry>>,
     npm: &Arc<CachedRegistry<NpmRegistry>>,
     crates_io: &Arc<CachedRegistry<CratesIoRegistry>>,
@@ -360,9 +433,12 @@ async fn run_interactive_update(
     cache_enabled: bool,
 ) -> Result<()> {
     // Phase 1: Discover all available updates (dry-run)
-    let dry_run_options = UpdateOptions {
-        dry_run: true,
-        full_precision: cli.full_precision,
+    let dry_run_options = {
+        let mut opts = UpdateOptions::new(true, cli.full_precision);
+        if let Some(cfg) = config {
+            opts = opts.with_config(Arc::clone(cfg));
+        }
+        opts
     };
 
     let mut pending_updates: Vec<PendingUpdate> = Vec::new();
@@ -375,27 +451,27 @@ async fn run_interactive_update(
         let result = match file_type {
             FileType::Requirements => {
                 requirements_updater
-                    .update(path, pypi.as_ref(), dry_run_options)
+                    .update(path, pypi.as_ref(), dry_run_options.clone())
                     .await
             }
             FileType::PyProject => {
                 pyproject_updater
-                    .update(path, pypi.as_ref(), dry_run_options)
+                    .update(path, pypi.as_ref(), dry_run_options.clone())
                     .await
             }
             FileType::PackageJson => {
                 package_json_updater
-                    .update(path, npm.as_ref(), dry_run_options)
+                    .update(path, npm.as_ref(), dry_run_options.clone())
                     .await
             }
             FileType::CargoToml => {
                 cargo_toml_updater
-                    .update(path, crates_io.as_ref(), dry_run_options)
+                    .update(path, crates_io.as_ref(), dry_run_options.clone())
                     .await
             }
             FileType::GoMod => {
                 go_mod_updater
-                    .update(path, go_proxy.as_ref(), dry_run_options)
+                    .update(path, go_proxy.as_ref(), dry_run_options.clone())
                     .await
             }
         };
@@ -453,9 +529,12 @@ async fn run_interactive_update(
         format!("Applying {} update(s)...", approved_count).cyan()
     );
 
-    let apply_options = UpdateOptions {
-        dry_run: false,
-        full_precision: cli.full_precision,
+    let apply_options = {
+        let mut opts = UpdateOptions::new(false, cli.full_precision);
+        if let Some(cfg) = config {
+            opts = opts.with_config(Arc::clone(cfg));
+        }
+        opts
     };
 
     let mut total_applied = 0;
@@ -472,27 +551,27 @@ async fn run_interactive_update(
         let result = match file_type {
             FileType::Requirements => {
                 requirements_updater
-                    .update(path, pypi.as_ref(), apply_options)
+                    .update(path, pypi.as_ref(), apply_options.clone())
                     .await
             }
             FileType::PyProject => {
                 pyproject_updater
-                    .update(path, pypi.as_ref(), apply_options)
+                    .update(path, pypi.as_ref(), apply_options.clone())
                     .await
             }
             FileType::PackageJson => {
                 package_json_updater
-                    .update(path, npm.as_ref(), apply_options)
+                    .update(path, npm.as_ref(), apply_options.clone())
                     .await
             }
             FileType::CargoToml => {
                 cargo_toml_updater
-                    .update(path, crates_io.as_ref(), apply_options)
+                    .update(path, crates_io.as_ref(), apply_options.clone())
                     .await
             }
             FileType::GoMod => {
                 go_mod_updater
-                    .update(path, go_proxy.as_ref(), apply_options)
+                    .update(path, go_proxy.as_ref(), apply_options.clone())
                     .await
             }
         };
@@ -1111,8 +1190,18 @@ fn count_updates_by_type(
     )
 }
 
-fn print_file_result(path: &str, result: &UpdateResult, dry_run: bool, filter: UpdateFilter) {
-    if result.updated.is_empty() && result.errors.is_empty() {
+fn print_file_result(
+    path: &str,
+    result: &UpdateResult,
+    dry_run: bool,
+    filter: UpdateFilter,
+    verbose: bool,
+) {
+    if result.updated.is_empty()
+        && result.pinned.is_empty()
+        && result.ignored.is_empty()
+        && result.errors.is_empty()
+    {
         return;
     }
 
@@ -1149,6 +1238,44 @@ fn print_file_result(path: &str, result: &UpdateResult, dry_run: bool, filter: U
         );
     }
 
+    // Show pinned packages (always shown)
+    let pinned_action = if dry_run { "Would pin" } else { "Pinned" };
+    for (package, old, new, line_num) in &result.pinned {
+        let location = match line_num {
+            Some(n) => format!("{}:{}:", path, n),
+            None => format!("{}:", path),
+        };
+
+        println!(
+            "{} {} {} {} → {} {}",
+            location.blue().underline(),
+            pinned_action.cyan(),
+            package.bold(),
+            old.dimmed(),
+            new.cyan(),
+            "(pinned)".dimmed()
+        );
+    }
+
+    // Show ignored packages (only in verbose mode)
+    if verbose {
+        for (package, version, line_num) in &result.ignored {
+            let location = match line_num {
+                Some(n) => format!("{}:{}:", path, n),
+                None => format!("{}:", path),
+            };
+
+            println!(
+                "{} {} {} {} {}",
+                location.blue().underline(),
+                "Skipped".dimmed(),
+                package.bold(),
+                version.dimmed(),
+                "(ignored)".dimmed()
+            );
+        }
+    }
+
     for error in &result.errors {
         let location = format!("{}:", path);
         println!(
@@ -1167,14 +1294,17 @@ fn print_summary(result: &UpdateResult, file_count: usize, dry_run: bool, filter
     let (major_count, minor_count, patch_count, filtered_total) =
         count_updates_by_type(&result.updated, filter);
 
-    if filtered_total == 0 {
+    let pinned_count = result.pinned.len();
+    let ignored_count = result.ignored.len();
+
+    if filtered_total == 0 && pinned_count == 0 {
         println!(
             "{} Scanned {} file(s), all dependencies up to date",
             "✓".green(),
             file_count
         );
     } else {
-        // Build breakdown string
+        // Build breakdown string for updates
         let mut parts = Vec::new();
         if major_count > 0 {
             parts.push(format!(
@@ -1195,13 +1325,34 @@ fn print_summary(result: &UpdateResult, file_count: usize, dry_run: bool, filter
             format!(" ({})", parts.join(", "))
         };
 
+        if filtered_total > 0 {
+            println!(
+                "{} {} package(s){} in {} file(s), {} up to date",
+                action,
+                filtered_total.to_string().green().bold(),
+                breakdown,
+                file_count,
+                result.unchanged
+            );
+        }
+
+        // Show pinned count
+        if pinned_count > 0 {
+            let pinned_action = if dry_run { "Would pin" } else { "Pinned" };
+            println!(
+                "{} {} package(s) to configured versions",
+                pinned_action,
+                pinned_count.to_string().cyan().bold()
+            );
+        }
+    }
+
+    // Show ignored count (informational)
+    if ignored_count > 0 {
         println!(
-            "{} {} package(s){} in {} file(s), {} up to date",
-            action,
-            filtered_total.to_string().green().bold(),
-            breakdown,
-            file_count,
-            result.unchanged
+            "{} {} package(s) per config",
+            "Skipped".dimmed(),
+            ignored_count.to_string().dimmed()
         );
     }
 

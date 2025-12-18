@@ -85,7 +85,9 @@ impl Updater for PackageJsonUpdater {
         let mut result = UpdateResult::default();
         let mut new_content = content.clone();
 
-        // First pass: collect all packages to check
+        // First pass: collect all packages and separate by config status
+        let mut ignored_packages: Vec<(String, String)> = Vec::new();
+        let mut pinned_packages: Vec<(String, String, String, String, String)> = Vec::new();
         let mut packages_to_check: Vec<(String, String, String, String)> = Vec::new();
 
         for section in [
@@ -115,6 +117,24 @@ impl Updater for PackageJsonUpdater {
                             continue;
                         }
 
+                        // Check if package should be ignored
+                        if options.should_ignore(package) {
+                            ignored_packages.push((package.clone(), current_version));
+                            continue;
+                        }
+
+                        // Check if package has a pinned version
+                        if let Some(pinned_version) = options.get_pinned_version(package) {
+                            pinned_packages.push((
+                                package.clone(),
+                                version_str.to_string(),
+                                prefix,
+                                current_version,
+                                pinned_version.to_string(),
+                            ));
+                            continue;
+                        }
+
                         packages_to_check.push((
                             package.clone(),
                             version_str.to_string(),
@@ -126,7 +146,42 @@ impl Updater for PackageJsonUpdater {
             }
         }
 
-        // Fetch all versions in parallel
+        // Record ignored packages
+        for (package, version) in ignored_packages {
+            let line_num = self.find_package_line(&content, &package);
+            result.ignored.push((package, version, line_num));
+        }
+
+        // Process pinned packages (no registry fetch needed)
+        for (package, version_str, prefix, current_version, pinned_version) in pinned_packages {
+            let matched_version = if options.full_precision {
+                pinned_version.clone()
+            } else {
+                match_version_precision(&current_version, &pinned_version)
+            };
+
+            if matched_version != current_version {
+                let line_num = self.find_package_line(&content, &package);
+                result.pinned.push((
+                    package.clone(),
+                    current_version.clone(),
+                    matched_version.clone(),
+                    line_num,
+                ));
+
+                // Update in content preserving formatting
+                new_content = self.update_version_in_content(
+                    &new_content,
+                    &package,
+                    &version_str,
+                    &format!("{}{}", prefix, matched_version),
+                );
+            } else {
+                result.unchanged += 1;
+            }
+        }
+
+        // Fetch all versions in parallel for non-ignored, non-pinned packages
         let version_futures: Vec<_> = packages_to_check
             .iter()
             .map(|(package, _, _, _)| registry.get_latest_version(package))
@@ -172,7 +227,7 @@ impl Updater for PackageJsonUpdater {
             }
         }
 
-        if !result.updated.is_empty() && !options.dry_run {
+        if (!result.updated.is_empty() || !result.pinned.is_empty()) && !options.dry_run {
             write_file_atomic(path, &new_content)?;
         }
 
@@ -284,10 +339,7 @@ mod tests {
             .with_version("lodash", "4.17.21");
 
         let updater = PackageJsonUpdater::new();
-        let options = UpdateOptions {
-            dry_run: false,
-            full_precision: false,
-        };
+        let options = UpdateOptions::new(false, false);
 
         let result = updater
             .update(file.path(), &registry, options)
@@ -316,10 +368,7 @@ mod tests {
         let registry = MockRegistry::new("npm").with_version("express", "4.18.2");
 
         let updater = PackageJsonUpdater::new();
-        let options = UpdateOptions {
-            dry_run: true,
-            full_precision: false,
-        };
+        let options = UpdateOptions::new(true, false);
 
         let result = updater
             .update(file.path(), &registry, options)
@@ -356,10 +405,7 @@ mod tests {
             .with_version("gte", "2.0.0");
 
         let updater = PackageJsonUpdater::new();
-        let options = UpdateOptions {
-            dry_run: false,
-            full_precision: false,
-        };
+        let options = UpdateOptions::new(false, false);
 
         let result = updater
             .update(file.path(), &registry, options)
@@ -394,10 +440,7 @@ mod tests {
             .with_version("jest", "29.7.0");
 
         let updater = PackageJsonUpdater::new();
-        let options = UpdateOptions {
-            dry_run: false,
-            full_precision: false,
-        };
+        let options = UpdateOptions::new(false, false);
 
         let result = updater
             .update(file.path(), &registry, options)
@@ -431,10 +474,7 @@ mod tests {
         let registry = MockRegistry::new("npm").with_version("normal-pkg", "2.0.0");
 
         let updater = PackageJsonUpdater::new();
-        let options = UpdateOptions {
-            dry_run: false,
-            full_precision: false,
-        };
+        let options = UpdateOptions::new(false, false);
 
         let result = updater
             .update(file.path(), &registry, options)
@@ -463,10 +503,7 @@ mod tests {
         let registry = MockRegistry::new("npm").with_version("react", "18.2.0");
 
         let updater = PackageJsonUpdater::new();
-        let options = UpdateOptions {
-            dry_run: true,
-            full_precision: false,
-        };
+        let options = UpdateOptions::new(true, false);
 
         let result = updater
             .update(file.path(), &registry, options)
@@ -496,10 +533,7 @@ mod tests {
         let registry = MockRegistry::new("npm");
 
         let updater = PackageJsonUpdater::new();
-        let options = UpdateOptions {
-            dry_run: true,
-            full_precision: false,
-        };
+        let options = UpdateOptions::new(true, false);
 
         let result = updater
             .update(file.path(), &registry, options)
@@ -509,5 +543,261 @@ mod tests {
         assert_eq!(result.updated.len(), 0);
         assert_eq!(result.errors.len(), 1);
         assert!(result.errors[0].contains("nonexistent-pkg"));
+    }
+
+    // Tests for config-based ignore/pin functionality
+
+    #[tokio::test]
+    async fn test_update_package_json_with_config_ignore() {
+        use crate::config::UpdConfig;
+        use std::sync::Arc;
+
+        let mut file = NamedTempFile::with_suffix(".json").unwrap();
+        write!(
+            file,
+            r#"{{
+  "name": "test-project",
+  "dependencies": {{
+    "react": "^17.0.0",
+    "lodash": "~4.17.0",
+    "express": "^4.17.0"
+  }}
+}}"#
+        )
+        .unwrap();
+
+        let registry = MockRegistry::new("npm")
+            .with_version("react", "18.2.0")
+            .with_version("lodash", "4.17.21")
+            .with_version("express", "4.18.2");
+
+        // Create config that ignores lodash
+        let config = UpdConfig {
+            ignore: vec!["lodash".to_string()],
+            pin: std::collections::HashMap::new(),
+        };
+
+        let updater = PackageJsonUpdater::new();
+        let options = UpdateOptions::new(false, false).with_config(Arc::new(config));
+
+        let result = updater
+            .update(file.path(), &registry, options)
+            .await
+            .unwrap();
+
+        // 2 packages updated (react, express), 1 ignored (lodash)
+        assert_eq!(result.updated.len(), 2);
+        assert_eq!(result.ignored.len(), 1);
+        assert_eq!(result.ignored[0].0, "lodash");
+        assert_eq!(result.ignored[0].1, "4.17.0");
+
+        // Verify file was updated only for non-ignored packages
+        let content = fs::read_to_string(file.path()).unwrap();
+        assert!(content.contains("^18.2.0"));
+        assert!(content.contains("~4.17.0")); // lodash unchanged
+        assert!(content.contains("^4.18.2"));
+    }
+
+    #[tokio::test]
+    async fn test_update_package_json_with_config_pin() {
+        use crate::config::UpdConfig;
+        use std::sync::Arc;
+
+        let mut file = NamedTempFile::with_suffix(".json").unwrap();
+        write!(
+            file,
+            r#"{{
+  "name": "test-project",
+  "dependencies": {{
+    "react": "^17.0.0",
+    "lodash": "~4.17.0"
+  }}
+}}"#
+        )
+        .unwrap();
+
+        let registry = MockRegistry::new("npm")
+            .with_version("react", "18.2.0")
+            .with_version("lodash", "4.17.21");
+
+        // Create config that pins react to 17.0.2
+        let mut pin = std::collections::HashMap::new();
+        pin.insert("react".to_string(), "17.0.2".to_string());
+        let config = UpdConfig {
+            ignore: Vec::new(),
+            pin,
+        };
+
+        let updater = PackageJsonUpdater::new();
+        let options = UpdateOptions::new(false, false).with_config(Arc::new(config));
+
+        let result = updater
+            .update(file.path(), &registry, options)
+            .await
+            .unwrap();
+
+        // 1 package updated from registry (lodash), 1 pinned (react)
+        assert_eq!(result.updated.len(), 1);
+        assert_eq!(result.updated[0].0, "lodash");
+        assert_eq!(result.pinned.len(), 1);
+        assert_eq!(result.pinned[0].0, "react");
+        assert_eq!(result.pinned[0].1, "17.0.0"); // old
+        assert_eq!(result.pinned[0].2, "17.0.2"); // new (pinned)
+
+        // Verify file was updated with pinned version
+        let content = fs::read_to_string(file.path()).unwrap();
+        assert!(content.contains("^17.0.2"));
+        assert!(content.contains("~4.17.21"));
+    }
+
+    #[tokio::test]
+    async fn test_update_package_json_with_config_ignore_and_pin() {
+        use crate::config::UpdConfig;
+        use std::sync::Arc;
+
+        let mut file = NamedTempFile::with_suffix(".json").unwrap();
+        write!(
+            file,
+            r#"{{
+  "name": "test-project",
+  "dependencies": {{
+    "react": "^17.0.0",
+    "lodash": "~4.17.0",
+    "express": "^4.17.0"
+  }}
+}}"#
+        )
+        .unwrap();
+
+        let registry = MockRegistry::new("npm")
+            .with_version("react", "18.2.0")
+            .with_version("lodash", "4.17.21")
+            .with_version("express", "4.18.2");
+
+        // Config: ignore lodash, pin express to 4.17.3
+        let mut pin = std::collections::HashMap::new();
+        pin.insert("express".to_string(), "4.17.3".to_string());
+        let config = UpdConfig {
+            ignore: vec!["lodash".to_string()],
+            pin,
+        };
+
+        let updater = PackageJsonUpdater::new();
+        let options = UpdateOptions::new(false, false).with_config(Arc::new(config));
+
+        let result = updater
+            .update(file.path(), &registry, options)
+            .await
+            .unwrap();
+
+        // 1 updated from registry (react), 1 ignored (lodash), 1 pinned (express)
+        assert_eq!(result.updated.len(), 1);
+        assert_eq!(result.updated[0].0, "react");
+        assert_eq!(result.ignored.len(), 1);
+        assert_eq!(result.ignored[0].0, "lodash");
+        assert_eq!(result.pinned.len(), 1);
+        assert_eq!(result.pinned[0].0, "express");
+        assert_eq!(result.pinned[0].2, "4.17.3");
+
+        let content = fs::read_to_string(file.path()).unwrap();
+        assert!(content.contains("^18.2.0")); // react updated from registry
+        assert!(content.contains("~4.17.0")); // lodash unchanged (ignored)
+        assert!(content.contains("^4.17.3")); // express pinned version
+    }
+
+    #[tokio::test]
+    async fn test_update_package_json_dev_deps_with_config() {
+        use crate::config::UpdConfig;
+        use std::sync::Arc;
+
+        let mut file = NamedTempFile::with_suffix(".json").unwrap();
+        write!(
+            file,
+            r#"{{
+  "devDependencies": {{
+    "typescript": "^4.9.0",
+    "jest": "^29.0.0"
+  }}
+}}"#
+        )
+        .unwrap();
+
+        let registry = MockRegistry::new("npm")
+            .with_version("typescript", "5.3.3")
+            .with_version("jest", "29.7.0");
+
+        // Config: ignore typescript
+        let config = UpdConfig {
+            ignore: vec!["typescript".to_string()],
+            pin: std::collections::HashMap::new(),
+        };
+
+        let updater = PackageJsonUpdater::new();
+        let options = UpdateOptions::new(false, false).with_config(Arc::new(config));
+
+        let result = updater
+            .update(file.path(), &registry, options)
+            .await
+            .unwrap();
+
+        // 1 updated (jest), 1 ignored (typescript)
+        assert_eq!(result.updated.len(), 1);
+        assert_eq!(result.updated[0].0, "jest");
+        assert_eq!(result.ignored.len(), 1);
+        assert_eq!(result.ignored[0].0, "typescript");
+
+        let content = fs::read_to_string(file.path()).unwrap();
+        assert!(content.contains("^4.9.0")); // typescript unchanged
+        assert!(content.contains("^29.7.0"));
+    }
+
+    #[tokio::test]
+    async fn test_update_package_json_pin_preserves_prefix() {
+        use crate::config::UpdConfig;
+        use std::sync::Arc;
+
+        let mut file = NamedTempFile::with_suffix(".json").unwrap();
+        write!(
+            file,
+            r#"{{
+  "dependencies": {{
+    "caret": "^1.0.0",
+    "tilde": "~1.0.0",
+    "exact": "1.0.0"
+  }}
+}}"#
+        )
+        .unwrap();
+
+        let registry = MockRegistry::new("npm")
+            .with_version("caret", "2.0.0")
+            .with_version("tilde", "2.0.0")
+            .with_version("exact", "2.0.0");
+
+        // Pin all with specific versions
+        let mut pin = std::collections::HashMap::new();
+        pin.insert("caret".to_string(), "1.5.0".to_string());
+        pin.insert("tilde".to_string(), "1.5.0".to_string());
+        pin.insert("exact".to_string(), "1.5.0".to_string());
+        let config = UpdConfig {
+            ignore: Vec::new(),
+            pin,
+        };
+
+        let updater = PackageJsonUpdater::new();
+        let options = UpdateOptions::new(false, false).with_config(Arc::new(config));
+
+        let result = updater
+            .update(file.path(), &registry, options)
+            .await
+            .unwrap();
+
+        assert_eq!(result.pinned.len(), 3);
+
+        let content = fs::read_to_string(file.path()).unwrap();
+        // Prefixes should be preserved
+        assert!(content.contains("\"^1.5.0\""));
+        assert!(content.contains("\"~1.5.0\""));
+        assert!(content.contains("\"1.5.0\"")); // exact version
     }
 }

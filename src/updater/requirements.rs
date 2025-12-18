@@ -252,8 +252,43 @@ impl Updater for RequirementsUpdater {
             }
         }
 
-        // Fetch all versions in parallel
-        let version_futures: Vec<_> = parsed_deps
+        // Separate packages into ignored, pinned, and to-be-fetched
+        let mut ignored_packages: Vec<(usize, String, String)> = Vec::new();
+        let mut pinned_packages: Vec<(usize, String, String, String)> = Vec::new();
+        let mut fetch_deps: Vec<(usize, &str, &ParsedDep)> = Vec::new();
+
+        for (line_idx, line, parsed) in &parsed_deps {
+            // Check if package should be ignored
+            if options.should_ignore(&parsed.package) {
+                ignored_packages.push((
+                    *line_idx,
+                    parsed.package.clone(),
+                    parsed.first_version.clone(),
+                ));
+                continue;
+            }
+
+            // Check if package has a pinned version
+            if let Some(pinned_version) = options.get_pinned_version(&parsed.package) {
+                pinned_packages.push((
+                    *line_idx,
+                    parsed.package.clone(),
+                    parsed.first_version.clone(),
+                    pinned_version.to_string(),
+                ));
+                continue;
+            }
+
+            fetch_deps.push((*line_idx, *line, parsed));
+        }
+
+        // Add ignored packages to result
+        for (line_idx, package, version) in ignored_packages {
+            result.ignored.push((package, version, Some(line_idx + 1)));
+        }
+
+        // Fetch versions only for non-ignored, non-pinned packages
+        let version_futures: Vec<_> = fetch_deps
             .iter()
             .map(|(_, _, parsed)| async {
                 if Self::is_simple_constraint(&parsed.full_constraint) {
@@ -271,8 +306,16 @@ impl Updater for RequirementsUpdater {
         // Build a map of line index to version result
         let mut version_map: std::collections::HashMap<usize, Result<String, anyhow::Error>> =
             std::collections::HashMap::new();
-        for ((line_idx, _, _), version_result) in parsed_deps.iter().zip(version_results) {
+        for ((line_idx, _, _), version_result) in fetch_deps.iter().zip(version_results) {
             version_map.insert(*line_idx, version_result);
+        }
+
+        // Add pinned versions to version_map and record in result
+        for (line_idx, package, current_version, pinned_version) in pinned_packages {
+            version_map.insert(line_idx, Ok(pinned_version.clone()));
+            result
+                .pinned
+                .push((package, current_version, pinned_version, Some(line_idx + 1)));
         }
 
         // Second pass: apply updates
@@ -592,10 +635,7 @@ flask>=2.0.0
             .with_version("django", "5.0.0");
 
         let updater = RequirementsUpdater::new();
-        let options = UpdateOptions {
-            dry_run: false,
-            full_precision: false,
-        };
+        let options = UpdateOptions::new(false, false);
 
         let result = updater
             .update(file.path(), &registry, options)
@@ -605,6 +645,8 @@ flask>=2.0.0
         assert_eq!(result.updated.len(), 3);
         assert_eq!(result.unchanged, 0);
         assert!(result.errors.is_empty());
+        assert!(result.ignored.is_empty());
+        assert!(result.pinned.is_empty());
 
         // Verify file contents
         let contents = std::fs::read_to_string(file.path()).unwrap();
@@ -622,10 +664,7 @@ flask>=2.0.0
         let registry = MockRegistry::new("PyPI").with_version("requests", "2.31.0");
 
         let updater = RequirementsUpdater::new();
-        let options = UpdateOptions {
-            dry_run: true,
-            full_precision: false,
-        };
+        let options = UpdateOptions::new(true, false);
 
         let result = updater
             .update(file.path(), &registry, options)
@@ -650,10 +689,7 @@ flask>=2.0.0
         let updater = RequirementsUpdater::new();
 
         // Without full precision - should preserve 2-component format
-        let options = UpdateOptions {
-            dry_run: false,
-            full_precision: false,
-        };
+        let options = UpdateOptions::new(false, false);
         updater
             .update(file.path(), &registry, options)
             .await
@@ -672,10 +708,7 @@ flask>=2.0.0
         std::fs::write(file.path(), "flask>=2.0\n").unwrap();
 
         // With full precision - should output full version
-        let options = UpdateOptions {
-            dry_run: false,
-            full_precision: true,
-        };
+        let options = UpdateOptions::new(false, true);
         let result = updater
             .update(file.path(), &registry, options)
             .await
@@ -702,10 +735,7 @@ flask>=2.0.0
             .with_version("flask", "3.0.0");
 
         let updater = RequirementsUpdater::new();
-        let options = UpdateOptions {
-            dry_run: false,
-            full_precision: false,
-        };
+        let options = UpdateOptions::new(false, false);
 
         updater
             .update(file.path(), &registry, options)
@@ -727,10 +757,7 @@ flask>=2.0.0
         let registry = MockRegistry::new("PyPI").with_version("requests", "2.31.0");
 
         let updater = RequirementsUpdater::new();
-        let options = UpdateOptions {
-            dry_run: false,
-            full_precision: false,
-        };
+        let options = UpdateOptions::new(false, false);
 
         let result = updater
             .update(file.path(), &registry, options)
@@ -749,10 +776,7 @@ flask>=2.0.0
         let registry = MockRegistry::new("PyPI").with_version("uvicorn", "0.24.0");
 
         let updater = RequirementsUpdater::new();
-        let options = UpdateOptions {
-            dry_run: false,
-            full_precision: false,
-        };
+        let options = UpdateOptions::new(false, false);
 
         let result = updater
             .update(file.path(), &registry, options)
@@ -777,10 +801,7 @@ flask>=2.0.0
             .with_version("flask", "3.0.0");
 
         let updater = RequirementsUpdater::new();
-        let options = UpdateOptions {
-            dry_run: false,
-            full_precision: false,
-        };
+        let options = UpdateOptions::new(false, false);
 
         let result = updater
             .update(file.path(), &registry, options)
@@ -812,10 +833,7 @@ flask>=2.0.0
         let registry = MockRegistry::new("PyPI");
 
         let updater = RequirementsUpdater::new();
-        let options = UpdateOptions {
-            dry_run: false,
-            full_precision: false,
-        };
+        let options = UpdateOptions::new(false, false);
 
         let result = updater
             .update(file.path(), &registry, options)
@@ -840,10 +858,7 @@ flask>=2.0.0
             .with_version("flask", "2.3.0");
 
         let updater = RequirementsUpdater::new();
-        let options = UpdateOptions {
-            dry_run: false,
-            full_precision: false,
-        };
+        let options = UpdateOptions::new(false, false);
 
         let result = updater
             .update(file.path(), &registry, options)
@@ -883,10 +898,7 @@ flask>=2.0.0
         let registry = MockRegistry::new("PyPI").with_constrained("django", ">=4.0,<6", "5.2");
 
         let updater = RequirementsUpdater::new();
-        let options = UpdateOptions {
-            dry_run: false,
-            full_precision: false,
-        };
+        let options = UpdateOptions::new(false, false);
 
         let result = updater
             .update(file.path(), &registry, options)
@@ -906,5 +918,132 @@ flask>=2.0.0
             contents.contains("django>=5.2"),
             "Version should be updated to 5.2"
         );
+    }
+
+    #[tokio::test]
+    async fn test_update_requirements_with_config_ignore() {
+        use crate::config::UpdConfig;
+        use std::collections::HashMap;
+
+        let mut file = NamedTempFile::new().unwrap();
+        writeln!(file, "requests==2.28.0").unwrap();
+        writeln!(file, "flask>=2.0.0").unwrap();
+        writeln!(file, "django>=4.0").unwrap();
+
+        let registry = MockRegistry::new("PyPI")
+            .with_version("requests", "2.31.0")
+            .with_version("flask", "3.0.0")
+            .with_version("django", "5.0.0");
+
+        // Create config that ignores "flask"
+        let config = UpdConfig {
+            ignore: vec!["flask".to_string()],
+            pin: HashMap::new(),
+        };
+
+        let updater = RequirementsUpdater::new();
+        let options = UpdateOptions::new(false, false).with_config(Arc::new(config));
+
+        let result = updater
+            .update(file.path(), &registry, options)
+            .await
+            .unwrap();
+
+        // Only 2 packages should be updated (requests and django), flask should be ignored
+        assert_eq!(result.updated.len(), 2);
+        assert_eq!(result.ignored.len(), 1);
+        assert_eq!(result.ignored[0].0, "flask");
+
+        // Verify file contents - flask should remain unchanged
+        let contents = std::fs::read_to_string(file.path()).unwrap();
+        assert!(contents.contains("requests==2.31.0"));
+        assert!(contents.contains("flask>=2.0.0")); // Unchanged!
+        assert!(contents.contains("django>=5.0"));
+    }
+
+    #[tokio::test]
+    async fn test_update_requirements_with_config_pin() {
+        use crate::config::UpdConfig;
+        use std::collections::HashMap;
+
+        let mut file = NamedTempFile::new().unwrap();
+        writeln!(file, "requests==2.28.0").unwrap();
+        writeln!(file, "flask>=2.0.0").unwrap();
+
+        let registry = MockRegistry::new("PyPI")
+            .with_version("requests", "2.31.0")
+            .with_version("flask", "3.0.0");
+
+        // Create config that pins "requests" to 2.30.0
+        let mut pin = HashMap::new();
+        pin.insert("requests".to_string(), "2.30.0".to_string());
+
+        let config = UpdConfig {
+            ignore: vec![],
+            pin,
+        };
+
+        let updater = RequirementsUpdater::new();
+        let options = UpdateOptions::new(false, false).with_config(Arc::new(config));
+
+        let result = updater
+            .update(file.path(), &registry, options)
+            .await
+            .unwrap();
+
+        // Both should be updated, but requests should use pinned version
+        assert_eq!(result.updated.len(), 2);
+        assert_eq!(result.pinned.len(), 1);
+        assert_eq!(result.pinned[0].0, "requests");
+        assert_eq!(result.pinned[0].2, "2.30.0"); // Pinned version
+
+        // Verify file contents
+        let contents = std::fs::read_to_string(file.path()).unwrap();
+        assert!(contents.contains("requests==2.30.0")); // Pinned version, not 2.31.0
+        assert!(contents.contains("flask>=3.0.0"));
+    }
+
+    #[tokio::test]
+    async fn test_update_requirements_with_config_ignore_and_pin() {
+        use crate::config::UpdConfig;
+        use std::collections::HashMap;
+
+        let mut file = NamedTempFile::new().unwrap();
+        writeln!(file, "requests==2.28.0").unwrap();
+        writeln!(file, "flask>=2.0.0").unwrap();
+        writeln!(file, "django>=4.0").unwrap();
+
+        let registry = MockRegistry::new("PyPI")
+            .with_version("requests", "2.31.0")
+            .with_version("flask", "3.0.0")
+            .with_version("django", "5.0.0");
+
+        // Create config that ignores "flask" and pins "requests"
+        let mut pin = HashMap::new();
+        pin.insert("requests".to_string(), "2.29.0".to_string());
+
+        let config = UpdConfig {
+            ignore: vec!["flask".to_string()],
+            pin,
+        };
+
+        let updater = RequirementsUpdater::new();
+        let options = UpdateOptions::new(false, false).with_config(Arc::new(config));
+
+        let result = updater
+            .update(file.path(), &registry, options)
+            .await
+            .unwrap();
+
+        // requests and django should be updated, flask should be ignored
+        assert_eq!(result.updated.len(), 2);
+        assert_eq!(result.ignored.len(), 1);
+        assert_eq!(result.pinned.len(), 1);
+
+        // Verify file contents
+        let contents = std::fs::read_to_string(file.path()).unwrap();
+        assert!(contents.contains("requests==2.29.0")); // Pinned version
+        assert!(contents.contains("flask>=2.0.0")); // Unchanged (ignored)
+        assert!(contents.contains("django>=5.0")); // Updated
     }
 }

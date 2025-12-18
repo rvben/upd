@@ -6,11 +6,11 @@ mod npm;
 mod pypi;
 mod utils;
 
-pub use crates_io::{CargoCredentials, CratesIoRegistry};
-pub use go_proxy::{GoCredentials, GoProxyRegistry};
+pub use crates_io::{CargoConfig, CargoCredentials, CratesIoRegistry, read_cargo_config};
+pub use go_proxy::{GoCredentials, GoPrivateConfig, GoProxyRegistry, read_go_private_config};
 #[cfg(test)]
 pub use mock::MockRegistry;
-pub use npm::{NpmCredentials, NpmRegistry};
+pub use npm::{NpmCredentials, NpmRegistry, NpmrcConfig, read_npmrc_config};
 pub use pypi::{MultiPyPiRegistry, PyPiCredentials, PyPiRegistry};
 
 use anyhow::Result;
