@@ -74,7 +74,7 @@ struct ReleaseFile {
 
 impl PyPiRegistry {
     pub fn new() -> Self {
-        Self::with_index_url("https://pypi.org/pypi".to_string())
+        Self::with_index_url("https://pypi.org".to_string())
     }
 
     pub fn with_index_url(index_url: String) -> Self {
@@ -398,7 +398,7 @@ impl PyPiRegistry {
         }
 
         // Simple API failed - try legacy JSON API (PyPI.org style)
-        let json_url = format!("{}/{}/json", self.index_url, normalized);
+        let json_url = format!("{}/pypi/{}/json", self.index_url, normalized);
         let response = self.get_with_retry(&json_url).await?;
 
         if response.status().is_success() {
@@ -1442,9 +1442,16 @@ mod tests {
         async fn test_multi_registry_first_match_returns_primary() {
             let mock_server1 = MockServer::start().await;
 
+            // Simple API returns 404 (fallback to JSON API)
+            Mock::given(method("GET"))
+                .and(path("/simple/testpkg/"))
+                .respond_with(ResponseTemplate::new(404))
+                .mount(&mock_server1)
+                .await;
+
             // Server 1 (primary) has version 1.0.0
             Mock::given(method("GET"))
-                .and(path("/testpkg/json"))
+                .and(path("/pypi/testpkg/json"))
                 .respond_with(
                     ResponseTemplate::new(200)
                         .set_body_string(r#"{"releases": {"1.0.0": [{"yanked": false}]}}"#),
@@ -1469,17 +1476,31 @@ mod tests {
             let mock_server1 = MockServer::start().await;
             let mock_server2 = MockServer::start().await;
 
-            // Server 1 (primary) returns 404 (package not found)
+            // Server 1 (primary): Simple API returns 404
             Mock::given(method("GET"))
-                .and(path("/testpkg/json"))
+                .and(path("/simple/testpkg/"))
+                .respond_with(ResponseTemplate::new(404))
+                .mount(&mock_server1)
+                .await;
+
+            // Server 1 (primary): JSON API also returns 404 (package not found)
+            Mock::given(method("GET"))
+                .and(path("/pypi/testpkg/json"))
                 .respond_with(ResponseTemplate::new(404))
                 .expect(1) // Primary is tried first
                 .mount(&mock_server1)
                 .await;
 
-            // Server 2 (extra) has version 1.5.0
+            // Server 2 (extra): Simple API returns 404
             Mock::given(method("GET"))
-                .and(path("/testpkg/json"))
+                .and(path("/simple/testpkg/"))
+                .respond_with(ResponseTemplate::new(404))
+                .mount(&mock_server2)
+                .await;
+
+            // Server 2 (extra): JSON API has version 1.5.0
+            Mock::given(method("GET"))
+                .and(path("/pypi/testpkg/json"))
                 .respond_with(
                     ResponseTemplate::new(200)
                         .set_body_string(r#"{"releases": {"1.5.0": [{"yanked": false}]}}"#),
@@ -1543,9 +1564,16 @@ mod tests {
         async fn test_multi_registry_prereleases_first_match() {
             let mock_server1 = MockServer::start().await;
 
+            // Simple API returns 404 (fallback to JSON API)
+            Mock::given(method("GET"))
+                .and(path("/simple/testpkg/"))
+                .respond_with(ResponseTemplate::new(404))
+                .mount(&mock_server1)
+                .await;
+
             // Server 1 (primary) has prerelease version
             Mock::given(method("GET"))
-                .and(path("/testpkg/json"))
+                .and(path("/pypi/testpkg/json"))
                 .respond_with(
                     ResponseTemplate::new(200)
                         .set_body_string(r#"{"releases": {"2.0.0a1": [{"yanked": false}]}}"#),
@@ -1571,17 +1599,31 @@ mod tests {
             let mock_server1 = MockServer::start().await;
             let mock_server2 = MockServer::start().await;
 
-            // Server 1 (primary) returns 404
+            // Server 1 (primary): Simple API returns 404
             Mock::given(method("GET"))
-                .and(path("/testpkg/json"))
+                .and(path("/simple/testpkg/"))
+                .respond_with(ResponseTemplate::new(404))
+                .mount(&mock_server1)
+                .await;
+
+            // Server 1 (primary): JSON API returns 404
+            Mock::given(method("GET"))
+                .and(path("/pypi/testpkg/json"))
                 .respond_with(ResponseTemplate::new(404))
                 .expect(1)
                 .mount(&mock_server1)
                 .await;
 
-            // Server 2 (extra) has prerelease version
+            // Server 2 (extra): Simple API returns 404
             Mock::given(method("GET"))
-                .and(path("/testpkg/json"))
+                .and(path("/simple/testpkg/"))
+                .respond_with(ResponseTemplate::new(404))
+                .mount(&mock_server2)
+                .await;
+
+            // Server 2 (extra): JSON API has prerelease version
+            Mock::given(method("GET"))
+                .and(path("/pypi/testpkg/json"))
                 .respond_with(
                     ResponseTemplate::new(200)
                         .set_body_string(r#"{"releases": {"3.0.0b2": [{"yanked": false}]}}"#),
@@ -1606,9 +1648,16 @@ mod tests {
         async fn test_multi_registry_matching_first_match() {
             let mock_server1 = MockServer::start().await;
 
+            // Simple API returns 404 (fallback to JSON API)
+            Mock::given(method("GET"))
+                .and(path("/simple/testpkg/"))
+                .respond_with(ResponseTemplate::new(404))
+                .mount(&mock_server1)
+                .await;
+
             // Server 1 (primary) has versions 1.0.0 and 2.0.0
             Mock::given(method("GET"))
-                .and(path("/testpkg/json"))
+                .and(path("/pypi/testpkg/json"))
                 .respond_with(ResponseTemplate::new(200).set_body_string(
                     r#"{"releases": {"1.0.0": [{"yanked": false}], "2.0.0": [{"yanked": false}]}}"#,
                 ))
@@ -1633,17 +1682,31 @@ mod tests {
             let mock_server1 = MockServer::start().await;
             let mock_server2 = MockServer::start().await;
 
-            // Server 1 (primary) returns 404
+            // Server 1 (primary): Simple API returns 404
             Mock::given(method("GET"))
-                .and(path("/testpkg/json"))
+                .and(path("/simple/testpkg/"))
+                .respond_with(ResponseTemplate::new(404))
+                .mount(&mock_server1)
+                .await;
+
+            // Server 1 (primary): JSON API returns 404
+            Mock::given(method("GET"))
+                .and(path("/pypi/testpkg/json"))
                 .respond_with(ResponseTemplate::new(404))
                 .expect(1)
                 .mount(&mock_server1)
                 .await;
 
-            // Server 2 (extra) has version that matches constraint
+            // Server 2 (extra): Simple API returns 404
             Mock::given(method("GET"))
-                .and(path("/testpkg/json"))
+                .and(path("/simple/testpkg/"))
+                .respond_with(ResponseTemplate::new(404))
+                .mount(&mock_server2)
+                .await;
+
+            // Server 2 (extra): JSON API has version that matches constraint
+            Mock::given(method("GET"))
+                .and(path("/pypi/testpkg/json"))
                 .respond_with(ResponseTemplate::new(200).set_body_string(
                     r#"{"releases": {"1.5.0": [{"yanked": false}], "3.0.0": [{"yanked": false}]}}"#,
                 ))

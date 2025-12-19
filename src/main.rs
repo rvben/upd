@@ -175,7 +175,7 @@ async fn run_update(cli: &Cli) -> Result<()> {
     // Create PyPI registry with optional credentials and extra index URLs
     let pypi_registry = {
         let index_url =
-            PyPiRegistry::detect_index_url().unwrap_or_else(|| "https://pypi.org/pypi".to_string());
+            PyPiRegistry::detect_index_url().unwrap_or_else(|| "https://pypi.org".to_string());
         let credentials = PyPiRegistry::detect_credentials(&index_url);
         if cli.verbose && credentials.is_some() {
             println!("{}", "Using authenticated PyPI access".cyan());

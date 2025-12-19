@@ -336,10 +336,18 @@ mod tests {
         async fn test_pypi_sends_basic_auth_header() {
             let mock_server = MockServer::start().await;
 
-            // Verify that Basic Auth header is sent
+            // Simple API endpoint should fail (to trigger fallback to JSON API)
+            Mock::given(method("GET"))
+                .and(path("/simple/testpkg/"))
+                .and(header("Authorization", "Basic dGVzdHVzZXI6dGVzdHBhc3M="))
+                .respond_with(ResponseTemplate::new(404))
+                .mount(&mock_server)
+                .await;
+
+            // Verify that Basic Auth header is sent to JSON API
             // "testuser:testpass" base64 encoded is "dGVzdHVzZXI6dGVzdHBhc3M="
             Mock::given(method("GET"))
-                .and(path("/testpkg/json"))
+                .and(path("/pypi/testpkg/json"))
                 .and(header("Authorization", "Basic dGVzdHVzZXI6dGVzdHBhc3M="))
                 .respond_with(
                     ResponseTemplate::new(200)
