@@ -5,6 +5,16 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.0.20] - 2025-12-19
+
+### Fixed
+
+- **PyPI registry URL format**: Corrected default PyPI base URL from `https://pypi.org/pypi` to `https://pypi.org`
+  - Fixed Simple API URL construction: now correctly uses `https://pypi.org/simple/{package}/` instead of malformed `https://pypi.org/pypi/simple/{package}/`
+  - Fixed "Package exists but has no suitable versions" errors for valid packages
+  - Resolves CloudFlare challenge page responses that prevented package lookups
+  - Particularly affects packages in PEP 735 dependency-groups sections
+
 ## [0.0.19] - 2025-12-19
 
 ### Fixed
