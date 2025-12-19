@@ -5,6 +5,18 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.0.19] - 2025-12-19
+
+### Fixed
+
+- **Improved error messages for common failures**:
+  - HTTP client creation failures now explain TLS/SSL configuration issues
+  - HTTP errors categorized by status code (401, 403, 404, 429, 5xx)
+  - Registry-specific credential hints for authentication errors (PyPI, npm, crates.io, Go)
+  - TOML parsing errors now include file path and line numbers
+  - "Package not found" (404) distinguished from "no versions available" (yanked/pre-release only)
+  - Config file errors (`--config` flag) now show detailed messages instead of silent failure
+
 ## [0.0.18] - 2025-12-18
 
 ### Added

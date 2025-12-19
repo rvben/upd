@@ -1,6 +1,6 @@
 [package]
 name = "upd"
-version = "0.0.18"
+version = "0.0.19"
 edition = "2024"
 rust-version = "1.91.1"
 description = "A fast dependency updater for Python, Node.js, Rust, and Go projects"
