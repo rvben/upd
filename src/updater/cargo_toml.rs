@@ -366,9 +366,13 @@ impl Updater for CargoTomlUpdater {
         options: UpdateOptions,
     ) -> Result<UpdateResult> {
         let content = read_file_safe(path)?;
-        let mut doc: DocumentMut = content
-            .parse()
-            .map_err(|e| anyhow!("Failed to parse Cargo.toml: {}", e))?;
+        let mut doc: DocumentMut = content.parse().map_err(|e: toml_edit::TomlError| {
+            anyhow!(
+                "Failed to parse {}:\n  {}",
+                path.display(),
+                e.to_string().replace('\n', "\n  ")
+            )
+        })?;
 
         let mut result = UpdateResult::default();
 
@@ -495,9 +499,13 @@ impl Updater for CargoTomlUpdater {
 
     fn parse_dependencies(&self, path: &Path) -> Result<Vec<ParsedDependency>> {
         let content = read_file_safe(path)?;
-        let doc: DocumentMut = content
-            .parse()
-            .map_err(|e| anyhow!("Failed to parse Cargo.toml: {}", e))?;
+        let doc: DocumentMut = content.parse().map_err(|e: toml_edit::TomlError| {
+            anyhow!(
+                "Failed to parse {}:\n  {}",
+                path.display(),
+                e.to_string().replace('\n', "\n  ")
+            )
+        })?;
 
         let mut deps = Vec::new();
 

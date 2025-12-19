@@ -102,7 +102,7 @@ impl OsvClient {
             client: Client::builder()
                 .timeout(Duration::from_secs(30))
                 .build()
-                .expect("Failed to create HTTP client"),
+                .expect("Failed to create HTTP client. This usually indicates a TLS/SSL configuration issue on your system."),
         }
     }
 
@@ -358,8 +358,10 @@ mod tests {
 
     #[test]
     fn test_audit_result_counts() {
-        let mut result = AuditResult::default();
-        result.safe_count = 5;
+        let mut result = AuditResult {
+            safe_count: 5,
+            ..Default::default()
+        };
         result.vulnerable.push(PackageAuditResult {
             package: Package {
                 name: "test".to_string(),

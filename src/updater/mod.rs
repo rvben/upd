@@ -357,7 +357,7 @@ mod tests {
         let req_path = temp.path().join("requirements.txt");
         fs::write(&req_path, "flask>=2.0").unwrap();
 
-        let files = discover_files(&[req_path.clone()], &[]);
+        let files = discover_files(std::slice::from_ref(&req_path), &[]);
 
         assert_eq!(files.len(), 1);
         assert_eq!(files[0].0, req_path);

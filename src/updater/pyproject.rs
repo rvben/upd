@@ -478,9 +478,13 @@ impl Updater for PyProjectUpdater {
         options: UpdateOptions,
     ) -> Result<UpdateResult> {
         let content = read_file_safe(path)?;
-        let mut doc: DocumentMut = content
-            .parse()
-            .map_err(|e| anyhow!("Failed to parse TOML: {}", e))?;
+        let mut doc: DocumentMut = content.parse().map_err(|e: toml_edit::TomlError| {
+            anyhow!(
+                "Failed to parse {}:\n  {}",
+                path.display(),
+                e.to_string().replace('\n', "\n  ")
+            )
+        })?;
 
         let mut result = UpdateResult::default();
 
@@ -564,9 +568,13 @@ impl Updater for PyProjectUpdater {
 
     fn parse_dependencies(&self, path: &Path) -> Result<Vec<ParsedDependency>> {
         let content = read_file_safe(path)?;
-        let doc: DocumentMut = content
-            .parse()
-            .map_err(|e| anyhow!("Failed to parse TOML: {}", e))?;
+        let doc: DocumentMut = content.parse().map_err(|e: toml_edit::TomlError| {
+            anyhow!(
+                "Failed to parse {}:\n  {}",
+                path.display(),
+                e.to_string().replace('\n', "\n  ")
+            )
+        })?;
 
         let mut deps = Vec::new();
 
@@ -970,7 +978,7 @@ name = "invalid toml - missing bracket"
 
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
-        assert!(err.contains("Failed to parse TOML"));
+        assert!(err.contains("Failed to parse"));
     }
 
     #[tokio::test]

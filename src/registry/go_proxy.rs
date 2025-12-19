@@ -1,7 +1,7 @@
-use super::Registry;
 #[cfg(test)]
 use super::utils::read_netrc_credentials_from_path;
 use super::utils::{base64_encode, read_netrc_credentials};
+use super::{Registry, http_error_message};
 use anyhow::{Result, anyhow};
 use async_trait::async_trait;
 use reqwest::header::{AUTHORIZATION, HeaderMap, HeaderValue};
@@ -181,7 +181,7 @@ impl GoProxyRegistry {
             .connect_timeout(Duration::from_secs(10))
             .default_headers(headers)
             .build()
-            .expect("Failed to create HTTP client");
+            .expect("Failed to create HTTP client. This usually indicates a TLS/SSL configuration issue on your system.");
 
         Self { client, proxy_url }
     }
@@ -264,11 +264,12 @@ impl GoProxyRegistry {
         let response = self.get_with_retry(&url).await?;
 
         if !response.status().is_success() {
-            return Err(anyhow!(
-                "Failed to fetch module '{}': HTTP {}",
+            return Err(anyhow!(http_error_message(
+                response.status(),
+                "Module",
                 module,
-                response.status()
-            ));
+                Some("For private modules, configure credentials in ~/.netrc or set GOPRIVATE.")
+            )));
         }
 
         let text = response.text().await?;
@@ -340,10 +341,12 @@ impl Registry for GoProxyRegistry {
 
         stable.sort_by(|a, b| b.0.cmp(&a.0));
 
-        stable
-            .first()
-            .map(|(_, s)| s.clone())
-            .ok_or_else(|| anyhow!("No stable versions found for module '{}'", package))
+        stable.first().map(|(_, s)| s.clone()).ok_or_else(|| {
+            anyhow!(
+                "Module '{}' exists but has no stable versions. Only pre-releases are available.",
+                package
+            )
+        })
     }
 
     async fn get_latest_version_including_prereleases(&self, package: &str) -> Result<String> {
@@ -356,9 +359,12 @@ impl Registry for GoProxyRegistry {
 
         all.sort_by(|a, b| b.0.cmp(&a.0));
 
-        all.first()
-            .map(|(_, s)| s.clone())
-            .ok_or_else(|| anyhow!("No versions found for module '{}'", package))
+        all.first().map(|(_, s)| s.clone()).ok_or_else(|| {
+            anyhow!(
+                "Module '{}' exists but has no versions available. All versions may be retracted.",
+                package
+            )
+        })
     }
 
     async fn get_latest_version_matching(

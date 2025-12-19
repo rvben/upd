@@ -1,5 +1,5 @@
-use super::Registry;
 use super::utils::home_dir;
+use super::{Registry, http_error_message};
 use anyhow::{Result, anyhow};
 use async_trait::async_trait;
 use reqwest::header::{AUTHORIZATION, HeaderMap, HeaderValue};
@@ -297,7 +297,7 @@ impl CratesIoRegistry {
             .connect_timeout(Duration::from_secs(10))
             .default_headers(headers)
             .build()
-            .expect("Failed to create HTTP client");
+            .expect("Failed to create HTTP client. This usually indicates a TLS/SSL configuration issue on your system.");
 
         Self {
             client,
@@ -401,11 +401,12 @@ impl CratesIoRegistry {
         let response = self.get_with_retry(&url).await?;
 
         if !response.status().is_success() {
-            return Err(anyhow!(
-                "Failed to fetch crate '{}': HTTP {}",
+            return Err(anyhow!(http_error_message(
+                response.status(),
+                "Crate",
                 name,
-                response.status()
-            ));
+                Some("For private registries, configure token in ~/.cargo/credentials.toml.")
+            )));
         }
 
         Ok(response.json().await?)
@@ -453,20 +454,24 @@ impl Registry for CratesIoRegistry {
 
         // Fallback: find latest stable from versions list
         let versions = Self::get_sorted_versions(&data, false);
-        versions
-            .first()
-            .map(|(_, s)| s.clone())
-            .ok_or_else(|| anyhow!("No stable versions found for crate '{}'", package))
+        versions.first().map(|(_, s)| s.clone()).ok_or_else(|| {
+            anyhow!(
+                "Crate '{}' exists but has no stable versions. Only pre-releases are available.",
+                package
+            )
+        })
     }
 
     async fn get_latest_version_including_prereleases(&self, package: &str) -> Result<String> {
         let data = self.fetch_crate(package).await?;
         let versions = Self::get_sorted_versions(&data, true);
 
-        versions
-            .first()
-            .map(|(_, s)| s.clone())
-            .ok_or_else(|| anyhow!("No versions found for crate '{}'", package))
+        versions.first().map(|(_, s)| s.clone()).ok_or_else(|| {
+            anyhow!(
+                "Crate '{}' exists but has no versions available. All versions may be yanked.",
+                package
+            )
+        })
     }
 
     async fn get_latest_version_matching(
@@ -639,14 +644,14 @@ mod tests {
         let mut config_file = NamedTempFile::new().unwrap();
         writeln!(config_file, "[registry]").unwrap();
         writeln!(config_file, "default = \"private\"").unwrap();
-        writeln!(config_file, "").unwrap();
+        writeln!(config_file).unwrap();
         writeln!(config_file, "[registries.private]").unwrap();
         writeln!(
             config_file,
             "index = \"sparse+https://private.registry.com/index/\""
         )
         .unwrap();
-        writeln!(config_file, "").unwrap();
+        writeln!(config_file).unwrap();
         writeln!(config_file, "[registries.other]").unwrap();
         writeln!(
             config_file,

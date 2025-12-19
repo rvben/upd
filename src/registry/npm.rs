@@ -1,5 +1,5 @@
-use super::Registry;
 use super::utils::home_dir;
+use super::{Registry, http_error_message};
 use anyhow::{Result, anyhow};
 use async_trait::async_trait;
 use reqwest::Client;
@@ -252,7 +252,7 @@ impl NpmRegistry {
             .connect_timeout(Duration::from_secs(10))
             .default_headers(headers)
             .build()
-            .expect("Failed to create HTTP client");
+            .expect("Failed to create HTTP client. This usually indicates a TLS/SSL configuration issue on your system.");
 
         Self {
             client,
@@ -337,11 +337,12 @@ impl NpmRegistry {
             .await?;
 
         if !response.status().is_success() {
-            return Err(anyhow!(
-                "Failed to fetch package '{}': HTTP {}",
+            return Err(anyhow!(http_error_message(
+                response.status(),
+                "Package",
                 package,
-                response.status()
-            ));
+                Some("For private npm, add authToken to ~/.npmrc or set NPM_TOKEN.")
+            )));
         }
 
         response
@@ -399,10 +400,12 @@ impl Registry for NpmRegistry {
 
         // Fall back to finding the latest stable version from the versions list
         let versions = Self::get_stable_versions(&data);
-        versions
-            .first()
-            .map(|(_, s)| s.clone())
-            .ok_or_else(|| anyhow!("No stable versions found for package '{}'", package))
+        versions.first().map(|(_, s)| s.clone()).ok_or_else(|| {
+            anyhow!(
+                "Package '{}' exists but has no stable versions. Only pre-releases are available.",
+                package
+            )
+        })
     }
 
     async fn get_latest_version_matching(

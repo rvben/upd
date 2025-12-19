@@ -726,7 +726,7 @@ flask>=2.0.0
         let mut file = NamedTempFile::new().unwrap();
         writeln!(file, "# Python dependencies").unwrap();
         writeln!(file, "requests==2.28.0  # HTTP library").unwrap();
-        writeln!(file, "").unwrap();
+        writeln!(file).unwrap();
         writeln!(file, "# Web framework").unwrap();
         writeln!(file, "flask>=2.0.0").unwrap();
 

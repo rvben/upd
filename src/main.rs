@@ -104,25 +104,21 @@ async fn run_update(cli: &Cli) -> Result<()> {
 
     // Load configuration from file or auto-discover
     let config: Option<Arc<UpdConfig>> = if let Some(config_path) = &cli.config {
-        // Load from specified path
-        if let Some(config) = UpdConfig::load_from_path(config_path) {
-            if cli.verbose {
-                println!(
-                    "{}",
-                    format!("Using config from: {}", config_path.display()).cyan()
-                );
+        // Load from specified path - show detailed error if it fails
+        match UpdConfig::load_from_path_with_error(config_path) {
+            Ok(config) => {
+                if cli.verbose {
+                    println!(
+                        "{}",
+                        format!("Using config from: {}", config_path.display()).cyan()
+                    );
+                }
+                Some(Arc::new(config))
             }
-            Some(Arc::new(config))
-        } else {
-            eprintln!(
-                "{}",
-                format!(
-                    "Warning: Could not load config from {}",
-                    config_path.display()
-                )
-                .yellow()
-            );
-            None
+            Err(error) => {
+                eprintln!("{}", format!("Error: {}", error).red());
+                None
+            }
         }
     } else {
         // Auto-discover from current directory

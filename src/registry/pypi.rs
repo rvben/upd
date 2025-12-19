@@ -1,7 +1,7 @@
-use super::Registry;
 #[cfg(test)]
 use super::utils::read_netrc_credentials_from_path;
 use super::utils::{base64_encode, read_netrc_credentials, read_pip_config};
+use super::{Registry, http_error_message};
 use anyhow::{Result, anyhow};
 use async_trait::async_trait;
 use pep440_rs::{Version, VersionSpecifiers};
@@ -135,7 +135,7 @@ impl PyPiRegistry {
             .connect_timeout(Duration::from_secs(10))
             .default_headers(headers)
             .build()
-            .expect("Failed to create HTTP client");
+            .expect("Failed to create HTTP client. This usually indicates a TLS/SSL configuration issue on your system.");
 
         Self { client, index_url }
     }
@@ -406,11 +406,14 @@ impl PyPiRegistry {
             return self.parse_json_response(data, include_prereleases);
         }
 
-        Err(anyhow!(
-            "Failed to fetch package '{}': HTTP {}",
+        Err(anyhow!(http_error_message(
+            response.status(),
+            "Package",
             package,
-            response.status()
-        ))
+            Some(
+                "For private PyPI, configure credentials in ~/.netrc or use UV_INDEX_URL with credentials."
+            )
+        )))
     }
 
     /// Parse JSON API response from PyPI
@@ -479,7 +482,10 @@ impl PyPiRegistry {
         }
 
         if versions.is_empty() {
-            return Err(anyhow!("No versions found for package '{}'", package));
+            return Err(anyhow!(
+                "Package '{}' exists but has no suitable versions. All releases may be yanked or pre-release.",
+                package
+            ));
         }
 
         versions.sort_by(|a, b| b.0.cmp(&a.0));
@@ -533,7 +539,10 @@ impl PyPiRegistry {
         }
 
         if versions.is_empty() {
-            return Err(anyhow!("No versions found for package '{}'", package));
+            return Err(anyhow!(
+                "Package '{}' exists but has no suitable versions. All releases may be yanked or pre-release.",
+                package
+            ));
         }
 
         versions.sort_by(|a, b| b.0.cmp(&a.0));
@@ -733,19 +742,23 @@ impl Registry for PyPiRegistry {
     async fn get_latest_version(&self, package: &str) -> Result<String> {
         let versions = self.fetch_versions(package).await?;
 
-        versions
-            .first()
-            .map(|(_, s)| s.clone())
-            .ok_or_else(|| anyhow!("No stable versions found for package '{}'", package))
+        versions.first().map(|(_, s)| s.clone()).ok_or_else(|| {
+            anyhow!(
+                "Package '{}' exists but has no stable versions. Only pre-releases are available.",
+                package
+            )
+        })
     }
 
     async fn get_latest_version_including_prereleases(&self, package: &str) -> Result<String> {
         let versions = self.fetch_all_versions(package).await?;
 
-        versions
-            .first()
-            .map(|(_, s)| s.clone())
-            .ok_or_else(|| anyhow!("No versions found for package '{}'", package))
+        versions.first().map(|(_, s)| s.clone()).ok_or_else(|| {
+            anyhow!(
+                "Package '{}' exists but has no versions available. All versions may be yanked.",
+                package
+            )
+        })
     }
 
     async fn get_latest_version_matching(

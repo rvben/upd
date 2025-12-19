@@ -56,17 +56,54 @@ impl UpdConfig {
         None
     }
 
-    /// Load configuration from a specific file path
+    /// Load configuration from a specific file path (silent failure for auto-discovery)
     pub fn load_from_path(path: &Path) -> Option<Self> {
-        // Check file size to prevent DoS
-        if let Ok(metadata) = std::fs::metadata(path)
-            && metadata.len() > MAX_CONFIG_FILE_SIZE
-        {
-            return None;
+        Self::load_from_path_with_error(path).ok()
+    }
+
+    /// Load configuration from a specific file path with detailed error messages
+    pub fn load_from_path_with_error(path: &Path) -> Result<Self, String> {
+        // Check if file exists
+        if !path.exists() {
+            return Err(format!("Config file not found: {}", path.display()));
         }
 
-        let content = std::fs::read_to_string(path).ok()?;
-        toml::from_str(&content).ok()
+        // Check file size to prevent DoS
+        match std::fs::metadata(path) {
+            Ok(metadata) => {
+                if metadata.len() > MAX_CONFIG_FILE_SIZE {
+                    return Err(format!(
+                        "Config file too large: {} bytes (max {} MB). Consider splitting into multiple files.",
+                        metadata.len(),
+                        MAX_CONFIG_FILE_SIZE / 1024 / 1024
+                    ));
+                }
+            }
+            Err(e) => {
+                return Err(format!(
+                    "Cannot read config file metadata: {}. Check file permissions.",
+                    e
+                ));
+            }
+        }
+
+        // Read file content
+        let content = std::fs::read_to_string(path).map_err(|e| {
+            if e.kind() == std::io::ErrorKind::PermissionDenied {
+                format!(
+                    "Permission denied reading config file: {}. Check file permissions.",
+                    path.display()
+                )
+            } else {
+                format!("Failed to read config file {}: {}", path.display(), e)
+            }
+        })?;
+
+        // Parse TOML
+        toml::from_str(&content).map_err(|e| {
+            // toml::de::Error provides line/column info
+            format!("Invalid TOML in config file {}:\n  {}", path.display(), e)
+        })
     }
 
     /// Check if a package should be ignored
@@ -587,5 +624,71 @@ other-pkg = "1.0"
             // CargoTomlUpdater counts pinned packages only in pinned, not updated
             assert_eq!(result.updated.len(), 1); // only other-pkg
         }
+    }
+
+    // ==================== Error Handling Tests ====================
+
+    #[test]
+    fn test_load_from_path_with_error_file_not_found() {
+        let temp_dir = TempDir::new().unwrap();
+        let nonexistent = temp_dir.path().join("nonexistent.toml");
+
+        let result = UpdConfig::load_from_path_with_error(&nonexistent);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            err.contains("not found"),
+            "Error should mention 'not found': {}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_load_from_path_with_error_invalid_toml() {
+        let temp_dir = TempDir::new().unwrap();
+        let config_path = temp_dir.path().join("invalid.toml");
+
+        // Invalid TOML syntax
+        fs::write(&config_path, "ignore = [invalid syntax").unwrap();
+
+        let result = UpdConfig::load_from_path_with_error(&config_path);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            err.contains("Invalid TOML"),
+            "Error should mention 'Invalid TOML': {}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_load_from_path_with_error_wrong_type() {
+        let temp_dir = TempDir::new().unwrap();
+        let config_path = temp_dir.path().join("wrong_type.toml");
+
+        // Wrong type: ignore should be array, not string
+        fs::write(&config_path, "ignore = \"not-an-array\"").unwrap();
+
+        let result = UpdConfig::load_from_path_with_error(&config_path);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            err.contains("Invalid TOML"),
+            "Error should mention 'Invalid TOML': {}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_load_from_path_with_error_success() {
+        let temp_dir = TempDir::new().unwrap();
+        let config_path = temp_dir.path().join("valid.toml");
+
+        fs::write(&config_path, "ignore = [\"pkg1\", \"pkg2\"]").unwrap();
+
+        let result = UpdConfig::load_from_path_with_error(&config_path);
+        assert!(result.is_ok());
+        let config = result.unwrap();
+        assert_eq!(config.ignore.len(), 2);
     }
 }

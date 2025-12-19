@@ -61,6 +61,64 @@ pub async fn get_with_retry(client: &Client, url: &str) -> Result<Response, reqw
     Err(last_error.unwrap())
 }
 
+/// Create a descriptive error message for HTTP failures
+/// Helps users understand why a request failed and what to do
+///
+/// # Arguments
+/// * `status` - HTTP status code
+/// * `entity_type` - Type of entity (e.g., "Package", "Crate", "Module")
+/// * `name` - Name of the package/crate/module
+/// * `registry_hint` - Optional hint about where to configure credentials
+pub fn http_error_message(
+    status: reqwest::StatusCode,
+    entity_type: &str,
+    name: &str,
+    registry_hint: Option<&str>,
+) -> String {
+    let code = status.as_u16();
+    match code {
+        401 => {
+            let hint = registry_hint.map_or_else(
+                || "Check your credentials or API token.".to_string(),
+                |h| format!("Check your credentials or API token. {}", h),
+            );
+            format!(
+                "{} '{}' requires authentication (HTTP 401). {}",
+                entity_type, name, hint
+            )
+        }
+        403 => format!(
+            "Access denied for {} '{}' (HTTP 403). You may lack permission or the {} may be private.",
+            entity_type,
+            name,
+            entity_type.to_lowercase()
+        ),
+        404 => format!(
+            "{} '{}' not found (HTTP 404). Check the name for typos or verify it exists in the registry.",
+            entity_type, name
+        ),
+        408 | 504 => format!(
+            "Request timed out for {} '{}' (HTTP {}). The registry may be slow or unreachable.",
+            entity_type, name, code
+        ),
+        429 => format!(
+            "Rate limited while fetching {} '{}' (HTTP 429). Wait a moment and try again.",
+            entity_type, name
+        ),
+        500..=599 => format!(
+            "Registry server error for {} '{}' (HTTP {}). The registry may be experiencing issues.",
+            entity_type, name, code
+        ),
+        _ => format!(
+            "Failed to fetch {} '{}': HTTP {} {}",
+            entity_type,
+            name,
+            code,
+            status.canonical_reason().unwrap_or("Unknown error")
+        ),
+    }
+}
+
 #[async_trait]
 pub trait Registry: Send + Sync {
     /// Get the latest stable version of a package
