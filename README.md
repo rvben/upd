@@ -4,8 +4,7 @@
 
 # upd
 
-A fast dependency updater for Python, Node.js, Rust, and Go projects,
-written in Rust.
+A fast dependency updater for Python, Node.js, Rust, Go, Ruby, GitHub Actions, pre-commit, and Mise projects, written in Rust.
 
 ## Quick Start
 
@@ -22,9 +21,9 @@ uvx --from upd-cli upd -n
 
 ## Features
 
-- **Multi-ecosystem**: Python, Node.js, Rust, and Go dependencies
+- **Multi-ecosystem**: Python, Node.js, Rust, Go, Ruby, GitHub Actions, pre-commit, Mise/asdf
 - **Fast**: Parallel registry requests for all dependencies
-- **Constraint-aware**: Respects version constraints like `>=2.0,<3`
+- **Constraint-aware**: Respects version constraints like `>=2.0,<3` and `~> 7.1`
 - **Smart caching**: 24-hour version cache for faster subsequent runs
 - **Update filters**: Filter by `--major`, `--minor`, or `--patch` updates
 - **Interactive mode**: Approve updates individually with `-i`
@@ -36,7 +35,7 @@ uvx --from upd-cli upd -n
 - **Version alignment**: Align package versions across multiple files
 - **Security auditing**: Check dependencies for known vulnerabilities via OSV
 - **Config file support**: Ignore or pin packages via `.updrc.toml`
-- **Private registries**: Authentication for PyPI, npm, Cargo, and Go
+- **Private registries**: Authentication for PyPI, npm, Cargo, Go, and GitHub
 
 ## Installation
 
@@ -104,6 +103,10 @@ upd --interactive
 upd --lang python           # Update only Python dependencies
 upd -l rust                 # Short form
 upd --lang python --lang go # Update Python and Go only
+upd --lang actions          # Update only GitHub Actions
+upd --lang pre-commit       # Update only pre-commit hooks
+upd --lang ruby             # Update only Ruby gems
+upd --lang mise             # Update only Mise/asdf tools
 
 # Version precision
 upd --full-precision  # Output full versions (e.g., 3.1.5 instead of 3.1)
@@ -160,15 +163,41 @@ upd audit --check  # Exit 1 if vulnerabilities found (for CI)
 
 - `go.mod` (`require` blocks)
 
+### Ruby
+
+- `Gemfile` (gem declarations with version constraints)
+
+### GitHub Actions
+
+- `.github/workflows/*.yml` and `.github/workflows/*.yaml`
+- Updates `uses:` version references (e.g., `actions/checkout@v3` → `actions/checkout@v4`)
+- Skips SHA-pinned actions, branch refs, local actions, and Docker references
+- Authenticates via `GITHUB_TOKEN` or `GH_TOKEN` for higher API rate limits
+
+### Pre-commit
+
+- `.pre-commit-config.yaml`
+- Updates `rev:` fields for GitHub-hosted hook repositories
+- Skips local hooks, meta hooks, and non-GitHub repositories
+
+### Mise / asdf
+
+- `.mise.toml` (`[tools]` section)
+- `.tool-versions` (space-delimited format)
+- Supports 24+ common dev tools: node, python, go, rust, zig, deno, bun, uv, ruff, terraform, kubectl, helm, and more
+- Skips `latest` versions and `cargo:*` tools
+
 ## Example Output
 
 ```text
-pyproject.toml:12: Would update requests 2.28.0 → 2.31.0
-pyproject.toml:13: Would update flask 2.2.0 → 3.0.0 (MAJOR)
-Cargo.toml:8: Would update serde 1.0.180 → 1.0.200
-Cargo.toml:9: Would update tokio 1.28.0 → 1.35.0
+.pre-commit-config.yaml:37: Would update pre-commit/pre-commit-hooks v4.6.0 → v6.0.0 (MAJOR)
+.github/workflows/ci.yml:16: Would update actions/checkout v4 → v6 (MAJOR)
+.github/workflows/ci.yml:18: Would update jdx/mise-action v2 → v4 (MAJOR)
+.mise.toml:8: Would update rust 1.91.1 → 1.94.0
+Cargo.toml:33: Would update clap 4.5.53 → 4.6.0
+Cargo.toml:36: Would update tokio 1.48.0 → 1.50.0
 
-Would update 4 package(s) in 2 file(s), 15 up to date
+Would update 6 package(s) (2 major, 3 minor, 1 patch) in 4 file(s), 8 up to date
 ```
 
 Output includes clickable `file:line:` locations (recognized by VS Code, iTerm2, and modern terminals).
@@ -184,6 +213,9 @@ django>=4         →  django>=6         (not 6.0.0)
 
 # Original file has 3-component versions
 requests>=2.0.0   →  requests>=2.32.5
+
+# GitHub Actions major-only tags
+actions/checkout@v3  →  actions/checkout@v4  (not @v4.2.0)
 ```
 
 Use `--full-precision` to always output full semver versions:
@@ -260,13 +292,7 @@ Checking 42 unique package(s) for vulnerabilities...
 Summary: 2 vulnerable package(s), 3 total vulnerability/ies
 ```
 
-**Features:**
-
-- Queries the OSV API (free, no API key required)
-- Supports all ecosystems: PyPI, npm, crates.io, Go
-- Deduplicates packages across files
-- Shows severity scores (CVSS), descriptions, and fixed versions
-- Batch queries for efficiency (up to 1000 packages per request)
+**Supported ecosystems for auditing:** PyPI, npm, crates.io, Go, RubyGems
 
 **CI/CD Integration:**
 
@@ -274,19 +300,6 @@ Summary: 2 vulnerable package(s), 3 total vulnerability/ies
 # GitHub Actions example
 - name: Check for vulnerabilities
   run: upd audit --check
-```
-
-```yaml
-# Pre-commit hook (.pre-commit-config.yaml)
-repos:
-  - repo: local
-    hooks:
-      - id: upd-audit
-        name: security audit
-        entry: upd audit --check
-        language: system
-        pass_filenames: false
-        stages: [pre-push]
 ```
 
 ## Version Constraints
@@ -298,6 +311,7 @@ repos:
 | `>=2.0,<3` | Updates within 2.x range only |
 | `^2.0.0` | Updates within 2.x range (npm/Cargo) |
 | `~2.0.0` | Updates within 2.0.x range (npm) |
+| `~> 7.1` | Updates within 7.x range (Ruby pessimistic) |
 | `>=2.0` | Updates to any version >= 2.0 |
 | `==2.0.0` | No updates (pinned) |
 
@@ -324,12 +338,16 @@ The search starts from the target directory and walks up to parent directories, 
 ignore = [
     "legacy-package",
     "internal-tool",
+    "actions/checkout",        # GitHub Actions use owner/repo
+    "pre-commit/pre-commit-hooks",  # Pre-commit hooks too
 ]
 
 # Pin packages to specific versions (bypasses registry lookup)
 [pin]
 flask = "2.3.0"
 django = "4.2.0"
+"actions/setup-node" = "v4"   # Pin GitHub Actions
+"psf/black" = "24.0.0"        # Pin pre-commit hooks
 ```
 
 ### Options
@@ -338,38 +356,6 @@ django = "4.2.0"
 |--------|------|-------------|
 | `ignore` | `string[]` | List of package names to skip during updates |
 | `pin` | `table` | Map of package names to pinned versions |
-
-### Example Configurations
-
-**Ignore unstable packages:**
-
-```toml
-# .updrc.toml
-ignore = [
-    "experimental-api",
-    "beta-feature",
-]
-```
-
-**Pin critical dependencies:**
-
-```toml
-# .updrc.toml
-[pin]
-django = "4.2.0"      # LTS version
-sqlalchemy = "2.0.0"  # Major version boundary
-```
-
-**Combined configuration:**
-
-```toml
-# .updrc.toml
-ignore = ["internal-utils"]
-
-[pin]
-requests = "2.31.0"
-flask = "3.0.0"
-```
 
 ### Verbose Output
 
@@ -515,12 +501,25 @@ export GONOSUMDB=github.com/mycompany/*
 the public proxy. `upd` respects these patterns and will attempt direct access
 for matching modules.
 
+### GitHub (Actions & Pre-commit)
+
+```bash
+# Option 1: GITHUB_TOKEN (automatically available in GitHub Actions)
+export GITHUB_TOKEN=ghp_your-token-here
+
+# Option 2: GH_TOKEN (used by the gh CLI)
+export GH_TOKEN=ghp_your-token-here
+```
+
+Without a token, the GitHub API rate limit is 60 requests/hour. With a token, it's 5,000 requests/hour.
+
 Use `--verbose` to see when authenticated access is being used:
 
 ```bash
 upd --verbose
 # Output: Using authenticated PyPI access
 # Output: Using authenticated npm access
+# Output: Using authenticated GitHub access
 ```
 
 ## Environment Variables
@@ -545,6 +544,8 @@ upd --verbose
 | `GOPRIVATE` | Comma-separated private module patterns |
 | `GONOPROXY` | Modules to exclude from proxy |
 | `GONOSUMDB` | Modules to exclude from checksum DB |
+| `GITHUB_TOKEN` | GitHub API token (for Actions and pre-commit) |
+| `GH_TOKEN` | GitHub API token (gh CLI compatible) |
 | `UPD_CACHE_DIR` | Custom cache directory |
 
 ## Pre-commit Integration
@@ -554,7 +555,7 @@ Add `upd` to your `.pre-commit-config.yaml`:
 ```yaml
 repos:
   - repo: https://github.com/rvben/upd
-    rev: v0.0.17  # Use the latest version
+    rev: v0.0.22  # Use the latest version
     hooks:
       - id: upd-check
         # Optional: only check specific ecosystems
