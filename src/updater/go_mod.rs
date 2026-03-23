@@ -277,7 +277,10 @@ impl Updater for GoModUpdater {
 
             // Check if we have a version result for this line
             if let Some(version_result) = version_map.remove(&line_idx) {
-                let (module, current_version, is_pinned) = module_info.get(&line_idx).unwrap();
+                let Some((module, current_version, is_pinned)) = module_info.get(&line_idx) else {
+                    new_lines.push(line.to_string());
+                    continue;
+                };
 
                 match version_result {
                     Ok(latest_version) => {
@@ -289,7 +292,7 @@ impl Updater for GoModUpdater {
                         };
                         if matched_version != *current_version {
                             // Replace version in the line, preserving everything else
-                            let new_line = line.replace(current_version, &matched_version);
+                            let new_line = line.replacen(current_version, &matched_version, 1);
                             new_lines.push(new_line);
 
                             if *is_pinned {
