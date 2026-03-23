@@ -1,4 +1,5 @@
 mod crates_io;
+mod github_releases;
 mod go_proxy;
 #[cfg(test)]
 pub mod mock;
@@ -7,6 +8,7 @@ mod pypi;
 mod utils;
 
 pub use crates_io::{CargoConfig, CargoCredentials, CratesIoRegistry, read_cargo_config};
+pub use github_releases::GitHubReleasesRegistry;
 pub use go_proxy::{GoCredentials, GoPrivateConfig, GoProxyRegistry, read_go_private_config};
 #[cfg(test)]
 pub use mock::MockRegistry;
