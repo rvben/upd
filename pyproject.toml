@@ -5,11 +5,11 @@ build-backend = "maturin"
 [project]
 name = "upd-cli"
 dynamic = ["version"]
-description = "A fast dependency updater for Python and Node.js projects"
+description = "A fast dependency updater for Python, Node.js, Rust, Go, Ruby, Terraform, GitHub Actions, pre-commit, and Mise projects"
 readme = "README.md"
 license = { text = "MIT" }
 authors = [{ name = "Ruben Jongejan", email = "ruben.jongejan@gmail.com" }]
-keywords = ["dependencies", "update", "python", "nodejs", "npm"]
+keywords = ["dependencies", "update", "python", "nodejs", "rust", "go", "ruby", "terraform", "github-actions"]
 classifiers = [
     "Development Status :: 4 - Beta",
     "Environment :: Console",
