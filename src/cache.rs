@@ -21,6 +21,8 @@ pub struct Cache {
     crates_io: HashMap<String, CacheEntry>,
     #[serde(default, rename = "go-proxy")]
     go_proxy: HashMap<String, CacheEntry>,
+    #[serde(default, rename = "github-releases")]
+    github_releases: HashMap<String, CacheEntry>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -74,6 +76,7 @@ impl Cache {
             "npm" => &self.npm,
             "crates.io" => &self.crates_io,
             "go-proxy" => &self.go_proxy,
+            "github-releases" => &self.github_releases,
             _ => return None,
         };
 
@@ -92,6 +95,7 @@ impl Cache {
             "npm" => &mut self.npm,
             "crates.io" => &mut self.crates_io,
             "go-proxy" => &mut self.go_proxy,
+            "github-releases" => &mut self.github_releases,
             _ => return,
         };
 
@@ -148,6 +152,8 @@ impl Cache {
         self.crates_io
             .retain(|_, entry| !Self::is_expired(entry.fetched_at));
         self.go_proxy
+            .retain(|_, entry| !Self::is_expired(entry.fetched_at));
+        self.github_releases
             .retain(|_, entry| !Self::is_expired(entry.fetched_at));
     }
 }
@@ -265,6 +271,12 @@ mod tests {
         assert_eq!(
             cache.get("go-proxy", "golang.org/x/sync"),
             Some("v0.7.0".to_string())
+        );
+
+        cache.set("github-releases", "actions/checkout", "v4.2.0".to_string());
+        assert_eq!(
+            cache.get("github-releases", "actions/checkout"),
+            Some("v4.2.0".to_string())
         );
     }
 
