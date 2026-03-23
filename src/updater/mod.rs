@@ -1,10 +1,12 @@
 mod cargo_toml;
+mod github_actions;
 mod go_mod;
 mod package_json;
 mod pyproject;
 mod requirements;
 
 pub use cargo_toml::CargoTomlUpdater;
+pub use github_actions::GithubActionsUpdater;
 pub use go_mod::GoModUpdater;
 pub use package_json::PackageJsonUpdater;
 pub use pyproject::PyProjectUpdater;

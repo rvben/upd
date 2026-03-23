@@ -4,8 +4,8 @@
 //! used across multiple dependency files and update all occurrences to that version.
 
 use crate::updater::{
-    CargoTomlUpdater, FileType, GoModUpdater, Lang, PackageJsonUpdater, ParsedDependency,
-    PyProjectUpdater, RequirementsUpdater, Updater,
+    CargoTomlUpdater, FileType, GithubActionsUpdater, GoModUpdater, Lang, PackageJsonUpdater,
+    ParsedDependency, PyProjectUpdater, RequirementsUpdater, Updater,
 };
 use anyhow::Result;
 use std::collections::HashMap;
@@ -76,7 +76,7 @@ fn get_updater(file_type: FileType) -> Box<dyn Updater> {
         FileType::PackageJson => Box::new(PackageJsonUpdater::new()),
         FileType::CargoToml => Box::new(CargoTomlUpdater::new()),
         FileType::GoMod => Box::new(GoModUpdater::new()),
-        FileType::GithubActions => unimplemented!("GithubActions updater - added in task 4"),
+        FileType::GithubActions => Box::new(GithubActionsUpdater::new()),
     }
 }
 
