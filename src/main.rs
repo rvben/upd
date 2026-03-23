@@ -15,12 +15,12 @@ use upd::interactive::{PendingUpdate, prompt_all};
 use upd::lockfile::regenerate_lockfiles;
 use upd::registry::{
     CratesIoRegistry, GitHubReleasesRegistry, GoProxyRegistry, MultiPyPiRegistry, NpmRegistry,
-    PyPiRegistry,
+    PyPiRegistry, RubyGemsRegistry,
 };
 use upd::updater::{
-    CargoTomlUpdater, FileType, GithubActionsUpdater, GoModUpdater, Lang, PackageJsonUpdater,
-    PreCommitUpdater, PyProjectUpdater, RequirementsUpdater, UpdateOptions, UpdateResult, Updater,
-    discover_files, read_file_safe, write_file_atomic,
+    CargoTomlUpdater, FileType, GemfileUpdater, GithubActionsUpdater, GoModUpdater, Lang,
+    PackageJsonUpdater, PreCommitUpdater, PyProjectUpdater, RequirementsUpdater, UpdateOptions,
+    UpdateResult, Updater, discover_files, read_file_safe, write_file_atomic,
 };
 use upd::version::match_version_precision;
 
@@ -236,6 +236,10 @@ async fn run_update(cli: &Cli) -> Result<()> {
 
     let go_proxy = CachedRegistry::new(go_proxy_registry, Arc::clone(&cache), cache_enabled);
 
+    // Create RubyGems registry
+    let rubygems_registry = RubyGemsRegistry::new();
+    let rubygems = CachedRegistry::new(rubygems_registry, Arc::clone(&cache), cache_enabled);
+
     // Create GitHub releases registry with optional token
     let github_releases_registry = GitHubReleasesRegistry::new();
     if cli.verbose && GitHubReleasesRegistry::detect_token().is_some() {
@@ -252,12 +256,14 @@ async fn run_update(cli: &Cli) -> Result<()> {
     let go_mod_updater = Arc::new(GoModUpdater::new());
     let github_actions_updater = Arc::new(GithubActionsUpdater::new());
     let pre_commit_updater = Arc::new(PreCommitUpdater::new());
+    let gemfile_updater = Arc::new(GemfileUpdater::new());
 
     // Wrap registries in Arc for parallel processing
     let pypi = Arc::new(pypi);
     let npm = Arc::new(npm);
     let crates_io = Arc::new(crates_io);
     let go_proxy = Arc::new(go_proxy);
+    let rubygems = Arc::new(rubygems);
     let github_releases = Arc::new(github_releases);
 
     // Interactive mode: first discover updates, then prompt, then apply approved ones
@@ -271,12 +277,14 @@ async fn run_update(cli: &Cli) -> Result<()> {
             &npm,
             &crates_io,
             &go_proxy,
+            &rubygems,
             &github_releases,
             &requirements_updater,
             &pyproject_updater,
             &package_json_updater,
             &cargo_toml_updater,
             &go_mod_updater,
+            &gemfile_updater,
             &github_actions_updater,
             &pre_commit_updater,
             &cache,
@@ -307,12 +315,14 @@ async fn run_update(cli: &Cli) -> Result<()> {
             let npm = Arc::clone(&npm);
             let crates_io = Arc::clone(&crates_io);
             let go_proxy = Arc::clone(&go_proxy);
+            let rubygems = Arc::clone(&rubygems);
             let github_releases = Arc::clone(&github_releases);
             let requirements_updater = Arc::clone(&requirements_updater);
             let pyproject_updater = Arc::clone(&pyproject_updater);
             let package_json_updater = Arc::clone(&package_json_updater);
             let cargo_toml_updater = Arc::clone(&cargo_toml_updater);
             let go_mod_updater = Arc::clone(&go_mod_updater);
+            let gemfile_updater = Arc::clone(&gemfile_updater);
             let github_actions_updater = Arc::clone(&github_actions_updater);
             let pre_commit_updater = Arc::clone(&pre_commit_updater);
             let update_options = update_options.clone();
@@ -342,6 +352,11 @@ async fn run_update(cli: &Cli) -> Result<()> {
                     FileType::GoMod => {
                         go_mod_updater
                             .update(&path, go_proxy.as_ref(), update_options.clone())
+                            .await
+                    }
+                    FileType::Gemfile => {
+                        gemfile_updater
+                            .update(&path, rubygems.as_ref(), update_options.clone())
                             .await
                     }
                     FileType::GithubActions => {
@@ -448,12 +463,14 @@ async fn run_interactive_update(
     npm: &Arc<CachedRegistry<NpmRegistry>>,
     crates_io: &Arc<CachedRegistry<CratesIoRegistry>>,
     go_proxy: &Arc<CachedRegistry<GoProxyRegistry>>,
+    rubygems: &Arc<CachedRegistry<RubyGemsRegistry>>,
     github_releases: &Arc<CachedRegistry<GitHubReleasesRegistry>>,
     requirements_updater: &Arc<RequirementsUpdater>,
     pyproject_updater: &Arc<PyProjectUpdater>,
     package_json_updater: &Arc<PackageJsonUpdater>,
     cargo_toml_updater: &Arc<CargoTomlUpdater>,
     go_mod_updater: &Arc<GoModUpdater>,
+    gemfile_updater: &Arc<GemfileUpdater>,
     github_actions_updater: &Arc<GithubActionsUpdater>,
     pre_commit_updater: &Arc<PreCommitUpdater>,
     cache: &Arc<std::sync::Mutex<Cache>>,
@@ -499,6 +516,11 @@ async fn run_interactive_update(
             FileType::GoMod => {
                 go_mod_updater
                     .update(path, go_proxy.as_ref(), dry_run_options.clone())
+                    .await
+            }
+            FileType::Gemfile => {
+                gemfile_updater
+                    .update(path, rubygems.as_ref(), dry_run_options.clone())
                     .await
             }
             FileType::GithubActions => {
@@ -609,6 +631,11 @@ async fn run_interactive_update(
             FileType::GoMod => {
                 go_mod_updater
                     .update(path, go_proxy.as_ref(), apply_options.clone())
+                    .await
+            }
+            FileType::Gemfile => {
+                gemfile_updater
+                    .update(path, rubygems.as_ref(), apply_options.clone())
                     .await
             }
             FileType::GithubActions => {
@@ -820,6 +847,7 @@ async fn run_audit(cli: &Cli) -> Result<()> {
             Lang::Node => Ecosystem::Npm,
             Lang::Rust => Ecosystem::CratesIo,
             Lang::Go => Ecosystem::Go,
+            Lang::Ruby => Ecosystem::RubyGems,
             Lang::Actions | Lang::PreCommit => unreachable!("filtered above"),
         };
 
@@ -890,6 +918,7 @@ async fn run_audit(cli: &Cli) -> Result<()> {
                 Ecosystem::Npm => "(npm)",
                 Ecosystem::CratesIo => "(crates.io)",
                 Ecosystem::Go => "(Go)",
+                Ecosystem::RubyGems => "(RubyGems)",
             };
 
             println!(
@@ -971,6 +1000,7 @@ fn print_alignment(alignment: &PackageAlignment, _dry_run: bool) {
         Lang::Node => " (npm)",
         Lang::Rust => " (cargo)",
         Lang::Go => " (go)",
+        Lang::Ruby => " (rubygems)",
         Lang::Actions => " (actions)",
         Lang::PreCommit => " (pre-commit)",
     };
@@ -1087,6 +1117,9 @@ fn apply_version_updates(
             FileType::GoMod => {
                 replace_go_mod_version(&result, package, old_version, &target_version)
             }
+            FileType::Gemfile => {
+                replace_gemfile_version(&result, package, old_version, &target_version)
+            }
             FileType::GithubActions => {
                 replace_github_actions_version(&result, package, old_version, &target_version)
             }
@@ -1187,6 +1220,18 @@ fn replace_go_mod_version(content: &str, package: &str, old: &str, new: &str) ->
     // Pattern: module/path vOLD
     let pattern = format!(
         r"({}\s+){}(\s|$)",
+        regex::escape(package),
+        regex::escape(old)
+    );
+    let re = regex::Regex::new(&pattern).unwrap();
+    re.replace_all(content, format!("${{1}}{}${{2}}", new))
+        .to_string()
+}
+
+fn replace_gemfile_version(content: &str, package: &str, old: &str, new: &str) -> String {
+    // Pattern: gem 'package', 'operator old_version'
+    let pattern = format!(
+        r#"(gem\s+['"]{}['"]\s*,\s*['"](?:~>\s*|>=\s*|<=\s*|>\s*|<\s*|=\s*|!=\s*)?){}(['"])"#,
         regex::escape(package),
         regex::escape(old)
     );

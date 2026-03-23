@@ -4,8 +4,9 @@
 //! used across multiple dependency files and update all occurrences to that version.
 
 use crate::updater::{
-    CargoTomlUpdater, FileType, GithubActionsUpdater, GoModUpdater, Lang, PackageJsonUpdater,
-    ParsedDependency, PreCommitUpdater, PyProjectUpdater, RequirementsUpdater, Updater,
+    CargoTomlUpdater, FileType, GemfileUpdater, GithubActionsUpdater, GoModUpdater, Lang,
+    PackageJsonUpdater, ParsedDependency, PreCommitUpdater, PyProjectUpdater, RequirementsUpdater,
+    Updater,
 };
 use anyhow::Result;
 use std::collections::HashMap;
@@ -76,6 +77,7 @@ fn get_updater(file_type: FileType) -> Box<dyn Updater> {
         FileType::PackageJson => Box::new(PackageJsonUpdater::new()),
         FileType::CargoToml => Box::new(CargoTomlUpdater::new()),
         FileType::GoMod => Box::new(GoModUpdater::new()),
+        FileType::Gemfile => Box::new(GemfileUpdater::new()),
         FileType::GithubActions => Box::new(GithubActionsUpdater::new()),
         FileType::PreCommitConfig => Box::new(PreCommitUpdater::new()),
     }
@@ -179,6 +181,13 @@ fn is_stable_version(version: &str, lang: Lang) -> bool {
             // Semver pre-release indicator: hyphen followed by identifier
             !version.contains('-')
         }
+        Lang::Ruby => {
+            let v = version.to_lowercase();
+            !v.contains(".pre")
+                && !v.contains(".rc")
+                && !v.contains(".beta")
+                && !v.contains(".alpha")
+        }
         Lang::Actions | Lang::PreCommit => {
             let v = version.strip_prefix('v').unwrap_or(version);
             !v.contains('-')
@@ -190,7 +199,7 @@ fn is_stable_version(version: &str, lang: Lang) -> bool {
 fn compare_versions(a: &str, b: &str, lang: Lang) -> std::cmp::Ordering {
     match lang {
         Lang::Python => compare_pep440(a, b),
-        Lang::Node | Lang::Rust => compare_semver(a, b),
+        Lang::Node | Lang::Rust | Lang::Ruby => compare_semver(a, b),
         Lang::Go => compare_go_version(a, b),
         Lang::Actions | Lang::PreCommit => {
             let clean_a = a.trim_start_matches('v');

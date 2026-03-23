@@ -1,4 +1,5 @@
 mod cargo_toml;
+mod gemfile;
 mod github_actions;
 mod go_mod;
 mod package_json;
@@ -7,6 +8,7 @@ mod pyproject;
 mod requirements;
 
 pub use cargo_toml::CargoTomlUpdater;
+pub use gemfile::GemfileUpdater;
 pub use github_actions::GithubActionsUpdater;
 pub use go_mod::GoModUpdater;
 pub use package_json::PackageJsonUpdater;
@@ -155,6 +157,7 @@ pub enum Lang {
     Node,
     Rust,
     Go,
+    Ruby,
     Actions,
     PreCommit,
 }
@@ -167,6 +170,7 @@ pub enum FileType {
     PackageJson,
     CargoToml,
     GoMod,
+    Gemfile,
     GithubActions,
     PreCommitConfig,
 }
@@ -179,6 +183,7 @@ impl FileType {
             FileType::PackageJson => Lang::Node,
             FileType::CargoToml => Lang::Rust,
             FileType::GoMod => Lang::Go,
+            FileType::Gemfile => Lang::Ruby,
             FileType::GithubActions => Lang::Actions,
             FileType::PreCommitConfig => Lang::PreCommit,
         }
@@ -203,6 +208,10 @@ impl FileType {
 
         if file_name == "go.mod" {
             return Some(FileType::GoMod);
+        }
+
+        if file_name == "Gemfile" {
+            return Some(FileType::Gemfile);
         }
 
         if file_name == ".pre-commit-config.yaml" {
@@ -578,6 +587,7 @@ mod tests {
         assert_eq!(FileType::PackageJson.lang(), Lang::Node);
         assert_eq!(FileType::CargoToml.lang(), Lang::Rust);
         assert_eq!(FileType::GoMod.lang(), Lang::Go);
+        assert_eq!(FileType::Gemfile.lang(), Lang::Ruby);
         assert_eq!(FileType::GithubActions.lang(), Lang::Actions);
         assert_eq!(FileType::PreCommitConfig.lang(), Lang::PreCommit);
     }

@@ -23,6 +23,7 @@ pub enum Ecosystem {
     Npm,
     CratesIo,
     Go,
+    RubyGems,
 }
 
 impl Ecosystem {
@@ -33,6 +34,7 @@ impl Ecosystem {
             Ecosystem::Npm => "npm",
             Ecosystem::CratesIo => "crates.io",
             Ecosystem::Go => "Go",
+            Ecosystem::RubyGems => "RubyGems",
         }
     }
 }

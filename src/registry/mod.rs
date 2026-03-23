@@ -5,6 +5,7 @@ mod go_proxy;
 pub mod mock;
 mod npm;
 mod pypi;
+mod rubygems;
 mod utils;
 
 pub use crates_io::{CargoConfig, CargoCredentials, CratesIoRegistry, read_cargo_config};
@@ -14,6 +15,7 @@ pub use go_proxy::{GoCredentials, GoPrivateConfig, GoProxyRegistry, read_go_priv
 pub use mock::MockRegistry;
 pub use npm::{NpmCredentials, NpmRegistry, NpmrcConfig, read_npmrc_config};
 pub use pypi::{MultiPyPiRegistry, PyPiCredentials, PyPiRegistry};
+pub use rubygems::RubyGemsRegistry;
 
 use anyhow::Result;
 use async_trait::async_trait;
