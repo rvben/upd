@@ -2,6 +2,7 @@ mod cargo_toml;
 mod github_actions;
 mod go_mod;
 mod package_json;
+mod pre_commit;
 mod pyproject;
 mod requirements;
 
@@ -9,6 +10,7 @@ pub use cargo_toml::CargoTomlUpdater;
 pub use github_actions::GithubActionsUpdater;
 pub use go_mod::GoModUpdater;
 pub use package_json::PackageJsonUpdater;
+pub use pre_commit::PreCommitUpdater;
 pub use pyproject::PyProjectUpdater;
 pub use requirements::RequirementsUpdater;
 
@@ -154,6 +156,7 @@ pub enum Lang {
     Rust,
     Go,
     Actions,
+    PreCommit,
 }
 
 /// Type of dependency file
@@ -165,6 +168,7 @@ pub enum FileType {
     CargoToml,
     GoMod,
     GithubActions,
+    PreCommitConfig,
 }
 
 impl FileType {
@@ -176,6 +180,7 @@ impl FileType {
             FileType::CargoToml => Lang::Rust,
             FileType::GoMod => Lang::Go,
             FileType::GithubActions => Lang::Actions,
+            FileType::PreCommitConfig => Lang::PreCommit,
         }
     }
 }
@@ -198,6 +203,10 @@ impl FileType {
 
         if file_name == "go.mod" {
             return Some(FileType::GoMod);
+        }
+
+        if file_name == ".pre-commit-config.yaml" {
+            return Some(FileType::PreCommitConfig);
         }
 
         // Requirements file patterns (.txt and .in extensions)
@@ -275,6 +284,15 @@ fn discover_github_actions(path: &Path, files: &mut Vec<(PathBuf, FileType)>) {
     }
 }
 
+/// Scan for .pre-commit-config.yaml in a directory.
+/// This is a separate pass because WalkBuilder::hidden(true) skips dot-files.
+fn discover_pre_commit_config(path: &Path, files: &mut Vec<(PathBuf, FileType)>) {
+    let config_path = path.join(".pre-commit-config.yaml");
+    if config_path.is_file() {
+        files.push((config_path, FileType::PreCommitConfig));
+    }
+}
+
 /// Discover dependency files in the given paths, optionally filtered by language
 pub fn discover_files(paths: &[PathBuf], langs: &[Lang]) -> Vec<(PathBuf, FileType)> {
     let mut files = Vec::new();
@@ -308,6 +326,11 @@ pub fn discover_files(paths: &[PathBuf], langs: &[Lang]) -> Vec<(PathBuf, FileTy
             // Separate scan for .github/workflows/ (hidden from WalkBuilder)
             if langs.is_empty() || langs.contains(&Lang::Actions) {
                 discover_github_actions(path, &mut files);
+            }
+
+            // Separate scan for .pre-commit-config.yaml (hidden from WalkBuilder)
+            if langs.is_empty() || langs.contains(&Lang::PreCommit) {
+                discover_pre_commit_config(path, &mut files);
             }
         }
     }
@@ -556,6 +579,7 @@ mod tests {
         assert_eq!(FileType::CargoToml.lang(), Lang::Rust);
         assert_eq!(FileType::GoMod.lang(), Lang::Go);
         assert_eq!(FileType::GithubActions.lang(), Lang::Actions);
+        assert_eq!(FileType::PreCommitConfig.lang(), Lang::PreCommit);
     }
 
     #[test]

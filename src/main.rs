@@ -19,8 +19,8 @@ use upd::registry::{
 };
 use upd::updater::{
     CargoTomlUpdater, FileType, GithubActionsUpdater, GoModUpdater, Lang, PackageJsonUpdater,
-    PyProjectUpdater, RequirementsUpdater, UpdateOptions, UpdateResult, Updater, discover_files,
-    read_file_safe, write_file_atomic,
+    PreCommitUpdater, PyProjectUpdater, RequirementsUpdater, UpdateOptions, UpdateResult, Updater,
+    discover_files, read_file_safe, write_file_atomic,
 };
 use upd::version::match_version_precision;
 
@@ -251,6 +251,7 @@ async fn run_update(cli: &Cli) -> Result<()> {
     let cargo_toml_updater = Arc::new(CargoTomlUpdater::new());
     let go_mod_updater = Arc::new(GoModUpdater::new());
     let github_actions_updater = Arc::new(GithubActionsUpdater::new());
+    let pre_commit_updater = Arc::new(PreCommitUpdater::new());
 
     // Wrap registries in Arc for parallel processing
     let pypi = Arc::new(pypi);
@@ -277,6 +278,7 @@ async fn run_update(cli: &Cli) -> Result<()> {
             &cargo_toml_updater,
             &go_mod_updater,
             &github_actions_updater,
+            &pre_commit_updater,
             &cache,
             cache_enabled,
         )
@@ -312,6 +314,7 @@ async fn run_update(cli: &Cli) -> Result<()> {
             let cargo_toml_updater = Arc::clone(&cargo_toml_updater);
             let go_mod_updater = Arc::clone(&go_mod_updater);
             let github_actions_updater = Arc::clone(&github_actions_updater);
+            let pre_commit_updater = Arc::clone(&pre_commit_updater);
             let update_options = update_options.clone();
 
             async move {
@@ -343,6 +346,11 @@ async fn run_update(cli: &Cli) -> Result<()> {
                     }
                     FileType::GithubActions => {
                         github_actions_updater
+                            .update(&path, github_releases.as_ref(), update_options.clone())
+                            .await
+                    }
+                    FileType::PreCommitConfig => {
+                        pre_commit_updater
                             .update(&path, github_releases.as_ref(), update_options.clone())
                             .await
                     }
@@ -447,6 +455,7 @@ async fn run_interactive_update(
     cargo_toml_updater: &Arc<CargoTomlUpdater>,
     go_mod_updater: &Arc<GoModUpdater>,
     github_actions_updater: &Arc<GithubActionsUpdater>,
+    pre_commit_updater: &Arc<PreCommitUpdater>,
     cache: &Arc<std::sync::Mutex<Cache>>,
     cache_enabled: bool,
 ) -> Result<()> {
@@ -494,6 +503,11 @@ async fn run_interactive_update(
             }
             FileType::GithubActions => {
                 github_actions_updater
+                    .update(path, github_releases.as_ref(), dry_run_options.clone())
+                    .await
+            }
+            FileType::PreCommitConfig => {
+                pre_commit_updater
                     .update(path, github_releases.as_ref(), dry_run_options.clone())
                     .await
             }
@@ -599,6 +613,11 @@ async fn run_interactive_update(
             }
             FileType::GithubActions => {
                 github_actions_updater
+                    .update(path, github_releases.as_ref(), apply_options.clone())
+                    .await
+            }
+            FileType::PreCommitConfig => {
+                pre_commit_updater
                     .update(path, github_releases.as_ref(), apply_options.clone())
                     .await
             }
@@ -791,8 +810,8 @@ async fn run_audit(cli: &Cli) -> Result<()> {
         std::collections::HashSet::new();
 
     for ((name, lang), occurrences) in &packages {
-        // OSV doesn't cover GitHub Actions; skip actions dependencies
-        if *lang == Lang::Actions {
+        // OSV doesn't cover GitHub Actions or pre-commit hooks; skip
+        if *lang == Lang::Actions || *lang == Lang::PreCommit {
             continue;
         }
 
@@ -801,7 +820,7 @@ async fn run_audit(cli: &Cli) -> Result<()> {
             Lang::Node => Ecosystem::Npm,
             Lang::Rust => Ecosystem::CratesIo,
             Lang::Go => Ecosystem::Go,
-            Lang::Actions => unreachable!("Actions filtered above"),
+            Lang::Actions | Lang::PreCommit => unreachable!("filtered above"),
         };
 
         for occurrence in occurrences {
@@ -953,6 +972,7 @@ fn print_alignment(alignment: &PackageAlignment, _dry_run: bool) {
         Lang::Rust => " (cargo)",
         Lang::Go => " (go)",
         Lang::Actions => " (actions)",
+        Lang::PreCommit => " (pre-commit)",
     };
 
     println!(
@@ -1070,6 +1090,9 @@ fn apply_version_updates(
             FileType::GithubActions => {
                 replace_github_actions_version(&result, package, old_version, &target_version)
             }
+            FileType::PreCommitConfig => {
+                replace_pre_commit_version(&result, package, old_version, &target_version)
+            }
         };
     }
 
@@ -1180,6 +1203,14 @@ fn replace_github_actions_version(content: &str, package: &str, old: &str, new: 
     );
     let re = regex::Regex::new(&pattern).unwrap();
     re.replace_all(content, format!("${{1}}{}${{2}}", new))
+        .to_string()
+}
+
+fn replace_pre_commit_version(content: &str, _package: &str, old: &str, new: &str) -> String {
+    // Replace rev: values. Handles unquoted, single-quoted, and double-quoted forms.
+    let pattern = format!(r#"(?m)(^\s*rev:\s*['"]?){}"#, regex::escape(old));
+    let re = regex::Regex::new(&pattern).unwrap();
+    re.replace_all(content, format!("${{1}}{}", new))
         .to_string()
 }
 
