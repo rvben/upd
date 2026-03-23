@@ -627,4 +627,33 @@ mod tests {
         assert_eq!(deps.len(), 1);
         assert_eq!(deps[0].name, "psf/black");
     }
+
+    #[test]
+    fn test_handles() {
+        let updater = PreCommitUpdater::new();
+        assert!(updater.handles(FileType::PreCommitConfig));
+        assert!(!updater.handles(FileType::Requirements));
+    }
+
+    #[tokio::test]
+    async fn test_registry_error_populates_errors() {
+        let mut file = NamedTempFile::new().unwrap();
+        write!(
+            file,
+            "repos:\n  - repo: https://github.com/nonexistent/hook\n    rev: v1.0.0\n    hooks:\n      - id: test\n"
+        )
+        .unwrap();
+
+        // Registry has no entry for nonexistent/hook → will error
+        let registry = MockRegistry::new("github-releases");
+        let updater = PreCommitUpdater::new();
+        let options = UpdateOptions::new(true, false);
+        let result = updater
+            .update(file.path(), &registry, options)
+            .await
+            .unwrap();
+
+        assert_eq!(result.errors.len(), 1);
+        assert!(result.errors[0].contains("nonexistent/hook"));
+    }
 }

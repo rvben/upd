@@ -494,4 +494,49 @@ mod tests {
         assert_eq!(parsed.name, "rails");
         assert_eq!(parsed.version, "7.1");
     }
+
+    #[test]
+    fn test_handles() {
+        let updater = GemfileUpdater::new();
+        assert!(updater.handles(FileType::Gemfile));
+        assert!(!updater.handles(FileType::Requirements));
+    }
+
+    #[tokio::test]
+    async fn test_registry_error_populates_errors() {
+        let mut file = NamedTempFile::new().unwrap();
+        write!(file, "gem 'nonexistent-gem', '1.0.0'\n").unwrap();
+
+        // Registry has no entry for nonexistent-gem → will error
+        let registry = MockRegistry::new("rubygems");
+        let updater = GemfileUpdater::new();
+        let options = UpdateOptions::new(true, false);
+        let result = updater
+            .update(file.path(), &registry, options)
+            .await
+            .unwrap();
+
+        assert_eq!(result.errors.len(), 1);
+        assert!(result.errors[0].contains("nonexistent-gem"));
+    }
+
+    #[tokio::test]
+    async fn test_unchanged_count() {
+        let mut file = NamedTempFile::new().unwrap();
+        write!(file, "gem 'rails', '7.2.3'\ngem 'puma', '6.0.0'\n").unwrap();
+
+        let registry = MockRegistry::new("rubygems")
+            .with_version("rails", "7.2.3") // Already at latest
+            .with_version("puma", "6.5.0"); // Has update
+
+        let updater = GemfileUpdater::new();
+        let options = UpdateOptions::new(true, false);
+        let result = updater
+            .update(file.path(), &registry, options)
+            .await
+            .unwrap();
+
+        assert_eq!(result.updated.len(), 1);
+        assert_eq!(result.unchanged, 1);
+    }
 }

@@ -713,4 +713,31 @@ rust = "1.90.0"
         let content = fs::read_to_string(&file_path).unwrap();
         assert_eq!(content, original);
     }
+
+    #[test]
+    fn test_handles() {
+        let updater = MiseUpdater::new();
+        assert!(updater.handles(FileType::MiseToml));
+        assert!(updater.handles(FileType::ToolVersions));
+        assert!(!updater.handles(FileType::Requirements));
+    }
+
+    #[tokio::test]
+    async fn test_registry_error_populates_errors() {
+        let temp = tempdir().unwrap();
+        let file_path = temp.path().join(".mise.toml");
+        fs::write(&file_path, "[tools]\nnode = \"20.0.0\"\n").unwrap();
+
+        // Registry has no entry for nodejs/node → will error
+        let registry = MockRegistry::new("github-releases");
+        let updater = MiseUpdater::new();
+        let options = UpdateOptions::new(true, false);
+        let result = updater
+            .update(&file_path, &registry, options)
+            .await
+            .unwrap();
+
+        assert_eq!(result.errors.len(), 1);
+        assert!(result.errors[0].contains("node"));
+    }
 }

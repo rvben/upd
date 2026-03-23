@@ -932,6 +932,83 @@ jobs:
         );
     }
 
+    #[test]
+    fn test_handles() {
+        let updater = GithubActionsUpdater::new();
+        assert!(updater.handles(FileType::GithubActions));
+        assert!(!updater.handles(FileType::Requirements));
+    }
+
+    #[tokio::test]
+    async fn test_registry_error_populates_errors() {
+        let mut file = NamedTempFile::new().unwrap();
+        write!(file, "steps:\n  - uses: nonexistent/action@v1\n").unwrap();
+
+        // Registry has no entry for nonexistent/action → will error
+        let registry = MockRegistry::new("github-releases");
+        let updater = GithubActionsUpdater::new();
+        let options = UpdateOptions::new(true, false);
+        let result = updater
+            .update(file.path(), &registry, options)
+            .await
+            .unwrap();
+
+        assert_eq!(result.errors.len(), 1);
+        assert!(result.errors[0].contains("nonexistent/action"));
+    }
+
+    #[tokio::test]
+    async fn test_preserves_crlf_line_endings() {
+        let mut file = NamedTempFile::new().unwrap();
+        std::io::Write::write_all(&mut file, b"steps:\r\n  - uses: actions/checkout@v3\r\n")
+            .unwrap();
+
+        let registry =
+            MockRegistry::new("github-releases").with_version("actions/checkout", "v4.2.0");
+        let updater = GithubActionsUpdater::new();
+        let options = UpdateOptions::new(false, false);
+        updater
+            .update(file.path(), &registry, options)
+            .await
+            .unwrap();
+
+        let content = std::fs::read_to_string(file.path()).unwrap();
+        assert!(
+            content.contains("\r\n"),
+            "Should preserve CRLF line endings"
+        );
+        assert!(content.contains("actions/checkout@v4\r\n"));
+    }
+
+    #[tokio::test]
+    async fn test_deduplicates_same_action() {
+        let mut file = NamedTempFile::new().unwrap();
+        write!(
+            file,
+            "steps:\n  - uses: actions/checkout@v3\n  - uses: actions/checkout@v3\n  - uses: actions/checkout@v3\n"
+        )
+        .unwrap();
+
+        let registry =
+            MockRegistry::new("github-releases").with_version("actions/checkout", "v4.2.0");
+        let updater = GithubActionsUpdater::new();
+        let options = UpdateOptions::new(false, false);
+        let result = updater
+            .update(file.path(), &registry, options)
+            .await
+            .unwrap();
+
+        // All 3 occurrences should be updated
+        assert_eq!(result.updated.len(), 3);
+
+        let content = fs::read_to_string(file.path()).unwrap();
+        assert!(
+            !content.contains("@v3"),
+            "All occurrences should be updated"
+        );
+        assert_eq!(content.matches("@v4").count(), 3);
+    }
+
     #[tokio::test]
     async fn test_config_ignore_and_pin() {
         use crate::config::UpdConfig;
