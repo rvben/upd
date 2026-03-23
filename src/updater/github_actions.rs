@@ -788,4 +788,137 @@ jobs:
         assert_eq!(deps[1].name, "actions/setup-node");
         assert_eq!(deps[1].version, "v3.8.1");
     }
+
+    #[tokio::test]
+    async fn test_full_workflow_integration() {
+        use std::io::Write;
+        use tempfile::NamedTempFile;
+
+        let mut file = NamedTempFile::new().unwrap();
+        write!(
+            file,
+            r#"name: CI
+on: push
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+      - uses: actions/setup-node@v4.1.0
+      - uses: actions/checkout@a5ac7e51b41094c92402da3b24376905380afc29
+      - uses: ./local-action
+      - uses: docker://node:20
+      - uses: actions/checkout@main
+      # uses: commented/action@v1
+      - name: Echo
+        run: |
+          echo "uses: fake/action@v1"
+      - uses: jdx/mise-action@v2
+"#
+        )
+        .unwrap();
+
+        let registry = MockRegistry::new("github-releases")
+            .with_version("actions/checkout", "v4.2.0")
+            .with_version("actions/setup-node", "v4.2.0")
+            .with_version("jdx/mise-action", "v2.1.0");
+
+        let updater = GithubActionsUpdater::new();
+        let options = UpdateOptions::new(false, false);
+        let result = updater
+            .update(file.path(), &registry, options)
+            .await
+            .unwrap();
+
+        // actions/checkout@v3 -> v4 (major-only precision)
+        // actions/setup-node@v4.1.0 -> v4.2.0 (full precision preserved)
+        // SHA-pinned: skipped
+        // ./local-action: skipped (local ref)
+        // docker://node:20: skipped (docker ref)
+        // actions/checkout@main: skipped (branch ref)
+        // commented line: skipped
+        // run: | block content: skipped
+        // jdx/mise-action@v2 -> v2 (unchanged, same major)
+        assert_eq!(
+            result.updated.len(),
+            2,
+            "Expected 2 updates, got: {:?}",
+            result.updated
+        );
+
+        let content = fs::read_to_string(file.path()).unwrap();
+        assert!(
+            content.contains("actions/checkout@v4"),
+            "checkout should be updated to v4"
+        );
+        assert!(
+            content.contains("actions/setup-node@v4.2.0"),
+            "setup-node should be updated to v4.2.0"
+        );
+        assert!(
+            content.contains("a5ac7e51b41094c92402da3b24376905380afc29"),
+            "SHA should be unchanged"
+        );
+        assert!(
+            content.contains("actions/checkout@main"),
+            "branch ref should be unchanged"
+        );
+        assert!(
+            content.contains(r#"echo "uses: fake/action@v1""#),
+            "block scalar content should be unchanged"
+        );
+        assert!(
+            content.contains("# uses: commented/action@v1"),
+            "commented line should be unchanged"
+        );
+        assert!(
+            content.contains("jdx/mise-action@v2"),
+            "unchanged action should keep version"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_config_ignore_and_pin() {
+        use crate::config::UpdConfig;
+        use std::io::Write;
+        use std::sync::Arc;
+        use tempfile::NamedTempFile;
+
+        let mut file = NamedTempFile::new().unwrap();
+        write!(
+            file,
+            r#"steps:
+  - uses: actions/checkout@v3
+  - uses: actions/setup-node@v3
+  - uses: jdx/mise-action@v1
+"#
+        )
+        .unwrap();
+
+        let registry = MockRegistry::new("github-releases")
+            .with_version("actions/checkout", "v4.2.0")
+            .with_version("actions/setup-node", "v4.2.0")
+            .with_version("jdx/mise-action", "v2.1.0");
+
+        let mut pins = std::collections::HashMap::new();
+        pins.insert("actions/setup-node".to_string(), "v4.0.0".to_string());
+        let config = UpdConfig {
+            ignore: vec!["actions/checkout".to_string()],
+            pin: pins,
+        };
+
+        let updater = GithubActionsUpdater::new();
+        let options = UpdateOptions::new(false, false).with_config(Arc::new(config));
+        let result = updater
+            .update(file.path(), &registry, options)
+            .await
+            .unwrap();
+
+        assert_eq!(result.ignored.len(), 1);
+        assert_eq!(result.ignored[0].0, "actions/checkout");
+        assert_eq!(result.pinned.len(), 1);
+        assert_eq!(result.pinned[0].0, "actions/setup-node");
+        assert_eq!(result.updated.len(), 1);
+        assert_eq!(result.updated[0].0, "jdx/mise-action");
+    }
 }
