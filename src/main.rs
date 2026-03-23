@@ -998,14 +998,17 @@ fn print_alignment(alignment: &PackageAlignment, _dry_run: bool) {
 fn apply_alignments(alignments: &[&PackageAlignment], full_precision: bool) -> Result<usize> {
     use std::collections::HashMap;
 
-    // Group updates by file path
-    let mut updates_by_file: HashMap<&std::path::Path, Vec<(&str, &str, &str)>> = HashMap::new();
+    // Group updates by file path, carrying the FileType from the occurrence
+    // (FileType::detect() doesn't handle path-based types like GithubActions)
+    type FileUpdates<'a> = (FileType, Vec<(&'a str, &'a str, &'a str)>);
+    let mut updates_by_file: HashMap<&std::path::Path, FileUpdates<'_>> = HashMap::new();
 
     for alignment in alignments {
         for occurrence in alignment.misaligned_occurrences() {
             updates_by_file
                 .entry(occurrence.file_path.as_path())
-                .or_default()
+                .or_insert_with(|| (occurrence.file_type, Vec::new()))
+                .1
                 .push((
                     &alignment.package_name,
                     &occurrence.version,
@@ -1016,9 +1019,8 @@ fn apply_alignments(alignments: &[&PackageAlignment], full_precision: bool) -> R
 
     let mut total_updated = 0;
 
-    for (path, updates) in updates_by_file {
+    for (path, (file_type, updates)) in updates_by_file {
         let content = read_file_safe(path)?;
-        let file_type = FileType::detect(path).unwrap();
 
         let new_content = apply_version_updates(&content, &updates, file_type, full_precision);
 
