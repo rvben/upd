@@ -4,6 +4,7 @@ mod go_proxy;
 #[cfg(test)]
 pub mod mock;
 mod npm;
+mod nuget;
 mod pypi;
 mod rubygems;
 mod terraform;
@@ -15,6 +16,7 @@ pub use go_proxy::{GoCredentials, GoPrivateConfig, GoProxyRegistry, read_go_priv
 #[cfg(test)]
 pub use mock::MockRegistry;
 pub use npm::{NpmCredentials, NpmRegistry, NpmrcConfig, read_npmrc_config};
+pub use nuget::NuGetRegistry;
 pub use pypi::{MultiPyPiRegistry, PyPiCredentials, PyPiRegistry};
 pub use rubygems::RubyGemsRegistry;
 pub use terraform::TerraformRegistry;

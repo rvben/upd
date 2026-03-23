@@ -1,4 +1,5 @@
 mod cargo_toml;
+mod csproj;
 mod gemfile;
 mod github_actions;
 mod go_mod;
@@ -10,6 +11,7 @@ mod requirements;
 mod terraform;
 
 pub use cargo_toml::CargoTomlUpdater;
+pub use csproj::CsprojUpdater;
 pub use gemfile::GemfileUpdater;
 pub use github_actions::GithubActionsUpdater;
 pub use go_mod::GoModUpdater;
@@ -162,6 +164,8 @@ pub enum Lang {
     Rust,
     Go,
     Ruby,
+    #[value(name = "dotnet")]
+    DotNet,
     Actions,
     PreCommit,
     Mise,
@@ -177,6 +181,7 @@ pub enum FileType {
     CargoToml,
     GoMod,
     Gemfile,
+    Csproj,
     GithubActions,
     PreCommitConfig,
     MiseToml,
@@ -193,6 +198,7 @@ impl FileType {
             FileType::CargoToml => Lang::Rust,
             FileType::GoMod => Lang::Go,
             FileType::Gemfile => Lang::Ruby,
+            FileType::Csproj => Lang::DotNet,
             FileType::GithubActions => Lang::Actions,
             FileType::PreCommitConfig => Lang::PreCommit,
             FileType::MiseToml | FileType::ToolVersions => Lang::Mise,
@@ -223,6 +229,22 @@ impl FileType {
 
         if file_name == "Gemfile" {
             return Some(FileType::Gemfile);
+        }
+
+        // .csproj files (case-insensitive extension check)
+        if file_name
+            .rsplit('.')
+            .next()
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("csproj"))
+        {
+            return Some(FileType::Csproj);
+        }
+
+        // Directory.Packages.props and Directory.Build.props (central package management)
+        if file_name.eq_ignore_ascii_case("Directory.Packages.props")
+            || file_name.eq_ignore_ascii_case("Directory.Build.props")
+        {
+            return Some(FileType::Csproj);
         }
 
         if file_name == ".pre-commit-config.yaml" {

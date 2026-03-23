@@ -15,11 +15,11 @@ use upd::interactive::{PendingUpdate, prompt_all};
 use upd::lockfile::regenerate_lockfiles;
 use upd::registry::{
     CratesIoRegistry, GitHubReleasesRegistry, GoProxyRegistry, MultiPyPiRegistry, NpmRegistry,
-    PyPiRegistry, RubyGemsRegistry, TerraformRegistry,
+    NuGetRegistry, PyPiRegistry, RubyGemsRegistry, TerraformRegistry,
 };
 use upd::updater::{
-    CargoTomlUpdater, FileType, GemfileUpdater, GithubActionsUpdater, GoModUpdater, Lang,
-    MiseUpdater, PackageJsonUpdater, PreCommitUpdater, PyProjectUpdater, RequirementsUpdater,
+    CargoTomlUpdater, CsprojUpdater, FileType, GemfileUpdater, GithubActionsUpdater, GoModUpdater,
+    Lang, MiseUpdater, PackageJsonUpdater, PreCommitUpdater, PyProjectUpdater, RequirementsUpdater,
     TerraformUpdater, UpdateOptions, UpdateResult, Updater, discover_files, read_file_safe,
     write_file_atomic,
 };
@@ -245,6 +245,10 @@ async fn run_update(cli: &Cli) -> Result<()> {
     let terraform_registry = TerraformRegistry::new();
     let terraform = CachedRegistry::new(terraform_registry, Arc::clone(&cache), cache_enabled);
 
+    // Create NuGet registry
+    let nuget_registry = NuGetRegistry::new();
+    let nuget = CachedRegistry::new(nuget_registry, Arc::clone(&cache), cache_enabled);
+
     // Create GitHub releases registry with optional token
     let github_releases_registry = GitHubReleasesRegistry::new();
     if cli.verbose && GitHubReleasesRegistry::detect_token().is_some() {
@@ -264,6 +268,7 @@ async fn run_update(cli: &Cli) -> Result<()> {
     let gemfile_updater = Arc::new(GemfileUpdater::new());
     let mise_updater = Arc::new(MiseUpdater::new());
     let terraform_updater = Arc::new(TerraformUpdater::new());
+    let csproj_updater = Arc::new(CsprojUpdater::new());
 
     // Wrap registries in Arc for parallel processing
     let pypi = Arc::new(pypi);
@@ -272,6 +277,7 @@ async fn run_update(cli: &Cli) -> Result<()> {
     let go_proxy = Arc::new(go_proxy);
     let rubygems = Arc::new(rubygems);
     let terraform = Arc::new(terraform);
+    let nuget = Arc::new(nuget);
     let github_releases = Arc::new(github_releases);
 
     // Interactive mode: first discover updates, then prompt, then apply approved ones
@@ -287,6 +293,7 @@ async fn run_update(cli: &Cli) -> Result<()> {
             &go_proxy,
             &rubygems,
             &terraform,
+            &nuget,
             &github_releases,
             &requirements_updater,
             &pyproject_updater,
@@ -298,6 +305,7 @@ async fn run_update(cli: &Cli) -> Result<()> {
             &pre_commit_updater,
             &mise_updater,
             &terraform_updater,
+            &csproj_updater,
             &cache,
             cache_enabled,
         )
@@ -328,6 +336,7 @@ async fn run_update(cli: &Cli) -> Result<()> {
             let go_proxy = Arc::clone(&go_proxy);
             let rubygems = Arc::clone(&rubygems);
             let terraform = Arc::clone(&terraform);
+            let nuget = Arc::clone(&nuget);
             let github_releases = Arc::clone(&github_releases);
             let requirements_updater = Arc::clone(&requirements_updater);
             let pyproject_updater = Arc::clone(&pyproject_updater);
@@ -338,6 +347,7 @@ async fn run_update(cli: &Cli) -> Result<()> {
             let github_actions_updater = Arc::clone(&github_actions_updater);
             let pre_commit_updater = Arc::clone(&pre_commit_updater);
             let mise_updater = Arc::clone(&mise_updater);
+            let csproj_updater = Arc::clone(&csproj_updater);
             let terraform_updater = Arc::clone(&terraform_updater);
             let update_options = update_options.clone();
 
@@ -386,6 +396,11 @@ async fn run_update(cli: &Cli) -> Result<()> {
                     FileType::MiseToml | FileType::ToolVersions => {
                         mise_updater
                             .update(&path, github_releases.as_ref(), update_options.clone())
+                            .await
+                    }
+                    FileType::Csproj => {
+                        csproj_updater
+                            .update(&path, nuget.as_ref(), update_options.clone())
                             .await
                     }
                     FileType::TerraformTf => {
@@ -489,6 +504,7 @@ async fn run_interactive_update(
     go_proxy: &Arc<CachedRegistry<GoProxyRegistry>>,
     rubygems: &Arc<CachedRegistry<RubyGemsRegistry>>,
     terraform: &Arc<CachedRegistry<TerraformRegistry>>,
+    nuget: &Arc<CachedRegistry<NuGetRegistry>>,
     github_releases: &Arc<CachedRegistry<GitHubReleasesRegistry>>,
     requirements_updater: &Arc<RequirementsUpdater>,
     pyproject_updater: &Arc<PyProjectUpdater>,
@@ -500,6 +516,7 @@ async fn run_interactive_update(
     pre_commit_updater: &Arc<PreCommitUpdater>,
     mise_updater: &Arc<MiseUpdater>,
     terraform_updater: &Arc<TerraformUpdater>,
+    csproj_updater: &Arc<CsprojUpdater>,
     cache: &Arc<std::sync::Mutex<Cache>>,
     cache_enabled: bool,
 ) -> Result<()> {
@@ -563,6 +580,11 @@ async fn run_interactive_update(
             FileType::MiseToml | FileType::ToolVersions => {
                 mise_updater
                     .update(path, github_releases.as_ref(), dry_run_options.clone())
+                    .await
+            }
+            FileType::Csproj => {
+                csproj_updater
+                    .update(path, nuget.as_ref(), dry_run_options.clone())
                     .await
             }
             FileType::TerraformTf => {
@@ -688,6 +710,11 @@ async fn run_interactive_update(
             FileType::MiseToml | FileType::ToolVersions => {
                 mise_updater
                     .update(path, github_releases.as_ref(), apply_options.clone())
+                    .await
+            }
+            FileType::Csproj => {
+                csproj_updater
+                    .update(path, nuget.as_ref(), apply_options.clone())
                     .await
             }
             FileType::TerraformTf => {
@@ -884,11 +911,12 @@ async fn run_audit(cli: &Cli) -> Result<()> {
         std::collections::HashSet::new();
 
     for ((name, lang), occurrences) in &packages {
-        // OSV doesn't cover GitHub Actions, pre-commit hooks, mise tools, or Terraform; skip
+        // OSV doesn't cover GitHub Actions, pre-commit hooks, mise tools, Terraform, or .NET; skip
         if *lang == Lang::Actions
             || *lang == Lang::PreCommit
             || *lang == Lang::Mise
             || *lang == Lang::Terraform
+            || *lang == Lang::DotNet
         {
             continue;
         }
@@ -899,7 +927,7 @@ async fn run_audit(cli: &Cli) -> Result<()> {
             Lang::Rust => Ecosystem::CratesIo,
             Lang::Go => Ecosystem::Go,
             Lang::Ruby => Ecosystem::RubyGems,
-            Lang::Actions | Lang::PreCommit | Lang::Mise | Lang::Terraform => {
+            Lang::Actions | Lang::PreCommit | Lang::Mise | Lang::Terraform | Lang::DotNet => {
                 unreachable!("filtered above")
             }
         };
@@ -1054,6 +1082,7 @@ fn print_alignment(alignment: &PackageAlignment, _dry_run: bool) {
         Lang::Rust => " (cargo)",
         Lang::Go => " (go)",
         Lang::Ruby => " (rubygems)",
+        Lang::DotNet => " (nuget)",
         Lang::Actions => " (actions)",
         Lang::PreCommit => " (pre-commit)",
         Lang::Mise => " (mise)",
@@ -1187,6 +1216,9 @@ fn apply_version_updates(
             FileType::ToolVersions => {
                 replace_tool_versions_version(&result, package, old_version, &target_version)
             }
+            FileType::Csproj => {
+                replace_csproj_version(&result, package, old_version, &target_version)
+            }
             FileType::TerraformTf => {
                 replace_terraform_version(&result, package, old_version, &target_version)
             }
@@ -1302,6 +1334,27 @@ fn replace_gemfile_version(content: &str, package: &str, old: &str, new: &str) -
     let re = regex::Regex::new(&pattern).unwrap();
     re.replace_all(content, format!("${{1}}{}${{2}}", new))
         .to_string()
+}
+
+fn replace_csproj_version(content: &str, package: &str, old: &str, new: &str) -> String {
+    // Pattern: <PackageReference Include="package" Version="old" />
+    // and:     <PackageVersion Include="package" Version="old" />
+    let pattern = format!(
+        r#"(<(?:PackageReference|PackageVersion)\s+Include="{}"[^>]*Version="){}"#,
+        regex::escape(package),
+        regex::escape(old)
+    );
+    let re = regex::Regex::new(&pattern).unwrap();
+    let mut result = re
+        .replace_all(content, format!(r#"${{1}}{}"#, new))
+        .to_string();
+
+    // Also handle <Version>old</Version> child element for the given package
+    let old_element = format!("<Version>{}</Version>", old);
+    let new_element = format!("<Version>{}</Version>", new);
+    result = result.replacen(&old_element, &new_element, 1);
+
+    result
 }
 
 fn replace_github_actions_version(content: &str, package: &str, old: &str, new: &str) -> String {

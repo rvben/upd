@@ -4,8 +4,8 @@
 //! used across multiple dependency files and update all occurrences to that version.
 
 use crate::updater::{
-    CargoTomlUpdater, FileType, GemfileUpdater, GithubActionsUpdater, GoModUpdater, Lang,
-    MiseUpdater, PackageJsonUpdater, ParsedDependency, PreCommitUpdater, PyProjectUpdater,
+    CargoTomlUpdater, CsprojUpdater, FileType, GemfileUpdater, GithubActionsUpdater, GoModUpdater,
+    Lang, MiseUpdater, PackageJsonUpdater, ParsedDependency, PreCommitUpdater, PyProjectUpdater,
     RequirementsUpdater, TerraformUpdater, Updater,
 };
 use anyhow::Result;
@@ -78,6 +78,7 @@ fn get_updater(file_type: FileType) -> Box<dyn Updater> {
         FileType::CargoToml => Box::new(CargoTomlUpdater::new()),
         FileType::GoMod => Box::new(GoModUpdater::new()),
         FileType::Gemfile => Box::new(GemfileUpdater::new()),
+        FileType::Csproj => Box::new(CsprojUpdater::new()),
         FileType::GithubActions => Box::new(GithubActionsUpdater::new()),
         FileType::PreCommitConfig => Box::new(PreCommitUpdater::new()),
         FileType::MiseToml | FileType::ToolVersions => Box::new(MiseUpdater::new()),
@@ -179,7 +180,7 @@ fn is_stable_version(version: &str, lang: Lang) -> bool {
                 && !v.contains("beta")
                 && !v.contains("dev")
         }
-        Lang::Node | Lang::Rust | Lang::Go => {
+        Lang::Node | Lang::Rust | Lang::Go | Lang::DotNet => {
             // Semver pre-release indicator: hyphen followed by identifier
             !version.contains('-')
         }
@@ -201,7 +202,7 @@ fn is_stable_version(version: &str, lang: Lang) -> bool {
 fn compare_versions(a: &str, b: &str, lang: Lang) -> std::cmp::Ordering {
     match lang {
         Lang::Python => compare_pep440(a, b),
-        Lang::Node | Lang::Rust | Lang::Ruby => compare_semver(a, b),
+        Lang::Node | Lang::Rust | Lang::Ruby | Lang::DotNet => compare_semver(a, b),
         Lang::Go => compare_go_version(a, b),
         Lang::Actions | Lang::PreCommit | Lang::Mise | Lang::Terraform => {
             let clean_a = a.trim_start_matches('v');
