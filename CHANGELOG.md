@@ -5,6 +5,21 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.0.21] - 2026-03-23
+
+### Added
+
+- **GitHub Actions support**: Update action version references in `.github/workflows/*.yml` files
+  - Preserves version precision (`@v4` stays major-only, `@v4.1.0` stays exact)
+  - Skips SHA-pinned actions, branch refs, local actions, and Docker references
+  - Authentication via `GITHUB_TOKEN` or `GH_TOKEN` for higher rate limits
+  - Filter with `--lang actions`, works with all existing flags
+
+### Fixed
+
+- Rate limit and access denied errors now include hints about setting authentication tokens
+- Fixed potential panic in align command for path-based file types
+
 ## [0.0.20] - 2025-12-19
 
 ### Fixed
