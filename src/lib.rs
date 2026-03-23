@@ -15,5 +15,5 @@ pub use cache::Cache;
 pub use cli::{Cli, Command};
 pub use config::UpdConfig;
 pub use lockfile::{LockfileType, detect_lockfiles, regenerate_lockfiles};
-pub use registry::{NpmRegistry, PyPiRegistry, Registry};
+pub use registry::{GitHubReleasesRegistry, NpmRegistry, PyPiRegistry, Registry};
 pub use updater::{FileType, Lang, UpdateResult, Updater, discover_files};

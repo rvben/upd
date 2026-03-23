@@ -14,12 +14,13 @@ use upd::config::UpdConfig;
 use upd::interactive::{PendingUpdate, prompt_all};
 use upd::lockfile::regenerate_lockfiles;
 use upd::registry::{
-    CratesIoRegistry, GoProxyRegistry, MultiPyPiRegistry, NpmRegistry, PyPiRegistry,
+    CratesIoRegistry, GitHubReleasesRegistry, GoProxyRegistry, MultiPyPiRegistry, NpmRegistry,
+    PyPiRegistry,
 };
 use upd::updater::{
-    CargoTomlUpdater, FileType, GoModUpdater, Lang, PackageJsonUpdater, PyProjectUpdater,
-    RequirementsUpdater, UpdateOptions, UpdateResult, Updater, discover_files, read_file_safe,
-    write_file_atomic,
+    CargoTomlUpdater, FileType, GithubActionsUpdater, GoModUpdater, Lang, PackageJsonUpdater,
+    PyProjectUpdater, RequirementsUpdater, UpdateOptions, UpdateResult, Updater, discover_files,
+    read_file_safe, write_file_atomic,
 };
 use upd::version::match_version_precision;
 
@@ -235,18 +236,25 @@ async fn run_update(cli: &Cli) -> Result<()> {
 
     let go_proxy = CachedRegistry::new(go_proxy_registry, Arc::clone(&cache), cache_enabled);
 
+    // Create GitHub releases registry with optional token
+    let github_releases_registry = GitHubReleasesRegistry::new();
+    let github_releases =
+        CachedRegistry::new(github_releases_registry, Arc::clone(&cache), cache_enabled);
+
     // Create updaters wrapped in Arc for parallel processing
     let requirements_updater = Arc::new(RequirementsUpdater::new());
     let pyproject_updater = Arc::new(PyProjectUpdater::new());
     let package_json_updater = Arc::new(PackageJsonUpdater::new());
     let cargo_toml_updater = Arc::new(CargoTomlUpdater::new());
     let go_mod_updater = Arc::new(GoModUpdater::new());
+    let github_actions_updater = Arc::new(GithubActionsUpdater::new());
 
     // Wrap registries in Arc for parallel processing
     let pypi = Arc::new(pypi);
     let npm = Arc::new(npm);
     let crates_io = Arc::new(crates_io);
     let go_proxy = Arc::new(go_proxy);
+    let github_releases = Arc::new(github_releases);
 
     // Interactive mode: first discover updates, then prompt, then apply approved ones
     if cli.interactive {
@@ -259,11 +267,13 @@ async fn run_update(cli: &Cli) -> Result<()> {
             &npm,
             &crates_io,
             &go_proxy,
+            &github_releases,
             &requirements_updater,
             &pyproject_updater,
             &package_json_updater,
             &cargo_toml_updater,
             &go_mod_updater,
+            &github_actions_updater,
             &cache,
             cache_enabled,
         )
@@ -292,11 +302,13 @@ async fn run_update(cli: &Cli) -> Result<()> {
             let npm = Arc::clone(&npm);
             let crates_io = Arc::clone(&crates_io);
             let go_proxy = Arc::clone(&go_proxy);
+            let github_releases = Arc::clone(&github_releases);
             let requirements_updater = Arc::clone(&requirements_updater);
             let pyproject_updater = Arc::clone(&pyproject_updater);
             let package_json_updater = Arc::clone(&package_json_updater);
             let cargo_toml_updater = Arc::clone(&cargo_toml_updater);
             let go_mod_updater = Arc::clone(&go_mod_updater);
+            let github_actions_updater = Arc::clone(&github_actions_updater);
             let update_options = update_options.clone();
 
             async move {
@@ -327,8 +339,9 @@ async fn run_update(cli: &Cli) -> Result<()> {
                             .await
                     }
                     FileType::GithubActions => {
-                        // Stub — wired up in task 7
-                        Ok(UpdateResult::default())
+                        github_actions_updater
+                            .update(&path, github_releases.as_ref(), update_options.clone())
+                            .await
                     }
                 };
                 (path, result.map_err(|e| e.to_string()))
@@ -424,11 +437,13 @@ async fn run_interactive_update(
     npm: &Arc<CachedRegistry<NpmRegistry>>,
     crates_io: &Arc<CachedRegistry<CratesIoRegistry>>,
     go_proxy: &Arc<CachedRegistry<GoProxyRegistry>>,
+    github_releases: &Arc<CachedRegistry<GitHubReleasesRegistry>>,
     requirements_updater: &Arc<RequirementsUpdater>,
     pyproject_updater: &Arc<PyProjectUpdater>,
     package_json_updater: &Arc<PackageJsonUpdater>,
     cargo_toml_updater: &Arc<CargoTomlUpdater>,
     go_mod_updater: &Arc<GoModUpdater>,
+    github_actions_updater: &Arc<GithubActionsUpdater>,
     cache: &Arc<std::sync::Mutex<Cache>>,
     cache_enabled: bool,
 ) -> Result<()> {
@@ -474,7 +489,11 @@ async fn run_interactive_update(
                     .update(path, go_proxy.as_ref(), dry_run_options.clone())
                     .await
             }
-            FileType::GithubActions => Ok(UpdateResult::default()),
+            FileType::GithubActions => {
+                github_actions_updater
+                    .update(path, github_releases.as_ref(), dry_run_options.clone())
+                    .await
+            }
         };
 
         if let Ok(file_result) = result {
@@ -575,7 +594,11 @@ async fn run_interactive_update(
                     .update(path, go_proxy.as_ref(), apply_options.clone())
                     .await
             }
-            FileType::GithubActions => Ok(UpdateResult::default()),
+            FileType::GithubActions => {
+                github_actions_updater
+                    .update(path, github_releases.as_ref(), apply_options.clone())
+                    .await
+            }
         };
 
         if let Ok(file_result) = result {
@@ -1039,7 +1062,9 @@ fn apply_version_updates(
             FileType::GoMod => {
                 replace_go_mod_version(&result, package, old_version, &target_version)
             }
-            FileType::GithubActions => result.to_string(),
+            FileType::GithubActions => {
+                replace_github_actions_version(&result, package, old_version, &target_version)
+            }
         };
     }
 
@@ -1134,6 +1159,17 @@ fn replace_go_mod_version(content: &str, package: &str, old: &str, new: &str) ->
     // Pattern: module/path vOLD
     let pattern = format!(
         r"({}\s+){}(\s|$)",
+        regex::escape(package),
+        regex::escape(old)
+    );
+    let re = regex::Regex::new(&pattern).unwrap();
+    re.replace_all(content, format!("${{1}}{}${{2}}", new))
+        .to_string()
+}
+
+fn replace_github_actions_version(content: &str, package: &str, old: &str, new: &str) -> String {
+    let pattern = format!(
+        r#"({}@){}(\s|$|#|")"#,
         regex::escape(package),
         regex::escape(old)
     );
