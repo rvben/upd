@@ -440,6 +440,52 @@ mod tests {
         assert_eq!(parsed.version, "3.12");
     }
 
+    #[tokio::test]
+    async fn test_config_ignore_and_pin() {
+        use crate::config::UpdConfig;
+        use std::sync::Arc;
+
+        let mut file = NamedTempFile::new().unwrap();
+        write!(
+            file,
+            "gem 'rails', '7.0.0'\ngem 'devise', '4.9.0'\ngem 'puma', '6.0.0'\n"
+        )
+        .unwrap();
+
+        let registry = MockRegistry::new("rubygems")
+            .with_version("rails", "7.2.3")
+            .with_version("devise", "4.9.5")
+            .with_version("puma", "6.5.0");
+
+        let mut pins = std::collections::HashMap::new();
+        pins.insert("devise".to_string(), "4.9.3".to_string());
+        let config = UpdConfig {
+            ignore: vec!["rails".to_string()],
+            pin: pins,
+        };
+
+        let updater = GemfileUpdater::new();
+        let options = UpdateOptions::new(false, false).with_config(Arc::new(config));
+        let result = updater
+            .update(file.path(), &registry, options)
+            .await
+            .unwrap();
+
+        assert_eq!(result.ignored.len(), 1);
+        assert_eq!(result.ignored[0].0, "rails");
+        assert_eq!(result.pinned.len(), 1);
+        assert_eq!(result.pinned[0].0, "devise");
+        // GemfileUpdater adds pinned packages to both pinned and updated
+        assert_eq!(result.updated.len(), 2);
+        let updated_names: Vec<&str> = result
+            .updated
+            .iter()
+            .map(|(n, _, _, _)| n.as_str())
+            .collect();
+        assert!(updated_names.contains(&"devise"));
+        assert!(updated_names.contains(&"puma"));
+    }
+
     #[test]
     fn test_parse_gem_with_indentation() {
         let updater = GemfileUpdater::new();

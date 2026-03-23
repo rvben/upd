@@ -284,6 +284,52 @@ mod tests {
         assert!(!matches_ruby_constraint("7.0.0", "~> 7.1.0"));
     }
 
+    #[tokio::test]
+    async fn test_get_latest_version_matching_pessimistic() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/api/v1/versions/rails.json"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                r#"[
+                    {"number": "8.0.4", "prerelease": false},
+                    {"number": "7.2.3", "prerelease": false},
+                    {"number": "7.1.5", "prerelease": false},
+                    {"number": "6.1.7", "prerelease": false}
+                ]"#,
+            ))
+            .mount(&mock_server)
+            .await;
+
+        let registry = RubyGemsRegistry::with_api_url(mock_server.uri());
+        // ~> 7.1 should match >= 7.1, < 8.0
+        let version = registry
+            .get_latest_version_matching("rails", "~> 7.1")
+            .await
+            .unwrap();
+        assert_eq!(version, "7.2.3");
+    }
+
+    #[tokio::test]
+    async fn test_get_latest_version_matching_no_match() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/api/v1/versions/oldgem.json"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string(r#"[{"number": "2.0.0", "prerelease": false}]"#),
+            )
+            .mount(&mock_server)
+            .await;
+
+        let registry = RubyGemsRegistry::with_api_url(mock_server.uri());
+        let result = registry
+            .get_latest_version_matching("oldgem", "~> 1.0")
+            .await;
+        assert!(result.is_err());
+    }
+
     #[test]
     fn test_matches_ruby_constraint_comparison() {
         assert!(matches_ruby_constraint("5.0.0", ">= 4.9.0"));

@@ -648,6 +648,46 @@ uv = "latest"
     }
 
     #[tokio::test]
+    async fn test_config_ignore_and_pin() {
+        use crate::config::UpdConfig;
+        use std::sync::Arc;
+
+        let temp = tempdir().unwrap();
+        let file_path = temp.path().join(".mise.toml");
+        fs::write(
+            &file_path,
+            "[tools]\nnode = \"20.11.0\"\nzig = \"0.13.0\"\nrust = \"1.80.0\"\n",
+        )
+        .unwrap();
+
+        let registry = MockRegistry::new("github-releases")
+            .with_version("nodejs/node", "v22.0.0")
+            .with_version("ziglang/zig", "0.14.0")
+            .with_version("rust-lang/rust", "v1.85.0");
+
+        let mut pins = std::collections::HashMap::new();
+        pins.insert("zig".to_string(), "0.13.1".to_string());
+        let config = UpdConfig {
+            ignore: vec!["node".to_string()],
+            pin: pins,
+        };
+
+        let updater = MiseUpdater::new();
+        let options = UpdateOptions::new(false, false).with_config(Arc::new(config));
+        let result = updater
+            .update(&file_path, &registry, options)
+            .await
+            .unwrap();
+
+        assert_eq!(result.ignored.len(), 1);
+        assert_eq!(result.ignored[0].0, "node");
+        assert_eq!(result.pinned.len(), 1);
+        assert_eq!(result.pinned[0].0, "zig");
+        assert_eq!(result.updated.len(), 1);
+        assert_eq!(result.updated[0].0, "rust");
+    }
+
+    #[tokio::test]
     async fn test_dry_run_mise_toml() {
         let temp = tempdir().unwrap();
         let file_path = temp.path().join(".mise.toml");

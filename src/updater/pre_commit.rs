@@ -560,6 +560,58 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn test_config_ignore_and_pin() {
+        use crate::config::UpdConfig;
+        use std::sync::Arc;
+
+        let mut file = NamedTempFile::new().unwrap();
+        write!(
+            file,
+            r#"repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v4.0.0
+    hooks:
+      - id: trailing-whitespace
+  - repo: https://github.com/psf/black
+    rev: 23.0.0
+    hooks:
+      - id: black
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.1.0
+    hooks:
+      - id: ruff
+"#
+        )
+        .unwrap();
+
+        let registry = MockRegistry::new("github-releases")
+            .with_version("pre-commit/pre-commit-hooks", "v5.0.0")
+            .with_version("psf/black", "24.3.0")
+            .with_version("astral-sh/ruff-pre-commit", "v0.4.0");
+
+        let mut pins = std::collections::HashMap::new();
+        pins.insert("psf/black".to_string(), "24.0.0".to_string());
+        let config = UpdConfig {
+            ignore: vec!["pre-commit/pre-commit-hooks".to_string()],
+            pin: pins,
+        };
+
+        let updater = PreCommitUpdater::new();
+        let options = UpdateOptions::new(false, false).with_config(Arc::new(config));
+        let result = updater
+            .update(file.path(), &registry, options)
+            .await
+            .unwrap();
+
+        assert_eq!(result.ignored.len(), 1);
+        assert_eq!(result.ignored[0].0, "pre-commit/pre-commit-hooks");
+        assert_eq!(result.pinned.len(), 1);
+        assert_eq!(result.pinned[0].0, "psf/black");
+        assert_eq!(result.updated.len(), 1);
+        assert_eq!(result.updated[0].0, "astral-sh/ruff-pre-commit");
+    }
+
     #[test]
     fn test_skips_commented_lines() {
         let updater = PreCommitUpdater::new();

@@ -347,6 +347,57 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_rate_limit_error_includes_token_hint() {
+        let server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/repos/actions/checkout/releases/latest"))
+            .respond_with(ResponseTemplate::new(403))
+            .mount(&server)
+            .await;
+
+        let result = registry(&server)
+            .get_latest_version("actions/checkout")
+            .await;
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("403"), "Should mention 403: {}", err);
+        assert!(
+            err.contains("GITHUB_TOKEN"),
+            "Should hint about token: {}",
+            err
+        );
+    }
+
+    #[tokio::test]
+    async fn test_tags_with_no_parseable_versions() {
+        let server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/repos/test/repo/releases/latest"))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&server)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path("/repos/test/repo/tags"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_string(
+                    r#"[{"name": "nightly"}, {"name": "edge"}, {"name": "latest"}]"#,
+                ),
+            )
+            .mount(&server)
+            .await;
+
+        let result = registry(&server).get_latest_version("test/repo").await;
+        assert!(result.is_err());
+        assert!(
+            result.unwrap_err().to_string().contains("no stable"),
+            "Error should mention 'no stable'"
+        );
+    }
+
+    #[tokio::test]
     async fn test_get_latest_including_prereleases() {
         let server = MockServer::start().await;
 

@@ -606,6 +606,30 @@ mod tests {
             Some(FileType::GoMod)
         );
 
+        // Pre-commit config
+        assert_eq!(
+            FileType::detect(Path::new(".pre-commit-config.yaml")),
+            Some(FileType::PreCommitConfig)
+        );
+
+        // Gemfile
+        assert_eq!(
+            FileType::detect(Path::new("Gemfile")),
+            Some(FileType::Gemfile)
+        );
+
+        // Mise
+        assert_eq!(
+            FileType::detect(Path::new(".mise.toml")),
+            Some(FileType::MiseToml)
+        );
+
+        // Tool versions
+        assert_eq!(
+            FileType::detect(Path::new(".tool-versions")),
+            Some(FileType::ToolVersions)
+        );
+
         // Non-matching patterns
         assert_eq!(FileType::detect(Path::new("requirements")), None);
         assert_eq!(FileType::detect(Path::new("requirements-dev")), None);
@@ -703,6 +727,43 @@ mod tests {
         let files = discover_files(&[temp.path().to_path_buf()], &[Lang::Actions]);
         assert_eq!(files.len(), 1);
         assert_eq!(files[0].1, FileType::GithubActions);
+    }
+
+    #[test]
+    fn test_discover_pre_commit_config() {
+        let temp = tempdir().unwrap();
+        fs::write(temp.path().join(".pre-commit-config.yaml"), "repos: []").unwrap();
+        fs::write(temp.path().join("package.json"), "{}").unwrap();
+
+        let files = discover_files(&[temp.path().to_path_buf()], &[]);
+        let types: Vec<_> = files.iter().map(|(_, ft)| *ft).collect();
+        assert!(types.contains(&FileType::PreCommitConfig));
+        assert!(types.contains(&FileType::PackageJson));
+    }
+
+    #[test]
+    fn test_discover_mise_files() {
+        let temp = tempdir().unwrap();
+        fs::write(temp.path().join(".mise.toml"), "[tools]\nnode = \"20\"").unwrap();
+        fs::write(temp.path().join(".tool-versions"), "node 20").unwrap();
+
+        let files = discover_files(&[temp.path().to_path_buf()], &[Lang::Mise]);
+        assert_eq!(files.len(), 2);
+        let types: Vec<_> = files.iter().map(|(_, ft)| *ft).collect();
+        assert!(types.contains(&FileType::MiseToml));
+        assert!(types.contains(&FileType::ToolVersions));
+    }
+
+    #[test]
+    fn test_discover_mise_respects_lang_filter() {
+        let temp = tempdir().unwrap();
+        fs::write(temp.path().join(".mise.toml"), "[tools]").unwrap();
+        fs::write(temp.path().join("package.json"), "{}").unwrap();
+
+        // Node filter should not include mise files
+        let files = discover_files(&[temp.path().to_path_buf()], &[Lang::Node]);
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].1, FileType::PackageJson);
     }
 
     #[test]
