@@ -89,12 +89,27 @@ pub fn http_error_message(
                 entity_type, name, hint
             )
         }
-        403 => format!(
-            "Access denied for {} '{}' (HTTP 403). You may lack permission or the {} may be private.",
-            entity_type,
-            name,
-            entity_type.to_lowercase()
-        ),
+        403 => {
+            let hint = registry_hint.map_or_else(
+                || {
+                    format!(
+                        "You may lack permission or the {} may be private.",
+                        entity_type.to_lowercase()
+                    )
+                },
+                |h| {
+                    format!(
+                        "You may lack permission or the {} may be private. {}",
+                        entity_type.to_lowercase(),
+                        h
+                    )
+                },
+            );
+            format!(
+                "Access denied for {} '{}' (HTTP 403). {}",
+                entity_type, name, hint
+            )
+        }
         404 => format!(
             "{} '{}' not found (HTTP 404). Check the name for typos or verify it exists in the registry.",
             entity_type, name

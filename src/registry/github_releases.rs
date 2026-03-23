@@ -27,6 +27,7 @@ impl GitHubReleasesRegistry {
         Self::with_api_url_and_token("https://api.github.com".to_string(), token)
     }
 
+    #[cfg(test)]
     pub fn with_api_url(api_url: String) -> Self {
         Self::with_api_url_and_token(api_url, None)
     }
@@ -104,10 +105,9 @@ impl GitHubReleasesRegistry {
 
         if !response.status().is_success() {
             let status = response.status();
-            let hint = if status.as_u16() == 429 {
-                Some("Set GITHUB_TOKEN to increase the API rate limit.")
-            } else {
-                None
+            let hint = match status.as_u16() {
+                403 | 429 => Some("Set GITHUB_TOKEN to increase the API rate limit."),
+                _ => None,
             };
             return Err(anyhow!(http_error_message(
                 status,
@@ -149,10 +149,9 @@ impl Registry for GitHubReleasesRegistry {
         // On 404 (no releases published), fall back to the tags endpoint.
         if response.status().as_u16() != 404 {
             let status = response.status();
-            let hint = if status.as_u16() == 429 {
-                Some("Set GITHUB_TOKEN to increase the API rate limit.")
-            } else {
-                None
+            let hint = match status.as_u16() {
+                403 | 429 => Some("Set GITHUB_TOKEN to increase the API rate limit."),
+                _ => None,
             };
             return Err(anyhow!(http_error_message(
                 status,

@@ -238,6 +238,9 @@ async fn run_update(cli: &Cli) -> Result<()> {
 
     // Create GitHub releases registry with optional token
     let github_releases_registry = GitHubReleasesRegistry::new();
+    if cli.verbose && GitHubReleasesRegistry::detect_token().is_some() {
+        println!("{}", "Using authenticated GitHub access".cyan());
+    }
     let github_releases =
         CachedRegistry::new(github_releases_registry, Arc::clone(&cache), cache_enabled);
 

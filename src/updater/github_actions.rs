@@ -59,12 +59,20 @@ impl GithubActionsUpdater {
     }
 
     /// Returns true if the line starts a YAML block scalar (e.g., `run: |`)
+    /// Handles all YAML block scalar forms: `|`, `>`, `|-`, `>+`, `|2`, `>3-`, etc.
     fn is_block_scalar_start(line: &str) -> bool {
         let trimmed = line.trim();
-        // Must contain a colon followed by space then a block scalar indicator
         if let Some(colon_pos) = trimmed.find(':') {
             let after_colon = trimmed[colon_pos + 1..].trim();
-            matches!(after_colon, "|" | ">" | "|-" | ">-" | "|+" | ">+")
+            let mut chars = after_colon.chars();
+            match chars.next() {
+                Some('|' | '>') => {}
+                _ => return false,
+            }
+            // After `|` or `>`, optional digit(s) then optional `-`/`+`, then end
+            let rest: String = chars.collect();
+            let rest = rest.trim_start_matches(|c: char| c.is_ascii_digit());
+            matches!(rest, "" | "-" | "+")
         } else {
             false
         }
@@ -248,18 +256,48 @@ impl Updater for GithubActionsUpdater {
                 .push((owner_repo, version, Some(line_idx + 1)));
         }
 
-        // Pass 2: Fetch versions in parallel
-        let version_futures: Vec<_> = actions_to_check
+        // Pass 2: Fetch versions in parallel (deduplicated by owner_repo)
+        let unique_repos: Vec<String> = {
+            let mut seen = std::collections::HashSet::new();
+            actions_to_check
+                .iter()
+                .filter_map(|(_, owner_repo, _)| {
+                    if seen.insert(owner_repo.clone()) {
+                        Some(owner_repo.clone())
+                    } else {
+                        None
+                    }
+                })
+                .collect()
+        };
+
+        let version_futures: Vec<_> = unique_repos
             .iter()
-            .map(|(_, owner_repo, _)| async { registry.get_latest_version(owner_repo).await })
+            .map(|owner_repo| async { registry.get_latest_version(owner_repo).await })
             .collect();
 
         let version_results = join_all(version_futures).await;
 
-        // Build version map
+        // Build a map from owner_repo -> latest version result
+        let repo_versions: HashMap<String, Result<String, String>> = unique_repos
+            .into_iter()
+            .zip(version_results)
+            .map(|(repo, result)| (repo, result.map_err(|e| e.to_string())))
+            .collect();
+
+        // Build version map per line index, cloning results from the deduplicated map
         let mut version_map: HashMap<usize, Result<String, anyhow::Error>> = HashMap::new();
-        for ((line_idx, _, _), version_result) in actions_to_check.iter().zip(version_results) {
-            version_map.insert(*line_idx, version_result);
+        for (line_idx, owner_repo, _) in &actions_to_check {
+            if let Some(result) = repo_versions.get(owner_repo) {
+                match result {
+                    Ok(version) => {
+                        version_map.insert(*line_idx, Ok(version.clone()));
+                    }
+                    Err(e) => {
+                        version_map.insert(*line_idx, Err(anyhow::anyhow!("{}", e)));
+                    }
+                }
+            }
         }
 
         // Add pinned versions to version map
@@ -506,6 +544,19 @@ mod tests {
         ));
         assert!(GithubActionsUpdater::is_block_scalar_start(
             "        run: >+"
+        ));
+        // With explicit indentation indicators
+        assert!(GithubActionsUpdater::is_block_scalar_start(
+            "        run: |2"
+        ));
+        assert!(GithubActionsUpdater::is_block_scalar_start(
+            "        run: >3"
+        ));
+        assert!(GithubActionsUpdater::is_block_scalar_start(
+            "        run: |2-"
+        ));
+        assert!(GithubActionsUpdater::is_block_scalar_start(
+            "        run: >3+"
         ));
         // Not block scalar
         assert!(!GithubActionsUpdater::is_block_scalar_start(
