@@ -5,6 +5,21 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.0.23] - 2026-03-23
+
+### Added
+
+- **Pre-commit support**: Update hook versions in `.pre-commit-config.yaml` via GitHub releases
+- **Ruby Gemfile support**: Update gem versions with RubyGems registry and pessimistic constraint (`~>`) support
+- **Mise/asdf support**: Update tool versions in `.mise.toml` and `.tool-versions` for 24+ mapped dev tools
+- **Terraform/OpenTofu support**: Update provider and module versions in `.tf` files via the Terraform Registry API
+
+### Fixed
+
+- All updaters now use safe HashMap lookups (no panics on edge cases)
+- Version replacement no longer clobbers inline comments
+- Duplicate registry lookups deduplicated across all updaters
+
 ## [0.0.22] - 2026-03-23
 
 ### Added
