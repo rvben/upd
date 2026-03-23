@@ -302,7 +302,10 @@ impl Updater for MiseUpdater {
             let line_num = line_idx + 1;
 
             if let Some(version_result) = version_map.remove(&line_idx) {
-                let (tool_name, current_version, is_pinned) = tool_info.get(&line_idx).unwrap();
+                let Some((tool_name, current_version, is_pinned)) = tool_info.get(&line_idx) else {
+                    new_lines.push(line.to_string());
+                    continue;
+                };
 
                 match version_result {
                     Ok(latest_tag) => {
@@ -314,7 +317,7 @@ impl Updater for MiseUpdater {
                         );
 
                         if new_version != *current_version {
-                            let new_line = line.replace(current_version, &new_version);
+                            let new_line = line.replacen(current_version, &new_version, 1);
                             new_lines.push(new_line);
 
                             if *is_pinned {

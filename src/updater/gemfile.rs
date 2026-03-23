@@ -7,6 +7,7 @@ use crate::version::match_version_precision;
 use anyhow::Result;
 use futures::future::join_all;
 use regex::Regex;
+use std::collections::HashMap;
 use std::path::Path;
 
 pub struct GemfileUpdater {
@@ -136,32 +137,66 @@ impl Updater for GemfileUpdater {
             result.ignored.push((package, version, Some(line_idx + 1)));
         }
 
-        // Fetch versions concurrently
-        let version_futures: Vec<_> = fetch_deps
-            .iter()
-            .map(|(_, _, parsed)| async {
-                if Self::has_upper_bound(&parsed.operator) {
-                    // Build Ruby constraint string for matching
-                    let constraint = if parsed.operator.is_empty() {
-                        format!("= {}", parsed.version)
+        // Deduplicate registry lookups: one request per unique gem name
+        // (same gem can appear multiple times, e.g. in different groups)
+        let unique_gems: Vec<(String, String, String)> = {
+            let mut seen = std::collections::HashSet::new();
+            fetch_deps
+                .iter()
+                .filter_map(|(_, _, parsed)| {
+                    if seen.insert(parsed.name.clone()) {
+                        Some((
+                            parsed.name.clone(),
+                            parsed.operator.clone(),
+                            parsed.version.clone(),
+                        ))
                     } else {
-                        format!("{} {}", parsed.operator, parsed.version)
+                        None
+                    }
+                })
+                .collect()
+        };
+
+        let version_futures: Vec<_> = unique_gems
+            .iter()
+            .map(|(name, operator, version)| async move {
+                if Self::has_upper_bound(operator) {
+                    let constraint = if operator.is_empty() {
+                        format!("= {}", version)
+                    } else {
+                        format!("{} {}", operator, version)
                     };
                     registry
-                        .get_latest_version_matching(&parsed.name, &constraint)
+                        .get_latest_version_matching(name, &constraint)
                         .await
                 } else {
-                    registry.get_latest_version(&parsed.name).await
+                    registry.get_latest_version(name).await
                 }
             })
             .collect();
 
         let version_results = join_all(version_futures).await;
 
-        let mut version_map: std::collections::HashMap<usize, Result<String, anyhow::Error>> =
-            std::collections::HashMap::new();
-        for ((line_idx, _, _), version_result) in fetch_deps.iter().zip(version_results) {
-            version_map.insert(*line_idx, version_result);
+        // Build a map from gem name -> latest version result
+        let gem_versions: HashMap<String, Result<String, String>> = unique_gems
+            .into_iter()
+            .zip(version_results)
+            .map(|((name, _, _), result)| (name, result.map_err(|e| e.to_string())))
+            .collect();
+
+        // Map results back to every line index that references each gem
+        let mut version_map: HashMap<usize, Result<String, anyhow::Error>> = HashMap::new();
+        for (line_idx, _, parsed) in &fetch_deps {
+            if let Some(result) = gem_versions.get(&parsed.name) {
+                match result {
+                    Ok(version) => {
+                        version_map.insert(*line_idx, Ok(version.clone()));
+                    }
+                    Err(e) => {
+                        version_map.insert(*line_idx, Err(anyhow::anyhow!("{}", e)));
+                    }
+                }
+            }
         }
 
         for (line_idx, package, current_version, pinned_version) in pinned_packages {
