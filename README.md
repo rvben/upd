@@ -4,7 +4,7 @@
 
 # upd
 
-A fast dependency updater for Python, Node.js, Rust, Go, Ruby, Terraform, GitHub Actions, pre-commit, and Mise projects, written in Rust.
+A fast dependency updater for Python, Node.js, Rust, Go, Ruby, .NET, Terraform, GitHub Actions, pre-commit, and Mise projects, written in Rust.
 
 ## Quick Start
 
@@ -21,7 +21,7 @@ uvx --from upd-cli upd -n
 
 ## Features
 
-- **Multi-ecosystem**: Python, Node.js, Rust, Go, Ruby, Terraform, GitHub Actions, pre-commit, Mise/asdf
+- **Multi-ecosystem**: Python, Node.js, Rust, Go, Ruby, .NET, Terraform, GitHub Actions, pre-commit, Mise/asdf
 - **Fast**: Parallel registry requests for all dependencies
 - **Constraint-aware**: Respects version constraints like `>=2.0,<3` and `~> 7.1`
 - **Smart caching**: 24-hour version cache for faster subsequent runs
@@ -106,6 +106,7 @@ upd --lang python --lang go # Update Python and Go only
 upd --lang actions          # Update only GitHub Actions
 upd --lang pre-commit       # Update only pre-commit hooks
 upd --lang ruby             # Update only Ruby gems
+upd --lang dot-net          # Update only .NET NuGet packages
 upd --lang terraform        # Update only Terraform providers/modules
 upd --lang mise             # Update only Mise/asdf tools
 
@@ -167,6 +168,14 @@ upd audit --check  # Exit 1 if vulnerabilities found (for CI)
 ### Ruby
 
 - `Gemfile` (gem declarations with version constraints)
+
+### .NET / NuGet
+
+- `.csproj` files (`PackageReference` elements)
+- `Directory.Packages.props` and `Directory.Build.props` (`PackageVersion` elements)
+- Supports both inline `Version` attributes and child `<Version>` elements
+- Queries the NuGet v3 API (`api.nuget.org`)
+- Skips range version constraints (`[1.0, 2.0)`)
 
 ### Terraform / OpenTofu
 
@@ -301,7 +310,7 @@ Checking 42 unique package(s) for vulnerabilities...
 Summary: 2 vulnerable package(s), 3 total vulnerability/ies
 ```
 
-**Supported ecosystems for auditing:** PyPI, npm, crates.io, Go, RubyGems
+**Supported ecosystems for auditing:** PyPI, npm, crates.io, Go, RubyGems, NuGet
 
 **CI/CD Integration:**
 
@@ -564,7 +573,7 @@ Add `upd` to your `.pre-commit-config.yaml`:
 ```yaml
 repos:
   - repo: https://github.com/rvben/upd
-    rev: v0.0.22  # Use the latest version
+    rev: v0.0.24  # Use the latest version
     hooks:
       - id: upd-check
         # Optional: only check specific ecosystems
