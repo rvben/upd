@@ -19,8 +19,8 @@ use upd::registry::{
 };
 use upd::updater::{
     CargoTomlUpdater, FileType, GemfileUpdater, GithubActionsUpdater, GoModUpdater, Lang,
-    PackageJsonUpdater, PreCommitUpdater, PyProjectUpdater, RequirementsUpdater, UpdateOptions,
-    UpdateResult, Updater, discover_files, read_file_safe, write_file_atomic,
+    MiseUpdater, PackageJsonUpdater, PreCommitUpdater, PyProjectUpdater, RequirementsUpdater,
+    UpdateOptions, UpdateResult, Updater, discover_files, read_file_safe, write_file_atomic,
 };
 use upd::version::match_version_precision;
 
@@ -257,6 +257,7 @@ async fn run_update(cli: &Cli) -> Result<()> {
     let github_actions_updater = Arc::new(GithubActionsUpdater::new());
     let pre_commit_updater = Arc::new(PreCommitUpdater::new());
     let gemfile_updater = Arc::new(GemfileUpdater::new());
+    let mise_updater = Arc::new(MiseUpdater::new());
 
     // Wrap registries in Arc for parallel processing
     let pypi = Arc::new(pypi);
@@ -287,6 +288,7 @@ async fn run_update(cli: &Cli) -> Result<()> {
             &gemfile_updater,
             &github_actions_updater,
             &pre_commit_updater,
+            &mise_updater,
             &cache,
             cache_enabled,
         )
@@ -325,6 +327,7 @@ async fn run_update(cli: &Cli) -> Result<()> {
             let gemfile_updater = Arc::clone(&gemfile_updater);
             let github_actions_updater = Arc::clone(&github_actions_updater);
             let pre_commit_updater = Arc::clone(&pre_commit_updater);
+            let mise_updater = Arc::clone(&mise_updater);
             let update_options = update_options.clone();
 
             async move {
@@ -366,6 +369,11 @@ async fn run_update(cli: &Cli) -> Result<()> {
                     }
                     FileType::PreCommitConfig => {
                         pre_commit_updater
+                            .update(&path, github_releases.as_ref(), update_options.clone())
+                            .await
+                    }
+                    FileType::MiseToml | FileType::ToolVersions => {
+                        mise_updater
                             .update(&path, github_releases.as_ref(), update_options.clone())
                             .await
                     }
@@ -473,6 +481,7 @@ async fn run_interactive_update(
     gemfile_updater: &Arc<GemfileUpdater>,
     github_actions_updater: &Arc<GithubActionsUpdater>,
     pre_commit_updater: &Arc<PreCommitUpdater>,
+    mise_updater: &Arc<MiseUpdater>,
     cache: &Arc<std::sync::Mutex<Cache>>,
     cache_enabled: bool,
 ) -> Result<()> {
@@ -530,6 +539,11 @@ async fn run_interactive_update(
             }
             FileType::PreCommitConfig => {
                 pre_commit_updater
+                    .update(path, github_releases.as_ref(), dry_run_options.clone())
+                    .await
+            }
+            FileType::MiseToml | FileType::ToolVersions => {
+                mise_updater
                     .update(path, github_releases.as_ref(), dry_run_options.clone())
                     .await
             }
@@ -645,6 +659,11 @@ async fn run_interactive_update(
             }
             FileType::PreCommitConfig => {
                 pre_commit_updater
+                    .update(path, github_releases.as_ref(), apply_options.clone())
+                    .await
+            }
+            FileType::MiseToml | FileType::ToolVersions => {
+                mise_updater
                     .update(path, github_releases.as_ref(), apply_options.clone())
                     .await
             }
@@ -837,8 +856,8 @@ async fn run_audit(cli: &Cli) -> Result<()> {
         std::collections::HashSet::new();
 
     for ((name, lang), occurrences) in &packages {
-        // OSV doesn't cover GitHub Actions or pre-commit hooks; skip
-        if *lang == Lang::Actions || *lang == Lang::PreCommit {
+        // OSV doesn't cover GitHub Actions, pre-commit hooks, or mise tools; skip
+        if *lang == Lang::Actions || *lang == Lang::PreCommit || *lang == Lang::Mise {
             continue;
         }
 
@@ -848,7 +867,7 @@ async fn run_audit(cli: &Cli) -> Result<()> {
             Lang::Rust => Ecosystem::CratesIo,
             Lang::Go => Ecosystem::Go,
             Lang::Ruby => Ecosystem::RubyGems,
-            Lang::Actions | Lang::PreCommit => unreachable!("filtered above"),
+            Lang::Actions | Lang::PreCommit | Lang::Mise => unreachable!("filtered above"),
         };
 
         for occurrence in occurrences {
@@ -1003,6 +1022,7 @@ fn print_alignment(alignment: &PackageAlignment, _dry_run: bool) {
         Lang::Ruby => " (rubygems)",
         Lang::Actions => " (actions)",
         Lang::PreCommit => " (pre-commit)",
+        Lang::Mise => " (mise)",
     };
 
     println!(
@@ -1125,6 +1145,12 @@ fn apply_version_updates(
             }
             FileType::PreCommitConfig => {
                 replace_pre_commit_version(&result, package, old_version, &target_version)
+            }
+            FileType::MiseToml => {
+                replace_mise_toml_version(&result, package, old_version, &target_version)
+            }
+            FileType::ToolVersions => {
+                replace_tool_versions_version(&result, package, old_version, &target_version)
             }
         };
     }
@@ -1256,6 +1282,30 @@ fn replace_pre_commit_version(content: &str, _package: &str, old: &str, new: &st
     let pattern = format!(r#"(?m)(^\s*rev:\s*['"]?){}"#, regex::escape(old));
     let re = regex::Regex::new(&pattern).unwrap();
     re.replace_all(content, format!("${{1}}{}", new))
+        .to_string()
+}
+
+fn replace_mise_toml_version(content: &str, package: &str, old: &str, new: &str) -> String {
+    // Pattern: tool_name = "version" (with optional quotes around tool name)
+    let pattern = format!(
+        r#"(?m)^("?{}?"?\s*=\s*"){}""#,
+        regex::escape(package),
+        regex::escape(old)
+    );
+    let re = regex::Regex::new(&pattern).unwrap();
+    re.replace_all(content, format!(r#"${{1}}{}""#, new))
+        .to_string()
+}
+
+fn replace_tool_versions_version(content: &str, package: &str, old: &str, new: &str) -> String {
+    // Pattern: tool_name old_version
+    let pattern = format!(
+        r"(?m)^({}\s+){}(\s|$)",
+        regex::escape(package),
+        regex::escape(old)
+    );
+    let re = regex::Regex::new(&pattern).unwrap();
+    re.replace_all(content, format!("${{1}}{}${{2}}", new))
         .to_string()
 }
 

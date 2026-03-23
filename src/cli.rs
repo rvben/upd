@@ -7,7 +7,7 @@ use std::path::PathBuf;
 #[command(
     author,
     version,
-    about = "A fast dependency updater for Python, Node.js, Rust, Go, Ruby, GitHub Actions, and pre-commit projects"
+    about = "A fast dependency updater for Python, Node.js, Rust, Go, Ruby, GitHub Actions, pre-commit, and Mise/asdf projects"
 )]
 pub struct Cli {
     #[command(subcommand)]

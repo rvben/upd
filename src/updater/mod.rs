@@ -2,6 +2,7 @@ mod cargo_toml;
 mod gemfile;
 mod github_actions;
 mod go_mod;
+mod mise;
 mod package_json;
 mod pre_commit;
 mod pyproject;
@@ -11,6 +12,7 @@ pub use cargo_toml::CargoTomlUpdater;
 pub use gemfile::GemfileUpdater;
 pub use github_actions::GithubActionsUpdater;
 pub use go_mod::GoModUpdater;
+pub use mise::MiseUpdater;
 pub use package_json::PackageJsonUpdater;
 pub use pre_commit::PreCommitUpdater;
 pub use pyproject::PyProjectUpdater;
@@ -160,6 +162,7 @@ pub enum Lang {
     Ruby,
     Actions,
     PreCommit,
+    Mise,
 }
 
 /// Type of dependency file
@@ -173,6 +176,8 @@ pub enum FileType {
     Gemfile,
     GithubActions,
     PreCommitConfig,
+    MiseToml,
+    ToolVersions,
 }
 
 impl FileType {
@@ -186,6 +191,7 @@ impl FileType {
             FileType::Gemfile => Lang::Ruby,
             FileType::GithubActions => Lang::Actions,
             FileType::PreCommitConfig => Lang::PreCommit,
+            FileType::MiseToml | FileType::ToolVersions => Lang::Mise,
         }
     }
 }
@@ -216,6 +222,14 @@ impl FileType {
 
         if file_name == ".pre-commit-config.yaml" {
             return Some(FileType::PreCommitConfig);
+        }
+
+        if file_name == ".mise.toml" {
+            return Some(FileType::MiseToml);
+        }
+
+        if file_name == ".tool-versions" {
+            return Some(FileType::ToolVersions);
         }
 
         // Requirements file patterns (.txt and .in extensions)
@@ -302,6 +316,20 @@ fn discover_pre_commit_config(path: &Path, files: &mut Vec<(PathBuf, FileType)>)
     }
 }
 
+/// Scan for .mise.toml and .tool-versions in a directory.
+/// These are dot-files, so WalkBuilder::hidden(true) skips them.
+fn discover_mise_files(path: &Path, files: &mut Vec<(PathBuf, FileType)>) {
+    let mise_path = path.join(".mise.toml");
+    if mise_path.is_file() {
+        files.push((mise_path, FileType::MiseToml));
+    }
+
+    let tool_versions_path = path.join(".tool-versions");
+    if tool_versions_path.is_file() {
+        files.push((tool_versions_path, FileType::ToolVersions));
+    }
+}
+
 /// Discover dependency files in the given paths, optionally filtered by language
 pub fn discover_files(paths: &[PathBuf], langs: &[Lang]) -> Vec<(PathBuf, FileType)> {
     let mut files = Vec::new();
@@ -340,6 +368,11 @@ pub fn discover_files(paths: &[PathBuf], langs: &[Lang]) -> Vec<(PathBuf, FileTy
             // Separate scan for .pre-commit-config.yaml (hidden from WalkBuilder)
             if langs.is_empty() || langs.contains(&Lang::PreCommit) {
                 discover_pre_commit_config(path, &mut files);
+            }
+
+            // Separate scan for .mise.toml and .tool-versions (hidden from WalkBuilder)
+            if langs.is_empty() || langs.contains(&Lang::Mise) {
+                discover_mise_files(path, &mut files);
             }
         }
     }
@@ -590,6 +623,8 @@ mod tests {
         assert_eq!(FileType::Gemfile.lang(), Lang::Ruby);
         assert_eq!(FileType::GithubActions.lang(), Lang::Actions);
         assert_eq!(FileType::PreCommitConfig.lang(), Lang::PreCommit);
+        assert_eq!(FileType::MiseToml.lang(), Lang::Mise);
+        assert_eq!(FileType::ToolVersions.lang(), Lang::Mise);
     }
 
     #[test]
