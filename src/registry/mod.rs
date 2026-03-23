@@ -103,10 +103,16 @@ pub fn http_error_message(
             "Request timed out for {} '{}' (HTTP {}). The registry may be slow or unreachable.",
             entity_type, name, code
         ),
-        429 => format!(
-            "Rate limited while fetching {} '{}' (HTTP 429). Wait a moment and try again.",
-            entity_type, name
-        ),
+        429 => {
+            let hint = registry_hint.map_or_else(
+                || "Wait a moment and try again.".to_string(),
+                |h| format!("Wait a moment and try again. {}", h),
+            );
+            format!(
+                "Rate limited while fetching {} '{}' (HTTP 429). {}",
+                entity_type, name, hint
+            )
+        }
         500..=599 => format!(
             "Registry server error for {} '{}' (HTTP {}). The registry may be experiencing issues.",
             entity_type, name, code
