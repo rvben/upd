@@ -27,6 +27,8 @@ pub enum LockfileType {
     CargoLock,
     /// go.sum - regenerated with `go mod tidy`
     GoSum,
+    /// Gemfile.lock - regenerated with `bundle install`
+    GemfileLock,
 }
 
 impl LockfileType {
@@ -41,6 +43,7 @@ impl LockfileType {
             LockfileType::BunLock => "bun.lockb",
             LockfileType::CargoLock => "Cargo.lock",
             LockfileType::GoSum => "go.sum",
+            LockfileType::GemfileLock => "Gemfile.lock",
         }
     }
 
@@ -55,6 +58,7 @@ impl LockfileType {
             LockfileType::BunLock => ("bun", &["install"]),
             LockfileType::CargoLock => ("cargo", &["update"]),
             LockfileType::GoSum => ("go", &["mod", "tidy"]),
+            LockfileType::GemfileLock => ("bundle", &["install"]),
         }
     }
 
@@ -68,6 +72,7 @@ impl LockfileType {
             | LockfileType::BunLock => "package.json",
             LockfileType::CargoLock => "Cargo.toml",
             LockfileType::GoSum => "go.mod",
+            LockfileType::GemfileLock => "Gemfile",
         }
     }
 }
@@ -129,6 +134,16 @@ pub fn detect_lockfiles(manifest_path: &Path) -> Vec<LockfileType> {
         && dir.join("go.sum").exists()
     {
         lockfiles.push(LockfileType::GoSum);
+    }
+
+    // Check for Ruby lockfile (only if manifest is Gemfile)
+    if manifest_path
+        .file_name()
+        .map(|n| n == "Gemfile")
+        .unwrap_or(false)
+        && dir.join("Gemfile.lock").exists()
+    {
+        lockfiles.push(LockfileType::GemfileLock);
     }
 
     lockfiles
@@ -402,6 +417,63 @@ mod tests {
         let lockfile = dir.path().join("poetry.lock");
 
         fs::write(&manifest, "{}").unwrap();
+        fs::write(&lockfile, "").unwrap();
+
+        let detected = detect_lockfiles(&manifest);
+        assert!(detected.is_empty());
+    }
+
+    #[test]
+    fn test_lockfile_type_gemfile_filename() {
+        assert_eq!(LockfileType::GemfileLock.filename(), "Gemfile.lock");
+    }
+
+    #[test]
+    fn test_lockfile_type_gemfile_command() {
+        let (cmd, args) = LockfileType::GemfileLock.command();
+        assert_eq!(cmd, "bundle");
+        assert_eq!(args, &["install"]);
+    }
+
+    #[test]
+    fn test_lockfile_type_gemfile_manifest() {
+        assert_eq!(LockfileType::GemfileLock.manifest(), "Gemfile");
+    }
+
+    #[test]
+    fn test_detect_lockfiles_gemfile() {
+        let dir = tempdir().unwrap();
+        let manifest = dir.path().join("Gemfile");
+        let lockfile = dir.path().join("Gemfile.lock");
+
+        fs::write(&manifest, "source 'https://rubygems.org'").unwrap();
+        fs::write(&lockfile, "").unwrap();
+
+        let detected = detect_lockfiles(&manifest);
+        assert_eq!(detected.len(), 1);
+        assert_eq!(detected[0], LockfileType::GemfileLock);
+    }
+
+    #[test]
+    fn test_detect_lockfiles_gemfile_no_lockfile() {
+        // Gemfile without Gemfile.lock should not detect any lockfile
+        let dir = tempdir().unwrap();
+        let manifest = dir.path().join("Gemfile");
+
+        fs::write(&manifest, "source 'https://rubygems.org'").unwrap();
+
+        let detected = detect_lockfiles(&manifest);
+        assert!(detected.is_empty());
+    }
+
+    #[test]
+    fn test_detect_lockfiles_gemfile_wrong_manifest() {
+        // Gemfile.lock should only be detected for Gemfile, not for other manifests
+        let dir = tempdir().unwrap();
+        let manifest = dir.path().join("pyproject.toml");
+        let lockfile = dir.path().join("Gemfile.lock");
+
+        fs::write(&manifest, "[project]").unwrap();
         fs::write(&lockfile, "").unwrap();
 
         let detected = detect_lockfiles(&manifest);
