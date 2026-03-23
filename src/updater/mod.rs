@@ -254,6 +254,27 @@ pub trait Updater: Send + Sync {
     fn parse_dependencies(&self, path: &Path) -> Result<Vec<ParsedDependency>>;
 }
 
+/// Scan for GitHub Actions workflow files in .github/workflows/ directories.
+/// This is a separate pass because WalkBuilder::hidden(true) skips dot-directories.
+fn discover_github_actions(path: &Path, files: &mut Vec<(PathBuf, FileType)>) {
+    let workflows_dir = path.join(".github").join("workflows");
+    if !workflows_dir.is_dir() {
+        return;
+    }
+
+    if let Ok(entries) = std::fs::read_dir(&workflows_dir) {
+        for entry in entries.flatten() {
+            let entry_path = entry.path();
+            if entry_path.is_file()
+                && let Some(ext) = entry_path.extension().and_then(|e| e.to_str())
+                && (ext == "yml" || ext == "yaml")
+            {
+                files.push((entry_path, FileType::GithubActions));
+            }
+        }
+    }
+}
+
 /// Discover dependency files in the given paths, optionally filtered by language
 pub fn discover_files(paths: &[PathBuf], langs: &[Lang]) -> Vec<(PathBuf, FileType)> {
     let mut files = Vec::new();
@@ -282,6 +303,11 @@ pub fn discover_files(paths: &[PathBuf], langs: &[Lang]) -> Vec<(PathBuf, FileTy
                 {
                     files.push((entry_path.to_path_buf(), file_type));
                 }
+            }
+
+            // Separate scan for .github/workflows/ (hidden from WalkBuilder)
+            if langs.is_empty() || langs.contains(&Lang::Actions) {
+                discover_github_actions(path, &mut files);
             }
         }
     }
@@ -569,5 +595,51 @@ mod tests {
         // Filter for Python and Rust
         let files = discover_files(&[temp.path().to_path_buf()], &[Lang::Python, Lang::Rust]);
         assert_eq!(files.len(), 2);
+    }
+
+    #[test]
+    fn test_discover_github_actions_files() {
+        let temp = tempdir().unwrap();
+        let workflows_dir = temp.path().join(".github").join("workflows");
+        fs::create_dir_all(&workflows_dir).unwrap();
+        fs::write(workflows_dir.join("ci.yml"), "name: CI\non: push").unwrap();
+        fs::write(workflows_dir.join("release.yaml"), "name: Release").unwrap();
+        fs::write(temp.path().join("package.json"), "{}").unwrap();
+
+        let files = discover_files(&[temp.path().to_path_buf()], &[]);
+        assert_eq!(files.len(), 3);
+        let types: Vec<_> = files.iter().map(|(_, ft)| *ft).collect();
+        assert!(types.contains(&FileType::PackageJson));
+        assert_eq!(
+            types
+                .iter()
+                .filter(|ft| **ft == FileType::GithubActions)
+                .count(),
+            2
+        );
+    }
+
+    #[test]
+    fn test_discover_github_actions_respects_lang_filter() {
+        let temp = tempdir().unwrap();
+        let workflows_dir = temp.path().join(".github").join("workflows");
+        fs::create_dir_all(&workflows_dir).unwrap();
+        fs::write(workflows_dir.join("ci.yml"), "name: CI").unwrap();
+        fs::write(temp.path().join("package.json"), "{}").unwrap();
+
+        let files = discover_files(&[temp.path().to_path_buf()], &[Lang::Node]);
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].1, FileType::PackageJson);
+
+        let files = discover_files(&[temp.path().to_path_buf()], &[Lang::Actions]);
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].1, FileType::GithubActions);
+    }
+
+    #[test]
+    fn test_discover_no_github_dir() {
+        let temp = tempdir().unwrap();
+        let files = discover_files(&[temp.path().to_path_buf()], &[Lang::Actions]);
+        assert!(files.is_empty());
     }
 }
