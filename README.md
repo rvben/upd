@@ -572,8 +572,8 @@ Add `upd` to your `.pre-commit-config.yaml`:
 
 ```yaml
 repos:
-  - repo: https://github.com/rvben/upd
-    rev: v0.0.24  # Use the latest version
+  - repo: https://github.com/rvben/upd-pre-commit
+    rev: v0.0.24
     hooks:
       - id: upd-check
         # Optional: only check specific ecosystems
@@ -587,9 +587,7 @@ Available hooks:
 | `upd-check` | Fail if any dependencies are outdated |
 | `upd-check-major` | Fail only on major (breaking) updates |
 
-Both hooks run on `pre-push` by default and trigger when dependency files change.
-
-**Note:** Requires `upd` to be installed and available in PATH.
+Both hooks run on `pre-push` by default. Uses `language: python` which installs `upd-cli` from PyPI automatically — no manual installation needed.
 
 ## Development
 
