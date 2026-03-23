@@ -326,6 +326,10 @@ async fn run_update(cli: &Cli) -> Result<()> {
                             .update(&path, go_proxy.as_ref(), update_options.clone())
                             .await
                     }
+                    FileType::GithubActions => {
+                        // Stub — wired up in task 7
+                        Ok(UpdateResult::default())
+                    }
                 };
                 (path, result.map_err(|e| e.to_string()))
             }
@@ -470,6 +474,7 @@ async fn run_interactive_update(
                     .update(path, go_proxy.as_ref(), dry_run_options.clone())
                     .await
             }
+            FileType::GithubActions => Ok(UpdateResult::default()),
         };
 
         if let Ok(file_result) = result {
@@ -570,6 +575,7 @@ async fn run_interactive_update(
                     .update(path, go_proxy.as_ref(), apply_options.clone())
                     .await
             }
+            FileType::GithubActions => Ok(UpdateResult::default()),
         };
 
         if let Ok(file_result) = result {
@@ -759,11 +765,17 @@ async fn run_audit(cli: &Cli) -> Result<()> {
         std::collections::HashSet::new();
 
     for ((name, lang), occurrences) in &packages {
+        // OSV doesn't cover GitHub Actions; skip actions dependencies
+        if *lang == Lang::Actions {
+            continue;
+        }
+
         let ecosystem = match lang {
             Lang::Python => Ecosystem::PyPI,
             Lang::Node => Ecosystem::Npm,
             Lang::Rust => Ecosystem::CratesIo,
             Lang::Go => Ecosystem::Go,
+            Lang::Actions => unreachable!("Actions filtered above"),
         };
 
         for occurrence in occurrences {
@@ -914,6 +926,7 @@ fn print_alignment(alignment: &PackageAlignment, _dry_run: bool) {
         Lang::Node => " (npm)",
         Lang::Rust => " (cargo)",
         Lang::Go => " (go)",
+        Lang::Actions => " (actions)",
     };
 
     println!(
@@ -1026,6 +1039,7 @@ fn apply_version_updates(
             FileType::GoMod => {
                 replace_go_mod_version(&result, package, old_version, &target_version)
             }
+            FileType::GithubActions => result.to_string(),
         };
     }
 

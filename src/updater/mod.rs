@@ -151,6 +151,7 @@ pub enum Lang {
     Node,
     Rust,
     Go,
+    Actions,
 }
 
 /// Type of dependency file
@@ -161,6 +162,7 @@ pub enum FileType {
     PackageJson,
     CargoToml,
     GoMod,
+    GithubActions,
 }
 
 impl FileType {
@@ -171,6 +173,7 @@ impl FileType {
             FileType::PackageJson => Lang::Node,
             FileType::CargoToml => Lang::Rust,
             FileType::GoMod => Lang::Go,
+            FileType::GithubActions => Lang::Actions,
         }
     }
 }
@@ -524,6 +527,7 @@ mod tests {
         assert_eq!(FileType::PackageJson.lang(), Lang::Node);
         assert_eq!(FileType::CargoToml.lang(), Lang::Rust);
         assert_eq!(FileType::GoMod.lang(), Lang::Go);
+        assert_eq!(FileType::GithubActions.lang(), Lang::Actions);
     }
 
     #[test]

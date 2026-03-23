@@ -76,6 +76,7 @@ fn get_updater(file_type: FileType) -> Box<dyn Updater> {
         FileType::PackageJson => Box::new(PackageJsonUpdater::new()),
         FileType::CargoToml => Box::new(CargoTomlUpdater::new()),
         FileType::GoMod => Box::new(GoModUpdater::new()),
+        FileType::GithubActions => unimplemented!("GithubActions updater - added in task 4"),
     }
 }
 
@@ -177,6 +178,10 @@ fn is_stable_version(version: &str, lang: Lang) -> bool {
             // Semver pre-release indicator: hyphen followed by identifier
             !version.contains('-')
         }
+        Lang::Actions => {
+            let v = version.strip_prefix('v').unwrap_or(version);
+            !v.contains('-')
+        }
     }
 }
 
@@ -186,6 +191,11 @@ fn compare_versions(a: &str, b: &str, lang: Lang) -> std::cmp::Ordering {
         Lang::Python => compare_pep440(a, b),
         Lang::Node | Lang::Rust => compare_semver(a, b),
         Lang::Go => compare_go_version(a, b),
+        Lang::Actions => {
+            let clean_a = a.trim_start_matches('v');
+            let clean_b = b.trim_start_matches('v');
+            compare_semver(clean_a, clean_b)
+        }
     }
 }
 
