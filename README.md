@@ -4,7 +4,7 @@
 
 # upd
 
-A fast dependency updater for Python, Node.js, Rust, Go, Ruby, GitHub Actions, pre-commit, and Mise projects, written in Rust.
+A fast dependency updater for Python, Node.js, Rust, Go, Ruby, Terraform, GitHub Actions, pre-commit, and Mise projects, written in Rust.
 
 ## Quick Start
 
@@ -21,7 +21,7 @@ uvx --from upd-cli upd -n
 
 ## Features
 
-- **Multi-ecosystem**: Python, Node.js, Rust, Go, Ruby, GitHub Actions, pre-commit, Mise/asdf
+- **Multi-ecosystem**: Python, Node.js, Rust, Go, Ruby, Terraform, GitHub Actions, pre-commit, Mise/asdf
 - **Fast**: Parallel registry requests for all dependencies
 - **Constraint-aware**: Respects version constraints like `>=2.0,<3` and `~> 7.1`
 - **Smart caching**: 24-hour version cache for faster subsequent runs
@@ -106,6 +106,7 @@ upd --lang python --lang go # Update Python and Go only
 upd --lang actions          # Update only GitHub Actions
 upd --lang pre-commit       # Update only pre-commit hooks
 upd --lang ruby             # Update only Ruby gems
+upd --lang terraform        # Update only Terraform providers/modules
 upd --lang mise             # Update only Mise/asdf tools
 
 # Version precision
@@ -166,6 +167,14 @@ upd audit --check  # Exit 1 if vulnerabilities found (for CI)
 ### Ruby
 
 - `Gemfile` (gem declarations with version constraints)
+
+### Terraform / OpenTofu
+
+- `.tf` files (HCL format)
+- Updates `required_providers` version constraints and `module` version declarations
+- Queries the Terraform Registry API (`registry.terraform.io`)
+- Skips local modules (`./`, `../`) and git sources
+- Supports pessimistic constraints (`~> 5.0`)
 
 ### GitHub Actions
 
