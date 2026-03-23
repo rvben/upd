@@ -15,12 +15,13 @@ use upd::interactive::{PendingUpdate, prompt_all};
 use upd::lockfile::regenerate_lockfiles;
 use upd::registry::{
     CratesIoRegistry, GitHubReleasesRegistry, GoProxyRegistry, MultiPyPiRegistry, NpmRegistry,
-    PyPiRegistry, RubyGemsRegistry,
+    PyPiRegistry, RubyGemsRegistry, TerraformRegistry,
 };
 use upd::updater::{
     CargoTomlUpdater, FileType, GemfileUpdater, GithubActionsUpdater, GoModUpdater, Lang,
     MiseUpdater, PackageJsonUpdater, PreCommitUpdater, PyProjectUpdater, RequirementsUpdater,
-    UpdateOptions, UpdateResult, Updater, discover_files, read_file_safe, write_file_atomic,
+    TerraformUpdater, UpdateOptions, UpdateResult, Updater, discover_files, read_file_safe,
+    write_file_atomic,
 };
 use upd::version::match_version_precision;
 
@@ -240,6 +241,10 @@ async fn run_update(cli: &Cli) -> Result<()> {
     let rubygems_registry = RubyGemsRegistry::new();
     let rubygems = CachedRegistry::new(rubygems_registry, Arc::clone(&cache), cache_enabled);
 
+    // Create Terraform registry
+    let terraform_registry = TerraformRegistry::new();
+    let terraform = CachedRegistry::new(terraform_registry, Arc::clone(&cache), cache_enabled);
+
     // Create GitHub releases registry with optional token
     let github_releases_registry = GitHubReleasesRegistry::new();
     if cli.verbose && GitHubReleasesRegistry::detect_token().is_some() {
@@ -258,6 +263,7 @@ async fn run_update(cli: &Cli) -> Result<()> {
     let pre_commit_updater = Arc::new(PreCommitUpdater::new());
     let gemfile_updater = Arc::new(GemfileUpdater::new());
     let mise_updater = Arc::new(MiseUpdater::new());
+    let terraform_updater = Arc::new(TerraformUpdater::new());
 
     // Wrap registries in Arc for parallel processing
     let pypi = Arc::new(pypi);
@@ -265,6 +271,7 @@ async fn run_update(cli: &Cli) -> Result<()> {
     let crates_io = Arc::new(crates_io);
     let go_proxy = Arc::new(go_proxy);
     let rubygems = Arc::new(rubygems);
+    let terraform = Arc::new(terraform);
     let github_releases = Arc::new(github_releases);
 
     // Interactive mode: first discover updates, then prompt, then apply approved ones
@@ -279,6 +286,7 @@ async fn run_update(cli: &Cli) -> Result<()> {
             &crates_io,
             &go_proxy,
             &rubygems,
+            &terraform,
             &github_releases,
             &requirements_updater,
             &pyproject_updater,
@@ -289,6 +297,7 @@ async fn run_update(cli: &Cli) -> Result<()> {
             &github_actions_updater,
             &pre_commit_updater,
             &mise_updater,
+            &terraform_updater,
             &cache,
             cache_enabled,
         )
@@ -318,6 +327,7 @@ async fn run_update(cli: &Cli) -> Result<()> {
             let crates_io = Arc::clone(&crates_io);
             let go_proxy = Arc::clone(&go_proxy);
             let rubygems = Arc::clone(&rubygems);
+            let terraform = Arc::clone(&terraform);
             let github_releases = Arc::clone(&github_releases);
             let requirements_updater = Arc::clone(&requirements_updater);
             let pyproject_updater = Arc::clone(&pyproject_updater);
@@ -328,6 +338,7 @@ async fn run_update(cli: &Cli) -> Result<()> {
             let github_actions_updater = Arc::clone(&github_actions_updater);
             let pre_commit_updater = Arc::clone(&pre_commit_updater);
             let mise_updater = Arc::clone(&mise_updater);
+            let terraform_updater = Arc::clone(&terraform_updater);
             let update_options = update_options.clone();
 
             async move {
@@ -375,6 +386,11 @@ async fn run_update(cli: &Cli) -> Result<()> {
                     FileType::MiseToml | FileType::ToolVersions => {
                         mise_updater
                             .update(&path, github_releases.as_ref(), update_options.clone())
+                            .await
+                    }
+                    FileType::TerraformTf => {
+                        terraform_updater
+                            .update(&path, terraform.as_ref(), update_options.clone())
                             .await
                     }
                 };
@@ -472,6 +488,7 @@ async fn run_interactive_update(
     crates_io: &Arc<CachedRegistry<CratesIoRegistry>>,
     go_proxy: &Arc<CachedRegistry<GoProxyRegistry>>,
     rubygems: &Arc<CachedRegistry<RubyGemsRegistry>>,
+    terraform: &Arc<CachedRegistry<TerraformRegistry>>,
     github_releases: &Arc<CachedRegistry<GitHubReleasesRegistry>>,
     requirements_updater: &Arc<RequirementsUpdater>,
     pyproject_updater: &Arc<PyProjectUpdater>,
@@ -482,6 +499,7 @@ async fn run_interactive_update(
     github_actions_updater: &Arc<GithubActionsUpdater>,
     pre_commit_updater: &Arc<PreCommitUpdater>,
     mise_updater: &Arc<MiseUpdater>,
+    terraform_updater: &Arc<TerraformUpdater>,
     cache: &Arc<std::sync::Mutex<Cache>>,
     cache_enabled: bool,
 ) -> Result<()> {
@@ -545,6 +563,11 @@ async fn run_interactive_update(
             FileType::MiseToml | FileType::ToolVersions => {
                 mise_updater
                     .update(path, github_releases.as_ref(), dry_run_options.clone())
+                    .await
+            }
+            FileType::TerraformTf => {
+                terraform_updater
+                    .update(path, terraform.as_ref(), dry_run_options.clone())
                     .await
             }
         };
@@ -665,6 +688,11 @@ async fn run_interactive_update(
             FileType::MiseToml | FileType::ToolVersions => {
                 mise_updater
                     .update(path, github_releases.as_ref(), apply_options.clone())
+                    .await
+            }
+            FileType::TerraformTf => {
+                terraform_updater
+                    .update(path, terraform.as_ref(), apply_options.clone())
                     .await
             }
         };
@@ -856,8 +884,12 @@ async fn run_audit(cli: &Cli) -> Result<()> {
         std::collections::HashSet::new();
 
     for ((name, lang), occurrences) in &packages {
-        // OSV doesn't cover GitHub Actions, pre-commit hooks, or mise tools; skip
-        if *lang == Lang::Actions || *lang == Lang::PreCommit || *lang == Lang::Mise {
+        // OSV doesn't cover GitHub Actions, pre-commit hooks, mise tools, or Terraform; skip
+        if *lang == Lang::Actions
+            || *lang == Lang::PreCommit
+            || *lang == Lang::Mise
+            || *lang == Lang::Terraform
+        {
             continue;
         }
 
@@ -867,7 +899,9 @@ async fn run_audit(cli: &Cli) -> Result<()> {
             Lang::Rust => Ecosystem::CratesIo,
             Lang::Go => Ecosystem::Go,
             Lang::Ruby => Ecosystem::RubyGems,
-            Lang::Actions | Lang::PreCommit | Lang::Mise => unreachable!("filtered above"),
+            Lang::Actions | Lang::PreCommit | Lang::Mise | Lang::Terraform => {
+                unreachable!("filtered above")
+            }
         };
 
         for occurrence in occurrences {
@@ -1023,6 +1057,7 @@ fn print_alignment(alignment: &PackageAlignment, _dry_run: bool) {
         Lang::Actions => " (actions)",
         Lang::PreCommit => " (pre-commit)",
         Lang::Mise => " (mise)",
+        Lang::Terraform => " (terraform)",
     };
 
     println!(
@@ -1151,6 +1186,9 @@ fn apply_version_updates(
             }
             FileType::ToolVersions => {
                 replace_tool_versions_version(&result, package, old_version, &target_version)
+            }
+            FileType::TerraformTf => {
+                replace_terraform_version(&result, package, old_version, &target_version)
             }
         };
     }
@@ -1306,6 +1344,17 @@ fn replace_tool_versions_version(content: &str, package: &str, old: &str, new: &
     );
     let re = regex::Regex::new(&pattern).unwrap();
     re.replace_all(content, format!("${{1}}{}${{2}}", new))
+        .to_string()
+}
+
+fn replace_terraform_version(content: &str, _package: &str, old: &str, new: &str) -> String {
+    // Replace version values in Terraform files. Handles constraint operators.
+    let pattern = format!(
+        r#"(version\s*=\s*"(?:~>\s*|>=\s*|<=\s*|>\s*|<\s*|=\s*|!=\s*)?){}""#,
+        regex::escape(old)
+    );
+    let re = regex::Regex::new(&pattern).unwrap();
+    re.replace_all(content, format!(r#"${{1}}{}""#, new))
         .to_string()
 }
 

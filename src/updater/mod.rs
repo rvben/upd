@@ -7,6 +7,7 @@ mod package_json;
 mod pre_commit;
 mod pyproject;
 mod requirements;
+mod terraform;
 
 pub use cargo_toml::CargoTomlUpdater;
 pub use gemfile::GemfileUpdater;
@@ -17,6 +18,7 @@ pub use package_json::PackageJsonUpdater;
 pub use pre_commit::PreCommitUpdater;
 pub use pyproject::PyProjectUpdater;
 pub use requirements::RequirementsUpdater;
+pub use terraform::TerraformUpdater;
 
 use crate::config::UpdConfig;
 use crate::registry::Registry;
@@ -163,6 +165,7 @@ pub enum Lang {
     Actions,
     PreCommit,
     Mise,
+    Terraform,
 }
 
 /// Type of dependency file
@@ -178,6 +181,7 @@ pub enum FileType {
     PreCommitConfig,
     MiseToml,
     ToolVersions,
+    TerraformTf,
 }
 
 impl FileType {
@@ -192,6 +196,7 @@ impl FileType {
             FileType::GithubActions => Lang::Actions,
             FileType::PreCommitConfig => Lang::PreCommit,
             FileType::MiseToml | FileType::ToolVersions => Lang::Mise,
+            FileType::TerraformTf => Lang::Terraform,
         }
     }
 }
@@ -230,6 +235,14 @@ impl FileType {
 
         if file_name == ".tool-versions" {
             return Some(FileType::ToolVersions);
+        }
+
+        // Terraform .tf files (exclude files inside .terraform/ directories)
+        if file_name.ends_with(".tf") {
+            let path_str = path.to_string_lossy();
+            if !path_str.contains("/.terraform/") && !path_str.contains("\\.terraform\\") {
+                return Some(FileType::TerraformTf);
+            }
         }
 
         // Requirements file patterns (.txt and .in extensions)

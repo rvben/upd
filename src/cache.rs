@@ -25,6 +25,8 @@ pub struct Cache {
     github_releases: HashMap<String, CacheEntry>,
     #[serde(default)]
     rubygems: HashMap<String, CacheEntry>,
+    #[serde(default)]
+    terraform: HashMap<String, CacheEntry>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -80,6 +82,7 @@ impl Cache {
             "go-proxy" => &self.go_proxy,
             "github-releases" => &self.github_releases,
             "rubygems" => &self.rubygems,
+            "terraform" => &self.terraform,
             _ => return None,
         };
 
@@ -100,6 +103,7 @@ impl Cache {
             "go-proxy" => &mut self.go_proxy,
             "github-releases" => &mut self.github_releases,
             "rubygems" => &mut self.rubygems,
+            "terraform" => &mut self.terraform,
             _ => return,
         };
 
@@ -160,6 +164,8 @@ impl Cache {
         self.github_releases
             .retain(|_, entry| !Self::is_expired(entry.fetched_at));
         self.rubygems
+            .retain(|_, entry| !Self::is_expired(entry.fetched_at));
+        self.terraform
             .retain(|_, entry| !Self::is_expired(entry.fetched_at));
     }
 }

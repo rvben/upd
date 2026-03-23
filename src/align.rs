@@ -6,7 +6,7 @@
 use crate::updater::{
     CargoTomlUpdater, FileType, GemfileUpdater, GithubActionsUpdater, GoModUpdater, Lang,
     MiseUpdater, PackageJsonUpdater, ParsedDependency, PreCommitUpdater, PyProjectUpdater,
-    RequirementsUpdater, Updater,
+    RequirementsUpdater, TerraformUpdater, Updater,
 };
 use anyhow::Result;
 use std::collections::HashMap;
@@ -81,6 +81,7 @@ fn get_updater(file_type: FileType) -> Box<dyn Updater> {
         FileType::GithubActions => Box::new(GithubActionsUpdater::new()),
         FileType::PreCommitConfig => Box::new(PreCommitUpdater::new()),
         FileType::MiseToml | FileType::ToolVersions => Box::new(MiseUpdater::new()),
+        FileType::TerraformTf => Box::new(TerraformUpdater::new()),
     }
 }
 
@@ -189,7 +190,7 @@ fn is_stable_version(version: &str, lang: Lang) -> bool {
                 && !v.contains(".beta")
                 && !v.contains(".alpha")
         }
-        Lang::Actions | Lang::PreCommit | Lang::Mise => {
+        Lang::Actions | Lang::PreCommit | Lang::Mise | Lang::Terraform => {
             let v = version.strip_prefix('v').unwrap_or(version);
             !v.contains('-')
         }
@@ -202,7 +203,7 @@ fn compare_versions(a: &str, b: &str, lang: Lang) -> std::cmp::Ordering {
         Lang::Python => compare_pep440(a, b),
         Lang::Node | Lang::Rust | Lang::Ruby => compare_semver(a, b),
         Lang::Go => compare_go_version(a, b),
-        Lang::Actions | Lang::PreCommit | Lang::Mise => {
+        Lang::Actions | Lang::PreCommit | Lang::Mise | Lang::Terraform => {
             let clean_a = a.trim_start_matches('v');
             let clean_b = b.trim_start_matches('v');
             compare_semver(clean_a, clean_b)
