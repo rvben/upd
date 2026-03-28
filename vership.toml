@@ -1,0 +1,2 @@
+[hooks]
+post-push = "gh api repos/rvben/upd-pre-commit/dispatches -f event_type=pypi_release"
