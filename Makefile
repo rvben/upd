@@ -1,4 +1,4 @@
-.PHONY: build release test lint fmt check clean run install
+.PHONY: build release test lint fmt check clean run install release-patch release-minor release-major
 
 # Build debug binary
 build:
@@ -46,3 +46,12 @@ run-release:
 # Install to ~/.cargo/bin
 install:
 	cargo install --path .
+
+release-patch:
+	vership bump patch
+
+release-minor:
+	vership bump minor
+
+release-major:
+	vership bump major
