@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 
 
+
+## [0.0.27](https://github.com/rvben/upd/compare/v0.0.26...v0.0.27) - 2026-04-15
+
+### Fixed
+
+- **align**: use pep440_rs for Python stable-version check ([7f132b3](https://github.com/rvben/upd/commit/7f132b351cdd9225a31df96d2a421c8c42926987))
+- **version**: use PEP 440 release segments for precision matching ([fff041d](https://github.com/rvben/upd/commit/fff041d2d2e9508f117012a6bfc857ee57e5cd20))
+
 ## [0.0.26](https://github.com/rvben/upd/compare/v0.0.25...v0.0.26) - 2026-04-15
 
 ### Fixed
