@@ -28,6 +28,9 @@ mod tests {
         assert!(is_stable_pep440("0.1.0"));
         assert!(is_stable_pep440("1.0"));
         assert!(is_stable_pep440("1"));
+        // Post-releases are stable releases that fix packaging issues
+        assert!(is_stable_pep440("1.0.0.post1"));
+        assert!(is_stable_pep440("2.1117.0.post1"));
     }
 
     #[test]

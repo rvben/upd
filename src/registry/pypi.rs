@@ -896,6 +896,9 @@ mod tests {
     fn test_stable_version_detection() {
         assert!(PyPiRegistry::is_stable_version("1.0.0"));
         assert!(PyPiRegistry::is_stable_version("2.31.0"));
+        // Post-releases are stable releases that fix packaging issues
+        assert!(PyPiRegistry::is_stable_version("1.0.0.post1"));
+        assert!(PyPiRegistry::is_stable_version("2.1117.0.post1"));
         assert!(!PyPiRegistry::is_stable_version("1.0.0a1"));
         assert!(!PyPiRegistry::is_stable_version("1.0.0b2"));
         assert!(!PyPiRegistry::is_stable_version("1.0.0rc1"));

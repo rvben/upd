@@ -8,6 +8,7 @@ use crate::updater::{
     Lang, MiseUpdater, PackageJsonUpdater, ParsedDependency, PreCommitUpdater, PyProjectUpdater,
     RequirementsUpdater, TerraformUpdater, Updater,
 };
+use crate::version::is_stable_pep440;
 use anyhow::Result;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -170,16 +171,7 @@ fn find_highest_version(occurrences: &[PackageOccurrence], lang: Lang) -> Option
 /// Check if a version is stable (not a pre-release)
 fn is_stable_version(version: &str, lang: Lang) -> bool {
     match lang {
-        Lang::Python => {
-            // Python pre-release indicators: a, b, rc, alpha, beta, dev
-            let v = version.to_lowercase();
-            !v.contains("a")
-                && !v.contains("b")
-                && !v.contains("rc")
-                && !v.contains("alpha")
-                && !v.contains("beta")
-                && !v.contains("dev")
-        }
+        Lang::Python => is_stable_pep440(version),
         Lang::Node | Lang::Rust | Lang::Go | Lang::DotNet => {
             // Semver pre-release indicator: hyphen followed by identifier
             !version.contains('-')
