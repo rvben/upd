@@ -5,6 +5,13 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+
+## [0.0.25](https://github.com/rvben/upd/compare/v0.0.24...v0.0.25) - 2026-04-15
+
+### Fixed
+
+- **pypi**: handle string-valued yanked field in PEP 691 JSON Simple API ([b17034b](https://github.com/rvben/upd/commit/b17034b540f6a5b62e446131c6e87f43695bbd9b))
+
 ## [0.0.24] - 2026-03-23
 
 ### Added
