@@ -2001,7 +2001,6 @@ mod tests {
             let mock_server = MockServer::start().await;
 
             // Server responds with HTML (no PEP 691 support)
-            // Each <a> tag needs to be on its own line for the parser
             let html = r#"<!DOCTYPE html>
 <html>
 <body>
