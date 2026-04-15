@@ -6,6 +6,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 
+
+## [0.0.26](https://github.com/rvben/upd/compare/v0.0.25...v0.0.26) - 2026-04-15
+
+### Fixed
+
+- **pypi**: rewrite HTML Simple API parser to handle multi-line anchor tags ([f9c937b](https://github.com/rvben/upd/commit/f9c937be297112e0556cae205f8c0f3ce54997f4))
+
 ## [0.0.25](https://github.com/rvben/upd/compare/v0.0.24...v0.0.25) - 2026-04-15
 
 ### Fixed
