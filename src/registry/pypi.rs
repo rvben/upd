@@ -60,11 +60,50 @@ struct SimpleApiResponse {
     files: Vec<SimpleApiFile>,
 }
 
+/// Deserialize the `yanked` field from PyPI's Simple API (PEP 592 / PEP 700).
+/// The field can be:
+/// - absent / `null`  → not yanked (false)
+/// - `false`          → not yanked
+/// - `true`           → yanked (rare)
+/// - a non-empty string (the yank reason) → yanked
+fn deserialize_yanked_flag<'de, D>(deserializer: D) -> Result<bool, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    struct YankedVisitor;
+
+    impl<'de> serde::de::Visitor<'de> for YankedVisitor {
+        type Value = bool;
+
+        fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+            formatter.write_str("a boolean or yank-reason string")
+        }
+
+        fn visit_bool<E: serde::de::Error>(self, v: bool) -> Result<bool, E> {
+            Ok(v)
+        }
+
+        fn visit_str<E: serde::de::Error>(self, v: &str) -> Result<bool, E> {
+            Ok(!v.is_empty())
+        }
+
+        fn visit_string<E: serde::de::Error>(self, v: String) -> Result<bool, E> {
+            Ok(!v.is_empty())
+        }
+
+        fn visit_unit<E: serde::de::Error>(self) -> Result<bool, E> {
+            Ok(false)
+        }
+    }
+
+    deserializer.deserialize_any(YankedVisitor)
+}
+
 #[derive(Debug, Clone, Deserialize)]
 struct SimpleApiFile {
     filename: String,
-    #[serde(default)]
-    yanked: Option<bool>,
+    #[serde(default, deserialize_with = "deserialize_yanked_flag")]
+    yanked: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -457,7 +496,7 @@ impl PyPiRegistry {
 
         for file in &data.files {
             // Skip yanked packages
-            if file.yanked.unwrap_or(false) {
+            if file.yanked {
                 continue;
             }
 
@@ -920,19 +959,19 @@ mod tests {
             files: vec![
                 SimpleApiFile {
                     filename: "my_package-1.0.0.tar.gz".to_string(),
-                    yanked: Some(false),
+                    yanked: false,
                 },
                 SimpleApiFile {
                     filename: "my_package-1.1.0.tar.gz".to_string(),
-                    yanked: None,
+                    yanked: false,
                 },
                 SimpleApiFile {
                     filename: "my_package-1.2.0-py3-none-any.whl".to_string(),
-                    yanked: Some(false),
+                    yanked: false,
                 },
                 SimpleApiFile {
                     filename: "my_package-2.0.0a1.tar.gz".to_string(),
-                    yanked: Some(false),
+                    yanked: false,
                 },
             ],
         };
@@ -961,19 +1000,19 @@ mod tests {
             files: vec![
                 SimpleApiFile {
                     filename: "my_package-1.0.0.tar.gz".to_string(),
-                    yanked: Some(false),
+                    yanked: false,
                 },
                 SimpleApiFile {
                     filename: "my_package-1.1.0.tar.gz".to_string(),
-                    yanked: Some(true), // Yanked
+                    yanked: true, // Yanked
                 },
                 SimpleApiFile {
                     filename: "my_package-1.2.0.tar.gz".to_string(),
-                    yanked: Some(true), // Yanked
+                    yanked: true, // Yanked
                 },
                 SimpleApiFile {
                     filename: "my_package-1.3.0.tar.gz".to_string(),
-                    yanked: Some(false),
+                    yanked: false,
                 },
             ],
         };
@@ -984,6 +1023,31 @@ mod tests {
         // Should only have 1.0.0 and 1.3.0 (1.1.0 and 1.2.0 are yanked)
         assert_eq!(versions.len(), 2);
         assert_eq!(versions[0].1, "1.3.0");
+        assert_eq!(versions[1].1, "1.0.0");
+    }
+
+    #[test]
+    fn test_parse_simple_api_json_response_string_yanked() {
+        // PyPI can return yanked as a string (the yank reason) per PEP 592 / PEP 700.
+        // Packages with string yanked values used to cause a serde deserialization
+        // failure (Option<bool> vs String), which caused the entire response to be
+        // discarded and fell through to the fallback registry with misleading 404 errors.
+        let registry = PyPiRegistry::new();
+        let json = r#"{
+            "files": [
+                {"filename": "my_package-1.0.0.tar.gz", "yanked": false},
+                {"filename": "my_package-1.1.0.tar.gz", "yanked": "Backward compatibility bug"},
+                {"filename": "my_package-1.2.0.tar.gz", "yanked": "security issue"},
+                {"filename": "my_package-2.0.0.tar.gz", "yanked": false}
+            ]
+        }"#;
+        let data: SimpleApiResponse = serde_json::from_str(json).unwrap();
+        let versions = registry
+            .parse_simple_api_json_response(data, "my-package", false)
+            .unwrap();
+        // 1.1.0 and 1.2.0 are yanked (string reason), should be skipped
+        assert_eq!(versions.len(), 2);
+        assert_eq!(versions[0].1, "2.0.0");
         assert_eq!(versions[1].1, "1.0.0");
     }
 
