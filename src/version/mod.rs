@@ -93,6 +93,11 @@ mod tests {
 
         // PEP 440 pre-release labels (no dot separator) are also preserved
         assert_eq!(match_version_precision("2.0.0", "2.0.1a1"), "2.0.1a1");
+        assert_eq!(match_version_precision("2.0.0", "2.0.1b1"), "2.0.1b1");
+        assert_eq!(match_version_precision("2.0.0", "2.0.1rc1"), "2.0.1rc1");
+
+        // PEP 440 dev releases are also preserved
+        assert_eq!(match_version_precision("2.0.0", "2.0.0.dev1"), "2.0.0.dev1");
 
         // Truncation path: suffix is dropped when original has lower precision
         assert_eq!(match_version_precision("2.0", "3.0.5.post1"), "3.0");
