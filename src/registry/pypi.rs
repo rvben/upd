@@ -1052,6 +1052,26 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_simple_api_json_response_empty_string_yanked() {
+        // yanked: "" is treated as not-yanked — an empty string carries no yank reason.
+        // PyPI uses true (bool) for no-reason yanks; empty string is not a valid yank signal.
+        let registry = PyPiRegistry::new();
+        let json = r#"{
+            "files": [
+                {"filename": "my_package-1.0.0.tar.gz", "yanked": ""},
+                {"filename": "my_package-2.0.0.tar.gz", "yanked": ""}
+            ]
+        }"#;
+        let data: SimpleApiResponse = serde_json::from_str(json).unwrap();
+        let versions = registry
+            .parse_simple_api_json_response(data, "my-package", false)
+            .unwrap();
+        assert_eq!(versions.len(), 2);
+        assert_eq!(versions[0].1, "2.0.0");
+        assert_eq!(versions[1].1, "1.0.0");
+    }
+
+    #[test]
     fn test_parse_simple_api_json_response_null_yanked() {
         // yanked: null must be treated as not-yanked (visit_unit)
         let registry = PyPiRegistry::new();
@@ -1626,18 +1646,20 @@ mod tests {
             let mock_server1 = MockServer::start().await;
             let mock_server2 = MockServer::start().await;
 
-            // Both servers return 404
-            Mock::given(method("GET"))
-                .and(path("/testpkg/json"))
-                .respond_with(ResponseTemplate::new(404))
-                .mount(&mock_server1)
-                .await;
+            // Both servers: Simple API returns 404, JSON API also returns 404
+            for server in [&mock_server1, &mock_server2] {
+                Mock::given(method("GET"))
+                    .and(path("/simple/testpkg/"))
+                    .respond_with(ResponseTemplate::new(404))
+                    .mount(server)
+                    .await;
 
-            Mock::given(method("GET"))
-                .and(path("/testpkg/json"))
-                .respond_with(ResponseTemplate::new(404))
-                .mount(&mock_server2)
-                .await;
+                Mock::given(method("GET"))
+                    .and(path("/pypi/testpkg/json"))
+                    .respond_with(ResponseTemplate::new(404))
+                    .mount(server)
+                    .await;
+            }
 
             let primary = PyPiRegistry::with_index_url(mock_server1.uri());
             let extras = vec![mock_server2.uri()];
