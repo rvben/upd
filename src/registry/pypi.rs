@@ -1052,6 +1052,44 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_simple_api_json_response_null_yanked() {
+        // yanked: null must be treated as not-yanked (visit_unit)
+        let registry = PyPiRegistry::new();
+        let json = r#"{
+            "files": [
+                {"filename": "my_package-1.0.0.tar.gz", "yanked": null},
+                {"filename": "my_package-2.0.0.tar.gz", "yanked": null}
+            ]
+        }"#;
+        let data: SimpleApiResponse = serde_json::from_str(json).unwrap();
+        let versions = registry
+            .parse_simple_api_json_response(data, "my-package", false)
+            .unwrap();
+        assert_eq!(versions.len(), 2);
+        assert_eq!(versions[0].1, "2.0.0");
+        assert_eq!(versions[1].1, "1.0.0");
+    }
+
+    #[test]
+    fn test_parse_simple_api_json_response_absent_yanked() {
+        // yanked field absent entirely must be treated as not-yanked (#[serde(default)])
+        let registry = PyPiRegistry::new();
+        let json = r#"{
+            "files": [
+                {"filename": "my_package-1.0.0.tar.gz"},
+                {"filename": "my_package-2.0.0.tar.gz"}
+            ]
+        }"#;
+        let data: SimpleApiResponse = serde_json::from_str(json).unwrap();
+        let versions = registry
+            .parse_simple_api_json_response(data, "my-package", false)
+            .unwrap();
+        assert_eq!(versions.len(), 2);
+        assert_eq!(versions[0].1, "2.0.0");
+        assert_eq!(versions[1].1, "1.0.0");
+    }
+
+    #[test]
     fn test_base64_encode() {
         assert_eq!(base64_encode("hello"), "aGVsbG8=");
         assert_eq!(base64_encode("user:pass"), "dXNlcjpwYXNz");
