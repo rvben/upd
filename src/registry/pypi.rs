@@ -542,38 +542,88 @@ impl PyPiRegistry {
         let mut versions: Vec<(Version, String)> = Vec::new();
         let normalized = package.to_lowercase().replace('_', "-");
 
-        // Extract versions from href attributes in anchor tags
-        // Format: <a href="...">package-version.tar.gz</a> or package-version-py3-none-any.whl
-        // Yanked packages have data-yanked attribute: <a href="..." data-yanked="">...</a>
+        // Use a state machine to collect multi-line <a> opening tags.
+        //
+        // Some registries (e.g. Nexus Repository Manager) spread attributes
+        // across multiple lines:
+        //   <a href="...pkg-1.0.0.whl#sha256=..."
+        //     rel="internal"
+        //     data-requires-python="&gt;=3.10"
+        //     >
+        //       pkg-1.0.0.whl
+        //   </a>
+        //
+        // We extract the filename from the `href` URL (the last path segment
+        // before the `#sha256=...` fragment) rather than the link text, so
+        // both single-line and multi-line formats are handled uniformly.
+        let mut collecting = false;
+        let mut is_yanked = false;
+        let mut href_value: Option<String> = None;
+
         for line in html.lines() {
-            // Skip yanked packages (marked with data-yanked attribute)
-            if line.contains("data-yanked") {
-                continue;
+            let trimmed = line.trim();
+
+            // Detect start of an anchor element
+            if trimmed.starts_with("<a ") || trimmed.starts_with("<a\t") {
+                collecting = true;
+                is_yanked = false;
+                href_value = None;
             }
 
-            let Some(start) = line.find('>') else {
-                continue;
-            };
-            let Some(end) = line[start..].find('<') else {
-                continue;
-            };
-            let filename = &line[start + 1..start + end];
-            let Some(version_str) = Self::extract_version_from_filename(filename, &normalized)
-            else {
-                continue;
-            };
+            if collecting {
+                // Check for yanked attribute (may be on any line of the element)
+                if trimmed.contains("data-yanked") {
+                    is_yanked = true;
+                }
 
-            if !include_prereleases && !Self::is_stable_version(&version_str) {
-                continue;
-            }
+                // Extract href value from whichever line carries it
+                if href_value.is_none()
+                    && let Some(href_start) = trimmed.find("href=\"")
+                {
+                    let after = &trimmed[href_start + 6..];
+                    if let Some(href_end) = after.find('"') {
+                        href_value = Some(after[..href_end].to_string());
+                    }
+                }
 
-            let Ok(version) = version_str.parse::<Version>() else {
-                continue;
-            };
+                // The opening tag ends when we see a bare `>`.
+                // `&gt;` in attribute values (e.g. data-requires-python="&gt;=3.10")
+                // is the HTML entity and does NOT contain a literal `>` byte in the
+                // raw HTTP response, so it won't trigger this check.
+                if trimmed.contains('>') {
+                    collecting = false;
 
-            // Avoid duplicates
-            if !versions.iter().any(|(_, v)| v == &version_str) {
-                versions.push((version, version_str));
+                    if is_yanked {
+                        continue;
+                    }
+
+                    let Some(href) = href_value.take() else {
+                        continue;
+                    };
+
+                    // Filename is the last URL path segment, before any `#fragment`
+                    let url_path = href.split('#').next().unwrap_or(&href);
+                    let filename = url_path.split('/').next_back().unwrap_or("");
+
+                    let Some(version_str) =
+                        Self::extract_version_from_filename(filename, &normalized)
+                    else {
+                        continue;
+                    };
+
+                    if !include_prereleases && !Self::is_stable_version(&version_str) {
+                        continue;
+                    }
+
+                    let Ok(version) = version_str.parse::<Version>() else {
+                        continue;
+                    };
+
+                    // Avoid duplicates (e.g. both .whl and .tar.gz for the same version)
+                    if !versions.iter().any(|(_, v)| v == &version_str) {
+                        versions.push((version, version_str));
+                    }
+                }
             }
         }
 
@@ -950,6 +1000,56 @@ mod tests {
         assert_eq!(versions.len(), 2);
         assert_eq!(versions[0].1, "1.3.0");
         assert_eq!(versions[1].1, "1.0.0");
+    }
+
+    #[test]
+    fn test_parse_simple_api_response_multiline_anchor_format() {
+        // Some registries (e.g. Nexus Repository Manager) spread <a> attributes
+        // across multiple lines, with the filename text on a separate line after
+        // the closing '>'. Versions must be extracted from the href URL, not the
+        // link text.
+        let registry = PyPiRegistry::new();
+        let html = r#"
+<!DOCTYPE html>
+<html lang="en">
+<head><title>Links for my-package</title>
+  <meta name="api-version" value="2"/>
+</head>
+<body>
+  <h1>Links for my-package</h1>
+    <a href="../../packages/my-package/2.0.0/my_package-2.0.0.tar.gz#sha256=abc123"
+      rel="internal"
+      data-requires-python="&gt;=3.10"
+
+      >
+        my_package-2.0.0.tar.gz
+    </a>
+    <br/>
+    <a href="../../packages/my-package/2.0.0/my_package-2.0.0-py3-none-any.whl#sha256=def456"
+      rel="internal"
+      data-requires-python="&gt;=3.10"
+
+      >
+        my_package-2.0.0-py3-none-any.whl
+    </a>
+    <br/>
+    <a href="../../packages/my-package/1.9.0/my_package-1.9.0-py3-none-any.whl#sha256=ghi789"
+      rel="internal"
+      data-requires-python="&gt;=3.10"
+      data-yanked="superseded"
+      >
+        my_package-1.9.0-py3-none-any.whl
+    </a>
+</body>
+</html>
+"#;
+        let versions = registry
+            .parse_simple_api_response(html, "my-package", false)
+            .unwrap();
+        // 2.0.0 appears twice (tar.gz + whl) but should be deduplicated
+        // 1.9.0 is yanked and should be excluded
+        assert_eq!(versions.len(), 1);
+        assert_eq!(versions[0].1, "2.0.0");
     }
 
     #[test]
