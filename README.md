@@ -608,6 +608,61 @@ make fmt
 make check
 ```
 
+## Stability
+
+Starting with `0.1.0`, `upd` commits to the following public surfaces.
+Anything listed here will not change in a backwards-incompatible way
+without a major-version bump.
+
+### Stable CLI
+
+Global flags (accepted on every subcommand):
+
+| Flag | Short | Purpose |
+|------|-------|---------|
+| `--dry-run` | `-n` | Preview changes without writing |
+| `--verbose` | `-v` | Verbose output |
+| `--interactive` | `-i` | Approve each update individually |
+| `--check` | | Exit 1 if updates/misalignments/vulnerabilities found |
+| `--bump <major\|minor\|patch>` | | Filter by bump level (repeatable, comma-separated) |
+| `--lang <LANG>` | `-l` | Filter by ecosystem (repeatable) |
+| `--full-precision` | | Output full versions |
+| `--no-cache` | | Disable version cache |
+| `--no-color` | | Disable colored output |
+| `--lock` | | Regenerate lockfiles after updates |
+| `--config <FILE>` | `-c` | Use a specific config file |
+| `--format <text\|json>` | | Output format |
+| `--version` | `-V` | Print version (built-in clap flag) |
+| `--help` | `-h` | Print help (built-in clap flag) |
+
+Subcommands: `update` (default), `align`, `audit`, `clean-cache`, `self-update`.
+
+### Stable exit codes
+
+| Code | Meaning |
+|------|---------|
+| `0` | Success — no action required, or updates applied cleanly |
+| `1` | `--check` flagged pending updates / misalignments / vulnerabilities, or an audit could not complete |
+| `2` | Invalid CLI arguments or unparseable configuration (clap default) |
+
+### Stable output
+
+- **Text output** is designed for humans. Exact wording, colour, and spacing may change between minor versions — do not parse it.
+- **JSON output** (`--format json`) follows an additive schema. New
+  fields may appear in minor releases; existing fields will not change
+  type, be renamed, or be removed before `1.0`.
+
+### Stable configuration
+
+- `.updrc.toml` / `upd.toml` / `.updrc` discovery order and the `ignore` array + `[pin]` table are stable.
+- New top-level keys may be added in minor releases, but will always default to the pre-existing behaviour.
+
+### Not covered by stability guarantees
+
+- Error message wording and verbose/debug log lines.
+- Cache file layout on disk (`$UPD_CACHE_DIR/versions.json`).
+- The `upd` Rust library crate — internal types may change between any releases. Depend on the CLI, not the crate.
+
 ## License
 
 MIT
