@@ -25,6 +25,12 @@ struct PackageJsonLineIndex {
     lines_by_section: HashMap<String, HashMap<String, usize>>,
 }
 
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct BraceCounts {
+    opening: usize,
+    closing: usize,
+}
+
 impl PackageJsonUpdater {
     pub fn new() -> Self {
         Self
@@ -67,30 +73,94 @@ impl PackageJsonUpdater {
 }
 
 impl PackageJsonLineIndex {
+    fn record_entries(
+        lines_by_section: &mut HashMap<String, HashMap<String, usize>>,
+        section: &str,
+        line: &str,
+        entry_re: &Regex,
+        line_num: usize,
+    ) {
+        for caps in entry_re.captures_iter(line) {
+            let package = caps.get(1).unwrap().as_str();
+            lines_by_section
+                .entry(section.to_string())
+                .or_default()
+                .entry(package.to_string())
+                .or_insert(line_num);
+        }
+    }
+
+    fn count_structural_braces(line: &str) -> BraceCounts {
+        let mut counts = BraceCounts::default();
+        let mut in_string = false;
+        let mut escaped = false;
+
+        for ch in line.chars() {
+            if in_string {
+                if escaped {
+                    escaped = false;
+                    continue;
+                }
+
+                match ch {
+                    '\\' => escaped = true,
+                    '"' => in_string = false,
+                    _ => {}
+                }
+                continue;
+            }
+
+            match ch {
+                '"' => in_string = true,
+                '{' => counts.opening += 1,
+                '}' => counts.closing += 1,
+                _ => {}
+            }
+        }
+
+        counts
+    }
+
     fn from_content(content: &str) -> Self {
         let section_re = Regex::new(
-            r#"^\s*"(dependencies|devDependencies|peerDependencies|optionalDependencies)"\s*:\s*\{"#,
+            r#"^\s*"(dependencies|devDependencies|peerDependencies|optionalDependencies)"\s*:\s*(.*)$"#,
         )
         .expect("Invalid section regex");
         let entry_re =
             Regex::new(r#""([^"]+)"\s*:\s*"[^"]*""#).expect("Invalid dependency entry regex");
 
         let mut lines_by_section: HashMap<String, HashMap<String, usize>> = HashMap::new();
+        let mut pending_section: Option<String> = None;
         let mut current_section: Option<String> = None;
         let mut section_brace_balance = 0isize;
 
         for (line_idx, line) in content.lines().enumerate() {
+            let line_num = line_idx + 1;
+
             if let Some(section) = current_section.as_ref() {
-                for caps in entry_re.captures_iter(line) {
-                    let package = caps.get(1).unwrap().as_str();
-                    lines_by_section
-                        .entry(section.clone())
-                        .or_default()
-                        .entry(package.to_string())
-                        .or_insert(line_idx + 1);
+                Self::record_entries(&mut lines_by_section, section, line, &entry_re, line_num);
+
+                let braces = Self::count_structural_braces(line);
+                section_brace_balance += braces.opening as isize - braces.closing as isize;
+                if section_brace_balance <= 0 {
+                    current_section = None;
+                    section_brace_balance = 0;
                 }
 
-                section_brace_balance += brace_delta(line);
+                continue;
+            }
+
+            if let Some(section) = pending_section.clone() {
+                let braces = Self::count_structural_braces(line);
+                if braces.opening == 0 {
+                    continue;
+                }
+
+                current_section = Some(section.clone());
+                pending_section = None;
+                Self::record_entries(&mut lines_by_section, &section, line, &entry_re, line_num);
+                section_brace_balance = braces.opening as isize - braces.closing as isize;
+
                 if section_brace_balance <= 0 {
                     current_section = None;
                     section_brace_balance = 0;
@@ -101,17 +171,19 @@ impl PackageJsonLineIndex {
 
             if let Some(caps) = section_re.captures(line) {
                 let section = caps.get(1).unwrap().as_str().to_string();
-                current_section = Some(section.clone());
-                section_brace_balance = brace_delta(line);
+                let rest = caps.get(2).unwrap().as_str();
+                let braces = Self::count_structural_braces(rest);
 
-                for caps in entry_re.captures_iter(line) {
-                    let package = caps.get(1).unwrap().as_str();
-                    lines_by_section
-                        .entry(section.clone())
-                        .or_default()
-                        .entry(package.to_string())
-                        .or_insert(line_idx + 1);
+                if braces.opening == 0 {
+                    if rest.trim().is_empty() {
+                        pending_section = Some(section);
+                    }
+                    continue;
                 }
+
+                current_section = Some(section.clone());
+                Self::record_entries(&mut lines_by_section, &section, line, &entry_re, line_num);
+                section_brace_balance = braces.opening as isize - braces.closing as isize;
 
                 if section_brace_balance <= 0 {
                     current_section = None;
@@ -128,10 +200,6 @@ impl PackageJsonLineIndex {
             .get(section)
             .and_then(|section_lines| section_lines.get(package).copied())
     }
-}
-
-fn brace_delta(line: &str) -> isize {
-    line.matches('{').count() as isize - line.matches('}').count() as isize
 }
 
 impl Default for PackageJsonUpdater {
@@ -671,6 +739,25 @@ mod tests {
         assert_eq!(result.updated[0].3, Some(4));
     }
 
+    #[test]
+    fn test_line_index_handles_brace_on_next_line() {
+        let content = r#"{
+  "dependencies":
+  {
+    "react": "^18.2.0"
+  },
+  "devDependencies":
+  {
+    "react": "^18.2.0"
+  }
+}"#;
+
+        let line_index = PackageJsonLineIndex::from_content(content);
+
+        assert_eq!(line_index.line_for("dependencies", "react"), Some(4));
+        assert_eq!(line_index.line_for("devDependencies", "react"), Some(8));
+    }
+
     #[tokio::test]
     async fn test_update_package_json_duplicate_package_names_keep_section_line_numbers() {
         use crate::config::UpdConfig;
@@ -715,6 +802,55 @@ mod tests {
             .collect();
         line_numbers.sort_unstable();
         assert_eq!(line_numbers, vec![3, 6]);
+    }
+
+    #[tokio::test]
+    async fn test_update_package_json_duplicate_same_versions_keep_line_numbers_with_split_braces()
+    {
+        use crate::config::UpdConfig;
+        use std::sync::Arc;
+
+        let mut file = NamedTempFile::with_suffix(".json").unwrap();
+        write!(
+            file,
+            r#"{{
+  "dependencies":
+  {{
+    "react": "^18.2.0"
+  }},
+  "devDependencies":
+  {{
+    "react": "^18.2.0"
+  }}
+}}"#
+        )
+        .unwrap();
+
+        let mut pin = std::collections::HashMap::new();
+        pin.insert("react".to_string(), "19.0.0".to_string());
+        let config = UpdConfig {
+            ignore: Vec::new(),
+            pin,
+        };
+
+        let updater = PackageJsonUpdater::new();
+        let options = UpdateOptions::new(false, false).with_config(Arc::new(config));
+
+        let result = updater
+            .update(file.path(), &MockRegistry::new("npm"), options)
+            .await
+            .unwrap();
+
+        assert!(result.updated.is_empty());
+        assert_eq!(result.pinned.len(), 2);
+
+        let mut line_numbers: Vec<_> = result
+            .pinned
+            .iter()
+            .map(|(_, _, _, line_num)| line_num.unwrap())
+            .collect();
+        line_numbers.sort_unstable();
+        assert_eq!(line_numbers, vec![4, 8]);
     }
 
     #[tokio::test]
