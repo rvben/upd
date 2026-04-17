@@ -360,12 +360,28 @@ async fn main() -> Result<()> {
 }
 
 async fn run_update(cli: &Cli) -> Result<()> {
+    if cli.interactive && cli.format == upd::cli::OutputFormat::Json {
+        anyhow::bail!("--interactive cannot be combined with --format json");
+    }
+
     let paths = cli.get_paths();
     let files = discover_files(&paths, &cli.langs);
     let file_count = files.len();
 
+    let text_mode_early = cli.format == upd::cli::OutputFormat::Text;
+
     if files.is_empty() {
-        println!("{}", "No dependency files found.".yellow());
+        if text_mode_early {
+            println!("{}", "No dependency files found.".yellow());
+        } else {
+            emit_update_json(
+                &[],
+                &UpdateResult::default(),
+                0,
+                cli.dry_run || cli.check,
+                UpdateFilter::from_levels(&cli.bump),
+            )?;
+        }
         return Ok(());
     }
 
@@ -543,7 +559,7 @@ async fn run_update(cli: &Cli) -> Result<()> {
     // Process files in parallel with a concurrency limit
     let concurrency_limit = 8; // Process up to 8 files concurrently
 
-    let results: Vec<(PathBuf, Result<UpdateResult, String>)> = stream::iter(file_jobs)
+    let results: Vec<(PathBuf, FileType, Result<UpdateResult, String>)> = stream::iter(file_jobs)
         .map(|(path, file_type, update_options)| {
             let pypi = Arc::clone(&pypi);
             let npm = Arc::clone(&npm);
@@ -623,35 +639,43 @@ async fn run_update(cli: &Cli) -> Result<()> {
                             .await
                     }
                 };
-                (path, result.map_err(|e| e.to_string()))
+                (path, file_type, result.map_err(|e| e.to_string()))
             }
         })
         .buffer_unordered(concurrency_limit)
         .collect()
         .await;
 
-    // Process results in order and merge
+    // Process results, preserving per-file attribution for both text and JSON output.
+    let text_mode = cli.format == upd::cli::OutputFormat::Text;
     let mut total_result = UpdateResult::default();
     let mut updated_files: Vec<PathBuf> = Vec::new();
+    let mut scanned: Vec<ScannedFileResult> = Vec::new();
 
-    for (path, result) in results {
-        if verbose {
+    for (path, file_type, result) in results {
+        if verbose && text_mode {
             println!("{}", format!("Processed: {}", path.display()).cyan());
         }
 
         match result {
             Ok(file_result) => {
-                // Track files that were actually updated (not just checked)
                 if !dry_run && file_has_manifest_changes(&file_result) {
                     updated_files.push(path.clone());
                 }
-                print_file_result(
-                    &path.display().to_string(),
-                    &file_result,
-                    dry_run,
-                    filter,
-                    verbose,
-                );
+                if text_mode {
+                    print_file_result(
+                        &path.display().to_string(),
+                        &file_result,
+                        dry_run,
+                        filter,
+                        verbose,
+                    );
+                }
+                scanned.push(ScannedFileResult {
+                    path: path.clone(),
+                    file_type,
+                    result: file_result.clone(),
+                });
                 total_result.merge(file_result);
             }
             Err(e) => {
@@ -665,17 +689,18 @@ async fn run_update(cli: &Cli) -> Result<()> {
 
     // Regenerate lockfiles if requested and files were updated
     if cli.lock && !dry_run && !updated_files.is_empty() {
-        println!();
-        println!("{}", "Regenerating lockfiles...".cyan());
+        if text_mode {
+            println!();
+            println!("{}", "Regenerating lockfiles...".cyan());
+        }
 
-        // Deduplicate directories (multiple files in same dir should only regenerate once)
         let mut processed_dirs: HashSet<PathBuf> = HashSet::new();
 
         for path in &updated_files {
             if let Some(dir) = path.parent() {
                 let dir_path = dir.to_path_buf();
                 if processed_dirs.insert(dir_path) {
-                    let results = regenerate_lockfiles(path, verbose);
+                    let results = regenerate_lockfiles(path, verbose && text_mode);
                     for result in results {
                         if let Err(e) = result {
                             eprintln!("{}", format!("Warning: {}", e).yellow());
@@ -691,15 +716,67 @@ async fn run_update(cli: &Cli) -> Result<()> {
         let _ = Cache::save_shared(&cache);
     }
 
-    // Print summary
-    println!();
-    print_summary(&total_result, file_count, dry_run, filter);
+    if text_mode {
+        println!();
+        print_summary(&total_result, file_count, dry_run, filter);
+    } else {
+        emit_update_json(&scanned, &total_result, file_count, dry_run, filter)?;
+    }
 
     // In check mode, exit with code 1 if any updates are available
     if cli.check && has_checkable_manifest_changes(&total_result, filter) {
         std::process::exit(1);
     }
 
+    Ok(())
+}
+
+fn emit_update_json(
+    scanned: &[ScannedFileResult],
+    total_result: &UpdateResult,
+    file_count: usize,
+    dry_run: bool,
+    filter: UpdateFilter,
+) -> Result<()> {
+    use upd::output::{UpdateReport, UpdateSummary, build_update_file_report};
+
+    let files: Vec<_> = scanned
+        .iter()
+        .map(|sf| {
+            build_update_file_report(&sf.path, sf.file_type, &sf.result, |old, new| {
+                match classify_update(old, new) {
+                    UpdateType::Major => "major",
+                    UpdateType::Minor => "minor",
+                    UpdateType::Patch => "patch",
+                }
+            })
+        })
+        .collect();
+
+    let (major, minor, patch, total) = count_updates_by_type(&total_result.updated, filter);
+    let summary = UpdateSummary {
+        files_scanned: file_count,
+        files_with_changes: scanned
+            .iter()
+            .filter(|sf| file_has_manifest_changes(&sf.result))
+            .count(),
+        updates_total: total,
+        updates_major: major,
+        updates_minor: minor,
+        updates_patch: patch,
+        pinned: total_result.pinned.len(),
+        ignored: total_result.ignored.len(),
+        errors: total_result.errors.len(),
+    };
+
+    let report = UpdateReport {
+        command: "update",
+        mode: if dry_run { "dry-run" } else { "applied" },
+        files,
+        summary,
+    };
+
+    println!("{}", serde_json::to_string_pretty(&report)?);
     Ok(())
 }
 
@@ -1005,16 +1082,21 @@ async fn run_interactive_update(
 }
 
 async fn run_align(cli: &Cli) -> Result<()> {
+    let text_mode = cli.format == upd::cli::OutputFormat::Text;
     let paths = cli.get_paths();
     let files = discover_files(&paths, &cli.langs);
     let file_count = files.len();
 
     if files.is_empty() {
-        println!("{}", "No dependency files found.".yellow());
+        if text_mode {
+            println!("{}", "No dependency files found.".yellow());
+        } else {
+            emit_align_json(&[], 0)?;
+        }
         return Ok(());
     }
 
-    if cli.verbose {
+    if cli.verbose && text_mode {
         println!(
             "{}",
             format!("Scanning {} dependency file(s) for alignment", file_count).cyan()
@@ -1040,39 +1122,55 @@ async fn run_align(cli: &Cli) -> Result<()> {
         .filter(|p| p.has_misalignment())
         .collect();
 
+    if !text_mode {
+        let to_report: Vec<PackageAlignment> = align_result
+            .packages
+            .iter()
+            .filter(|p| p.has_misalignment())
+            .cloned()
+            .collect();
+        emit_align_json(&to_report, file_count)?;
+    }
+
     if misaligned.is_empty() {
-        println!(
-            "{} Scanned {} file(s), all packages are aligned",
-            "✓".green(),
-            file_count
-        );
+        if text_mode {
+            println!(
+                "{} Scanned {} file(s), all packages are aligned",
+                "✓".green(),
+                file_count
+            );
+        }
         return Ok(());
     }
 
-    // Display misalignments
     let dry_run = cli.dry_run || cli.check;
-    let action_prefix = if dry_run { "Would align" } else { "Aligning" };
 
-    println!(
-        "\n{} {} misaligned package(s) across {} file(s):\n",
-        action_prefix,
-        misaligned.len().to_string().yellow().bold(),
-        file_count
-    );
+    if text_mode {
+        let action_prefix = if dry_run { "Would align" } else { "Aligning" };
 
-    for alignment in &misaligned {
-        print_alignment(alignment, dry_run);
+        println!(
+            "\n{} {} misaligned package(s) across {} file(s):\n",
+            action_prefix,
+            misaligned.len().to_string().yellow().bold(),
+            file_count
+        );
+
+        for alignment in &misaligned {
+            print_alignment(alignment, dry_run);
+        }
     }
 
     // Apply alignments if not dry-run
     if !dry_run {
         let updated_count = apply_alignments(&misaligned, cli.full_precision)?;
-        println!(
-            "\n{} {} package occurrence(s)",
-            "Aligned".green(),
-            updated_count.to_string().green().bold()
-        );
-    } else {
+        if text_mode {
+            println!(
+                "\n{} {} package occurrence(s)",
+                "Aligned".green(),
+                updated_count.to_string().green().bold()
+            );
+        }
+    } else if text_mode {
         let total_misaligned: usize = misaligned
             .iter()
             .map(|a| a.misaligned_occurrences().len())
@@ -1092,17 +1190,48 @@ async fn run_align(cli: &Cli) -> Result<()> {
     Ok(())
 }
 
+fn emit_align_json(packages: &[PackageAlignment], file_count: usize) -> Result<()> {
+    use upd::output::{AlignReport, AlignSummary, build_align_package};
+
+    let pkgs: Vec<_> = packages.iter().map(build_align_package).collect();
+    let misaligned_packages = pkgs.iter().filter(|p| p.is_misaligned).count();
+    let misaligned_occurrences = pkgs
+        .iter()
+        .flat_map(|p| p.occurrences.iter())
+        .filter(|o| o.is_misaligned)
+        .count();
+
+    let report = AlignReport {
+        command: "align",
+        summary: AlignSummary {
+            files_scanned: file_count,
+            packages: pkgs.len(),
+            misaligned_packages,
+            misaligned_occurrences,
+        },
+        packages: pkgs,
+    };
+
+    println!("{}", serde_json::to_string_pretty(&report)?);
+    Ok(())
+}
+
 async fn run_audit(cli: &Cli) -> Result<()> {
+    let text_mode = cli.format == upd::cli::OutputFormat::Text;
     let paths = cli.get_paths();
     let files = discover_files(&paths, &cli.langs);
     let file_count = files.len();
 
     if files.is_empty() {
-        println!("{}", "No dependency files found.".yellow());
+        if text_mode {
+            println!("{}", "No dependency files found.".yellow());
+        } else {
+            emit_audit_json(&AuditResult::default(), "complete")?;
+        }
         return Ok(());
     }
 
-    if cli.verbose {
+    if cli.verbose && text_mode {
         println!(
             "{}",
             format!(
@@ -1166,64 +1295,78 @@ async fn run_audit(cli: &Cli) -> Result<()> {
     }
 
     if audit_packages.is_empty() {
-        println!(
-            "{} Scanned {} file(s), no packages found",
-            "✓".green(),
-            file_count
-        );
+        if text_mode {
+            println!(
+                "{} Scanned {} file(s), no packages found",
+                "✓".green(),
+                file_count
+            );
+        } else {
+            emit_audit_json(&AuditResult::default(), "complete")?;
+        }
         return Ok(());
     }
 
-    println!(
-        "{}",
-        format!(
-            "Checking {} unique package(s) for vulnerabilities...",
-            audit_packages.len()
-        )
-        .cyan()
-    );
+    if text_mode {
+        println!(
+            "{}",
+            format!(
+                "Checking {} unique package(s) for vulnerabilities...",
+                audit_packages.len()
+            )
+            .cyan()
+        );
+    }
 
     // Query OSV API
     let osv_client = OsvClient::new();
     let audit_result = osv_client.check_packages(&audit_packages).await?;
 
-    // Display results
-    match audit_status(&audit_result) {
-        AuditStatus::Clean => {
-            println!(
-                "\n{} No vulnerabilities found in {} package(s)",
-                "✓".green(),
-                audit_packages.len()
-            );
-        }
-        AuditStatus::Vulnerable => {
-            print_audit_vulnerabilities(&audit_result);
-        }
-        AuditStatus::Incomplete => {
-            if audit_result.vulnerable.is_empty() {
+    let status = audit_status(&audit_result);
+
+    if text_mode {
+        match status {
+            AuditStatus::Clean => {
                 println!(
-                    "\n{} Audit incomplete: {} error(s) occurred while checking {} package(s)",
-                    "⚠".yellow().bold(),
-                    audit_result.errors.len().to_string().yellow().bold(),
+                    "\n{} No vulnerabilities found in {} package(s)",
+                    "✓".green(),
                     audit_packages.len()
                 );
-            } else {
+            }
+            AuditStatus::Vulnerable => {
                 print_audit_vulnerabilities(&audit_result);
-                println!(
-                    "\n{} Audit incomplete: {} error(s) occurred while checking dependencies",
-                    "⚠".yellow().bold(),
-                    audit_result.errors.len().to_string().yellow().bold()
-                );
+            }
+            AuditStatus::Incomplete => {
+                if audit_result.vulnerable.is_empty() {
+                    println!(
+                        "\n{} Audit incomplete: {} error(s) occurred while checking {} package(s)",
+                        "⚠".yellow().bold(),
+                        audit_result.errors.len().to_string().yellow().bold(),
+                        audit_packages.len()
+                    );
+                } else {
+                    print_audit_vulnerabilities(&audit_result);
+                    println!(
+                        "\n{} Audit incomplete: {} error(s) occurred while checking dependencies",
+                        "⚠".yellow().bold(),
+                        audit_result.errors.len().to_string().yellow().bold()
+                    );
+                }
             }
         }
+
+        for error in &audit_result.errors {
+            eprintln!("{} {}", "Error:".red(), error);
+        }
+    } else {
+        let status_str = match status {
+            AuditStatus::Clean | AuditStatus::Vulnerable => "complete",
+            AuditStatus::Incomplete => "incomplete",
+        };
+        emit_audit_json(&audit_result, status_str)?;
     }
 
-    // Print errors if any
-    for error in &audit_result.errors {
-        eprintln!("{} {}", "Error:".red(), error);
-    }
-
-    if audit_status(&audit_result) == AuditStatus::Incomplete {
+    if status == AuditStatus::Incomplete {
         anyhow::bail!(
             "Audit incomplete: {} error(s) occurred while checking dependencies",
             audit_result.errors.len()
@@ -1235,6 +1378,13 @@ async fn run_audit(cli: &Cli) -> Result<()> {
         std::process::exit(1);
     }
 
+    Ok(())
+}
+
+fn emit_audit_json(audit: &AuditResult, status: &'static str) -> Result<()> {
+    use upd::output::build_audit_report;
+    let report = build_audit_report(audit, 0, status);
+    println!("{}", serde_json::to_string_pretty(&report)?);
     Ok(())
 }
 

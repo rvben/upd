@@ -11,6 +11,17 @@ pub enum BumpLevel {
     Patch,
 }
 
+/// Output format for command results.
+#[derive(ValueEnum, Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[value(rename_all = "lower")]
+pub enum OutputFormat {
+    /// Human-readable coloured text (default).
+    #[default]
+    Text,
+    /// Machine-readable JSON on stdout.
+    Json,
+}
+
 #[derive(Parser)]
 #[command(name = "upd")]
 #[command(
@@ -75,6 +86,10 @@ pub struct Cli {
     /// Path to config file (default: auto-discover .updrc.toml, upd.toml, or .updrc)
     #[arg(short = 'c', long, global = true, value_name = "FILE")]
     pub config: Option<PathBuf>,
+
+    /// Output format (defaults to human-readable text)
+    #[arg(long, global = true, value_enum, default_value_t = OutputFormat::Text, value_name = "FORMAT")]
+    pub format: OutputFormat,
 }
 
 #[derive(Subcommand)]
@@ -447,5 +462,38 @@ mod tests {
     fn test_cli_config_flag_is_optional() {
         let cli = Cli::try_parse_from(["upd"]).unwrap();
         assert!(cli.config.is_none());
+    }
+
+    #[test]
+    fn test_cli_format_defaults_to_text() {
+        let cli = Cli::try_parse_from(["upd"]).unwrap();
+        assert_eq!(cli.format, OutputFormat::Text);
+    }
+
+    #[test]
+    fn test_cli_format_accepts_json() {
+        let cli = Cli::try_parse_from(["upd", "--format", "json"]).unwrap();
+        assert_eq!(cli.format, OutputFormat::Json);
+    }
+
+    #[test]
+    fn test_cli_format_accepts_text() {
+        let cli = Cli::try_parse_from(["upd", "--format", "text"]).unwrap();
+        assert_eq!(cli.format, OutputFormat::Text);
+    }
+
+    #[test]
+    fn test_cli_format_is_global_across_subcommands() {
+        let cli = Cli::try_parse_from(["upd", "audit", "--format", "json"]).unwrap();
+        assert_eq!(cli.format, OutputFormat::Json);
+        assert!(matches!(cli.command, Some(Command::Audit { .. })));
+    }
+
+    #[test]
+    fn test_cli_format_rejects_unknown_value() {
+        match Cli::try_parse_from(["upd", "--format", "yaml"]) {
+            Err(err) => assert!(err.to_string().contains("invalid value")),
+            Ok(_) => panic!("expected invalid format to be rejected"),
+        }
     }
 }

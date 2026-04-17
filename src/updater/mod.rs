@@ -132,7 +132,7 @@ pub struct ParsedDependency {
 }
 
 /// Result of updating a single file
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct UpdateResult {
     /// Packages that were updated: (name, old_version, new_version, line_number)
     pub updated: Vec<(String, String, String, Option<usize>)>,
@@ -179,6 +179,24 @@ pub enum Lang {
     Terraform,
 }
 
+impl Lang {
+    /// Canonical, stable identifier for this language (used by JSON output and CLI).
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Lang::Python => "python",
+            Lang::Node => "node",
+            Lang::Rust => "rust",
+            Lang::Go => "go",
+            Lang::Ruby => "ruby",
+            Lang::DotNet => "dotnet",
+            Lang::Actions => "actions",
+            Lang::PreCommit => "pre_commit",
+            Lang::Mise => "mise",
+            Lang::Terraform => "terraform",
+        }
+    }
+}
+
 /// Type of dependency file
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum FileType {
@@ -210,6 +228,24 @@ impl FileType {
             FileType::PreCommitConfig => Lang::PreCommit,
             FileType::MiseToml | FileType::ToolVersions => Lang::Mise,
             FileType::TerraformTf => Lang::Terraform,
+        }
+    }
+
+    /// Canonical, stable identifier for this file type (used by JSON output).
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            FileType::Requirements => "requirements",
+            FileType::PyProject => "pyproject",
+            FileType::PackageJson => "package_json",
+            FileType::CargoToml => "cargo_toml",
+            FileType::GoMod => "go_mod",
+            FileType::Gemfile => "gemfile",
+            FileType::Csproj => "csproj",
+            FileType::GithubActions => "github_actions",
+            FileType::PreCommitConfig => "pre_commit",
+            FileType::MiseToml => "mise_toml",
+            FileType::ToolVersions => "tool_versions",
+            FileType::TerraformTf => "terraform_tf",
         }
     }
 }
@@ -496,6 +532,62 @@ mod tests {
         assert!(result.updated.is_empty());
         assert_eq!(result.unchanged, 0);
         assert!(result.errors.is_empty());
+    }
+
+    #[test]
+    fn test_filetype_as_str_is_unique_and_stable() {
+        let variants = [
+            FileType::Requirements,
+            FileType::PyProject,
+            FileType::PackageJson,
+            FileType::CargoToml,
+            FileType::GoMod,
+            FileType::Gemfile,
+            FileType::Csproj,
+            FileType::GithubActions,
+            FileType::PreCommitConfig,
+            FileType::MiseToml,
+            FileType::ToolVersions,
+            FileType::TerraformTf,
+        ];
+        let mut seen = std::collections::HashSet::new();
+        for ft in variants {
+            let name = ft.as_str();
+            assert!(
+                seen.insert(name),
+                "duplicate FileType::as_str value: {name}"
+            );
+            assert!(
+                name.chars()
+                    .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_'),
+                "FileType::as_str must be snake_case ASCII: {name}"
+            );
+        }
+        assert_eq!(FileType::PackageJson.as_str(), "package_json");
+        assert_eq!(FileType::TerraformTf.as_str(), "terraform_tf");
+    }
+
+    #[test]
+    fn test_lang_as_str_is_unique_and_stable() {
+        let variants = [
+            Lang::Python,
+            Lang::Node,
+            Lang::Rust,
+            Lang::Go,
+            Lang::Ruby,
+            Lang::DotNet,
+            Lang::Actions,
+            Lang::PreCommit,
+            Lang::Mise,
+            Lang::Terraform,
+        ];
+        let mut seen = std::collections::HashSet::new();
+        for lang in variants {
+            let name = lang.as_str();
+            assert!(seen.insert(name), "duplicate Lang::as_str value: {name}");
+        }
+        assert_eq!(Lang::DotNet.as_str(), "dotnet");
+        assert_eq!(Lang::PreCommit.as_str(), "pre_commit");
     }
 
     #[test]
