@@ -7,7 +7,7 @@ use crate::version::match_version_precision;
 use anyhow::Result;
 use futures::future::join_all;
 use regex::Regex;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 pub struct CsprojUpdater {
@@ -270,11 +270,26 @@ impl Updater for CsprojUpdater {
             }
         }
 
+        let mut pinned_lines = HashSet::new();
         for (line_idx, package, current_version, pinned_version) in pinned_packages {
-            version_map.insert(line_idx, Ok(pinned_version.clone()));
-            result
-                .pinned
-                .push((package, current_version, pinned_version, Some(line_idx + 1)));
+            let matched_version = if options.full_precision {
+                pinned_version.clone()
+            } else {
+                match_version_precision(&current_version, &pinned_version)
+            };
+
+            if matched_version != current_version {
+                version_map.insert(line_idx, Ok(matched_version.clone()));
+                pinned_lines.insert(line_idx);
+                result.pinned.push((
+                    package,
+                    current_version,
+                    matched_version,
+                    Some(line_idx + 1),
+                ));
+            } else {
+                result.unchanged += 1;
+            }
         }
 
         // Apply updates
@@ -325,12 +340,14 @@ impl Updater for CsprojUpdater {
                                 match_version_precision(&pkg.version, &latest_version)
                             };
                             if matched_version != pkg.version {
-                                result.updated.push((
-                                    pkg.name.clone(),
-                                    pkg.version.clone(),
-                                    matched_version.clone(),
-                                    Some(line_num),
-                                ));
+                                if !pinned_lines.contains(&line_idx) {
+                                    result.updated.push((
+                                        pkg.name.clone(),
+                                        pkg.version.clone(),
+                                        matched_version.clone(),
+                                        Some(line_num),
+                                    ));
+                                }
 
                                 if line.contains("Version=") {
                                     // Inline version attribute
@@ -631,6 +648,53 @@ mod tests {
         assert_eq!(result.ignored[0].0, "Newtonsoft.Json");
         assert_eq!(result.pinned.len(), 1);
         assert_eq!(result.pinned[0].0, "Serilog");
+    }
+
+    #[tokio::test]
+    async fn test_config_pin_multiline_reports_only_pinned_change() {
+        use crate::config::UpdConfig;
+        use std::sync::Arc;
+
+        let content = r#"<Project Sdk="Microsoft.NET.Sdk">
+  <ItemGroup>
+    <PackageReference Include="Serilog">
+      <Version>3.1.0</Version>
+    </PackageReference>
+  </ItemGroup>
+</Project>
+"#;
+
+        let mut file = NamedTempFile::new().unwrap();
+        write!(file, "{}", content).unwrap();
+
+        let registry = MockRegistry::new("nuget");
+
+        let mut pins = std::collections::HashMap::new();
+        pins.insert("Serilog".to_string(), "3.2.0".to_string());
+        let config = UpdConfig {
+            ignore: vec![],
+            pin: pins,
+        };
+
+        let updater = CsprojUpdater::new();
+        let options = UpdateOptions::new(false, false).with_config(Arc::new(config));
+        let result = updater
+            .update(file.path(), &registry, options)
+            .await
+            .unwrap();
+
+        assert!(result.updated.is_empty());
+        assert_eq!(result.pinned.len(), 1);
+        assert_eq!(result.pinned[0].0, "Serilog");
+        assert_eq!(result.pinned[0].1, "3.1.0");
+        assert_eq!(result.pinned[0].2, "3.2.0");
+        assert_eq!(result.pinned[0].3, Some(3));
+
+        let contents = std::fs::read_to_string(file.path()).unwrap();
+        assert!(
+            contents
+                .contains("<PackageReference Include=\"Serilog\">\n      <Version>3.2.0</Version>")
+        );
     }
 
     #[test]

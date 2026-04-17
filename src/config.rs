@@ -482,7 +482,7 @@ parent-pkg = "1.0.0"
 
         // Verify results:
         // - requests should be ignored
-        // - flask should be pinned to 2.0.0 (appears in both pinned and updated)
+        // - flask should be pinned to 2.0.0
         // - django should be updated to 4.2.0
 
         assert_eq!(result.ignored.len(), 1);
@@ -492,8 +492,7 @@ parent-pkg = "1.0.0"
         assert_eq!(result.pinned[0].0, "flask");
         assert_eq!(result.pinned[0].2, "2.0.0"); // New version is pinned version
 
-        // Both flask (pinned) and django (registry) are in updated
-        assert_eq!(result.updated.len(), 2);
+        assert_eq!(result.updated.len(), 1);
 
         // Verify contents by checking all updated packages
         let updated_names: Vec<&str> = result
@@ -501,8 +500,8 @@ parent-pkg = "1.0.0"
             .iter()
             .map(|(n, _, _, _)| n.as_str())
             .collect();
-        assert!(updated_names.contains(&"flask"));
         assert!(updated_names.contains(&"django"));
+        assert!(!updated_names.contains(&"flask"));
     }
 
     /// Integration test: Config with all supported file types
@@ -527,7 +526,7 @@ parent-pkg = "1.0.0"
         });
 
         // Test Requirements
-        // RequirementsUpdater: pinned packages appear in BOTH pinned AND updated
+        // RequirementsUpdater: pinned packages appear only in pinned
         {
             let mut file = NamedTempFile::new().unwrap();
             writeln!(file, "ignored-pkg>=1.0.0").unwrap();
@@ -549,8 +548,7 @@ parent-pkg = "1.0.0"
 
             assert_eq!(result.ignored.len(), 1);
             assert_eq!(result.pinned.len(), 1);
-            // RequirementsUpdater counts pinned packages in both updated and pinned
-            assert_eq!(result.updated.len(), 2); // pinned-pkg + other-pkg
+            assert_eq!(result.updated.len(), 1); // other-pkg only
         }
 
         // Test package.json

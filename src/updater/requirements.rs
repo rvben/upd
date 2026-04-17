@@ -1,6 +1,6 @@
 use super::{
-    FileType, ParsedDependency, UpdateOptions, UpdateResult, Updater, read_file_safe,
-    write_file_atomic,
+    FileType, ParsedDependency, PendingVersion, UpdateOptions, UpdateResult, Updater,
+    read_file_safe, write_file_atomic,
 };
 use crate::registry::{MultiPyPiRegistry, PyPiRegistry, Registry};
 use crate::version::match_version_precision;
@@ -304,18 +304,15 @@ impl Updater for RequirementsUpdater {
         let version_results = join_all(version_futures).await;
 
         // Build a map of line index to version result
-        let mut version_map: std::collections::HashMap<usize, Result<String, anyhow::Error>> =
+        let mut version_map: std::collections::HashMap<usize, PendingVersion> =
             std::collections::HashMap::new();
         for ((line_idx, _, _), version_result) in fetch_deps.iter().zip(version_results) {
-            version_map.insert(*line_idx, version_result);
+            version_map.insert(*line_idx, PendingVersion::Registry(version_result));
         }
 
-        // Add pinned versions to version_map and record in result
-        for (line_idx, package, current_version, pinned_version) in pinned_packages {
-            version_map.insert(line_idx, Ok(pinned_version.clone()));
-            result
-                .pinned
-                .push((package, current_version, pinned_version, Some(line_idx + 1)));
+        // Add pinned versions to version_map; they are recorded during the apply pass.
+        for (line_idx, _package, _current_version, pinned_version) in pinned_packages {
+            version_map.insert(line_idx, PendingVersion::Pinned(pinned_version));
         }
 
         // Second pass: apply updates
@@ -336,7 +333,27 @@ impl Updater for RequirementsUpdater {
 
                 if let Some(version_result) = version_map.remove(&line_idx) {
                     match version_result {
-                        Ok(latest_version) => {
+                        PendingVersion::Pinned(pinned_version) => {
+                            let matched_version = if options.full_precision {
+                                pinned_version.clone()
+                            } else {
+                                match_version_precision(&parsed.first_version, &pinned_version)
+                            };
+                            if matched_version != parsed.first_version {
+                                result.pinned.push((
+                                    parsed.package.clone(),
+                                    parsed.first_version.clone(),
+                                    matched_version.clone(),
+                                    Some(line_num),
+                                ));
+                                new_lines.push(self.update_line(line, &matched_version));
+                                modified = true;
+                            } else {
+                                result.unchanged += 1;
+                                new_lines.push(line.to_string());
+                            }
+                        }
+                        PendingVersion::Registry(Ok(latest_version)) => {
                             // Match the precision of the original version (unless full precision requested)
                             let matched_version = if options.full_precision {
                                 latest_version.clone()
@@ -357,7 +374,7 @@ impl Updater for RequirementsUpdater {
                                 new_lines.push(line.to_string());
                             }
                         }
-                        Err(e) => {
+                        PendingVersion::Registry(Err(e)) => {
                             result.errors.push(format!("{}: {}", parsed.package, e));
                             new_lines.push(line.to_string());
                         }
@@ -991,8 +1008,9 @@ flask>=2.0.0
             .await
             .unwrap();
 
-        // Both should be updated, but requests should use pinned version
-        assert_eq!(result.updated.len(), 2);
+        // flask should be updated from the registry; requests should be recorded only as pinned
+        assert_eq!(result.updated.len(), 1);
+        assert_eq!(result.updated[0].0, "flask");
         assert_eq!(result.pinned.len(), 1);
         assert_eq!(result.pinned[0].0, "requests");
         assert_eq!(result.pinned[0].2, "2.30.0"); // Pinned version
@@ -1035,8 +1053,9 @@ flask>=2.0.0
             .await
             .unwrap();
 
-        // requests and django should be updated, flask should be ignored
-        assert_eq!(result.updated.len(), 2);
+        // django should be updated, requests should be pinned, flask should be ignored
+        assert_eq!(result.updated.len(), 1);
+        assert_eq!(result.updated[0].0, "django");
         assert_eq!(result.ignored.len(), 1);
         assert_eq!(result.pinned.len(), 1);
 

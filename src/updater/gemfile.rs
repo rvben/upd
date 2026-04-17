@@ -1,6 +1,6 @@
 use super::{
-    FileType, ParsedDependency, UpdateOptions, UpdateResult, Updater, read_file_safe,
-    write_file_atomic,
+    FileType, ParsedDependency, PendingVersion, UpdateOptions, UpdateResult, Updater,
+    read_file_safe, write_file_atomic,
 };
 use crate::registry::Registry;
 use crate::version::match_version_precision;
@@ -185,25 +185,26 @@ impl Updater for GemfileUpdater {
             .collect();
 
         // Map results back to every line index that references each gem
-        let mut version_map: HashMap<usize, Result<String, anyhow::Error>> = HashMap::new();
+        let mut version_map: HashMap<usize, PendingVersion> = HashMap::new();
         for (line_idx, _, parsed) in &fetch_deps {
             if let Some(result) = gem_versions.get(&parsed.name) {
                 match result {
                     Ok(version) => {
-                        version_map.insert(*line_idx, Ok(version.clone()));
+                        version_map
+                            .insert(*line_idx, PendingVersion::Registry(Ok(version.clone())));
                     }
                     Err(e) => {
-                        version_map.insert(*line_idx, Err(anyhow::anyhow!("{}", e)));
+                        version_map.insert(
+                            *line_idx,
+                            PendingVersion::Registry(Err(anyhow::anyhow!("{}", e))),
+                        );
                     }
                 }
             }
         }
 
-        for (line_idx, package, current_version, pinned_version) in pinned_packages {
-            version_map.insert(line_idx, Ok(pinned_version.clone()));
-            result
-                .pinned
-                .push((package, current_version, pinned_version, Some(line_idx + 1)));
+        for (line_idx, _package, _current_version, pinned_version) in pinned_packages {
+            version_map.insert(line_idx, PendingVersion::Pinned(pinned_version));
         }
 
         // Apply updates
@@ -216,7 +217,31 @@ impl Updater for GemfileUpdater {
             if let Some(parsed) = self.parse_line(line) {
                 if let Some(version_result) = version_map.remove(&line_idx) {
                     match version_result {
-                        Ok(latest_version) => {
+                        PendingVersion::Pinned(pinned_version) => {
+                            let matched_version = if options.full_precision {
+                                pinned_version.clone()
+                            } else {
+                                match_version_precision(&parsed.version, &pinned_version)
+                            };
+                            if matched_version != parsed.version {
+                                result.pinned.push((
+                                    parsed.name.clone(),
+                                    parsed.version.clone(),
+                                    matched_version.clone(),
+                                    Some(line_num),
+                                ));
+                                new_lines.push(self.update_line(
+                                    line,
+                                    &parsed.version,
+                                    &matched_version,
+                                ));
+                                modified = true;
+                            } else {
+                                result.unchanged += 1;
+                                new_lines.push(line.to_string());
+                            }
+                        }
+                        PendingVersion::Registry(Ok(latest_version)) => {
                             let matched_version = if options.full_precision {
                                 latest_version.clone()
                             } else {
@@ -240,7 +265,7 @@ impl Updater for GemfileUpdater {
                                 new_lines.push(line.to_string());
                             }
                         }
-                        Err(e) => {
+                        PendingVersion::Registry(Err(e)) => {
                             result.errors.push(format!("{}: {}", parsed.name, e));
                             new_lines.push(line.to_string());
                         }
@@ -475,15 +500,14 @@ mod tests {
         assert_eq!(result.ignored[0].0, "rails");
         assert_eq!(result.pinned.len(), 1);
         assert_eq!(result.pinned[0].0, "devise");
-        // GemfileUpdater adds pinned packages to both pinned and updated
-        assert_eq!(result.updated.len(), 2);
+        assert_eq!(result.updated.len(), 1);
         let updated_names: Vec<&str> = result
             .updated
             .iter()
             .map(|(n, _, _, _)| n.as_str())
             .collect();
-        assert!(updated_names.contains(&"devise"));
         assert!(updated_names.contains(&"puma"));
+        assert!(!updated_names.contains(&"devise"));
     }
 
     #[test]
@@ -505,7 +529,7 @@ mod tests {
     #[tokio::test]
     async fn test_registry_error_populates_errors() {
         let mut file = NamedTempFile::new().unwrap();
-        write!(file, "gem 'nonexistent-gem', '1.0.0'\n").unwrap();
+        writeln!(file, "gem 'nonexistent-gem', '1.0.0'").unwrap();
 
         // Registry has no entry for nonexistent-gem → will error
         let registry = MockRegistry::new("rubygems");

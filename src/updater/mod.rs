@@ -156,6 +156,13 @@ impl UpdateResult {
     }
 }
 
+/// A version selected for a line in a dependency file, either resolved from a
+/// registry fetch or supplied by user configuration (a pin).
+pub(crate) enum PendingVersion {
+    Registry(Result<String, anyhow::Error>),
+    Pinned(String),
+}
+
 /// Language/ecosystem type for filtering
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, clap::ValueEnum)]
 pub enum Lang {
