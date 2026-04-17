@@ -19,6 +19,10 @@ struct GemInfo {
 struct GemVersion {
     number: String,
     prerelease: bool,
+    /// RubyGems marks yanked releases with this flag. Older API responses
+    /// omit the field; `serde(default)` treats that as "not yanked".
+    #[serde(default)]
+    yanked: bool,
 }
 
 impl RubyGemsRegistry {
@@ -88,7 +92,8 @@ impl Registry for RubyGemsRegistry {
 
         // Versions are returned newest first by RubyGems API
         versions
-            .first()
+            .iter()
+            .find(|v| !v.yanked)
             .map(|v| v.number.clone())
             .ok_or_else(|| anyhow!("Gem '{}' has no versions", package))
     }
@@ -118,7 +123,7 @@ impl Registry for RubyGemsRegistry {
         // Parse the constraint (e.g., "~> 7.1", ">= 4.9.0")
         // For now, return latest stable version that satisfies semver constraints
         for version in &versions {
-            if version.prerelease {
+            if version.prerelease || version.yanked {
                 continue;
             }
 
@@ -341,5 +346,83 @@ mod tests {
 
         assert!(matches_ruby_constraint("1.5.4", "= 1.5.4"));
         assert!(!matches_ruby_constraint("1.5.5", "= 1.5.4"));
+    }
+
+    #[tokio::test]
+    async fn test_get_latest_including_prereleases_skips_yanked() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/api/v1/versions/rails.json"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                r#"[
+                    {"number":"8.0.1","prerelease":false,"yanked":true},
+                    {"number":"8.0.0.beta1","prerelease":true,"yanked":false},
+                    {"number":"7.2.1","prerelease":false,"yanked":false}
+                ]"#,
+            ))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let registry = RubyGemsRegistry::with_api_url(mock_server.uri());
+        let version = registry
+            .get_latest_version_including_prereleases("rails")
+            .await
+            .unwrap();
+        assert_eq!(
+            version, "8.0.0.beta1",
+            "yanked 8.0.1 must be skipped, next newest returned"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_get_latest_version_matching_skips_yanked() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/api/v1/versions/rails.json"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                r#"[
+                    {"number":"7.2.3","prerelease":false,"yanked":true},
+                    {"number":"7.1.5","prerelease":false,"yanked":false},
+                    {"number":"7.1.4","prerelease":false,"yanked":false}
+                ]"#,
+            ))
+            .mount(&mock_server)
+            .await;
+
+        let registry = RubyGemsRegistry::with_api_url(mock_server.uri());
+        let version = registry
+            .get_latest_version_matching("rails", "~> 7.1")
+            .await
+            .unwrap();
+        assert_eq!(
+            version, "7.1.5",
+            "yanked 7.2.3 must be skipped even when it matches the constraint"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_get_latest_version_matching_accepts_missing_yanked_field() {
+        // Older RubyGems responses may omit the `yanked` field entirely; we
+        // must treat that as "not yanked" and still return the version.
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/api/v1/versions/rails.json"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string(r#"[{"number":"7.1.5","prerelease":false}]"#),
+            )
+            .mount(&mock_server)
+            .await;
+
+        let registry = RubyGemsRegistry::with_api_url(mock_server.uri());
+        let version = registry
+            .get_latest_version_matching("rails", "~> 7.1")
+            .await
+            .unwrap();
+        assert_eq!(version, "7.1.5");
     }
 }
