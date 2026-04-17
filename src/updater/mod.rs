@@ -180,7 +180,7 @@ pub enum Lang {
 }
 
 /// Type of dependency file
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum FileType {
     Requirements,
     PyProject,

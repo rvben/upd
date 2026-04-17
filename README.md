@@ -141,7 +141,7 @@ upd align --check  # Exit 1 if misalignments found (for CI)
 
 # Check for security vulnerabilities
 upd audit
-upd audit --check  # Exit 1 if vulnerabilities found (for CI)
+upd audit --check  # Exit 1 if vulnerabilities are found or the audit can't complete (for CI)
 ```
 
 ## Supported Files
@@ -282,7 +282,7 @@ Check your dependencies for known security vulnerabilities using the [OSV (Open 
 ```bash
 upd audit              # Scan all dependency files
 upd audit --dry-run    # Same as audit (read-only operation)
-upd audit --check      # Exit 1 if vulnerabilities found (for CI)
+upd audit --check      # Exit 1 if vulnerabilities are found or the audit can't complete
 upd audit --lang python # Audit only Python packages
 upd audit ./services   # Audit specific directory
 ```
