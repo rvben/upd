@@ -372,6 +372,24 @@ fn discover_mise_files(path: &Path, files: &mut Vec<(PathBuf, FileType)>) {
     }
 }
 
+fn discover_hidden_dependency_files(
+    path: &Path,
+    langs: &[Lang],
+    files: &mut Vec<(PathBuf, FileType)>,
+) {
+    if langs.is_empty() || langs.contains(&Lang::Actions) {
+        discover_github_actions(path, files);
+    }
+
+    if langs.is_empty() || langs.contains(&Lang::PreCommit) {
+        discover_pre_commit_config(path, files);
+    }
+
+    if langs.is_empty() || langs.contains(&Lang::Mise) {
+        discover_mise_files(path, files);
+    }
+}
+
 /// Discover dependency files in the given paths, optionally filtered by language
 pub fn discover_files(paths: &[PathBuf], langs: &[Lang]) -> Vec<(PathBuf, FileType)> {
     let mut files = Vec::new();
@@ -384,6 +402,8 @@ pub fn discover_files(paths: &[PathBuf], langs: &[Lang]) -> Vec<(PathBuf, FileTy
                 files.push((path.clone(), file_type));
             }
         } else if path.is_dir() {
+            discover_hidden_dependency_files(path, langs, &mut files);
+
             // Walk directory respecting .gitignore
             let walker = WalkBuilder::new(path)
                 .hidden(true)
@@ -394,27 +414,16 @@ pub fn discover_files(paths: &[PathBuf], langs: &[Lang]) -> Vec<(PathBuf, FileTy
 
             for entry in walker.flatten() {
                 let entry_path = entry.path();
+                if entry_path.is_dir() && entry_path != path {
+                    discover_hidden_dependency_files(entry_path, langs, &mut files);
+                }
+
                 if entry_path.is_file()
                     && let Some(file_type) = FileType::detect(entry_path)
                     && (langs.is_empty() || langs.contains(&file_type.lang()))
                 {
                     files.push((entry_path.to_path_buf(), file_type));
                 }
-            }
-
-            // Separate scan for .github/workflows/ (hidden from WalkBuilder)
-            if langs.is_empty() || langs.contains(&Lang::Actions) {
-                discover_github_actions(path, &mut files);
-            }
-
-            // Separate scan for .pre-commit-config.yaml (hidden from WalkBuilder)
-            if langs.is_empty() || langs.contains(&Lang::PreCommit) {
-                discover_pre_commit_config(path, &mut files);
-            }
-
-            // Separate scan for .mise.toml and .tool-versions (hidden from WalkBuilder)
-            if langs.is_empty() || langs.contains(&Lang::Mise) {
-                discover_mise_files(path, &mut files);
             }
         }
     }
@@ -806,6 +815,30 @@ mod tests {
         let files = discover_files(&[temp.path().to_path_buf()], &[Lang::Node]);
         assert_eq!(files.len(), 1);
         assert_eq!(files[0].1, FileType::PackageJson);
+    }
+
+    #[test]
+    fn test_discover_nested_hidden_ecosystem_files() {
+        let temp = tempdir().unwrap();
+        let nested = temp.path().join("apps").join("api");
+
+        fs::create_dir_all(nested.join(".github").join("workflows")).unwrap();
+        fs::write(
+            nested.join(".github").join("workflows").join("ci.yml"),
+            "name: CI",
+        )
+        .unwrap();
+        fs::write(nested.join(".pre-commit-config.yaml"), "repos: []").unwrap();
+        fs::write(nested.join(".mise.toml"), "[tools]\nnode = \"20\"").unwrap();
+        fs::write(nested.join(".tool-versions"), "node 20").unwrap();
+
+        let files = discover_files(&[temp.path().to_path_buf()], &[]);
+        let paths: Vec<_> = files.iter().map(|(path, _)| path.clone()).collect();
+
+        assert!(paths.contains(&nested.join(".github").join("workflows").join("ci.yml")));
+        assert!(paths.contains(&nested.join(".pre-commit-config.yaml")));
+        assert!(paths.contains(&nested.join(".mise.toml")));
+        assert!(paths.contains(&nested.join(".tool-versions")));
     }
 
     #[test]

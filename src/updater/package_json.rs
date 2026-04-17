@@ -8,9 +8,22 @@ use anyhow::Result;
 use futures::future::join_all;
 use regex::Regex;
 use serde_json::Value;
+use std::collections::HashMap;
 use std::path::Path;
 
 pub struct PackageJsonUpdater;
+
+const DEPENDENCY_SECTIONS: [&str; 4] = [
+    "dependencies",
+    "devDependencies",
+    "peerDependencies",
+    "optionalDependencies",
+];
+
+#[derive(Default)]
+struct PackageJsonLineIndex {
+    lines_by_section: HashMap<String, HashMap<String, usize>>,
+}
 
 impl PackageJsonUpdater {
     pub fn new() -> Self {
@@ -29,19 +42,6 @@ impl PackageJsonUpdater {
 
         // No prefix
         (String::new(), version_str.to_string())
-    }
-
-    /// Find the line number where a package is defined
-    fn find_package_line(&self, content: &str, package: &str) -> Option<usize> {
-        let pattern = format!(r#""{}""#, regex::escape(package));
-        let re = Regex::new(&pattern).ok()?;
-
-        for (line_idx, line) in content.lines().enumerate() {
-            if re.is_match(line) {
-                return Some(line_idx + 1); // 1-indexed
-            }
-        }
-        None
     }
 
     fn update_version_in_content(
@@ -66,6 +66,74 @@ impl PackageJsonUpdater {
     }
 }
 
+impl PackageJsonLineIndex {
+    fn from_content(content: &str) -> Self {
+        let section_re = Regex::new(
+            r#"^\s*"(dependencies|devDependencies|peerDependencies|optionalDependencies)"\s*:\s*\{"#,
+        )
+        .expect("Invalid section regex");
+        let entry_re =
+            Regex::new(r#""([^"]+)"\s*:\s*"[^"]*""#).expect("Invalid dependency entry regex");
+
+        let mut lines_by_section: HashMap<String, HashMap<String, usize>> = HashMap::new();
+        let mut current_section: Option<String> = None;
+        let mut section_brace_balance = 0isize;
+
+        for (line_idx, line) in content.lines().enumerate() {
+            if let Some(section) = current_section.as_ref() {
+                for caps in entry_re.captures_iter(line) {
+                    let package = caps.get(1).unwrap().as_str();
+                    lines_by_section
+                        .entry(section.clone())
+                        .or_default()
+                        .entry(package.to_string())
+                        .or_insert(line_idx + 1);
+                }
+
+                section_brace_balance += brace_delta(line);
+                if section_brace_balance <= 0 {
+                    current_section = None;
+                    section_brace_balance = 0;
+                }
+
+                continue;
+            }
+
+            if let Some(caps) = section_re.captures(line) {
+                let section = caps.get(1).unwrap().as_str().to_string();
+                current_section = Some(section.clone());
+                section_brace_balance = brace_delta(line);
+
+                for caps in entry_re.captures_iter(line) {
+                    let package = caps.get(1).unwrap().as_str();
+                    lines_by_section
+                        .entry(section.clone())
+                        .or_default()
+                        .entry(package.to_string())
+                        .or_insert(line_idx + 1);
+                }
+
+                if section_brace_balance <= 0 {
+                    current_section = None;
+                    section_brace_balance = 0;
+                }
+            }
+        }
+
+        Self { lines_by_section }
+    }
+
+    fn line_for(&self, section: &str, package: &str) -> Option<usize> {
+        self.lines_by_section
+            .get(section)
+            .and_then(|section_lines| section_lines.get(package).copied())
+    }
+}
+
+fn brace_delta(line: &str) -> isize {
+    line.matches('{').count() as isize - line.matches('}').count() as isize
+}
+
 impl Default for PackageJsonUpdater {
     fn default() -> Self {
         Self::new()
@@ -84,18 +152,14 @@ impl Updater for PackageJsonUpdater {
         let json: Value = serde_json::from_str(&content)?;
         let mut result = UpdateResult::default();
         let mut new_content = content.clone();
+        let line_index = PackageJsonLineIndex::from_content(&content);
 
         // First pass: collect all packages and separate by config status
-        let mut ignored_packages: Vec<(String, String)> = Vec::new();
-        let mut pinned_packages: Vec<(String, String, String, String, String)> = Vec::new();
-        let mut packages_to_check: Vec<(String, String, String, String)> = Vec::new();
+        let mut ignored_packages: Vec<(String, String, String)> = Vec::new();
+        let mut pinned_packages: Vec<(String, String, String, String, String, String)> = Vec::new();
+        let mut packages_to_check: Vec<(String, String, String, String, String)> = Vec::new();
 
-        for section in [
-            "dependencies",
-            "devDependencies",
-            "peerDependencies",
-            "optionalDependencies",
-        ] {
+        for section in DEPENDENCY_SECTIONS {
             if let Some(deps) = json.get(section).and_then(|v| v.as_object()) {
                 for (package, version_value) in deps {
                     if let Some(version_str) = version_value.as_str() {
@@ -119,13 +183,18 @@ impl Updater for PackageJsonUpdater {
 
                         // Check if package should be ignored
                         if options.should_ignore(package) {
-                            ignored_packages.push((package.clone(), current_version));
+                            ignored_packages.push((
+                                section.to_string(),
+                                package.clone(),
+                                current_version,
+                            ));
                             continue;
                         }
 
                         // Check if package has a pinned version
                         if let Some(pinned_version) = options.get_pinned_version(package) {
                             pinned_packages.push((
+                                section.to_string(),
                                 package.clone(),
                                 version_str.to_string(),
                                 prefix,
@@ -136,6 +205,7 @@ impl Updater for PackageJsonUpdater {
                         }
 
                         packages_to_check.push((
+                            section.to_string(),
                             package.clone(),
                             version_str.to_string(),
                             prefix,
@@ -147,13 +217,15 @@ impl Updater for PackageJsonUpdater {
         }
 
         // Record ignored packages
-        for (package, version) in ignored_packages {
-            let line_num = self.find_package_line(&content, &package);
+        for (section, package, version) in ignored_packages {
+            let line_num = line_index.line_for(&section, &package);
             result.ignored.push((package, version, line_num));
         }
 
         // Process pinned packages (no registry fetch needed)
-        for (package, version_str, prefix, current_version, pinned_version) in pinned_packages {
+        for (section, package, version_str, prefix, current_version, pinned_version) in
+            pinned_packages
+        {
             let matched_version = if options.full_precision {
                 pinned_version.clone()
             } else {
@@ -161,7 +233,7 @@ impl Updater for PackageJsonUpdater {
             };
 
             if matched_version != current_version {
-                let line_num = self.find_package_line(&content, &package);
+                let line_num = line_index.line_for(&section, &package);
                 result.pinned.push((
                     package.clone(),
                     current_version.clone(),
@@ -184,13 +256,13 @@ impl Updater for PackageJsonUpdater {
         // Fetch all versions in parallel for non-ignored, non-pinned packages
         let version_futures: Vec<_> = packages_to_check
             .iter()
-            .map(|(package, _, _, _)| registry.get_latest_version(package))
+            .map(|(_, package, _, _, _)| registry.get_latest_version(package))
             .collect();
 
         let version_results = join_all(version_futures).await;
 
         // Process results
-        for ((package, version_str, prefix, current_version), version_result) in
+        for ((section, package, version_str, prefix, current_version), version_result) in
             packages_to_check.into_iter().zip(version_results)
         {
             match version_result {
@@ -202,7 +274,7 @@ impl Updater for PackageJsonUpdater {
                         match_version_precision(&current_version, &latest_version)
                     };
                     if matched_version != current_version {
-                        let line_num = self.find_package_line(&content, &package);
+                        let line_num = line_index.line_for(&section, &package);
                         result.updated.push((
                             package.clone(),
                             current_version.clone(),
@@ -242,13 +314,9 @@ impl Updater for PackageJsonUpdater {
         let content = read_file_safe(path)?;
         let json: Value = serde_json::from_str(&content)?;
         let mut deps = Vec::new();
+        let line_index = PackageJsonLineIndex::from_content(&content);
 
-        for section in [
-            "dependencies",
-            "devDependencies",
-            "peerDependencies",
-            "optionalDependencies",
-        ] {
+        for section in DEPENDENCY_SECTIONS {
             if let Some(section_deps) = json.get(section).and_then(|v| v.as_object()) {
                 for (package, version_value) in section_deps {
                     if let Some(version_str) = version_value.as_str() {
@@ -270,7 +338,7 @@ impl Updater for PackageJsonUpdater {
                             continue;
                         }
 
-                        let line_num = self.find_package_line(&content, package);
+                        let line_num = line_index.line_for(section, package);
                         deps.push(ParsedDependency {
                             name: package.clone(),
                             version: current_version,
@@ -289,10 +357,42 @@ impl Updater for PackageJsonUpdater {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::registry::MockRegistry;
+    use crate::registry::{MockRegistry, NpmRegistry};
+    use serial_test::serial;
     use std::fs;
     use std::io::Write;
     use tempfile::NamedTempFile;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    struct EnvVarGuard {
+        key: &'static str,
+        previous: Option<String>,
+    }
+
+    impl EnvVarGuard {
+        fn set(key: &'static str, value: &str) -> Self {
+            let previous = std::env::var(key).ok();
+            // SAFETY: Test-only mutation of the process environment, serialized where needed.
+            unsafe {
+                std::env::set_var(key, value);
+            }
+            Self { key, previous }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            // SAFETY: Test-only restoration of the process environment, serialized where needed.
+            unsafe {
+                if let Some(previous) = &self.previous {
+                    std::env::set_var(self.key, previous);
+                } else {
+                    std::env::remove_var(self.key);
+                }
+            }
+        }
+    }
 
     #[test]
     fn test_extract_version_info() {
@@ -380,6 +480,61 @@ mod tests {
         // Verify file was NOT updated (dry run)
         let content = fs::read_to_string(file.path()).unwrap();
         assert_eq!(content, original);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_update_package_json_uses_scoped_registry_from_npmrc() {
+        let default_registry = MockServer::start().await;
+        let scoped_registry = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/@private/pkg"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                r#"{
+  "dist-tags": { "latest": "1.2.3" },
+  "versions": {
+    "1.0.0": {},
+    "1.2.3": {}
+  }
+}"#,
+            ))
+            .expect(1)
+            .mount(&scoped_registry)
+            .await;
+
+        let mut npmrc = NamedTempFile::new().unwrap();
+        writeln!(npmrc, "@private:registry={}", scoped_registry.uri()).unwrap();
+        let _npmrc_guard =
+            EnvVarGuard::set("NPM_CONFIG_USERCONFIG", npmrc.path().to_str().unwrap());
+
+        let mut file = NamedTempFile::with_suffix(".json").unwrap();
+        write!(
+            file,
+            r#"{{
+  "dependencies": {{
+    "@private/pkg": "^1.0.0"
+  }}
+}}"#
+        )
+        .unwrap();
+
+        let registry = NpmRegistry::with_registry_url(default_registry.uri());
+        let updater = PackageJsonUpdater::new();
+
+        let result = updater
+            .update(file.path(), &registry, UpdateOptions::new(false, false))
+            .await
+            .unwrap();
+
+        assert!(result.errors.is_empty());
+        assert_eq!(result.updated.len(), 1);
+        assert_eq!(result.updated[0].0, "@private/pkg");
+        assert_eq!(result.updated[0].1, "1.0.0");
+        assert_eq!(result.updated[0].2, "1.2.3");
+
+        let content = fs::read_to_string(file.path()).unwrap();
+        assert!(content.contains("\"@private/pkg\": \"^1.2.3\""));
     }
 
     #[tokio::test]
@@ -514,6 +669,52 @@ mod tests {
         // Line number should be found (react is on line 4)
         assert!(result.updated[0].3.is_some());
         assert_eq!(result.updated[0].3, Some(4));
+    }
+
+    #[tokio::test]
+    async fn test_update_package_json_duplicate_package_names_keep_section_line_numbers() {
+        use crate::config::UpdConfig;
+        use std::sync::Arc;
+
+        let mut file = NamedTempFile::with_suffix(".json").unwrap();
+        write!(
+            file,
+            r#"{{
+  "dependencies": {{
+    "react": "^18.2.0"
+  }},
+  "devDependencies": {{
+    "react": "^18.1.0"
+  }}
+}}"#
+        )
+        .unwrap();
+
+        let mut pin = std::collections::HashMap::new();
+        pin.insert("react".to_string(), "19.0.0".to_string());
+        let config = UpdConfig {
+            ignore: Vec::new(),
+            pin,
+        };
+
+        let updater = PackageJsonUpdater::new();
+        let options = UpdateOptions::new(false, false).with_config(Arc::new(config));
+
+        let result = updater
+            .update(file.path(), &MockRegistry::new("npm"), options)
+            .await
+            .unwrap();
+
+        assert!(result.updated.is_empty());
+        assert_eq!(result.pinned.len(), 2);
+
+        let mut line_numbers: Vec<_> = result
+            .pinned
+            .iter()
+            .map(|(_, _, _, line_num)| line_num.unwrap())
+            .collect();
+        line_numbers.sort_unstable();
+        assert_eq!(line_numbers, vec![3, 6]);
     }
 
     #[tokio::test]

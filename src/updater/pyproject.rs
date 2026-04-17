@@ -7,6 +7,7 @@ use crate::version::{is_stable_pep440, match_version_precision};
 use anyhow::{Result, anyhow};
 use futures::future::join_all;
 use regex::Regex;
+use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 use toml_edit::{DocumentMut, Formatted, Item, Value};
@@ -18,6 +19,23 @@ pub struct PyProjectUpdater {
     // Regex to capture the full constraint including additional constraints after commas
     // E.g., ">=2.8.0,<9" or ">=1.0.0,!=1.5.0,<2.0.0"
     constraint_re: Regex,
+}
+
+#[derive(Default)]
+struct PyProjectLineIndex {
+    lines_by_section: HashMap<String, HashMap<String, usize>>,
+}
+
+#[derive(Clone)]
+struct ArraySectionState {
+    section_path: String,
+    depth: usize,
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct ArrayBracketCounts {
+    opening: usize,
+    closing: usize,
 }
 
 impl PyProjectUpdater {
@@ -89,16 +107,6 @@ impl PyProjectUpdater {
         (trimmed.starts_with('<') || trimmed.starts_with("<=")) && !trimmed.contains(',') // No other constraints (like >=x,<y)
     }
 
-    /// Find the line number where a dependency string appears
-    fn find_dependency_line(content: &str, dep_substring: &str) -> Option<usize> {
-        for (line_idx, line) in content.lines().enumerate() {
-            if line.contains(dep_substring) {
-                return Some(line_idx + 1); // 1-indexed
-            }
-        }
-        None
-    }
-
     fn update_dependency(&self, dep: &str, new_version: &str) -> String {
         if let Some(caps) = self.version_re.captures(dep) {
             // Only replace the version number itself, preserving everything else
@@ -111,6 +119,19 @@ impl PyProjectUpdater {
         } else {
             dep.to_string()
         }
+    }
+
+    fn assignment_parts(line: &str) -> Option<(String, &str)> {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') || trimmed.starts_with('[') {
+            return None;
+        }
+
+        let (key, value) = trimmed.split_once('=')?;
+        Some((
+            key.trim().trim_matches('"').trim_matches('\'').to_string(),
+            value.trim(),
+        ))
     }
 
     /// Extract index URLs from pyproject.toml for Poetry and PDM configurations
@@ -197,22 +218,27 @@ impl PyProjectUpdater {
         array: &mut toml_edit::Array,
         registry: &dyn Registry,
         result: &mut UpdateResult,
-        original_content: &str,
+        line_index: &PyProjectLineIndex,
+        section_path: &str,
         options: &UpdateOptions,
     ) {
         // First pass: collect all dependencies and separate by config status
-        let mut ignored_deps: Vec<(String, String)> = Vec::new();
-        let mut pinned_deps: Vec<(usize, String, String, String, String)> = Vec::new();
-        let mut deps_to_check: Vec<(usize, String, String, String, String)> = Vec::new();
+        let mut ignored_deps: Vec<(String, String, Option<usize>)> = Vec::new();
+        let mut pinned_deps: Vec<(usize, String, String, String, String, Option<usize>)> =
+            Vec::new();
+        let mut deps_to_check: Vec<(usize, String, String, String, String, Option<usize>)> =
+            Vec::new();
 
         for i in 0..array.len() {
             if let Some(item) = array.get(i)
                 && let Some(s) = item.as_str()
                 && let Some((package, current_version, full_constraint)) = self.parse_dependency(s)
             {
+                let line_num = line_index.line_for(section_path, &package);
+
                 // Check if package should be ignored
                 if options.should_ignore(&package) {
-                    ignored_deps.push((package, current_version));
+                    ignored_deps.push((package, current_version, line_num));
                     continue;
                 }
 
@@ -224,23 +250,30 @@ impl PyProjectUpdater {
                         package,
                         current_version,
                         pinned_version.to_string(),
+                        line_num,
                     ));
                     continue;
                 }
 
-                deps_to_check.push((i, s.to_string(), package, current_version, full_constraint));
+                deps_to_check.push((
+                    i,
+                    s.to_string(),
+                    package,
+                    current_version,
+                    full_constraint,
+                    line_num,
+                ));
             }
         }
 
         // Record ignored packages
-        for (package, version) in ignored_deps {
-            let line_num = Self::find_dependency_line(original_content, &package);
+        for (package, version, line_num) in ignored_deps {
             result.ignored.push((package, version, line_num));
         }
 
         // Process pinned packages (no registry fetch needed)
         let mut updates: Vec<(usize, String)> = Vec::new();
-        for (i, dep_str, package, current_version, pinned_version) in pinned_deps {
+        for (i, dep_str, package, current_version, pinned_version, line_num) in pinned_deps {
             let matched_version = if options.full_precision {
                 pinned_version.clone()
             } else {
@@ -249,7 +282,6 @@ impl PyProjectUpdater {
 
             if matched_version != current_version {
                 let updated = self.update_dependency(&dep_str, &matched_version);
-                let line_num = Self::find_dependency_line(original_content, &package);
                 result
                     .pinned
                     .push((package, current_version, matched_version.clone(), line_num));
@@ -262,25 +294,27 @@ impl PyProjectUpdater {
         // Fetch versions for remaining deps in parallel
         let version_futures: Vec<_> = deps_to_check
             .iter()
-            .map(|(_, _, package, current_version, full_constraint)| async {
-                if !is_stable_pep440(current_version) {
-                    registry
-                        .get_latest_version_including_prereleases(package)
-                        .await
-                } else if Self::is_simple_constraint(full_constraint) {
-                    registry.get_latest_version(package).await
-                } else {
-                    registry
-                        .get_latest_version_matching(package, full_constraint)
-                        .await
-                }
-            })
+            .map(
+                |(_, _, package, current_version, full_constraint, _)| async {
+                    if !is_stable_pep440(current_version) {
+                        registry
+                            .get_latest_version_including_prereleases(package)
+                            .await
+                    } else if Self::is_simple_constraint(full_constraint) {
+                        registry.get_latest_version(package).await
+                    } else {
+                        registry
+                            .get_latest_version_matching(package, full_constraint)
+                            .await
+                    }
+                },
+            )
             .collect();
 
         let version_results = join_all(version_futures).await;
 
         // Process results and collect updates
-        for ((i, dep_str, package, current_version, full_constraint), version_result) in
+        for ((i, dep_str, package, current_version, full_constraint, line_num), version_result) in
             deps_to_check.into_iter().zip(version_results)
         {
             // Skip upper-bound-only constraints (e.g., "<6", "<=5.0")
@@ -300,7 +334,6 @@ impl PyProjectUpdater {
                     };
                     if matched_version != current_version {
                         let updated = self.update_dependency(&dep_str, &matched_version);
-                        let line_num = Self::find_dependency_line(original_content, &package);
                         result
                             .updated
                             .push((package, current_version, matched_version, line_num));
@@ -336,13 +369,14 @@ impl PyProjectUpdater {
         deps_table: &mut toml_edit::Table,
         registry: &dyn Registry,
         result: &mut UpdateResult,
-        original_content: &str,
+        line_index: &PyProjectLineIndex,
+        section_path: &str,
         options: &UpdateOptions,
     ) {
         // First pass: collect dependencies and separate by config status
-        let mut ignored_deps: Vec<(String, String)> = Vec::new();
-        let mut pinned_deps: Vec<(String, String, String, String)> = Vec::new();
-        let mut deps_to_check: Vec<(String, String, String)> = Vec::new();
+        let mut ignored_deps: Vec<(String, String, Option<usize>)> = Vec::new();
+        let mut pinned_deps: Vec<(String, String, String, String, Option<usize>)> = Vec::new();
+        let mut deps_to_check: Vec<(String, String, String, Option<usize>)> = Vec::new();
 
         for (key, item) in deps_table.iter() {
             if key == "python" {
@@ -359,31 +393,37 @@ impl PyProjectUpdater {
                     };
 
                 let package = key.to_string();
+                let line_num = line_index.line_for(section_path, &package);
 
                 // Check if package should be ignored
                 if options.should_ignore(&package) {
-                    ignored_deps.push((package, version));
+                    ignored_deps.push((package, version, line_num));
                     continue;
                 }
 
                 // Check if package has a pinned version
                 if let Some(pinned_version) = options.get_pinned_version(&package) {
-                    pinned_deps.push((package, prefix, version, pinned_version.to_string()));
+                    pinned_deps.push((
+                        package,
+                        prefix,
+                        version,
+                        pinned_version.to_string(),
+                        line_num,
+                    ));
                     continue;
                 }
 
-                deps_to_check.push((package, prefix, version));
+                deps_to_check.push((package, prefix, version, line_num));
             }
         }
 
         // Record ignored packages
-        for (package, version) in ignored_deps {
-            let line_num = Self::find_dependency_line(original_content, &package);
+        for (package, version, line_num) in ignored_deps {
             result.ignored.push((package, version, line_num));
         }
 
         // Process pinned packages (no registry fetch needed)
-        for (key, prefix, version, pinned_version) in pinned_deps {
+        for (key, prefix, version, pinned_version, line_num) in pinned_deps {
             let matched_version = if options.full_precision {
                 pinned_version.clone()
             } else {
@@ -392,7 +432,6 @@ impl PyProjectUpdater {
 
             if matched_version != version {
                 let new_val = format!("{}{}", prefix, matched_version);
-                let line_num = Self::find_dependency_line(original_content, &key);
                 result
                     .pinned
                     .push((key.clone(), version, matched_version.clone(), line_num));
@@ -412,7 +451,7 @@ impl PyProjectUpdater {
         // Fetch versions for remaining deps in parallel
         let version_futures: Vec<_> = deps_to_check
             .iter()
-            .map(|(key, _, version)| async {
+            .map(|(key, _, version, _)| async {
                 if is_stable_pep440(version) {
                     registry.get_latest_version(key).await
                 } else {
@@ -424,7 +463,7 @@ impl PyProjectUpdater {
         let version_results = join_all(version_futures).await;
 
         // Process results
-        for ((key, prefix, version), version_result) in
+        for ((key, prefix, version, line_num), version_result) in
             deps_to_check.into_iter().zip(version_results)
         {
             match version_result {
@@ -437,7 +476,6 @@ impl PyProjectUpdater {
                     };
                     if matched_version != version {
                         let new_val = format!("{}{}", prefix, matched_version);
-                        let line_num = Self::find_dependency_line(original_content, &key);
                         result
                             .updated
                             .push((key.clone(), version, matched_version, line_num));
@@ -460,6 +498,190 @@ impl PyProjectUpdater {
                 }
             }
         }
+    }
+}
+
+impl PyProjectLineIndex {
+    fn record_dependency_literals(
+        lines_by_section: &mut HashMap<String, HashMap<String, usize>>,
+        section_path: &str,
+        line: &str,
+        literal_re: &Regex,
+        updater: &PyProjectUpdater,
+        line_num: usize,
+    ) {
+        for caps in literal_re.captures_iter(line) {
+            let dep = caps.get(1).or_else(|| caps.get(2)).unwrap().as_str();
+            if let Some((package, _, _)) = updater.parse_dependency(dep) {
+                lines_by_section
+                    .entry(section_path.to_string())
+                    .or_default()
+                    .entry(package)
+                    .or_insert(line_num);
+            }
+        }
+    }
+
+    fn count_structural_array_brackets(line: &str) -> ArrayBracketCounts {
+        #[derive(Clone, Copy)]
+        enum ScanState {
+            Normal,
+            BasicString,
+            LiteralString,
+        }
+
+        let mut counts = ArrayBracketCounts::default();
+        let mut state = ScanState::Normal;
+        let mut chars = line.chars();
+
+        while let Some(ch) = chars.next() {
+            match state {
+                ScanState::Normal => match ch {
+                    '#' => break,
+                    '"' => state = ScanState::BasicString,
+                    '\'' => state = ScanState::LiteralString,
+                    '[' => counts.opening += 1,
+                    ']' => counts.closing += 1,
+                    _ => {}
+                },
+                ScanState::BasicString => match ch {
+                    '\\' => {
+                        let _ = chars.next();
+                    }
+                    '"' => state = ScanState::Normal,
+                    _ => {}
+                },
+                ScanState::LiteralString => {
+                    if ch == '\'' {
+                        state = ScanState::Normal;
+                    }
+                }
+            }
+        }
+
+        counts
+    }
+
+    fn from_content(content: &str, updater: &PyProjectUpdater) -> Self {
+        let section_re =
+            Regex::new(r#"^\s*\[([^\]]+)\]\s*$"#).expect("Invalid pyproject section regex");
+        let literal_re =
+            Regex::new(r#""([^"]+)"|'([^']+)'"#).expect("Invalid dependency literal regex");
+        let mut lines_by_section: HashMap<String, HashMap<String, usize>> = HashMap::new();
+        let mut current_section: Option<String> = None;
+        let mut current_array_section: Option<ArraySectionState> = None;
+
+        for (line_idx, line) in content.lines().enumerate() {
+            if let Some(caps) = section_re.captures(line) {
+                current_section = Some(caps.get(1).unwrap().as_str().to_string());
+                current_array_section = None;
+                continue;
+            }
+
+            if let Some(array_state) = current_array_section.as_mut() {
+                Self::record_dependency_literals(
+                    &mut lines_by_section,
+                    &array_state.section_path,
+                    line,
+                    &literal_re,
+                    updater,
+                    line_idx + 1,
+                );
+
+                let brackets = Self::count_structural_array_brackets(line);
+                let next_depth = array_state.depth as isize + brackets.opening as isize
+                    - brackets.closing as isize;
+                if next_depth <= 0 {
+                    current_array_section = None;
+                } else {
+                    array_state.depth = next_depth as usize;
+                }
+
+                continue;
+            }
+
+            let Some(section) = current_section.as_deref() else {
+                continue;
+            };
+
+            match section {
+                "project" => {
+                    if let Some((key, value)) = PyProjectUpdater::assignment_parts(line)
+                        && key == "dependencies"
+                    {
+                        let brackets = Self::count_structural_array_brackets(value);
+                        if brackets.opening == 0 {
+                            continue;
+                        }
+
+                        let section_path = "project.dependencies".to_string();
+                        Self::record_dependency_literals(
+                            &mut lines_by_section,
+                            &section_path,
+                            line,
+                            &literal_re,
+                            updater,
+                            line_idx + 1,
+                        );
+
+                        let depth = brackets.opening.saturating_sub(brackets.closing);
+                        if depth > 0 {
+                            current_array_section = Some(ArraySectionState {
+                                section_path,
+                                depth,
+                            });
+                        }
+                    }
+                }
+                "project.optional-dependencies" | "dependency-groups" => {
+                    if let Some((group, value)) = PyProjectUpdater::assignment_parts(line) {
+                        let brackets = Self::count_structural_array_brackets(value);
+                        if brackets.opening == 0 {
+                            continue;
+                        }
+
+                        let section_path = format!("{}.{}", section, group);
+                        Self::record_dependency_literals(
+                            &mut lines_by_section,
+                            &section_path,
+                            line,
+                            &literal_re,
+                            updater,
+                            line_idx + 1,
+                        );
+
+                        let depth = brackets.opening.saturating_sub(brackets.closing);
+                        if depth > 0 {
+                            current_array_section = Some(ArraySectionState {
+                                section_path,
+                                depth,
+                            });
+                        }
+                    }
+                }
+                "tool.poetry.dependencies" | "tool.poetry.dev-dependencies" => {
+                    if let Some((key, value)) = PyProjectUpdater::assignment_parts(line)
+                        && key != "python"
+                        && (value.starts_with('"') || value.starts_with('\''))
+                    {
+                        lines_by_section
+                            .entry(section.to_string())
+                            .or_default()
+                            .entry(key)
+                            .or_insert(line_idx + 1);
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        Self { lines_by_section }
+    }
+
+    fn line_for(&self, section_path: &str, package: &str) -> Option<usize> {
+        self.lines_by_section
+            .get(section_path)
+            .and_then(|section_lines| section_lines.get(package).copied())
     }
 }
 
@@ -487,6 +709,7 @@ impl Updater for PyProjectUpdater {
         })?;
 
         let mut result = UpdateResult::default();
+        let line_index = PyProjectLineIndex::from_content(&content, self);
 
         // Check for inline index configuration (Poetry/PDM/uv)
         // If found, use that registry instead of the default
@@ -500,8 +723,15 @@ impl Updater for PyProjectUpdater {
         // Update [project.dependencies]
         if let Some(Item::Table(project)) = doc.get_mut("project") {
             if let Some(Item::Value(Value::Array(deps))) = project.get_mut("dependencies") {
-                self.update_array_deps(deps, effective_registry, &mut result, &content, &options)
-                    .await;
+                self.update_array_deps(
+                    deps,
+                    effective_registry,
+                    &mut result,
+                    &line_index,
+                    "project.dependencies",
+                    &options,
+                )
+                .await;
             }
 
             // Update [project.optional-dependencies.*]
@@ -510,11 +740,13 @@ impl Updater for PyProjectUpdater {
                 let keys: Vec<String> = opt_deps.iter().map(|(k, _)| k.to_string()).collect();
                 for key in keys {
                     if let Some(Item::Value(Value::Array(deps))) = opt_deps.get_mut(&key) {
+                        let section_path = format!("project.optional-dependencies.{}", key);
                         self.update_array_deps(
                             deps,
                             effective_registry,
                             &mut result,
-                            &content,
+                            &line_index,
+                            &section_path,
                             &options,
                         )
                         .await;
@@ -528,11 +760,13 @@ impl Updater for PyProjectUpdater {
             let keys: Vec<String> = groups.iter().map(|(k, _)| k.to_string()).collect();
             for key in keys {
                 if let Some(Item::Value(Value::Array(deps))) = groups.get_mut(&key) {
+                    let section_path = format!("dependency-groups.{}", key);
                     self.update_array_deps(
                         deps,
                         effective_registry,
                         &mut result,
-                        &content,
+                        &line_index,
+                        &section_path,
                         &options,
                     )
                     .await;
@@ -545,13 +779,27 @@ impl Updater for PyProjectUpdater {
             && let Some(Item::Table(poetry)) = tool.get_mut("poetry")
         {
             if let Some(Item::Table(deps)) = poetry.get_mut("dependencies") {
-                self.update_poetry_deps(deps, effective_registry, &mut result, &content, &options)
-                    .await;
+                self.update_poetry_deps(
+                    deps,
+                    effective_registry,
+                    &mut result,
+                    &line_index,
+                    "tool.poetry.dependencies",
+                    &options,
+                )
+                .await;
             }
 
             if let Some(Item::Table(deps)) = poetry.get_mut("dev-dependencies") {
-                self.update_poetry_deps(deps, effective_registry, &mut result, &content, &options)
-                    .await;
+                self.update_poetry_deps(
+                    deps,
+                    effective_registry,
+                    &mut result,
+                    &line_index,
+                    "tool.poetry.dev-dependencies",
+                    &options,
+                )
+                .await;
             }
         }
 
@@ -577,6 +825,7 @@ impl Updater for PyProjectUpdater {
         })?;
 
         let mut deps = Vec::new();
+        let line_index = PyProjectLineIndex::from_content(&content, self);
 
         // Parse [project.dependencies]
         if let Some(Item::Table(project)) = doc.get("project") {
@@ -586,7 +835,7 @@ impl Updater for PyProjectUpdater {
                         && let Some((name, version, constraint)) = self.parse_dependency(s)
                     {
                         let has_upper_bound = !Self::is_simple_constraint(&constraint);
-                        let line_num = Self::find_dependency_line(&content, &name);
+                        let line_num = line_index.line_for("project.dependencies", &name);
                         deps.push(ParsedDependency {
                             name,
                             version,
@@ -599,14 +848,17 @@ impl Updater for PyProjectUpdater {
 
             // Parse [project.optional-dependencies.*]
             if let Some(Item::Table(opt_deps)) = project.get("optional-dependencies") {
-                for (_, group_deps) in opt_deps.iter() {
+                for (group_name, group_deps) in opt_deps.iter() {
                     if let Some(arr) = group_deps.as_array() {
                         for item in arr.iter() {
                             if let Some(s) = item.as_str()
                                 && let Some((name, version, constraint)) = self.parse_dependency(s)
                             {
                                 let has_upper_bound = !Self::is_simple_constraint(&constraint);
-                                let line_num = Self::find_dependency_line(&content, &name);
+                                let line_num = line_index.line_for(
+                                    &format!("project.optional-dependencies.{}", group_name),
+                                    &name,
+                                );
                                 deps.push(ParsedDependency {
                                     name,
                                     version,
@@ -638,7 +890,8 @@ impl Updater for PyProjectUpdater {
                                 } else {
                                     version_str
                                 };
-                            let line_num = Self::find_dependency_line(&content, key);
+                            let line_num =
+                                line_index.line_for(&format!("tool.poetry.{}", section), key);
                             deps.push(ParsedDependency {
                                 name: key.to_string(),
                                 version,
@@ -752,6 +1005,62 @@ mod tests {
         assert_eq!(
             updater.update_dependency("foo>=1.0.0,!=1.5.0,<2.0.0", "1.8.0"),
             "foo>=1.8.0,!=1.5.0,<2.0.0"
+        );
+    }
+
+    #[test]
+    fn test_count_structural_array_brackets_ignores_strings_and_comments() {
+        assert_eq!(
+            PyProjectLineIndex::count_structural_array_brackets(
+                r#"[ "requests[socks]>=2.28.0", 'flask[async]>=2.0.0' ] # ]"#,
+            ),
+            ArrayBracketCounts {
+                opening: 1,
+                closing: 1,
+            }
+        );
+        assert_eq!(
+            PyProjectLineIndex::count_structural_array_brackets(
+                r#"  "requests[socks]>=2.28.0", # ] inside a comment"#,
+            ),
+            ArrayBracketCounts::default()
+        );
+    }
+
+    #[test]
+    fn test_line_index_tracks_entries_after_extras_in_multiline_arrays() {
+        let updater = PyProjectUpdater::new();
+        let content = r#"[project]
+name = "demo"
+dependencies = [
+  "requests[socks]>=2.28.0", # ] inside a comment should be ignored
+  "flask>=2.0.0",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest[testing]>=7.0.0",
+  "black>=23.0.0", # [comment]
+]
+"#;
+
+        let line_index = PyProjectLineIndex::from_content(content, &updater);
+
+        assert_eq!(
+            line_index.line_for("project.dependencies", "requests"),
+            Some(4)
+        );
+        assert_eq!(
+            line_index.line_for("project.dependencies", "flask"),
+            Some(5)
+        );
+        assert_eq!(
+            line_index.line_for("project.optional-dependencies.dev", "pytest"),
+            Some(10)
+        );
+        assert_eq!(
+            line_index.line_for("project.optional-dependencies.dev", "black"),
+            Some(11)
         );
     }
 
@@ -1401,6 +1710,110 @@ requests = "^2.28.0"
 
         let contents = std::fs::read_to_string(file.path()).unwrap();
         assert!(contents.contains("requests = \"^2.29.0\""));
+    }
+
+    #[tokio::test]
+    async fn test_update_pyproject_duplicate_dependency_names_keep_occurrence_line_numbers() {
+        use crate::config::UpdConfig;
+
+        let mut file = NamedTempFile::with_suffix(".toml").unwrap();
+        write!(
+            file,
+            r#"[project]
+name = "demo"
+version = "0.1.0"
+dependencies = [
+  "requests>=2.28.0",
+]
+
+[project.optional-dependencies]
+dev = [
+  "requests>=2.27.0",
+]
+"#
+        )
+        .unwrap();
+
+        let mut pin = std::collections::HashMap::new();
+        pin.insert("requests".to_string(), "2.29.0".to_string());
+        let config = UpdConfig {
+            ignore: Vec::new(),
+            pin,
+        };
+
+        let updater = PyProjectUpdater::new();
+        let options = UpdateOptions::new(false, false).with_config(Arc::new(config));
+
+        let result = updater
+            .update(file.path(), &MockRegistry::new("PyPI"), options)
+            .await
+            .unwrap();
+
+        assert!(result.updated.is_empty());
+        assert_eq!(result.pinned.len(), 2);
+
+        let mut line_numbers: Vec<_> = result
+            .pinned
+            .iter()
+            .map(|(_, _, _, line_num)| line_num.unwrap())
+            .collect();
+        line_numbers.sort_unstable();
+        assert_eq!(line_numbers, vec![5, 10]);
+    }
+
+    #[tokio::test]
+    async fn test_update_pyproject_multiline_arrays_with_extras_keep_following_line_numbers() {
+        let mut file = NamedTempFile::with_suffix(".toml").unwrap();
+        write!(
+            file,
+            r#"[project]
+name = "demo"
+dependencies = [
+  "requests[socks]>=2.28.0", # ] inside a comment should be ignored
+  "flask>=2.0.0",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest[testing]>=7.0.0",
+  "black>=23.0.0", # [comment]
+]
+"#
+        )
+        .unwrap();
+
+        let registry = MockRegistry::new("PyPI")
+            .with_version("requests", "2.31.0")
+            .with_version("flask", "3.0.0")
+            .with_version("pytest", "8.0.0")
+            .with_version("black", "24.0.0");
+
+        let updater = PyProjectUpdater::new();
+        let result = updater
+            .update(file.path(), &registry, UpdateOptions::new(false, false))
+            .await
+            .unwrap();
+
+        assert_eq!(result.updated.len(), 4);
+
+        let line_for = |package: &str| {
+            result
+                .updated
+                .iter()
+                .find(|(name, _, _, _)| name == package)
+                .and_then(|(_, _, _, line_num)| *line_num)
+        };
+
+        assert_eq!(line_for("requests"), Some(4));
+        assert_eq!(line_for("flask"), Some(5));
+        assert_eq!(line_for("pytest"), Some(10));
+        assert_eq!(line_for("black"), Some(11));
+
+        let contents = std::fs::read_to_string(file.path()).unwrap();
+        assert!(contents.contains("requests[socks]>=2.31.0"));
+        assert!(contents.contains("flask>=3.0.0"));
+        assert!(contents.contains("pytest[testing]>=8.0.0"));
+        assert!(contents.contains("black>=24.0.0"));
     }
 
     #[tokio::test]

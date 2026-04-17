@@ -13,6 +13,14 @@ use toml_edit::{DocumentMut, Formatted, Item, Table, Value};
 
 pub struct CargoTomlUpdater;
 
+#[derive(Default)]
+struct CargoTomlLineIndex {
+    lines_by_section: HashMap<String, HashMap<String, usize>>,
+}
+
+/// (package, prefix, current_version, optional registry name, source line).
+type DependencyLookup = (String, String, String, Option<String>, Option<usize>);
+
 impl CargoTomlUpdater {
     pub fn new() -> Self {
         Self
@@ -135,22 +143,6 @@ impl CargoTomlUpdater {
         }
     }
 
-    /// Find the line number where a dependency is defined
-    fn find_dependency_line(content: &str, dep_name: &str) -> Option<usize> {
-        for (line_idx, line) in content.lines().enumerate() {
-            // Look for lines that contain the dependency name as a key
-            // This handles: dep_name = "version", dep_name = { version = "..." }, [dependencies.dep_name]
-            if line.contains(dep_name)
-                && (line.trim().starts_with(dep_name)
-                    || line.contains(&format!(".{}", dep_name))
-                    || line.contains(&format!("[dependencies.{}]", dep_name)))
-            {
-                return Some(line_idx + 1); // 1-indexed
-            }
-        }
-        None
-    }
-
     /// Parse version requirement to extract the actual version number
     /// Handles: "1.0", "^1.0", "~1.0", ">=1.0", "=1.0", etc.
     fn parse_version_req(version_req: &str) -> (String, String) {
@@ -167,6 +159,38 @@ impl CargoTomlUpdater {
         (prefix.to_string(), version.to_string())
     }
 
+    fn normalize_section_path(section: &str) -> String {
+        section
+            .split('.')
+            .map(|segment| segment.trim_matches('"').trim_matches('\''))
+            .collect::<Vec<_>>()
+            .join(".")
+    }
+
+    fn is_dependency_section_path(section: &str) -> bool {
+        matches!(
+            section,
+            "dependencies" | "dev-dependencies" | "build-dependencies" | "workspace.dependencies"
+        ) || (section.starts_with("target.")
+            && (section.ends_with(".dependencies")
+                || section.ends_with(".dev-dependencies")
+                || section.ends_with(".build-dependencies")))
+    }
+
+    fn dependency_assignment_key(line: &str) -> Option<String> {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') || trimmed.starts_with('[') {
+            return None;
+        }
+
+        let key = trimmed.split('=').next()?.trim();
+        if key.is_empty() {
+            return None;
+        }
+
+        Some(key.trim_matches('"').trim_matches('\'').to_string())
+    }
+
     /// Update dependencies in a table (e.g., [dependencies], [dev-dependencies])
     #[allow(clippy::too_many_arguments)]
     async fn update_deps_table(
@@ -176,13 +200,14 @@ impl CargoTomlUpdater {
         cargo_toml_registries: &HashMap<String, String>,
         registry_cache: &mut HashMap<String, Arc<dyn Registry + Send + Sync>>,
         result: &mut UpdateResult,
-        original_content: &str,
+        line_index: &CargoTomlLineIndex,
+        section_path: &str,
         options: &UpdateOptions,
     ) {
         // First pass: collect dependencies and separate by config status
-        let mut ignored_deps: Vec<(String, String)> = Vec::new();
-        let mut pinned_deps: Vec<(String, String, String, String)> = Vec::new();
-        let mut deps_to_check: Vec<(String, String, String, Option<String>)> = Vec::new();
+        let mut ignored_deps: Vec<(String, String, Option<usize>)> = Vec::new();
+        let mut pinned_deps: Vec<(String, String, String, String, Option<usize>)> = Vec::new();
+        let mut deps_to_check: Vec<DependencyLookup> = Vec::new();
 
         for (key, item) in table.iter() {
             // Skip path/git dependencies (they have no version to update from registry)
@@ -204,30 +229,36 @@ impl CargoTomlUpdater {
             let registry_name = Self::get_registry_name(item);
             let (prefix, current_version) = Self::parse_version_req(&version_req);
             let package = key.to_string();
+            let line_num = line_index.line_for(section_path, &package);
 
             // Check if package should be ignored
             if options.should_ignore(&package) {
-                ignored_deps.push((package, current_version));
+                ignored_deps.push((package, current_version, line_num));
                 continue;
             }
 
             // Check if package has a pinned version
             if let Some(pinned_version) = options.get_pinned_version(&package) {
-                pinned_deps.push((package, prefix, current_version, pinned_version.to_string()));
+                pinned_deps.push((
+                    package,
+                    prefix,
+                    current_version,
+                    pinned_version.to_string(),
+                    line_num,
+                ));
                 continue;
             }
 
-            deps_to_check.push((package, prefix, current_version, registry_name));
+            deps_to_check.push((package, prefix, current_version, registry_name, line_num));
         }
 
         // Record ignored packages
-        for (package, version) in ignored_deps {
-            let line_num = Self::find_dependency_line(original_content, &package);
+        for (package, version, line_num) in ignored_deps {
             result.ignored.push((package, version, line_num));
         }
 
         // Process pinned packages (no registry fetch needed)
-        for (key, prefix, current_version, pinned_version) in pinned_deps {
+        for (key, prefix, current_version, pinned_version, line_num) in pinned_deps {
             let matched_version = if options.full_precision {
                 pinned_version.clone()
             } else {
@@ -239,7 +270,6 @@ impl CargoTomlUpdater {
                 if let Some(item) = table.get_mut(&key) {
                     Self::set_version(item, &new_version_req);
                 }
-                let line_num = Self::find_dependency_line(original_content, &key);
                 result
                     .pinned
                     .push((key.clone(), current_version, matched_version, line_num));
@@ -249,7 +279,7 @@ impl CargoTomlUpdater {
         }
 
         // Ensure custom registries are created and cached
-        for (_, _, _, registry_name) in &deps_to_check {
+        for (_, _, _, registry_name, _) in &deps_to_check {
             if let Some(name) = registry_name
                 && !registry_cache.contains_key(name)
                 && let Some(reg) = Self::create_registry_for_name(name, cargo_toml_registries)
@@ -261,7 +291,7 @@ impl CargoTomlUpdater {
         // Fetch all versions in parallel for non-ignored, non-pinned packages
         let version_futures: Vec<_> = deps_to_check
             .iter()
-            .map(|(key, _, current_version, registry_name)| {
+            .map(|(key, _, current_version, registry_name, _)| {
                 let effective_registry: &dyn Registry = if let Some(name) = registry_name {
                     registry_cache
                         .get(name)
@@ -286,7 +316,7 @@ impl CargoTomlUpdater {
         let version_results = join_all(version_futures).await;
 
         // Process results
-        for ((key, prefix, current_version, _registry_name), version_result) in
+        for ((key, prefix, current_version, _registry_name, line_num), version_result) in
             deps_to_check.into_iter().zip(version_results)
         {
             match version_result {
@@ -302,7 +332,6 @@ impl CargoTomlUpdater {
                         if let Some(item) = table.get_mut(&key) {
                             Self::set_version(item, &new_version_req);
                         }
-                        let line_num = Self::find_dependency_line(original_content, &key);
                         result.updated.push((
                             key.clone(),
                             current_version,
@@ -330,7 +359,8 @@ impl CargoTomlUpdater {
         cargo_toml_registries: &HashMap<String, String>,
         registry_cache: &mut HashMap<String, Arc<dyn Registry + Send + Sync>>,
         result: &mut UpdateResult,
-        original_content: &str,
+        line_index: &CargoTomlLineIndex,
+        section_path: &str,
         options: &UpdateOptions,
     ) {
         let table = match deps_item {
@@ -344,10 +374,63 @@ impl CargoTomlUpdater {
             cargo_toml_registries,
             registry_cache,
             result,
-            original_content,
+            line_index,
+            section_path,
             options,
         )
         .await;
+    }
+}
+
+impl CargoTomlLineIndex {
+    fn from_content(content: &str) -> Self {
+        let section_re =
+            regex::Regex::new(r#"^\s*\[([^\]]+)\]\s*$"#).expect("Invalid Cargo.toml section regex");
+        let mut lines_by_section: HashMap<String, HashMap<String, usize>> = HashMap::new();
+        let mut current_section: Option<String> = None;
+
+        for (line_idx, line) in content.lines().enumerate() {
+            if let Some(caps) = section_re.captures(line) {
+                let normalized =
+                    CargoTomlUpdater::normalize_section_path(caps.get(1).unwrap().as_str());
+                current_section = None;
+
+                if let Some((parent, package)) = normalized.rsplit_once('.')
+                    && CargoTomlUpdater::is_dependency_section_path(parent)
+                {
+                    lines_by_section
+                        .entry(parent.to_string())
+                        .or_default()
+                        .entry(package.to_string())
+                        .or_insert(line_idx + 1);
+                    continue;
+                }
+
+                if CargoTomlUpdater::is_dependency_section_path(&normalized) {
+                    current_section = Some(normalized);
+                }
+
+                continue;
+            }
+
+            if let Some(section) = current_section.as_ref()
+                && let Some(package) = CargoTomlUpdater::dependency_assignment_key(line)
+            {
+                lines_by_section
+                    .entry(section.clone())
+                    .or_default()
+                    .entry(package)
+                    .or_insert(line_idx + 1);
+            }
+        }
+
+        Self { lines_by_section }
+    }
+
+    fn line_for(&self, section_path: &str, package: &str) -> Option<usize> {
+        self.lines_by_section
+            .get(section_path)
+            .and_then(|section_lines| section_lines.get(package).copied())
     }
 }
 
@@ -375,6 +458,7 @@ impl Updater for CargoTomlUpdater {
         })?;
 
         let mut result = UpdateResult::default();
+        let line_index = CargoTomlLineIndex::from_content(&content);
 
         // Extract registries defined in Cargo.toml
         let cargo_toml_registries = Self::extract_registries(&doc);
@@ -389,7 +473,8 @@ impl Updater for CargoTomlUpdater {
                 &cargo_toml_registries,
                 &mut registry_cache,
                 &mut result,
-                &content,
+                &line_index,
+                "dependencies",
                 &options,
             )
             .await;
@@ -403,7 +488,8 @@ impl Updater for CargoTomlUpdater {
                 &cargo_toml_registries,
                 &mut registry_cache,
                 &mut result,
-                &content,
+                &line_index,
+                "dev-dependencies",
                 &options,
             )
             .await;
@@ -417,7 +503,8 @@ impl Updater for CargoTomlUpdater {
                 &cargo_toml_registries,
                 &mut registry_cache,
                 &mut result,
-                &content,
+                &line_index,
+                "build-dependencies",
                 &options,
             )
             .await;
@@ -433,7 +520,8 @@ impl Updater for CargoTomlUpdater {
                 &cargo_toml_registries,
                 &mut registry_cache,
                 &mut result,
-                &content,
+                &line_index,
+                "workspace.dependencies",
                 &options,
             )
             .await;
@@ -447,37 +535,43 @@ impl Updater for CargoTomlUpdater {
                 if let Some(Item::Table(target_table)) = target.get_mut(&target_key) {
                     // Update dependencies for this target
                     if let Some(Item::Table(deps)) = target_table.get_mut("dependencies") {
+                        let section_path = format!("target.{}.dependencies", target_key);
                         self.update_deps_table(
                             deps,
                             registry,
                             &cargo_toml_registries,
                             &mut registry_cache,
                             &mut result,
-                            &content,
+                            &line_index,
+                            &section_path,
                             &options,
                         )
                         .await;
                     }
                     if let Some(Item::Table(deps)) = target_table.get_mut("dev-dependencies") {
+                        let section_path = format!("target.{}.dev-dependencies", target_key);
                         self.update_deps_table(
                             deps,
                             registry,
                             &cargo_toml_registries,
                             &mut registry_cache,
                             &mut result,
-                            &content,
+                            &line_index,
+                            &section_path,
                             &options,
                         )
                         .await;
                     }
                     if let Some(Item::Table(deps)) = target_table.get_mut("build-dependencies") {
+                        let section_path = format!("target.{}.build-dependencies", target_key);
                         self.update_deps_table(
                             deps,
                             registry,
                             &cargo_toml_registries,
                             &mut registry_cache,
                             &mut result,
-                            &content,
+                            &line_index,
+                            &section_path,
                             &options,
                         )
                         .await;
@@ -510,67 +604,73 @@ impl Updater for CargoTomlUpdater {
         let mut deps = Vec::new();
 
         // Helper to parse dependencies from a table
-        let parse_table = |table: &toml_edit::Table, deps: &mut Vec<ParsedDependency>| {
-            for (key, item) in table.iter() {
-                // Skip path/git dependencies
-                if let Item::Value(Value::InlineTable(t)) = item
-                    && (t.contains_key("path") || t.contains_key("git"))
-                {
-                    continue;
-                }
-                if let Item::Table(t) = item
-                    && (t.contains_key("path") || t.contains_key("git"))
-                {
-                    continue;
-                }
+        let line_index = CargoTomlLineIndex::from_content(&content);
 
-                if let Some(version_req) = Self::get_version(item) {
-                    let (_, version) = Self::parse_version_req(&version_req);
-                    let line_num = Self::find_dependency_line(&content, key);
-                    deps.push(ParsedDependency {
-                        name: key.to_string(),
-                        version,
-                        line_number: line_num,
-                        has_upper_bound: false, // Cargo.toml doesn't use same constraint syntax as Python
-                    });
+        let parse_table =
+            |table: &toml_edit::Table, section_path: &str, deps: &mut Vec<ParsedDependency>| {
+                for (key, item) in table.iter() {
+                    // Skip path/git dependencies
+                    if let Item::Value(Value::InlineTable(t)) = item
+                        && (t.contains_key("path") || t.contains_key("git"))
+                    {
+                        continue;
+                    }
+                    if let Item::Table(t) = item
+                        && (t.contains_key("path") || t.contains_key("git"))
+                    {
+                        continue;
+                    }
+
+                    if let Some(version_req) = Self::get_version(item) {
+                        let (_, version) = Self::parse_version_req(&version_req);
+                        let line_num = line_index.line_for(section_path, key);
+                        deps.push(ParsedDependency {
+                            name: key.to_string(),
+                            version,
+                            line_number: line_num,
+                            has_upper_bound: false, // Cargo.toml doesn't use same constraint syntax as Python
+                        });
+                    }
                 }
-            }
-        };
+            };
 
         // Parse [dependencies]
         if let Some(Item::Table(table)) = doc.get("dependencies") {
-            parse_table(table, &mut deps);
+            parse_table(table, "dependencies", &mut deps);
         }
 
         // Parse [dev-dependencies]
         if let Some(Item::Table(table)) = doc.get("dev-dependencies") {
-            parse_table(table, &mut deps);
+            parse_table(table, "dev-dependencies", &mut deps);
         }
 
         // Parse [build-dependencies]
         if let Some(Item::Table(table)) = doc.get("build-dependencies") {
-            parse_table(table, &mut deps);
+            parse_table(table, "build-dependencies", &mut deps);
         }
 
         // Parse [workspace.dependencies]
         if let Some(Item::Table(workspace)) = doc.get("workspace")
             && let Some(Item::Table(table)) = workspace.get("dependencies")
         {
-            parse_table(table, &mut deps);
+            parse_table(table, "workspace.dependencies", &mut deps);
         }
 
         // Parse [target.'cfg(...)'.dependencies] sections
         if let Some(Item::Table(target)) = doc.get("target") {
-            for (_, target_item) in target.iter() {
+            for (target_key, target_item) in target.iter() {
                 if let Item::Table(target_table) = target_item {
                     if let Some(Item::Table(table)) = target_table.get("dependencies") {
-                        parse_table(table, &mut deps);
+                        let section_path = format!("target.{}.dependencies", target_key);
+                        parse_table(table, &section_path, &mut deps);
                     }
                     if let Some(Item::Table(table)) = target_table.get("dev-dependencies") {
-                        parse_table(table, &mut deps);
+                        let section_path = format!("target.{}.dev-dependencies", target_key);
+                        parse_table(table, &section_path, &mut deps);
                     }
                     if let Some(Item::Table(table)) = target_table.get("build-dependencies") {
-                        parse_table(table, &mut deps);
+                        let section_path = format!("target.{}.build-dependencies", target_key);
+                        parse_table(table, &section_path, &mut deps);
                     }
                 }
             }
@@ -1118,6 +1218,53 @@ tokio = "1.0.0"
         let content = std::fs::read_to_string(file.path()).unwrap();
         assert!(content.contains("serde = \"1.0.150\""));
         assert!(content.contains("tokio = \"1.37.0\""));
+    }
+
+    #[tokio::test]
+    async fn test_update_cargo_toml_duplicate_dependency_names_keep_occurrence_line_numbers() {
+        use crate::config::UpdConfig;
+
+        let mut file = NamedTempFile::with_suffix(".toml").unwrap();
+        write!(
+            file,
+            r#"[package]
+name = "test"
+version = "0.1.0"
+
+[dependencies]
+serde = "1.0.0"
+
+[dev-dependencies]
+serde = "1.0.1"
+"#
+        )
+        .unwrap();
+
+        let mut pin = std::collections::HashMap::new();
+        pin.insert("serde".to_string(), "1.0.150".to_string());
+        let config = UpdConfig {
+            ignore: Vec::new(),
+            pin,
+        };
+
+        let updater = CargoTomlUpdater::new();
+        let options = UpdateOptions::new(false, false).with_config(Arc::new(config));
+
+        let result = updater
+            .update(file.path(), &MockRegistry::new("crates.io"), options)
+            .await
+            .unwrap();
+
+        assert!(result.updated.is_empty());
+        assert_eq!(result.pinned.len(), 2);
+
+        let mut line_numbers: Vec<_> = result
+            .pinned
+            .iter()
+            .map(|(_, _, _, line_num)| line_num.unwrap())
+            .collect();
+        line_numbers.sort_unstable();
+        assert_eq!(line_numbers, vec![6, 9]);
     }
 
     #[tokio::test]

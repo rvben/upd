@@ -377,6 +377,17 @@ impl NpmRegistry {
         versions.sort_by(|a, b| b.0.cmp(&a.0));
         versions
     }
+
+    async fn fetch_package_with_scope_resolution(
+        &self,
+        package: &str,
+    ) -> Result<NpmAbbreviatedResponse> {
+        if let Some(scoped_registry) = Self::for_scoped_package(package) {
+            return scoped_registry.fetch_package(package).await;
+        }
+
+        self.fetch_package(package).await
+    }
 }
 
 impl Default for NpmRegistry {
@@ -388,7 +399,7 @@ impl Default for NpmRegistry {
 #[async_trait]
 impl Registry for NpmRegistry {
     async fn get_latest_version(&self, package: &str) -> Result<String> {
-        let data = self.fetch_package(package).await?;
+        let data = self.fetch_package_with_scope_resolution(package).await?;
 
         // Use the 'latest' dist-tag (this is the authoritative answer from npm)
         if let Some(latest) = &data.dist_tags.latest
@@ -413,7 +424,7 @@ impl Registry for NpmRegistry {
         package: &str,
         constraints: &str,
     ) -> Result<String> {
-        let data = self.fetch_package(package).await?;
+        let data = self.fetch_package_with_scope_resolution(package).await?;
         let versions = Self::get_stable_versions(&data);
 
         // Parse npm-style version requirements (^1.0.0, ~2.0.0, >=1.0.0 <2.0.0, etc.)
