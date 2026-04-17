@@ -7,8 +7,8 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::time::Duration;
 
-/// OSV API base URL
-const OSV_API_URL: &str = "https://api.osv.dev/v1";
+/// Default OSV API base URL (override via `OsvClient::with_base_url`).
+const DEFAULT_OSV_API_URL: &str = "https://api.osv.dev/v1";
 
 /// Maximum packages per batch request (OSV limit)
 const BATCH_SIZE: usize = 1000;
@@ -24,6 +24,7 @@ pub enum Ecosystem {
     CratesIo,
     Go,
     RubyGems,
+    NuGet,
 }
 
 impl Ecosystem {
@@ -35,6 +36,7 @@ impl Ecosystem {
             Ecosystem::CratesIo => "crates.io",
             Ecosystem::Go => "Go",
             Ecosystem::RubyGems => "RubyGems",
+            Ecosystem::NuGet => "NuGet",
         }
     }
 }
@@ -96,15 +98,22 @@ impl AuditResult {
 /// OSV API client for vulnerability checking
 pub struct OsvClient {
     client: Client,
+    base_url: String,
 }
 
 impl OsvClient {
     pub fn new() -> Self {
+        Self::with_base_url(DEFAULT_OSV_API_URL.to_string())
+    }
+
+    /// Create a client pointing at a custom base URL (used by tests).
+    pub fn with_base_url(base_url: String) -> Self {
         Self {
             client: Client::builder()
                 .timeout(Duration::from_secs(30))
                 .build()
                 .expect("Failed to create HTTP client. This usually indicates a TLS/SSL configuration issue on your system."),
+            base_url,
         }
     }
 
@@ -156,7 +165,7 @@ impl OsvClient {
 
         let response = self
             .client
-            .post(format!("{}/querybatch", OSV_API_URL))
+            .post(format!("{}/querybatch", self.base_url))
             .json(&request)
             .send()
             .await?;
@@ -214,7 +223,7 @@ impl OsvClient {
     async fn fetch_vuln_by_id(&self, id: &str) -> Result<Vulnerability> {
         let response = self
             .client
-            .get(format!("{}/vulns/{}", OSV_API_URL, id))
+            .get(format!("{}/vulns/{}", self.base_url, id))
             .send()
             .await?;
 
@@ -356,6 +365,32 @@ mod tests {
         assert_eq!(Ecosystem::Npm.as_str(), "npm");
         assert_eq!(Ecosystem::CratesIo.as_str(), "crates.io");
         assert_eq!(Ecosystem::Go.as_str(), "Go");
+        assert_eq!(Ecosystem::RubyGems.as_str(), "RubyGems");
+        // OSV schema uses "NuGet" (capital N, capital G) as the ecosystem
+        // identifier: https://ossf.github.io/osv-schema/#affectedpackage-field
+        assert_eq!(Ecosystem::NuGet.as_str(), "NuGet");
+    }
+
+    #[test]
+    fn test_every_ecosystem_has_unique_osv_identifier() {
+        // Protects against accidental collisions when new ecosystems are
+        // added. All OSV ecosystem IDs must be distinct.
+        let all = [
+            Ecosystem::PyPI,
+            Ecosystem::Npm,
+            Ecosystem::CratesIo,
+            Ecosystem::Go,
+            Ecosystem::RubyGems,
+            Ecosystem::NuGet,
+        ];
+        let mut seen = std::collections::HashSet::new();
+        for eco in all {
+            assert!(
+                seen.insert(eco.as_str()),
+                "duplicate ecosystem identifier: {}",
+                eco.as_str()
+            );
+        }
     }
 
     #[test]
@@ -390,5 +425,100 @@ mod tests {
 
         assert_eq!(result.total_vulnerabilities(), 2);
         assert_eq!(result.vulnerable_packages(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_check_packages_sends_nuget_ecosystem_and_reports_vulnerabilities() {
+        use wiremock::matchers::{body_json, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+
+        let expected_batch_body = serde_json::json!({
+            "queries": [
+                {
+                    "package": { "name": "Newtonsoft.Json", "ecosystem": "NuGet" },
+                    "version": "12.0.2"
+                }
+            ]
+        });
+
+        Mock::given(method("POST"))
+            .and(path("/querybatch"))
+            .and(body_json(&expected_batch_body))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "results": [
+                    { "vulns": [{ "id": "GHSA-nuget-test" }] }
+                ]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path("/vulns/GHSA-nuget-test"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "GHSA-nuget-test",
+                "summary": "test",
+                "affected": [{
+                    "ranges": [{
+                        "events": [{ "fixed": "13.0.1" }]
+                    }]
+                }],
+                "references": [{ "url": "https://example/nuget" }]
+            })))
+            .mount(&server)
+            .await;
+
+        let client = OsvClient::with_base_url(server.uri());
+        let audit = client
+            .check_packages(&[Package {
+                name: "Newtonsoft.Json".into(),
+                version: "12.0.2".into(),
+                ecosystem: Ecosystem::NuGet,
+            }])
+            .await
+            .unwrap();
+
+        assert_eq!(audit.vulnerable.len(), 1);
+        assert_eq!(audit.vulnerable[0].package.name, "Newtonsoft.Json");
+        assert_eq!(audit.vulnerable[0].vulnerabilities.len(), 1);
+        assert_eq!(audit.vulnerable[0].vulnerabilities[0].id, "GHSA-nuget-test");
+        assert_eq!(
+            audit.vulnerable[0].vulnerabilities[0]
+                .fixed_version
+                .as_deref(),
+            Some("13.0.1")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_check_packages_reports_safe_when_no_vulnerabilities() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/querybatch"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "results": [{ "vulns": [] }]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = OsvClient::with_base_url(server.uri());
+        let audit = client
+            .check_packages(&[Package {
+                name: "Serilog".into(),
+                version: "4.0.0".into(),
+                ecosystem: Ecosystem::NuGet,
+            }])
+            .await
+            .unwrap();
+
+        assert!(audit.vulnerable.is_empty());
+        assert_eq!(audit.safe_count, 1);
+        assert!(audit.errors.is_empty());
     }
 }

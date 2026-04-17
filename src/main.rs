@@ -1257,12 +1257,11 @@ async fn run_audit(cli: &Cli) -> Result<()> {
         std::collections::HashSet::new();
 
     for ((name, lang), occurrences) in &packages {
-        // OSV doesn't cover GitHub Actions, pre-commit hooks, mise tools, Terraform, or .NET; skip
+        // OSV doesn't cover GitHub Actions, pre-commit hooks, mise tools, or Terraform; skip
         if *lang == Lang::Actions
             || *lang == Lang::PreCommit
             || *lang == Lang::Mise
             || *lang == Lang::Terraform
-            || *lang == Lang::DotNet
         {
             continue;
         }
@@ -1273,7 +1272,8 @@ async fn run_audit(cli: &Cli) -> Result<()> {
             Lang::Rust => Ecosystem::CratesIo,
             Lang::Go => Ecosystem::Go,
             Lang::Ruby => Ecosystem::RubyGems,
-            Lang::Actions | Lang::PreCommit | Lang::Mise | Lang::Terraform | Lang::DotNet => {
+            Lang::DotNet => Ecosystem::NuGet,
+            Lang::Actions | Lang::PreCommit | Lang::Mise | Lang::Terraform => {
                 unreachable!("filtered above")
             }
         };
@@ -1411,6 +1411,7 @@ fn print_audit_vulnerabilities(audit_result: &AuditResult) {
             Ecosystem::CratesIo => "(crates.io)",
             Ecosystem::Go => "(Go)",
             Ecosystem::RubyGems => "(RubyGems)",
+            Ecosystem::NuGet => "(NuGet)",
         };
 
         println!(
