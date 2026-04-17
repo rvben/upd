@@ -1137,4 +1137,166 @@ mod tests {
         assert!(content.contains("\"~1.5.0\""));
         assert!(content.contains("\"1.5.0\"")); // exact version
     }
+
+    #[tokio::test]
+    async fn test_update_package_json_peer_and_optional_dependencies() {
+        let mut file = NamedTempFile::with_suffix(".json").unwrap();
+        write!(
+            file,
+            r#"{{
+  "peerDependencies": {{
+    "react": "^17.0.0"
+  }},
+  "optionalDependencies": {{
+    "fsevents": "^2.3.0"
+  }}
+}}"#
+        )
+        .unwrap();
+
+        let registry = MockRegistry::new("npm")
+            .with_version("react", "18.2.0")
+            .with_version("fsevents", "2.3.3");
+
+        let updater = PackageJsonUpdater::new();
+        let options = UpdateOptions::new(false, false);
+
+        let result = updater
+            .update(file.path(), &registry, options)
+            .await
+            .unwrap();
+
+        let names: std::collections::HashSet<_> = result
+            .updated
+            .iter()
+            .map(|(n, _, _, _)| n.as_str())
+            .collect();
+        assert!(names.contains("react"), "peerDependencies must be updated");
+        assert!(
+            names.contains("fsevents"),
+            "optionalDependencies must be updated"
+        );
+
+        let content = fs::read_to_string(file.path()).unwrap();
+        assert!(content.contains("^18.2.0"));
+        assert!(content.contains("^2.3.3"));
+    }
+
+    #[tokio::test]
+    async fn test_update_package_json_skips_workspace_protocol() {
+        let mut file = NamedTempFile::with_suffix(".json").unwrap();
+        write!(
+            file,
+            r#"{{
+  "dependencies": {{
+    "local-lib": "workspace:^",
+    "other-lib": "workspace:*",
+    "pinned-lib": "workspace:1.0.0",
+    "real-pkg": "^1.0.0"
+  }}
+}}"#
+        )
+        .unwrap();
+
+        // Only real-pkg has a version in the registry; workspace:* entries
+        // must be silently skipped (not treated as errors).
+        let registry = MockRegistry::new("npm").with_version("real-pkg", "2.0.0");
+
+        let updater = PackageJsonUpdater::new();
+        let options = UpdateOptions::new(false, false);
+
+        let result = updater
+            .update(file.path(), &registry, options)
+            .await
+            .unwrap();
+
+        assert_eq!(result.updated.len(), 1);
+        assert_eq!(result.updated[0].0, "real-pkg");
+        assert!(
+            result.errors.is_empty(),
+            "workspace: protocol must not produce errors"
+        );
+
+        let content = fs::read_to_string(file.path()).unwrap();
+        assert!(content.contains("\"workspace:^\""));
+        assert!(content.contains("\"workspace:*\""));
+        assert!(content.contains("\"workspace:1.0.0\""));
+    }
+
+    #[tokio::test]
+    async fn test_update_package_json_does_not_touch_overrides() {
+        // `overrides` is not part of DEPENDENCY_SECTIONS — any pin in there
+        // must be left untouched. This guards against accidental drift if
+        // the DEPENDENCY_SECTIONS list is reshuffled.
+        let mut file = NamedTempFile::with_suffix(".json").unwrap();
+        write!(
+            file,
+            r#"{{
+  "dependencies": {{
+    "lodash": "^4.17.20"
+  }},
+  "overrides": {{
+    "lodash": "4.17.21"
+  }}
+}}"#
+        )
+        .unwrap();
+
+        let registry = MockRegistry::new("npm").with_version("lodash", "4.17.22");
+
+        let updater = PackageJsonUpdater::new();
+        let options = UpdateOptions::new(false, false);
+
+        let result = updater
+            .update(file.path(), &registry, options)
+            .await
+            .unwrap();
+
+        assert_eq!(result.updated.len(), 1);
+        let content = fs::read_to_string(file.path()).unwrap();
+        assert!(
+            content.contains("\"overrides\": {\n    \"lodash\": \"4.17.21\""),
+            "overrides section must be preserved verbatim, got:\n{content}"
+        );
+        assert!(content.contains("\"^4.17.22\""));
+    }
+
+    #[tokio::test]
+    async fn test_update_package_json_scoped_package_name() {
+        let mut file = NamedTempFile::with_suffix(".json").unwrap();
+        write!(
+            file,
+            r#"{{
+  "dependencies": {{
+    "@types/node": "^18.0.0",
+    "@scope/private-thing": "^1.0.0"
+  }}
+}}"#
+        )
+        .unwrap();
+
+        let registry = MockRegistry::new("npm")
+            .with_version("@types/node", "20.11.0")
+            .with_version("@scope/private-thing", "1.2.3");
+
+        let updater = PackageJsonUpdater::new();
+        let options = UpdateOptions::new(false, false);
+
+        let result = updater
+            .update(file.path(), &registry, options)
+            .await
+            .unwrap();
+
+        let names: Vec<&str> = result
+            .updated
+            .iter()
+            .map(|(n, _, _, _)| n.as_str())
+            .collect();
+        assert!(names.contains(&"@types/node"));
+        assert!(names.contains(&"@scope/private-thing"));
+
+        let content = fs::read_to_string(file.path()).unwrap();
+        assert!(content.contains("\"@types/node\": \"^20.11.0\""));
+        assert!(content.contains("\"@scope/private-thing\": \"^1.2.3\""));
+    }
 }

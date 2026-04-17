@@ -222,4 +222,72 @@ mod tests {
             .unwrap();
         assert_eq!(version, "2.7.0-rc.1");
     }
+
+    #[tokio::test]
+    async fn test_picks_highest_version_even_when_list_is_unsorted() {
+        // The NuGet flat-container spec says versions are sorted, but we do
+        // not rely on that: max_by(semver) must pick the highest regardless
+        // of array order. This guards against broken mirrors.
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/serilog/index.json"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string(r#"{"versions": ["3.0.1", "2.12.0", "4.0.0", "3.1.1"]}"#),
+            )
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let registry = NuGetRegistry::with_api_url(mock_server.uri());
+        let version = registry.get_latest_version("Serilog").await.unwrap();
+        assert_eq!(version, "4.0.0");
+    }
+
+    #[tokio::test]
+    async fn test_skips_non_semver_version_strings() {
+        // Legacy NuGet packages sometimes use 4-segment versions (e.g.
+        // `6.0.0.0`) which are not valid SemVer. These should be ignored
+        // in favour of SemVer-parseable entries rather than crashing.
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/entityframework/index.json"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string(r#"{"versions": ["6.0.0.0", "6.4.4", "6.5.0.0"]}"#),
+            )
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let registry = NuGetRegistry::with_api_url(mock_server.uri());
+        let version = registry
+            .get_latest_version("EntityFramework")
+            .await
+            .unwrap();
+        assert_eq!(version, "6.4.4");
+    }
+
+    #[tokio::test]
+    async fn test_empty_versions_list_returns_error() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/emptypkg/index.json"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(r#"{"versions": []}"#))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let registry = NuGetRegistry::with_api_url(mock_server.uri());
+        let result = registry.get_latest_version("emptypkg").await;
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("no stable versions"),
+            "error message must mention missing versions, got: {err}"
+        );
+    }
 }

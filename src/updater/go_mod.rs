@@ -1037,4 +1037,122 @@ require (
         let content = fs::read_to_string(file.path()).unwrap();
         assert!(content.contains("v1.2.0 // indirect")); // version updated, comment preserved
     }
+
+    #[tokio::test]
+    async fn test_update_go_mod_ignores_retract_block() {
+        // `retract` blocks mention versions that were pulled from the module
+        // proxy. They must never be treated as require statements.
+        let mut file = NamedTempFile::new().unwrap();
+        write!(
+            file,
+            r#"module example.com/mymodule
+
+go 1.21
+
+require github.com/foo/bar v1.0.0
+
+retract (
+	v1.0.0 // accidentally published
+	v0.9.0
+)
+
+retract v0.8.0
+"#
+        )
+        .unwrap();
+
+        let registry = MockRegistry::new("go-proxy").with_version("github.com/foo/bar", "v1.1.0");
+
+        let updater = GoModUpdater::new();
+        let options = UpdateOptions::new(false, false);
+
+        let result = updater
+            .update(file.path(), &registry, options)
+            .await
+            .unwrap();
+
+        assert_eq!(result.updated.len(), 1);
+        assert_eq!(result.updated[0].0, "github.com/foo/bar");
+        assert!(
+            result.errors.is_empty(),
+            "retract lines must not produce errors"
+        );
+
+        let content = fs::read_to_string(file.path()).unwrap();
+        assert!(
+            content.contains("retract (\n\tv1.0.0 // accidentally published\n\tv0.9.0\n)"),
+            "retract block must be preserved verbatim, got:\n{content}"
+        );
+        assert!(content.contains("retract v0.8.0"));
+        assert!(content.contains("github.com/foo/bar v1.1.0"));
+    }
+
+    #[tokio::test]
+    async fn test_update_go_mod_incompatible_version_updates() {
+        // `+incompatible` marks modules that haven't adopted Go modules
+        // semantics for v2+. They still have valid semver tags and must be
+        // updated to newer +incompatible versions from the proxy.
+        let mut file = NamedTempFile::new().unwrap();
+        write!(
+            file,
+            r#"module example.com/mymodule
+
+require github.com/foo/bar v2.0.0+incompatible
+"#
+        )
+        .unwrap();
+
+        let registry =
+            MockRegistry::new("go-proxy").with_version("github.com/foo/bar", "v2.1.0+incompatible");
+
+        let updater = GoModUpdater::new();
+        let options = UpdateOptions::new(false, false);
+
+        let result = updater
+            .update(file.path(), &registry, options)
+            .await
+            .unwrap();
+
+        assert_eq!(result.updated.len(), 1);
+        let (name, old, new, _) = &result.updated[0];
+        assert_eq!(name, "github.com/foo/bar");
+        assert_eq!(old, "v2.0.0+incompatible");
+        assert_eq!(new, "v2.1.0+incompatible");
+
+        let content = fs::read_to_string(file.path()).unwrap();
+        assert!(content.contains("v2.1.0+incompatible"));
+    }
+
+    #[tokio::test]
+    async fn test_update_go_mod_preserves_indirect_comments_on_update() {
+        // Regression: `replacen` with count 1 must not eat inline comments.
+        let mut file = NamedTempFile::new().unwrap();
+        write!(
+            file,
+            r#"module example.com/mymodule
+
+require (
+	github.com/foo/bar v1.0.0 // indirect
+	github.com/baz/qux v1.0.0 // indirect; kept for compat
+)
+"#
+        )
+        .unwrap();
+
+        let registry = MockRegistry::new("go-proxy")
+            .with_version("github.com/foo/bar", "v1.1.0")
+            .with_version("github.com/baz/qux", "v1.2.0");
+
+        let updater = GoModUpdater::new();
+        let options = UpdateOptions::new(false, false);
+
+        updater
+            .update(file.path(), &registry, options)
+            .await
+            .unwrap();
+
+        let content = fs::read_to_string(file.path()).unwrap();
+        assert!(content.contains("v1.1.0 // indirect"));
+        assert!(content.contains("v1.2.0 // indirect; kept for compat"));
+    }
 }
