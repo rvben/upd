@@ -304,6 +304,11 @@ fn file_has_manifest_changes(result: &UpdateResult) -> bool {
     !result.updated.is_empty() || !result.pinned.is_empty()
 }
 
+fn has_checkable_manifest_changes(result: &UpdateResult, filter: UpdateFilter) -> bool {
+    let (_, _, _, filtered_total) = count_updates_by_type(&result.updated, filter);
+    filtered_total > 0 || !result.pinned.is_empty()
+}
+
 fn has_interactive_changes(
     pending_updates: &[PendingUpdate],
     scanned_results: &[ScannedFileResult],
@@ -694,11 +699,8 @@ async fn run_update(cli: &Cli) -> Result<()> {
     print_summary(&total_result, file_count, dry_run, filter);
 
     // In check mode, exit with code 1 if any updates are available
-    if cli.check {
-        let (_, _, _, filtered_total) = count_updates_by_type(&total_result.updated, filter);
-        if filtered_total > 0 {
-            std::process::exit(1);
-        }
+    if cli.check && has_checkable_manifest_changes(&total_result, filter) {
+        std::process::exit(1);
     }
 
     Ok(())
@@ -2558,6 +2560,28 @@ mod tests {
     }
 
     #[test]
+    fn test_has_checkable_manifest_changes_counts_pin_only_results() {
+        let result = UpdateResult {
+            pinned: vec![("react".into(), "18.2.0".into(), "19.0.0".into(), Some(4))],
+            ..Default::default()
+        };
+        let filter = UpdateFilter::new(false, false, false);
+
+        assert!(has_checkable_manifest_changes(&result, filter));
+    }
+
+    #[test]
+    fn test_has_checkable_manifest_changes_respects_update_filter_without_pins() {
+        let result = UpdateResult {
+            updated: vec![("react".into(), "18.2.0".into(), "19.0.0".into(), Some(4))],
+            ..Default::default()
+        };
+        let filter = UpdateFilter::new(false, true, true);
+
+        assert!(!has_checkable_manifest_changes(&result, filter));
+    }
+
+    #[test]
     fn test_take_approved_changes_for_file_only_returns_selected_updates() {
         let path = PathBuf::from("package.json");
         let file_type = FileType::PackageJson;
@@ -2640,6 +2664,49 @@ mod tests {
             take_approved_changes_for_file(&path, file_type, &updates, &mut approved_counts);
 
         assert_eq!(selected.len(), 2);
+        assert!(approved_counts.is_empty());
+    }
+
+    #[test]
+    fn test_build_approved_change_counts_distinguishes_duplicate_updates_by_line_number() {
+        let path = PathBuf::from("package.json");
+        let file_type = FileType::PackageJson;
+        let updates = vec![
+            ("react".into(), "18.2.0".into(), "19.0.0".into(), Some(4)),
+            ("react".into(), "18.2.0".into(), "19.0.0".into(), Some(8)),
+        ];
+
+        let mut approved = PendingUpdate::new(
+            "package.json".into(),
+            Some(4),
+            "react".into(),
+            "18.2.0".into(),
+            "19.0.0".into(),
+            true,
+        );
+        approved.approved = true;
+
+        let rejected = PendingUpdate::new(
+            "package.json".into(),
+            Some(8),
+            "react".into(),
+            "18.2.0".into(),
+            "19.0.0".into(),
+            true,
+        );
+
+        let planned_changes: Vec<_> = updates
+            .iter()
+            .map(|update| PlannedChange::from_update(path.clone(), file_type, update))
+            .collect();
+        let mut approved_counts =
+            build_approved_change_counts(&[approved, rejected], &planned_changes);
+
+        let selected =
+            take_approved_changes_for_file(&path, file_type, &updates, &mut approved_counts);
+
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].line_num, Some(4));
         assert!(approved_counts.is_empty());
     }
 
