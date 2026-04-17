@@ -9,7 +9,7 @@ use std::sync::Arc;
 use upd::align::{PackageAlignment, find_alignments, scan_packages};
 use upd::audit::{AuditResult, Ecosystem, OsvClient, Package as AuditPackage};
 use upd::cache::{Cache, CachedRegistry};
-use upd::cli::{Cli, Command};
+use upd::cli::{BumpLevel, Cli, Command};
 use upd::config::UpdConfig;
 use upd::interactive::{PendingUpdate, prompt_all};
 use upd::lockfile::regenerate_lockfiles;
@@ -339,9 +339,6 @@ async fn main() -> Result<()> {
     }
 
     match &cli.command {
-        Some(Command::Version) => {
-            println!("upd version {}", VERSION);
-        }
         Some(Command::CleanCache) => {
             clean_cache()?;
         }
@@ -382,7 +379,7 @@ async fn run_update(cli: &Cli) -> Result<()> {
     }
 
     // Create filter from CLI flags
-    let filter = UpdateFilter::new(cli.major, cli.minor, cli.patch);
+    let filter = UpdateFilter::from_levels(&cli.bump);
 
     // Create shared cache and wrap registries with caching layer
     let cache = Cache::new_shared();
@@ -2111,20 +2108,20 @@ struct UpdateFilter {
 }
 
 impl UpdateFilter {
-    fn new(major: bool, minor: bool, patch: bool) -> Self {
-        // If no filter specified, show all
-        if !major && !minor && !patch {
-            Self {
+    /// Build a filter from an optional list of bump levels.
+    /// Empty slice means "include every level".
+    fn from_levels(levels: &[BumpLevel]) -> Self {
+        if levels.is_empty() {
+            return Self {
                 major: true,
                 minor: true,
                 patch: true,
-            }
-        } else {
-            Self {
-                major,
-                minor,
-                patch,
-            }
+            };
+        }
+        Self {
+            major: levels.contains(&BumpLevel::Major),
+            minor: levels.contains(&BumpLevel::Minor),
+            patch: levels.contains(&BumpLevel::Patch),
         }
     }
 
@@ -2431,7 +2428,7 @@ mod tests {
 
     #[test]
     fn test_update_filter_defaults_to_all() {
-        let filter = UpdateFilter::new(false, false, false);
+        let filter = UpdateFilter::from_levels(&[]);
         assert!(filter.major);
         assert!(filter.minor);
         assert!(filter.patch);
@@ -2439,7 +2436,7 @@ mod tests {
 
     #[test]
     fn test_update_filter_major_only() {
-        let filter = UpdateFilter::new(true, false, false);
+        let filter = UpdateFilter::from_levels(&[BumpLevel::Major]);
         assert!(filter.major);
         assert!(!filter.minor);
         assert!(!filter.patch);
@@ -2447,7 +2444,7 @@ mod tests {
 
     #[test]
     fn test_update_filter_minor_only() {
-        let filter = UpdateFilter::new(false, true, false);
+        let filter = UpdateFilter::from_levels(&[BumpLevel::Minor]);
         assert!(!filter.major);
         assert!(filter.minor);
         assert!(!filter.patch);
@@ -2455,7 +2452,7 @@ mod tests {
 
     #[test]
     fn test_update_filter_patch_only() {
-        let filter = UpdateFilter::new(false, false, true);
+        let filter = UpdateFilter::from_levels(&[BumpLevel::Patch]);
         assert!(!filter.major);
         assert!(!filter.minor);
         assert!(filter.patch);
@@ -2463,7 +2460,7 @@ mod tests {
 
     #[test]
     fn test_update_filter_combined() {
-        let filter = UpdateFilter::new(true, true, false);
+        let filter = UpdateFilter::from_levels(&[BumpLevel::Major, BumpLevel::Minor]);
         assert!(filter.major);
         assert!(filter.minor);
         assert!(!filter.patch);
@@ -2471,12 +2468,12 @@ mod tests {
 
     #[test]
     fn test_update_filter_matches() {
-        let filter = UpdateFilter::new(true, false, false);
+        let filter = UpdateFilter::from_levels(&[BumpLevel::Major]);
         assert!(filter.matches(UpdateType::Major));
         assert!(!filter.matches(UpdateType::Minor));
         assert!(!filter.matches(UpdateType::Patch));
 
-        let filter = UpdateFilter::new(false, true, true);
+        let filter = UpdateFilter::from_levels(&[BumpLevel::Minor, BumpLevel::Patch]);
         assert!(!filter.matches(UpdateType::Major));
         assert!(filter.matches(UpdateType::Minor));
         assert!(filter.matches(UpdateType::Patch));
@@ -2485,7 +2482,7 @@ mod tests {
     #[test]
     fn test_count_updates_by_type_empty() {
         let updates: Vec<(String, String, String, Option<usize>)> = vec![];
-        let filter = UpdateFilter::new(false, false, false); // show all
+        let filter = UpdateFilter::from_levels(&[]); // show all
 
         let (major, minor, patch, total) = count_updates_by_type(&updates, filter);
         assert_eq!(major, 0);
@@ -2503,7 +2500,7 @@ mod tests {
             ("pkg4".into(), "2.0.0".into(), "3.0.0".into(), Some(4)), // major
             ("pkg5".into(), "1.5.0".into(), "1.5.1".into(), Some(5)), // patch
         ];
-        let filter = UpdateFilter::new(false, false, false); // show all
+        let filter = UpdateFilter::from_levels(&[]); // show all
 
         let (major, minor, patch, total) = count_updates_by_type(&updates, filter);
         assert_eq!(major, 2);
@@ -2519,7 +2516,7 @@ mod tests {
             ("pkg2".into(), "1.0.0".into(), "1.1.0".into(), Some(2)), // minor (filtered out)
             ("pkg3".into(), "1.0.0".into(), "1.0.1".into(), Some(3)), // patch (filtered out)
         ];
-        let filter = UpdateFilter::new(true, false, false); // major only
+        let filter = UpdateFilter::from_levels(&[BumpLevel::Major]);
 
         let (major, minor, patch, total) = count_updates_by_type(&updates, filter);
         assert_eq!(major, 1);
@@ -2535,7 +2532,7 @@ mod tests {
             ("pkg2".into(), "1.0.0".into(), "1.1.0".into(), Some(2)), // minor
             ("pkg3".into(), "1.0.0".into(), "1.0.1".into(), Some(3)), // patch
         ];
-        let filter = UpdateFilter::new(false, true, true); // minor + patch
+        let filter = UpdateFilter::from_levels(&[BumpLevel::Minor, BumpLevel::Patch]);
 
         let (major, minor, patch, total) = count_updates_by_type(&updates, filter);
         assert_eq!(major, 0);
@@ -2550,7 +2547,7 @@ mod tests {
             ("pkg1".into(), "1.0.0".into(), "2.0.0".into(), None), // major, no line
             ("pkg2".into(), "1.0.0".into(), "1.1.0".into(), None), // minor, no line
         ];
-        let filter = UpdateFilter::new(false, false, false); // show all
+        let filter = UpdateFilter::from_levels(&[]); // show all
 
         let (major, minor, patch, total) = count_updates_by_type(&updates, filter);
         assert_eq!(major, 1);
@@ -2565,7 +2562,7 @@ mod tests {
             pinned: vec![("react".into(), "18.2.0".into(), "19.0.0".into(), Some(4))],
             ..Default::default()
         };
-        let filter = UpdateFilter::new(false, false, false);
+        let filter = UpdateFilter::from_levels(&[]);
 
         assert!(has_checkable_manifest_changes(&result, filter));
     }
@@ -2576,7 +2573,7 @@ mod tests {
             updated: vec![("react".into(), "18.2.0".into(), "19.0.0".into(), Some(4))],
             ..Default::default()
         };
-        let filter = UpdateFilter::new(false, true, true);
+        let filter = UpdateFilter::from_levels(&[BumpLevel::Minor, BumpLevel::Patch]);
 
         assert!(!has_checkable_manifest_changes(&result, filter));
     }

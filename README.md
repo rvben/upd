@@ -25,7 +25,7 @@ uvx --from upd-cli upd -n
 - **Fast**: Parallel registry requests for all dependencies
 - **Constraint-aware**: Respects version constraints like `>=2.0,<3` and `~> 7.1`
 - **Smart caching**: 24-hour version cache for faster subsequent runs
-- **Update filters**: Filter by `--major`, `--minor`, or `--patch` updates
+- **Update filters**: Filter by bump level with `--bump <major|minor|patch>` (repeatable)
 - **Interactive mode**: Approve updates individually with `-i`
 - **Check mode**: Exit with code 1 if updates available (for CI/pre-commit)
 - **Major warnings**: Highlights breaking changes with `(MAJOR)`
@@ -87,13 +87,14 @@ upd --no-color
 # Disable caching (force fresh lookups)
 upd --no-cache
 
-# Filter by update type
-upd --major      # Show only major (breaking) updates
-upd --minor      # Show only minor updates
-upd --patch      # Show only patch updates
+# Filter by bump level
+upd --bump major      # Show only major (breaking) updates
+upd --bump minor      # Show only minor updates
+upd --bump patch      # Show only patch updates
 
-# Combine filters
-upd --major --minor  # Show major and minor updates only
+# Combine filters (repeat --bump or comma-separate)
+upd --bump major --bump minor
+upd --bump major,minor
 
 # Interactive mode - approve updates one by one
 upd -i
@@ -115,19 +116,18 @@ upd --full-precision  # Output full versions (e.g., 3.1.5 instead of 3.1)
 
 # Check mode - exit with code 1 if updates available (for CI/pre-commit)
 upd --check
-upd -c
 upd --check --lang python  # Check only Python dependencies
 
 # Use a specific config file
 upd --config /path/to/config.toml
-upd --config .updrc.toml
+upd -c .updrc.toml         # Short form
 ```
 
 ### Commands
 
 ```bash
 # Show version
-upd version
+upd --version
 
 # Check for upd updates
 upd self-update

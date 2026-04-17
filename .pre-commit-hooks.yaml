@@ -10,7 +10,7 @@
 - id: upd-check-major
   name: Check for major dependency updates
   description: Check if any dependencies have major updates available
-  entry: upd --check --major
+  entry: upd --check --bump major
   language: system
   pass_filenames: false
   files: (requirements.*\.txt|pyproject\.toml|package\.json|Cargo\.toml|go\.mod)$
