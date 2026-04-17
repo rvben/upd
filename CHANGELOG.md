@@ -8,6 +8,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 
 
+
+## [0.0.28](https://github.com/rvben/upd/compare/v0.0.27...v0.0.28) - 2026-04-17
+
+### Added
+
+- **updater**: recursive hidden-file discovery, precise line numbers, scoped npm ([5fcc5d8](https://github.com/rvben/upd/commit/5fcc5d818d349abd109ae7cac001972a6a9cadea))
+
+### Fixed
+
+- **package_json**: index dependencies when opening brace starts on its own line ([e40c3f1](https://github.com/rvben/upd/commit/e40c3f1bf736ef3ea0c565047d886ff7543d37c9))
+- **update**: check mode exits 1 when only configured pins differ ([33a69f5](https://github.com/rvben/upd/commit/33a69f5a16ee03247a13c41bfabe1935d09bfa64))
+- **updater**: classify configured pins as pins, not updates ([571a96b](https://github.com/rvben/upd/commit/571a96b9de72fe283c5114e594da72687a67efab))
+
 ## [0.0.27](https://github.com/rvben/upd/compare/v0.0.26...v0.0.27) - 2026-04-15
 
 ### Fixed
