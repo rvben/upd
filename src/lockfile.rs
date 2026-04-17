@@ -29,6 +29,10 @@ pub enum LockfileType {
     GoSum,
     /// Gemfile.lock - regenerated with `bundle install`
     GemfileLock,
+    /// packages.lock.json - regenerated with `dotnet restore`
+    PackagesLockJson,
+    /// .terraform.lock.hcl - regenerated with `terraform providers lock`
+    TerraformLock,
 }
 
 impl LockfileType {
@@ -44,6 +48,8 @@ impl LockfileType {
             LockfileType::CargoLock => "Cargo.lock",
             LockfileType::GoSum => "go.sum",
             LockfileType::GemfileLock => "Gemfile.lock",
+            LockfileType::PackagesLockJson => "packages.lock.json",
+            LockfileType::TerraformLock => ".terraform.lock.hcl",
         }
     }
 
@@ -59,6 +65,8 @@ impl LockfileType {
             LockfileType::CargoLock => ("cargo", &["update"]),
             LockfileType::GoSum => ("go", &["mod", "tidy"]),
             LockfileType::GemfileLock => ("bundle", &["install"]),
+            LockfileType::PackagesLockJson => ("dotnet", &["restore"]),
+            LockfileType::TerraformLock => ("terraform", &["providers", "lock"]),
         }
     }
 
@@ -73,8 +81,22 @@ impl LockfileType {
             LockfileType::CargoLock => "Cargo.toml",
             LockfileType::GoSum => "go.mod",
             LockfileType::GemfileLock => "Gemfile",
+            // .NET supports multiple manifest shapes; `.csproj` is the
+            // canonical one but a central-management project may keep
+            // versions in `Directory.Packages.props` or `Directory.Build.props`.
+            LockfileType::PackagesLockJson => ".csproj",
+            LockfileType::TerraformLock => ".tf",
         }
     }
+}
+
+/// True if this manifest is a .NET project file that can own a
+/// `packages.lock.json` next to it.
+fn is_dotnet_manifest(name: &std::ffi::OsStr) -> bool {
+    let name = name.to_string_lossy();
+    name.ends_with(".csproj")
+        || name == "Directory.Packages.props"
+        || name == "Directory.Build.props"
 }
 
 /// Detect lockfiles in the directory containing the given manifest file
@@ -144,6 +166,26 @@ pub fn detect_lockfiles(manifest_path: &Path) -> Vec<LockfileType> {
         && dir.join("Gemfile.lock").exists()
     {
         lockfiles.push(LockfileType::GemfileLock);
+    }
+
+    // Check for .NET packages.lock.json (only if manifest is a .NET project file)
+    if manifest_path
+        .file_name()
+        .map(is_dotnet_manifest)
+        .unwrap_or(false)
+        && dir.join("packages.lock.json").exists()
+    {
+        lockfiles.push(LockfileType::PackagesLockJson);
+    }
+
+    // Check for Terraform lockfile (only if manifest is a .tf file)
+    if manifest_path
+        .extension()
+        .map(|ext| ext == "tf")
+        .unwrap_or(false)
+        && dir.join(".terraform.lock.hcl").exists()
+    {
+        lockfiles.push(LockfileType::TerraformLock);
     }
 
     lockfiles
@@ -475,6 +517,98 @@ mod tests {
 
         fs::write(&manifest, "[project]").unwrap();
         fs::write(&lockfile, "").unwrap();
+
+        let detected = detect_lockfiles(&manifest);
+        assert!(detected.is_empty());
+    }
+
+    #[test]
+    fn test_lockfile_type_packages_lock_json_filename() {
+        assert_eq!(
+            LockfileType::PackagesLockJson.filename(),
+            "packages.lock.json"
+        );
+    }
+
+    #[test]
+    fn test_lockfile_type_packages_lock_json_command() {
+        // .NET lockfiles are regenerated via `dotnet restore` (which
+        // rewrites `packages.lock.json` next to each .csproj when
+        // `RestorePackagesWithLockFile` is enabled).
+        let (cmd, args) = LockfileType::PackagesLockJson.command();
+        assert_eq!(cmd, "dotnet");
+        assert_eq!(args, &["restore"]);
+    }
+
+    #[test]
+    fn test_detect_lockfiles_packages_lock_json_for_csproj() {
+        let dir = tempdir().unwrap();
+        let manifest = dir.path().join("App.csproj");
+        fs::write(&manifest, "<Project/>").unwrap();
+        fs::write(dir.path().join("packages.lock.json"), "{}").unwrap();
+
+        let detected = detect_lockfiles(&manifest);
+        assert_eq!(detected, vec![LockfileType::PackagesLockJson]);
+    }
+
+    #[test]
+    fn test_detect_lockfiles_packages_lock_json_for_directory_packages_props() {
+        let dir = tempdir().unwrap();
+        let manifest = dir.path().join("Directory.Packages.props");
+        fs::write(&manifest, "<Project/>").unwrap();
+        fs::write(dir.path().join("packages.lock.json"), "{}").unwrap();
+
+        let detected = detect_lockfiles(&manifest);
+        assert_eq!(detected, vec![LockfileType::PackagesLockJson]);
+    }
+
+    #[test]
+    fn test_detect_lockfiles_packages_lock_json_ignored_without_dotnet_manifest() {
+        let dir = tempdir().unwrap();
+        let manifest = dir.path().join("package.json");
+        fs::write(&manifest, "{}").unwrap();
+        fs::write(dir.path().join("packages.lock.json"), "{}").unwrap();
+
+        let detected = detect_lockfiles(&manifest);
+        assert!(detected.is_empty());
+    }
+
+    #[test]
+    fn test_lockfile_type_terraform_lock_hcl_filename() {
+        assert_eq!(
+            LockfileType::TerraformLock.filename(),
+            ".terraform.lock.hcl"
+        );
+    }
+
+    #[test]
+    fn test_lockfile_type_terraform_lock_hcl_command() {
+        // Terraform's dependency-lock file is regenerated with
+        // `terraform providers lock -platform=...`. We use the bare form
+        // which updates the existing lock in-place for all platforms
+        // currently pinned.
+        let (cmd, args) = LockfileType::TerraformLock.command();
+        assert_eq!(cmd, "terraform");
+        assert_eq!(args, &["providers", "lock"]);
+    }
+
+    #[test]
+    fn test_detect_lockfiles_terraform_lock_hcl_for_tf_file() {
+        let dir = tempdir().unwrap();
+        let manifest = dir.path().join("main.tf");
+        fs::write(&manifest, "").unwrap();
+        fs::write(dir.path().join(".terraform.lock.hcl"), "").unwrap();
+
+        let detected = detect_lockfiles(&manifest);
+        assert_eq!(detected, vec![LockfileType::TerraformLock]);
+    }
+
+    #[test]
+    fn test_detect_lockfiles_terraform_lock_hcl_ignored_without_tf() {
+        let dir = tempdir().unwrap();
+        let manifest = dir.path().join("Cargo.toml");
+        fs::write(&manifest, "[package]").unwrap();
+        fs::write(dir.path().join(".terraform.lock.hcl"), "").unwrap();
 
         let detected = detect_lockfiles(&manifest);
         assert!(detected.is_empty());
