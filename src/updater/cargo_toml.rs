@@ -5,7 +5,7 @@ use super::{
 use crate::align::compare_versions;
 use crate::registry::{CratesIoRegistry, Registry};
 use crate::updater::Lang;
-use crate::version::{is_stable_semver, match_version_precision};
+use crate::version::{is_prerelease_semver, is_stable_semver, match_version_precision};
 use anyhow::{Result, anyhow};
 use futures::future::join_all;
 use std::collections::HashMap;
@@ -323,6 +323,16 @@ impl CargoTomlUpdater {
         {
             match version_result {
                 Ok(latest_version) => {
+                    // When the current version is a pre-release, we fetched the latest
+                    // pre-release. If the registry returned a stable version instead
+                    // (no newer pre-release exists), refuse silent promotion to stable.
+                    if is_prerelease_semver(&current_version)
+                        && !is_prerelease_semver(&latest_version)
+                    {
+                        result.unchanged += 1;
+                        continue;
+                    }
+
                     // Match the precision of the original version (unless full precision requested)
                     let matched_version = if options.full_precision {
                         latest_version.clone()

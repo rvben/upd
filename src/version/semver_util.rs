@@ -33,6 +33,13 @@ pub fn is_stable_semver(version_str: &str) -> bool {
     }
 }
 
+/// Check if a semver version string represents a pre-release.
+/// Handles incomplete versions like "0.9" by normalizing to "0.9.0".
+/// Returns false for unparseable strings (treated as stable).
+pub fn is_prerelease_semver(version_str: &str) -> bool {
+    !is_stable_semver(version_str)
+}
+
 /// Compare two semver version strings
 /// Returns None if either version is invalid
 pub fn compare_versions(a: &str, b: &str) -> Option<std::cmp::Ordering> {
@@ -78,6 +85,23 @@ mod tests {
         // Incomplete versions with prerelease suffix
         assert!(!is_stable_semver("1.0-alpha"));
         assert!(!is_stable_semver("0.9-rc1"));
+    }
+
+    #[test]
+    fn test_is_prerelease_semver() {
+        // Pre-releases must return true
+        assert!(is_prerelease_semver("1.0.0-alpha.1"));
+        assert!(is_prerelease_semver("1.0.0-beta.2"));
+        assert!(is_prerelease_semver("1.0.0-rc.1"));
+        assert!(is_prerelease_semver("1.0.0-beta.1"));
+
+        // Stable releases must return false
+        assert!(!is_prerelease_semver("1.0.0"));
+        assert!(!is_prerelease_semver("2.0.0"));
+        assert!(!is_prerelease_semver("0.9"));
+
+        // Unparseable strings must return false (treated as stable)
+        assert!(!is_prerelease_semver("*"));
     }
 
     #[test]

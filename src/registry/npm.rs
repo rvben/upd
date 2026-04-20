@@ -351,9 +351,9 @@ impl NpmRegistry {
             .map_err(|e| anyhow!("Failed to parse npm response for '{}': {}", package, e))
     }
 
-    /// Get all stable (non-prerelease) versions sorted descending
+    /// Get all stable (non-prerelease) versions sorted descending.
     /// Note: abbreviated metadata doesn't include deprecated info, but dist-tags.latest
-    /// is authoritative for the recommended version
+    /// is authoritative for the recommended version.
     fn get_stable_versions(data: &NpmAbbreviatedResponse) -> Vec<(semver::Version, String)> {
         let versions_obj = match data.versions.as_object() {
             Some(obj) => obj,
@@ -371,6 +371,26 @@ impl NpmRegistry {
                         None
                     }
                 })
+            })
+            .collect();
+
+        versions.sort_by(|a, b| b.0.cmp(&a.0));
+        versions
+    }
+
+    /// Get all versions (including pre-releases) sorted descending.
+    fn get_all_versions(data: &NpmAbbreviatedResponse) -> Vec<(semver::Version, String)> {
+        let versions_obj = match data.versions.as_object() {
+            Some(obj) => obj,
+            None => return Vec::new(),
+        };
+
+        let mut versions: Vec<_> = versions_obj
+            .keys()
+            .filter_map(|ver_str| {
+                semver::Version::parse(ver_str)
+                    .ok()
+                    .map(|v| (v, ver_str.clone()))
             })
             .collect();
 
@@ -417,6 +437,15 @@ impl Registry for NpmRegistry {
                 package
             )
         })
+    }
+
+    async fn get_latest_version_including_prereleases(&self, package: &str) -> Result<String> {
+        let data = self.fetch_package_with_scope_resolution(package).await?;
+        let versions = Self::get_all_versions(&data);
+        versions
+            .first()
+            .map(|(_, s)| s.clone())
+            .ok_or_else(|| anyhow!("Package '{}' exists but has no versions.", package))
     }
 
     async fn get_latest_version_matching(

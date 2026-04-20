@@ -5,7 +5,7 @@ use super::{
 use crate::align::compare_versions;
 use crate::registry::{MultiPyPiRegistry, PyPiRegistry, Registry};
 use crate::updater::Lang;
-use crate::version::match_version_precision;
+use crate::version::{is_prerelease_pep440, match_version_precision};
 use anyhow::Result;
 use futures::future::join_all;
 use pep440_rs::Version as Pep440Version;
@@ -301,11 +301,17 @@ impl Updater for RequirementsUpdater {
             result.ignored.push((package, version, Some(line_idx + 1)));
         }
 
-        // Fetch versions only for non-ignored, non-pinned packages
+        // Fetch versions only for non-ignored, non-pinned packages.
+        // When the current version is a pre-release, request the latest pre-release
+        // so we do not silently promote the user to a stable release.
         let version_futures: Vec<_> = fetch_deps
             .iter()
             .map(|(_, _, parsed)| async {
-                if Self::is_simple_constraint(&parsed.full_constraint) {
+                if is_prerelease_pep440(&parsed.first_version) {
+                    effective_registry
+                        .get_latest_version_including_prereleases(&parsed.package)
+                        .await
+                } else if Self::is_simple_constraint(&parsed.full_constraint) {
                     effective_registry.get_latest_version(&parsed.package).await
                 } else {
                     effective_registry
@@ -368,6 +374,16 @@ impl Updater for RequirementsUpdater {
                             }
                         }
                         PendingVersion::Registry(Ok(latest_version)) => {
+                            // When the current version is a pre-release, we fetched the latest
+                            // pre-release. If the registry returned a stable version instead
+                            // (no newer pre-release exists), refuse silent promotion to stable.
+                            let current_is_prerelease = is_prerelease_pep440(&parsed.first_version);
+                            if current_is_prerelease && !is_prerelease_pep440(&latest_version) {
+                                result.unchanged += 1;
+                                new_lines.push(line.to_string());
+                                continue;
+                            }
+
                             // Match the precision of the original version (unless full precision requested)
                             let matched_version = if options.full_precision {
                                 latest_version.clone()
@@ -1221,6 +1237,150 @@ flask>=2.0.0
             "requests line must not be modified"
         );
         assert!(contents.contains("flask==4.0.0"), "flask must be updated");
+    }
+
+    /// When the current version is a pre-release, the updater must seek the latest
+    /// pre-release rather than promoting to stable.
+    #[tokio::test]
+    async fn test_prerelease_stays_on_prerelease() {
+        // black==25.0.0b1 → should go to 26.1a1 (latest pre), not 26.3.1 (stable)
+        let mut file = NamedTempFile::new().unwrap();
+        writeln!(file, "black==25.0.0b1").unwrap();
+
+        let registry = MockRegistry::new("PyPI").with_prerelease("black", "26.3.1", "26.1a1");
+
+        let updater = RequirementsUpdater::new();
+        let options = UpdateOptions::new(false, false);
+        let result = updater
+            .update(file.path(), &registry, options)
+            .await
+            .unwrap();
+
+        assert_eq!(result.updated.len(), 1, "should have one update");
+        assert_eq!(
+            result.updated[0].2, "26.1a1",
+            "should update to pre-release, not stable"
+        );
+
+        let contents = std::fs::read_to_string(file.path()).unwrap();
+        assert!(
+            contents.contains("black==26.1a1"),
+            "file must contain the pre-release version"
+        );
+        assert!(!contents.contains("26.3.1"), "must not promote to stable");
+    }
+
+    /// Realistic-registry scenario: a newer pre-release exists alongside a newer stable.
+    /// The updater must pick the higher pre-release, not the stable, and must not
+    /// regress to an older pre-release just because a stable also exists.
+    #[tokio::test]
+    async fn test_prerelease_picks_higher_prerelease_over_stable() {
+        // Current: 25.0.0b1. Available: stable=26.3.1, pre=26.4.0a1 (higher pre-release).
+        // Expected: update to 26.4.0a1, not to 26.3.1.
+        let mut file = NamedTempFile::new().unwrap();
+        writeln!(file, "black==25.0.0b1").unwrap();
+
+        // with_prerelease configures: get_latest_version → "26.3.1" (stable),
+        //                             get_latest_version_including_prereleases → "26.4.0a1"
+        let registry = MockRegistry::new("PyPI").with_prerelease("black", "26.3.1", "26.4.0a1");
+
+        let updater = RequirementsUpdater::new();
+        let options = UpdateOptions::new(false, false);
+        let result = updater
+            .update(file.path(), &registry, options)
+            .await
+            .unwrap();
+
+        assert_eq!(result.updated.len(), 1, "should have one update");
+        assert_eq!(
+            result.updated[0].2, "26.4.0a1",
+            "should pick the highest pre-release, not the stable"
+        );
+
+        let contents = std::fs::read_to_string(file.path()).unwrap();
+        assert!(contents.contains("black==26.4.0a1"));
+        assert!(!contents.contains("26.3.1"), "must not promote to stable");
+    }
+
+    /// When no newer pre-release exists and only a newer stable is available,
+    /// a pre-release-pinned package must not be silently promoted to stable.
+    #[tokio::test]
+    async fn test_prerelease_no_silent_promotion_to_stable() {
+        let mut file = NamedTempFile::new().unwrap();
+        writeln!(file, "mylib==1.0a1").unwrap();
+
+        // Registry only has a stable version — no pre-release at all.
+        // get_latest_version_including_prereleases will return "2.0.0" (stable),
+        // which is newer than 1.0a1. Without the guard this would silently promote.
+        let registry = MockRegistry::new("PyPI").with_version("mylib", "2.0.0");
+
+        let updater = RequirementsUpdater::new();
+        let options = UpdateOptions::new(false, false);
+        let result = updater
+            .update(file.path(), &registry, options)
+            .await
+            .unwrap();
+
+        // No update should happen — the only available "latest" is a stable, not a pre-release.
+        assert_eq!(
+            result.updated.len(),
+            0,
+            "should not silently promote pre-release to stable"
+        );
+        assert_eq!(result.unchanged, 1, "should be counted as unchanged");
+
+        let contents = std::fs::read_to_string(file.path()).unwrap();
+        assert!(
+            contents.contains("mylib==1.0a1"),
+            "version must remain unchanged"
+        );
+    }
+
+    /// Current pre-release, higher pre-release available across versions — pick the highest.
+    #[tokio::test]
+    async fn test_prerelease_picks_highest_prerelease() {
+        let mut file = NamedTempFile::new().unwrap();
+        writeln!(file, "lib==1.0a1").unwrap();
+
+        // Available: stable=1.0.0, prerelease=2.0a1 (highest pre)
+        let registry = MockRegistry::new("PyPI").with_prerelease("lib", "1.0.0", "2.0a1");
+
+        let updater = RequirementsUpdater::new();
+        let options = UpdateOptions::new(false, false);
+        let result = updater
+            .update(file.path(), &registry, options)
+            .await
+            .unwrap();
+
+        assert_eq!(result.updated.len(), 1);
+        assert_eq!(result.updated[0].2, "2.0a1");
+
+        let contents = std::fs::read_to_string(file.path()).unwrap();
+        assert!(contents.contains("lib==2.0a1"));
+    }
+
+    /// Current stable should still skip pre-releases (regression guard).
+    #[tokio::test]
+    async fn test_stable_skips_prerelease_regression() {
+        let mut file = NamedTempFile::new().unwrap();
+        writeln!(file, "tool==1.0.0").unwrap();
+
+        let registry = MockRegistry::new("PyPI").with_prerelease("tool", "2.0.0", "3.0.0a1");
+
+        let updater = RequirementsUpdater::new();
+        let options = UpdateOptions::new(false, false);
+        let result = updater
+            .update(file.path(), &registry, options)
+            .await
+            .unwrap();
+
+        // Should update to 2.0.0 (stable), not 3.0.0a1 (pre-release)
+        assert_eq!(result.updated.len(), 1);
+        assert_eq!(result.updated[0].2, "2.0.0");
+
+        let contents = std::fs::read_to_string(file.path()).unwrap();
+        assert!(contents.contains("tool==2.0.0"));
+        assert!(!contents.contains("3.0.0a1"));
     }
 
     /// Equal versions (current == latest after precision-matching) must NOT trigger the

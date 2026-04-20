@@ -9,6 +9,17 @@ pub fn is_stable_pep440(version_str: &str) -> bool {
     }
 }
 
+/// Check if a PEP 440 version string represents a pre-release
+/// (alpha, beta, release candidate, or dev release).
+/// Returns false for unparseable strings (treated as stable).
+pub fn is_prerelease_pep440(version_str: &str) -> bool {
+    if let Ok(version) = version_str.parse::<Version>() {
+        version.is_pre() || version.is_dev()
+    } else {
+        false
+    }
+}
+
 /// Compare two PEP 440 version strings
 /// Returns None if either version is invalid
 pub fn compare_versions(a: &str, b: &str) -> Option<std::cmp::Ordering> {
@@ -41,6 +52,25 @@ mod tests {
         assert!(!is_stable_pep440("1.0.0.dev1"));
         assert!(!is_stable_pep440("1.0.0alpha"));
         assert!(!is_stable_pep440("1.0.0beta"));
+    }
+
+    #[test]
+    fn test_is_prerelease_pep440() {
+        // Pre-releases must return true
+        assert!(is_prerelease_pep440("1.0.0a1"));
+        assert!(is_prerelease_pep440("1.0.0b2"));
+        assert!(is_prerelease_pep440("1.0.0rc1"));
+        assert!(is_prerelease_pep440("1.0.0.dev1"));
+        assert!(is_prerelease_pep440("25.0.0b1"));
+
+        // Stable releases must return false
+        assert!(!is_prerelease_pep440("1.0.0"));
+        assert!(!is_prerelease_pep440("2.31.0"));
+        assert!(!is_prerelease_pep440("1.0.0.post1"));
+
+        // Unparseable strings must return false (treated as stable)
+        assert!(!is_prerelease_pep440("not-a-version"));
+        assert!(!is_prerelease_pep440(""));
     }
 
     #[test]

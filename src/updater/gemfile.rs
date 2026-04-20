@@ -79,6 +79,21 @@ impl GemfileUpdater {
         line.replacen(old_version, new_version, 1)
     }
 
+    /// Check if a Ruby gem version string is a pre-release.
+    /// RubyGems pre-releases include a letter component in the version segments,
+    /// commonly expressed as `.pre`, `.rc`, `.beta`, `.alpha`, or similar suffixes.
+    fn is_prerelease_ruby(version: &str) -> bool {
+        let v = version.to_lowercase();
+        v.contains(".pre")
+            || v.contains(".rc")
+            || v.contains(".beta")
+            || v.contains(".alpha")
+            || v.contains(".dev")
+            // RubyGems also treats any version segment that is non-numeric as a pre-release
+            // (e.g. "8.0.0.beta1" or "8.0.0.rc2")
+            || version.split('.').any(|seg| seg.chars().any(|c| c.is_alphabetic()))
+    }
+
     /// Check if the constraint has an upper bound that requires constraint-aware lookup
     fn has_upper_bound(operator: &str) -> bool {
         matches!(operator, "~>" | "<" | "<=" | "!=")
@@ -159,10 +174,17 @@ impl Updater for GemfileUpdater {
                 .collect()
         };
 
+        // Fetch versions in parallel.
+        // When the current version is a pre-release, request the latest pre-release
+        // to avoid silently promoting the gem to a stable release.
         let version_futures: Vec<_> = unique_gems
             .iter()
             .map(|(name, operator, version)| async move {
-                if Self::has_upper_bound(operator) {
+                if Self::is_prerelease_ruby(version) {
+                    registry
+                        .get_latest_version_including_prereleases(name)
+                        .await
+                } else if Self::has_upper_bound(operator) {
                     let constraint = if operator.is_empty() {
                         format!("= {}", version)
                     } else {
@@ -244,6 +266,17 @@ impl Updater for GemfileUpdater {
                             }
                         }
                         PendingVersion::Registry(Ok(latest_version)) => {
+                            // When the current version is a pre-release, we fetched the latest
+                            // pre-release. If the registry returned a stable version instead
+                            // (no newer pre-release exists), refuse silent promotion to stable.
+                            if Self::is_prerelease_ruby(&parsed.version)
+                                && !Self::is_prerelease_ruby(&latest_version)
+                            {
+                                result.unchanged += 1;
+                                new_lines.push(line.to_string());
+                                continue;
+                            }
+
                             let matched_version = if options.full_precision {
                                 latest_version.clone()
                             } else {
@@ -542,6 +575,23 @@ mod tests {
         assert!(!updater.handles(FileType::Requirements));
     }
 
+    #[test]
+    fn test_is_prerelease_ruby() {
+        // Known RubyGems pre-release version formats
+        assert!(GemfileUpdater::is_prerelease_ruby("8.0.0.beta1"));
+        assert!(GemfileUpdater::is_prerelease_ruby("8.0.0.rc1"));
+        assert!(GemfileUpdater::is_prerelease_ruby("8.0.0.rc2"));
+        assert!(GemfileUpdater::is_prerelease_ruby("2.0.0.alpha"));
+        assert!(GemfileUpdater::is_prerelease_ruby("1.0.0.pre"));
+        assert!(GemfileUpdater::is_prerelease_ruby("1.0.0.dev1"));
+        assert!(GemfileUpdater::is_prerelease_ruby("8.0.0.beta1"));
+
+        // Stable versions must return false
+        assert!(!GemfileUpdater::is_prerelease_ruby("7.2.3"));
+        assert!(!GemfileUpdater::is_prerelease_ruby("1.0.0"));
+        assert!(!GemfileUpdater::is_prerelease_ruby("7.1"));
+    }
+
     #[tokio::test]
     async fn test_registry_error_populates_errors() {
         let mut file = NamedTempFile::new().unwrap();
@@ -578,5 +628,98 @@ mod tests {
 
         assert_eq!(result.updated.len(), 1);
         assert_eq!(result.unchanged, 1);
+    }
+
+    /// When the current Ruby gem version is a pre-release, the updater must pick
+    /// the latest pre-release, not promote to stable.
+    #[tokio::test]
+    async fn test_ruby_prerelease_stays_on_prerelease() {
+        let mut file = NamedTempFile::new().unwrap();
+        writeln!(file, "gem 'rails', '8.0.0.beta1'").unwrap();
+
+        // stable=7.2.3, prerelease=8.0.0.rc1
+        let registry = MockRegistry::new("rubygems").with_prerelease("rails", "7.2.3", "8.0.0.rc1");
+
+        let updater = GemfileUpdater::new();
+        let options = UpdateOptions::new(false, false);
+        let result = updater
+            .update(file.path(), &registry, options)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            result.updated.len(),
+            1,
+            "should update to newer pre-release"
+        );
+        assert_eq!(
+            result.updated[0].2, "8.0.0.rc1",
+            "should pick pre-release, not stable"
+        );
+
+        let contents = std::fs::read_to_string(file.path()).unwrap();
+        assert!(
+            contents.contains("8.0.0.rc1"),
+            "file must contain the pre-release version"
+        );
+        assert!(!contents.contains("7.2.3"), "must not promote to stable");
+    }
+
+    /// When no newer pre-release exists and only a newer stable is available,
+    /// a pre-release-pinned gem must not be silently promoted to stable.
+    #[tokio::test]
+    async fn test_ruby_prerelease_no_silent_promotion_to_stable() {
+        let mut file = NamedTempFile::new().unwrap();
+        writeln!(file, "gem 'rails', '8.0.0.beta1'").unwrap();
+
+        // Registry only has a stable version — no pre-release at all.
+        // get_latest_version_including_prereleases will return "8.1.0" (stable),
+        // which is newer than 8.0.0.beta1. Without the guard this would silently promote.
+        let registry = MockRegistry::new("rubygems").with_version("rails", "8.1.0");
+
+        let updater = GemfileUpdater::new();
+        let options = UpdateOptions::new(false, false);
+        let result = updater
+            .update(file.path(), &registry, options)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            result.updated.len(),
+            0,
+            "should not silently promote pre-release to stable"
+        );
+        assert_eq!(result.unchanged, 1, "should be counted as unchanged");
+
+        let contents = std::fs::read_to_string(file.path()).unwrap();
+        assert!(
+            contents.contains("8.0.0.beta1"),
+            "version must remain unchanged"
+        );
+        assert!(!contents.contains("8.1.0"), "must not promote to stable");
+    }
+
+    /// Current stable Ruby gem must still skip pre-releases (regression guard).
+    #[tokio::test]
+    async fn test_ruby_stable_skips_prerelease_regression() {
+        let mut file = NamedTempFile::new().unwrap();
+        writeln!(file, "gem 'rails', '7.0.0'").unwrap();
+
+        let registry = MockRegistry::new("rubygems").with_prerelease("rails", "7.2.3", "8.0.0.rc1");
+
+        let updater = GemfileUpdater::new();
+        let options = UpdateOptions::new(false, false);
+        let result = updater
+            .update(file.path(), &registry, options)
+            .await
+            .unwrap();
+
+        // Should update to 7.2.3 (stable), not 8.0.0.rc1 (pre-release)
+        assert_eq!(result.updated.len(), 1);
+        assert_eq!(result.updated[0].2, "7.2.3");
+
+        let contents = std::fs::read_to_string(file.path()).unwrap();
+        assert!(contents.contains("7.2.3"));
+        assert!(!contents.contains("8.0.0.rc1"));
     }
 }

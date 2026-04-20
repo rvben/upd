@@ -5,7 +5,7 @@ use super::{
 use crate::align::compare_versions;
 use crate::registry::Registry;
 use crate::updater::Lang;
-use crate::version::match_version_precision;
+use crate::version::{is_prerelease_semver, match_version_precision};
 use anyhow::Result;
 use futures::future::join_all;
 use regex::Regex;
@@ -323,10 +323,20 @@ impl Updater for PackageJsonUpdater {
             }
         }
 
-        // Fetch all versions in parallel for non-ignored, non-pinned packages
+        // Fetch all versions in parallel for non-ignored, non-pinned packages.
+        // When the current version is a semver pre-release, request the latest
+        // pre-release to avoid silently promoting the package to stable.
         let version_futures: Vec<_> = packages_to_check
             .iter()
-            .map(|(_, package, _, _, _)| registry.get_latest_version(package))
+            .map(|(_, package, _, _, current_version)| async {
+                if is_prerelease_semver(current_version) {
+                    registry
+                        .get_latest_version_including_prereleases(package)
+                        .await
+                } else {
+                    registry.get_latest_version(package).await
+                }
+            })
             .collect();
 
         let version_results = join_all(version_futures).await;
@@ -337,6 +347,16 @@ impl Updater for PackageJsonUpdater {
         {
             match version_result {
                 Ok(latest_version) => {
+                    // When the current version is a pre-release, we fetched the latest
+                    // pre-release. If the registry returned a stable version instead
+                    // (no newer pre-release exists), refuse silent promotion to stable.
+                    if is_prerelease_semver(&current_version)
+                        && !is_prerelease_semver(&latest_version)
+                    {
+                        result.unchanged += 1;
+                        continue;
+                    }
+
                     // Match the precision of the original version (unless full precision requested)
                     let matched_version = if options.full_precision {
                         latest_version.clone()
@@ -1313,5 +1333,118 @@ mod tests {
         let content = fs::read_to_string(file.path()).unwrap();
         assert!(content.contains("\"@types/node\": \"^20.11.0\""));
         assert!(content.contains("\"@scope/private-thing\": \"^1.2.3\""));
+    }
+
+    /// When the current version is a semver pre-release, the updater must seek the
+    /// latest pre-release rather than promoting to stable.
+    #[tokio::test]
+    async fn test_semver_prerelease_stays_on_prerelease() {
+        let mut file = NamedTempFile::with_suffix(".json").unwrap();
+        write!(
+            file,
+            r#"{{
+  "dependencies": {{
+    "my-lib": "1.0.0-beta.1"
+  }}
+}}"#
+        )
+        .unwrap();
+
+        // stable=1.0.0, prerelease=1.0.0-rc.1
+        let registry = MockRegistry::new("npm").with_prerelease("my-lib", "1.0.0", "1.0.0-rc.1");
+
+        let updater = PackageJsonUpdater::new();
+        let options = UpdateOptions::new(false, false);
+        let result = updater
+            .update(file.path(), &registry, options)
+            .await
+            .unwrap();
+
+        assert_eq!(result.updated.len(), 1, "should update to pre-release");
+        assert_eq!(
+            result.updated[0].2, "1.0.0-rc.1",
+            "should pick pre-release, not stable"
+        );
+
+        let content = fs::read_to_string(file.path()).unwrap();
+        assert!(
+            content.contains("1.0.0-rc.1"),
+            "file must contain pre-release version"
+        );
+        assert!(!content.contains("\"1.0.0\""), "must not promote to stable");
+    }
+
+    /// When no newer pre-release exists and only a newer stable is available,
+    /// a pre-release-pinned package must not be silently promoted to stable.
+    #[tokio::test]
+    async fn test_semver_prerelease_no_silent_promotion_to_stable() {
+        let mut file = NamedTempFile::with_suffix(".json").unwrap();
+        write!(
+            file,
+            r#"{{
+  "dependencies": {{
+    "my-lib": "1.0.0-beta.1"
+  }}
+}}"#
+        )
+        .unwrap();
+
+        // Registry only has a stable version — no pre-release at all.
+        // get_latest_version_including_prereleases will return "2.0.0" (stable),
+        // which is newer than 1.0.0-beta.1. Without the guard this would silently promote.
+        let registry = MockRegistry::new("npm").with_version("my-lib", "2.0.0");
+
+        let updater = PackageJsonUpdater::new();
+        let options = UpdateOptions::new(false, false);
+        let result = updater
+            .update(file.path(), &registry, options)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            result.updated.len(),
+            0,
+            "should not silently promote pre-release to stable"
+        );
+        assert_eq!(result.unchanged, 1, "should be counted as unchanged");
+
+        let content = fs::read_to_string(file.path()).unwrap();
+        assert!(
+            content.contains("1.0.0-beta.1"),
+            "version must remain unchanged"
+        );
+        assert!(!content.contains("2.0.0"), "must not promote to stable");
+    }
+
+    /// Current stable package must still skip pre-releases (regression guard).
+    #[tokio::test]
+    async fn test_semver_stable_skips_prerelease_regression() {
+        let mut file = NamedTempFile::with_suffix(".json").unwrap();
+        write!(
+            file,
+            r#"{{
+  "dependencies": {{
+    "my-lib": "^1.0.0"
+  }}
+}}"#
+        )
+        .unwrap();
+
+        let registry = MockRegistry::new("npm").with_prerelease("my-lib", "2.0.0", "3.0.0-rc.1");
+
+        let updater = PackageJsonUpdater::new();
+        let options = UpdateOptions::new(false, false);
+        let result = updater
+            .update(file.path(), &registry, options)
+            .await
+            .unwrap();
+
+        // Should update to 2.0.0 (stable), not 3.0.0-rc.1 (pre-release)
+        assert_eq!(result.updated.len(), 1);
+        assert_eq!(result.updated[0].2, "2.0.0");
+
+        let content = fs::read_to_string(file.path()).unwrap();
+        assert!(content.contains("^2.0.0"));
+        assert!(!content.contains("3.0.0-rc.1"));
     }
 }

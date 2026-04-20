@@ -5,7 +5,7 @@ use super::{
 use crate::align::compare_versions;
 use crate::registry::{MultiPyPiRegistry, PyPiRegistry, Registry};
 use crate::updater::Lang;
-use crate::version::{is_stable_pep440, match_version_precision};
+use crate::version::{is_prerelease_pep440, is_stable_pep440, match_version_precision};
 use anyhow::{Result, anyhow};
 use futures::future::join_all;
 use regex::Regex;
@@ -328,6 +328,16 @@ impl PyProjectUpdater {
 
             match version_result {
                 Ok(latest_version) => {
+                    // When the current version is a pre-release, we fetched the latest
+                    // pre-release. If the registry returned a stable version instead
+                    // (no newer pre-release exists), refuse silent promotion to stable.
+                    if is_prerelease_pep440(&current_version)
+                        && !is_prerelease_pep440(&latest_version)
+                    {
+                        result.unchanged += 1;
+                        continue;
+                    }
+
                     // Match the precision of the original version (unless full precision requested)
                     let matched_version = if options.full_precision {
                         latest_version.clone()
@@ -485,6 +495,14 @@ impl PyProjectUpdater {
         {
             match version_result {
                 Ok(latest_version) => {
+                    // When the current version is a pre-release, we fetched the latest
+                    // pre-release. If the registry returned a stable version instead
+                    // (no newer pre-release exists), refuse silent promotion to stable.
+                    if is_prerelease_pep440(&version) && !is_prerelease_pep440(&latest_version) {
+                        result.unchanged += 1;
+                        continue;
+                    }
+
                     // Match the precision of the original version (unless full precision requested)
                     let matched_version = if options.full_precision {
                         latest_version.clone()
