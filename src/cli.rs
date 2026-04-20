@@ -113,6 +113,10 @@ pub enum Command {
         /// Paths to scan
         #[arg()]
         paths: Vec<PathBuf>,
+
+        /// Exit 0 even when vulnerabilities are found (useful for scheduled scans that should not break CI)
+        #[arg(long)]
+        no_fail: bool,
     },
 
     /// Clear the version cache
@@ -127,7 +131,7 @@ impl Cli {
         match &self.command {
             Some(Command::Update { paths }) if !paths.is_empty() => paths.clone(),
             Some(Command::Align { paths }) if !paths.is_empty() => paths.clone(),
-            Some(Command::Audit { paths }) if !paths.is_empty() => paths.clone(),
+            Some(Command::Audit { paths, .. }) if !paths.is_empty() => paths.clone(),
             _ if !self.paths.is_empty() => self.paths.clone(),
             _ => vec![PathBuf::from(".")],
         }
@@ -413,7 +417,7 @@ mod tests {
     fn test_cli_parses_audit_command_with_paths() {
         let cli = Cli::try_parse_from(["upd", "audit", "path1", "path2"]).unwrap();
         match cli.command {
-            Some(Command::Audit { paths }) => {
+            Some(Command::Audit { paths, .. }) => {
                 assert_eq!(paths.len(), 2);
                 assert_eq!(paths[0], PathBuf::from("path1"));
                 assert_eq!(paths[1], PathBuf::from("path2"));

@@ -38,3 +38,21 @@ pub fn decide_exit_code(check_mode: bool, has_pending_updates: bool, has_errors:
         0
     }
 }
+
+/// Determine the process exit code for the `audit` subcommand.
+///
+/// - `2` — scan errors occurred; errors take precedence over vulnerability
+///   findings so that CI can distinguish a broken scan from a clean one.
+/// - `3` — vulnerabilities were found and `no_fail` is `false`; distinct from
+///   the update exit codes (1 = pending updates, 2 = errors) so callers can
+///   handle each condition independently.
+/// - `0` — no vulnerabilities found, or `no_fail` suppresses the non-zero exit.
+pub fn decide_audit_exit_code(vuln_count: usize, error_count: usize, no_fail: bool) -> i32 {
+    if error_count > 0 {
+        2
+    } else if vuln_count > 0 && !no_fail {
+        3
+    } else {
+        0
+    }
+}

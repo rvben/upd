@@ -258,3 +258,160 @@ fn decide_exit_code_errors_take_precedence() {
     // errors in mutate mode → 2
     assert_eq!(decide_exit_code(false, false, true), 2);
 }
+
+// ── decide_audit_exit_code unit tests ────────────────────────────────────────
+
+/// Unit test: no vulns, no errors → exit 0 regardless of --no-fail.
+#[test]
+fn decide_audit_exit_code_clean() {
+    use upd::decide_audit_exit_code;
+    assert_eq!(decide_audit_exit_code(0, 0, false), 0);
+    assert_eq!(decide_audit_exit_code(0, 0, true), 0);
+}
+
+/// Unit test: vulns found, no --no-fail → exit 3.
+#[test]
+fn decide_audit_exit_code_vulns_without_no_fail() {
+    use upd::decide_audit_exit_code;
+    assert_eq!(decide_audit_exit_code(1, 0, false), 3);
+    assert_eq!(decide_audit_exit_code(162, 0, false), 3);
+}
+
+/// Unit test: vulns found, --no-fail present → exit 0.
+#[test]
+fn decide_audit_exit_code_vulns_with_no_fail() {
+    use upd::decide_audit_exit_code;
+    assert_eq!(decide_audit_exit_code(1, 0, true), 0);
+    assert_eq!(decide_audit_exit_code(162, 0, true), 0);
+}
+
+/// Unit test: scan errors take precedence over vulns — always exit 2.
+#[test]
+fn decide_audit_exit_code_errors_take_precedence() {
+    use upd::decide_audit_exit_code;
+    // errors + vulns, no --no-fail → 2 (not 3)
+    assert_eq!(decide_audit_exit_code(5, 1, false), 2);
+    // errors + vulns, --no-fail → still 2
+    assert_eq!(decide_audit_exit_code(5, 1, true), 2);
+    // errors only, no vulns → 2
+    assert_eq!(decide_audit_exit_code(0, 3, false), 2);
+    // errors only, --no-fail → still 2
+    assert_eq!(decide_audit_exit_code(0, 3, true), 2);
+}
+
+// ── audit integration tests ───────────────────────────────────────────────────
+
+/// Exit 0: `audit` on an empty workspace — no packages, no errors.
+#[test]
+fn audit_on_empty_workspace_exits_zero() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (_stdout, _stderr, code) = run(&["audit"], tmp.path());
+    assert_eq!(
+        code, 0,
+        "expected 0 for audit on empty workspace, got {code}"
+    );
+}
+
+/// Exit 3: `audit` finds vulnerabilities and `--no-fail` is absent.
+///
+/// A wiremock server stands in for the OSV API and reports one vulnerability
+/// for `requests==1.0.0`.
+#[tokio::test]
+async fn audit_with_vulns_exits_three() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .and(path("/querybatch"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "results": [{ "vulns": [{ "id": "GHSA-test-0001" }] }]
+        })))
+        .mount(&server)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/vulns/GHSA-test-0001"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "id": "GHSA-test-0001",
+            "summary": "test vulnerability",
+            "references": [{ "url": "https://example.com/GHSA-test-0001" }]
+        })))
+        .mount(&server)
+        .await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    fs::write(tmp.path().join("requirements.txt"), "requests==1.0.0\n").unwrap();
+
+    let (_stdout, stderr, code) = run_with_env(
+        &["audit", "--no-cache"],
+        tmp.path(),
+        &[("OSV_API_URL", &server.uri())],
+    );
+
+    assert_eq!(
+        code, 3,
+        "audit with vulns must exit 3 (no --no-fail); stderr: {stderr}"
+    );
+}
+
+/// Exit 0: `audit` finds vulnerabilities but `--no-fail` suppresses non-zero exit.
+#[tokio::test]
+async fn audit_with_vulns_and_no_fail_exits_zero() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .and(path("/querybatch"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "results": [{ "vulns": [{ "id": "GHSA-test-0002" }] }]
+        })))
+        .mount(&server)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/vulns/GHSA-test-0002"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "id": "GHSA-test-0002",
+            "summary": "test vulnerability",
+            "references": [{ "url": "https://example.com/GHSA-test-0002" }]
+        })))
+        .mount(&server)
+        .await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    fs::write(tmp.path().join("requirements.txt"), "requests==1.0.0\n").unwrap();
+
+    let (_stdout, stderr, code) = run_with_env(
+        &["audit", "--no-fail", "--no-cache"],
+        tmp.path(),
+        &[("OSV_API_URL", &server.uri())],
+    );
+
+    assert_eq!(
+        code, 0,
+        "audit with --no-fail must exit 0 even with vulns; stderr: {stderr}"
+    );
+}
+
+/// Exit 2: `audit` when OSV is unreachable — scan error, not a vuln result.
+#[test]
+fn audit_with_osv_unreachable_exits_two() {
+    let tmp = tempfile::tempdir().unwrap();
+    fs::write(tmp.path().join("requirements.txt"), "requests==1.0.0\n").unwrap();
+
+    let (_stdout, stderr, code) = run_with_env(
+        &["audit", "--no-cache"],
+        tmp.path(),
+        // Port 1 on loopback is never bound; the OS returns ECONNREFUSED instantly.
+        &[("OSV_API_URL", "http://127.0.0.1:1")],
+    );
+
+    assert_eq!(
+        code, 2,
+        "audit with unreachable OSV must exit 2; stderr: {stderr}"
+    );
+}

@@ -1297,6 +1297,7 @@ pub(crate) fn build_audit_packages(
 }
 
 async fn run_audit(cli: &Cli) -> Result<()> {
+    let no_fail = matches!(&cli.command, Some(Command::Audit { no_fail, .. }) if *no_fail);
     let text_mode = cli.format == upd::cli::OutputFormat::Text;
     let paths = cli.get_paths();
     let files = discover_files(&paths, &cli.langs);
@@ -1406,16 +1407,13 @@ async fn run_audit(cli: &Cli) -> Result<()> {
         emit_audit_json(&audit_result, status_str)?;
     }
 
-    if status == AuditStatus::Incomplete {
-        anyhow::bail!(
-            "Audit incomplete: {} error(s) occurred while checking dependencies",
-            audit_result.errors.len()
-        );
-    }
-
-    // In check mode, exit with code 1 if any vulnerabilities found
-    if cli.check && !audit_result.vulnerable.is_empty() {
-        std::process::exit(1);
+    let exit_code = upd::decide_audit_exit_code(
+        audit_result.total_vulnerabilities(),
+        audit_result.errors.len(),
+        no_fail,
+    );
+    if exit_code != 0 {
+        std::process::exit(exit_code);
     }
 
     Ok(())

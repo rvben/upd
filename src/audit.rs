@@ -103,7 +103,9 @@ pub struct OsvClient {
 
 impl OsvClient {
     pub fn new() -> Self {
-        Self::with_base_url(DEFAULT_OSV_API_URL.to_string())
+        let base_url =
+            std::env::var("OSV_API_URL").unwrap_or_else(|_| DEFAULT_OSV_API_URL.to_string());
+        Self::with_base_url(base_url)
     }
 
     /// Create a client pointing at a custom base URL (used by tests).
