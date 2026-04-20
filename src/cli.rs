@@ -37,7 +37,7 @@ pub struct Cli {
     #[arg(global = true)]
     pub paths: Vec<PathBuf>,
 
-    /// Show what would change without writing
+    /// Print updates without applying them. Exits 1 when updates are available (same as --check), 2 on errors.
     #[arg(short = 'n', long, global = true)]
     pub dry_run: bool,
 
@@ -75,7 +75,7 @@ pub struct Cli {
     #[arg(short = 'l', long = "lang", value_name = "LANG", global = true)]
     pub langs: Vec<Lang>,
 
-    /// Check mode: exit with code 1 if updates are available (implies --dry-run)
+    /// Check mode: exit with code 1 if updates are available, without writing changes
     #[arg(long, global = true)]
     pub check: bool,
 

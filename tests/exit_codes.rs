@@ -207,6 +207,53 @@ async fn check_with_pending_update_exits_one() {
     );
 }
 
+/// Exit 1: `--dry-run` with a genuinely out-of-date dependency.
+///
+/// Mirrors `check_with_pending_update_exits_one`: `--dry-run` must exit 1
+/// when updates are available, identical to `--check`.
+#[tokio::test]
+async fn dry_run_with_pending_updates_exits_one() {
+    use wiremock::matchers::{method, path_regex};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+
+    let html = r#"<!DOCTYPE html><html><body>
+<a href="requests-99.0.0.tar.gz">requests-99.0.0.tar.gz</a>
+</body></html>"#;
+
+    Mock::given(method("GET"))
+        .and(path_regex(r"^/simple/requests/?$"))
+        .respond_with(ResponseTemplate::new(200).set_body_raw(html.as_bytes(), "text/html"))
+        .mount(&server)
+        .await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    fs::write(tmp.path().join("requirements.txt"), "requests==1.0.0\n").unwrap();
+
+    let (_stdout, stderr, code) = run_with_env(
+        &["--dry-run", "--no-cache"],
+        tmp.path(),
+        &[("UV_INDEX_URL", &server.uri())],
+    );
+
+    assert_eq!(
+        code, 1,
+        "--dry-run with a pending update must exit 1; stderr: {stderr}"
+    );
+}
+
+/// Exit 0: `--dry-run` on an empty workspace — no updates, no errors.
+#[test]
+fn dry_run_on_empty_workspace_exits_zero() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (_stdout, _stderr, code) = run(&["--dry-run"], tmp.path());
+    assert_eq!(
+        code, 0,
+        "--dry-run on an empty workspace must exit 0 (no updates, no errors)"
+    );
+}
+
 /// Exit 2: `--check` when the registry is unreachable (network/registry error).
 ///
 /// `NPM_REGISTRY` is pointed at a loopback address with no listener, which
@@ -245,6 +292,19 @@ fn decide_exit_code_clean() {
 fn decide_exit_code_check_with_updates() {
     use upd::decide_exit_code;
     assert_eq!(decide_exit_code(true, true, false), 1);
+}
+
+/// Unit test: `decide_exit_code` returns 1 for pending updates in dry-run mode
+/// (non_mutating=true covers both --check and --dry-run).
+#[test]
+fn decide_exit_code_dry_run_with_updates() {
+    use upd::decide_exit_code;
+    // --dry-run passes non_mutating=true, same as --check
+    assert_eq!(decide_exit_code(true, true, false), 1);
+    // no pending updates → 0 even in non-mutating mode
+    assert_eq!(decide_exit_code(true, false, false), 0);
+    // mutating mode with pending → 0 (updates applied, not flagged)
+    assert_eq!(decide_exit_code(false, true, false), 0);
 }
 
 /// Unit test: `decide_exit_code` returns 2 when errors occurred, regardless of updates.

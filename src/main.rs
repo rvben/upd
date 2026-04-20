@@ -541,7 +541,6 @@ async fn run_update(cli: &Cli) -> Result<()> {
     }
 
     // Non-interactive mode: process files in parallel
-    // Create update options (--check implies --dry-run)
     let dry_run = cli.dry_run || cli.check;
     let file_jobs: Vec<_> = files
         .into_iter()
@@ -737,7 +736,7 @@ async fn run_update(cli: &Cli) -> Result<()> {
 
     let has_errors = !total_result.errors.is_empty();
     let has_pending = has_checkable_manifest_changes(&total_result, filter);
-    let exit_code = upd::decide_exit_code(cli.check, has_pending, has_errors);
+    let exit_code = upd::decide_exit_code(cli.check || cli.dry_run, has_pending, has_errors);
     if exit_code != 0 {
         std::process::exit(exit_code);
     }
