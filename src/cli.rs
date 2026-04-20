@@ -71,8 +71,14 @@ pub struct Cli {
     #[arg(long, global = true)]
     pub full_precision: bool,
 
-    /// Filter by language/ecosystem (can be specified multiple times)
-    #[arg(short = 'l', long = "lang", value_name = "LANG", global = true)]
+    /// Filter by language/ecosystem (repeatable, or comma-separated: --lang python,rust)
+    #[arg(
+        short = 'l',
+        long = "lang",
+        value_name = "LANG",
+        global = true,
+        value_delimiter = ','
+    )]
     pub langs: Vec<Lang>,
 
     /// Check mode: exit with code 1 if updates are available, without writing changes
@@ -358,6 +364,49 @@ mod tests {
     fn test_cli_parses_lang_empty() {
         let cli = Cli::try_parse_from(["upd"]).unwrap();
         assert!(cli.langs.is_empty());
+    }
+
+    #[test]
+    fn test_cli_parses_lang_comma_separated() {
+        let cli = Cli::try_parse_from(["upd", "--lang", "python,rust"]).unwrap();
+        assert_eq!(cli.langs, vec![Lang::Python, Lang::Rust]);
+    }
+
+    #[test]
+    fn test_cli_parses_lang_repeated_flag() {
+        let cli = Cli::try_parse_from(["upd", "--lang", "python", "--lang", "rust"]).unwrap();
+        assert_eq!(cli.langs, vec![Lang::Python, Lang::Rust]);
+    }
+
+    #[test]
+    fn test_cli_parses_lang_mixed_comma_and_repeated() {
+        let cli = Cli::try_parse_from(["upd", "--lang", "python,rust", "--lang", "go"]).unwrap();
+        assert_eq!(cli.langs, vec![Lang::Python, Lang::Rust, Lang::Go]);
+    }
+
+    #[test]
+    fn test_cli_rejects_unknown_lang_in_comma_list() {
+        match Cli::try_parse_from(["upd", "--lang", "python,nonsense"]) {
+            Ok(_) => panic!("unknown lang value should be rejected"),
+            Err(err) => {
+                let msg = err.to_string();
+                assert!(
+                    msg.contains("nonsense"),
+                    "error should mention the unknown value, got: {msg}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_cli_lang_trailing_comma_behaviour() {
+        // clap with value_delimiter treats a trailing comma as an empty segment and
+        // rejects it with an "invalid value" error because "" is not a valid Lang variant.
+        let result = Cli::try_parse_from(["upd", "--lang", "python,"]);
+        assert!(
+            result.is_err(),
+            "trailing comma should produce a parse error"
+        );
     }
 
     #[test]
