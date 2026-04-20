@@ -163,6 +163,7 @@ impl GithubActionsUpdater {
                     version: version_ref.to_string(),
                     line_number: Some(line_idx + 1),
                     has_upper_bound: false,
+                    is_bumpable: true,
                 });
             }
         }

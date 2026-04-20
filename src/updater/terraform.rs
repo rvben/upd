@@ -434,6 +434,7 @@ impl Updater for TerraformUpdater {
                 version: dep.version,
                 line_number: Some(dep.version_line_idx + 1),
                 has_upper_bound: Self::has_upper_bound(&dep.operator),
+                is_bumpable: true,
             })
             .collect())
     }

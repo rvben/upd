@@ -643,6 +643,7 @@ impl Updater for CargoTomlUpdater {
                             version,
                             line_number: line_num,
                             has_upper_bound: false, // Cargo.toml doesn't use same constraint syntax as Python
+                            is_bumpable: true,
                         });
                     }
                 }

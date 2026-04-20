@@ -24,8 +24,11 @@ impl GoModUpdater {
     pub fn new() -> Self {
         // Match: module_path version [// comment]
         // Version format: v1.2.3, v1.2.3-alpha, v1.2.3+incompatible
+        // Pseudo-versions have multiple dash segments: v0.0.0-YYYYMMDDHHMMSS-abcdef012345
+        // The pattern allows zero or more additional dash-separated pre-release segments
+        // so that pseudo-versions are captured in their entirety.
         let require_re =
-            Regex::new(r"^\s*([\w./-]+)\s+(v\d+\.\d+\.\d+(?:-[\w.]+)?(?:\+incompatible)?)")
+            Regex::new(r"^\s*([\w./-]+)\s+(v\d+\.\d+\.\d+(?:-[\w.]+)*(?:\+incompatible)?)")
                 .expect("Invalid require regex");
 
         // Match replace directives: replace old => new
@@ -433,16 +436,22 @@ impl Updater for GoModUpdater {
                 let module = caps.get(1).unwrap().as_str();
                 let current_version = caps.get(2).unwrap().as_str();
 
-                // Skip replaced modules and pseudo-versions
-                if replaced_modules.contains(module) || Self::is_pseudo_version(current_version) {
+                // Skip replaced modules entirely — they point to a local or forked
+                // path and cannot be resolved via the registry.
+                if replaced_modules.contains(module) {
                     continue;
                 }
+
+                // Pseudo-versions (commit-based, not a release tag) are included so
+                // that the audit path can see them, but they must not be bumped.
+                let is_bumpable = !Self::is_pseudo_version(current_version);
 
                 deps.push(ParsedDependency {
                     name: module.to_string(),
                     version: current_version.to_string(),
                     line_number: Some(line_idx + 1),
                     has_upper_bound: false, // Go doesn't have explicit upper bounds
+                    is_bumpable,
                 });
             }
         }
@@ -1137,6 +1146,120 @@ require github.com/foo/bar v2.0.0+incompatible
 
         let content = fs::read_to_string(file.path()).unwrap();
         assert!(content.contains("v2.1.0+incompatible"));
+    }
+
+    // ==================== Pseudo-version audit tests ====================
+
+    /// `parse_dependencies` must include pseudo-version entries so the audit path can see
+    /// them. The entry must carry `is_bumpable: false` so alignment and update paths leave
+    /// it alone.
+    #[test]
+    fn test_parse_dependencies_includes_pseudo_version_as_non_bumpable() {
+        let updater = GoModUpdater::new();
+
+        let mut file = NamedTempFile::new().unwrap();
+        write!(
+            file,
+            r#"module example.com/mymodule
+
+go 1.21
+
+require (
+	golang.org/x/crypto v0.0.0-20200115085410-6d4e4cb37c7d
+)
+"#
+        )
+        .unwrap();
+
+        let deps = updater.parse_dependencies(file.path()).unwrap();
+
+        assert_eq!(deps.len(), 1, "pseudo-version must appear in parse output");
+        assert_eq!(deps[0].name, "golang.org/x/crypto");
+        assert_eq!(
+            deps[0].version, "v0.0.0-20200115085410-6d4e4cb37c7d",
+            "exact pseudo-version string must be preserved"
+        );
+        assert!(
+            !deps[0].is_bumpable,
+            "pseudo-version must have is_bumpable == false"
+        );
+    }
+
+    /// When a go.mod contains both a pseudo-version and a normal release of the same
+    /// module, `parse_dependencies` must return both, and only the semver release must
+    /// be marked bumpable.
+    #[test]
+    fn test_parse_dependencies_mixed_pseudo_and_semver() {
+        let updater = GoModUpdater::new();
+
+        let mut file = NamedTempFile::new().unwrap();
+        write!(
+            file,
+            r#"module example.com/mymodule
+
+require (
+	golang.org/x/crypto v0.0.0-20200115085410-6d4e4cb37c7d
+	github.com/foo/bar v1.2.3
+)
+"#
+        )
+        .unwrap();
+
+        let deps = updater.parse_dependencies(file.path()).unwrap();
+
+        assert_eq!(deps.len(), 2);
+        let pseudo = deps
+            .iter()
+            .find(|d| d.name == "golang.org/x/crypto")
+            .expect("pseudo-version dep not found");
+        assert!(!pseudo.is_bumpable);
+
+        let semver_dep = deps
+            .iter()
+            .find(|d| d.name == "github.com/foo/bar")
+            .expect("semver dep not found");
+        assert!(semver_dep.is_bumpable);
+    }
+
+    /// The update path must continue to skip pseudo-versions — they must remain
+    /// unchanged after `update_file`.
+    #[tokio::test]
+    async fn test_update_still_skips_pseudo_versions() {
+        let mut file = NamedTempFile::new().unwrap();
+        write!(
+            file,
+            r#"module example.com/mymodule
+
+require (
+	golang.org/x/crypto v0.0.0-20200115085410-6d4e4cb37c7d
+	github.com/foo/bar v1.0.0
+)
+"#
+        )
+        .unwrap();
+
+        let registry = MockRegistry::new("go-proxy")
+            .with_version("golang.org/x/crypto", "v0.31.0")
+            .with_version("github.com/foo/bar", "v1.5.0");
+
+        let updater = GoModUpdater::new();
+        let options = UpdateOptions::new(false, false);
+
+        let result = updater
+            .update(file.path(), &registry, options)
+            .await
+            .unwrap();
+
+        // Only the semver dep should be updated
+        assert_eq!(result.updated.len(), 1);
+        assert_eq!(result.updated[0].0, "github.com/foo/bar");
+
+        let content = fs::read_to_string(file.path()).unwrap();
+        assert!(
+            content.contains("v0.0.0-20200115085410-6d4e4cb37c7d"),
+            "pseudo-version must remain unchanged"
+        );
+        assert!(content.contains("v1.5.0"), "semver dep must be updated");
     }
 
     #[tokio::test]

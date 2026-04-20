@@ -426,6 +426,7 @@ impl Updater for PackageJsonUpdater {
                             version: current_version,
                             line_number: line_num,
                             has_upper_bound: false, // npm versions don't have explicit upper bounds like Python
+                            is_bumpable: true,
                         });
                     }
                 }

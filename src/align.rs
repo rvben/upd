@@ -33,6 +33,12 @@ pub struct PackageOccurrence {
     /// deduplication, but OSV NuGet lookups are case-sensitive. This field
     /// carries the un-normalized name so audit queries reach the right advisory.
     pub original_name: String,
+    /// Whether this occurrence can be bumped to a newer version.
+    ///
+    /// `false` for commit-pinned references such as Go pseudo-versions.  These
+    /// are still included so the audit path can inspect them, but they must not
+    /// participate in alignment comparisons or update attempts.
+    pub is_bumpable: bool,
 }
 
 /// Result of alignment analysis for a single package
@@ -53,14 +59,14 @@ impl PackageAlignment {
     pub fn has_misalignment(&self) -> bool {
         self.occurrences
             .iter()
-            .any(|o| !o.has_upper_bound && o.version != self.highest_version)
+            .any(|o| o.is_bumpable && !o.has_upper_bound && o.version != self.highest_version)
     }
 
-    /// Returns only the misaligned occurrences (excluding those at highest version or with constraints)
+    /// Returns only the misaligned occurrences (excluding those at highest version, with constraints, or not bumpable)
     pub fn misaligned_occurrences(&self) -> Vec<&PackageOccurrence> {
         self.occurrences
             .iter()
-            .filter(|o| !o.has_upper_bound && o.version != self.highest_version)
+            .filter(|o| o.is_bumpable && !o.has_upper_bound && o.version != self.highest_version)
             .collect()
     }
 }
@@ -102,6 +108,7 @@ fn to_occurrence(dep: &ParsedDependency, path: &Path, file_type: FileType) -> Pa
         line_number: dep.line_number,
         has_upper_bound: dep.has_upper_bound,
         original_name: dep.name.clone(),
+        is_bumpable: dep.is_bumpable,
     }
 }
 
@@ -169,6 +176,7 @@ pub fn find_alignments(packages: HashMap<(String, Lang), Vec<PackageOccurrence>>
 fn find_highest_version(occurrences: &[PackageOccurrence], lang: Lang) -> Option<String> {
     occurrences
         .iter()
+        .filter(|o| o.is_bumpable) // Skip commit-pinned refs (e.g. Go pseudo-versions)
         .filter(|o| !o.has_upper_bound) // Skip constrained versions
         .filter(|o| is_stable_version(&o.version, lang)) // Skip pre-releases
         .max_by(|a, b| compare_versions(&a.version, &b.version, lang))
@@ -298,6 +306,7 @@ mod tests {
                     line_number: Some(1),
                     has_upper_bound: false,
                     original_name: "requests".to_string(),
+                    is_bumpable: true,
                 },
                 PackageOccurrence {
                     file_path: PathBuf::from("requirements-dev.txt"),
@@ -306,6 +315,7 @@ mod tests {
                     line_number: Some(1),
                     has_upper_bound: false,
                     original_name: "requests".to_string(),
+                    is_bumpable: true,
                 },
             ],
         };
@@ -328,6 +338,7 @@ mod tests {
                     line_number: Some(1),
                     has_upper_bound: true, // Has constraint, should be skipped
                     original_name: "django".to_string(),
+                    is_bumpable: true,
                 },
                 PackageOccurrence {
                     file_path: PathBuf::from("requirements-dev.txt"),
@@ -336,6 +347,7 @@ mod tests {
                     line_number: Some(1),
                     has_upper_bound: false,
                     original_name: "django".to_string(),
+                    is_bumpable: true,
                 },
             ],
         };
@@ -384,6 +396,88 @@ mod tests {
         assert_eq!(
             occurrences[0].original_name, "Newtonsoft.Json",
             "original_name must preserve casing; lowercased name fails OSV NuGet lookups"
+        );
+    }
+
+    /// When the same Go module appears as a pseudo-version in one go.mod and as a
+    /// semver release in another, `find_alignments` must NOT report a misalignment.
+    /// Pseudo-versions are commit pins, not version choices, so they must be excluded
+    /// from alignment comparisons.
+    #[test]
+    fn test_find_alignments_no_misalignment_for_pseudo_version() {
+        use std::io::Write;
+        use tempfile::NamedTempFile;
+
+        let mut file_a = NamedTempFile::with_suffix(".mod").unwrap();
+        write!(
+            file_a,
+            "module example.com/a\n\nrequire golang.org/x/crypto v0.0.0-20200115085410-6d4e4cb37c7d\n"
+        )
+        .unwrap();
+
+        let mut file_b = NamedTempFile::with_suffix(".mod").unwrap();
+        write!(
+            file_b,
+            "module example.com/b\n\nrequire golang.org/x/crypto v0.17.0\n"
+        )
+        .unwrap();
+
+        // We use scan_packages on actual go.mod files to get real ParsedDependency values.
+        // The file extension is .mod, not go.mod, so we specify the FileType directly.
+        let files = vec![
+            (file_a.path().to_path_buf(), FileType::GoMod),
+            (file_b.path().to_path_buf(), FileType::GoMod),
+        ];
+        let packages = scan_packages(&files).unwrap();
+        let result = find_alignments(packages);
+
+        // There must be no misaligned occurrences — the pseudo-version is a pin, not
+        // a version choice that should be aligned to v0.17.0.
+        assert_eq!(
+            result.misaligned_count, 0,
+            "pseudo-version occurrence must not be counted as misaligned"
+        );
+
+        // The package may appear in result.packages (with highest_version = v0.17.0),
+        // but has_misalignment must be false.
+        if let Some(alignment) = result
+            .packages
+            .iter()
+            .find(|p| p.package_name == "golang.org/x/crypto")
+        {
+            assert!(
+                !alignment.has_misalignment(),
+                "has_misalignment must be false when the only lower occurrence is a pseudo-version"
+            );
+        }
+    }
+
+    /// scan_packages must include pseudo-version Go dependencies so that the audit path
+    /// can see them. The occurrence must carry `is_bumpable: false`.
+    #[test]
+    fn test_scan_packages_includes_pseudo_version_with_is_bumpable_false() {
+        use std::io::Write;
+        use tempfile::NamedTempFile;
+
+        let mut f = NamedTempFile::with_suffix(".mod").unwrap();
+        write!(
+            f,
+            "module example.com/mymodule\n\nrequire golang.org/x/crypto v0.0.0-20200115085410-6d4e4cb37c7d\n"
+        )
+        .unwrap();
+
+        let files = vec![(f.path().to_path_buf(), FileType::GoMod)];
+        let packages = scan_packages(&files).unwrap();
+
+        let key = ("golang.org/x/crypto".to_string(), Lang::Go);
+        let occurrences = packages
+            .get(&key)
+            .expect("pseudo-version package not found by scan_packages");
+        assert_eq!(occurrences.len(), 1);
+        assert_eq!(occurrences[0].version, "v0.0.0-20200115085410-6d4e4cb37c7d");
+        assert!(
+            !occurrences[0].is_bumpable,
+            "pseudo-version occurrence must have is_bumpable == false"
         );
     }
 }

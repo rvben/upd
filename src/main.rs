@@ -3313,6 +3313,7 @@ serde = "1.0.1"
                 line_number: Some(6),
                 has_upper_bound: false,
                 original_name: "PackageB".into(),
+                is_bumpable: true,
             }],
             lang: Lang::DotNet,
         };
@@ -3349,6 +3350,7 @@ serde = "1.0.1"
             line_number: Some(5),
             has_upper_bound: false,
             original_name: "Newtonsoft.Json".to_string(),
+            is_bumpable: true,
         }];
 
         let mut packages = HashMap::new();
@@ -3362,5 +3364,48 @@ serde = "1.0.1"
             "AuditPackage.name must use original casing; lowercased name fails OSV NuGet lookups"
         );
         assert_eq!(audit_pkgs[0].version, "12.0.1");
+    }
+
+    /// `build_audit_packages` must include Go pseudo-version entries so the OSV
+    /// query can find CVEs for the specific commit snapshot. Pseudo-versions are
+    /// valid OSV query inputs for the Go ecosystem.
+    #[test]
+    fn test_build_audit_packages_includes_go_pseudo_version() {
+        use std::path::PathBuf;
+
+        let pseudo_version = "v0.0.0-20200115085410-6d4e4cb37c7d";
+
+        // Simulate a scan_packages result containing a pseudo-version occurrence.
+        let key = ("golang.org/x/crypto".to_string(), Lang::Go);
+        let occurrences = vec![PackageOccurrence {
+            file_path: PathBuf::from("go.mod"),
+            file_type: FileType::GoMod,
+            version: pseudo_version.to_string(),
+            line_number: Some(5),
+            has_upper_bound: false,
+            original_name: "golang.org/x/crypto".to_string(),
+            is_bumpable: false,
+        }];
+
+        let mut packages = HashMap::new();
+        packages.insert(key, occurrences);
+
+        let audit_pkgs = build_audit_packages(&packages);
+
+        assert_eq!(
+            audit_pkgs.len(),
+            1,
+            "pseudo-version must produce an AuditPackage"
+        );
+        assert_eq!(audit_pkgs[0].name, "golang.org/x/crypto");
+        assert_eq!(
+            audit_pkgs[0].version, pseudo_version,
+            "exact pseudo-version string must be forwarded to OSV"
+        );
+        assert_eq!(
+            audit_pkgs[0].ecosystem,
+            upd::audit::Ecosystem::Go,
+            "ecosystem must be Go"
+        );
     }
 }

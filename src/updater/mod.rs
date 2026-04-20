@@ -137,6 +137,13 @@ pub struct ParsedDependency {
     pub line_number: Option<usize>,
     /// Whether this dependency has upper bound constraints (e.g., <3.0)
     pub has_upper_bound: bool,
+    /// Whether this dependency can be bumped to a newer version.
+    ///
+    /// Set to `false` for entries that reference a specific commit rather than
+    /// a release tag (e.g. Go pseudo-versions like `v0.0.0-20200115085410-6d4e4cb37c7d`).
+    /// Such entries are still included so that audit paths can see them, but the
+    /// update path and alignment logic must not attempt to bump them.
+    pub is_bumpable: bool,
 }
 
 /// Result of updating a single file

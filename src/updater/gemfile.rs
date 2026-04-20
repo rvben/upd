@@ -327,6 +327,7 @@ impl Updater for GemfileUpdater {
                     version: parsed.version,
                     line_number: Some(line_idx + 1),
                     has_upper_bound: Self::has_upper_bound(&parsed.operator),
+                    is_bumpable: true,
                 });
             }
         }

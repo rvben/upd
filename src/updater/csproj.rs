@@ -452,6 +452,7 @@ impl Updater for CsprojUpdater {
                         version,
                         line_number: Some(tag_line_idx + 1),
                         has_upper_bound: has_range,
+                        is_bumpable: true,
                     });
                     pending_tag = None;
                     continue;
@@ -468,6 +469,7 @@ impl Updater for CsprojUpdater {
                     version: parsed.version,
                     line_number: Some(line_idx + 1),
                     has_upper_bound: parsed.has_range_constraint,
+                    is_bumpable: true,
                 });
                 continue;
             }

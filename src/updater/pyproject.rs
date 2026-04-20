@@ -870,6 +870,7 @@ impl Updater for PyProjectUpdater {
                             version,
                             line_number: line_num,
                             has_upper_bound,
+                            is_bumpable: true,
                         });
                     }
                 }
@@ -893,6 +894,7 @@ impl Updater for PyProjectUpdater {
                                     version,
                                     line_number: line_num,
                                     has_upper_bound,
+                                    is_bumpable: true,
                                 });
                             }
                         }
@@ -926,6 +928,7 @@ impl Updater for PyProjectUpdater {
                                 version,
                                 line_number: line_num,
                                 has_upper_bound: false,
+                                is_bumpable: true,
                             });
                         }
                     }

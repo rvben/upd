@@ -123,6 +123,7 @@ impl MiseUpdater {
                         version: version.to_string(),
                         line_number: Some(line_idx + 1),
                         has_upper_bound: false,
+                        is_bumpable: true,
                     });
                 }
             }
@@ -159,6 +160,7 @@ impl MiseUpdater {
                         version: version.to_string(),
                         line_number: Some(line_idx + 1),
                         has_upper_bound: false,
+                        is_bumpable: true,
                     });
                 }
             }

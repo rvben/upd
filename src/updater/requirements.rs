@@ -454,6 +454,7 @@ impl Updater for RequirementsUpdater {
                     version: parsed.first_version,
                     line_number: Some(line_idx + 1),
                     has_upper_bound,
+                    is_bumpable: true,
                 });
             }
         }
