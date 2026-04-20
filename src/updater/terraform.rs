@@ -185,6 +185,83 @@ impl TerraformUpdater {
     fn has_upper_bound(operator: &str) -> bool {
         matches!(operator, "~>" | "<" | "<=" | "!=")
     }
+
+    /// Computes the new `~>` constraint version when the existing constraint no longer
+    /// covers `latest` (i.e., `pessimistic_constraint_satisfied` returned `false`).
+    ///
+    /// The new constraint version is anchored at the same precision as the original,
+    /// but with the "pinned prefix" taken from `latest` and the variable tail zeroed:
+    ///
+    /// - `~> X.Y`   (2 components): `latest_major.0`
+    ///   e.g. constraint `4.0`, latest `5.2.1` → `5.0`
+    /// - `~> X.Y.Z` (3 components): `latest_major.latest_minor.0`
+    ///   e.g. constraint `4.0.5`, latest `4.1.3` → `4.1.0`
+    ///
+    /// The trailing zero preserves the "start of range" semantics: the constraint
+    /// allows any release in the new series, not just from the specific latest version.
+    fn pessimistic_constraint_new_version(constraint_version: &str, latest: &str) -> String {
+        let constraint_parts: Vec<u64> = constraint_version
+            .split('.')
+            .filter_map(|s| s.parse().ok())
+            .collect();
+        let latest_parts: Vec<u64> = latest.split('.').filter_map(|s| s.parse().ok()).collect();
+
+        let precision = constraint_parts.len();
+
+        // Build a new version with `precision` components: take the first (precision - 1)
+        // components from latest and set the last component to 0.
+        let mut new_parts: Vec<String> = latest_parts
+            .iter()
+            .take(precision.saturating_sub(1))
+            .map(|n| n.to_string())
+            .collect();
+
+        // Pad with zeros if latest has fewer components than needed
+        while new_parts.len() < precision.saturating_sub(1) {
+            new_parts.push("0".to_string());
+        }
+
+        new_parts.push("0".to_string());
+        new_parts.join(".")
+    }
+
+    /// Returns `true` when `latest` falls within the range implied by `~> constraint_version`.
+    ///
+    /// Terraform's pessimistic-constraint operator `~>` pins all but the rightmost
+    /// component of the version and allows any version up to (but not including)
+    /// the next increment of the second-to-rightmost component:
+    ///
+    /// - `~> X.Y`   → `>= X.Y, < X+1.0.0`   (any `X.*`)
+    /// - `~> X.Y.Z` → `>= X.Y.Z, < X.Y+1.0` (any `X.Y.*`)
+    ///
+    /// If the existing constraint already covers `latest`, updating the constraint
+    /// would silently raise its floor and block rollback to earlier patch versions.
+    fn pessimistic_constraint_satisfied(constraint_version: &str, latest: &str) -> bool {
+        let constraint_parts: Vec<u64> = constraint_version
+            .split('.')
+            .filter_map(|s| s.parse().ok())
+            .collect();
+        let latest_parts: Vec<u64> = latest.split('.').filter_map(|s| s.parse().ok()).collect();
+
+        if constraint_parts.is_empty() || latest_parts.is_empty() {
+            return false;
+        }
+
+        match constraint_parts.len() {
+            // ~> X.Y.Z or more: all components except the last must match
+            n if n >= 3 => {
+                // The pinned prefix is all components except the last one.
+                // ~> X.Y.Z means >= X.Y.Z, < X.Y+1.0, so the prefix to lock is [X, Y].
+                let pinned_len = n - 1;
+                constraint_parts[..pinned_len]
+                    == *latest_parts.get(..pinned_len).unwrap_or(&latest_parts[..])
+            }
+            // ~> X.Y: only the major must match
+            2 => latest_parts.first() == constraint_parts.first(),
+            // ~> X: major must match (uncommon but handle gracefully)
+            _ => latest_parts.first() == constraint_parts.first(),
+        }
+    }
 }
 
 impl Default for TerraformUpdater {
@@ -351,7 +428,31 @@ impl Updater for TerraformUpdater {
                             }
                         }
                         PendingVersion::Registry(Ok(latest_version)) => {
-                            let matched_version = if options.full_precision {
+                            // For `~>` constraints, if the latest version still falls within
+                            // the range the constraint already expresses, leave the constraint
+                            // untouched. Rewriting it would silently raise the floor (e.g.
+                            // `~> 4.0` → `~> 4.67`) and block rollback to earlier releases.
+                            if dep.operator == "~>"
+                                && Self::pessimistic_constraint_satisfied(
+                                    &dep.version,
+                                    &latest_version,
+                                )
+                            {
+                                result.unchanged += 1;
+                                new_lines.push(line.to_string());
+                                continue;
+                            }
+
+                            // For ~> constraints that need bumping, anchor the new
+                            // constraint at the start of the new series (e.g. `5.0`)
+                            // rather than the exact latest (e.g. `5.2`), so the full
+                            // new major/minor range remains accessible.
+                            let matched_version = if dep.operator == "~>" {
+                                Self::pessimistic_constraint_new_version(
+                                    &dep.version,
+                                    &latest_version,
+                                )
+                            } else if options.full_precision {
                                 latest_version.clone()
                             } else {
                                 match_version_precision(&dep.version, &latest_version)
@@ -585,11 +686,17 @@ module "vpc" {{
             .await
             .unwrap();
 
-        assert_eq!(result.updated.len(), 3);
+        // hashicorp/aws uses ~> 5.0 and latest 5.83.0 satisfies that constraint —
+        // the constraint floor must not be raised, so aws stays unchanged.
+        assert_eq!(result.updated.len(), 2);
+        assert_eq!(result.unchanged, 1);
         assert!(result.errors.is_empty());
 
         let contents = std::fs::read_to_string(file.path()).unwrap();
-        assert!(contents.contains("~> 5.83"));
+        assert!(
+            contents.contains("~> 5.0"),
+            "~> constraint must not be raised when already satisfied"
+        );
         assert!(contents.contains("3.7.0"));
         assert!(contents.contains("5.16.0"));
     }
@@ -706,5 +813,226 @@ module "vpc" {{
         assert!(updater.handles(FileType::TerraformTf));
         assert!(!updater.handles(FileType::Requirements));
         assert!(!updater.handles(FileType::CargoToml));
+    }
+
+    #[test]
+    fn test_pessimistic_constraint_satisfied_two_components() {
+        // ~> 4.0 allows >= 4.0, < 5.0 — any 4.x satisfies it
+        assert!(TerraformUpdater::pessimistic_constraint_satisfied(
+            "4.0", "4.67.1"
+        ));
+        assert!(TerraformUpdater::pessimistic_constraint_satisfied(
+            "4.0", "4.0.0"
+        ));
+        assert!(TerraformUpdater::pessimistic_constraint_satisfied(
+            "4.0", "4.99.99"
+        ));
+        // Major version changed — no longer satisfied
+        assert!(!TerraformUpdater::pessimistic_constraint_satisfied(
+            "4.0", "5.0.0"
+        ));
+        assert!(!TerraformUpdater::pessimistic_constraint_satisfied(
+            "4.0", "5.2.1"
+        ));
+        assert!(!TerraformUpdater::pessimistic_constraint_satisfied(
+            "4.0", "3.99.0"
+        ));
+    }
+
+    #[test]
+    fn test_pessimistic_constraint_satisfied_three_components() {
+        // ~> 4.0.5 allows >= 4.0.5, < 4.1.0 — any 4.0.x satisfies it
+        assert!(TerraformUpdater::pessimistic_constraint_satisfied(
+            "4.0.5", "4.0.9"
+        ));
+        assert!(TerraformUpdater::pessimistic_constraint_satisfied(
+            "4.0.5", "4.0.5"
+        ));
+        // Minor version changed — no longer satisfied
+        assert!(!TerraformUpdater::pessimistic_constraint_satisfied(
+            "4.0.5", "4.1.0"
+        ));
+        assert!(!TerraformUpdater::pessimistic_constraint_satisfied(
+            "4.0.5", "5.0.0"
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_tilde_gt_two_components_no_change_when_satisfied() {
+        // ~> 4.0 with latest 4.67.1 — constraint already covers latest, leave untouched
+        let mut file = NamedTempFile::new().unwrap();
+        write!(
+            file,
+            r#"terraform {{
+  required_providers {{
+    aws = {{
+      source  = "hashicorp/aws"
+      version = "~> 4.0"
+    }}
+  }}
+}}
+"#
+        )
+        .unwrap();
+
+        let registry =
+            MockRegistry::new("terraform").with_constrained("hashicorp/aws", "~> 4.0", "4.67.1");
+
+        let updater = TerraformUpdater::new();
+        let result = updater
+            .update(file.path(), &registry, UpdateOptions::new(false, false))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            result.updated.len(),
+            0,
+            "should not update when constraint already satisfied"
+        );
+        assert_eq!(result.unchanged, 1);
+        let contents = std::fs::read_to_string(file.path()).unwrap();
+        assert!(contents.contains("~> 4.0"), "file must remain unchanged");
+    }
+
+    #[tokio::test]
+    async fn test_tilde_gt_three_components_no_change_when_satisfied() {
+        // ~> 4.0.5 with latest 4.0.9 — same minor, leave untouched
+        let mut file = NamedTempFile::new().unwrap();
+        write!(
+            file,
+            r#"terraform {{
+  required_providers {{
+    null = {{
+      source  = "hashicorp/null"
+      version = "~> 4.0.5"
+    }}
+  }}
+}}
+"#
+        )
+        .unwrap();
+
+        let registry =
+            MockRegistry::new("terraform").with_constrained("hashicorp/null", "~> 4.0.5", "4.0.9");
+
+        let updater = TerraformUpdater::new();
+        let result = updater
+            .update(file.path(), &registry, UpdateOptions::new(false, false))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            result.updated.len(),
+            0,
+            "should not update when constraint already satisfied"
+        );
+        assert_eq!(result.unchanged, 1);
+        let contents = std::fs::read_to_string(file.path()).unwrap();
+        assert!(contents.contains("~> 4.0.5"), "file must remain unchanged");
+    }
+
+    #[tokio::test]
+    async fn test_tilde_gt_two_components_bumps_on_major_change() {
+        // ~> 4.0 with latest 5.2.1 — major changed, bump to ~> 5.0 (preserve precision)
+        let mut file = NamedTempFile::new().unwrap();
+        write!(
+            file,
+            r#"terraform {{
+  required_providers {{
+    aws = {{
+      source  = "hashicorp/aws"
+      version = "~> 4.0"
+    }}
+  }}
+}}
+"#
+        )
+        .unwrap();
+
+        let registry =
+            MockRegistry::new("terraform").with_constrained("hashicorp/aws", "~> 4.0", "5.2.1");
+
+        let updater = TerraformUpdater::new();
+        let result = updater
+            .update(file.path(), &registry, UpdateOptions::new(false, false))
+            .await
+            .unwrap();
+
+        assert_eq!(result.updated.len(), 1);
+        let contents = std::fs::read_to_string(file.path()).unwrap();
+        // Two-component precision: bump anchors at start of new major series → 5.0
+        assert!(
+            contents.contains("~> 5.0"),
+            "should bump to start of new major with two-component precision"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_tilde_gt_three_components_bumps_on_minor_change() {
+        // ~> 4.0.5 with latest 4.1.0 — minor changed, bump to ~> 4.1.0
+        let mut file = NamedTempFile::new().unwrap();
+        write!(
+            file,
+            r#"terraform {{
+  required_providers {{
+    null = {{
+      source  = "hashicorp/null"
+      version = "~> 4.0.5"
+    }}
+  }}
+}}
+"#
+        )
+        .unwrap();
+
+        let registry =
+            MockRegistry::new("terraform").with_constrained("hashicorp/null", "~> 4.0.5", "4.1.0");
+
+        let updater = TerraformUpdater::new();
+        let result = updater
+            .update(file.path(), &registry, UpdateOptions::new(false, false))
+            .await
+            .unwrap();
+
+        assert_eq!(result.updated.len(), 1);
+        let contents = std::fs::read_to_string(file.path()).unwrap();
+        assert!(
+            contents.contains("~> 4.1.0"),
+            "should bump to new minor with three-component precision"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_exact_pin_still_updates() {
+        // Exact pin (no operator) keeps existing behavior: always update to latest
+        let mut file = NamedTempFile::new().unwrap();
+        write!(
+            file,
+            r#"terraform {{
+  required_providers {{
+    aws = {{
+      source  = "hashicorp/aws"
+      version = "4.0"
+    }}
+  }}
+}}
+"#
+        )
+        .unwrap();
+
+        let registry = MockRegistry::new("terraform").with_version("hashicorp/aws", "4.67.1");
+
+        let updater = TerraformUpdater::new();
+        let result = updater
+            .update(file.path(), &registry, UpdateOptions::new(false, false))
+            .await
+            .unwrap();
+
+        assert_eq!(result.updated.len(), 1);
+        let contents = std::fs::read_to_string(file.path()).unwrap();
+        assert!(
+            contents.contains("4.67"),
+            "exact pin should update to latest"
+        );
     }
 }
