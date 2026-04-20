@@ -197,8 +197,12 @@ fn is_stable_version(version: &str, lang: Lang) -> bool {
     }
 }
 
-/// Compare two versions within the same ecosystem
-fn compare_versions(a: &str, b: &str, lang: Lang) -> std::cmp::Ordering {
+/// Compare two versions within the same ecosystem.
+///
+/// Returns `Ordering::Greater` if `a` is newer than `b`, `Ordering::Less` if older,
+/// and `Ordering::Equal` if they are the same version. Used by updaters to enforce
+/// the no-downgrade invariant before writing any version change.
+pub(crate) fn compare_versions(a: &str, b: &str, lang: Lang) -> std::cmp::Ordering {
     match lang {
         Lang::Python => compare_pep440(a, b),
         Lang::Node | Lang::Rust | Lang::Ruby | Lang::DotNet => compare_semver(a, b),

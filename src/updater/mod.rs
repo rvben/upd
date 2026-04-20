@@ -52,6 +52,14 @@ pub fn read_file_safe(path: &Path) -> Result<String> {
     Ok(content.to_string())
 }
 
+/// Build the standard warning message for a refused version downgrade.
+///
+/// Centralises the message format so all updaters emit identical text,
+/// which makes it easy to grep logs and assert in tests.
+pub(crate) fn downgrade_warning(pkg: &str, latest: &str, current: &str) -> String {
+    format!("skipping {pkg}: latest \"{latest}\" is not greater than current \"{current}\"")
+}
+
 /// Write a file atomically (write to temp file, then rename)
 pub fn write_file_atomic(path: &Path, content: &str) -> Result<()> {
     use std::io::Write;

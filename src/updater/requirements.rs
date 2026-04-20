@@ -1,8 +1,10 @@
 use super::{
     FileType, ParsedDependency, PendingVersion, UpdateOptions, UpdateResult, Updater,
-    read_file_safe, write_file_atomic,
+    downgrade_warning, read_file_safe, write_file_atomic,
 };
+use crate::align::compare_versions;
 use crate::registry::{MultiPyPiRegistry, PyPiRegistry, Registry};
+use crate::updater::Lang;
 use crate::version::match_version_precision;
 use anyhow::Result;
 use futures::future::join_all;
@@ -373,14 +375,30 @@ impl Updater for RequirementsUpdater {
                                 match_version_precision(&parsed.first_version, &latest_version)
                             };
                             if matched_version != parsed.first_version {
-                                result.updated.push((
-                                    parsed.package.clone(),
-                                    parsed.first_version.clone(),
-                                    matched_version.clone(),
-                                    Some(line_num),
-                                ));
-                                new_lines.push(self.update_line(line, &matched_version));
-                                modified = true;
+                                // Refuse to write a downgrade.
+                                if compare_versions(
+                                    &matched_version,
+                                    &parsed.first_version,
+                                    Lang::Python,
+                                ) != std::cmp::Ordering::Greater
+                                {
+                                    result.warnings.push(downgrade_warning(
+                                        &parsed.package,
+                                        &matched_version,
+                                        &parsed.first_version,
+                                    ));
+                                    result.unchanged += 1;
+                                    new_lines.push(line.to_string());
+                                } else {
+                                    result.updated.push((
+                                        parsed.package.clone(),
+                                        parsed.first_version.clone(),
+                                        matched_version.clone(),
+                                        Some(line_num),
+                                    ));
+                                    new_lines.push(self.update_line(line, &matched_version));
+                                    modified = true;
+                                }
                             } else {
                                 result.unchanged += 1;
                                 new_lines.push(line.to_string());
@@ -1144,6 +1162,87 @@ flask>=2.0.0
         assert!(
             contents.contains("django==5.2.0"),
             "django must be updated to 5.2.0"
+        );
+    }
+
+    /// When the registry returns a version *lower* than the current, the updater must
+    /// leave the line unchanged and emit a warning (PEP 440 comparator path).
+    #[tokio::test]
+    async fn test_no_downgrade() {
+        let mut file = NamedTempFile::new().unwrap();
+        writeln!(file, "requests==5.0.0").unwrap();
+        writeln!(file, "flask==3.0.0").unwrap();
+
+        let registry = MockRegistry::new("PyPI")
+            .with_version("requests", "4.0.0") // lower — must be refused
+            .with_version("flask", "4.0.0"); // higher — normal upgrade
+
+        let updater = RequirementsUpdater::new();
+        let options = UpdateOptions::new(false, false);
+        let result = updater
+            .update(file.path(), &registry, options)
+            .await
+            .unwrap();
+
+        // Only flask should be updated; requests downgrade must be refused.
+        assert_eq!(
+            result.updated.len(),
+            1,
+            "only the upgrade should be applied"
+        );
+        assert_eq!(result.updated[0].0, "flask");
+        assert_eq!(
+            result.unchanged, 1,
+            "refused downgrade must count as unchanged"
+        );
+
+        assert_eq!(
+            result.warnings.len(),
+            1,
+            "expected exactly one downgrade warning"
+        );
+        assert!(
+            result.warnings[0].contains("requests"),
+            "warning must name the package"
+        );
+        assert!(
+            result.warnings[0].contains("4.0.0"),
+            "warning must include the rejected latest version"
+        );
+        assert!(
+            result.warnings[0].contains("5.0.0"),
+            "warning must include the current version"
+        );
+
+        let contents = std::fs::read_to_string(file.path()).unwrap();
+        assert!(
+            contents.contains("requests==5.0.0"),
+            "requests line must not be modified"
+        );
+        assert!(contents.contains("flask==4.0.0"), "flask must be updated");
+    }
+
+    /// Equal versions (current == latest after precision-matching) must NOT trigger the
+    /// no-downgrade warning — the existing unchanged branch handles them.
+    #[tokio::test]
+    async fn test_equal_version_no_warning() {
+        let mut file = NamedTempFile::new().unwrap();
+        writeln!(file, "requests==2.31.0").unwrap();
+
+        let registry = MockRegistry::new("PyPI").with_version("requests", "2.31.0");
+
+        let updater = RequirementsUpdater::new();
+        let options = UpdateOptions::new(false, false);
+        let result = updater
+            .update(file.path(), &registry, options)
+            .await
+            .unwrap();
+
+        assert_eq!(result.updated.len(), 0, "no update expected");
+        assert_eq!(result.unchanged, 1, "should be marked unchanged");
+        assert!(
+            result.warnings.is_empty(),
+            "no warning expected for equal version"
         );
     }
 }

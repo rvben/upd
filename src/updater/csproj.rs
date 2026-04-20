@@ -1,8 +1,10 @@
 use super::{
-    FileType, ParsedDependency, UpdateOptions, UpdateResult, Updater, read_file_safe,
-    write_file_atomic,
+    FileType, ParsedDependency, UpdateOptions, UpdateResult, Updater, downgrade_warning,
+    read_file_safe, write_file_atomic,
 };
+use crate::align::compare_versions;
 use crate::registry::Registry;
+use crate::updater::Lang;
 use crate::version::match_version_precision;
 use anyhow::Result;
 use futures::future::join_all;
@@ -340,27 +342,42 @@ impl Updater for CsprojUpdater {
                                 match_version_precision(&pkg.version, &latest_version)
                             };
                             if matched_version != pkg.version {
-                                if !pinned_lines.contains(&line_idx) {
-                                    result.updated.push((
-                                        pkg.name.clone(),
-                                        pkg.version.clone(),
-                                        matched_version.clone(),
-                                        Some(line_num),
-                                    ));
-                                }
-
-                                if line.contains("Version=") {
-                                    // Inline version attribute
-                                    new_lines.push(line.replacen(
-                                        &pkg.version,
+                                // Refuse to write a downgrade: matched_version must be strictly
+                                // greater than the current version.
+                                if compare_versions(&matched_version, &pkg.version, Lang::DotNet)
+                                    != std::cmp::Ordering::Greater
+                                {
+                                    result.warnings.push(downgrade_warning(
+                                        &pkg.name,
                                         &matched_version,
-                                        1,
+                                        &pkg.version,
                                     ));
-                                    modified = true;
-                                } else {
-                                    // Multi-line: version is on a subsequent <Version> line
+                                    result.unchanged += 1;
                                     new_lines.push(line.to_string());
-                                    pending_update = Some((pkg.version.clone(), matched_version));
+                                } else {
+                                    if !pinned_lines.contains(&line_idx) {
+                                        result.updated.push((
+                                            pkg.name.clone(),
+                                            pkg.version.clone(),
+                                            matched_version.clone(),
+                                            Some(line_num),
+                                        ));
+                                    }
+
+                                    if line.contains("Version=") {
+                                        // Inline version attribute
+                                        new_lines.push(line.replacen(
+                                            &pkg.version,
+                                            &matched_version,
+                                            1,
+                                        ));
+                                        modified = true;
+                                    } else {
+                                        // Multi-line: version is on a subsequent <Version> line
+                                        new_lines.push(line.to_string());
+                                        pending_update =
+                                            Some((pkg.version.clone(), matched_version));
+                                    }
                                 }
                             } else {
                                 result.unchanged += 1;
@@ -726,5 +743,107 @@ mod tests {
 
         assert_eq!(result.errors.len(), 1);
         assert!(result.errors[0].contains("NonExistent.Package"));
+    }
+
+    /// When the registry returns a version *lower* than the current (e.g., the NuGet trigger
+    /// case where Microsoft.AspNetCore.App was absorbed into the shared framework after 2.x),
+    /// the updater must leave the file unchanged and emit a warning.
+    #[tokio::test]
+    async fn test_no_downgrade_inline() {
+        let content = r#"<Project Sdk="Microsoft.NET.Sdk">
+  <ItemGroup>
+    <PackageVersion Include="Microsoft.AspNetCore.App" Version="6.0.0" />
+  </ItemGroup>
+</Project>
+"#;
+
+        let mut file = NamedTempFile::new().unwrap();
+        write!(file, "{}", content).unwrap();
+
+        // Registry returns an older version — the real trigger case.
+        let registry = MockRegistry::new("nuget").with_version("Microsoft.AspNetCore.App", "2.2.8");
+
+        let updater = CsprojUpdater::new();
+        let options = UpdateOptions::new(false, false);
+        let result = updater
+            .update(file.path(), &registry, options)
+            .await
+            .unwrap();
+
+        // No updates should have been applied.
+        assert!(
+            result.updated.is_empty(),
+            "downgrade must not be written: {:?}",
+            result.updated
+        );
+        assert_eq!(
+            result.unchanged, 1,
+            "refused downgrade must count as unchanged"
+        );
+
+        // A warning must be present mentioning the package and both versions.
+        assert_eq!(
+            result.warnings.len(),
+            1,
+            "expected exactly one downgrade warning"
+        );
+        assert!(
+            result.warnings[0].contains("Microsoft.AspNetCore.App"),
+            "warning must name the package"
+        );
+        assert!(
+            result.warnings[0].contains("2.2.8"),
+            "warning must include the rejected latest version"
+        );
+        assert!(
+            result.warnings[0].contains("6.0.0"),
+            "warning must include the current version"
+        );
+
+        // File must be byte-for-byte unchanged.
+        let contents = std::fs::read_to_string(file.path()).unwrap();
+        assert!(
+            contents.contains("Version=\"6.0.0\""),
+            "file must not be modified"
+        );
+    }
+
+    /// Multi-line <Version> element variant of the same no-downgrade guard.
+    #[tokio::test]
+    async fn test_no_downgrade_multiline() {
+        let content = r#"<Project Sdk="Microsoft.NET.Sdk">
+  <ItemGroup>
+    <PackageReference Include="Some.Package">
+      <Version>5.0.0</Version>
+    </PackageReference>
+  </ItemGroup>
+</Project>
+"#;
+
+        let mut file = NamedTempFile::new().unwrap();
+        write!(file, "{}", content).unwrap();
+
+        let registry = MockRegistry::new("nuget").with_version("Some.Package", "3.0.0");
+
+        let updater = CsprojUpdater::new();
+        let options = UpdateOptions::new(false, false);
+        let result = updater
+            .update(file.path(), &registry, options)
+            .await
+            .unwrap();
+
+        assert!(result.updated.is_empty(), "downgrade must not be written");
+        assert_eq!(
+            result.unchanged, 1,
+            "refused downgrade must count as unchanged"
+        );
+        assert_eq!(result.warnings.len(), 1);
+        assert!(result.warnings[0].contains("Some.Package"));
+
+        let contents = std::fs::read_to_string(file.path()).unwrap();
+        assert!(
+            contents.contains("<Version>5.0.0</Version>"),
+            "file must not be modified"
+        );
     }
 }

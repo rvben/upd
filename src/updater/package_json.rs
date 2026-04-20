@@ -1,8 +1,10 @@
 use super::{
-    FileType, ParsedDependency, UpdateOptions, UpdateResult, Updater, read_file_safe,
-    write_file_atomic,
+    FileType, ParsedDependency, UpdateOptions, UpdateResult, Updater, downgrade_warning,
+    read_file_safe, write_file_atomic,
 };
+use crate::align::compare_versions;
 use crate::registry::Registry;
+use crate::updater::Lang;
 use crate::version::match_version_precision;
 use anyhow::Result;
 use futures::future::join_all;
@@ -342,21 +344,33 @@ impl Updater for PackageJsonUpdater {
                         match_version_precision(&current_version, &latest_version)
                     };
                     if matched_version != current_version {
-                        let line_num = line_index.line_for(&section, &package);
-                        result.updated.push((
-                            package.clone(),
-                            current_version.clone(),
-                            matched_version.clone(),
-                            line_num,
-                        ));
+                        // Refuse to write a downgrade.
+                        if compare_versions(&matched_version, &current_version, Lang::Node)
+                            != std::cmp::Ordering::Greater
+                        {
+                            result.warnings.push(downgrade_warning(
+                                &package,
+                                &matched_version,
+                                &current_version,
+                            ));
+                            result.unchanged += 1;
+                        } else {
+                            let line_num = line_index.line_for(&section, &package);
+                            result.updated.push((
+                                package.clone(),
+                                current_version.clone(),
+                                matched_version.clone(),
+                                line_num,
+                            ));
 
-                        // Update in content preserving formatting
-                        new_content = self.update_version_in_content(
-                            &new_content,
-                            &package,
-                            &version_str,
-                            &format!("{}{}", prefix, matched_version),
-                        );
+                            // Update in content preserving formatting
+                            new_content = self.update_version_in_content(
+                                &new_content,
+                                &package,
+                                &version_str,
+                                &format!("{}{}", prefix, matched_version),
+                            );
+                        }
                     } else {
                         result.unchanged += 1;
                     }

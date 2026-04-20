@@ -1,8 +1,10 @@
 use super::{
-    FileType, ParsedDependency, UpdateOptions, UpdateResult, Updater, read_file_safe,
-    write_file_atomic,
+    FileType, ParsedDependency, UpdateOptions, UpdateResult, Updater, downgrade_warning,
+    read_file_safe, write_file_atomic,
 };
+use crate::align::compare_versions;
 use crate::registry::Registry;
+use crate::updater::Lang;
 use crate::version::match_version_precision;
 use anyhow::Result;
 use futures::future::join_all;
@@ -291,25 +293,39 @@ impl Updater for GoModUpdater {
                             match_version_precision(current_version, &latest_version)
                         };
                         if matched_version != *current_version {
-                            // Replace version in the line, preserving everything else
-                            let new_line = line.replacen(current_version, &matched_version, 1);
-                            new_lines.push(new_line);
-
-                            if *is_pinned {
-                                // Record as pinned (bypassed registry lookup)
-                                result.pinned.push((
-                                    module.clone(),
-                                    current_version.clone(),
-                                    matched_version,
-                                    Some(line_num),
+                            // Refuse to write a downgrade (registry path only; pins are intentional).
+                            if !is_pinned
+                                && compare_versions(&matched_version, current_version, Lang::Go)
+                                    != std::cmp::Ordering::Greater
+                            {
+                                result.warnings.push(downgrade_warning(
+                                    module,
+                                    &matched_version,
+                                    current_version,
                                 ));
+                                result.unchanged += 1;
+                                new_lines.push(line.to_string());
                             } else {
-                                result.updated.push((
-                                    module.clone(),
-                                    current_version.clone(),
-                                    matched_version,
-                                    Some(line_num),
-                                ));
+                                // Replace version in the line, preserving everything else
+                                let new_line = line.replacen(current_version, &matched_version, 1);
+                                new_lines.push(new_line);
+
+                                if *is_pinned {
+                                    // Record as pinned (bypassed registry lookup)
+                                    result.pinned.push((
+                                        module.clone(),
+                                        current_version.clone(),
+                                        matched_version,
+                                        Some(line_num),
+                                    ));
+                                } else {
+                                    result.updated.push((
+                                        module.clone(),
+                                        current_version.clone(),
+                                        matched_version,
+                                        Some(line_num),
+                                    ));
+                                }
                             }
                         } else {
                             new_lines.push(line.to_string());

@@ -1,8 +1,10 @@
 use super::{
-    FileType, ParsedDependency, UpdateOptions, UpdateResult, Updater, read_file_safe,
-    write_file_atomic,
+    FileType, ParsedDependency, UpdateOptions, UpdateResult, Updater, downgrade_warning,
+    read_file_safe, write_file_atomic,
 };
+use crate::align::compare_versions;
 use crate::registry::{MultiPyPiRegistry, PyPiRegistry, Registry};
+use crate::updater::Lang;
 use crate::version::{is_stable_pep440, match_version_precision};
 use anyhow::{Result, anyhow};
 use futures::future::join_all;
@@ -333,11 +335,26 @@ impl PyProjectUpdater {
                         match_version_precision(&current_version, &latest_version)
                     };
                     if matched_version != current_version {
-                        let updated = self.update_dependency(&dep_str, &matched_version);
-                        result
-                            .updated
-                            .push((package, current_version, matched_version, line_num));
-                        updates.push((i, updated));
+                        // Refuse to write a downgrade.
+                        if compare_versions(&matched_version, &current_version, Lang::Python)
+                            != std::cmp::Ordering::Greater
+                        {
+                            result.warnings.push(downgrade_warning(
+                                &package,
+                                &matched_version,
+                                &current_version,
+                            ));
+                            result.unchanged += 1;
+                        } else {
+                            let updated = self.update_dependency(&dep_str, &matched_version);
+                            result.updated.push((
+                                package,
+                                current_version,
+                                matched_version,
+                                line_num,
+                            ));
+                            updates.push((i, updated));
+                        }
                     } else {
                         result.unchanged += 1;
                     }
@@ -475,19 +492,31 @@ impl PyProjectUpdater {
                         match_version_precision(&version, &latest_version)
                     };
                     if matched_version != version {
-                        let new_val = format!("{}{}", prefix, matched_version);
-                        result
-                            .updated
-                            .push((key.clone(), version, matched_version, line_num));
-
-                        // Preserve decoration when updating
-                        if let Some(Item::Value(Value::String(formatted))) =
-                            deps_table.get_mut(&key)
+                        // Refuse to write a downgrade.
+                        if compare_versions(&matched_version, &version, Lang::Python)
+                            != std::cmp::Ordering::Greater
                         {
-                            let decor = formatted.decor().clone();
-                            let mut new_formatted = Formatted::new(new_val);
-                            *new_formatted.decor_mut() = decor;
-                            *formatted = new_formatted;
+                            result.warnings.push(downgrade_warning(
+                                &key,
+                                &matched_version,
+                                &version,
+                            ));
+                            result.unchanged += 1;
+                        } else {
+                            let new_val = format!("{}{}", prefix, matched_version);
+                            result
+                                .updated
+                                .push((key.clone(), version, matched_version, line_num));
+
+                            // Preserve decoration when updating
+                            if let Some(Item::Value(Value::String(formatted))) =
+                                deps_table.get_mut(&key)
+                            {
+                                let decor = formatted.decor().clone();
+                                let mut new_formatted = Formatted::new(new_val);
+                                *new_formatted.decor_mut() = decor;
+                                *formatted = new_formatted;
+                            }
                         }
                     } else {
                         result.unchanged += 1;

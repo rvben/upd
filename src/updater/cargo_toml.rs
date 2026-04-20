@@ -1,8 +1,10 @@
 use super::{
-    FileType, ParsedDependency, UpdateOptions, UpdateResult, Updater, read_file_safe,
-    write_file_atomic,
+    FileType, ParsedDependency, UpdateOptions, UpdateResult, Updater, downgrade_warning,
+    read_file_safe, write_file_atomic,
 };
+use crate::align::compare_versions;
 use crate::registry::{CratesIoRegistry, Registry};
+use crate::updater::Lang;
 use crate::version::{is_stable_semver, match_version_precision};
 use anyhow::{Result, anyhow};
 use futures::future::join_all;
@@ -328,16 +330,28 @@ impl CargoTomlUpdater {
                         match_version_precision(&current_version, &latest_version)
                     };
                     if matched_version != current_version {
-                        let new_version_req = format!("{}{}", prefix, matched_version);
-                        if let Some(item) = table.get_mut(&key) {
-                            Self::set_version(item, &new_version_req);
+                        // Refuse to write a downgrade.
+                        if compare_versions(&matched_version, &current_version, Lang::Rust)
+                            != std::cmp::Ordering::Greater
+                        {
+                            result.warnings.push(downgrade_warning(
+                                &key,
+                                &matched_version,
+                                &current_version,
+                            ));
+                            result.unchanged += 1;
+                        } else {
+                            let new_version_req = format!("{}{}", prefix, matched_version);
+                            if let Some(item) = table.get_mut(&key) {
+                                Self::set_version(item, &new_version_req);
+                            }
+                            result.updated.push((
+                                key.clone(),
+                                current_version,
+                                matched_version,
+                                line_num,
+                            ));
                         }
-                        result.updated.push((
-                            key.clone(),
-                            current_version,
-                            matched_version,
-                            line_num,
-                        ));
                     } else {
                         result.unchanged += 1;
                     }

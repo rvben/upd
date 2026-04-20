@@ -1,8 +1,10 @@
 use super::{
     FileType, ParsedDependency, PendingVersion, UpdateOptions, UpdateResult, Updater,
-    read_file_safe, write_file_atomic,
+    downgrade_warning, read_file_safe, write_file_atomic,
 };
+use crate::align::compare_versions;
 use crate::registry::Registry;
+use crate::updater::Lang;
 use crate::version::match_version_precision;
 use anyhow::Result;
 use futures::future::join_all;
@@ -248,18 +250,31 @@ impl Updater for GemfileUpdater {
                                 match_version_precision(&parsed.version, &latest_version)
                             };
                             if matched_version != parsed.version {
-                                result.updated.push((
-                                    parsed.name.clone(),
-                                    parsed.version.clone(),
-                                    matched_version.clone(),
-                                    Some(line_num),
-                                ));
-                                new_lines.push(self.update_line(
-                                    line,
-                                    &parsed.version,
-                                    &matched_version,
-                                ));
-                                modified = true;
+                                // Refuse to write a downgrade.
+                                if compare_versions(&matched_version, &parsed.version, Lang::Ruby)
+                                    != std::cmp::Ordering::Greater
+                                {
+                                    result.warnings.push(downgrade_warning(
+                                        &parsed.name,
+                                        &matched_version,
+                                        &parsed.version,
+                                    ));
+                                    result.unchanged += 1;
+                                    new_lines.push(line.to_string());
+                                } else {
+                                    result.updated.push((
+                                        parsed.name.clone(),
+                                        parsed.version.clone(),
+                                        matched_version.clone(),
+                                        Some(line_num),
+                                    ));
+                                    new_lines.push(self.update_line(
+                                        line,
+                                        &parsed.version,
+                                        &matched_version,
+                                    ));
+                                    modified = true;
+                                }
                             } else {
                                 result.unchanged += 1;
                                 new_lines.push(line.to_string());

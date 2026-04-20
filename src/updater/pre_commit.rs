@@ -1,8 +1,10 @@
 use super::{
-    FileType, ParsedDependency, UpdateOptions, UpdateResult, Updater, read_file_safe,
-    write_file_atomic,
+    FileType, ParsedDependency, UpdateOptions, UpdateResult, Updater, downgrade_warning,
+    read_file_safe, write_file_atomic,
 };
+use crate::align::compare_versions;
 use crate::registry::Registry;
+use crate::updater::Lang;
 use crate::version::match_version_precision;
 use anyhow::Result;
 use futures::future::join_all;
@@ -259,23 +261,37 @@ impl Updater for PreCommitUpdater {
                         );
 
                         if new_version != *current_version {
-                            let new_line = line.replacen(current_version, &new_version, 1);
-                            new_lines.push(new_line);
-
-                            if *is_pinned {
-                                result.pinned.push((
-                                    owner_repo.clone(),
-                                    current_version.clone(),
-                                    new_version,
-                                    Some(line_num),
+                            // Refuse to write a downgrade (registry path only; pins are intentional).
+                            if !is_pinned
+                                && compare_versions(&new_version, current_version, Lang::PreCommit)
+                                    != std::cmp::Ordering::Greater
+                            {
+                                result.warnings.push(downgrade_warning(
+                                    owner_repo,
+                                    &new_version,
+                                    current_version,
                                 ));
+                                result.unchanged += 1;
+                                new_lines.push(line.to_string());
                             } else {
-                                result.updated.push((
-                                    owner_repo.clone(),
-                                    current_version.clone(),
-                                    new_version,
-                                    Some(line_num),
-                                ));
+                                let new_line = line.replacen(current_version, &new_version, 1);
+                                new_lines.push(new_line);
+
+                                if *is_pinned {
+                                    result.pinned.push((
+                                        owner_repo.clone(),
+                                        current_version.clone(),
+                                        new_version,
+                                        Some(line_num),
+                                    ));
+                                } else {
+                                    result.updated.push((
+                                        owner_repo.clone(),
+                                        current_version.clone(),
+                                        new_version,
+                                        Some(line_num),
+                                    ));
+                                }
                             }
                         } else {
                             new_lines.push(line.to_string());
