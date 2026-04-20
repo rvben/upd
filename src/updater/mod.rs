@@ -140,6 +140,8 @@ pub struct UpdateResult {
     pub unchanged: usize,
     /// Errors encountered during update
     pub errors: Vec<String>,
+    /// Non-fatal warnings (e.g. lines with unparseable version tokens that were skipped)
+    pub warnings: Vec<String>,
     /// Packages that were ignored due to config: (name, current_version, line_number)
     pub ignored: Vec<(String, String, Option<usize>)>,
     /// Packages that were pinned to a specific version: (name, current_version, pinned_version, line_number)
@@ -151,6 +153,7 @@ impl UpdateResult {
         self.updated.extend(other.updated);
         self.unchanged += other.unchanged;
         self.errors.extend(other.errors);
+        self.warnings.extend(other.warnings);
         self.ignored.extend(other.ignored);
         self.pinned.extend(other.pinned);
     }
@@ -484,6 +487,7 @@ mod tests {
             )],
             unchanged: 5,
             errors: vec!["error1".to_string()],
+            warnings: vec!["warn1".to_string()],
             ignored: vec![("ignored1".to_string(), "1.0".to_string(), Some(3))],
             pinned: vec![(
                 "pinned1".to_string(),
@@ -502,6 +506,7 @@ mod tests {
             )],
             unchanged: 3,
             errors: vec!["error2".to_string()],
+            warnings: vec!["warn2".to_string()],
             ignored: vec![("ignored2".to_string(), "2.0".to_string(), Some(5))],
             pinned: vec![(
                 "pinned2".to_string(),
@@ -516,6 +521,7 @@ mod tests {
         assert_eq!(result1.updated.len(), 2);
         assert_eq!(result1.unchanged, 8);
         assert_eq!(result1.errors.len(), 2);
+        assert_eq!(result1.warnings.len(), 2);
         assert_eq!(result1.ignored.len(), 2);
         assert_eq!(result1.pinned.len(), 2);
         assert_eq!(result1.updated[0].0, "pkg1");

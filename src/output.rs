@@ -22,6 +22,7 @@ pub struct UpdateFileReport {
     pub pinned: Vec<PinnedEntry>,
     pub ignored: Vec<IgnoredEntry>,
     pub errors: Vec<String>,
+    pub warnings: Vec<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -62,6 +63,7 @@ pub struct UpdateSummary {
     pub pinned: usize,
     pub ignored: usize,
     pub errors: usize,
+    pub warnings: usize,
 }
 
 #[derive(Debug, Serialize)]
@@ -190,6 +192,7 @@ pub fn build_update_file_report(
         pinned,
         ignored,
         errors: result.errors.clone(),
+        warnings: result.warnings.clone(),
     }
 }
 
@@ -310,6 +313,9 @@ mod tests {
             pinned: vec![("lodash".into(), "4.17.0".into(), "4.17.21".into(), Some(12))],
             ignored: vec![("chalk".into(), "5.0.0".into(), Some(20))],
             errors: vec!["lookup failed: foo".into()],
+            warnings: vec![
+                "skipping bar: current version \"%version%\" is not a valid PEP 440 version".into(),
+            ],
             unchanged: 4,
         };
         let report = build_update_file_report(
@@ -337,6 +343,10 @@ mod tests {
         assert_eq!(json["pinned"][0]["pinned_to"], "4.17.21");
         assert_eq!(json["ignored"][0]["package"], "chalk");
         assert_eq!(json["errors"][0], "lookup failed: foo");
+        assert_eq!(
+            json["warnings"][0],
+            "skipping bar: current version \"%version%\" is not a valid PEP 440 version"
+        );
     }
 
     #[test]

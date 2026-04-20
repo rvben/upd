@@ -6,6 +6,7 @@ use crate::registry::{MultiPyPiRegistry, PyPiRegistry, Registry};
 use crate::version::match_version_precision;
 use anyhow::Result;
 use futures::future::join_all;
+use pep440_rs::Version as Pep440Version;
 use regex::Regex;
 use std::path::Path;
 use std::sync::Arc;
@@ -275,6 +276,17 @@ impl Updater for RequirementsUpdater {
                     parsed.package.clone(),
                     parsed.first_version.clone(),
                     pinned_version.to_string(),
+                ));
+                continue;
+            }
+
+            // Reject version tokens that are not valid PEP 440 versions (e.g.
+            // template placeholders like `%version%` or garbage like `abc`).
+            // Updating such a line would silently destroy intentional content.
+            if parsed.first_version.parse::<Pep440Version>().is_err() {
+                result.warnings.push(format!(
+                    "skipping {}: current version \"{}\" is not a valid PEP 440 version",
+                    parsed.package, parsed.first_version
                 ));
                 continue;
             }
@@ -1064,5 +1076,74 @@ flask>=2.0.0
         assert!(contents.contains("requests==2.29.0")); // Pinned version
         assert!(contents.contains("flask>=2.0.0")); // Unchanged (ignored)
         assert!(contents.contains("django>=5.0")); // Updated
+    }
+
+    /// Lines whose version token is not a valid PEP 440 version (e.g. template
+    /// placeholders or typos) must be left byte-for-byte unchanged and must
+    /// produce a warning.  Valid lines in the same file must still be updated.
+    #[tokio::test]
+    async fn test_invalid_pep440_version_skipped() {
+        let mut file = NamedTempFile::new().unwrap();
+        writeln!(file, "flask==%version%").unwrap();
+        writeln!(file, "numpy==abc").unwrap();
+        writeln!(file, "django==3.0.0").unwrap();
+
+        let registry = MockRegistry::new("PyPI")
+            .with_version("flask", "3.1.0")
+            .with_version("numpy", "2.0.0")
+            .with_version("django", "5.2.0");
+
+        let updater = RequirementsUpdater::new();
+        let options = UpdateOptions::new(false, false);
+
+        let result = updater
+            .update(file.path(), &registry, options)
+            .await
+            .unwrap();
+
+        // Only django should have been updated — flask and numpy have invalid versions
+        assert_eq!(
+            result.updated.len(),
+            1,
+            "Only the valid package (django) should be updated"
+        );
+        assert_eq!(result.updated[0].0, "django");
+
+        // A warning must be produced for each invalid version
+        assert_eq!(
+            result.warnings.len(),
+            2,
+            "Expected one warning per invalid version token"
+        );
+        assert!(
+            result
+                .warnings
+                .iter()
+                .any(|w| w.contains("flask") && w.contains("%version%")),
+            "Warning for flask must mention the package and the raw token"
+        );
+        assert!(
+            result
+                .warnings
+                .iter()
+                .any(|w| w.contains("numpy") && w.contains("abc")),
+            "Warning for numpy must mention the package and the raw token"
+        );
+
+        // The file lines with invalid versions must be unchanged byte-for-byte
+        let contents = std::fs::read_to_string(file.path()).unwrap();
+        assert!(
+            contents.contains("flask==%version%"),
+            "flask line must remain unchanged"
+        );
+        assert!(
+            contents.contains("numpy==abc"),
+            "numpy line must remain unchanged"
+        );
+        // The valid django line must have been updated
+        assert!(
+            contents.contains("django==5.2.0"),
+            "django must be updated to 5.2.0"
+        );
     }
 }

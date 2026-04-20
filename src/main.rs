@@ -767,6 +767,7 @@ fn emit_update_json(
         pinned: total_result.pinned.len(),
         ignored: total_result.ignored.len(),
         errors: total_result.errors.len(),
+        warnings: total_result.warnings.len(),
     };
 
     let report = UpdateReport {
@@ -2332,6 +2333,7 @@ fn print_file_result(
         && result.pinned.is_empty()
         && result.ignored.is_empty()
         && result.errors.is_empty()
+        && result.warnings.is_empty()
     {
         return;
     }
@@ -2414,6 +2416,16 @@ fn print_file_result(
             location.blue().underline(),
             "Error:".red(),
             error
+        );
+    }
+
+    for warning in &result.warnings {
+        let location = format!("{}:", path);
+        println!(
+            "{} {} {}",
+            location.blue().underline(),
+            "Warning:".yellow(),
+            warning
         );
     }
 }
