@@ -15,7 +15,10 @@ pub use audit::{AuditResult, Ecosystem, OsvClient, Package, PackageAuditResult, 
 pub use cache::Cache;
 pub use cli::{Cli, Command};
 pub use config::UpdConfig;
-pub use lockfile::{LockfileType, detect_lockfiles, regenerate_lockfiles};
+pub use lockfile::{
+    LockfileRegenResult, LockfileType, RegenOutcome, detect_lockfiles, regenerate_lockfiles,
+    tool_available,
+};
 pub use registry::{
     GitHubReleasesRegistry, NpmRegistry, NuGetRegistry, PyPiRegistry, Registry, RubyGemsRegistry,
     TerraformRegistry,

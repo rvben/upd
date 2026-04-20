@@ -3,10 +3,52 @@
 //! After updating manifest files, this module can regenerate lockfiles
 //! by invoking the appropriate package manager.
 
+use std::io;
 use std::path::Path;
 use std::process::Command;
 
 use colored::Colorize;
+
+/// The outcome of attempting to regenerate a single lockfile.
+#[derive(Debug)]
+pub enum RegenOutcome {
+    /// Lockfile was successfully regenerated.
+    Ok(LockfileType),
+    /// The required CLI tool was not found on PATH.
+    ToolMissing {
+        lockfile: LockfileType,
+        /// Name of the missing tool (e.g. `"npm"`).
+        tool: &'static str,
+    },
+    /// The tool ran but exited with a non-zero status.
+    Failed {
+        lockfile: LockfileType,
+        message: String,
+    },
+}
+
+impl RegenOutcome {
+    /// Returns `true` if this outcome represents a hard error (tool missing or
+    /// command failure), which should propagate to the process exit code.
+    pub fn is_error(&self) -> bool {
+        matches!(
+            self,
+            RegenOutcome::ToolMissing { .. } | RegenOutcome::Failed { .. }
+        )
+    }
+
+    /// Returns the error message for hard-error outcomes.
+    pub fn error_message(&self) -> Option<String> {
+        match self {
+            RegenOutcome::Ok(_) => None,
+            RegenOutcome::ToolMissing { lockfile, tool } => Some(format!(
+                "{tool} not found on PATH — cannot regenerate {}\nhint: install {tool} or remove --lock",
+                lockfile.filename()
+            )),
+            RegenOutcome::Failed { message, .. } => Some(message.clone()),
+        }
+    }
+}
 
 /// Lockfile types and their associated commands
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -191,14 +233,38 @@ pub fn detect_lockfiles(manifest_path: &Path) -> Vec<LockfileType> {
     lockfiles
 }
 
-/// Regenerate a lockfile by running the appropriate package manager command
+/// Returns `true` if `tool` is found on PATH.
+///
+/// Uses a lightweight probe: attempt to spawn `tool --version` and check
+/// whether the OS reports `NotFound`. Any other result (including non-zero
+/// exit from `--version`) means the binary exists.
+pub fn tool_available(tool: &str) -> bool {
+    match Command::new(tool).arg("--version").output() {
+        Ok(_) => true,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => false,
+        // Unexpected OS error — assume the tool exists to avoid a false error.
+        Err(_) => true,
+    }
+}
+
+/// Regenerate a single lockfile by running the appropriate package manager.
+///
+/// Returns a [`RegenOutcome`] distinguishing success, missing tool, and
+/// command failure.
 pub fn regenerate_lockfile(
     manifest_path: &Path,
     lockfile_type: LockfileType,
     verbose: bool,
-) -> Result<(), String> {
+) -> RegenOutcome {
     let dir = manifest_path.parent().unwrap_or(Path::new("."));
     let (cmd, args) = lockfile_type.command();
+
+    if !tool_available(cmd) {
+        return RegenOutcome::ToolMissing {
+            lockfile: lockfile_type,
+            tool: cmd,
+        };
+    }
 
     if verbose {
         println!(
@@ -213,11 +279,15 @@ pub fn regenerate_lockfile(
         );
     }
 
-    let output = Command::new(cmd)
-        .args(args)
-        .current_dir(dir)
-        .output()
-        .map_err(|e| format!("Failed to run `{}`: {}", cmd, e))?;
+    let output = match Command::new(cmd).args(args).current_dir(dir).output() {
+        Ok(o) => o,
+        Err(e) => {
+            return RegenOutcome::Failed {
+                lockfile: lockfile_type,
+                message: format!("Failed to run `{cmd}`: {e}"),
+            };
+        }
+    };
 
     if output.status.success() {
         println!(
@@ -225,33 +295,63 @@ pub fn regenerate_lockfile(
             "✓".green(),
             lockfile_type.filename().bold()
         );
-        Ok(())
+        RegenOutcome::Ok(lockfile_type)
     } else {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        Err(format!(
-            "Failed to regenerate {}: {}",
-            lockfile_type.filename(),
-            stderr.trim()
-        ))
+        RegenOutcome::Failed {
+            lockfile: lockfile_type,
+            message: format!(
+                "Failed to regenerate {}: {}",
+                lockfile_type.filename(),
+                stderr.trim()
+            ),
+        }
     }
 }
 
-/// Regenerate all detected lockfiles for a manifest
-pub fn regenerate_lockfiles(
-    manifest_path: &Path,
-    verbose: bool,
-) -> Vec<Result<LockfileType, String>> {
-    let lockfiles = detect_lockfiles(manifest_path);
-    let mut results = Vec::new();
+/// The result of running lockfile regeneration for a single manifest path.
+#[derive(Debug, Default)]
+pub struct LockfileRegenResult {
+    /// Outcomes for each lockfile that was attempted (or found missing).
+    pub outcomes: Vec<RegenOutcome>,
+    /// True if the manifest had no associated lockfiles to regenerate.
+    pub no_lockfiles: bool,
+}
 
-    for lockfile_type in lockfiles {
-        match regenerate_lockfile(manifest_path, lockfile_type, verbose) {
-            Ok(()) => results.push(Ok(lockfile_type)),
-            Err(e) => results.push(Err(e)),
-        }
+impl LockfileRegenResult {
+    /// Returns all hard-error messages (tool missing or command failed).
+    pub fn error_messages(&self) -> Vec<String> {
+        self.outcomes
+            .iter()
+            .filter_map(|o| o.error_message())
+            .collect()
+    }
+}
+
+/// Regenerate all lockfiles for a manifest, returning a structured result.
+///
+/// If no lockfiles are detected the caller is responsible for emitting the
+/// `note:` skip message; this function sets `no_lockfiles = true` to signal
+/// that.
+pub fn regenerate_lockfiles(manifest_path: &Path, verbose: bool) -> LockfileRegenResult {
+    let lockfiles = detect_lockfiles(manifest_path);
+
+    if lockfiles.is_empty() {
+        return LockfileRegenResult {
+            outcomes: Vec::new(),
+            no_lockfiles: true,
+        };
     }
 
-    results
+    let outcomes = lockfiles
+        .into_iter()
+        .map(|lf| regenerate_lockfile(manifest_path, lf, verbose))
+        .collect();
+
+    LockfileRegenResult {
+        outcomes,
+        no_lockfiles: false,
+    }
 }
 
 #[cfg(test)]
@@ -612,5 +712,119 @@ mod tests {
 
         let detected = detect_lockfiles(&manifest);
         assert!(detected.is_empty());
+    }
+
+    // --- tool_available tests ---
+
+    #[test]
+    fn tool_available_returns_true_for_known_tools() {
+        // These tools are reliably present in a standard Rust dev environment.
+        assert!(
+            tool_available("cargo"),
+            "cargo should be on PATH in a Rust dev environment"
+        );
+    }
+
+    #[test]
+    fn tool_available_returns_false_for_nonexistent_tool() {
+        assert!(
+            !tool_available("__upd_nonexistent_tool_abc123__"),
+            "a nonsense binary name should not be found on PATH"
+        );
+    }
+
+    // --- regenerate_lockfiles no-lockfile detection ---
+
+    #[test]
+    fn regenerate_lockfiles_no_lockfile_sets_flag() {
+        // package.json with NO package-lock.json → no_lockfiles = true
+        let dir = tempdir().unwrap();
+        let manifest = dir.path().join("package.json");
+        fs::write(&manifest, "{}").unwrap();
+        // Deliberately do NOT create package-lock.json
+
+        let result = regenerate_lockfiles(&manifest, false);
+        assert!(
+            result.no_lockfiles,
+            "no_lockfiles should be true when no lockfile exists beside the manifest"
+        );
+        assert!(
+            result.outcomes.is_empty(),
+            "outcomes should be empty when no lockfile exists"
+        );
+    }
+
+    #[test]
+    fn regenerate_lockfiles_cargo_no_lockfile_sets_flag() {
+        // Cargo.toml with NO Cargo.lock → no_lockfiles = true
+        let dir = tempdir().unwrap();
+        let manifest = dir.path().join("Cargo.toml");
+        fs::write(&manifest, "[package]").unwrap();
+        // Deliberately do NOT create Cargo.lock
+
+        let result = regenerate_lockfiles(&manifest, false);
+        assert!(
+            result.no_lockfiles,
+            "no_lockfiles should be true when Cargo.lock is absent"
+        );
+    }
+
+    #[test]
+    fn regen_outcome_tool_missing_is_error_with_message() {
+        let outcome = RegenOutcome::ToolMissing {
+            lockfile: LockfileType::PackageLockJson,
+            tool: "npm",
+        };
+        assert!(outcome.is_error());
+        let msg = outcome
+            .error_message()
+            .expect("ToolMissing should have an error message");
+        assert!(
+            msg.contains("npm"),
+            "error message should mention the tool name"
+        );
+        assert!(
+            msg.contains("package-lock.json"),
+            "error message should mention the lockfile"
+        );
+    }
+
+    #[test]
+    fn regen_outcome_ok_is_not_error() {
+        let outcome = RegenOutcome::Ok(LockfileType::CargoLock);
+        assert!(!outcome.is_error());
+        assert!(outcome.error_message().is_none());
+    }
+
+    #[test]
+    fn regen_outcome_failed_is_error() {
+        let outcome = RegenOutcome::Failed {
+            lockfile: LockfileType::CargoLock,
+            message: "exit status 1".to_string(),
+        };
+        assert!(outcome.is_error());
+        assert!(outcome.error_message().is_some());
+    }
+
+    #[test]
+    fn lockfile_regen_result_error_messages_collects_hard_errors() {
+        let result = LockfileRegenResult {
+            outcomes: vec![
+                RegenOutcome::Ok(LockfileType::PoetryLock),
+                RegenOutcome::ToolMissing {
+                    lockfile: LockfileType::CargoLock,
+                    tool: "cargo",
+                },
+                RegenOutcome::Failed {
+                    lockfile: LockfileType::GoSum,
+                    message: "exit 1".to_string(),
+                },
+            ],
+            no_lockfiles: false,
+        };
+        let msgs = result.error_messages();
+        assert_eq!(msgs.len(), 2, "only ToolMissing and Failed are errors");
+        assert!(msgs[0].contains("cargo"));
+        assert!(msgs[1].contains("exit 1"));
     }
 }

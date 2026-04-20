@@ -13,7 +13,7 @@ use upd::cache::{Cache, CachedRegistry};
 use upd::cli::{BumpLevel, Cli, Command};
 use upd::config::UpdConfig;
 use upd::interactive::{PendingUpdate, prompt_all};
-use upd::lockfile::regenerate_lockfiles;
+use upd::lockfile::{LockfileRegenResult, regenerate_lockfiles};
 use upd::registry::{
     CratesIoRegistry, GitHubReleasesRegistry, GoProxyRegistry, MultiPyPiRegistry, NpmRegistry,
     NuGetRegistry, PyPiRegistry, RubyGemsRegistry, TerraformRegistry,
@@ -700,23 +700,44 @@ async fn run_update(cli: &Cli) -> Result<()> {
 
     // Regenerate lockfiles if requested and files were updated
     if cli.lock && !dry_run && !updated_files.is_empty() {
-        if text_mode {
-            println!();
-            println!("{}", "Regenerating lockfiles...".cyan());
-        }
-
         let mut processed_dirs: HashSet<PathBuf> = HashSet::new();
+        let mut regen_results: Vec<(PathBuf, LockfileRegenResult)> = Vec::new();
 
         for path in &updated_files {
             if let Some(dir) = path.parent() {
                 let dir_path = dir.to_path_buf();
                 if processed_dirs.insert(dir_path) {
-                    let results = regenerate_lockfiles(path, verbose && text_mode);
-                    for result in results {
-                        if let Err(e) = result {
-                            eprintln!("{}", format!("Warning: {}", e).yellow());
-                        }
-                    }
+                    let result = regenerate_lockfiles(path, verbose && text_mode);
+                    regen_results.push((path.clone(), result));
+                }
+            }
+        }
+
+        // Determine whether any lockfiles will actually be regenerated so
+        // the header is only printed when there is real work to do.
+        let has_work = regen_results.iter().any(|(_, r)| !r.no_lockfiles);
+
+        if text_mode && has_work {
+            println!();
+            println!("{}", "Regenerating lockfiles...".cyan());
+        }
+
+        for (path, result) in regen_results {
+            if result.no_lockfiles {
+                let manifest_name = path
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_default();
+                eprintln!(
+                    "note: no lockfile found for {} — skipping (nothing to regenerate)",
+                    manifest_name
+                );
+                continue;
+            }
+            for outcome in result.outcomes {
+                if let Some(msg) = outcome.error_message() {
+                    eprintln!("{}", format!("error: {msg}").red());
+                    total_result.errors.push(msg);
                 }
             }
         }
@@ -1063,23 +1084,49 @@ async fn run_interactive_update(
 
     // Regenerate lockfiles if requested and files were updated
     if cli.lock && !updated_files.is_empty() {
-        println!();
-        println!("{}", "Regenerating lockfiles...".cyan());
-
         let mut processed_dirs: HashSet<std::path::PathBuf> = HashSet::new();
+        let mut regen_results: Vec<(PathBuf, LockfileRegenResult)> = Vec::new();
 
         for path in &updated_files {
             if let Some(dir) = path.parent() {
                 let dir_path = dir.to_path_buf();
                 if processed_dirs.insert(dir_path) {
-                    let results = regenerate_lockfiles(path, cli.verbose);
-                    for result in results {
-                        if let Err(e) = result {
-                            eprintln!("{}", format!("Warning: {}", e).yellow());
-                        }
-                    }
+                    let result = regenerate_lockfiles(path, cli.verbose);
+                    regen_results.push((path.clone(), result));
                 }
             }
+        }
+
+        // Only print the header when at least one lockfile will be regenerated.
+        let has_work = regen_results.iter().any(|(_, r)| !r.no_lockfiles);
+
+        if has_work {
+            println!();
+            println!("{}", "Regenerating lockfiles...".cyan());
+        }
+
+        let mut had_error = false;
+        for (path, result) in regen_results {
+            if result.no_lockfiles {
+                let manifest_name = path
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_default();
+                eprintln!(
+                    "note: no lockfile found for {} — skipping (nothing to regenerate)",
+                    manifest_name
+                );
+                continue;
+            }
+            for outcome in result.outcomes {
+                if let Some(msg) = outcome.error_message() {
+                    eprintln!("{}", format!("error: {msg}").red());
+                    had_error = true;
+                }
+            }
+        }
+        if had_error {
+            std::process::exit(2);
         }
     }
 
