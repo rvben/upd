@@ -4,6 +4,7 @@ use colored::Colorize;
 use futures::stream::{self, StreamExt};
 
 use std::collections::{HashMap, HashSet};
+use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use upd::align::{PackageAlignment, PackageOccurrence, find_alignments, scan_packages};
@@ -809,6 +810,18 @@ async fn run_interactive_update(
     cache: &Arc<std::sync::Mutex<Cache>>,
     cache_enabled: bool,
 ) -> Result<()> {
+    if !std::io::stdin().is_terminal() {
+        eprintln!(
+            "{} --interactive requires a terminal on stdin",
+            "error:".red()
+        );
+        eprintln!(
+            "{} use --check to preview updates, or --dry-run to print proposed changes",
+            "hint:".dimmed()
+        );
+        std::process::exit(2);
+    }
+
     let mut pending_updates: Vec<PendingUpdate> = Vec::new();
     let mut planned_changes: Vec<PlannedChange> = Vec::new();
     let mut scanned_results: Vec<ScannedFileResult> = Vec::new();
