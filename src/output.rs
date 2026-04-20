@@ -371,6 +371,7 @@ mod tests {
                     version: "18.2.0".into(),
                     line_number: Some(4),
                     has_upper_bound: false,
+                    original_name: "react".into(),
                 },
                 PackageOccurrence {
                     file_path: PathBuf::from("api/package.json"),
@@ -378,6 +379,7 @@ mod tests {
                     version: "19.0.0".into(),
                     line_number: Some(5),
                     has_upper_bound: false,
+                    original_name: "react".into(),
                 },
                 PackageOccurrence {
                     file_path: PathBuf::from("legacy/package.json"),
@@ -385,6 +387,7 @@ mod tests {
                     version: "17.0.0".into(),
                     line_number: Some(6),
                     has_upper_bound: true,
+                    original_name: "react".into(),
                 },
             ],
         };

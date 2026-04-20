@@ -6,7 +6,7 @@ use futures::stream::{self, StreamExt};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use upd::align::{PackageAlignment, find_alignments, scan_packages};
+use upd::align::{PackageAlignment, PackageOccurrence, find_alignments, scan_packages};
 use upd::audit::{AuditResult, Ecosystem, OsvClient, Package as AuditPackage};
 use upd::cache::{Cache, CachedRegistry};
 use upd::cli::{BumpLevel, Cli, Command};
@@ -1216,6 +1216,59 @@ fn emit_align_json(packages: &[PackageAlignment], file_count: usize) -> Result<(
     Ok(())
 }
 
+/// Build the deduplicated list of packages to submit to OSV.
+///
+/// The HashMap key is lowercased for case-insensitive alignment deduplication,
+/// but OSV's NuGet ecosystem is case-sensitive. Each `PackageOccurrence` carries
+/// `original_name` with the casing from the dependency file; that value is used
+/// as `AuditPackage::name` so OSV queries reach the correct advisory.
+pub(crate) fn build_audit_packages(
+    packages: &HashMap<(String, Lang), Vec<PackageOccurrence>>,
+) -> Vec<AuditPackage> {
+    let mut audit_packages: Vec<AuditPackage> = Vec::new();
+    let mut seen: HashSet<(String, String, String)> = HashSet::new();
+
+    for ((name, lang), occurrences) in packages {
+        // OSV doesn't cover GitHub Actions, pre-commit hooks, mise tools, or Terraform; skip
+        if *lang == Lang::Actions
+            || *lang == Lang::PreCommit
+            || *lang == Lang::Mise
+            || *lang == Lang::Terraform
+        {
+            continue;
+        }
+
+        let ecosystem = match lang {
+            Lang::Python => Ecosystem::PyPI,
+            Lang::Node => Ecosystem::Npm,
+            Lang::Rust => Ecosystem::CratesIo,
+            Lang::Go => Ecosystem::Go,
+            Lang::Ruby => Ecosystem::RubyGems,
+            Lang::DotNet => Ecosystem::NuGet,
+            Lang::Actions | Lang::PreCommit | Lang::Mise | Lang::Terraform => {
+                unreachable!("filtered above")
+            }
+        };
+
+        for occurrence in occurrences {
+            let key = (
+                name.clone(),
+                occurrence.version.clone(),
+                ecosystem.as_str().to_string(),
+            );
+            if seen.insert(key) {
+                audit_packages.push(AuditPackage {
+                    name: occurrence.original_name.clone(),
+                    version: occurrence.version.clone(),
+                    ecosystem,
+                });
+            }
+        }
+    }
+
+    audit_packages
+}
+
 async fn run_audit(cli: &Cli) -> Result<()> {
     let text_mode = cli.format == upd::cli::OutputFormat::Text;
     let paths = cli.get_paths();
@@ -1252,47 +1305,7 @@ async fn run_audit(cli: &Cli) -> Result<()> {
     };
 
     // Convert to audit packages (deduplicate by name+version+ecosystem)
-    let mut audit_packages: Vec<AuditPackage> = Vec::new();
-    let mut seen: std::collections::HashSet<(String, String, String)> =
-        std::collections::HashSet::new();
-
-    for ((name, lang), occurrences) in &packages {
-        // OSV doesn't cover GitHub Actions, pre-commit hooks, mise tools, or Terraform; skip
-        if *lang == Lang::Actions
-            || *lang == Lang::PreCommit
-            || *lang == Lang::Mise
-            || *lang == Lang::Terraform
-        {
-            continue;
-        }
-
-        let ecosystem = match lang {
-            Lang::Python => Ecosystem::PyPI,
-            Lang::Node => Ecosystem::Npm,
-            Lang::Rust => Ecosystem::CratesIo,
-            Lang::Go => Ecosystem::Go,
-            Lang::Ruby => Ecosystem::RubyGems,
-            Lang::DotNet => Ecosystem::NuGet,
-            Lang::Actions | Lang::PreCommit | Lang::Mise | Lang::Terraform => {
-                unreachable!("filtered above")
-            }
-        };
-
-        for occurrence in occurrences {
-            let key = (
-                name.clone(),
-                occurrence.version.clone(),
-                ecosystem.as_str().to_string(),
-            );
-            if seen.insert(key) {
-                audit_packages.push(AuditPackage {
-                    name: name.clone(),
-                    version: occurrence.version.clone(),
-                    ecosystem,
-                });
-            }
-        }
-    }
+    let audit_packages = build_audit_packages(&packages);
 
     if audit_packages.is_empty() {
         if text_mode {
@@ -2532,6 +2545,7 @@ mod tests {
     use super::*;
     use clap::Parser;
     use tempfile::tempdir;
+    use upd::align::PackageOccurrence;
 
     #[test]
     fn test_parse_version() {
@@ -3267,12 +3281,13 @@ serde = "1.0.1"
         let alignment = PackageAlignment {
             package_name: "PackageB".into(),
             highest_version: "2.0.0".into(),
-            occurrences: vec![upd::align::PackageOccurrence {
+            occurrences: vec![PackageOccurrence {
                 file_path: file.clone(),
                 file_type: FileType::Csproj,
                 version: "1.0.0".into(),
                 line_number: Some(6),
                 has_upper_bound: false,
+                original_name: "PackageB".into(),
             }],
             lang: Lang::DotNet,
         };
@@ -3291,5 +3306,36 @@ serde = "1.0.1"
                 "<PackageReference Include=\"PackageB\">\n      <Version>2.0.0</Version>"
             )
         );
+    }
+
+    /// Asserts `AuditPackage.name` preserves original casing for OSV queries
+    /// (NuGet is case-sensitive).
+    #[test]
+    fn test_build_audit_packages_preserves_original_name_casing() {
+        use std::path::PathBuf;
+
+        // Simulate what scan_packages produces for a .csproj: the HashMap key is
+        // lowercased for deduplication, but the occurrence records the original casing.
+        let key = ("newtonsoft.json".to_string(), Lang::DotNet);
+        let occurrences = vec![PackageOccurrence {
+            file_path: PathBuf::from("MyApp.csproj"),
+            file_type: FileType::Csproj,
+            version: "12.0.1".to_string(),
+            line_number: Some(5),
+            has_upper_bound: false,
+            original_name: "Newtonsoft.Json".to_string(),
+        }];
+
+        let mut packages = HashMap::new();
+        packages.insert(key, occurrences);
+
+        let audit_pkgs = build_audit_packages(&packages);
+
+        assert_eq!(audit_pkgs.len(), 1);
+        assert_eq!(
+            audit_pkgs[0].name, "Newtonsoft.Json",
+            "AuditPackage.name must use original casing; lowercased name fails OSV NuGet lookups"
+        );
+        assert_eq!(audit_pkgs[0].version, "12.0.1");
     }
 }

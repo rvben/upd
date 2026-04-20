@@ -27,6 +27,12 @@ pub struct PackageOccurrence {
     pub line_number: Option<usize>,
     /// Whether this package has upper bound constraints (e.g., <3.0)
     pub has_upper_bound: bool,
+    /// Package name with its original casing as it appears in the file.
+    ///
+    /// The HashMap key in `scan_packages` is lowercased for case-insensitive
+    /// deduplication, but OSV NuGet lookups are case-sensitive. This field
+    /// carries the un-normalized name so audit queries reach the right advisory.
+    pub original_name: String,
 }
 
 /// Result of alignment analysis for a single package
@@ -95,6 +101,7 @@ fn to_occurrence(dep: &ParsedDependency, path: &Path, file_type: FileType) -> Pa
         version: dep.version.clone(),
         line_number: dep.line_number,
         has_upper_bound: dep.has_upper_bound,
+        original_name: dep.name.clone(),
     }
 }
 
@@ -286,6 +293,7 @@ mod tests {
                     version: "2.28.0".to_string(),
                     line_number: Some(1),
                     has_upper_bound: false,
+                    original_name: "requests".to_string(),
                 },
                 PackageOccurrence {
                     file_path: PathBuf::from("requirements-dev.txt"),
@@ -293,6 +301,7 @@ mod tests {
                     version: "2.31.0".to_string(),
                     line_number: Some(1),
                     has_upper_bound: false,
+                    original_name: "requests".to_string(),
                 },
             ],
         };
@@ -314,6 +323,7 @@ mod tests {
                     version: "3.2.0".to_string(),
                     line_number: Some(1),
                     has_upper_bound: true, // Has constraint, should be skipped
+                    original_name: "django".to_string(),
                 },
                 PackageOccurrence {
                     file_path: PathBuf::from("requirements-dev.txt"),
@@ -321,11 +331,55 @@ mod tests {
                     version: "4.2.0".to_string(),
                     line_number: Some(1),
                     has_upper_bound: false,
+                    original_name: "django".to_string(),
                 },
             ],
         };
 
         // No misalignment because the lower version has upper bound constraint
         assert!(!alignment.has_misalignment());
+    }
+
+    /// scan_packages must preserve the original package-name casing in each
+    /// PackageOccurrence so that OSV audit queries use the correct name.
+    ///
+    /// OSV's NuGet ecosystem is case-sensitive: querying with "newtonsoft.json"
+    /// returns no results, but "Newtonsoft.Json" returns CVE advisories. The
+    /// HashMap key is intentionally lowercased for deduplication; the
+    /// original_name field carries the un-lowercased form for audit queries.
+    #[test]
+    fn test_scan_packages_preserves_original_name_casing() {
+        use std::io::Write;
+        use tempfile::NamedTempFile;
+
+        // Create a minimal .csproj with a mixed-case NuGet package name
+        let mut f = NamedTempFile::with_suffix(".csproj").unwrap();
+        write!(
+            f,
+            r#"<Project Sdk="Microsoft.NET.Sdk">
+  <ItemGroup>
+    <PackageReference Include="Newtonsoft.Json" Version="12.0.1" />
+  </ItemGroup>
+</Project>"#
+        )
+        .unwrap();
+
+        let path = f.path().to_path_buf();
+        let files = vec![(path, FileType::Csproj)];
+
+        let packages = scan_packages(&files).unwrap();
+
+        // The HashMap key must be lowercased for deduplication
+        let key = ("newtonsoft.json".to_string(), Lang::DotNet);
+        let occurrences = packages
+            .get(&key)
+            .expect("package not found under lowercased key");
+        assert_eq!(occurrences.len(), 1);
+
+        // The occurrence must carry the original, un-lowercased name for OSV queries
+        assert_eq!(
+            occurrences[0].original_name, "Newtonsoft.Json",
+            "original_name must preserve casing; lowercased name fails OSV NuGet lookups"
+        );
     }
 }
