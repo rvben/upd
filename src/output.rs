@@ -11,6 +11,44 @@ use crate::updater::{FileType, UpdateResult};
 use serde::Serialize;
 use std::path::Path;
 
+/// A structured error entry in the JSON output.
+///
+/// Replaces the former `errors: Vec<String>` with typed objects so that
+/// consumers can programmatically distinguish network failures from parse
+/// errors without string-matching.
+#[derive(Debug, Serialize, Clone)]
+pub struct ErrorEntry {
+    /// Path of the file being processed when the error occurred, if known.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub file: Option<String>,
+    /// Package name involved in the error, if applicable.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub package: Option<String>,
+    /// Machine-readable error category.
+    pub kind: &'static str,
+    /// Human-readable error description.
+    pub message: String,
+}
+
+impl ErrorEntry {
+    /// Construct an error with a known file path.
+    ///
+    /// The `kind` argument is one of the documented error categories:
+    /// `"network"`, `"parse"`, `"registry"`, `"io"`, or `"other"`.
+    pub fn with_file(
+        file: impl Into<String>,
+        kind: &'static str,
+        message: impl Into<String>,
+    ) -> Self {
+        Self {
+            file: Some(file.into()),
+            package: None,
+            kind,
+            message: message.into(),
+        }
+    }
+}
+
 /// Wire-level representation of a dependency file and what `upd update`
 /// would or did do to it.
 #[derive(Debug, Serialize)]
@@ -21,7 +59,7 @@ pub struct UpdateFileReport {
     pub updates: Vec<UpdateEntry>,
     pub pinned: Vec<PinnedEntry>,
     pub ignored: Vec<IgnoredEntry>,
-    pub errors: Vec<String>,
+    pub errors: Vec<ErrorEntry>,
     pub warnings: Vec<String>,
 }
 
@@ -184,14 +222,21 @@ pub fn build_update_file_report(
         })
         .collect();
 
+    let path_str = path.display().to_string();
+    let errors = result
+        .errors
+        .iter()
+        .map(|msg| ErrorEntry::with_file(path_str.clone(), "other", msg.clone()))
+        .collect();
+
     UpdateFileReport {
-        path: path.display().to_string(),
+        path: path_str,
         file_type: file_type.as_str(),
         lang: file_type.lang().as_str(),
         updates,
         pinned,
         ignored,
-        errors: result.errors.clone(),
+        errors,
         warnings: result.warnings.clone(),
     }
 }
@@ -342,7 +387,9 @@ mod tests {
         assert_eq!(json["updates"][0]["line"], 7);
         assert_eq!(json["pinned"][0]["pinned_to"], "4.17.21");
         assert_eq!(json["ignored"][0]["package"], "chalk");
-        assert_eq!(json["errors"][0], "lookup failed: foo");
+        assert_eq!(json["errors"][0]["message"], "lookup failed: foo");
+        assert_eq!(json["errors"][0]["kind"], "other");
+        assert_eq!(json["errors"][0]["file"], "package.json");
         assert_eq!(
             json["warnings"][0],
             "skipping bar: current version \"%version%\" is not a valid PEP 440 version"

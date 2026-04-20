@@ -680,10 +680,21 @@ async fn run_update(cli: &Cli) -> Result<()> {
                 total_result.merge(file_result);
             }
             Err(e) => {
-                eprintln!(
-                    "{}",
-                    format!("Error processing {}: {}", path.display(), e).red()
-                );
+                let msg = format!("Error processing {}: {}", path.display(), e);
+                eprintln!("{}", msg.red());
+                // Surface the outer error in both the aggregate and the per-file
+                // record so JSON output captures it and the exit-code logic can
+                // detect that errors occurred.
+                let error_result = UpdateResult {
+                    errors: vec![e.clone()],
+                    ..Default::default()
+                };
+                total_result.errors.push(e);
+                scanned.push(ScannedFileResult {
+                    path: path.clone(),
+                    file_type,
+                    result: error_result,
+                });
             }
         }
     }
@@ -724,9 +735,11 @@ async fn run_update(cli: &Cli) -> Result<()> {
         emit_update_json(&scanned, &total_result, file_count, dry_run, filter)?;
     }
 
-    // In check mode, exit with code 1 if any updates are available
-    if cli.check && has_checkable_manifest_changes(&total_result, filter) {
-        std::process::exit(1);
+    let has_errors = !total_result.errors.is_empty();
+    let has_pending = has_checkable_manifest_changes(&total_result, filter);
+    let exit_code = upd::decide_exit_code(cli.check, has_pending, has_errors);
+    if exit_code != 0 {
+        std::process::exit(exit_code);
     }
 
     Ok(())
