@@ -26,7 +26,7 @@ repos:
 
       - id: cargo-test
         name: cargo test
-        entry: cargo test --lib -- --test-threads=1
+        entry: env UPD_CACHE_DIR=/tmp/upd-precommit-cache cargo test --lib -- --test-threads=1
         language: system
         types: [rust]
         pass_filenames: false
