@@ -191,7 +191,10 @@ impl RequirementsUpdater {
     fn update_line(&self, line: &str, new_version: &str) -> String {
         if let Some(caps) = self.package_re.captures(line) {
             // Only replace the version number itself, preserving everything else
-            // (package name, extras, operator, AND any additional constraints like ,<6)
+            // (package name, extras, operator, AND any additional constraints like ,<6).
+            // Known limitation: if the new version string is a different length than the
+            // old one, any trailing inline `# comment` will shift left or right by that
+            // difference. Column-aligned comment blocks are not preserved.
             let version_match = caps.get(4).unwrap();
 
             let mut result = line.to_string();
@@ -686,6 +689,32 @@ flask>=2.0.0
             updater.update_line("foo>=1.0.0,!=1.5.0,<2.0.0", "1.8.0"),
             "foo>=1.8.0,!=1.5.0,<2.0.0"
         );
+    }
+
+    #[test]
+    fn test_update_line_inline_comment_preserved_same_length() {
+        // When the version length does not change, the comment is preserved verbatim.
+        let updater = RequirementsUpdater::new();
+        let line = "requests==2.28.0  # HTTP library";
+        let updated = updater.update_line(line, "2.31.0");
+        assert_eq!(updated, "requests==2.31.0  # HTTP library");
+    }
+
+    #[test]
+    fn test_update_line_inline_comment_shifts_on_length_change() {
+        // Known limitation: when the new version is shorter or longer, the trailing
+        // comment shifts by the version length delta. Column alignment is not preserved.
+        let updater = RequirementsUpdater::new();
+
+        // Shorter version (5 chars → 3 chars): comment moves 2 columns left.
+        let line = "requests==2.28.0  # HTTP library";
+        let updated = updater.update_line(line, "3.0");
+        assert_eq!(updated, "requests==3.0  # HTTP library");
+
+        // Longer version (5 chars → 7 chars): comment moves 2 columns right.
+        let line2 = "flask==2.3.0  # web framework";
+        let updated2 = updater.update_line(line2, "3.1.0.1");
+        assert_eq!(updated2, "flask==3.1.0.1  # web framework");
     }
 
     // Integration tests using MockRegistry and temp files

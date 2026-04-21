@@ -12,10 +12,18 @@ use regex::Regex;
 use std::collections::HashMap;
 use std::path::Path;
 
+/// Updater for `.mise.toml` and `.tool-versions` files.
+///
+/// Symbolic versions (`latest`, `lts`, `system`, `global`, and `ref:` prefixes)
+/// are intentionally preserved — upd cannot resolve them to a concrete release.
+/// Only pinned numeric versions (e.g. `1.22.1`) are checked and updated.
+///
+/// For `.tool-versions` files with multiple versions on one line
+/// (e.g. `python 3.11.0 3.10.0`), only the **first** version is updated.
 pub struct MiseUpdater {
     /// Matches `tool = "version"` lines in .mise.toml [tools] section
     toml_tool_re: Regex,
-    /// Matches `tool version` lines in .tool-versions
+    /// Matches `tool version` lines in .tool-versions (captures first version only)
     tool_versions_re: Regex,
     /// Matches TOML section headers like [tools], [settings], etc.
     section_re: Regex,
@@ -49,6 +57,14 @@ fn tool_to_github_repo(tool: &str) -> Option<&'static str> {
         "ruff" => Some("astral-sh/ruff"),
         _ => None,
     }
+}
+
+/// Return true if `version` is a symbolic specifier that cannot be resolved
+/// to a concrete release (e.g. `latest`, `lts`, `system`, `global`, `ref:*`).
+fn is_symbolic_version(version: &str) -> bool {
+    matches!(version, "latest" | "lts" | "system" | "global")
+        || version.starts_with("ref:")
+        || version.starts_with("prefix:")
 }
 
 /// Strip tool-specific version prefixes from GitHub release tags.
@@ -111,8 +127,8 @@ impl MiseUpdater {
                     continue;
                 }
 
-                // Skip "latest" versions
-                if version == "latest" {
+                // Symbolic versions cannot be resolved to a concrete release; skip them.
+                if is_symbolic_version(version) {
                     continue;
                 }
 
@@ -148,8 +164,8 @@ impl MiseUpdater {
                 let tool = caps.get(1).unwrap().as_str();
                 let version = caps.get(2).unwrap().as_str();
 
-                // Skip "latest" versions
-                if version == "latest" {
+                // Symbolic versions cannot be resolved to a concrete release; skip them.
+                if is_symbolic_version(version) {
                     continue;
                 }
 
@@ -472,6 +488,25 @@ cargo_binstall = true
     }
 
     #[test]
+    fn test_parse_mise_toml_skips_symbolic_versions() {
+        // All symbolic specifiers must be preserved (skipped), not looked up.
+        let updater = MiseUpdater::new();
+        let content = r#"
+[tools]
+node = "lts"
+python = "latest"
+rust = "1.91.1"
+go = "system"
+terraform = "global"
+helm = "ref:master"
+kubectl = "prefix:1.29"
+"#;
+        let deps = updater.parse_mise_toml(content);
+        assert_eq!(deps.len(), 1, "only numeric-pinned rust should be returned");
+        assert_eq!(deps[0].name, "rust");
+    }
+
+    #[test]
     fn test_parse_mise_toml_skips_latest() {
         let updater = MiseUpdater::new();
         let content = r#"
@@ -556,12 +591,39 @@ python 3.12.2
     }
 
     #[test]
+    fn test_parse_tool_versions_skips_symbolic_versions() {
+        // Symbolic specifiers in .tool-versions must be skipped.
+        let updater = MiseUpdater::new();
+        let content = "node latest\ngo lts\nrust system\npython 3.12.2\n";
+        let deps = updater.parse_tool_versions(content);
+        assert_eq!(deps.len(), 1, "only pinned python should be returned");
+        assert_eq!(deps[0].name, "python");
+    }
+
+    #[test]
     fn test_parse_tool_versions_skips_latest() {
         let updater = MiseUpdater::new();
         let content = "node latest\npython 3.12.2\n";
         let deps = updater.parse_tool_versions(content);
         assert_eq!(deps.len(), 1);
         assert_eq!(deps[0].name, "python");
+    }
+
+    #[test]
+    fn test_parse_tool_versions_first_version_only() {
+        // .tool-versions supports multiple versions per line but only the first is updated.
+        let updater = MiseUpdater::new();
+        let content = "python 3.11.0 3.10.0 3.9.0\nnode 20.11.0\n";
+        let deps = updater.parse_tool_versions(content);
+        // python should be parsed with 3.11.0 (the first version)
+        assert_eq!(deps.len(), 2);
+        assert_eq!(deps[0].name, "python");
+        assert_eq!(
+            deps[0].version, "3.11.0",
+            "only the first version is parsed"
+        );
+        assert_eq!(deps[1].name, "node");
+        assert_eq!(deps[1].version, "20.11.0");
     }
 
     #[test]

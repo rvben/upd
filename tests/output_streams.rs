@@ -170,3 +170,28 @@ fn quiet_check_on_empty_workspace_produces_empty_stdout() {
         "--quiet must suppress check output; got: {stdout:?}"
     );
 }
+
+/// A pure-Python scan with --verbose must NOT mention crates.io auth,
+/// even when CARGO_REGISTRY_TOKEN is set.
+///
+/// The "Using authenticated crates.io access" log is gated on whether any
+/// Cargo.toml files were discovered; it must stay silent when there are none.
+#[test]
+fn verbose_python_scan_omits_crates_io_auth_message() {
+    let tmp = tempfile::tempdir().unwrap();
+    fs::write(tmp.path().join("requirements.txt"), "requests==2.28.0\n").unwrap();
+
+    // Provide a fake token so the credential detection path would trigger
+    // if not properly gated.
+    let (stdout, stderr, _code) = run_with_env(
+        &["--verbose", "--dry-run", "--no-cache", "--lang", "python"],
+        tmp.path(),
+        &[("CARGO_REGISTRY_TOKEN", "fake-token-for-test")],
+    );
+
+    let combined = format!("{stdout}{stderr}");
+    assert!(
+        !combined.contains("crates.io"),
+        "verbose python-only scan must not mention crates.io; combined output:\n{combined}"
+    );
+}

@@ -467,7 +467,8 @@ async fn run_update(cli: &Cli) -> Result<()> {
         let registry_url = CratesIoRegistry::detect_registry_url()
             .unwrap_or_else(|| "https://crates.io/api/v1/crates".to_string());
         let credentials = CratesIoRegistry::detect_credentials("crates-io");
-        if cli.verbose && credentials.is_some() {
+        let has_cargo_files = files.iter().any(|(_, ft)| *ft == FileType::CargoToml);
+        if cli.verbose && credentials.is_some() && has_cargo_files {
             println!("{}", "Using authenticated crates.io access".cyan());
         }
         CratesIoRegistry::with_registry_url_and_credentials(registry_url, credentials)

@@ -40,7 +40,10 @@ pub struct Cli {
     #[arg(global = true)]
     pub paths: Vec<PathBuf>,
 
-    /// Print updates without applying them. Exits 1 when updates are available (same as --check), 2 on errors.
+    /// Show available updates without writing any files.
+    ///
+    /// Exits with code 1 when updates are available, 2 on errors.
+    /// Equivalent to --check when you also want CI to fail on outdated deps.
     #[arg(short = 'n', long, global = true)]
     pub dry_run: bool,
 
@@ -56,15 +59,21 @@ pub struct Cli {
     #[arg(short, long, global = true)]
     pub verbose: bool,
 
-    /// Suppress non-error output. Errors and warnings still print.
+    /// Suppress all output except errors and warnings.
+    ///
+    /// Useful in scripts where you only care about the exit code.
     #[arg(long, short = 'q', global = true, conflicts_with = "verbose")]
     pub quiet: bool,
 
-    /// Interactive mode - approve each update individually
+    /// Prompt before applying each update.
+    ///
+    /// Presents each available update one at a time so you can accept or skip it.
     #[arg(short, long, global = true)]
     pub interactive: bool,
 
-    /// Include only these bump levels (repeatable). Omit to include all.
+    /// Restrict updates to the given bump level(s): major, minor, or patch.
+    ///
+    /// Repeatable or comma-separated. Omit to include all bump levels.
     #[arg(
         long,
         global = true,
@@ -78,7 +87,9 @@ pub struct Cli {
     #[arg(long, global = true)]
     pub full_precision: bool,
 
-    /// Filter by language/ecosystem (repeatable, or comma-separated: --lang python,rust)
+    /// Limit to one or more ecosystems (repeatable, or comma-separated).
+    ///
+    /// Examples: --lang python  |  --lang python,rust  |  -l go -l node
     #[arg(
         short = 'l',
         long = "lang",
@@ -88,11 +99,16 @@ pub struct Cli {
     )]
     pub langs: Vec<Lang>,
 
-    /// Check mode: exit with code 1 if updates are available, without writing changes
+    /// Exit with code 1 if updates are available, without writing any changes.
+    ///
+    /// Intended for CI pipelines that should fail when dependencies are outdated.
     #[arg(long, global = true)]
     pub check: bool,
 
-    /// Regenerate lockfiles after updating (runs poetry lock, npm install, etc.)
+    /// Regenerate lockfiles after updating.
+    ///
+    /// Runs the appropriate lock command for each ecosystem (e.g. `poetry lock`,
+    /// `npm install`, `cargo update`).
     #[arg(long, global = true)]
     pub lock: bool,
 
@@ -100,16 +116,21 @@ pub struct Cli {
     #[arg(short = 'c', long, global = true, value_name = "FILE")]
     pub config: Option<PathBuf>,
 
-    /// Output format (defaults to human-readable text)
+    /// Set output format: text (default) or json.
+    ///
+    /// Use --format json for machine-readable output in scripts or CI.
     #[arg(long, global = true, value_enum, default_value_t = OutputFormat::Text, value_name = "FORMAT")]
     pub format: OutputFormat,
 
-    /// Print the effective configuration schema and exit
+    /// Print the effective configuration and exit.
+    ///
+    /// Shows which config file was loaded and the resolved ignore/pin settings.
     #[arg(long, global = true)]
     pub show_config: bool,
 
-    /// Only update packages with these names (comma-separated or repeated).
-    /// Exact case-sensitive match. Non-matching packages are silently skipped.
+    /// Update only the named package(s), skipping all others.
+    ///
+    /// Comma-separated or repeatable. Exact case-sensitive match.
     #[arg(
         long = "package",
         value_name = "NAME",
@@ -128,7 +149,11 @@ pub enum Command {
         paths: Vec<PathBuf>,
     },
 
-    /// Align all packages to the highest version found in the repository
+    /// Align duplicate packages to their highest pinned version across files.
+    ///
+    /// Useful for monorepos where the same package appears at different versions
+    /// in multiple files (e.g. requirements.txt and pyproject.toml). Writes the
+    /// highest version found back to every file that has a lower pin.
     Align {
         /// Paths to scan and align
         #[arg()]
@@ -609,5 +634,57 @@ mod tests {
     fn test_cli_show_config_is_global() {
         let cli = Cli::try_parse_from(["upd", "update", "--show-config"]).unwrap();
         assert!(cli.show_config);
+    }
+
+    // P6: --help should produce longer output than -h because field doc comments
+    // have both a short first line (used by -h) and extended paragraphs (--help only).
+    #[test]
+    fn test_long_help_is_longer_than_short_help() {
+        use clap::CommandFactory;
+        let mut short_buf = Vec::new();
+        Cli::command()
+            .write_help(&mut short_buf)
+            .expect("short help failed");
+
+        let mut long_buf = Vec::new();
+        Cli::command()
+            .write_long_help(&mut long_buf)
+            .expect("long help failed");
+
+        assert!(
+            long_buf.len() > short_buf.len(),
+            "--help ({} bytes) should be longer than -h ({} bytes)",
+            long_buf.len(),
+            short_buf.len()
+        );
+    }
+
+    #[test]
+    fn test_long_help_contains_extended_descriptions() {
+        use clap::CommandFactory;
+        let mut buf = Vec::new();
+        Cli::command()
+            .write_long_help(&mut buf)
+            .expect("long help failed");
+        let help = String::from_utf8(buf).unwrap();
+
+        // Extended paragraphs that only appear in --help (not in -h)
+        assert!(
+            help.contains("Exit with code 1"),
+            "--help should contain extended --check description; got:\n{help}"
+        );
+        // The `align` subcommand description (long form) includes "monorepos";
+        // verify it appears in the align subcommand's own long help.
+        let mut align_buf = Vec::new();
+        Cli::command()
+            .find_subcommand_mut("align")
+            .expect("align subcommand must exist")
+            .write_long_help(&mut align_buf)
+            .expect("align long help failed");
+        let align_help = String::from_utf8(align_buf).unwrap();
+        assert!(
+            align_help.contains("monorepos"),
+            "align --help should describe monorepo use-case; got:\n{align_help}"
+        );
     }
 }
