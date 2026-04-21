@@ -71,17 +71,34 @@ pub struct Cli {
     #[arg(short, long, global = true)]
     pub interactive: bool,
 
-    /// Restrict updates to the given bump level(s): major, minor, or patch.
+    /// Include only updates whose bump level exactly matches one of the given levels.
     ///
-    /// Repeatable or comma-separated. Omit to include all bump levels.
+    /// Repeatable or comma-separated. Use when you want to restrict to an exact set
+    /// of bump levels (e.g. `--only-bump minor,patch` skips major updates).
+    /// Mutually exclusive with `--max-bump`.
     #[arg(
-        long,
+        long = "only-bump",
         global = true,
         value_enum,
         value_name = "LEVEL",
-        value_delimiter = ','
+        value_delimiter = ',',
+        conflicts_with = "max_bump"
     )]
-    pub bump: Vec<BumpLevel>,
+    pub only_bump: Vec<BumpLevel>,
+
+    /// Include updates up to and including the given bump level.
+    ///
+    /// `--max-bump patch` allows only patch updates; `--max-bump minor` allows
+    /// patch and minor but not major; `--max-bump major` allows everything.
+    /// Mutually exclusive with `--only-bump`.
+    #[arg(
+        long = "max-bump",
+        global = true,
+        value_enum,
+        value_name = "LEVEL",
+        conflicts_with = "only_bump"
+    )]
+    pub max_bump: Option<BumpLevel>,
 
     /// Use full version precision (e.g., 3.1.5 instead of 3.1)
     #[arg(long, global = true)]
@@ -215,7 +232,8 @@ mod tests {
         assert!(!cli.verbose);
         assert!(!cli.quiet);
         assert!(!cli.interactive);
-        assert!(cli.bump.is_empty());
+        assert!(cli.only_bump.is_empty());
+        assert!(cli.max_bump.is_none());
         assert!(!cli.full_precision);
         assert!(!cli.check);
         assert!(!cli.lock);
@@ -285,32 +303,33 @@ mod tests {
     }
 
     #[test]
-    fn test_cli_parses_bump_single_level() {
-        let cli = Cli::try_parse_from(["upd", "--bump", "major"]).unwrap();
-        assert_eq!(cli.bump, vec![BumpLevel::Major]);
+    fn test_cli_parses_only_bump_single_level() {
+        let cli = Cli::try_parse_from(["upd", "--only-bump", "major"]).unwrap();
+        assert_eq!(cli.only_bump, vec![BumpLevel::Major]);
 
-        let cli = Cli::try_parse_from(["upd", "--bump", "minor"]).unwrap();
-        assert_eq!(cli.bump, vec![BumpLevel::Minor]);
+        let cli = Cli::try_parse_from(["upd", "--only-bump", "minor"]).unwrap();
+        assert_eq!(cli.only_bump, vec![BumpLevel::Minor]);
 
-        let cli = Cli::try_parse_from(["upd", "--bump", "patch"]).unwrap();
-        assert_eq!(cli.bump, vec![BumpLevel::Patch]);
+        let cli = Cli::try_parse_from(["upd", "--only-bump", "patch"]).unwrap();
+        assert_eq!(cli.only_bump, vec![BumpLevel::Patch]);
     }
 
     #[test]
-    fn test_cli_parses_bump_repeatable() {
-        let cli = Cli::try_parse_from(["upd", "--bump", "major", "--bump", "minor"]).unwrap();
-        assert_eq!(cli.bump, vec![BumpLevel::Major, BumpLevel::Minor]);
+    fn test_cli_parses_only_bump_repeatable() {
+        let cli =
+            Cli::try_parse_from(["upd", "--only-bump", "major", "--only-bump", "minor"]).unwrap();
+        assert_eq!(cli.only_bump, vec![BumpLevel::Major, BumpLevel::Minor]);
     }
 
     #[test]
-    fn test_cli_parses_bump_comma_separated() {
-        let cli = Cli::try_parse_from(["upd", "--bump", "minor,patch"]).unwrap();
-        assert_eq!(cli.bump, vec![BumpLevel::Minor, BumpLevel::Patch]);
+    fn test_cli_parses_only_bump_comma_separated() {
+        let cli = Cli::try_parse_from(["upd", "--only-bump", "minor,patch"]).unwrap();
+        assert_eq!(cli.only_bump, vec![BumpLevel::Minor, BumpLevel::Patch]);
     }
 
     #[test]
-    fn test_cli_rejects_invalid_bump_level() {
-        let rendered = match Cli::try_parse_from(["upd", "--bump", "breaking"]) {
+    fn test_cli_rejects_invalid_only_bump_level() {
+        let rendered = match Cli::try_parse_from(["upd", "--only-bump", "breaking"]) {
             Err(err) => err.to_string(),
             Ok(_) => panic!("expected invalid bump level to be rejected"),
         };
@@ -322,12 +341,39 @@ mod tests {
 
     #[test]
     fn test_cli_rejects_removed_boolean_flags() {
-        for flag in ["--major", "--minor", "--patch"] {
+        for flag in ["--major", "--minor", "--patch", "--bump"] {
             assert!(
                 Cli::try_parse_from(["upd", flag]).is_err(),
-                "expected {flag} to be rejected after consolidation into --bump"
+                "expected {flag} to be rejected; it is not a valid flag"
             );
         }
+    }
+
+    #[test]
+    fn test_cli_parses_max_bump_major() {
+        let cli = Cli::try_parse_from(["upd", "--max-bump", "major"]).unwrap();
+        assert_eq!(cli.max_bump, Some(BumpLevel::Major));
+    }
+
+    #[test]
+    fn test_cli_parses_max_bump_minor() {
+        let cli = Cli::try_parse_from(["upd", "--max-bump", "minor"]).unwrap();
+        assert_eq!(cli.max_bump, Some(BumpLevel::Minor));
+    }
+
+    #[test]
+    fn test_cli_parses_max_bump_patch() {
+        let cli = Cli::try_parse_from(["upd", "--max-bump", "patch"]).unwrap();
+        assert_eq!(cli.max_bump, Some(BumpLevel::Patch));
+    }
+
+    #[test]
+    fn test_cli_only_bump_and_max_bump_are_mutually_exclusive() {
+        let result = Cli::try_parse_from(["upd", "--only-bump", "minor", "--max-bump", "minor"]);
+        assert!(
+            result.is_err(),
+            "--only-bump and --max-bump must conflict; got Ok"
+        );
     }
 
     #[test]
@@ -410,13 +456,20 @@ mod tests {
 
     #[test]
     fn test_cli_combined_options() {
-        let cli =
-            Cli::try_parse_from(["upd", "-n", "-v", "--no-cache", "--bump", "major", "path1"])
-                .unwrap();
+        let cli = Cli::try_parse_from([
+            "upd",
+            "-n",
+            "-v",
+            "--no-cache",
+            "--only-bump",
+            "major",
+            "path1",
+        ])
+        .unwrap();
         assert!(cli.dry_run);
         assert!(cli.verbose);
         assert!(cli.no_cache);
-        assert_eq!(cli.bump, vec![BumpLevel::Major]);
+        assert_eq!(cli.only_bump, vec![BumpLevel::Major]);
         assert_eq!(cli.paths, vec![PathBuf::from("path1")]);
     }
 

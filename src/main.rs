@@ -456,7 +456,7 @@ async fn run_update(cli: &Cli) -> Result<()> {
                 &UpdateResult::default(),
                 0,
                 effective_dry_run,
-                UpdateFilter::from_levels(&cli.bump),
+                UpdateFilter::from_cli(&cli.only_bump, cli.max_bump),
             )?;
         }
         return Ok(());
@@ -472,7 +472,7 @@ async fn run_update(cli: &Cli) -> Result<()> {
     }
 
     // Create filter from CLI flags
-    let filter = UpdateFilter::from_levels(&cli.bump);
+    let filter = UpdateFilter::from_cli(&cli.only_bump, cli.max_bump);
 
     // Create shared cache and wrap registries with caching layer
     let cache = Cache::new_shared();
@@ -2473,10 +2473,20 @@ struct UpdateFilter {
 }
 
 impl UpdateFilter {
-    /// Build a filter from an optional list of bump levels.
-    /// Empty slice means "include every level".
-    fn from_levels(levels: &[BumpLevel]) -> Self {
-        if levels.is_empty() {
+    /// Build a filter from CLI flags.
+    ///
+    /// `only_bump` is a list of exact levels to include (empty = all).
+    /// `max_bump` is a ceiling level: only updates at or below that level are included.
+    /// The two are mutually exclusive; clap enforces this at parse time.
+    fn from_cli(only_bump: &[BumpLevel], max_bump: Option<BumpLevel>) -> Self {
+        if let Some(max) = max_bump {
+            return Self {
+                major: matches!(max, BumpLevel::Major),
+                minor: matches!(max, BumpLevel::Major | BumpLevel::Minor),
+                patch: true,
+            };
+        }
+        if only_bump.is_empty() {
             return Self {
                 major: true,
                 minor: true,
@@ -2484,9 +2494,9 @@ impl UpdateFilter {
             };
         }
         Self {
-            major: levels.contains(&BumpLevel::Major),
-            minor: levels.contains(&BumpLevel::Minor),
-            patch: levels.contains(&BumpLevel::Patch),
+            major: only_bump.contains(&BumpLevel::Major),
+            minor: only_bump.contains(&BumpLevel::Minor),
+            patch: only_bump.contains(&BumpLevel::Patch),
         }
     }
 
@@ -2812,7 +2822,7 @@ mod tests {
 
     #[test]
     fn test_update_filter_defaults_to_all() {
-        let filter = UpdateFilter::from_levels(&[]);
+        let filter = UpdateFilter::from_cli(&[], None);
         assert!(filter.major);
         assert!(filter.minor);
         assert!(filter.patch);
@@ -2820,7 +2830,7 @@ mod tests {
 
     #[test]
     fn test_update_filter_major_only() {
-        let filter = UpdateFilter::from_levels(&[BumpLevel::Major]);
+        let filter = UpdateFilter::from_cli(&[BumpLevel::Major], None);
         assert!(filter.major);
         assert!(!filter.minor);
         assert!(!filter.patch);
@@ -2828,7 +2838,7 @@ mod tests {
 
     #[test]
     fn test_update_filter_minor_only() {
-        let filter = UpdateFilter::from_levels(&[BumpLevel::Minor]);
+        let filter = UpdateFilter::from_cli(&[BumpLevel::Minor], None);
         assert!(!filter.major);
         assert!(filter.minor);
         assert!(!filter.patch);
@@ -2836,7 +2846,7 @@ mod tests {
 
     #[test]
     fn test_update_filter_patch_only() {
-        let filter = UpdateFilter::from_levels(&[BumpLevel::Patch]);
+        let filter = UpdateFilter::from_cli(&[BumpLevel::Patch], None);
         assert!(!filter.major);
         assert!(!filter.minor);
         assert!(filter.patch);
@@ -2844,7 +2854,7 @@ mod tests {
 
     #[test]
     fn test_update_filter_combined() {
-        let filter = UpdateFilter::from_levels(&[BumpLevel::Major, BumpLevel::Minor]);
+        let filter = UpdateFilter::from_cli(&[BumpLevel::Major, BumpLevel::Minor], None);
         assert!(filter.major);
         assert!(filter.minor);
         assert!(!filter.patch);
@@ -2852,21 +2862,45 @@ mod tests {
 
     #[test]
     fn test_update_filter_matches() {
-        let filter = UpdateFilter::from_levels(&[BumpLevel::Major]);
+        let filter = UpdateFilter::from_cli(&[BumpLevel::Major], None);
         assert!(filter.matches(UpdateType::Major));
         assert!(!filter.matches(UpdateType::Minor));
         assert!(!filter.matches(UpdateType::Patch));
 
-        let filter = UpdateFilter::from_levels(&[BumpLevel::Minor, BumpLevel::Patch]);
+        let filter = UpdateFilter::from_cli(&[BumpLevel::Minor, BumpLevel::Patch], None);
         assert!(!filter.matches(UpdateType::Major));
         assert!(filter.matches(UpdateType::Minor));
         assert!(filter.matches(UpdateType::Patch));
     }
 
     #[test]
+    fn test_update_filter_max_bump_major_allows_all() {
+        let filter = UpdateFilter::from_cli(&[], Some(BumpLevel::Major));
+        assert!(filter.major);
+        assert!(filter.minor);
+        assert!(filter.patch);
+    }
+
+    #[test]
+    fn test_update_filter_max_bump_minor_excludes_major() {
+        let filter = UpdateFilter::from_cli(&[], Some(BumpLevel::Minor));
+        assert!(!filter.major);
+        assert!(filter.minor);
+        assert!(filter.patch);
+    }
+
+    #[test]
+    fn test_update_filter_max_bump_patch_allows_only_patch() {
+        let filter = UpdateFilter::from_cli(&[], Some(BumpLevel::Patch));
+        assert!(!filter.major);
+        assert!(!filter.minor);
+        assert!(filter.patch);
+    }
+
+    #[test]
     fn test_count_updates_by_type_empty() {
         let updates: Vec<(String, String, String, Option<usize>)> = vec![];
-        let filter = UpdateFilter::from_levels(&[]); // show all
+        let filter = UpdateFilter::from_cli(&[], None); // show all
 
         let (major, minor, patch, total) = count_updates_by_type(&updates, filter);
         assert_eq!(major, 0);
@@ -2884,7 +2918,7 @@ mod tests {
             ("pkg4".into(), "2.0.0".into(), "3.0.0".into(), Some(4)), // major
             ("pkg5".into(), "1.5.0".into(), "1.5.1".into(), Some(5)), // patch
         ];
-        let filter = UpdateFilter::from_levels(&[]); // show all
+        let filter = UpdateFilter::from_cli(&[], None); // show all
 
         let (major, minor, patch, total) = count_updates_by_type(&updates, filter);
         assert_eq!(major, 2);
@@ -2900,7 +2934,7 @@ mod tests {
             ("pkg2".into(), "1.0.0".into(), "1.1.0".into(), Some(2)), // minor (filtered out)
             ("pkg3".into(), "1.0.0".into(), "1.0.1".into(), Some(3)), // patch (filtered out)
         ];
-        let filter = UpdateFilter::from_levels(&[BumpLevel::Major]);
+        let filter = UpdateFilter::from_cli(&[BumpLevel::Major], None);
 
         let (major, minor, patch, total) = count_updates_by_type(&updates, filter);
         assert_eq!(major, 1);
@@ -2916,7 +2950,7 @@ mod tests {
             ("pkg2".into(), "1.0.0".into(), "1.1.0".into(), Some(2)), // minor
             ("pkg3".into(), "1.0.0".into(), "1.0.1".into(), Some(3)), // patch
         ];
-        let filter = UpdateFilter::from_levels(&[BumpLevel::Minor, BumpLevel::Patch]);
+        let filter = UpdateFilter::from_cli(&[BumpLevel::Minor, BumpLevel::Patch], None);
 
         let (major, minor, patch, total) = count_updates_by_type(&updates, filter);
         assert_eq!(major, 0);
@@ -2931,7 +2965,7 @@ mod tests {
             ("pkg1".into(), "1.0.0".into(), "2.0.0".into(), None), // major, no line
             ("pkg2".into(), "1.0.0".into(), "1.1.0".into(), None), // minor, no line
         ];
-        let filter = UpdateFilter::from_levels(&[]); // show all
+        let filter = UpdateFilter::from_cli(&[], None); // show all
 
         let (major, minor, patch, total) = count_updates_by_type(&updates, filter);
         assert_eq!(major, 1);
@@ -2946,7 +2980,7 @@ mod tests {
             pinned: vec![("react".into(), "18.2.0".into(), "19.0.0".into(), Some(4))],
             ..Default::default()
         };
-        let filter = UpdateFilter::from_levels(&[]);
+        let filter = UpdateFilter::from_cli(&[], None);
 
         assert!(has_checkable_manifest_changes(&result, filter));
     }
@@ -2957,7 +2991,7 @@ mod tests {
             updated: vec![("react".into(), "18.2.0".into(), "19.0.0".into(), Some(4))],
             ..Default::default()
         };
-        let filter = UpdateFilter::from_levels(&[BumpLevel::Minor, BumpLevel::Patch]);
+        let filter = UpdateFilter::from_cli(&[BumpLevel::Minor, BumpLevel::Patch], None);
 
         assert!(!has_checkable_manifest_changes(&result, filter));
     }
