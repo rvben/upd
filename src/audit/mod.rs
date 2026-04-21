@@ -1,5 +1,6 @@
 //! Security vulnerability auditing via OSV (Open Source Vulnerabilities) API
 
+pub mod cache;
 pub mod cvss;
 
 use anyhow::Result;
@@ -7,6 +8,7 @@ use futures::stream::{self, StreamExt};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 /// Default OSV API base URL (override via `OsvClient::with_base_url`).
@@ -52,7 +54,7 @@ pub struct Package {
 }
 
 /// A vulnerability found in a package
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Vulnerability {
     /// Unique vulnerability ID (e.g., GHSA-xxxx-xxxx-xxxx, CVE-xxxx-xxxx)
     pub id: String,
@@ -220,18 +222,86 @@ impl OsvClient {
 
     /// Check a batch of packages for vulnerabilities
     pub async fn check_packages(&self, packages: &[Package]) -> Result<AuditResult> {
+        self.check_packages_cached(packages, None, false).await
+    }
+
+    /// Check packages for vulnerabilities with optional disk-backed caching.
+    ///
+    /// - `cache`: when `Some`, fresh cache entries are returned directly and new
+    ///   OSV responses are written back. Pass `None` to disable caching entirely
+    ///   (equivalent to the previous `check_packages` behavior).
+    /// - `offline`: when `true`, the cache is the only source of truth. Any
+    ///   package whose cache entry is missing or expired is reported as an error
+    ///   and contributes to exit-code 2. OSV is never contacted.
+    pub async fn check_packages_cached(
+        &self,
+        packages: &[Package],
+        cache: Option<&Arc<Mutex<cache::AuditCache>>>,
+        offline: bool,
+    ) -> Result<AuditResult> {
+        use cache::AuditKey;
+
         let mut result = AuditResult::default();
 
-        // Process in batches
-        for chunk in packages.chunks(BATCH_SIZE) {
+        // Partition packages into cache-hits and misses.
+        let mut uncached: Vec<Package> = Vec::new();
+
+        for package in packages {
+            let key = AuditKey::new(package.ecosystem.as_str(), &package.name, &package.version);
+
+            // Try cache first (if enabled).
+            if let Some(c) = cache
+                && let Ok(guard) = c.lock()
+                && let Some(entry) = guard.get(&key)
+            {
+                // Cache hit — replay the stored result.
+                let mut vulns = entry.vulnerabilities.clone();
+                if vulns.is_empty() {
+                    result.safe_count += 1;
+                } else {
+                    vulns.sort_by_key(|v| severity_sort_key(v.severity.as_deref()));
+                    result.vulnerable.push(PackageAuditResult {
+                        package: package.clone(),
+                        vulnerabilities: vulns,
+                    });
+                }
+                continue;
+            }
+
+            // Cache miss.
+            if offline {
+                result.errors.push(format!(
+                    "cache miss, cannot audit {}/{} {} offline",
+                    package.ecosystem.as_str(),
+                    package.name,
+                    package.version
+                ));
+            } else {
+                uncached.push(package.clone());
+            }
+        }
+
+        // Query OSV for packages not satisfied by the cache.
+        for chunk in uncached.chunks(BATCH_SIZE) {
             match self.query_batch(chunk).await {
                 Ok(batch_results) => {
                     for (package, mut vulns) in batch_results {
+                        let key = AuditKey::new(
+                            package.ecosystem.as_str(),
+                            &package.name,
+                            &package.version,
+                        );
+
+                        // Write back to cache before sorting/consuming.
+                        if let Some(c) = cache
+                            && let Ok(mut guard) = c.lock()
+                        {
+                            guard.set(&key, vulns.clone());
+                        }
+
                         if vulns.is_empty() {
                             result.safe_count += 1;
                         } else {
-                            // Sort vulnerabilities by severity descending (Critical first).
-                            // Stable sort preserves the original order for equal severities.
                             vulns.sort_by_key(|v| severity_sort_key(v.severity.as_deref()));
                             result.vulnerable.push(PackageAuditResult {
                                 package,
@@ -786,5 +856,152 @@ mod tests {
         };
         let (fixable, _) = compute_fix_plan(&audit);
         assert_eq!(fixable.get("pkg").map(|s| s.as_str()), Some("2.10.0"));
+    }
+
+    // ─── check_packages_cached unit tests ────────────────────────────────────
+
+    fn sample_package(name: &str) -> Package {
+        Package {
+            name: name.to_string(),
+            version: "1.0.0".to_string(),
+            ecosystem: Ecosystem::PyPI,
+        }
+    }
+
+    #[tokio::test]
+    async fn cached_offline_with_empty_cache_reports_error_per_package() {
+        // With an empty cache and offline=true, every package should produce
+        // one error and OSV should never be contacted (no mock server needed).
+        let client = OsvClient::with_base_url("http://127.0.0.1:0".to_string());
+        let cache = cache::AuditCache::new_shared();
+        let pkgs = vec![sample_package("requests"), sample_package("flask")];
+
+        let result = client
+            .check_packages_cached(&pkgs, Some(&cache), true)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            result.errors.len(),
+            2,
+            "one error per cache-miss package in offline mode"
+        );
+        assert!(result.vulnerable.is_empty());
+        assert_eq!(result.safe_count, 0);
+        for err in &result.errors {
+            assert!(
+                err.contains("cache miss"),
+                "error message should mention 'cache miss': {err}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn cached_offline_with_populated_cache_skips_osv() {
+        use cache::{AuditCache, AuditKey};
+
+        // Pre-populate cache with a known vulnerability entry.
+        let cache = AuditCache::new_shared();
+        {
+            let mut guard = cache.lock().unwrap();
+            let key = AuditKey::new("PyPI", "requests", "1.0.0");
+            guard.set(
+                &key,
+                vec![Vulnerability {
+                    id: "CVE-CACHED".to_string(),
+                    summary: None,
+                    severity: None,
+                    url: None,
+                    fixed_version: None,
+                }],
+            );
+        }
+
+        // Point client at an unused address — if OSV were contacted, the test
+        // would fail with a connection error.
+        let client = OsvClient::with_base_url("http://127.0.0.1:0".to_string());
+        let pkgs = vec![sample_package("requests")];
+
+        let result = client
+            .check_packages_cached(&pkgs, Some(&cache), true)
+            .await
+            .unwrap();
+
+        assert!(
+            result.errors.is_empty(),
+            "no errors when cache is populated"
+        );
+        assert_eq!(result.vulnerable.len(), 1);
+        assert_eq!(result.vulnerable[0].vulnerabilities[0].id, "CVE-CACHED");
+    }
+
+    #[tokio::test]
+    async fn cached_online_miss_queries_osv_and_populates_cache() {
+        use cache::{AuditCache, AuditKey};
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/querybatch"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "results": [{ "vulns": [] }]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let cache = AuditCache::new_shared();
+        let client = OsvClient::with_base_url(server.uri());
+        let pkgs = vec![sample_package("safe-pkg")];
+
+        let result = client
+            .check_packages_cached(&pkgs, Some(&cache), false)
+            .await
+            .unwrap();
+
+        assert!(result.errors.is_empty());
+        assert_eq!(result.safe_count, 1);
+
+        // Verify that the cache was populated.
+        let guard = cache.lock().unwrap();
+        let key = AuditKey::new("PyPI", "safe-pkg", "1.0.0");
+        let entry = guard
+            .get(&key)
+            .expect("cache should be populated after OSV query");
+        assert!(entry.vulnerabilities.is_empty());
+    }
+
+    #[tokio::test]
+    async fn cached_online_hit_skips_osv() {
+        use cache::{AuditCache, AuditKey};
+        use wiremock::MockServer;
+
+        // Start a mock server but mount NO mocks — any request would be unexpected.
+        let server = MockServer::start().await;
+
+        let cache = AuditCache::new_shared();
+        {
+            let mut guard = cache.lock().unwrap();
+            let key = AuditKey::new("PyPI", "cached-pkg", "1.0.0");
+            guard.set(&key, vec![]);
+        }
+
+        let client = OsvClient::with_base_url(server.uri());
+        let pkgs = vec![Package {
+            name: "cached-pkg".to_string(),
+            version: "1.0.0".to_string(),
+            ecosystem: Ecosystem::PyPI,
+        }];
+
+        let result = client
+            .check_packages_cached(&pkgs, Some(&cache), false)
+            .await
+            .unwrap();
+
+        assert!(result.errors.is_empty());
+        assert_eq!(result.safe_count, 1);
+        // wiremock will assert that no requests were received when the server drops.
     }
 }

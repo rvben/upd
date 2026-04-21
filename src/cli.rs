@@ -205,6 +205,14 @@ pub enum Command {
         /// exits 1 when fixable packages are found (or 0 with `--no-fail`).
         #[arg(long = "fix-audit")]
         fix_audit: bool,
+
+        /// Use the local audit cache only; do not contact OSV.
+        ///
+        /// Any package whose cached result is missing or older than 24 hours is
+        /// reported as an error and causes the command to exit with status 2.
+        /// Combine with a prior online run to ensure the cache is populated.
+        #[arg(long)]
+        offline: bool,
     },
 
     /// Clear the version cache

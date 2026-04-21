@@ -8,6 +8,7 @@ use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use upd::align::{PackageAlignment, PackageOccurrence, find_alignments, scan_packages};
+use upd::audit::cache::AuditCache;
 use upd::audit::{AuditResult, Ecosystem, OsvClient, Package as AuditPackage, compute_fix_plan};
 use upd::cache::{Cache, CachedRegistry};
 use upd::cli::{BumpLevel, Cli, Command, REVERT_TIP};
@@ -1466,6 +1467,7 @@ type FileEdits = (FileType, Vec<(String, String, String, Option<usize>)>);
 async fn run_audit(cli: &Cli) -> Result<()> {
     let no_fail = matches!(&cli.command, Some(Command::Audit { no_fail, .. }) if *no_fail);
     let fix_audit = matches!(&cli.command, Some(Command::Audit { fix_audit, .. }) if *fix_audit);
+    let offline = matches!(&cli.command, Some(Command::Audit { offline, .. }) if *offline);
     let text_mode = cli.format == upd::cli::OutputFormat::Text;
     // Audit never mutates files, so no VCS check is needed. Fall back to CWD.
     let paths = {
@@ -1539,9 +1541,22 @@ async fn run_audit(cli: &Cli) -> Result<()> {
         );
     }
 
-    // Query OSV API
+    // Query OSV API (with optional disk-backed cache)
     let osv_client = OsvClient::new();
-    let audit_result = osv_client.check_packages(&audit_packages).await?;
+    let audit_cache = if cli.no_cache {
+        None
+    } else {
+        Some(AuditCache::new_shared())
+    };
+    let audit_result = osv_client
+        .check_packages_cached(&audit_packages, audit_cache.as_ref(), offline)
+        .await?;
+
+    // Persist cache to disk after a successful query.
+    if let Some(ref c) = audit_cache {
+        // Non-fatal: a save failure should not abort the audit report.
+        let _ = AuditCache::save_shared(c);
+    }
 
     let status = audit_status(&audit_result);
 

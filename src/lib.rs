@@ -11,6 +11,7 @@ pub mod updater;
 pub mod version;
 
 pub use align::{AlignResult, PackageAlignment, PackageOccurrence, find_alignments, scan_packages};
+pub use audit::cache::AuditCache;
 pub use audit::{AuditResult, Ecosystem, OsvClient, Package, PackageAuditResult, Vulnerability};
 pub use cache::Cache;
 pub use cli::{Cli, Command, REVERT_TIP};
