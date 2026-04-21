@@ -141,14 +141,22 @@ impl TerraformUpdater {
             // Inside module block: look for source and version
             if in_module_block {
                 if let Some(caps) = self.source_re.captures(line) {
-                    let source = caps.get(1).unwrap().as_str().to_string();
+                    let raw_source = caps.get(1).unwrap().as_str();
                     // Skip local and git sources
-                    if source.starts_with("./")
-                        || source.starts_with("../")
-                        || source.starts_with("git::")
+                    if raw_source.starts_with("./")
+                        || raw_source.starts_with("../")
+                        || raw_source.starts_with("git::")
                     {
                         continue;
                     }
+                    // Strip the explicit registry hostname so the remaining path
+                    // matches the standard namespace/name/provider format used for
+                    // registry API lookups. The original source string in the HCL
+                    // file is never rewritten; only the version line is modified.
+                    let source = raw_source
+                        .strip_prefix("registry.terraform.io/")
+                        .unwrap_or(raw_source)
+                        .to_string();
                     // Only track registry module sources (namespace/name/provider format)
                     if source.split('/').count() == 3 {
                         module_source = Some(source);
@@ -818,6 +826,99 @@ module "vpc" {{
         assert!(updater.handles(FileType::TerraformTf));
         assert!(!updater.handles(FileType::Requirements));
         assert!(!updater.handles(FileType::CargoToml));
+    }
+
+    #[test]
+    fn test_parse_module_with_registry_prefix() {
+        let updater = TerraformUpdater::new();
+        let content = r#"
+module "aws" {
+  source  = "registry.terraform.io/hashicorp/aws/aws"
+  version = "3.0.0"
+}
+"#;
+        let deps = updater.parse_content(content);
+        assert_eq!(deps.len(), 1, "prefixed module source must be parsed");
+        // The prefix must be stripped for the internal lookup key.
+        assert_eq!(deps[0].source, "hashicorp/aws/aws");
+        assert_eq!(deps[0].version, "3.0.0");
+    }
+
+    #[tokio::test]
+    async fn test_update_module_with_registry_prefix_bumps_version_keeps_source() {
+        // The HCL source string must remain verbatim; only the version line changes.
+        let mut file = NamedTempFile::new().unwrap();
+        write!(
+            file,
+            r#"module "aws" {{
+  source  = "registry.terraform.io/hashicorp/aws/aws"
+  version = "3.0.0"
+}}
+"#
+        )
+        .unwrap();
+
+        let registry = MockRegistry::new("terraform").with_version("hashicorp/aws/aws", "4.0.0");
+
+        let updater = TerraformUpdater::new();
+        let result = updater
+            .update(file.path(), &registry, UpdateOptions::new(false, false))
+            .await
+            .unwrap();
+
+        assert_eq!(result.updated.len(), 1, "version must be updated");
+        assert!(result.errors.is_empty(), "no errors expected");
+
+        let contents = std::fs::read_to_string(file.path()).unwrap();
+        // Source string preserved verbatim.
+        assert!(
+            contents.contains(r#"source  = "registry.terraform.io/hashicorp/aws/aws""#),
+            "source attribute must remain unchanged in file"
+        );
+        // Version bumped.
+        assert!(
+            contents.contains("4.0.0"),
+            "version must be bumped to 4.0.0"
+        );
+        assert!(!contents.contains("3.0.0"), "old version must be replaced");
+    }
+
+    #[test]
+    fn test_parse_module_without_prefix_unchanged() {
+        // Regression: bare namespace/name/provider still works.
+        let updater = TerraformUpdater::new();
+        let content = r#"
+module "vpc" {
+  source  = "hashicorp/aws/aws"
+  version = "3.0.0"
+}
+"#;
+        let deps = updater.parse_content(content);
+        assert_eq!(deps.len(), 1);
+        assert_eq!(deps[0].source, "hashicorp/aws/aws");
+        assert_eq!(deps[0].version, "3.0.0");
+    }
+
+    #[test]
+    fn test_skips_non_registry_sources() {
+        // Regression: git:: and other non-registry sources must still be skipped.
+        let updater = TerraformUpdater::new();
+        let content = r#"
+module "from_git" {
+  source  = "git::https://github.com/example/module.git"
+  version = "1.0.0"
+}
+
+module "local" {
+  source  = "./modules/mymodule"
+  version = "1.0.0"
+}
+"#;
+        let deps = updater.parse_content(content);
+        assert!(
+            deps.is_empty(),
+            "git:: and local sources must not trigger registry lookup"
+        );
     }
 
     #[test]
