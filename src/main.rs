@@ -394,7 +394,9 @@ async fn run_update(cli: &Cli) -> Result<()> {
 
     if files.is_empty() {
         if text_mode_early {
-            println!("{}", "No dependency files found.".yellow());
+            if !cli.quiet {
+                println!("{}", "No dependency files found.".yellow());
+            }
         } else {
             emit_update_json(
                 &[],
@@ -683,7 +685,7 @@ async fn run_update(cli: &Cli) -> Result<()> {
                 if !dry_run && file_has_manifest_changes(&file_result) {
                     updated_files.push(path.clone());
                 }
-                if text_mode {
+                if text_mode && !cli.quiet {
                     print_file_result(
                         &path.display().to_string(),
                         &file_result,
@@ -738,7 +740,7 @@ async fn run_update(cli: &Cli) -> Result<()> {
         // the header is only printed when there is real work to do.
         let has_work = regen_results.iter().any(|(_, r)| !r.no_lockfiles);
 
-        if text_mode && has_work {
+        if text_mode && has_work && !cli.quiet {
             println!();
             println!("{}", "Regenerating lockfiles...".cyan());
         }
@@ -770,11 +772,13 @@ async fn run_update(cli: &Cli) -> Result<()> {
     }
 
     if text_mode {
-        println!();
-        let applied = print_summary(&total_result, file_count, dry_run, filter);
-        // Print the revert tip after a mutating run that applied at least one update.
-        if !dry_run && applied > 0 {
-            println!("{}", REVERT_TIP);
+        if !cli.quiet {
+            println!();
+            let applied = print_summary(&total_result, file_count, dry_run, filter);
+            // Print the revert tip after a mutating run that applied at least one update.
+            if !dry_run && applied > 0 {
+                println!("{}", REVERT_TIP);
+            }
         }
     } else {
         emit_update_json(&scanned, &total_result, file_count, dry_run, filter)?;
@@ -996,11 +1000,13 @@ async fn run_interactive_update(
     }
 
     if !has_interactive_changes(&pending_updates, &scanned_results) {
-        println!(
-            "{} Scanned {} file(s), all dependencies up to date",
-            "✓".green(),
-            files.len()
-        );
+        if !cli.quiet {
+            println!(
+                "{} Scanned {} file(s), all dependencies up to date",
+                "✓".green(),
+                files.len()
+            );
+        }
         return Ok(());
     }
 
@@ -1021,7 +1027,9 @@ async fn run_interactive_update(
     let approved_count = updates_with_decisions.iter().filter(|u| u.approved).count();
 
     if approved_count == 0 && configured_pin_count == 0 {
-        println!("\n{}", "No updates applied.".yellow());
+        if !cli.quiet {
+            println!("\n{}", "No updates applied.".yellow());
+        }
         return Ok(());
     }
 
@@ -1032,10 +1040,12 @@ async fn run_interactive_update(
     if configured_pin_count > 0 {
         apply_parts.push(format!("{} configured pin(s)", configured_pin_count));
     }
-    println!(
-        "\n{}",
-        format!("Applying {}...", apply_parts.join(" and ")).cyan()
-    );
+    if !cli.quiet {
+        println!(
+            "\n{}",
+            format!("Applying {}...", apply_parts.join(" and ")).cyan()
+        );
+    }
 
     let mut applied_updates = 0;
     let mut applied_pins = 0;
@@ -1083,26 +1093,30 @@ async fn run_interactive_update(
             match change.kind {
                 ChangeKind::RegistryUpdate => {
                     applied_updates += 1;
-                    println!(
-                        "{} {} {} {} → {}",
-                        location.blue().underline(),
-                        "Updated".green(),
-                        change.package.bold(),
-                        change.old_version.dimmed(),
-                        change.new_version.green(),
-                    );
+                    if !cli.quiet {
+                        println!(
+                            "{} {} {} {} → {}",
+                            location.blue().underline(),
+                            "Updated".green(),
+                            change.package.bold(),
+                            change.old_version.dimmed(),
+                            change.new_version.green(),
+                        );
+                    }
                 }
                 ChangeKind::ConfigPin => {
                     applied_pins += 1;
-                    println!(
-                        "{} {} {} {} → {} {}",
-                        location.blue().underline(),
-                        "Pinned".cyan(),
-                        change.package.bold(),
-                        change.old_version.dimmed(),
-                        change.new_version.cyan(),
-                        "(pinned)".dimmed(),
-                    );
+                    if !cli.quiet {
+                        println!(
+                            "{} {} {} {} → {} {}",
+                            location.blue().underline(),
+                            "Pinned".cyan(),
+                            change.package.bold(),
+                            change.old_version.dimmed(),
+                            change.new_version.cyan(),
+                            "(pinned)".dimmed(),
+                        );
+                    }
                 }
             }
         }
@@ -1126,7 +1140,7 @@ async fn run_interactive_update(
         // Only print the header when at least one lockfile will be regenerated.
         let has_work = regen_results.iter().any(|(_, r)| !r.no_lockfiles);
 
-        if has_work {
+        if has_work && !cli.quiet {
             println!();
             println!("{}", "Regenerating lockfiles...".cyan());
         }
@@ -1161,20 +1175,22 @@ async fn run_interactive_update(
         let _ = Cache::save_shared(cache);
     }
 
-    println!();
-    if applied_updates > 0 {
-        println!(
-            "{} {} package(s)",
-            "Updated".green(),
-            applied_updates.to_string().green().bold()
-        );
-    }
-    if applied_pins > 0 {
-        println!(
-            "{} {} package(s) to configured versions",
-            "Pinned".cyan(),
-            applied_pins.to_string().cyan().bold()
-        );
+    if !cli.quiet {
+        println!();
+        if applied_updates > 0 {
+            println!(
+                "{} {} package(s)",
+                "Updated".green(),
+                applied_updates.to_string().green().bold()
+            );
+        }
+        if applied_pins > 0 {
+            println!(
+                "{} {} package(s) to configured versions",
+                "Pinned".cyan(),
+                applied_pins.to_string().cyan().bold()
+            );
+        }
     }
 
     Ok(())
@@ -1188,7 +1204,9 @@ async fn run_align(cli: &Cli) -> Result<()> {
 
     if files.is_empty() {
         if text_mode {
-            println!("{}", "No dependency files found.".yellow());
+            if !cli.quiet {
+                println!("{}", "No dependency files found.".yellow());
+            }
         } else {
             emit_align_json(&[], 0)?;
         }
@@ -1232,7 +1250,7 @@ async fn run_align(cli: &Cli) -> Result<()> {
     }
 
     if misaligned.is_empty() {
-        if text_mode {
+        if text_mode && !cli.quiet {
             println!(
                 "{} Scanned {} file(s), all packages are aligned",
                 "✓".green(),
@@ -1244,7 +1262,7 @@ async fn run_align(cli: &Cli) -> Result<()> {
 
     let dry_run = cli.dry_run || cli.check;
 
-    if text_mode {
+    if text_mode && !cli.quiet {
         let action_prefix = if dry_run { "Would align" } else { "Aligning" };
 
         println!(
@@ -1262,14 +1280,14 @@ async fn run_align(cli: &Cli) -> Result<()> {
     // Apply alignments if not dry-run
     if !dry_run {
         let updated_count = apply_alignments(&misaligned, cli.full_precision)?;
-        if text_mode {
+        if text_mode && !cli.quiet {
             println!(
                 "\n{} {} package occurrence(s)",
                 "Aligned".green(),
                 updated_count.to_string().green().bold()
             );
         }
-    } else if text_mode {
+    } else if text_mode && !cli.quiet {
         let total_misaligned: usize = misaligned
             .iter()
             .map(|a| a.misaligned_occurrences().len())
@@ -1377,7 +1395,9 @@ async fn run_audit(cli: &Cli) -> Result<()> {
 
     if files.is_empty() {
         if text_mode {
-            println!("{}", "No dependency files found.".yellow());
+            if !cli.quiet {
+                println!("{}", "No dependency files found.".yellow());
+            }
         } else {
             emit_audit_json(&AuditResult::default(), "complete")?;
         }
@@ -1409,18 +1429,20 @@ async fn run_audit(cli: &Cli) -> Result<()> {
 
     if audit_packages.is_empty() {
         if text_mode {
-            println!(
-                "{} Scanned {} file(s), no packages found",
-                "✓".green(),
-                file_count
-            );
+            if !cli.quiet {
+                println!(
+                    "{} Scanned {} file(s), no packages found",
+                    "✓".green(),
+                    file_count
+                );
+            }
         } else {
             emit_audit_json(&AuditResult::default(), "complete")?;
         }
         return Ok(());
     }
 
-    if text_mode {
+    if text_mode && !cli.quiet {
         println!(
             "{}",
             format!(
@@ -1438,32 +1460,34 @@ async fn run_audit(cli: &Cli) -> Result<()> {
     let status = audit_status(&audit_result);
 
     if text_mode {
-        match status {
-            AuditStatus::Clean => {
-                println!(
-                    "\n{} No vulnerabilities found in {} package(s)",
-                    "✓".green(),
-                    audit_packages.len()
-                );
-            }
-            AuditStatus::Vulnerable => {
-                print_audit_vulnerabilities(&audit_result);
-            }
-            AuditStatus::Incomplete => {
-                if audit_result.vulnerable.is_empty() {
+        if !cli.quiet {
+            match status {
+                AuditStatus::Clean => {
                     println!(
-                        "\n{} Audit incomplete: {} error(s) occurred while checking {} package(s)",
-                        "⚠".yellow().bold(),
-                        audit_result.errors.len().to_string().yellow().bold(),
+                        "\n{} No vulnerabilities found in {} package(s)",
+                        "✓".green(),
                         audit_packages.len()
                     );
-                } else {
+                }
+                AuditStatus::Vulnerable => {
                     print_audit_vulnerabilities(&audit_result);
-                    println!(
-                        "\n{} Audit incomplete: {} error(s) occurred while checking dependencies",
-                        "⚠".yellow().bold(),
-                        audit_result.errors.len().to_string().yellow().bold()
-                    );
+                }
+                AuditStatus::Incomplete => {
+                    if audit_result.vulnerable.is_empty() {
+                        println!(
+                            "\n{} Audit incomplete: {} error(s) occurred while checking {} package(s)",
+                            "⚠".yellow().bold(),
+                            audit_result.errors.len().to_string().yellow().bold(),
+                            audit_packages.len()
+                        );
+                    } else {
+                        print_audit_vulnerabilities(&audit_result);
+                        println!(
+                            "\n{} Audit incomplete: {} error(s) occurred while checking dependencies",
+                            "⚠".yellow().bold(),
+                            audit_result.errors.len().to_string().yellow().bold()
+                        );
+                    }
                 }
             }
         }
@@ -2507,7 +2531,7 @@ fn print_file_result(
 
     for error in &result.errors {
         let location = format!("{}:", path);
-        println!(
+        eprintln!(
             "{} {} {}",
             location.blue().underline(),
             "Error:".red(),
@@ -2517,7 +2541,7 @@ fn print_file_result(
 
     for warning in &result.warnings {
         let location = format!("{}:", path);
-        println!(
+        eprintln!(
             "{} {} {}",
             location.blue().underline(),
             "Warning:".yellow(),
@@ -2601,7 +2625,7 @@ fn print_summary(
     }
 
     if !result.errors.is_empty() {
-        println!(
+        eprintln!(
             "{} error(s) occurred",
             result.errors.len().to_string().red().bold()
         );

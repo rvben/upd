@@ -56,6 +56,10 @@ pub struct Cli {
     #[arg(short, long, global = true)]
     pub verbose: bool,
 
+    /// Suppress non-error output. Errors and warnings still print.
+    #[arg(long, short = 'q', global = true, conflicts_with = "verbose")]
+    pub quiet: bool,
+
     /// Interactive mode - approve each update individually
     #[arg(short, long, global = true)]
     pub interactive: bool,
@@ -172,6 +176,7 @@ mod tests {
         assert!(!cli.dry_run);
         assert!(!cli.no_cache);
         assert!(!cli.verbose);
+        assert!(!cli.quiet);
         assert!(!cli.interactive);
         assert!(cli.bump.is_empty());
         assert!(!cli.full_precision);
@@ -179,6 +184,27 @@ mod tests {
         assert!(!cli.lock);
         assert!(cli.paths.is_empty());
         assert!(cli.command.is_none());
+    }
+
+    #[test]
+    fn test_cli_parses_quiet_long() {
+        let cli = Cli::try_parse_from(["upd", "--quiet"]).unwrap();
+        assert!(cli.quiet);
+    }
+
+    #[test]
+    fn test_cli_parses_quiet_short() {
+        let cli = Cli::try_parse_from(["upd", "-q"]).unwrap();
+        assert!(cli.quiet);
+    }
+
+    #[test]
+    fn test_cli_quiet_conflicts_with_verbose() {
+        let result = Cli::try_parse_from(["upd", "--quiet", "--verbose"]);
+        assert!(
+            result.is_err(),
+            "--quiet and --verbose must conflict; got Ok"
+        );
     }
 
     #[test]
