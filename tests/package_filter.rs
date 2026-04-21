@@ -33,7 +33,8 @@ fn run(args: &[&str], cwd: &Path) -> (String, String, i32) {
 fn package_flag_accepts_single_name() {
     // clap parsing: --package foo should not error
     let tmp = tempfile::tempdir().unwrap();
-    let (_stdout, stderr, code) = run(&["--package", "foo", "--dry-run"], tmp.path());
+    let path_str = tmp.path().to_str().unwrap().to_string();
+    let (_stdout, stderr, code) = run(&["--package", "foo", "--dry-run", &path_str], tmp.path());
     assert_ne!(code, 2, "parse error: {stderr}");
     // empty workspace → exit 0
     assert_eq!(
@@ -45,7 +46,11 @@ fn package_flag_accepts_single_name() {
 #[test]
 fn package_flag_accepts_comma_separated() {
     let tmp = tempfile::tempdir().unwrap();
-    let (_stdout, stderr, code) = run(&["--package", "foo,bar", "--dry-run"], tmp.path());
+    let path_str = tmp.path().to_str().unwrap().to_string();
+    let (_stdout, stderr, code) = run(
+        &["--package", "foo,bar", "--dry-run", &path_str],
+        tmp.path(),
+    );
     assert_ne!(code, 2, "parse error: {stderr}");
     assert_eq!(code, 0, "expected 0 on empty workspace: {stderr}");
 }
@@ -53,8 +58,16 @@ fn package_flag_accepts_comma_separated() {
 #[test]
 fn package_flag_accepts_repeated() {
     let tmp = tempfile::tempdir().unwrap();
+    let path_str = tmp.path().to_str().unwrap().to_string();
     let (_stdout, stderr, code) = run(
-        &["--package", "foo", "--package", "bar", "--dry-run"],
+        &[
+            "--package",
+            "foo",
+            "--package",
+            "bar",
+            "--dry-run",
+            &path_str,
+        ],
         tmp.path(),
     );
     assert_ne!(code, 2, "parse error: {stderr}");
@@ -72,9 +85,12 @@ fn package_filter_excludes_non_matching_packages_dry_run() {
 
     // No mock registry — this test only verifies the CLI accepts the flag; filter behaviour is covered by unit tests.
     fs::write(tmp.path().join("requirements.txt"), "requests==2.28.0\n").unwrap();
+    let path_str = tmp.path().to_str().unwrap().to_string();
 
-    let (_stdout, _stderr, code) =
-        run(&["--package", "foo", "--dry-run", "--no-cache"], tmp.path());
+    let (_stdout, _stderr, code) = run(
+        &["--package", "foo", "--dry-run", "--no-cache", &path_str],
+        tmp.path(),
+    );
     assert_eq!(
         code, 0,
         "with --package foo, 'requests' must be silently skipped (exit 0)"
@@ -88,7 +104,8 @@ fn without_package_filter_processes_all_packages() {
 
     // An empty workspace with no files → always exit 0 regardless of filter.
     // This test verifies the flag is truly optional (no regression).
-    let (_stdout, _stderr, code) = run(&["--dry-run", "--no-cache"], tmp.path());
+    let path_str = tmp.path().to_str().unwrap().to_string();
+    let (_stdout, _stderr, code) = run(&["--dry-run", "--no-cache", &path_str], tmp.path());
     assert_eq!(code, 0, "no --package flag on empty workspace must exit 0");
 }
 
@@ -98,10 +115,11 @@ fn comma_separated_package_filter_excludes_others() {
     let tmp = tempfile::tempdir().unwrap();
 
     fs::write(tmp.path().join("requirements.txt"), "requests==2.28.0\n").unwrap();
+    let path_str = tmp.path().to_str().unwrap().to_string();
 
     // "requests" is not in {foo, bar}; should be silently skipped.
     let (_stdout, _stderr, code) = run(
-        &["--package", "foo,bar", "--dry-run", "--no-cache"],
+        &["--package", "foo,bar", "--dry-run", "--no-cache", &path_str],
         tmp.path(),
     );
     assert_eq!(
@@ -120,11 +138,15 @@ fn package_filter_matching_name_does_not_skip() {
     let tmp = tempfile::tempdir().unwrap();
 
     fs::write(tmp.path().join("requirements.txt"), "requests==2.28.0\n").unwrap();
+    let path_str = tmp.path().to_str().unwrap().to_string();
 
     // "requests" matches the filter; upd will try to resolve its version.
     // We don't assert a specific update count but we verify the filter
     // itself does not erroneously skip it (the run must not exit 2 from a crash).
-    let (_stdout, _stderr, code) = run(&["--package", "requests", "--dry-run"], tmp.path());
+    let (_stdout, _stderr, code) = run(
+        &["--package", "requests", "--dry-run", &path_str],
+        tmp.path(),
+    );
     assert_ne!(
         code, 2,
         "a network/parse error should not occur from the filter"

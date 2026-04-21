@@ -138,21 +138,13 @@ pub fn read_netrc_credentials_from_path(
                     }
                     i += 1;
                 }
-                "login" => {
-                    if i + 1 < tokens.len() {
-                        login = Some(tokens[i + 1].to_string());
-                        i += 2;
-                    } else {
-                        i += 1;
-                    }
+                "login" if i + 1 < tokens.len() => {
+                    login = Some(tokens[i + 1].to_string());
+                    i += 2;
                 }
-                "password" => {
-                    if i + 1 < tokens.len() {
-                        password = Some(tokens[i + 1].to_string());
-                        i += 2;
-                    } else {
-                        i += 1;
-                    }
+                "password" if i + 1 < tokens.len() => {
+                    password = Some(tokens[i + 1].to_string());
+                    i += 2;
                 }
                 _ => {
                     i += 1;
@@ -282,10 +274,8 @@ pub fn read_pip_config_from_path(path: &PathBuf) -> Option<PipConfig> {
             let value = value.trim().to_string();
 
             match key.as_str() {
-                "index-url" => {
-                    if !value.is_empty() {
-                        config.index_url = Some(value);
-                    }
+                "index-url" if !value.is_empty() => {
+                    config.index_url = Some(value);
                 }
                 "extra-index-url" => {
                     // Can be space or newline separated in the config

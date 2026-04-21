@@ -49,8 +49,9 @@ fn run_with_env(args: &[&str], cwd: &Path, env: &[(&str, &str)]) -> (String, Str
 fn parse_error_goes_to_stderr_not_stdout() {
     let tmp = tempfile::tempdir().unwrap();
     fs::write(tmp.path().join("package.json"), b"{ BROKEN JSON }").unwrap();
+    let path_str = tmp.path().to_str().unwrap().to_string();
 
-    let (stdout, stderr, code) = run(&["--dry-run", "--no-cache"], tmp.path());
+    let (stdout, stderr, code) = run(&["--dry-run", "--no-cache", &path_str], tmp.path());
 
     assert_eq!(code, 2, "parse error must exit 2; stderr: {stderr}");
     assert!(
@@ -67,8 +68,9 @@ fn parse_error_goes_to_stderr_not_stdout() {
 #[test]
 fn normal_text_run_prints_summary_to_stdout() {
     let tmp = tempfile::tempdir().unwrap();
-    // Empty workspace → "all dependencies up to date"
-    let (stdout, _stderr, code) = run(&["--dry-run"], tmp.path());
+    let path_str = tmp.path().to_str().unwrap().to_string();
+    // Empty workspace → "No dependency files found."
+    let (stdout, _stderr, code) = run(&["--dry-run", &path_str], tmp.path());
     assert_eq!(
         code, 0,
         "expected exit 0 on empty workspace; stdout: {stdout}"
@@ -83,7 +85,8 @@ fn normal_text_run_prints_summary_to_stdout() {
 #[test]
 fn quiet_on_empty_workspace_produces_empty_stdout() {
     let tmp = tempfile::tempdir().unwrap();
-    let (stdout, _stderr, code) = run(&["-q", "--dry-run"], tmp.path());
+    let path_str = tmp.path().to_str().unwrap().to_string();
+    let (stdout, _stderr, code) = run(&["-q", "--dry-run", &path_str], tmp.path());
     assert_eq!(code, 0, "expected exit 0; stderr was not checked");
     assert!(
         stdout.trim().is_empty(),
@@ -97,7 +100,11 @@ fn quiet_on_empty_workspace_produces_empty_stdout() {
 #[test]
 fn quiet_with_json_format_still_emits_json() {
     let tmp = tempfile::tempdir().unwrap();
-    let (stdout, _stderr, code) = run(&["-q", "--format", "json", "--dry-run"], tmp.path());
+    let path_str = tmp.path().to_str().unwrap().to_string();
+    let (stdout, _stderr, code) = run(
+        &["-q", "--format", "json", "--dry-run", &path_str],
+        tmp.path(),
+    );
     assert_eq!(code, 0, "expected exit 0");
     let parsed: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap_or_else(|e| {
         panic!("stdout must be valid JSON with --quiet --format json ({e}); got: {stdout}")
@@ -115,8 +122,9 @@ fn quiet_with_json_format_still_emits_json() {
 fn quiet_does_not_silence_errors_on_stderr() {
     let tmp = tempfile::tempdir().unwrap();
     fs::write(tmp.path().join("package.json"), b"NOT JSON AT ALL").unwrap();
+    let path_str = tmp.path().to_str().unwrap().to_string();
 
-    let (stdout, stderr, code) = run(&["-q", "--dry-run", "--no-cache"], tmp.path());
+    let (stdout, stderr, code) = run(&["-q", "--dry-run", "--no-cache", &path_str], tmp.path());
 
     assert_eq!(code, 2, "parse error must exit 2 even with --quiet");
     assert!(
@@ -141,9 +149,10 @@ fn registry_error_goes_to_stderr_not_stdout() {
         r#"{"dependencies":{"lodash":"1.0.0"}}"#,
     )
     .unwrap();
+    let path_str = tmp.path().to_str().unwrap().to_string();
 
     let (stdout, stderr, code) = run_with_env(
-        &["--dry-run", "--no-cache"],
+        &["--dry-run", "--no-cache", &path_str],
         tmp.path(),
         &[("NPM_REGISTRY", "http://127.0.0.1:1")],
     );
@@ -163,7 +172,8 @@ fn registry_error_goes_to_stderr_not_stdout() {
 #[test]
 fn quiet_check_on_empty_workspace_produces_empty_stdout() {
     let tmp = tempfile::tempdir().unwrap();
-    let (stdout, _stderr, code) = run(&["-q", "--check"], tmp.path());
+    let path_str = tmp.path().to_str().unwrap().to_string();
+    let (stdout, _stderr, code) = run(&["-q", "--check", &path_str], tmp.path());
     assert_eq!(code, 0, "expected exit 0");
     assert!(
         stdout.trim().is_empty(),
@@ -183,8 +193,16 @@ fn verbose_python_scan_omits_crates_io_auth_message() {
 
     // Provide a fake token so the credential detection path would trigger
     // if not properly gated.
+    let path_str = tmp.path().to_str().unwrap().to_string();
     let (stdout, stderr, _code) = run_with_env(
-        &["--verbose", "--dry-run", "--no-cache", "--lang", "python"],
+        &[
+            "--verbose",
+            "--dry-run",
+            "--no-cache",
+            "--lang",
+            "python",
+            &path_str,
+        ],
         tmp.path(),
         &[("CARGO_REGISTRY_TOKEN", "fake-token-for-test")],
     );

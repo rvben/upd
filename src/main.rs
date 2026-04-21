@@ -26,6 +26,47 @@ use upd::updater::{
 };
 use upd::version::match_version_precision;
 
+/// Walk up from `start` to find the nearest ancestor directory that contains a
+/// `.git` entry (file or directory). Returns the path to that ancestor.
+///
+/// Handles both regular git repositories (`.git` is a directory) and
+/// submodules/worktrees (`.git` is a file containing a `gitdir:` pointer).
+fn find_vcs_root(start: &Path) -> Option<PathBuf> {
+    let start = if start.is_file() {
+        start.parent()?
+    } else {
+        start
+    };
+
+    let mut current = start;
+    loop {
+        if current.join(".git").exists() {
+            return Some(current.to_path_buf());
+        }
+        current = current.parent()?;
+    }
+}
+
+/// Resolve the paths to scan.
+///
+/// If the CLI provided explicit paths, use them as-is. Otherwise, find the
+/// nearest VCS root from the current working directory. If no VCS root is
+/// found, return an `Err` with a user-facing message; the caller should exit 2.
+fn resolve_scan_paths(cli: &Cli) -> Result<Vec<PathBuf>, String> {
+    let explicit = cli.get_paths();
+    if !explicit.is_empty() {
+        return Ok(explicit);
+    }
+
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    match find_vcs_root(&cwd) {
+        Some(root) => Ok(vec![root]),
+        None => Err("no paths given and not inside a git repository. \
+Pass an explicit path, or run from inside a git repo."
+            .to_string()),
+    }
+}
+
 /// Parse version components
 fn parse_version(v: &str) -> Option<(u64, u64, u64)> {
     let v = v.trim_start_matches('v');
@@ -386,7 +427,19 @@ async fn run_update(cli: &Cli) -> Result<()> {
         anyhow::bail!("--interactive cannot be combined with --format json");
     }
 
-    let paths = cli.get_paths();
+    // Resolve paths: explicit > VCS root > error
+    let paths = match resolve_scan_paths(cli) {
+        Ok(p) => p,
+        Err(msg) => {
+            eprintln!("{} {}", "error:".red(), msg);
+            std::process::exit(2);
+        }
+    };
+
+    // Mutations are opt-in. Without --apply (and not --interactive, --check,
+    // or --dry-run), the run behaves as dry-run and tells the user how to apply.
+    let effective_dry_run = cli.check || cli.dry_run || (!cli.apply && !cli.interactive);
+
     let files = discover_files(&paths, &cli.langs);
     let file_count = files.len();
 
@@ -402,7 +455,7 @@ async fn run_update(cli: &Cli) -> Result<()> {
                 &[],
                 &UpdateResult::default(),
                 0,
-                cli.dry_run || cli.check,
+                effective_dry_run,
                 UpdateFilter::from_levels(&cli.bump),
             )?;
         }
@@ -565,7 +618,7 @@ async fn run_update(cli: &Cli) -> Result<()> {
     }
 
     // Non-interactive mode: process files in parallel
-    let dry_run = cli.dry_run || cli.check;
+    let dry_run = effective_dry_run;
     let file_jobs: Vec<_> = files
         .into_iter()
         .map(|(path, file_type)| {
@@ -780,6 +833,14 @@ async fn run_update(cli: &Cli) -> Result<()> {
             if !dry_run && applied > 0 {
                 println!("{}", REVERT_TIP);
             }
+            let implicit_dry_run = effective_dry_run && !cli.check && !cli.dry_run;
+            if implicit_dry_run && applied > 0 {
+                println!(
+                    "{}",
+                    "Run with --apply to write changes, or --interactive to approve individually."
+                        .yellow()
+                );
+            }
         }
     } else {
         emit_update_json(&scanned, &total_result, file_count, dry_run, filter)?;
@@ -787,7 +848,7 @@ async fn run_update(cli: &Cli) -> Result<()> {
 
     let has_errors = !total_result.errors.is_empty();
     let has_pending = has_checkable_manifest_changes(&total_result, filter);
-    let exit_code = upd::decide_exit_code(cli.check || cli.dry_run, has_pending, has_errors);
+    let exit_code = upd::decide_exit_code(dry_run, has_pending, has_errors);
     if exit_code != 0 {
         std::process::exit(exit_code);
     }
@@ -1199,7 +1260,16 @@ async fn run_interactive_update(
 
 async fn run_align(cli: &Cli) -> Result<()> {
     let text_mode = cli.format == upd::cli::OutputFormat::Text;
-    let paths = cli.get_paths();
+
+    // Resolve paths: explicit > VCS root > error
+    let paths = match resolve_scan_paths(cli) {
+        Ok(p) => p,
+        Err(msg) => {
+            eprintln!("{} {}", "error:".red(), msg);
+            std::process::exit(2);
+        }
+    };
+
     let files = discover_files(&paths, &cli.langs);
     let file_count = files.len();
 
@@ -1261,7 +1331,8 @@ async fn run_align(cli: &Cli) -> Result<()> {
         return Ok(());
     }
 
-    let dry_run = cli.dry_run || cli.check;
+    // Mutations are opt-in for align as well.
+    let dry_run = cli.check || cli.dry_run || (!cli.apply && !cli.interactive);
 
     if text_mode && !cli.quiet {
         let action_prefix = if dry_run { "Would align" } else { "Aligning" };
@@ -1390,7 +1461,15 @@ pub(crate) fn build_audit_packages(
 async fn run_audit(cli: &Cli) -> Result<()> {
     let no_fail = matches!(&cli.command, Some(Command::Audit { no_fail, .. }) if *no_fail);
     let text_mode = cli.format == upd::cli::OutputFormat::Text;
-    let paths = cli.get_paths();
+    // Audit never mutates files, so no VCS check is needed. Fall back to CWD.
+    let paths = {
+        let explicit = cli.get_paths();
+        if explicit.is_empty() {
+            vec![PathBuf::from(".")]
+        } else {
+            explicit
+        }
+    };
     let files = discover_files(&paths, &cli.langs);
     let file_count = files.len();
 
@@ -3521,6 +3600,75 @@ serde = "1.0.1"
             audit_pkgs[0].ecosystem,
             upd::audit::Ecosystem::Go,
             "ecosystem must be Go"
+        );
+    }
+
+    // ── find_vcs_root unit tests ──────────────────────────────────────────────
+
+    #[test]
+    fn test_find_vcs_root_returns_none_in_plain_tempdir() {
+        // A freshly created tempdir has no .git ancestor.
+        let tmp = tempdir().unwrap();
+        let result = find_vcs_root(tmp.path());
+        assert!(
+            result.is_none(),
+            "find_vcs_root must return None outside a git repo"
+        );
+    }
+
+    #[test]
+    fn test_find_vcs_root_finds_git_directory() {
+        let tmp = tempdir().unwrap();
+        // Create a fake .git directory at the root.
+        std::fs::create_dir(tmp.path().join(".git")).unwrap();
+        let result = find_vcs_root(tmp.path());
+        assert_eq!(
+            result,
+            Some(tmp.path().to_path_buf()),
+            "find_vcs_root must return the directory containing .git"
+        );
+    }
+
+    #[test]
+    fn test_find_vcs_root_finds_git_file_for_submodules() {
+        let tmp = tempdir().unwrap();
+        // A .git *file* (not directory) is used by submodules and worktrees.
+        std::fs::write(tmp.path().join(".git"), "gitdir: ../.git/worktrees/foo").unwrap();
+        let result = find_vcs_root(tmp.path());
+        assert_eq!(
+            result,
+            Some(tmp.path().to_path_buf()),
+            "find_vcs_root must handle .git as a file (submodule/worktree)"
+        );
+    }
+
+    #[test]
+    fn test_find_vcs_root_walks_up_to_parent() {
+        let tmp = tempdir().unwrap();
+        // .git is in the root; subdir should still find it.
+        std::fs::create_dir(tmp.path().join(".git")).unwrap();
+        let subdir = tmp.path().join("deep").join("nested");
+        std::fs::create_dir_all(&subdir).unwrap();
+        let result = find_vcs_root(&subdir);
+        assert_eq!(
+            result,
+            Some(tmp.path().to_path_buf()),
+            "find_vcs_root must walk up to find the .git ancestor"
+        );
+    }
+
+    #[test]
+    fn test_find_vcs_root_with_file_input_checks_parent() {
+        let tmp = tempdir().unwrap();
+        std::fs::create_dir(tmp.path().join(".git")).unwrap();
+        // Pass a file path; should scan the parent.
+        let file = tmp.path().join("requirements.txt");
+        std::fs::write(&file, "requests==1.0.0\n").unwrap();
+        let result = find_vcs_root(&file);
+        assert_eq!(
+            result,
+            Some(tmp.path().to_path_buf()),
+            "find_vcs_root with a file path must check the file's parent"
         );
     }
 }

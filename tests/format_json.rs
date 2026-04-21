@@ -35,7 +35,8 @@ fn parse_json(stdout: &str) -> Value {
 #[test]
 fn update_format_json_on_empty_workspace_emits_valid_schema() {
     let tmp = tempfile::tempdir().unwrap();
-    let (stdout, _stderr, code) = run(&["--format", "json", "--dry-run"], tmp.path());
+    let path_str = tmp.path().to_str().unwrap().to_string();
+    let (stdout, _stderr, code) = run(&["--format", "json", "--dry-run", &path_str], tmp.path());
     assert_eq!(code, 0, "exit code should be 0 on empty workspace");
 
     let json = parse_json(&stdout);
@@ -51,7 +52,8 @@ fn update_format_json_on_empty_workspace_emits_valid_schema() {
 #[test]
 fn align_format_json_on_empty_workspace_emits_valid_schema() {
     let tmp = tempfile::tempdir().unwrap();
-    let (stdout, _stderr, code) = run(&["--format", "json", "align"], tmp.path());
+    let path_str = tmp.path().to_str().unwrap().to_string();
+    let (stdout, _stderr, code) = run(&["--format", "json", "align", &path_str], tmp.path());
     assert_eq!(code, 0);
 
     let json = parse_json(&stdout);
@@ -95,7 +97,8 @@ fn interactive_with_format_json_is_rejected() {
 #[test]
 fn format_text_is_default_and_not_json() {
     let tmp = tempfile::tempdir().unwrap();
-    let (stdout, _stderr, code) = run(&["--dry-run"], tmp.path());
+    let path_str = tmp.path().to_str().unwrap().to_string();
+    let (stdout, _stderr, code) = run(&["--dry-run", &path_str], tmp.path());
     assert_eq!(code, 0);
     assert!(
         serde_json::from_str::<Value>(stdout.trim()).is_err(),

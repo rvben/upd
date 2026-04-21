@@ -50,16 +50,18 @@ fn parse_json(stdout: &str) -> Value {
 #[test]
 fn check_on_empty_workspace_exits_zero() {
     let tmp = tempfile::tempdir().unwrap();
-    let (_stdout, _stderr, code) = run(&["--check"], tmp.path());
+    let path_str = tmp.path().to_str().unwrap();
+    let (_stdout, _stderr, code) = run(&["--check", path_str], tmp.path());
     assert_eq!(code, 0, "expected 0 for clean --check, got {code}");
 }
 
-/// Exit 0: default (mutate) mode on an empty workspace — no files, no registry
+/// Exit 0: `--dry-run` mode on an empty workspace — no files, no registry
 /// calls, no errors.
 #[test]
 fn mutate_clean_workspace_exits_zero() {
     let tmp = tempfile::tempdir().unwrap();
-    let (_stdout, _stderr, status) = run(&["--dry-run"], tmp.path());
+    let path_str = tmp.path().to_str().unwrap();
+    let (_stdout, _stderr, status) = run(&["--dry-run", path_str], tmp.path());
     assert_eq!(
         status, 0,
         "dry-run on an empty workspace must exit 0 (no updates, no errors)"
@@ -71,8 +73,9 @@ fn mutate_clean_workspace_exits_zero() {
 fn dry_run_with_corrupted_package_json_exits_two() {
     let tmp = tempfile::tempdir().unwrap();
     fs::write(tmp.path().join("package.json"), b"{ THIS IS NOT JSON }").unwrap();
+    let path_str = tmp.path().to_str().unwrap();
 
-    let (_stdout, stderr, code) = run(&["--dry-run"], tmp.path());
+    let (_stdout, stderr, code) = run(&["--dry-run", path_str], tmp.path());
     assert_eq!(
         code, 2,
         "corrupted JSON should produce exit 2, got {code}; stderr: {stderr}"
@@ -84,8 +87,9 @@ fn dry_run_with_corrupted_package_json_exits_two() {
 fn check_with_corrupted_package_json_exits_two() {
     let tmp = tempfile::tempdir().unwrap();
     fs::write(tmp.path().join("package.json"), b"{ THIS IS NOT JSON }").unwrap();
+    let path_str = tmp.path().to_str().unwrap();
 
-    let (_stdout, stderr, code) = run(&["--check"], tmp.path());
+    let (_stdout, stderr, code) = run(&["--check", path_str], tmp.path());
     assert_eq!(
         code, 2,
         "corrupted JSON in --check should produce exit 2, got {code}; stderr: {stderr}"
@@ -103,8 +107,9 @@ fn dry_run_with_corrupted_requirements_exits_two() {
     // to exercise the Err path is via a package.json (JSON parse is strict).
     // Use package.json since its parse error is deterministic.
     fs::write(tmp.path().join("package.json"), b"INVALID").unwrap();
+    let path_str = tmp.path().to_str().unwrap();
 
-    let (_stdout, stderr, code) = run(&["--dry-run"], tmp.path());
+    let (_stdout, stderr, code) = run(&["--dry-run", path_str], tmp.path());
     assert_eq!(
         code, 2,
         "corrupted file should produce exit 2, got {code}; stderr: {stderr}"
@@ -116,8 +121,9 @@ fn dry_run_with_corrupted_requirements_exits_two() {
 fn json_output_with_error_has_structured_error_objects() {
     let tmp = tempfile::tempdir().unwrap();
     fs::write(tmp.path().join("package.json"), b"{ BROKEN }").unwrap();
+    let path_str = tmp.path().to_str().unwrap();
 
-    let (stdout, _stderr, code) = run(&["--format", "json", "--dry-run"], tmp.path());
+    let (stdout, _stderr, code) = run(&["--format", "json", "--dry-run", path_str], tmp.path());
     assert_eq!(
         code, 2,
         "corrupted file with --format json should exit 2, got {code}"
@@ -153,8 +159,9 @@ fn json_output_with_error_has_structured_error_objects() {
 fn json_output_summary_errors_count_nonzero_on_error() {
     let tmp = tempfile::tempdir().unwrap();
     fs::write(tmp.path().join("package.json"), b"BROKEN").unwrap();
+    let path_str = tmp.path().to_str().unwrap();
 
-    let (stdout, _stderr, code) = run(&["--format", "json", "--dry-run"], tmp.path());
+    let (stdout, _stderr, code) = run(&["--format", "json", "--dry-run", path_str], tmp.path());
     assert_eq!(code, 2, "expected exit 2 on error, got {code}");
 
     let json = parse_json(&stdout);
@@ -192,11 +199,12 @@ async fn check_with_pending_update_exits_one() {
 
     let tmp = tempfile::tempdir().unwrap();
     fs::write(tmp.path().join("requirements.txt"), "requests==1.0.0\n").unwrap();
+    let path_str = tmp.path().to_str().unwrap().to_string();
 
     // Point the PyPI client at the mock server.  UV_INDEX_URL is stripped of any
     // trailing "/simple" suffix by normalize_index_url, so pass the bare URI.
     let (_stdout, stderr, code) = run_with_env(
-        &["--check", "--no-cache"],
+        &["--check", "--no-cache", &path_str],
         tmp.path(),
         &[("UV_INDEX_URL", &server.uri())],
     );
@@ -230,9 +238,10 @@ async fn dry_run_with_pending_updates_exits_one() {
 
     let tmp = tempfile::tempdir().unwrap();
     fs::write(tmp.path().join("requirements.txt"), "requests==1.0.0\n").unwrap();
+    let path_str = tmp.path().to_str().unwrap().to_string();
 
     let (_stdout, stderr, code) = run_with_env(
-        &["--dry-run", "--no-cache"],
+        &["--dry-run", "--no-cache", &path_str],
         tmp.path(),
         &[("UV_INDEX_URL", &server.uri())],
     );
@@ -247,7 +256,8 @@ async fn dry_run_with_pending_updates_exits_one() {
 #[test]
 fn dry_run_on_empty_workspace_exits_zero() {
     let tmp = tempfile::tempdir().unwrap();
-    let (_stdout, _stderr, code) = run(&["--dry-run"], tmp.path());
+    let path_str = tmp.path().to_str().unwrap();
+    let (_stdout, _stderr, code) = run(&["--dry-run", path_str], tmp.path());
     assert_eq!(
         code, 0,
         "--dry-run on an empty workspace must exit 0 (no updates, no errors)"
@@ -266,9 +276,10 @@ fn check_with_registry_error_exits_two() {
         r#"{"dependencies":{"lodash":"1.0.0"}}"#,
     )
     .unwrap();
+    let path_str = tmp.path().to_str().unwrap().to_string();
 
     let (_stdout, stderr, code) = run_with_env(
-        &["--check", "--no-cache"],
+        &["--check", "--no-cache", &path_str],
         tmp.path(),
         // Port 1 on loopback is never bound; the OS returns ECONNREFUSED instantly.
         &[("NPM_REGISTRY", "http://127.0.0.1:1")],
@@ -519,8 +530,9 @@ fn bad_config_wrong_ignore_format_prints_error_on_stderr() {
     // that config loading is attempted and the parse error surfaces.
     fs::write(tmp.path().join("requirements.txt"), "requests==1.0.0\n").unwrap();
 
-    // Run with --no-cache to avoid hitting external registries in tests.
-    let (_stdout, stderr, _code) = run(&["--dry-run", "--no-cache"], tmp.path());
+    // Run with --no-cache and an explicit path to avoid the VCS-root check.
+    let path_str = tmp.path().to_str().unwrap();
+    let (_stdout, stderr, _code) = run(&["--dry-run", "--no-cache", path_str], tmp.path());
 
     // The error must be visible — the user must not see silence.
     assert!(

@@ -112,6 +112,14 @@ pub struct Cli {
     #[arg(long, global = true)]
     pub lock: bool,
 
+    /// Apply updates to files. Without --apply, runs in dry-run mode.
+    ///
+    /// When a positional path or no path (VCS root) is used, --apply is required
+    /// to mutate files. --check, --dry-run, and --interactive do not require
+    /// --apply.
+    #[arg(long, global = true)]
+    pub apply: bool,
+
     /// Path to config file (default: auto-discover .updrc.toml, upd.toml, or .updrc)
     #[arg(short = 'c', long, global = true, value_name = "FILE")]
     pub config: Option<PathBuf>,
@@ -179,13 +187,17 @@ pub enum Command {
 }
 
 impl Cli {
+    /// Returns explicitly provided paths, or an empty vec when none were given.
+    ///
+    /// Callers that need a default path (e.g. the VCS root) must resolve it
+    /// themselves; this method only surfaces what the user typed.
     pub fn get_paths(&self) -> Vec<PathBuf> {
         match &self.command {
             Some(Command::Update { paths }) if !paths.is_empty() => paths.clone(),
             Some(Command::Align { paths }) if !paths.is_empty() => paths.clone(),
             Some(Command::Audit { paths, .. }) if !paths.is_empty() => paths.clone(),
             _ if !self.paths.is_empty() => self.paths.clone(),
-            _ => vec![PathBuf::from(".")],
+            _ => vec![],
         }
     }
 }
@@ -207,6 +219,7 @@ mod tests {
         assert!(!cli.full_precision);
         assert!(!cli.check);
         assert!(!cli.lock);
+        assert!(!cli.apply);
         assert!(cli.paths.is_empty());
         assert!(cli.command.is_none());
     }
@@ -372,10 +385,13 @@ mod tests {
     }
 
     #[test]
-    fn test_get_paths_defaults_to_current_dir() {
+    fn test_get_paths_returns_empty_when_no_paths_given() {
         let cli = Cli::try_parse_from(["upd"]).unwrap();
         let paths = cli.get_paths();
-        assert_eq!(paths, vec![PathBuf::from(".")]);
+        assert!(
+            paths.is_empty(),
+            "get_paths() must return an empty vec when no paths are given; got: {paths:?}"
+        );
     }
 
     #[test]

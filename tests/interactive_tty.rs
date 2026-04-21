@@ -28,8 +28,9 @@ fn interactive_without_tty_exits_with_error() {
     })
     .expect("could not open null device");
 
+    let dir_str = tmp.path().to_str().expect("non-UTF-8 path");
     let output = Command::new(upd_bin())
-        .args(["--interactive"])
+        .args(["--interactive", dir_str])
         .current_dir(tmp.path())
         .stdin(stdin_null)
         .output()

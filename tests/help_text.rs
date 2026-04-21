@@ -146,13 +146,14 @@ fn json_format_does_not_print_tip() {
 ///
 /// We use wiremock to serve a fake PyPI Simple-API advertising version 99.0.0
 /// for `requests`, while the manifest pins it at 1.0.0.  The run is mutating
-/// (no --check / --dry-run), so the update is applied and the tip must appear.
+/// (--apply, no --check / --dry-run), so the update is applied and the tip must appear.
 #[tokio::test]
 async fn mutating_run_with_applied_update_prints_tip() {
     let (server, tmp) = setup_fake_pypi_with_update().await;
+    let path_str = tmp.path().to_str().unwrap().to_string();
 
     let (stdout, stderr, _code) = run_with_env(
-        &["--no-cache"],
+        &["--apply", "--no-cache", &path_str],
         tmp.path(),
         &[("UV_INDEX_URL", &server.uri())],
     );
