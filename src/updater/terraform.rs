@@ -290,6 +290,11 @@ impl Updater for TerraformUpdater {
         let mut fetch_deps: Vec<(usize, &ParsedTerraformDep)> = Vec::new();
 
         for (idx, dep) in parsed_deps.iter().enumerate() {
+            if options.is_package_filtered_out(&dep.source) {
+                result.unchanged += 1;
+                continue;
+            }
+
             if options.should_ignore(&dep.source) {
                 ignored_packages.push((
                     dep.version_line_idx,

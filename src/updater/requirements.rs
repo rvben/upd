@@ -261,6 +261,11 @@ impl Updater for RequirementsUpdater {
         let mut fetch_deps: Vec<(usize, &str, &ParsedDep)> = Vec::new();
 
         for (line_idx, line, parsed) in &parsed_deps {
+            if options.is_package_filtered_out(&parsed.package) {
+                result.unchanged += 1;
+                continue;
+            }
+
             // Check if package should be ignored
             if options.should_ignore(&parsed.package) {
                 ignored_packages.push((

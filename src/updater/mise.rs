@@ -223,7 +223,9 @@ impl Updater for MiseUpdater {
         for dep in deps {
             let line_idx = dep.line_number.map(|n| n - 1).unwrap_or(0);
 
-            if options.should_ignore(&dep.name) {
+            if options.is_package_filtered_out(&dep.name) {
+                result.unchanged += 1;
+            } else if options.should_ignore(&dep.name) {
                 ignored_tools.push((line_idx, dep.name, dep.version));
             } else if let Some(pinned_version) = options.get_pinned_version(&dep.name) {
                 pinned_tools.push((line_idx, dep.name, dep.version, pinned_version.to_string()));

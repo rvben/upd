@@ -233,6 +233,11 @@ impl CargoTomlUpdater {
             let package = key.to_string();
             let line_num = line_index.line_for(section_path, &package);
 
+            if options.is_package_filtered_out(&package) {
+                result.unchanged += 1;
+                continue;
+            }
+
             // Check if package should be ignored
             if options.should_ignore(&package) {
                 ignored_deps.push((package, current_version, line_num));

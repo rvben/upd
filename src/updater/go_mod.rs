@@ -186,6 +186,11 @@ impl Updater for GoModUpdater {
                     continue;
                 }
 
+                if options.is_package_filtered_out(module) {
+                    result.unchanged += 1;
+                    continue;
+                }
+
                 // Check if module should be ignored
                 if options.should_ignore(module) {
                     ignored_modules.push((

@@ -103,6 +103,16 @@ pub struct Cli {
     /// Print the effective configuration schema and exit
     #[arg(long, global = true)]
     pub show_config: bool,
+
+    /// Only update packages with these names (comma-separated or repeated).
+    /// Exact case-sensitive match. Non-matching packages are silently skipped.
+    #[arg(
+        long = "package",
+        value_name = "NAME",
+        global = true,
+        value_delimiter = ','
+    )]
+    pub packages: Vec<String>,
 }
 
 #[derive(Subcommand)]

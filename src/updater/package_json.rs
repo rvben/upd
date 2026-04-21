@@ -251,6 +251,11 @@ impl Updater for PackageJsonUpdater {
                             continue;
                         }
 
+                        if options.is_package_filtered_out(package) {
+                            result.unchanged += 1;
+                            continue;
+                        }
+
                         // Check if package should be ignored
                         if options.should_ignore(package) {
                             ignored_packages.push((

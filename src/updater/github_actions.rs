@@ -232,6 +232,11 @@ impl Updater for GithubActionsUpdater {
 
                 let owner_repo = Self::extract_owner_repo(action).to_string();
 
+                if options.is_package_filtered_out(&owner_repo) {
+                    result.unchanged += 1;
+                    continue;
+                }
+
                 // Check config for ignore/pin
                 if options.should_ignore(&owner_repo) {
                     ignored_actions.push((line_idx, owner_repo, version_ref.to_string()));

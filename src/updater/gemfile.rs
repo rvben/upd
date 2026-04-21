@@ -132,6 +132,11 @@ impl Updater for GemfileUpdater {
         let mut fetch_deps: Vec<(usize, &str, &ParsedGem)> = Vec::new();
 
         for (line_idx, line, parsed) in &parsed_gems {
+            if options.is_package_filtered_out(&parsed.name) {
+                result.unchanged += 1;
+                continue;
+            }
+
             if options.should_ignore(&parsed.name) {
                 ignored_packages.push((*line_idx, parsed.name.clone(), parsed.version.clone()));
                 continue;

@@ -225,11 +225,13 @@ fn build_update_options(
     dry_run: bool,
     full_precision: bool,
     config: Option<Arc<UpdConfig>>,
+    packages: &[String],
 ) -> UpdateOptions {
     let mut options = UpdateOptions::new(dry_run, full_precision);
     if let Some(config) = config {
         options = options.with_config(config);
     }
+    options = options.with_packages(packages.to_vec());
     options
 }
 
@@ -555,7 +557,7 @@ async fn run_update(cli: &Cli) -> Result<()> {
             (
                 path,
                 file_type,
-                build_update_options(dry_run, cli.full_precision, config),
+                build_update_options(dry_run, cli.full_precision, config, &cli.packages),
             )
         })
         .collect();
@@ -874,6 +876,7 @@ async fn run_interactive_update(
             true,
             cli.full_precision,
             file_configs.get(path).cloned().flatten(),
+            &cli.packages,
         );
 
         if cli.verbose {

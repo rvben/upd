@@ -163,7 +163,9 @@ impl Updater for PreCommitUpdater {
                 let version = caps.get(1).unwrap().as_str().to_string();
                 let owner_repo = owner_repo.clone();
 
-                if options.should_ignore(&owner_repo) {
+                if options.is_package_filtered_out(&owner_repo) {
+                    result.unchanged += 1;
+                } else if options.should_ignore(&owner_repo) {
                     ignored_repos.push((line_idx, owner_repo, version));
                 } else if let Some(pinned_version) = options.get_pinned_version(&owner_repo) {
                     pinned_repos.push((line_idx, owner_repo, version, pinned_version.to_string()));

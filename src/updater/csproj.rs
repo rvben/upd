@@ -202,6 +202,11 @@ impl Updater for CsprojUpdater {
                 continue;
             }
 
+            if options.is_package_filtered_out(&pkg.name) {
+                result.unchanged += 1;
+                continue;
+            }
+
             if options.should_ignore(&pkg.name) {
                 ignored_packages.push((pkg.line_idx, pkg.name.clone(), pkg.version.clone()));
                 continue;

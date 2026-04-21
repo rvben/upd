@@ -92,6 +92,9 @@ pub struct UpdateOptions {
     pub full_precision: bool,
     /// Configuration for ignoring/pinning packages
     pub config: Option<Arc<UpdConfig>>,
+    /// When non-empty, only packages whose name is in this set are processed.
+    /// An empty set means "process all packages" (no filter active).
+    pub packages: Vec<String>,
 }
 
 impl UpdateOptions {
@@ -101,6 +104,7 @@ impl UpdateOptions {
             dry_run,
             full_precision,
             config: None,
+            packages: Vec::new(),
         }
     }
 
@@ -108,6 +112,18 @@ impl UpdateOptions {
     pub fn with_config(mut self, config: Arc<UpdConfig>) -> Self {
         self.config = Some(config);
         self
+    }
+
+    /// Restrict processing to the named packages.
+    pub fn with_packages(mut self, packages: Vec<String>) -> Self {
+        self.packages = packages;
+        self
+    }
+
+    /// Returns `true` when this package should be skipped because a `--package`
+    /// filter is active and the name is not in the allowed set.
+    pub fn is_package_filtered_out(&self, package: &str) -> bool {
+        !self.packages.is_empty() && !self.packages.iter().any(|p| p == package)
     }
 
     /// Check if a package should be ignored
