@@ -194,6 +194,17 @@ pub enum Command {
         /// Exit 0 even when vulnerabilities are found (useful for scheduled scans that should not break CI)
         #[arg(long)]
         no_fail: bool,
+
+        /// Bump each vulnerable package to the minimum version that clears all known CVEs.
+        ///
+        /// For each vulnerable package, the safe target is the maximum `fixed_version` across
+        /// all its vulnerabilities. Packages that have at least one vulnerability with no
+        /// `fixed_version` are reported and left untouched.
+        ///
+        /// Requires `--apply` to write changes; without it this is a dry-run preview that
+        /// exits 1 when fixable packages are found (or 0 with `--no-fail`).
+        #[arg(long = "fix-audit")]
+        fix_audit: bool,
     },
 
     /// Clear the version cache
@@ -204,6 +215,14 @@ pub enum Command {
 }
 
 impl Cli {
+    /// Returns true when a run should be dry-run.
+    ///
+    /// Dry-run is implied by --check, --dry-run, or the absence of --apply
+    /// when --interactive is not set.
+    pub fn is_effective_dry_run(&self) -> bool {
+        self.check || self.dry_run || (!self.apply && !self.interactive)
+    }
+
     /// Returns explicitly provided paths, or an empty vec when none were given.
     ///
     /// Callers that need a default path (e.g. the VCS root) must resolve it

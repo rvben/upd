@@ -8,7 +8,7 @@ use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use upd::align::{PackageAlignment, PackageOccurrence, find_alignments, scan_packages};
-use upd::audit::{AuditResult, Ecosystem, OsvClient, Package as AuditPackage};
+use upd::audit::{AuditResult, Ecosystem, OsvClient, Package as AuditPackage, compute_fix_plan};
 use upd::cache::{Cache, CachedRegistry};
 use upd::cli::{BumpLevel, Cli, Command, REVERT_TIP};
 use upd::config::UpdConfig;
@@ -438,7 +438,7 @@ async fn run_update(cli: &Cli) -> Result<()> {
 
     // Mutations are opt-in. Without --apply (and not --interactive, --check,
     // or --dry-run), the run behaves as dry-run and tells the user how to apply.
-    let effective_dry_run = cli.check || cli.dry_run || (!cli.apply && !cli.interactive);
+    let effective_dry_run = cli.is_effective_dry_run();
 
     let files = discover_files(&paths, &cli.langs);
     let file_count = files.len();
@@ -1458,8 +1458,14 @@ pub(crate) fn build_audit_packages(
     audit_packages
 }
 
+/// Per-file edit list used by the --fix-audit apply path.
+///
+/// Each entry is `(file_type, [(package_name, old_version, new_version, line_num)])`.
+type FileEdits = (FileType, Vec<(String, String, String, Option<usize>)>);
+
 async fn run_audit(cli: &Cli) -> Result<()> {
     let no_fail = matches!(&cli.command, Some(Command::Audit { no_fail, .. }) if *no_fail);
+    let fix_audit = matches!(&cli.command, Some(Command::Audit { fix_audit, .. }) if *fix_audit);
     let text_mode = cli.format == upd::cli::OutputFormat::Text;
     // Audit never mutates files, so no VCS check is needed. Fall back to CWD.
     let paths = {
@@ -1581,6 +1587,192 @@ async fn run_audit(cli: &Cli) -> Result<()> {
             AuditStatus::Incomplete => "incomplete",
         };
         emit_audit_json(&audit_result, status_str)?;
+    }
+
+    // --fix-audit: bump each vulnerable package to its minimum safe version.
+    if fix_audit && !audit_result.vulnerable.is_empty() {
+        let (fixable, unfixable) = compute_fix_plan(&audit_result);
+
+        // Report unfixable packages.
+        if text_mode && !cli.quiet {
+            for (name, reason) in &unfixable {
+                eprintln!(
+                    "{} Cannot auto-fix {}: {}",
+                    "⚠".yellow().bold(),
+                    name.bold(),
+                    reason
+                );
+            }
+        }
+
+        if !fixable.is_empty() {
+            // Build a per-file map of (package_name, old_version, new_version, line_num)
+            // using the already-scanned package occurrences.
+            //
+            // We use the same approach as apply_alignments: collect edits per file,
+            // then apply them with apply_version_updates.
+            let mut edits_by_file: HashMap<PathBuf, FileEdits> = HashMap::new();
+
+            for ((name_lower, lang), occurrences) in &packages {
+                // Only ecosystems OSV covers.
+                if *lang == Lang::Actions
+                    || *lang == Lang::PreCommit
+                    || *lang == Lang::Mise
+                    || *lang == Lang::Terraform
+                {
+                    continue;
+                }
+
+                for occ in occurrences {
+                    if !occ.is_bumpable {
+                        continue;
+                    }
+                    // Match against the fixable map using original_name (preserves casing).
+                    // Fall back to the lowercased key if not found.
+                    let fix_version = fixable
+                        .get(&occ.original_name)
+                        .or_else(|| fixable.get(name_lower.as_str()));
+                    let Some(new_version) = fix_version else {
+                        continue;
+                    };
+
+                    let entry = edits_by_file
+                        .entry(occ.file_path.clone())
+                        .or_insert_with(|| (occ.file_type, Vec::new()));
+                    entry.1.push((
+                        occ.original_name.clone(),
+                        occ.version.clone(),
+                        new_version.clone(),
+                        occ.line_number,
+                    ));
+                }
+            }
+
+            // Mutations are opt-in; without --apply this is a dry-run preview.
+            let effective_dry_run = cli.is_effective_dry_run();
+
+            let mut total_fixed: usize = 0;
+            let mut fix_errors: Vec<String> = Vec::new();
+
+            for (path, (file_type, edits)) in &edits_by_file {
+                if text_mode && !cli.quiet {
+                    for (name, old_ver, new_ver, line_num) in edits {
+                        let location = match line_num {
+                            Some(n) => format!("{}:{}:", path.display(), n),
+                            None => format!("{}:", path.display()),
+                        };
+                        if effective_dry_run {
+                            println!(
+                                "{} {} {} {} → {} {}",
+                                location.blue().underline(),
+                                "Would fix".yellow(),
+                                name.bold(),
+                                old_ver.dimmed(),
+                                new_ver.yellow(),
+                                "(security fix)".dimmed(),
+                            );
+                        } else {
+                            println!(
+                                "{} {} {} {} → {} {}",
+                                location.blue().underline(),
+                                "Fixed".green(),
+                                name.bold(),
+                                old_ver.dimmed(),
+                                new_ver.green(),
+                                "(security fix)".dimmed(),
+                            );
+                        }
+                    }
+                }
+
+                if !effective_dry_run {
+                    let updates: Vec<VersionEdit<'_>> = edits
+                        .iter()
+                        .map(|(name, old_ver, new_ver, line_num)| VersionEdit {
+                            package: name.as_str(),
+                            old_version: old_ver.as_str(),
+                            new_version: new_ver.as_str(),
+                            line_num: *line_num,
+                        })
+                        .collect();
+
+                    match read_file_safe(path) {
+                        Ok(content) => {
+                            match apply_version_updates(
+                                &content,
+                                &updates,
+                                *file_type,
+                                cli.full_precision,
+                            ) {
+                                Ok(applied) => {
+                                    if applied.content != content {
+                                        if let Err(e) = write_file_atomic(path, &applied.content) {
+                                            let msg =
+                                                format!("Error writing {}: {}", path.display(), e);
+                                            eprintln!("{}", msg.red());
+                                            fix_errors.push(msg);
+                                        } else {
+                                            total_fixed += applied.applied_count();
+                                        }
+                                    }
+                                }
+                                Err(e) => {
+                                    let msg = format!(
+                                        "Error applying fixes to {}: {}",
+                                        path.display(),
+                                        e
+                                    );
+                                    eprintln!("{}", msg.red());
+                                    fix_errors.push(msg);
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            let msg = format!("Error reading {}: {}", path.display(), e);
+                            eprintln!("{}", msg.red());
+                            fix_errors.push(msg);
+                        }
+                    }
+                } else {
+                    total_fixed += edits.len();
+                }
+            }
+
+            if text_mode && !cli.quiet {
+                if effective_dry_run {
+                    if total_fixed > 0 {
+                        println!(
+                            "\n{} Would fix {} vulnerable package occurrence(s). Run with --apply to write changes.",
+                            "→".yellow(),
+                            total_fixed.to_string().yellow().bold()
+                        );
+                    }
+                } else {
+                    println!(
+                        "\n{} Fixed {} vulnerable package occurrence(s)",
+                        "✓".green(),
+                        total_fixed.to_string().green().bold()
+                    );
+                }
+            }
+
+            // Exit-code contract for --fix-audit:
+            // - errors during fix → 2
+            // - dry-run with pending fixes and !no_fail → 1
+            // - applied successfully (or no_fail) → 0
+            let fix_exit_code = if !fix_errors.is_empty() {
+                2
+            } else if effective_dry_run && total_fixed > 0 && !no_fail {
+                1
+            } else {
+                0
+            };
+
+            if fix_exit_code != 0 {
+                std::process::exit(fix_exit_code);
+            }
+            return Ok(());
+        }
     }
 
     let exit_code = upd::decide_audit_exit_code(

@@ -97,6 +97,89 @@ impl AuditResult {
     }
 }
 
+/// Compute which packages can be auto-fixed and which cannot.
+///
+/// Returns two collections:
+/// - `fixable`: a map of `package_name → min_safe_version`. The min safe version
+///   is the maximum `fixed_version` across all vulnerabilities for that package;
+///   upgrading to this version clears every known CVE.
+/// - `unfixable`: a list of `(package_name, reason)` for packages that have at
+///   least one vulnerability with no `fixed_version`.
+///
+/// A package appears in at most one of the two collections: if it has even one
+/// vulnerability without a fix, it is considered unfixable and excluded from the
+/// fixable set.
+pub fn compute_fix_plan(audit: &AuditResult) -> (HashMap<String, String>, Vec<(String, String)>) {
+    let mut fixable: HashMap<String, String> = HashMap::new();
+    let mut unfixable: Vec<(String, String)> = Vec::new();
+
+    for pkg_result in &audit.vulnerable {
+        let name = &pkg_result.package.name;
+
+        // Check whether any vulnerability has no fixed_version.
+        let blocking: Option<&Vulnerability> = pkg_result
+            .vulnerabilities
+            .iter()
+            .find(|v| v.fixed_version.is_none());
+
+        if let Some(blocker) = blocking {
+            unfixable.push((name.clone(), format!("{} has no fixed version", blocker.id)));
+            continue;
+        }
+
+        // All vulnerabilities have a fixed_version — find the maximum.
+        let max_fixed = pkg_result
+            .vulnerabilities
+            .iter()
+            .filter_map(|v| v.fixed_version.as_deref())
+            .max_by(|a, b| compare_fix_versions(a, b));
+
+        if let Some(version) = max_fixed {
+            fixable.insert(name.clone(), version.to_string());
+        }
+    }
+
+    (fixable, unfixable)
+}
+
+/// Compare two version strings for ordering, preferring semver but falling back
+/// to lexicographic comparison for non-semver ecosystems.
+fn compare_fix_versions(a: &str, b: &str) -> std::cmp::Ordering {
+    match (semver_parse(a), semver_parse(b)) {
+        (Some(va), Some(vb)) => va.cmp(&vb),
+        _ => a.cmp(b),
+    }
+}
+
+/// Parse a version string as semver, accepting an optional leading `v`.
+///
+/// Returns `(major, minor, patch, is_stable)` where `is_stable` is 1 for stable
+/// releases and 0 for pre-releases (e.g. `2.0.0-rc1`). This ensures stable
+/// versions beat pre-releases when all numeric components are equal.
+fn semver_parse(v: &str) -> Option<(u64, u64, u64, u8)> {
+    let v = v.trim_start_matches('v');
+    let parts: Vec<&str> = v.split('.').collect();
+    if parts.len() < 2 {
+        return None;
+    }
+    let major: u64 = parts[0].parse().ok()?;
+    let minor: u64 = parts[1].parse().ok()?;
+    // Patch may carry a pre-release or build suffix (e.g. "0-rc1", "3+build1").
+    // Take only the leading digit run so "0-rc1" → patch=0, rest="-rc1".
+    let patch_part = parts.get(2).copied().unwrap_or("0");
+    let (patch_digits, rest) = patch_part
+        .split_once(|c: char| !c.is_ascii_digit())
+        .unwrap_or((patch_part, ""));
+    let patch: u64 = if patch_digits.is_empty() {
+        0
+    } else {
+        patch_digits.parse().ok()?
+    };
+    // Stability flag: 1 = stable, 0 = pre-release. Stable wins ties.
+    let is_stable: u8 = if rest.is_empty() { 1 } else { 0 };
+    Some((major, minor, patch, is_stable))
+}
+
 /// Return a sort key for a severity string such that Critical sorts first.
 ///
 /// Lower numeric values sort earlier, so Critical = 0, Unknown = 5.
@@ -547,5 +630,161 @@ mod tests {
         assert!(audit.vulnerable.is_empty());
         assert_eq!(audit.safe_count, 1);
         assert!(audit.errors.is_empty());
+    }
+
+    // ─── compute_fix_plan unit tests ──────────────────────────────────────────
+
+    fn make_vuln(id: &str, fixed: Option<&str>) -> Vulnerability {
+        Vulnerability {
+            id: id.to_string(),
+            summary: None,
+            severity: None,
+            url: None,
+            fixed_version: fixed.map(str::to_string),
+        }
+    }
+
+    fn make_pkg_result(name: &str, vulns: Vec<Vulnerability>) -> PackageAuditResult {
+        PackageAuditResult {
+            package: Package {
+                name: name.to_string(),
+                version: "1.0.0".to_string(),
+                ecosystem: Ecosystem::PyPI,
+            },
+            vulnerabilities: vulns,
+        }
+    }
+
+    #[test]
+    fn fix_plan_empty_audit_returns_empty_plan() {
+        let audit = AuditResult::default();
+        let (fixable, unfixable) = compute_fix_plan(&audit);
+        assert!(fixable.is_empty());
+        assert!(unfixable.is_empty());
+    }
+
+    #[test]
+    fn fix_plan_all_vulns_have_fixed_version() {
+        let audit = AuditResult {
+            vulnerable: vec![make_pkg_result(
+                "requests",
+                vec![
+                    make_vuln("CVE-2024-001", Some("2.28.0")),
+                    make_vuln("CVE-2024-002", Some("2.30.0")),
+                ],
+            )],
+            safe_count: 0,
+            errors: vec![],
+        };
+        let (fixable, unfixable) = compute_fix_plan(&audit);
+        assert!(unfixable.is_empty());
+        assert_eq!(fixable.get("requests").map(|s| s.as_str()), Some("2.30.0"));
+    }
+
+    #[test]
+    fn fix_plan_one_vuln_missing_fixed_version_makes_unfixable() {
+        let audit = AuditResult {
+            vulnerable: vec![make_pkg_result(
+                "django",
+                vec![
+                    make_vuln("CVE-2024-003", Some("3.2.0")),
+                    make_vuln("CVE-2024-004", None),
+                ],
+            )],
+            safe_count: 0,
+            errors: vec![],
+        };
+        let (fixable, unfixable) = compute_fix_plan(&audit);
+        assert!(fixable.is_empty());
+        assert_eq!(unfixable.len(), 1);
+        assert_eq!(unfixable[0].0, "django");
+        assert!(
+            unfixable[0].1.contains("CVE-2024-004"),
+            "reason should name the blocking vuln: {}",
+            unfixable[0].1
+        );
+    }
+
+    #[test]
+    fn fix_plan_multiple_packages_mixed_fixability() {
+        let audit = AuditResult {
+            vulnerable: vec![
+                make_pkg_result("fixable-pkg", vec![make_vuln("CVE-A", Some("1.5.0"))]),
+                make_pkg_result("broken-pkg", vec![make_vuln("CVE-B", None)]),
+            ],
+            safe_count: 1,
+            errors: vec![],
+        };
+        let (fixable, unfixable) = compute_fix_plan(&audit);
+        assert_eq!(fixable.len(), 1);
+        assert!(fixable.contains_key("fixable-pkg"));
+        assert_eq!(unfixable.len(), 1);
+        assert_eq!(unfixable[0].0, "broken-pkg");
+    }
+
+    #[test]
+    fn fix_plan_max_fixed_version_wins_when_multiple_vulns() {
+        let audit = AuditResult {
+            vulnerable: vec![make_pkg_result(
+                "flask",
+                vec![
+                    make_vuln("CVE-X", Some("2.0.0")),
+                    make_vuln("CVE-Y", Some("2.3.1")),
+                    make_vuln("CVE-Z", Some("2.1.0")),
+                ],
+            )],
+            safe_count: 0,
+            errors: vec![],
+        };
+        let (fixable, unfixable) = compute_fix_plan(&audit);
+        assert!(unfixable.is_empty());
+        assert_eq!(fixable.get("flask").map(|s| s.as_str()), Some("2.3.1"));
+    }
+
+    #[test]
+    fn fix_plan_prefers_stable_over_prerelease() {
+        // One vuln fixed at "2.0.0-rc1", another at "2.0.0".
+        // The stable release "2.0.0" must win regardless of iteration order.
+        for vulns in [
+            vec![
+                make_vuln("CVE-pre", Some("2.0.0-rc1")),
+                make_vuln("CVE-stable", Some("2.0.0")),
+            ],
+            vec![
+                make_vuln("CVE-stable", Some("2.0.0")),
+                make_vuln("CVE-pre", Some("2.0.0-rc1")),
+            ],
+        ] {
+            let audit = AuditResult {
+                vulnerable: vec![make_pkg_result("mypkg", vulns)],
+                safe_count: 0,
+                errors: vec![],
+            };
+            let (fixable, unfixable) = compute_fix_plan(&audit);
+            assert!(unfixable.is_empty());
+            assert_eq!(
+                fixable.get("mypkg").map(|s| s.as_str()),
+                Some("2.0.0"),
+                "stable 2.0.0 must beat pre-release 2.0.0-rc1"
+            );
+        }
+    }
+
+    #[test]
+    fn fix_plan_semver_ordering_not_lexicographic() {
+        // "2.10.0" > "2.9.0" semver-wise but lexicographically "2.9.0" > "2.10.0"
+        let audit = AuditResult {
+            vulnerable: vec![make_pkg_result(
+                "pkg",
+                vec![
+                    make_vuln("CVE-1", Some("2.9.0")),
+                    make_vuln("CVE-2", Some("2.10.0")),
+                ],
+            )],
+            safe_count: 0,
+            errors: vec![],
+        };
+        let (fixable, _) = compute_fix_plan(&audit);
+        assert_eq!(fixable.get("pkg").map(|s| s.as_str()), Some("2.10.0"));
     }
 }
