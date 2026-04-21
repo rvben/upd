@@ -96,6 +96,10 @@ pub struct Cli {
     /// Output format (defaults to human-readable text)
     #[arg(long, global = true, value_enum, default_value_t = OutputFormat::Text, value_name = "FORMAT")]
     pub format: OutputFormat,
+
+    /// Print the effective configuration schema and exit
+    #[arg(long, global = true)]
+    pub show_config: bool,
 }
 
 #[derive(Subcommand)]
@@ -548,5 +552,23 @@ mod tests {
             Err(err) => assert!(err.to_string().contains("invalid value")),
             Ok(_) => panic!("expected invalid format to be rejected"),
         }
+    }
+
+    #[test]
+    fn test_cli_parses_show_config() {
+        let cli = Cli::try_parse_from(["upd", "--show-config"]).unwrap();
+        assert!(cli.show_config);
+    }
+
+    #[test]
+    fn test_cli_show_config_default_false() {
+        let cli = Cli::try_parse_from(["upd"]).unwrap();
+        assert!(!cli.show_config);
+    }
+
+    #[test]
+    fn test_cli_show_config_is_global() {
+        let cli = Cli::try_parse_from(["upd", "update", "--show-config"]).unwrap();
+        assert!(cli.show_config);
     }
 }

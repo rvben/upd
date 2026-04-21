@@ -475,3 +475,56 @@ fn audit_with_osv_unreachable_exits_two() {
         "audit with unreachable OSV must exit 2; stderr: {stderr}"
     );
 }
+
+// ── --show-config tests ───────────────────────────────────────────────────────
+
+/// Exit 0: `--show-config` prints the schema and exits cleanly.
+#[test]
+fn show_config_exits_zero() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (stdout, _stderr, code) = run(&["--show-config"], tmp.path());
+    assert_eq!(code, 0, "--show-config must exit 0; got {code}");
+    // The schema output must contain the documented top-level keys so users
+    // know what the config file should look like.
+    assert!(
+        stdout.contains("ignore"),
+        "--show-config stdout must contain 'ignore'; got:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("[pin]"),
+        "--show-config stdout must contain '[pin]'; got:\n{stdout}"
+    );
+}
+
+// ── bad config parse tests ────────────────────────────────────────────────────
+
+/// A config file using `[ignore]` (table) instead of `ignore = [...]` (array)
+/// must surface a visible parse error on stderr.
+///
+/// This is the "original bug": before the fix, `load_from_path` swallowed the
+/// error and the user saw zero output — the config was silently ignored.
+#[test]
+fn bad_config_wrong_ignore_format_prints_error_on_stderr() {
+    let tmp = tempfile::tempdir().unwrap();
+
+    // The broken config: `[ignore]` creates a table; the updater expects an array.
+    fs::write(
+        tmp.path().join(".updrc.toml"),
+        "[ignore]\npackages = [\"some-package\"]\n",
+    )
+    .unwrap();
+
+    // A minimal manifest so that the updater iterates over files and triggers
+    // config discovery.  The file itself need not be up-to-date; we only care
+    // that config loading is attempted and the parse error surfaces.
+    fs::write(tmp.path().join("requirements.txt"), "requests==1.0.0\n").unwrap();
+
+    // Run with --no-cache to avoid hitting external registries in tests.
+    let (_stdout, stderr, _code) = run(&["--dry-run", "--no-cache"], tmp.path());
+
+    // The error must be visible — the user must not see silence.
+    assert!(
+        stderr.to_lowercase().contains("error"),
+        "stderr must contain 'error' when config fails to parse; got:\n{stderr}"
+    );
+}

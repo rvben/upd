@@ -2,26 +2,36 @@
 //!
 //! Supports `.updrc.toml` and `upd.toml` configuration files.
 //!
-//! Example configuration:
+//! # Schema
+//!
+//! All configuration fields are top-level keys:
+//!
 //! ```toml
-//! # Packages to ignore (never update)
+//! # Packages to ignore (never update) — top-level array
 //! ignore = [
 //!     "some-legacy-package",
 //!     "pinned-for-compatibility",
 //! ]
 //!
-//! # Pin packages to specific versions or constraints
+//! # Pin packages to specific versions or constraints — top-level table
 //! [pin]
 //! requests = "2.28.0"  # Pin to exact version
 //! django = ">=3.2,<4"  # Pin to version range
 //! ```
+//!
+//! Unknown top-level keys produce a warning on stderr but do not stop execution.
+//! A common mistake is writing `[ignore]` (table) instead of `ignore = [...]` (array).
 
+use colored::Colorize;
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 /// Maximum size for config files (1 MB) to prevent DoS
 const MAX_CONFIG_FILE_SIZE: u64 = 1024 * 1024;
+
+/// All valid top-level keys in the config schema.
+const KNOWN_KEYS: &[&str] = &["ignore", "pin"];
 
 /// Configuration loaded from .updrc.toml or upd.toml
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -56,13 +66,45 @@ impl UpdConfig {
         None
     }
 
-    /// Load configuration from a specific file path (silent failure for auto-discovery)
+    /// Load configuration from a specific file path.
+    ///
+    /// Parse errors are printed to stderr so the user can see that their config
+    /// was ignored. Warnings for unknown keys are also printed to stderr.
     pub fn load_from_path(path: &Path) -> Option<Self> {
-        Self::load_from_path_with_error(path).ok()
+        match Self::load_with_warnings(path) {
+            Ok((config, warnings)) => {
+                for w in &warnings {
+                    eprintln!("warning: {w}");
+                }
+                Some(config)
+            }
+            Err(e) => {
+                eprintln!(
+                    "{} failed to parse {}: {}",
+                    "error:".red(),
+                    path.display(),
+                    e
+                );
+                None
+            }
+        }
     }
 
-    /// Load configuration from a specific file path with detailed error messages
+    /// Load configuration from a specific file path with detailed error messages.
+    ///
+    /// Warnings for unknown keys are printed to stderr.
     pub fn load_from_path_with_error(path: &Path) -> Result<Self, String> {
+        let (config, warnings) = Self::load_with_warnings(path)?;
+        for w in &warnings {
+            eprintln!("warning: {w}");
+        }
+        Ok(config)
+    }
+
+    /// Load configuration and return any unknown-key warnings alongside the parsed config.
+    ///
+    /// The caller decides how to surface warnings (print to stderr, collect, etc.).
+    pub fn load_with_warnings(path: &Path) -> Result<(Self, Vec<String>), String> {
         // Check if file exists
         if !path.exists() {
             return Err(format!("Config file not found: {}", path.display()));
@@ -99,11 +141,60 @@ impl UpdConfig {
             }
         })?;
 
-        // Parse TOML
-        toml::from_str(&content).map_err(|e| {
-            // toml::de::Error provides line/column info
-            format!("Invalid TOML in config file {}:\n  {}", path.display(), e)
-        })
+        Self::parse_with_warnings(&content, path.to_string_lossy().as_ref())
+    }
+
+    /// Parse config TOML content, collecting warnings for unknown top-level keys.
+    ///
+    /// `source_label` is used in warning messages (typically the file path).
+    pub fn parse_with_warnings(
+        content: &str,
+        source_label: &str,
+    ) -> Result<(Self, Vec<String>), String> {
+        // Parse as generic TOML Value to detect unknown keys before deserializing
+        // into the typed struct. This lets us warn without hard-rejecting.
+        let raw: toml::Value = toml::from_str(content)
+            .map_err(|e| format!("Invalid TOML in config file {}:\n  {}", source_label, e))?;
+
+        let mut warnings = Vec::new();
+        if let toml::Value::Table(table) = &raw {
+            for key in table.keys() {
+                if !KNOWN_KEYS.contains(&key.as_str()) {
+                    warnings.push(format!(
+                        "unknown key `{}` in config file {}; valid keys are: {}. \
+                         Run `upd --show-config` to see the expected schema.",
+                        key,
+                        source_label,
+                        KNOWN_KEYS.join(", ")
+                    ));
+                }
+            }
+        }
+
+        // Parse into typed struct (uses the already-validated TOML)
+        let config: Self = raw
+            .try_into()
+            .map_err(|e| format!("Invalid TOML in config file {}:\n  {}", source_label, e))?;
+
+        Ok((config, warnings))
+    }
+
+    /// Return the canonical schema as a TOML string.
+    ///
+    /// Used by `--show-config` to help users understand the expected format.
+    pub fn schema_toml() -> &'static str {
+        r#"# upd configuration schema
+# File names: .updrc.toml, upd.toml, or .updrc
+# Searched from the current directory upward.
+
+# ignore: packages that upd should never update (top-level array of strings)
+ignore = []
+
+# pin: packages pinned to a specific version or constraint (top-level table)
+[pin]
+# example-package = "1.2.3"
+# another-package = ">=2.0,<3"
+"#
     }
 
     /// Check if a package should be ignored
@@ -622,6 +713,121 @@ other-pkg = "1.0"
             // CargoTomlUpdater counts pinned packages only in pinned, not updated
             assert_eq!(result.updated.len(), 1); // only other-pkg
         }
+    }
+
+    // ==================== Unknown Key / Schema Validation Tests ====================
+
+    #[test]
+    fn test_valid_config_parses_cleanly_no_warnings() {
+        // Regression guard: a fully-valid config produces zero warnings.
+        let content = r#"
+ignore = ["legacy-package", "old-lib"]
+
+[pin]
+requests = "2.28.0"
+django = ">=3.2,<4"
+"#;
+        let (config, warnings) = UpdConfig::parse_with_warnings(content, "test.toml").unwrap();
+        assert!(
+            warnings.is_empty(),
+            "no warnings expected for valid config; got: {warnings:?}"
+        );
+        assert_eq!(config.ignore.len(), 2);
+        assert_eq!(config.pin.len(), 2);
+    }
+
+    #[test]
+    fn test_unknown_top_level_key_produces_warning_config_still_loads() {
+        // A config with an unknown key should emit a warning but still load correctly.
+        // The classic mistake: `[ignore] packages = [...]` creates a TABLE called ignore.
+        let content = r#"
+ignore = ["valid-pkg"]
+
+[unknown_section]
+foo = "bar"
+"#;
+        let (config, warnings) = UpdConfig::parse_with_warnings(content, "test.toml").unwrap();
+
+        assert_eq!(
+            warnings.len(),
+            1,
+            "expected exactly one warning; got: {warnings:?}"
+        );
+        assert!(
+            warnings[0].contains("unknown"),
+            "warning should mention 'unknown': {}",
+            warnings[0]
+        );
+        assert!(
+            warnings[0].contains("unknown_section"),
+            "warning should name the offending key: {}",
+            warnings[0]
+        );
+        // Config still loaded the valid parts
+        assert_eq!(config.ignore.len(), 1);
+        assert!(config.should_ignore("valid-pkg"));
+    }
+
+    #[test]
+    fn test_multiple_unknown_keys_produce_multiple_warnings() {
+        let content = r#"
+ignore = ["pkg-a"]
+
+[typo_ignore]
+packages = ["pkg-b"]
+
+[extras]
+foo = "bar"
+"#;
+        let (_, warnings) = UpdConfig::parse_with_warnings(content, "test.toml").unwrap();
+        assert_eq!(
+            warnings.len(),
+            2,
+            "expected two warnings; got: {warnings:?}"
+        );
+        let all = warnings.join("\n");
+        assert!(
+            all.contains("typo_ignore"),
+            "should mention typo_ignore: {all}"
+        );
+        assert!(all.contains("extras"), "should mention extras: {all}");
+    }
+
+    #[test]
+    fn test_show_config_hint_in_warning() {
+        // Warnings must reference --show-config so users know how to get help.
+        let content = r#"
+[wrong_section]
+foo = "bar"
+"#;
+        let (_, warnings) = UpdConfig::parse_with_warnings(content, "test.toml").unwrap();
+        assert!(!warnings.is_empty());
+        assert!(
+            warnings[0].contains("show-config"),
+            "warning should mention --show-config: {}",
+            warnings[0]
+        );
+    }
+
+    #[test]
+    fn test_classic_wrong_format_warns_and_loads_empty() {
+        // [ignore] packages = [...] is the documented wrong format.
+        // It creates a TABLE under `ignore`, which our struct can't deserialize as Vec<String>.
+        // The raw table parse should detect `ignore` is a table (unknown shape) but since
+        // `ignore` IS a known key name, it won't produce an unknown-key warning.
+        // However, the deserialization into Vec<String> will fail with a type error.
+        let content = r#"
+[ignore]
+packages = ["some-package"]
+"#;
+        // This should fail to parse since ignore is expected to be an array
+        let result = UpdConfig::parse_with_warnings(content, "test.toml");
+        assert!(result.is_err(), "wrong format should produce a parse error");
+        let err = result.unwrap_err();
+        assert!(
+            err.contains("Invalid TOML"),
+            "error should mention 'Invalid TOML': {err}"
+        );
     }
 
     // ==================== Error Handling Tests ====================

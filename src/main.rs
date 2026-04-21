@@ -339,6 +339,12 @@ async fn main() -> Result<()> {
         colored::control::set_override(false);
     }
 
+    // --show-config: print the canonical config schema and exit
+    if cli.show_config {
+        print!("{}", upd::config::UpdConfig::schema_toml());
+        return Ok(());
+    }
+
     match &cli.command {
         Some(Command::CleanCache) => {
             clean_cache()?;
