@@ -10,7 +10,7 @@ use std::sync::Arc;
 use upd::align::{PackageAlignment, PackageOccurrence, find_alignments, scan_packages};
 use upd::audit::{AuditResult, Ecosystem, OsvClient, Package as AuditPackage};
 use upd::cache::{Cache, CachedRegistry};
-use upd::cli::{BumpLevel, Cli, Command};
+use upd::cli::{BumpLevel, Cli, Command, REVERT_TIP};
 use upd::config::UpdConfig;
 use upd::interactive::{PendingUpdate, prompt_all};
 use upd::lockfile::{LockfileRegenResult, regenerate_lockfiles};
@@ -756,7 +756,11 @@ async fn run_update(cli: &Cli) -> Result<()> {
 
     if text_mode {
         println!();
-        print_summary(&total_result, file_count, dry_run, filter);
+        let applied = print_summary(&total_result, file_count, dry_run, filter);
+        // Print the revert tip after a mutating run that applied at least one update.
+        if !dry_run && applied > 0 {
+            println!("{}", REVERT_TIP);
+        }
     } else {
         emit_update_json(&scanned, &total_result, file_count, dry_run, filter)?;
     }
@@ -2506,7 +2510,12 @@ fn print_file_result(
     }
 }
 
-fn print_summary(result: &UpdateResult, file_count: usize, dry_run: bool, filter: UpdateFilter) {
+fn print_summary(
+    result: &UpdateResult,
+    file_count: usize,
+    dry_run: bool,
+    filter: UpdateFilter,
+) -> usize {
     let action = if dry_run { "Would update" } else { "Updated" };
 
     // Count by update type, respecting filter
@@ -2581,6 +2590,8 @@ fn print_summary(result: &UpdateResult, file_count: usize, dry_run: bool, filter
             result.errors.len().to_string().red().bold()
         );
     }
+
+    filtered_total
 }
 
 fn clean_cache() -> Result<()> {

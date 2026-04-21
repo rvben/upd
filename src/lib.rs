@@ -13,7 +13,7 @@ pub mod version;
 pub use align::{AlignResult, PackageAlignment, PackageOccurrence, find_alignments, scan_packages};
 pub use audit::{AuditResult, Ecosystem, OsvClient, Package, PackageAuditResult, Vulnerability};
 pub use cache::Cache;
-pub use cli::{Cli, Command};
+pub use cli::{Cli, Command, REVERT_TIP};
 pub use config::UpdConfig;
 pub use lockfile::{
     LockfileRegenResult, LockfileType, RegenOutcome, detect_lockfiles, regenerate_lockfiles,

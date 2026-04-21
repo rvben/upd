@@ -2,6 +2,8 @@ use crate::updater::Lang;
 use clap::{Parser, Subcommand, ValueEnum};
 use std::path::PathBuf;
 
+pub const REVERT_TIP: &str = "Tip: changes are applied in-place \u{2014} use git to revert.";
+
 /// Kind of version bump to include when filtering updates.
 #[derive(ValueEnum, Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[value(rename_all = "lower")]
@@ -27,7 +29,8 @@ pub enum OutputFormat {
 #[command(
     author,
     version,
-    about = "A fast dependency updater for Python, Node.js, Rust, Go, Ruby, .NET, Terraform, GitHub Actions, pre-commit, and Mise/asdf projects"
+    about = "A fast dependency updater for Python, Node.js, Rust, Go, Ruby, .NET, Terraform, GitHub Actions, pre-commit, and Mise/asdf projects",
+    after_help = REVERT_TIP
 )]
 pub struct Cli {
     #[command(subcommand)]
