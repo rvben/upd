@@ -347,6 +347,19 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
+    // Reject non-existent paths before any I/O; known subcommands are routed by clap before this point.
+    let invalid: Vec<_> = cli.paths.iter().filter(|p| !p.exists()).collect();
+    for path in &invalid {
+        eprintln!(
+            "{} '{}' is not a known subcommand or existing path",
+            "error:".red(),
+            path.display()
+        );
+    }
+    if !invalid.is_empty() {
+        std::process::exit(2);
+    }
+
     match &cli.command {
         Some(Command::CleanCache) => {
             clean_cache()?;
