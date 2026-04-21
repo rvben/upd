@@ -454,9 +454,11 @@ mod tests {
     #[tokio::test]
     async fn test_cached_registry_caches_results() {
         use crate::registry::MockRegistry;
+        use std::sync::Mutex;
 
         let mock = MockRegistry::new("pypi").with_version("flask", "3.0.0");
-        let cache = Cache::new_shared();
+        // Use an in-memory empty cache so the test never reads from disk.
+        let cache: Arc<Mutex<Cache>> = Arc::new(Mutex::new(Cache::default()));
         let cached = CachedRegistry::new(mock, cache.clone(), true);
 
         // First call - not in cache, should fetch from registry

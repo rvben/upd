@@ -146,6 +146,7 @@ impl AuditCache {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serial_test::serial;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn make_vuln(id: &str) -> Vulnerability {
@@ -287,6 +288,7 @@ mod tests {
     // ── file I/O ──────────────────────────────────────────────────────────────
 
     #[test]
+    #[serial]
     fn load_missing_file_returns_default() {
         use tempfile::tempdir;
         let original = std::env::var("UPD_CACHE_DIR").ok();
@@ -309,6 +311,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn save_and_load_roundtrip_via_disk() {
         use tempfile::tempdir;
         let original = std::env::var("UPD_CACHE_DIR").ok();
