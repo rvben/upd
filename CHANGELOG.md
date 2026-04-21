@@ -9,6 +9,48 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 
 
+
+## [0.1.0](https://github.com/rvben/upd/compare/v0.0.28...v0.1.0) - 2026-04-21
+
+### Breaking Changes
+
+- **cli**: rename --bump to --only-bump and add --max-bump ([eb63589](https://github.com/rvben/upd/commit/eb63589867bac483b5de313d413d7c8e22a00a5f))
+- **cli**: lock CLI surface for 0.1.0 ([d7a3ea4](https://github.com/rvben/upd/commit/d7a3ea441836e266c9ca3c3b772026246ba07d2f))
+
+### Added
+
+- **audit**: add SARIF 2.1.0 output for audit results ([d6b0118](https://github.com/rvben/upd/commit/d6b01188862bef90550814269df21c32f1588a50))
+- **audit**: cache OSV responses and add --offline mode ([5a3058b](https://github.com/rvben/upd/commit/5a3058b39d97c4a116eefde65265bdfe354d263d))
+- **audit**: add --fix-audit to bump packages to minimum safe version ([5292ae2](https://github.com/rvben/upd/commit/5292ae264b8f076c6b170f5eba5788e9d7eb56da))
+- **cli**: rename --bump to --only-bump and add --max-bump ([eb63589](https://github.com/rvben/upd/commit/eb63589867bac483b5de313d413d7c8e22a00a5f))
+- **cli**: scope no-args to VCS root and require --apply to mutate ([fe99418](https://github.com/rvben/upd/commit/fe99418b4844fa6c6944644e47982518a3f8616b))
+- **audit**: normalize severity labels and sort by severity ([940f25c](https://github.com/rvben/upd/commit/940f25c0286deb5bb72d59cd08bec5ec6a34577e))
+- **cli**: route errors to stderr and add --quiet flag ([0cbc19c](https://github.com/rvben/upd/commit/0cbc19c30f0c98a2683434c2f6b6f9f1cb9be615))
+- **cli**: add --package filter to restrict updates by name ([f7962c8](https://github.com/rvben/upd/commit/f7962c8b1333a2da2133aacdc89f6f8318d0eb4e))
+- **config**: warn on unknown keys and add --show-config ([cab49c1](https://github.com/rvben/upd/commit/cab49c18eb0ff1fd19f1e579959dc9ca3a555617))
+- **lock**: regenerate packages.lock.json and .terraform.lock.hcl ([87d8e4e](https://github.com/rvben/upd/commit/87d8e4e9f7ea4e13ad0a5d4e4244384eae48b779))
+- **audit**: include .NET packages via OSV NuGet ecosystem ([caec69d](https://github.com/rvben/upd/commit/caec69de65ae61f0923e19f1ba264031cc512365))
+- **cli**: add --format json for machine-readable output ([f9c867f](https://github.com/rvben/upd/commit/f9c867fc497ed53e6d6997bb84660b40d851469a))
+
+### Fixed
+
+- **cli**: reject unknown subcommands instead of silent no-op ([e28aea4](https://github.com/rvben/upd/commit/e28aea44b783190f002a3453a1fc21ceff23c882))
+- **terraform**: handle registry.terraform.io prefixed sources ([6d90d11](https://github.com/rvben/upd/commit/6d90d1175ab25b35d81dfff791329d5da8b34d8d))
+- **cli**: print revert tip in --help and post-run summary ([05cdd14](https://github.com/rvben/upd/commit/05cdd14a5de31fc0a9533f6d6454bb5cb5b8c6d4))
+- **lockfile**: error on missing tool, skip when no lockfile exists ([f8cca78](https://github.com/rvben/upd/commit/f8cca785f8a365ee7240cc60236b92387253afdb))
+- **cli**: accept comma-separated values for --lang ([c7f8b11](https://github.com/rvben/upd/commit/c7f8b11564b872270747f1cb88b2dbb988060bf3))
+- **main**: exit 1 on --dry-run with pending updates ([eb3cadc](https://github.com/rvben/upd/commit/eb3cadc79f03f33f5a9ce5cc26ecec74c804b103))
+- **audit**: exit 3 on vulnerabilities, add --no-fail ([28e8b75](https://github.com/rvben/upd/commit/28e8b75ad7b9ff15f33dfd56c5a8270e3dc1696b))
+- **main**: exit 2 on errors, structure JSON error objects ([353e013](https://github.com/rvben/upd/commit/353e013988cb43bd66544246e1dca0a5132d4263))
+- **version**: keep pre-releases on pre-release-pinned packages ([a95d2f8](https://github.com/rvben/upd/commit/a95d2f85c4143cc913266df774bda3fe35a0a4d3))
+- **terraform**: keep ~> constraint when latest still satisfies ([e869e40](https://github.com/rvben/upd/commit/e869e40f99ca88cda873556cfdaff06c44b8de53))
+- **audit**: include Go pseudoversion dependencies ([e051f06](https://github.com/rvben/upd/commit/e051f0621a88751059f83707bc415df359b15905))
+- **interactive**: require TTY for --interactive mode ([ba0d0b2](https://github.com/rvben/upd/commit/ba0d0b2e2bb7d021ea557bf547bade3be5953379))
+- **updater**: refuse to write version downgrades ([41bd7e6](https://github.com/rvben/upd/commit/41bd7e67d03d48cb2f948770abc7ee4979205f9e))
+- **requirements**: skip update when current is not valid PEP 440 ([4e6f3ea](https://github.com/rvben/upd/commit/4e6f3ea755d974392915e3fe211b6e0f9e6c3121))
+- **audit**: preserve package-name case for OSV queries ([8bde8b1](https://github.com/rvben/upd/commit/8bde8b1bc81aba56a43049d5fac46016195d7eac))
+- **rubygems**: skip yanked versions when selecting latest ([2d48a0e](https://github.com/rvben/upd/commit/2d48a0ebcce2c576ca0169f661f27bd4a268a18c))
+
 ## [0.0.28](https://github.com/rvben/upd/compare/v0.0.27...v0.0.28) - 2026-04-17
 
 ### Added
