@@ -409,10 +409,14 @@ mod tests {
     fn test_cache_file_operations() {
         use tempfile::tempdir;
 
+        // Capture the current value so we can restore it after the test.
+        let original_cache_dir = std::env::var("UPD_CACHE_DIR").ok();
+
         // Use a temp directory for cache
         let temp = tempdir().unwrap();
         let cache_dir = temp.path().join("upd-test-cache");
-        // SAFETY: This is a single-threaded test and we restore the var at the end
+        // SAFETY: Single-threaded test (`--test-threads=1`). The original
+        // value is restored unconditionally in the cleanup block below.
         unsafe {
             std::env::set_var("UPD_CACHE_DIR", &cache_dir);
         }
@@ -437,10 +441,13 @@ mod tests {
         let after_clean = Cache::load().unwrap();
         assert!(after_clean.pypi.is_empty());
 
-        // Clean up
-        // SAFETY: Restoring the environment variable after test
+        // Restore the environment to the state before this test ran.
+        // SAFETY: Same single-threaded constraint as the set above.
         unsafe {
-            std::env::remove_var("UPD_CACHE_DIR");
+            match original_cache_dir {
+                Some(val) => std::env::set_var("UPD_CACHE_DIR", val),
+                None => std::env::remove_var("UPD_CACHE_DIR"),
+            }
         }
     }
 

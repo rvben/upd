@@ -288,6 +288,10 @@ pub fn build_audit_report(
         }
     }
 
+    // Sort the flattened list by severity descending so JSON output is
+    // deterministic and consistent with the text output order.
+    vulnerabilities.sort_by_key(|v| crate::audit::severity_sort_key(v.severity.as_deref()));
+
     let packages_checked = audit.vulnerable.len() + audit.safe_count;
     let vulnerability_count = vulnerabilities.len();
 
@@ -478,14 +482,14 @@ mod tests {
                     Vulnerability {
                         id: "GHSA-abc".into(),
                         summary: Some("Prototype pollution".into()),
-                        severity: Some("HIGH".into()),
+                        severity: Some("High".into()),
                         url: Some("https://example/abc".into()),
                         fixed_version: Some("4.17.21".into()),
                     },
                     Vulnerability {
                         id: "CVE-2020-1234".into(),
                         summary: None,
-                        severity: None,
+                        severity: Some("Unknown".into()),
                         url: None,
                         fixed_version: None,
                     },
@@ -501,10 +505,10 @@ mod tests {
         assert_eq!(json["vulnerabilities"].as_array().unwrap().len(), 2);
         assert_eq!(json["vulnerabilities"][0]["ecosystem"], "npm");
         assert_eq!(json["vulnerabilities"][0]["id"], "GHSA-abc");
-        assert_eq!(json["vulnerabilities"][0]["severity"], "HIGH");
-        assert!(
-            json["vulnerabilities"][1].get("severity").is_none(),
-            "absent severity must be omitted"
+        assert_eq!(json["vulnerabilities"][0]["severity"], "High");
+        assert_eq!(
+            json["vulnerabilities"][1]["severity"], "Unknown",
+            "vulnerabilities with no severity data must serialize as Unknown"
         );
         assert_eq!(json["summary"]["packages_checked"], 6);
         assert_eq!(json["summary"]["vulnerable_packages"], 1);

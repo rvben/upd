@@ -1,5 +1,7 @@
 //! Security vulnerability auditing via OSV (Open Source Vulnerabilities) API
 
+pub mod cvss;
+
 use anyhow::Result;
 use futures::stream::{self, StreamExt};
 use reqwest::Client;
@@ -95,6 +97,20 @@ impl AuditResult {
     }
 }
 
+/// Return a sort key for a severity string such that Critical sorts first.
+///
+/// Lower numeric values sort earlier, so Critical = 0, Unknown = 5.
+pub(crate) fn severity_sort_key(severity: Option<&str>) -> u8 {
+    match severity {
+        Some("Critical") => 0,
+        Some("High") => 1,
+        Some("Medium") => 2,
+        Some("Low") => 3,
+        Some("None") => 4,
+        _ => 5, // Unknown or unexpected values sort last
+    }
+}
+
 /// OSV API client for vulnerability checking
 pub struct OsvClient {
     client: Client,
@@ -127,10 +143,13 @@ impl OsvClient {
         for chunk in packages.chunks(BATCH_SIZE) {
             match self.query_batch(chunk).await {
                 Ok(batch_results) => {
-                    for (package, vulns) in batch_results {
+                    for (package, mut vulns) in batch_results {
                         if vulns.is_empty() {
                             result.safe_count += 1;
                         } else {
+                            // Sort vulnerabilities by severity descending (Critical first).
+                            // Stable sort preserves the original order for equal severities.
+                            vulns.sort_by_key(|v| severity_sort_key(v.severity.as_deref()));
                             result.vulnerable.push(PackageAuditResult {
                                 package,
                                 vulnerabilities: vulns,
@@ -239,19 +258,25 @@ impl OsvClient {
 
         let vuln: OsvVulnerability = response.json().await?;
 
-        // Extract severity from database_specific or severity array
-        let severity = vuln
+        // Resolve severity: prefer database_specific label, then CVSS vector.
+        // database_specific.severity takes priority because it is curated by
+        // the advisory database and is often more accurate than a computed score.
+        let db_severity = vuln
+            .database_specific
+            .as_ref()
+            .and_then(|db| db.get("severity"))
+            .and_then(|v| v.as_str());
+        let cvss_vector = vuln
             .severity
             .as_ref()
             .and_then(|s| s.first())
-            .map(|s| s.score.clone())
-            .or_else(|| {
-                vuln.database_specific
-                    .as_ref()
-                    .and_then(|db| db.get("severity"))
-                    .and_then(|v| v.as_str())
-                    .map(String::from)
-            });
+            .map(|s| s.score.as_str());
+        let resolved = cvss::resolve_severity(db_severity, cvss_vector);
+        // All resolved labels, including "Unknown", are serialised so that
+        // JSON consumers see a consistent schema regardless of whether
+        // severity data was available. "Unknown" sorts last in the sort key,
+        // matching the same position as None would have occupied.
+        let severity = Some(resolved.as_severity_string());
 
         // Extract fixed version from affected ranges
         let fixed_version = vuln
