@@ -9,14 +9,14 @@ A fast dependency updater for Python, Node.js, Rust, Go, Ruby, .NET, Terraform, 
 ## Quick Start
 
 ```bash
-# Run without installing (using uv)
+# Preview changes without modifying files (default)
 uvx --from upd-cli upd
 
-# Or with pipx
-pipx run --spec upd-cli upd
+# Apply updates
+uvx --from upd-cli upd --apply
 
-# Preview changes without modifying files
-uvx --from upd-cli upd -n
+# Or with pipx
+pipx run --spec upd-cli upd --apply
 ```
 
 ## Features
@@ -25,7 +25,7 @@ uvx --from upd-cli upd -n
 - **Fast**: Parallel registry requests for all dependencies
 - **Constraint-aware**: Respects version constraints like `>=2.0,<3` and `~> 7.1`
 - **Smart caching**: 24-hour version cache for faster subsequent runs
-- **Update filters**: Filter by bump level with `--bump <major|minor|patch>` (repeatable)
+- **Update filters**: Filter by bump level with `--only-bump <major|minor|patch>` (repeatable) or cap with `--max-bump`
 - **Interactive mode**: Approve updates individually with `-i`
 - **Check mode**: Exit with code 1 if updates available (for CI/pre-commit)
 - **Major warnings**: Highlights breaking changes with `(MAJOR)`
@@ -67,13 +67,19 @@ cargo install --path .
 ## Usage
 
 ```bash
-# Update all dependency files in current directory
+# Preview changes without modifying files (default when no --apply)
 upd
 
-# Update specific files or directories
+# Apply updates to files
+upd --apply
+
+# Update specific files or directories (still dry-run without --apply)
 upd requirements.txt pyproject.toml
 
-# Dry-run mode (preview changes without writing)
+# Apply updates to specific files
+upd --apply requirements.txt pyproject.toml
+
+# Dry-run mode (explicit; same as omitting --apply)
 upd -n
 upd --dry-run
 
@@ -81,20 +87,33 @@ upd --dry-run
 upd -v
 upd --verbose
 
+# Suppress decorative output (errors still shown)
+upd --quiet
+upd -q
+
 # Disable colored output
 upd --no-color
 
 # Disable caching (force fresh lookups)
 upd --no-cache
 
-# Filter by bump level
-upd --bump major      # Show only major (breaking) updates
-upd --bump minor      # Show only minor updates
-upd --bump patch      # Show only patch updates
+# Filter to only the named packages
+upd --package requests
+upd --package requests --package flask
+upd --package requests,flask
 
-# Combine filters (repeat --bump or comma-separate)
-upd --bump major --bump minor
-upd --bump major,minor
+# Filter by bump level (only exact levels)
+upd --only-bump major      # Show only major (breaking) updates
+upd --only-bump minor      # Show only minor updates
+upd --only-bump patch      # Show only patch updates
+
+# Combine filters (repeat --only-bump or comma-separate)
+upd --only-bump major --only-bump minor
+upd --only-bump major,minor
+
+# Cap by bump level (include up to and including this level)
+upd --max-bump minor       # Allow patch + minor, skip major
+upd --max-bump patch       # Allow patch only
 
 # Interactive mode - approve updates one by one
 upd -i
@@ -118,10 +137,20 @@ upd --full-precision  # Output full versions (e.g., 3.1.5 instead of 3.1)
 upd --check
 upd --check --lang python  # Check only Python dependencies
 
+# Print effective configuration and exit
+upd --show-config
+
 # Use a specific config file
 upd --config /path/to/config.toml
 upd -c .updrc.toml         # Short form
 ```
+
+> **Dry-run by default**: `upd` without `--apply` only previews changes. Pass `--apply` to
+> write updates. `--check`, `--dry-run`, and `--interactive` do not require `--apply`.
+>
+> **VCS-root scoping**: When no path argument is given, `upd` scans from the nearest `.git`
+> ancestor directory rather than the current working directory. This prevents accidental
+> rewrites when CWD is a subdirectory inside a repository.
 
 ### Commands
 
@@ -142,6 +171,15 @@ upd align --check  # Exit 1 if misalignments found (for CI)
 # Check for security vulnerabilities
 upd audit
 upd audit --check  # Exit 1 if vulnerabilities are found or the audit can't complete (for CI)
+
+# Auto-fix vulnerable packages to minimum safe version, then write changes
+upd audit --fix-audit --apply
+
+# Run audit using only the local cache (no network; cache misses are errors)
+upd audit --offline
+
+# Emit SARIF 2.1.0 for GitHub Code Scanning upload
+upd audit --format sarif > results.sarif
 ```
 
 ## Supported Files
@@ -285,6 +323,17 @@ upd audit --dry-run    # Same as audit (read-only operation)
 upd audit --check      # Exit 1 if vulnerabilities are found or the audit can't complete
 upd audit --lang python # Audit only Python packages
 upd audit ./services   # Audit specific directory
+
+# Auto-fix: bump each vulnerable package to the minimum safe version
+# (max of fixed_version across all its vulnerabilities). Packages with
+# no fixed_version are reported but left untouched.
+upd audit --fix-audit --apply
+
+# Offline mode: use only cached OSV responses; cache misses are errors
+upd audit --offline
+
+# SARIF 2.1.0 output for GitHub Code Scanning
+upd audit --format sarif > results.sarif
 ```
 
 **Example output:**
@@ -315,9 +364,17 @@ Summary: 2 vulnerable package(s), 3 total vulnerability/ies
 **CI/CD Integration:**
 
 ```yaml
-# GitHub Actions example
+# GitHub Actions example — fail the build on vulnerabilities
 - name: Check for vulnerabilities
   run: upd audit --check
+
+# Upload SARIF results to GitHub Code Scanning
+- name: Audit dependencies (SARIF)
+  run: upd audit --format sarif > results.sarif
+- name: Upload to Code Scanning
+  uses: github/codeql-action/upload-sarif@v3
+  with:
+    sarif_file: results.sarif
 ```
 
 ## Version Constraints
@@ -620,22 +677,35 @@ Global flags (accepted on every subcommand):
 
 | Flag | Short | Purpose |
 |------|-------|---------|
-| `--dry-run` | `-n` | Preview changes without writing |
+| `--apply` | | Write changes to files (omit for dry-run preview) |
+| `--dry-run` | `-n` | Preview changes without writing (explicit form) |
 | `--verbose` | `-v` | Verbose output |
+| `--quiet` | `-q` | Suppress decorative output (errors still shown) |
 | `--interactive` | `-i` | Approve each update individually |
 | `--check` | | Exit 1 if updates/misalignments/vulnerabilities found |
-| `--bump <major\|minor\|patch>` | | Filter by bump level (repeatable, comma-separated) |
+| `--only-bump <major\|minor\|patch>` | | Restrict to exactly these bump levels (repeatable, comma-separated) |
+| `--max-bump <major\|minor\|patch>` | | Include updates up to and including this level |
+| `--package <NAME>` | | Restrict to named packages (repeatable, comma-separated) |
 | `--lang <LANG>` | `-l` | Filter by ecosystem (repeatable) |
 | `--full-precision` | | Output full versions |
 | `--no-cache` | | Disable version cache |
 | `--no-color` | | Disable colored output |
 | `--lock` | | Regenerate lockfiles after updates |
 | `--config <FILE>` | `-c` | Use a specific config file |
-| `--format <text\|json>` | | Output format |
+| `--show-config` | | Print effective configuration and exit |
+| `--format <text\|json\|sarif>` | | Output format (`sarif` applies to `audit`) |
 | `--version` | `-V` | Print version (built-in clap flag) |
 | `--help` | `-h` | Print help (built-in clap flag) |
 
 Subcommands: `update` (default), `align`, `audit`, `clean-cache`, `self-update`.
+
+Stable `audit`-specific flags:
+
+| Flag | Purpose |
+|------|---------|
+| `--fix-audit` | Bump each vulnerable package to minimum safe version |
+| `--offline` | Use only cached OSV responses; cache misses are errors |
+| `--format sarif` | Emit SARIF 2.1.0 for GitHub Code Scanning |
 
 ### Stable exit codes
 
@@ -644,6 +714,7 @@ Subcommands: `update` (default), `align`, `audit`, `clean-cache`, `self-update`.
 | `0` | Success — no action required, or updates applied cleanly |
 | `1` | `--check` flagged pending updates / misalignments / vulnerabilities, or an audit could not complete |
 | `2` | Invalid CLI arguments or unparseable configuration (clap default) |
+| `3` | Vulnerabilities found (`upd audit`). Pass `--no-fail` to force exit 0. |
 
 ### Stable output
 
