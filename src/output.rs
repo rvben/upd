@@ -270,6 +270,252 @@ fn occurrence_to_json(o: &PackageOccurrence, highest: &str) -> AlignOccurrence {
     }
 }
 
+// ──────────────────────────────────────────────────────────────────────────────
+// SARIF 2.1.0 types
+// ──────────────────────────────────────────────────────────────────────────────
+
+/// Top-level SARIF 2.1.0 log document.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SarifLog {
+    #[serde(rename = "$schema")]
+    pub schema: &'static str,
+    pub version: &'static str,
+    pub runs: Vec<SarifRun>,
+}
+
+/// A single tool run within a SARIF log.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SarifRun {
+    pub tool: SarifTool,
+    pub results: Vec<SarifResult>,
+}
+
+/// Tool metadata for a SARIF run.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SarifTool {
+    pub driver: SarifDriver,
+}
+
+/// SARIF tool driver (the analysis tool itself).
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SarifDriver {
+    pub name: &'static str,
+    pub version: String,
+    pub information_uri: &'static str,
+    pub rules: Vec<SarifRule>,
+}
+
+/// A SARIF rule entry (one per unique vulnerability ID).
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SarifRule {
+    pub id: String,
+    pub name: String,
+    pub short_description: SarifMessage,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub help_uri: Option<String>,
+    pub default_configuration: SarifRuleConfiguration,
+}
+
+/// SARIF rule default configuration.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SarifRuleConfiguration {
+    pub level: &'static str,
+}
+
+/// A SARIF result (one finding).
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SarifResult {
+    pub rule_id: String,
+    pub level: &'static str,
+    pub message: SarifMessage,
+    pub locations: Vec<SarifLocation>,
+    pub properties: SarifResultProperties,
+}
+
+/// A plain text message in SARIF.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SarifMessage {
+    pub text: String,
+}
+
+/// A location within a SARIF result.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SarifLocation {
+    pub physical_location: SarifPhysicalLocation,
+}
+
+/// Physical file location within SARIF.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SarifPhysicalLocation {
+    pub artifact_location: SarifArtifactLocation,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub region: Option<SarifRegion>,
+}
+
+/// Artifact (file) location in SARIF.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SarifArtifactLocation {
+    pub uri: String,
+}
+
+/// Line/column region within a SARIF artifact.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SarifRegion {
+    pub start_line: usize,
+}
+
+/// Additional metadata attached to a SARIF result.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SarifResultProperties {
+    pub package: String,
+    pub version: String,
+    pub ecosystem: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fixed_version: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+}
+
+/// Map an OSV severity label to a SARIF level string.
+///
+/// SARIF levels are: `"error"`, `"warning"`, `"note"`, `"none"`.
+fn osv_severity_to_sarif_level(severity: Option<&str>) -> &'static str {
+    match severity {
+        Some(s) if s.eq_ignore_ascii_case("critical") || s.eq_ignore_ascii_case("high") => "error",
+        Some(s) if s.eq_ignore_ascii_case("medium") => "warning",
+        Some(s) if s.eq_ignore_ascii_case("low") => "note",
+        _ => "warning",
+    }
+}
+
+/// Maps `(package_name, version, ecosystem)` to the list of `(file_path, line)`
+/// where that exact pin appears. Used as input to [`build_sarif_audit_report`].
+pub type SarifOccurrenceMap =
+    std::collections::HashMap<(String, String, String), Vec<(String, Option<usize>)>>;
+
+/// Build a [`SarifLog`] from an [`AuditResult`] and package location data.
+///
+/// The `occurrences` parameter maps each `(package_name, version, ecosystem)`
+/// triple to the list of `(file_path, line_number)` pairs where that exact pin
+/// appears. The caller is responsible for building this mapping from the
+/// already-scanned package data.
+pub fn build_sarif_audit_report(audit: &AuditResult, occurrences: &SarifOccurrenceMap) -> SarifLog {
+    // Collect deduplicated rules (one per unique vulnerability ID).
+    let mut rules: Vec<SarifRule> = Vec::new();
+    let mut seen_rule_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+    for pkg_result in &audit.vulnerable {
+        for vuln in &pkg_result.vulnerabilities {
+            if seen_rule_ids.insert(vuln.id.clone()) {
+                let level = osv_severity_to_sarif_level(vuln.severity.as_deref());
+                let description = vuln.summary.clone().unwrap_or_else(|| {
+                    format!(
+                        "Vulnerability in {} {}",
+                        pkg_result.package.name, pkg_result.package.version
+                    )
+                });
+                rules.push(SarifRule {
+                    id: vuln.id.clone(),
+                    name: vuln.id.clone(),
+                    short_description: SarifMessage { text: description },
+                    help_uri: vuln.url.clone(),
+                    default_configuration: SarifRuleConfiguration { level },
+                });
+            }
+        }
+    }
+
+    // Build one result per (vulnerability, file occurrence).
+    let mut results: Vec<SarifResult> = Vec::new();
+
+    for pkg_result in &audit.vulnerable {
+        let eco = pkg_result.package.ecosystem.as_str().to_string();
+        let lookup_key = (
+            pkg_result.package.name.clone(),
+            pkg_result.package.version.clone(),
+            eco.clone(),
+        );
+        let file_locations: &[(String, Option<usize>)] = occurrences
+            .get(&lookup_key)
+            .map(|v| v.as_slice())
+            .unwrap_or(&[]);
+
+        for vuln in &pkg_result.vulnerabilities {
+            let level = osv_severity_to_sarif_level(vuln.severity.as_deref());
+            let message_text = vuln.summary.clone().unwrap_or_else(|| {
+                format!(
+                    "Vulnerability in {} {}",
+                    pkg_result.package.name, pkg_result.package.version
+                )
+            });
+
+            // Emit one location per file where the package is pinned, or a
+            // placeholder location when no file occurrence data is available.
+            let sarif_locations: Vec<SarifLocation> = if file_locations.is_empty() {
+                vec![SarifLocation {
+                    physical_location: SarifPhysicalLocation {
+                        artifact_location: SarifArtifactLocation { uri: String::new() },
+                        region: None,
+                    },
+                }]
+            } else {
+                file_locations
+                    .iter()
+                    .map(|(path, line)| SarifLocation {
+                        physical_location: SarifPhysicalLocation {
+                            artifact_location: SarifArtifactLocation { uri: path.clone() },
+                            region: line.map(|l| SarifRegion { start_line: l }),
+                        },
+                    })
+                    .collect()
+            };
+
+            results.push(SarifResult {
+                rule_id: vuln.id.clone(),
+                level,
+                message: SarifMessage { text: message_text },
+                locations: sarif_locations,
+                properties: SarifResultProperties {
+                    package: pkg_result.package.name.clone(),
+                    version: pkg_result.package.version.clone(),
+                    ecosystem: eco.clone(),
+                    fixed_version: vuln.fixed_version.clone(),
+                    url: vuln.url.clone(),
+                },
+            });
+        }
+    }
+
+    SarifLog {
+        schema: "https://json.schemastore.org/sarif-2.1.0.json",
+        version: "2.1.0",
+        runs: vec![SarifRun {
+            tool: SarifTool {
+                driver: SarifDriver {
+                    name: "upd",
+                    version: env!("CARGO_PKG_VERSION").to_string(),
+                    information_uri: "https://github.com/rvben/upd",
+                    rules,
+                },
+            },
+            results,
+        }],
+    }
+}
+
 /// Build an [`AuditReport`] from an internal [`AuditResult`].
 pub fn build_audit_report(
     audit: &AuditResult,
@@ -527,5 +773,197 @@ mod tests {
         assert_eq!(json["status"], "incomplete");
         assert_eq!(json["errors"][0], "network error");
         assert_eq!(json["summary"]["errors"], 1);
+    }
+
+    // ──────────────────────────────────────────────────────────────────────────
+    // SARIF output unit tests
+    // ──────────────────────────────────────────────────────────────────────────
+
+    fn make_audit_with_vuln() -> AuditResult {
+        AuditResult {
+            vulnerable: vec![PackageAuditResult {
+                package: Package {
+                    name: "requests".into(),
+                    version: "2.27.0".into(),
+                    ecosystem: Ecosystem::PyPI,
+                },
+                vulnerabilities: vec![
+                    Vulnerability {
+                        id: "GHSA-abcd-1234-efgh".into(),
+                        summary: Some("Remote code execution in requests".into()),
+                        severity: Some("High".into()),
+                        url: Some("https://osv.dev/vulnerability/GHSA-abcd-1234-efgh".into()),
+                        fixed_version: Some("2.28.0".into()),
+                    },
+                    Vulnerability {
+                        id: "CVE-2023-99999".into(),
+                        summary: None,
+                        severity: Some("Medium".into()),
+                        url: None,
+                        fixed_version: None,
+                    },
+                ],
+            }],
+            safe_count: 2,
+            errors: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn sarif_report_includes_schema_and_version() {
+        let audit = make_audit_with_vuln();
+        let occurrences = std::collections::HashMap::new();
+        let log = build_sarif_audit_report(&audit, &occurrences);
+
+        assert_eq!(log.schema, "https://json.schemastore.org/sarif-2.1.0.json");
+        assert_eq!(log.version, "2.1.0");
+        assert_eq!(log.runs.len(), 1);
+
+        let json = serde_json::to_value(&log).unwrap();
+        assert_eq!(
+            json["$schema"],
+            "https://json.schemastore.org/sarif-2.1.0.json"
+        );
+        assert_eq!(json["version"], "2.1.0");
+        assert_eq!(json["runs"][0]["tool"]["driver"]["name"], "upd");
+        assert_eq!(
+            json["runs"][0]["tool"]["driver"]["informationUri"],
+            "https://github.com/rvben/upd"
+        );
+    }
+
+    #[test]
+    fn sarif_rules_deduplicated_by_id() {
+        // Two vulnerabilities with the same ID across different packages should
+        // produce only one rule entry.
+        let audit = AuditResult {
+            vulnerable: vec![
+                PackageAuditResult {
+                    package: Package {
+                        name: "pkg-a".into(),
+                        version: "1.0.0".into(),
+                        ecosystem: Ecosystem::Npm,
+                    },
+                    vulnerabilities: vec![Vulnerability {
+                        id: "GHSA-dup-test".into(),
+                        summary: Some("Shared vuln".into()),
+                        severity: Some("High".into()),
+                        url: None,
+                        fixed_version: None,
+                    }],
+                },
+                PackageAuditResult {
+                    package: Package {
+                        name: "pkg-b".into(),
+                        version: "2.0.0".into(),
+                        ecosystem: Ecosystem::Npm,
+                    },
+                    vulnerabilities: vec![Vulnerability {
+                        id: "GHSA-dup-test".into(),
+                        summary: Some("Shared vuln".into()),
+                        severity: Some("High".into()),
+                        url: None,
+                        fixed_version: None,
+                    }],
+                },
+            ],
+            safe_count: 0,
+            errors: Vec::new(),
+        };
+
+        let occurrences = std::collections::HashMap::new();
+        let log = build_sarif_audit_report(&audit, &occurrences);
+        let rules = &log.runs[0].tool.driver.rules;
+
+        assert_eq!(
+            rules.len(),
+            1,
+            "duplicate rule ID must appear only once; got {} rules",
+            rules.len()
+        );
+        assert_eq!(rules[0].id, "GHSA-dup-test");
+    }
+
+    #[test]
+    fn sarif_severity_mapping_critical_high_medium_low() {
+        for (sev, expected_level) in [
+            ("Critical", "error"),
+            ("High", "error"),
+            ("Medium", "warning"),
+            ("Low", "note"),
+            ("Unknown", "warning"),
+        ] {
+            let level = osv_severity_to_sarif_level(Some(sev));
+            assert_eq!(
+                level, expected_level,
+                "severity '{}' should map to '{}'",
+                sev, expected_level
+            );
+        }
+        // None maps to warning
+        assert_eq!(osv_severity_to_sarif_level(None), "warning");
+    }
+
+    #[test]
+    fn sarif_result_locations_from_file_occurrences() {
+        let audit = make_audit_with_vuln();
+
+        let mut occurrences = std::collections::HashMap::new();
+        occurrences.insert(
+            (
+                "requests".to_string(),
+                "2.27.0".to_string(),
+                "PyPI".to_string(),
+            ),
+            vec![
+                ("requirements.txt".to_string(), Some(5usize)),
+                ("setup.cfg".to_string(), None),
+            ],
+        );
+
+        let log = build_sarif_audit_report(&audit, &occurrences);
+        let results = &log.runs[0].results;
+
+        // Two vulns × two locations each = 4 results total.
+        // Each result for the first vuln should have two locations.
+        let first_result = &results[0];
+        assert_eq!(first_result.locations.len(), 2);
+
+        let loc0 = &first_result.locations[0].physical_location;
+        assert_eq!(loc0.artifact_location.uri, "requirements.txt");
+        assert_eq!(loc0.region.as_ref().unwrap().start_line, 5);
+
+        let loc1 = &first_result.locations[1].physical_location;
+        assert_eq!(loc1.artifact_location.uri, "setup.cfg");
+        assert!(
+            loc1.region.is_none(),
+            "line-less occurrence should have no region"
+        );
+    }
+
+    #[test]
+    fn sarif_result_properties_include_fixed_version() {
+        let audit = make_audit_with_vuln();
+        let occurrences = std::collections::HashMap::new();
+        let log = build_sarif_audit_report(&audit, &occurrences);
+        let json = serde_json::to_value(&log).unwrap();
+
+        let first_result = &json["runs"][0]["results"][0];
+        assert_eq!(first_result["properties"]["package"], "requests");
+        assert_eq!(first_result["properties"]["version"], "2.27.0");
+        assert_eq!(first_result["properties"]["ecosystem"], "PyPI");
+        assert_eq!(first_result["properties"]["fixedVersion"], "2.28.0");
+        assert_eq!(
+            first_result["properties"]["url"],
+            "https://osv.dev/vulnerability/GHSA-abcd-1234-efgh"
+        );
+
+        // Second vuln has no fixed_version — field should be absent.
+        let second_result = &json["runs"][0]["results"][1];
+        assert!(
+            second_result["properties"].get("fixedVersion").is_none()
+                || second_result["properties"]["fixedVersion"].is_null(),
+            "fixedVersion must be absent when not set"
+        );
     }
 }

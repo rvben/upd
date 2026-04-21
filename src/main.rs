@@ -1469,6 +1469,7 @@ async fn run_audit(cli: &Cli) -> Result<()> {
     let fix_audit = matches!(&cli.command, Some(Command::Audit { fix_audit, .. }) if *fix_audit);
     let offline = matches!(&cli.command, Some(Command::Audit { offline, .. }) if *offline);
     let text_mode = cli.format == upd::cli::OutputFormat::Text;
+    let sarif_mode = cli.format == upd::cli::OutputFormat::Sarif;
     // Audit never mutates files, so no VCS check is needed. Fall back to CWD.
     let paths = {
         let explicit = cli.get_paths();
@@ -1486,6 +1487,8 @@ async fn run_audit(cli: &Cli) -> Result<()> {
             if !cli.quiet {
                 println!("{}", "No dependency files found.".yellow());
             }
+        } else if sarif_mode {
+            emit_audit_sarif(&AuditResult::default(), &HashMap::new())?;
         } else {
             emit_audit_json(&AuditResult::default(), "complete")?;
         }
@@ -1524,6 +1527,8 @@ async fn run_audit(cli: &Cli) -> Result<()> {
                     file_count
                 );
             }
+        } else if sarif_mode {
+            emit_audit_sarif(&AuditResult::default(), &HashMap::new())?;
         } else {
             emit_audit_json(&AuditResult::default(), "complete")?;
         }
@@ -1596,6 +1601,10 @@ async fn run_audit(cli: &Cli) -> Result<()> {
         for error in &audit_result.errors {
             eprintln!("{} {}", "Error:".red(), error);
         }
+    } else if sarif_mode {
+        // Build the per-package occurrence map from already-scanned data.
+        let sarif_occurrences = build_sarif_occurrences(&packages);
+        emit_audit_sarif(&audit_result, &sarif_occurrences)?;
     } else {
         let status_str = match status {
             AuditStatus::Clean | AuditStatus::Vulnerable => "complete",
@@ -1807,6 +1816,92 @@ fn emit_audit_json(audit: &AuditResult, status: &'static str) -> Result<()> {
     let report = build_audit_report(audit, 0, status);
     println!("{}", serde_json::to_string_pretty(&report)?);
     Ok(())
+}
+
+/// Emit a SARIF 2.1.0 document for the audit result.
+///
+/// The `occurrences` map is keyed by `(package_name, version, ecosystem)` and
+/// maps to the list of `(file_path, line_number)` pairs where that pin appears.
+fn emit_audit_sarif(
+    audit: &AuditResult,
+    occurrences: &upd::output::SarifOccurrenceMap,
+) -> Result<()> {
+    use upd::output::build_sarif_audit_report;
+    let log = build_sarif_audit_report(audit, occurrences);
+    println!("{}", serde_json::to_string_pretty(&log)?);
+    Ok(())
+}
+
+/// Express `path` as a relative URI under `cwd` when possible.
+///
+/// Tries a plain `strip_prefix` against the invocation cwd first, then falls
+/// back to the canonicalized forms of both sides (macOS symlinks `/var` to
+/// `/private/var`, so a pass without canonicalization can miss).
+fn relativize_for_sarif(
+    path: &std::path::Path,
+    cwd: Option<&std::path::Path>,
+    cwd_canonical: Option<&std::path::Path>,
+) -> String {
+    if let Some(cwd) = cwd
+        && let Ok(rel) = path.strip_prefix(cwd)
+    {
+        return rel.display().to_string();
+    }
+    if let Some(cwd_canon) = cwd_canonical
+        && let Ok(canon_path) = path.canonicalize()
+        && let Ok(rel) = canon_path.strip_prefix(cwd_canon)
+    {
+        return rel.display().to_string();
+    }
+    path.display().to_string()
+}
+
+/// Build the occurrence map required by SARIF output from the scanned package data.
+///
+/// Returns a map keyed by `(package_name, version, ecosystem_str)` with values
+/// being the list of `(file_path, line_number)` where that pin appears.
+fn build_sarif_occurrences(
+    packages: &HashMap<(String, Lang), Vec<PackageOccurrence>>,
+) -> upd::output::SarifOccurrenceMap {
+    let mut map: upd::output::SarifOccurrenceMap = HashMap::new();
+
+    for ((_, lang), occurrences) in packages {
+        // Only ecosystems that OSV covers and that will appear in the audit result.
+        if *lang == Lang::Actions
+            || *lang == Lang::PreCommit
+            || *lang == Lang::Mise
+            || *lang == Lang::Terraform
+        {
+            continue;
+        }
+
+        let ecosystem = match lang {
+            Lang::Python => Ecosystem::PyPI,
+            Lang::Node => Ecosystem::Npm,
+            Lang::Rust => Ecosystem::CratesIo,
+            Lang::Go => Ecosystem::Go,
+            Lang::Ruby => Ecosystem::RubyGems,
+            Lang::DotNet => Ecosystem::NuGet,
+            Lang::Actions | Lang::PreCommit | Lang::Mise | Lang::Terraform => {
+                unreachable!("filtered above")
+            }
+        };
+
+        let cwd = std::env::current_dir().ok();
+        let cwd_canonical = cwd.as_ref().and_then(|c| c.canonicalize().ok());
+        for occ in occurrences {
+            let key = (
+                occ.original_name.clone(),
+                occ.version.clone(),
+                ecosystem.as_str().to_string(),
+            );
+            let uri =
+                relativize_for_sarif(&occ.file_path, cwd.as_deref(), cwd_canonical.as_deref());
+            map.entry(key).or_default().push((uri, occ.line_number));
+        }
+    }
+
+    map
 }
 
 fn print_audit_vulnerabilities(audit_result: &AuditResult) {

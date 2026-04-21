@@ -22,6 +22,12 @@ pub enum OutputFormat {
     Text,
     /// Machine-readable JSON on stdout.
     Json,
+    /// SARIF 2.1.0 output for GitHub Code Scanning integration.
+    ///
+    /// Emits a SARIF 2.1.0 JSON document on stdout with each vulnerability as
+    /// a result and per-file pin locations. Only meaningful for `upd audit`;
+    /// other subcommands fall back to JSON-equivalent output when this is set.
+    Sarif,
 }
 
 #[derive(Parser)]
@@ -141,9 +147,11 @@ pub struct Cli {
     #[arg(short = 'c', long, global = true, value_name = "FILE")]
     pub config: Option<PathBuf>,
 
-    /// Set output format: text (default) or json.
+    /// Set output format: text (default), json, or sarif.
     ///
     /// Use --format json for machine-readable output in scripts or CI.
+    /// Use --format sarif with `upd audit` to emit a SARIF 2.1.0 document
+    /// suitable for upload to GitHub Code Scanning.
     #[arg(long, global = true, value_enum, default_value_t = OutputFormat::Text, value_name = "FORMAT")]
     pub format: OutputFormat,
 
@@ -697,6 +705,19 @@ mod tests {
     fn test_cli_format_accepts_text() {
         let cli = Cli::try_parse_from(["upd", "--format", "text"]).unwrap();
         assert_eq!(cli.format, OutputFormat::Text);
+    }
+
+    #[test]
+    fn test_cli_format_accepts_sarif() {
+        let cli = Cli::try_parse_from(["upd", "--format", "sarif"]).unwrap();
+        assert_eq!(cli.format, OutputFormat::Sarif);
+    }
+
+    #[test]
+    fn test_cli_format_sarif_is_global_across_subcommands() {
+        let cli = Cli::try_parse_from(["upd", "audit", "--format", "sarif"]).unwrap();
+        assert_eq!(cli.format, OutputFormat::Sarif);
+        assert!(matches!(cli.command, Some(Command::Audit { .. })));
     }
 
     #[test]
