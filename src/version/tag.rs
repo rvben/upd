@@ -43,16 +43,17 @@ impl TagVersion {
             release.push(n);
         }
 
-        if release.is_empty() {
-            return None;
-        }
-
         Some(Self {
             release,
             prerelease,
         })
     }
 
+    /// Returns `true` if this version has a hyphen-delimited prerelease suffix.
+    ///
+    /// Any hyphen suffix (e.g. `-rc.1`, `-beta`, `-1`) is treated as a
+    /// prerelease marker. Tags like `v0.7.0.1-1` are therefore classified as
+    /// prereleases even though some ecosystems use them as packaging patches.
     pub fn is_prerelease(&self) -> bool {
         self.prerelease.is_some()
     }
@@ -77,6 +78,10 @@ impl Ord for TagVersion {
             (None, None) => Ordering::Equal,
             (None, Some(_)) => Ordering::Greater,
             (Some(_), None) => Ordering::Less,
+            // Prerelease strings are compared lexically. This gives a total
+            // order but does not match semantic intent for numeric suffixes
+            // like "rc.10" vs "rc.2". Good enough for picking a maximum tag
+            // out of a release stream.
             (Some(a), Some(b)) => a.cmp(b),
         }
     }
