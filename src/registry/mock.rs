@@ -1,6 +1,6 @@
 //! Mock registry for testing updaters without network calls.
 
-use super::Registry;
+use super::{Registry, VersionMeta};
 use anyhow::{Result, anyhow};
 use async_trait::async_trait;
 use std::collections::HashMap;
@@ -11,6 +11,8 @@ pub struct MockRegistry {
     versions: HashMap<String, (String, Option<String>)>,
     /// Map of package name + constraints to version
     constrained_versions: HashMap<(String, String), String>,
+    /// Map of package name to full version metadata entries
+    version_metas: HashMap<String, Vec<VersionMeta>>,
     /// Registry name
     name: &'static str,
 }
@@ -21,6 +23,7 @@ impl MockRegistry {
         Self {
             versions: HashMap::new(),
             constrained_versions: HashMap::new(),
+            version_metas: HashMap::new(),
             name,
         }
     }
@@ -38,6 +41,27 @@ impl MockRegistry {
             package.to_string(),
             (stable.to_string(), Some(prerelease.to_string())),
         );
+        self
+    }
+
+    /// Add a full version metadata entry for a package.
+    pub fn with_version_meta(
+        mut self,
+        package: &str,
+        version: &str,
+        published_at: Option<chrono::DateTime<chrono::Utc>>,
+        yanked: bool,
+        prerelease: bool,
+    ) -> Self {
+        self.version_metas
+            .entry(package.to_string())
+            .or_default()
+            .push(VersionMeta {
+                version: version.to_string(),
+                published_at,
+                yanked,
+                prerelease,
+            });
         self
     }
 
@@ -82,6 +106,10 @@ impl Registry for MockRegistry {
 
         // Fall back to stable version
         self.get_latest_version(package).await
+    }
+
+    async fn list_versions(&self, package: &str) -> Result<Vec<VersionMeta>> {
+        Ok(self.version_metas.get(package).cloned().unwrap_or_default())
     }
 
     fn name(&self) -> &'static str {
@@ -151,5 +179,34 @@ mod tests {
     async fn test_mock_registry_name() {
         let registry = MockRegistry::new("PyPI");
         assert_eq!(registry.name(), "PyPI");
+    }
+
+    #[tokio::test]
+    async fn test_mock_registry_list_versions_returns_added_metas() {
+        use chrono::{TimeZone, Utc};
+        let published = Utc.with_ymd_and_hms(2026, 4, 1, 0, 0, 0).unwrap();
+        let registry = MockRegistry::new("npm")
+            .with_version_meta("lodash", "4.17.21", Some(published), false, false)
+            .with_version_meta("lodash", "4.17.22", None, true, false);
+
+        let versions = registry.list_versions("lodash").await.unwrap();
+        assert_eq!(versions.len(), 2);
+        assert!(
+            versions
+                .iter()
+                .any(|v| v.version == "4.17.21" && v.yanked == false)
+        );
+        assert!(
+            versions
+                .iter()
+                .any(|v| v.version == "4.17.22" && v.yanked == true)
+        );
+    }
+
+    #[tokio::test]
+    async fn test_mock_registry_list_versions_empty_for_unknown_package() {
+        let registry = MockRegistry::new("npm");
+        let versions = registry.list_versions("nonexistent").await.unwrap();
+        assert!(versions.is_empty());
     }
 }
