@@ -3,6 +3,7 @@
 use super::{Registry, VersionMeta};
 use anyhow::{Result, anyhow};
 use async_trait::async_trait;
+use chrono::{DateTime, Utc};
 use std::collections::HashMap;
 
 /// A mock registry that returns pre-configured versions for testing.
@@ -49,7 +50,7 @@ impl MockRegistry {
         mut self,
         package: &str,
         version: &str,
-        published_at: Option<chrono::DateTime<chrono::Utc>>,
+        published_at: Option<DateTime<Utc>>,
         yanked: bool,
         prerelease: bool,
     ) -> Self {
@@ -183,7 +184,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_mock_registry_list_versions_returns_added_metas() {
-        use chrono::{TimeZone, Utc};
+        use chrono::TimeZone;
         let published = Utc.with_ymd_and_hms(2026, 4, 1, 0, 0, 0).unwrap();
         let registry = MockRegistry::new("npm")
             .with_version_meta("lodash", "4.17.21", Some(published), false, false)
@@ -191,15 +192,17 @@ mod tests {
 
         let versions = registry.list_versions("lodash").await.unwrap();
         assert_eq!(versions.len(), 2);
+        assert!(versions.iter().any(|v| v.version == "4.17.21" && !v.yanked));
+        assert!(versions.iter().any(|v| v.version == "4.17.22" && v.yanked));
         assert!(
             versions
                 .iter()
-                .any(|v| v.version == "4.17.21" && v.yanked == false)
+                .any(|v| v.version == "4.17.21" && v.published_at == Some(published))
         );
         assert!(
             versions
                 .iter()
-                .any(|v| v.version == "4.17.22" && v.yanked == true)
+                .any(|v| v.version == "4.17.22" && v.published_at.is_none())
         );
     }
 
