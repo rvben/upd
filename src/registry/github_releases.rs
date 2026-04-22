@@ -1,4 +1,5 @@
 use super::{Registry, get_with_retry, http_error_message};
+use crate::version::TagVersion;
 use anyhow::{Result, anyhow};
 use async_trait::async_trait;
 use reqwest::Client;
@@ -79,21 +80,6 @@ impl GitHubReleasesRegistry {
         Ok((owner, repo))
     }
 
-    /// Strip leading `v`, trailing `+<build-metadata>`, then parse with semver.
-    fn parse_version(version: &str) -> Option<semver::Version> {
-        let stripped = version.strip_prefix('v').unwrap_or(version);
-        let without_build = stripped.split('+').next().unwrap_or(stripped);
-        semver::Version::parse(without_build).ok()
-    }
-
-    /// Return true if the version string represents a pre-release.
-    /// Unparseable versions are treated as pre-releases (conservative).
-    fn is_prerelease(version: &str) -> bool {
-        Self::parse_version(version)
-            .map(|v| !v.pre.is_empty())
-            .unwrap_or(true)
-    }
-
     /// Fetch all tags for a repo and return them as raw strings.
     async fn fetch_tags(&self, owner: &str, repo: &str) -> Result<Vec<String>> {
         let url = format!(
@@ -165,8 +151,8 @@ impl Registry for GitHubReleasesRegistry {
 
         let mut stable: Vec<_> = tags
             .iter()
-            .filter(|t| !Self::is_prerelease(t))
-            .filter_map(|t| Self::parse_version(t).map(|v| (v, t.clone())))
+            .filter_map(|t| TagVersion::parse(t).map(|v| (v, t.clone())))
+            .filter(|(v, _)| !v.is_prerelease())
             .collect();
 
         stable.sort_by(|a, b| b.0.cmp(&a.0));
@@ -191,7 +177,7 @@ impl Registry for GitHubReleasesRegistry {
 
         let mut all: Vec<_> = tags
             .iter()
-            .filter_map(|t| Self::parse_version(t).map(|v| (v, t.clone())))
+            .filter_map(|t| TagVersion::parse(t).map(|v| (v, t.clone())))
             .collect();
 
         all.sort_by(|a, b| b.0.cmp(&a.0));
@@ -422,5 +408,106 @@ mod tests {
 
         // With prereleases included, v5.0.0-beta.1 is newest
         assert_eq!(version, "v5.0.0-beta.1");
+    }
+
+    /// Regression for issue #2: shellcheck-py publishes 4-segment tags
+    /// (v0.11.0.1, v0.8.0.4, …) and does NOT create GitHub Releases.
+    /// Before the fix, semver::Version::parse rejected every 4-segment tag and
+    /// the registry collapsed to the lone 3-segment legacy tag v0.0.2.
+    #[tokio::test]
+    async fn test_four_segment_tags_shellcheck_py_regression() {
+        let server = MockServer::start().await;
+
+        // releases/latest returns 404 — shellcheck-py has no GitHub Releases.
+        Mock::given(method("GET"))
+            .and(path("/repos/shellcheck-py/shellcheck-py/releases/latest"))
+            .respond_with(ResponseTemplate::new(404))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        // tags endpoint returns the real shellcheck-py tag stream.
+        Mock::given(method("GET"))
+            .and(path("/repos/shellcheck-py/shellcheck-py/tags"))
+            .and(query_param("per_page", "100"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                r#"[
+                    {"name": "v0.11.0.1"},
+                    {"name": "v0.10.0.1"},
+                    {"name": "v0.9.0.6"},
+                    {"name": "v0.9.0.5"},
+                    {"name": "v0.8.0.4"},
+                    {"name": "v0.8.0.3"},
+                    {"name": "v0.7.0.1-1"},
+                    {"name": "v0.0.2"}
+                ]"#,
+            ))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let version = registry(&server)
+            .get_latest_version("shellcheck-py/shellcheck-py")
+            .await
+            .unwrap();
+
+        assert_eq!(version, "v0.11.0.1");
+    }
+
+    /// Mixed 3- and 4-segment tags must sort numerically, not lexically.
+    #[tokio::test]
+    async fn test_tags_fallback_mixed_segment_counts_sort_numerically() {
+        let server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/repos/test/repo/releases/latest"))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&server)
+            .await;
+
+        // "0.9.0.10" > "0.9.0.2" numerically, but lexically "0.9.0.10" < "0.9.0.2".
+        Mock::given(method("GET"))
+            .and(path("/repos/test/repo/tags"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                r#"[
+                    {"name": "v0.9.0.2"},
+                    {"name": "v0.9.0.10"}
+                ]"#,
+            ))
+            .mount(&server)
+            .await;
+
+        let version = registry(&server)
+            .get_latest_version("test/repo")
+            .await
+            .unwrap();
+        assert_eq!(version, "v0.9.0.10");
+    }
+
+    /// get_latest_version_including_prereleases must also handle 4-segment tags.
+    #[tokio::test]
+    async fn test_prerelease_path_handles_four_segment_tags() {
+        let server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/repos/test/repo/tags"))
+            .and(query_param("per_page", "100"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                r#"[
+                    {"name": "v0.11.0.1"},
+                    {"name": "v0.12.0.0-rc.1"},
+                    {"name": "v0.8.0.4"}
+                ]"#,
+            ))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let version = registry(&server)
+            .get_latest_version_including_prereleases("test/repo")
+            .await
+            .unwrap();
+
+        assert_eq!(version, "v0.12.0.0-rc.1");
     }
 }
