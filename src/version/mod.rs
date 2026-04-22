@@ -1,8 +1,10 @@
 pub mod pep440;
 pub mod semver_util;
+pub mod tag;
 
 pub use pep440::{is_prerelease_pep440, is_stable_pep440};
 pub use semver_util::{is_prerelease_semver, is_stable_semver};
+pub use tag::TagVersion;
 
 /// Match the precision of a new version to the original version's precision.
 ///
