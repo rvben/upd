@@ -132,8 +132,9 @@ pub fn select(
         return CooldownDecision::Unsupported;
     }
 
-    // Pre-filter top (for diagnostic reporting in Skip when candidates are empty).
-    let raw_top = versions.iter().next().cloned();
+    // First entry in the raw input list (including potentially yanked versions),
+    // used as the diagnostic anchor in Skip when no non-yanked candidates remain.
+    let raw_top = versions.first().cloned();
 
     // Filter: yanked, prerelease, constraints, newer than current.
     let mut candidates: Vec<&VersionMeta> = versions
@@ -238,7 +239,7 @@ fn satisfies_constraint(version: &str, constraints: Option<&str>) -> bool {
         semver::VersionReq::parse(spec),
     ) {
         (Ok(v), Ok(req)) => req.matches(&v),
-        _ => true, // if we can't parse, don't over-restrict
+        _ => true, // unparseable version or constraint: don't over-restrict
     }
 }
 
@@ -594,7 +595,7 @@ mod tests {
         );
         match decision {
             CooldownDecision::Skip { latest_too_new } => {
-                // "latest" in the raw list (post-yank) is 1.5.0, but it's not newer
+                // "latest" in the raw list (pre-yank-filter) is 1.5.0, but it's not newer
                 // than current. This is an edge case; the caller would not normally
                 // invoke select() here (its precondition is "update is on the table").
                 assert_eq!(latest_too_new.version, "1.5.0");
