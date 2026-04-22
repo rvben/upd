@@ -2,6 +2,8 @@
 //!
 //! See docs/superpowers/specs/2026-04-22-cooldown-release-age-design.md.
 
+use std::collections::HashMap;
+
 use anyhow::{Result, anyhow};
 use chrono::Duration;
 
@@ -50,8 +52,6 @@ pub fn parse_duration(input: &str) -> Result<Duration> {
         )),
     }
 }
-
-use std::collections::HashMap;
 
 /// The resolved cooldown policy for a single run.
 ///
