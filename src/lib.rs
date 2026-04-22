@@ -22,7 +22,7 @@ pub use lockfile::{
 };
 pub use registry::{
     GitHubReleasesRegistry, NpmRegistry, NuGetRegistry, PyPiRegistry, Registry, RubyGemsRegistry,
-    TerraformRegistry,
+    TerraformRegistry, VersionMeta,
 };
 pub use updater::{FileType, Lang, UpdateResult, Updater, discover_files};
 
