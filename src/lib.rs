@@ -3,6 +3,7 @@ pub mod audit;
 pub mod cache;
 pub mod cli;
 pub mod config;
+pub mod cooldown;
 pub mod interactive;
 pub mod lockfile;
 pub mod output;
