@@ -148,6 +148,19 @@ pub fn http_error_message(
     }
 }
 
+/// Metadata for a single published version of a package.
+///
+/// `published_at` is `None` when the registry did not expose a timestamp for
+/// this version; the cooldown layer treats that as a signal to report the
+/// ecosystem as unsupported.
+#[derive(Debug, Clone)]
+pub struct VersionMeta {
+    pub version: String,
+    pub published_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub yanked: bool,
+    pub prerelease: bool,
+}
+
 #[async_trait]
 pub trait Registry: Send + Sync {
     /// Get the latest stable version of a package
@@ -170,6 +183,14 @@ pub trait Registry: Send + Sync {
         // Default: ignore constraints and return latest
         let _ = constraints;
         self.get_latest_version(package).await
+    }
+
+    /// List recent versions with metadata. Default returns empty, which the
+    /// cooldown layer treats as "publish dates unavailable for this registry".
+    /// Implementations should return the most recent ~50 versions in any order.
+    async fn list_versions(&self, package: &str) -> Result<Vec<VersionMeta>> {
+        let _ = package;
+        Ok(Vec::new())
     }
 
     /// Registry name for display
@@ -353,6 +374,32 @@ mod tests {
     async fn test_registry_name() {
         let registry = MinimalRegistry::new("1.0.0");
         assert_eq!(registry.name(), "Minimal");
+    }
+
+    #[tokio::test]
+    async fn test_registry_default_list_versions_is_empty() {
+        let registry = MinimalRegistry::new("1.0.0");
+        let versions = registry.list_versions("anypackage").await.unwrap();
+        assert!(
+            versions.is_empty(),
+            "default list_versions must return empty vec, got {} entries",
+            versions.len()
+        );
+    }
+
+    #[test]
+    fn test_version_meta_can_be_constructed() {
+        use chrono::{TimeZone, Utc};
+        let meta = VersionMeta {
+            version: "1.2.3".to_string(),
+            published_at: Some(Utc.with_ymd_and_hms(2026, 4, 1, 0, 0, 0).unwrap()),
+            yanked: false,
+            prerelease: false,
+        };
+        assert_eq!(meta.version, "1.2.3");
+        assert!(meta.published_at.is_some());
+        assert!(!meta.yanked);
+        assert!(!meta.prerelease);
     }
 
     // Integration tests for authentication headers
