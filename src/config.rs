@@ -21,6 +21,22 @@
 //!
 //! Unknown top-level keys produce a warning on stderr but do not stop execution.
 //! A common mistake is writing `[ignore]` (table) instead of `ignore = [...]` (array).
+//!
+//! # Minimum release age (cooldown)
+//!
+//! Opt-in cooldown policy delays updates to versions published
+//! within a configurable window (e.g. 7 days). Overrides:
+//!
+//! ```toml
+//! [cooldown]
+//! default = "7d"
+//!
+//! [cooldown.ecosystem]
+//! npm = "14d"
+//! "crates.io" = "3d"
+//! ```
+//!
+//! Valid duration units: `s`, `m`, `h`, `d`, `w`. Use `"0"` to disable.
 
 use colored::Colorize;
 use serde::Deserialize;
@@ -293,7 +309,7 @@ ignore = []
 
     /// Check if any configuration is present
     pub fn has_config(&self) -> bool {
-        !self.ignore.is_empty() || !self.pin.is_empty()
+        !self.ignore.is_empty() || !self.pin.is_empty() || self.cooldown.is_some()
     }
 
     /// Merge another configuration into this one (other takes precedence)
@@ -307,6 +323,10 @@ ignore = []
         // Override pinned versions
         for (pkg, version) in other.pin {
             self.pin.insert(pkg, version);
+        }
+        // Child cooldown overrides parent entirely when set
+        if other.cooldown.is_some() {
+            self.cooldown = other.cooldown;
         }
     }
 }
