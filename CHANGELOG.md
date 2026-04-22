@@ -10,6 +10,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 
 
+
+## [0.1.1](https://github.com/rvben/upd/compare/v0.1.0...v0.1.1) - 2026-04-22
+
+### Added
+
+- **version**: add TagVersion for N-segment git tag parsing ([5994c6b](https://github.com/rvben/upd/commit/5994c6b39e347ed6470ca2097c1d7ed0a10b767d))
+
+### Fixed
+
+- **align**: use TagVersion fallback in compare_semver ([1738ace](https://github.com/rvben/upd/commit/1738aceaa98e39bd5245864e6bb1a2658c147878))
+- **registry**: resolve N-segment git tags in GitHub fallback ([552425d](https://github.com/rvben/upd/commit/552425de91519cfb0d280eebc22c7802304d6580))
+
 ## [0.1.0](https://github.com/rvben/upd/compare/v0.0.28...v0.1.0) - 2026-04-21
 
 ### Breaking Changes
