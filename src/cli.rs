@@ -286,6 +286,7 @@ mod tests {
         assert!(!cli.apply);
         assert!(cli.paths.is_empty());
         assert!(cli.command.is_none());
+        assert!(cli.min_age.is_none());
     }
 
     #[test]
