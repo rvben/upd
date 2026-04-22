@@ -5,7 +5,9 @@
 use std::collections::HashMap;
 
 use anyhow::{Result, anyhow};
-use chrono::Duration;
+use chrono::{DateTime, Duration, Utc};
+
+use crate::registry::VersionMeta;
 
 /// Parse a cooldown duration string.
 ///
@@ -84,6 +86,159 @@ impl CooldownPolicy {
     /// Convenience: is cooldown active for this ecosystem?
     pub fn is_enabled_for(&self, ecosystem: &str) -> bool {
         self.effective_for(ecosystem) > Duration::zero()
+    }
+}
+
+/// The outcome of consulting the cooldown layer for a package.
+#[derive(Debug)]
+pub enum CooldownDecision {
+    /// Use `version`. If `held_back_from` is `Some`, the absolute latest was
+    /// inside the cooldown window and we selected an older safe version.
+    Use {
+        version: String,
+        held_back_from: Option<HeldBackInfo>,
+    },
+    /// No candidate satisfies both constraints and the cooldown window.
+    /// `latest_too_new` identifies the newest version that was skipped so the
+    /// caller can report "skipped by cooldown" with useful context.
+    Skip { latest_too_new: VersionMeta },
+    /// Registry did not provide enough publish-date information. Caller should
+    /// fall through to existing `get_latest_version*` behaviour and emit the
+    /// "cooldown not supported" note once per ecosystem.
+    Unsupported,
+}
+
+#[derive(Debug, Clone)]
+pub struct HeldBackInfo {
+    pub version: String,
+    pub published_at: DateTime<Utc>,
+}
+
+/// Select a version under the cooldown policy.
+///
+/// See docs/superpowers/specs/2026-04-22-cooldown-release-age-design.md for
+/// the algorithm spec. Precondition: the caller has already determined an
+/// update is available (current version is not the latest).
+pub fn select(
+    versions: &[VersionMeta],
+    current: &str,
+    constraints: Option<&str>,
+    include_prereleases: bool,
+    cooldown: Duration,
+    now: DateTime<Utc>,
+) -> CooldownDecision {
+    // Empty input => unsupported (nothing to decide on).
+    if versions.is_empty() {
+        return CooldownDecision::Unsupported;
+    }
+
+    // Pre-filter top (for diagnostic reporting in Skip when candidates are empty).
+    let raw_top = versions.iter().next().cloned();
+
+    // Filter: yanked, prerelease, constraints, newer than current.
+    let mut candidates: Vec<&VersionMeta> = versions
+        .iter()
+        .filter(|v| !v.yanked)
+        .filter(|v| include_prereleases || !v.prerelease)
+        .filter(|v| satisfies_constraint(&v.version, constraints))
+        .filter(|v| is_newer(&v.version, current))
+        .collect();
+
+    // Sort descending by version (best-effort semver; fall back to string).
+    candidates.sort_by(|a, b| compare_versions(&b.version, &a.version));
+
+    // Empty after filtering => Skip with diagnostic top.
+    if candidates.is_empty() {
+        return match raw_top {
+            Some(top) => CooldownDecision::Skip {
+                latest_too_new: top,
+            },
+            None => CooldownDecision::Unsupported,
+        };
+    }
+
+    // If any candidate has no publish date, we can't apply cooldown. Bail
+    // out cleanly.
+    if candidates.iter().any(|v| v.published_at.is_none()) {
+        return CooldownDecision::Unsupported;
+    }
+
+    // Cooldown disabled => use top candidate unconditionally.
+    if cooldown <= Duration::zero() {
+        let top = candidates[0];
+        return CooldownDecision::Use {
+            version: top.version.clone(),
+            held_back_from: None,
+        };
+    }
+
+    let top = candidates[0];
+    let top_ts = top.published_at.expect("checked above");
+    if top_ts + cooldown <= now {
+        return CooldownDecision::Use {
+            version: top.version.clone(),
+            held_back_from: None,
+        };
+    }
+
+    // Top is too new. Walk down for the newest version that satisfies the
+    // window.
+    for candidate in candidates.iter().skip(1) {
+        let ts = candidate.published_at.expect("checked above");
+        if ts + cooldown <= now {
+            return CooldownDecision::Use {
+                version: candidate.version.clone(),
+                held_back_from: Some(HeldBackInfo {
+                    version: top.version.clone(),
+                    published_at: top_ts,
+                }),
+            };
+        }
+    }
+
+    // Nothing in the candidate list was old enough.
+    CooldownDecision::Skip {
+        latest_too_new: top.clone(),
+    }
+}
+
+/// Version comparison: try semver first, fall back to lexicographic.
+///
+/// `upd` already has ecosystem-specific comparators in `src/align.rs` and
+/// `src/version/`. For cooldown selection we use a generic comparator here:
+/// the caller guarantees we are comparing versions within the same ecosystem,
+/// and for most registries semver is accurate enough. Edge cases (PEP 440
+/// pre-releases, Go `+incompatible`, etc.) affect the *ordering* of the
+/// filtered list, not whether cooldown fires — worst case we select a
+/// slightly different version than the existing `get_latest_version*`, which
+/// the caller reconciles by using `select`'s chosen version when it differs.
+fn compare_versions(a: &str, b: &str) -> std::cmp::Ordering {
+    let stripped_a = a.strip_prefix('v').unwrap_or(a);
+    let stripped_b = b.strip_prefix('v').unwrap_or(b);
+    match (
+        semver::Version::parse(stripped_a),
+        semver::Version::parse(stripped_b),
+    ) {
+        (Ok(va), Ok(vb)) => va.cmp(&vb),
+        _ => a.cmp(b),
+    }
+}
+
+fn is_newer(candidate: &str, current: &str) -> bool {
+    compare_versions(candidate, current) == std::cmp::Ordering::Greater
+}
+
+fn satisfies_constraint(version: &str, constraints: Option<&str>) -> bool {
+    let Some(spec) = constraints else {
+        return true;
+    };
+    let stripped = version.strip_prefix('v').unwrap_or(version);
+    match (
+        semver::Version::parse(stripped),
+        semver::VersionReq::parse(spec),
+    ) {
+        (Ok(v), Ok(req)) => req.matches(&v),
+        _ => true, // if we can't parse, don't over-restrict
     }
 }
 
@@ -248,5 +403,311 @@ mod tests {
         };
         assert!(policy.is_enabled_for("npm"));
         assert!(!policy.is_enabled_for("pypi"));
+    }
+
+    fn meta(version: &str, days_ago: i64, yanked: bool, prerelease: bool) -> VersionMeta {
+        use chrono::{TimeZone, Utc};
+        let now = Utc.with_ymd_and_hms(2026, 4, 22, 12, 0, 0).unwrap();
+        VersionMeta {
+            version: version.to_string(),
+            published_at: Some(now - Duration::days(days_ago)),
+            yanked,
+            prerelease,
+        }
+    }
+
+    fn fixed_now() -> chrono::DateTime<chrono::Utc> {
+        use chrono::{TimeZone, Utc};
+        Utc.with_ymd_and_hms(2026, 4, 22, 12, 0, 0).unwrap()
+    }
+
+    #[test]
+    fn test_select_use_when_latest_is_old_enough() {
+        let versions = vec![
+            meta("2.0.0", 10, false, false),
+            meta("1.9.0", 30, false, false),
+        ];
+        let decision = select(
+            &versions,
+            "1.8.0",
+            None,
+            false,
+            Duration::days(7),
+            fixed_now(),
+        );
+        match decision {
+            CooldownDecision::Use {
+                version,
+                held_back_from,
+            } => {
+                assert_eq!(version, "2.0.0");
+                assert!(
+                    held_back_from.is_none(),
+                    "not held back when latest is old enough"
+                );
+            }
+            other => panic!("expected Use, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_select_held_back_to_second_newest() {
+        let versions = vec![
+            meta("2.0.0", 2, false, false),  // too new
+            meta("1.9.0", 10, false, false), // safe
+        ];
+        let decision = select(
+            &versions,
+            "1.8.0",
+            None,
+            false,
+            Duration::days(7),
+            fixed_now(),
+        );
+        match decision {
+            CooldownDecision::Use {
+                version,
+                held_back_from,
+            } => {
+                assert_eq!(version, "1.9.0");
+                let info = held_back_from.expect("should be held back");
+                assert_eq!(info.version, "2.0.0");
+            }
+            other => panic!("expected Use with held_back_from, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_select_skip_when_nothing_old_enough() {
+        let versions = vec![
+            meta("2.0.0", 1, false, false),
+            meta("1.9.0", 2, false, false),
+        ];
+        let decision = select(
+            &versions,
+            "1.8.0",
+            None,
+            false,
+            Duration::days(7),
+            fixed_now(),
+        );
+        match decision {
+            CooldownDecision::Skip { latest_too_new } => {
+                assert_eq!(latest_too_new.version, "2.0.0");
+            }
+            other => panic!("expected Skip, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_select_filters_yanked() {
+        let versions = vec![
+            meta("2.0.0", 30, true, false), // yanked, ignore
+            meta("1.9.0", 30, false, false),
+        ];
+        let decision = select(
+            &versions,
+            "1.8.0",
+            None,
+            false,
+            Duration::days(7),
+            fixed_now(),
+        );
+        match decision {
+            CooldownDecision::Use { version, .. } => assert_eq!(version, "1.9.0"),
+            other => panic!("expected Use, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_select_filters_prereleases_by_default() {
+        let versions = vec![
+            meta("2.0.0-rc.1", 30, false, true),
+            meta("1.9.0", 30, false, false),
+        ];
+        let decision = select(
+            &versions,
+            "1.8.0",
+            None,
+            false,
+            Duration::days(7),
+            fixed_now(),
+        );
+        match decision {
+            CooldownDecision::Use { version, .. } => assert_eq!(version, "1.9.0"),
+            other => panic!("expected Use, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_select_includes_prereleases_when_requested() {
+        let versions = vec![
+            meta("2.0.0-rc.1", 30, false, true),
+            meta("1.9.0", 30, false, false),
+        ];
+        let decision = select(
+            &versions,
+            "1.8.0",
+            None,
+            true,
+            Duration::days(7),
+            fixed_now(),
+        );
+        match decision {
+            CooldownDecision::Use { version, .. } => assert_eq!(version, "2.0.0-rc.1"),
+            other => panic!("expected Use of prerelease, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_select_unsupported_when_any_date_missing() {
+        let mut versions = vec![
+            meta("2.0.0", 10, false, false),
+            meta("1.9.0", 30, false, false),
+        ];
+        versions[0].published_at = None; // partial data
+        let decision = select(
+            &versions,
+            "1.8.0",
+            None,
+            false,
+            Duration::days(7),
+            fixed_now(),
+        );
+        assert!(matches!(decision, CooldownDecision::Unsupported));
+    }
+
+    #[test]
+    fn test_select_skip_when_filtered_list_empty() {
+        // Current is already ahead of everything in the list after filtering.
+        let versions = vec![
+            meta("1.5.0", 30, false, false),
+            meta("1.4.0", 60, false, false),
+        ];
+        let decision = select(
+            &versions,
+            "2.0.0",
+            None,
+            false,
+            Duration::days(7),
+            fixed_now(),
+        );
+        match decision {
+            CooldownDecision::Skip { latest_too_new } => {
+                // "latest" in the raw list (post-yank) is 1.5.0, but it's not newer
+                // than current. This is an edge case; the caller would not normally
+                // invoke select() here (its precondition is "update is on the table").
+                assert_eq!(latest_too_new.version, "1.5.0");
+            }
+            other => panic!("expected Skip, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_select_respects_constraints() {
+        let versions = vec![
+            meta("3.0.0", 30, false, false),
+            meta("2.5.0", 30, false, false),
+            meta("2.0.0", 30, false, false),
+        ];
+        // Constraint: <3
+        let decision = select(
+            &versions,
+            "2.0.0",
+            Some("<3"),
+            false,
+            Duration::days(7),
+            fixed_now(),
+        );
+        match decision {
+            CooldownDecision::Use { version, .. } => assert_eq!(version, "2.5.0"),
+            other => panic!("expected Use of 2.5.0, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_select_cooldown_zero_means_always_use_latest() {
+        let versions = vec![
+            meta("2.0.0", 0, false, false), // published today
+        ];
+        let decision = select(
+            &versions,
+            "1.0.0",
+            None,
+            false,
+            Duration::zero(),
+            fixed_now(),
+        );
+        match decision {
+            CooldownDecision::Use {
+                version,
+                held_back_from,
+            } => {
+                assert_eq!(version, "2.0.0");
+                assert!(held_back_from.is_none());
+            }
+            other => panic!("expected Use, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_select_empty_input_is_unsupported() {
+        let decision = select(&[], "1.0.0", None, false, Duration::days(7), fixed_now());
+        // Per spec: caller handles empty list as "unsupported"; but if select is
+        // called with empty input, fold it to Unsupported too so behaviour is
+        // consistent.
+        assert!(matches!(decision, CooldownDecision::Unsupported));
+    }
+
+    #[test]
+    fn test_select_held_back_past_multiple_versions() {
+        let versions = vec![
+            meta("3.0.0", 1, false, false),  // too new
+            meta("2.9.0", 2, false, false),  // too new
+            meta("2.8.0", 3, false, false),  // too new
+            meta("2.7.0", 10, false, false), // safe
+        ];
+        let decision = select(
+            &versions,
+            "2.0.0",
+            None,
+            false,
+            Duration::days(7),
+            fixed_now(),
+        );
+        match decision {
+            CooldownDecision::Use {
+                version,
+                held_back_from,
+            } => {
+                assert_eq!(version, "2.7.0");
+                assert_eq!(held_back_from.unwrap().version, "3.0.0");
+            }
+            other => panic!("expected Use of 2.7.0, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_select_all_yanked_treated_as_no_candidates() {
+        let versions = vec![
+            meta("2.0.0", 30, true, false),
+            meta("1.9.0", 30, true, false),
+        ];
+        let decision = select(
+            &versions,
+            "1.0.0",
+            None,
+            false,
+            Duration::days(7),
+            fixed_now(),
+        );
+        // After filtering, list is empty. But the raw list is non-empty so we
+        // report Skip with the top pre-filter entry's version for diagnostics.
+        match decision {
+            CooldownDecision::Skip { latest_too_new } => {
+                assert_eq!(latest_too_new.version, "2.0.0");
+            }
+            other => panic!("expected Skip, got {other:?}"),
+        }
     }
 }
