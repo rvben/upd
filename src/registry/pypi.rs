@@ -888,14 +888,25 @@ impl Registry for PyPiRegistry {
         let json_url = format!("{}/pypi/{}/json", self.index_url, normalized);
         let response = self.get_with_retry(&json_url).await?;
 
-        if !response.status().is_success() {
+        let status = response.status();
+        if status == reqwest::StatusCode::NOT_FOUND {
             return Ok(Vec::new());
+        }
+        if !status.is_success() {
+            return Err(anyhow!(http_error_message(
+                status,
+                "Package",
+                package,
+                Some(
+                    "For private PyPI, configure credentials in ~/.netrc or use UV_INDEX_URL with credentials."
+                )
+            )));
         }
 
         let data: PyPiResponse = response.json().await?;
         let mut out = Vec::new();
         for (version_str, files) in data.releases.iter() {
-            let all_yanked = files.iter().all(|f| f.yanked);
+            let all_yanked = !files.is_empty() && files.iter().all(|f| f.yanked);
             let published_at = files
                 .first()
                 .and_then(|f| f.upload_time_iso_8601.as_deref())
@@ -2063,13 +2074,6 @@ mod tests {
         use wiremock::{Mock, MockServer, ResponseTemplate};
 
         let mock_server = MockServer::start().await;
-
-        // Trigger fallback to JSON API by returning 404 on simple API.
-        Mock::given(method("GET"))
-            .and(path("/simple/requests/"))
-            .respond_with(ResponseTemplate::new(404))
-            .mount(&mock_server)
-            .await;
 
         Mock::given(method("GET"))
             .and(path("/pypi/requests/json"))
