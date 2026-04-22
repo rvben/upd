@@ -462,18 +462,21 @@ mod tests {
         Mock::given(method("GET"))
             .and(path("/repos/test/repo/releases/latest"))
             .respond_with(ResponseTemplate::new(404))
+            .expect(1)
             .mount(&server)
             .await;
 
         // "0.9.0.10" > "0.9.0.2" numerically, but lexically "0.9.0.10" < "0.9.0.2".
         Mock::given(method("GET"))
             .and(path("/repos/test/repo/tags"))
+            .and(query_param("per_page", "100"))
             .respond_with(ResponseTemplate::new(200).set_body_string(
                 r#"[
                     {"name": "v0.9.0.2"},
                     {"name": "v0.9.0.10"}
                 ]"#,
             ))
+            .expect(1)
             .mount(&server)
             .await;
 
