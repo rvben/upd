@@ -386,6 +386,15 @@ async fn main() -> Result<()> {
     // --show-config: print the canonical config schema and exit
     if cli.show_config {
         print!("{}", upd::config::UpdConfig::schema_toml());
+
+        // Also render the active cooldown policy (if any).
+        let cwd = std::env::current_dir()?;
+        let (loaded_config, _) = upd::config::UpdConfig::discover(&cwd)
+            .unwrap_or_else(|| (upd::config::UpdConfig::default(), cwd.clone()));
+        let policy = loaded_config.to_cooldown_policy(None)?;
+        println!();
+        print!("{}", upd::config::render_cooldown_for_show_config(&policy));
+
         return Ok(());
     }
 

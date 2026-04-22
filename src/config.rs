@@ -254,6 +254,18 @@ ignore = []
 [pin]
 # example-package = "1.2.3"
 # another-package = ">=2.0,<3"
+
+# cooldown: minimum release age before upd will update to a version.
+# Accepts durations like "0" (disabled), "72h", "7d", "2w".
+[cooldown]
+# default = "7d"         # applied to every ecosystem unless overridden below
+
+# Per-ecosystem overrides. Valid keys: pypi, npm, crates.io, go-proxy,
+# github-releases, rubygems, terraform, nuget.
+[cooldown.ecosystem]
+# npm = "14d"
+# pypi = "14d"
+# "crates.io" = "3d"
 "#
     }
 
@@ -329,6 +341,46 @@ ignore = []
             self.cooldown = other.cooldown;
         }
     }
+}
+
+/// Render the resolved cooldown for human display in `--show-config`.
+pub fn render_cooldown_for_show_config(policy: &crate::cooldown::CooldownPolicy) -> String {
+    fn fmt_dur(d: chrono::Duration) -> String {
+        let secs = d.num_seconds();
+        if secs == 0 {
+            return "disabled".to_string();
+        }
+        let days = d.num_days();
+        if days * 86_400 == secs {
+            return format!("{days}d");
+        }
+        let hours = d.num_hours();
+        if hours * 3600 == secs {
+            return format!("{hours}h");
+        }
+        let minutes = d.num_minutes();
+        if minutes * 60 == secs {
+            return format!("{minutes}m");
+        }
+        format!("{secs}s")
+    }
+
+    let mut out = String::from("cooldown:\n");
+    if let Some(d) = policy.force_override {
+        out.push_str(&format!("  (--min-age override active: {})\n", fmt_dur(d)));
+    }
+    out.push_str(&format!("  default: {}\n", fmt_dur(policy.default)));
+    if policy.per_ecosystem.is_empty() {
+        out.push_str("  ecosystem: (no overrides)\n");
+    } else {
+        out.push_str("  ecosystem:\n");
+        let mut entries: Vec<_> = policy.per_ecosystem.iter().collect();
+        entries.sort_by(|a, b| a.0.cmp(b.0));
+        for (name, dur) in entries {
+            out.push_str(&format!("    {name}: {}\n", fmt_dur(*dur)));
+        }
+    }
+    out
 }
 
 #[cfg(test)]
@@ -1116,6 +1168,53 @@ default = "nope"
         assert!(
             err.contains("cooldown"),
             "error should mention cooldown: {err}"
+        );
+    }
+
+    // ==================== schema_toml / render_cooldown_for_show_config Tests ====================
+
+    #[test]
+    fn test_schema_toml_includes_cooldown_section() {
+        let schema = UpdConfig::schema_toml();
+        assert!(
+            schema.contains("[cooldown]"),
+            "schema should document [cooldown]: {schema}"
+        );
+        assert!(
+            schema.contains("default ="),
+            "schema should show `default =`: {schema}"
+        );
+        assert!(
+            schema.contains("[cooldown.ecosystem]"),
+            "schema should document per-ecosystem overrides: {schema}"
+        );
+    }
+
+    #[test]
+    fn test_render_cooldown_for_show_config_formats_durations() {
+        let mut per = std::collections::HashMap::new();
+        per.insert("npm".to_string(), chrono::Duration::days(14));
+        let policy = crate::cooldown::CooldownPolicy {
+            default: chrono::Duration::days(7),
+            per_ecosystem: per,
+            force_override: None,
+        };
+        let rendered = render_cooldown_for_show_config(&policy);
+        assert!(rendered.contains("default: 7d"), "{rendered}");
+        assert!(rendered.contains("npm: 14d"), "{rendered}");
+    }
+
+    #[test]
+    fn test_render_cooldown_for_show_config_shows_override() {
+        let policy = crate::cooldown::CooldownPolicy {
+            default: chrono::Duration::days(7),
+            per_ecosystem: std::collections::HashMap::new(),
+            force_override: Some(chrono::Duration::zero()),
+        };
+        let rendered = render_cooldown_for_show_config(&policy);
+        assert!(
+            rendered.contains("--min-age override active: disabled"),
+            "should note override: {rendered}"
         );
     }
 }
