@@ -1,7 +1,7 @@
 #[cfg(test)]
 use super::utils::read_netrc_credentials_from_path;
 use super::utils::{base64_encode, read_netrc_credentials, read_pip_config};
-use super::{Registry, http_error_message};
+use super::{Registry, VersionMeta, http_error_message};
 use anyhow::{Result, anyhow};
 use async_trait::async_trait;
 use pep440_rs::{Version, VersionSpecifiers};
@@ -106,9 +106,12 @@ struct SimpleApiFile {
     yanked: bool,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 struct ReleaseFile {
-    yanked: Option<bool>,
+    #[serde(default, deserialize_with = "deserialize_yanked_flag")]
+    yanked: bool,
+    #[serde(default)]
+    upload_time_iso_8601: Option<String>,
 }
 
 impl PyPiRegistry {
@@ -465,7 +468,7 @@ impl PyPiRegistry {
             .releases
             .iter()
             .filter(|(ver_str, files)| {
-                let is_yanked = files.iter().all(|f| f.yanked.unwrap_or(false));
+                let is_yanked = files.iter().all(|f| f.yanked);
                 if is_yanked {
                     return false;
                 }
@@ -878,6 +881,35 @@ impl Registry for PyPiRegistry {
             package,
             constraints
         ))
+    }
+
+    async fn list_versions(&self, package: &str) -> Result<Vec<VersionMeta>> {
+        let normalized = package.to_lowercase().replace('_', "-");
+        let json_url = format!("{}/pypi/{}/json", self.index_url, normalized);
+        let response = self.get_with_retry(&json_url).await?;
+
+        if !response.status().is_success() {
+            return Ok(Vec::new());
+        }
+
+        let data: PyPiResponse = response.json().await?;
+        let mut out = Vec::new();
+        for (version_str, files) in data.releases.iter() {
+            let all_yanked = files.iter().all(|f| f.yanked);
+            let published_at = files
+                .first()
+                .and_then(|f| f.upload_time_iso_8601.as_deref())
+                .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+                .map(|dt| dt.with_timezone(&chrono::Utc));
+            let prerelease = !Self::is_stable_version(version_str);
+            out.push(VersionMeta {
+                version: version_str.clone(),
+                published_at,
+                yanked: all_yanked,
+                prerelease,
+            });
+        }
+        Ok(out)
     }
 
     fn name(&self) -> &'static str {
@@ -2023,5 +2055,49 @@ mod tests {
 
             assert_eq!(version, "2.0.0");
         }
+    }
+
+    #[tokio::test]
+    async fn test_pypi_list_versions_returns_publish_dates() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+
+        // Trigger fallback to JSON API by returning 404 on simple API.
+        Mock::given(method("GET"))
+            .and(path("/simple/requests/"))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&mock_server)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path("/pypi/requests/json"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                r#"{
+              "releases": {
+                "2.31.0": [{"yanked": false, "upload_time_iso_8601": "2024-05-20T10:00:00.000000Z"}],
+                "2.30.0": [{"yanked": false, "upload_time_iso_8601": "2024-01-15T10:00:00.000000Z"}],
+                "1.0.0": [{"yanked": true, "upload_time_iso_8601": "2020-01-01T10:00:00.000000Z"}]
+              }
+            }"#,
+            ))
+            .mount(&mock_server)
+            .await;
+
+        let registry = PyPiRegistry::with_index_url(mock_server.uri());
+        let versions = registry.list_versions("requests").await.unwrap();
+
+        assert_eq!(
+            versions.len(),
+            3,
+            "should include yanked versions so caller can filter"
+        );
+        let v_2_31 = versions.iter().find(|v| v.version == "2.31.0").unwrap();
+        assert!(v_2_31.published_at.is_some());
+        assert!(!v_2_31.yanked);
+
+        let v_1_0 = versions.iter().find(|v| v.version == "1.0.0").unwrap();
+        assert!(v_1_0.yanked);
     }
 }
