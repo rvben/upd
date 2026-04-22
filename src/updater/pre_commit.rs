@@ -675,4 +675,81 @@ mod tests {
         assert_eq!(result.errors.len(), 1);
         assert!(result.errors[0].contains("nonexistent/hook"));
     }
+
+    /// End-to-end regression for the N-segment tag fix. PreCommitUpdater must
+    /// update shellcheck-py's 4-segment rev to the latest 4-segment tag.
+    #[tokio::test]
+    async fn test_shellcheck_py_four_segment_rev_is_updated() {
+        let mut file = NamedTempFile::new().unwrap();
+        write!(
+            file,
+            r#"repos:
+  - repo: https://github.com/shellcheck-py/shellcheck-py
+    rev: v0.8.0.4
+    hooks:
+      - id: shellcheck
+"#
+        )
+        .unwrap();
+
+        let registry = MockRegistry::new("github-releases")
+            .with_version("shellcheck-py/shellcheck-py", "v0.11.0.1");
+
+        let updater = PreCommitUpdater::new();
+        let options = UpdateOptions::new(false, false);
+
+        let result = updater
+            .update(file.path(), &registry, options)
+            .await
+            .unwrap();
+
+        assert_eq!(result.updated.len(), 1, "expected exactly one update");
+        assert_eq!(result.warnings.len(), 0, "no downgrade warning expected");
+        assert_eq!(result.updated[0].0, "shellcheck-py/shellcheck-py");
+        assert_eq!(result.updated[0].1, "v0.8.0.4");
+        assert_eq!(result.updated[0].2, "v0.11.0.1");
+
+        let content = fs::read_to_string(file.path()).unwrap();
+        assert!(
+            content.contains("rev: v0.11.0.1"),
+            "file should contain new rev, got: {content}",
+        );
+        assert!(
+            !content.contains("rev: v0.8.0.4"),
+            "file should no longer contain old rev, got: {content}",
+        );
+    }
+
+    /// Downgrade guard still fires if the registry returns a lower 4-segment tag.
+    /// This pins the guard in place so the primary fix can't silently reintroduce
+    /// the downgrade.
+    #[tokio::test]
+    async fn test_downgrade_guard_refuses_lower_four_segment_rev() {
+        let mut file = NamedTempFile::new().unwrap();
+        let original = r#"repos:
+  - repo: https://github.com/shellcheck-py/shellcheck-py
+    rev: v0.8.0.4
+    hooks:
+      - id: shellcheck
+"#;
+        write!(file, "{}", original).unwrap();
+
+        let registry = MockRegistry::new("github-releases")
+            .with_version("shellcheck-py/shellcheck-py", "v0.0.2");
+
+        let updater = PreCommitUpdater::new();
+        let options = UpdateOptions::new(false, false);
+
+        let result = updater
+            .update(file.path(), &registry, options)
+            .await
+            .unwrap();
+
+        assert_eq!(result.updated.len(), 0, "must not downgrade");
+        assert_eq!(result.warnings.len(), 1, "expected one downgrade warning");
+        assert!(result.warnings[0].contains("shellcheck-py/shellcheck-py"));
+
+        let content = fs::read_to_string(file.path()).unwrap();
+        assert_eq!(content, original, "file must be unchanged");
+    }
 }
