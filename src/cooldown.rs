@@ -51,6 +51,42 @@ pub fn parse_duration(input: &str) -> Result<Duration> {
     }
 }
 
+use std::collections::HashMap;
+
+/// The resolved cooldown policy for a single run.
+///
+/// Precedence (highest first): `force_override`, then `per_ecosystem`, then
+/// `default`, then zero (disabled).
+#[derive(Debug, Clone, Default)]
+pub struct CooldownPolicy {
+    /// Applied to every ecosystem unless overridden.
+    pub default: Duration,
+    /// Per-ecosystem overrides keyed by registry name (see `src/cache.rs` for
+    /// the canonical names: "pypi", "npm", "crates.io", "go-proxy",
+    /// "github-releases", "rubygems", "terraform", "nuget").
+    pub per_ecosystem: HashMap<String, Duration>,
+    /// CLI `--min-age` override. Wins over everything else when set.
+    pub force_override: Option<Duration>,
+}
+
+impl CooldownPolicy {
+    /// Returns the cooldown that applies to `ecosystem` right now.
+    pub fn effective_for(&self, ecosystem: &str) -> Duration {
+        if let Some(d) = self.force_override {
+            return d;
+        }
+        if let Some(d) = self.per_ecosystem.get(ecosystem) {
+            return *d;
+        }
+        self.default
+    }
+
+    /// Convenience: is cooldown active for this ecosystem?
+    pub fn is_enabled_for(&self, ecosystem: &str) -> bool {
+        self.effective_for(ecosystem) > Duration::zero()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -131,5 +167,86 @@ mod tests {
     #[test]
     fn test_parse_duration_rejects_float() {
         assert!(parse_duration("1.5d").is_err());
+    }
+
+    #[test]
+    fn test_policy_disabled_by_default() {
+        let policy = CooldownPolicy::default();
+        assert_eq!(policy.effective_for("pypi"), Duration::zero());
+        assert_eq!(policy.effective_for("npm"), Duration::zero());
+    }
+
+    #[test]
+    fn test_policy_default_applies_to_all_ecosystems() {
+        let policy = CooldownPolicy {
+            default: Duration::days(7),
+            per_ecosystem: std::collections::HashMap::new(),
+            force_override: None,
+        };
+        assert_eq!(policy.effective_for("pypi"), Duration::days(7));
+        assert_eq!(policy.effective_for("npm"), Duration::days(7));
+        assert_eq!(policy.effective_for("crates.io"), Duration::days(7));
+    }
+
+    #[test]
+    fn test_policy_per_ecosystem_overrides_default() {
+        let mut per = std::collections::HashMap::new();
+        per.insert("npm".to_string(), Duration::days(14));
+        let policy = CooldownPolicy {
+            default: Duration::days(7),
+            per_ecosystem: per,
+            force_override: None,
+        };
+        assert_eq!(policy.effective_for("npm"), Duration::days(14));
+        assert_eq!(
+            policy.effective_for("pypi"),
+            Duration::days(7),
+            "other ecosystems fall back to default"
+        );
+    }
+
+    #[test]
+    fn test_policy_force_override_wins_absolutely() {
+        let mut per = std::collections::HashMap::new();
+        per.insert("npm".to_string(), Duration::days(14));
+        let policy = CooldownPolicy {
+            default: Duration::days(7),
+            per_ecosystem: per,
+            force_override: Some(Duration::days(3)),
+        };
+        assert_eq!(
+            policy.effective_for("npm"),
+            Duration::days(3),
+            "force override clobbers per-ecosystem"
+        );
+        assert_eq!(
+            policy.effective_for("pypi"),
+            Duration::days(3),
+            "force override clobbers default"
+        );
+    }
+
+    #[test]
+    fn test_policy_force_override_zero_disables_all() {
+        let mut per = std::collections::HashMap::new();
+        per.insert("npm".to_string(), Duration::days(14));
+        let policy = CooldownPolicy {
+            default: Duration::days(7),
+            per_ecosystem: per,
+            force_override: Some(Duration::zero()),
+        };
+        assert_eq!(policy.effective_for("npm"), Duration::zero());
+        assert_eq!(policy.effective_for("pypi"), Duration::zero());
+    }
+
+    #[test]
+    fn test_policy_is_enabled_for() {
+        let policy = CooldownPolicy {
+            default: Duration::zero(),
+            per_ecosystem: std::iter::once(("npm".to_string(), Duration::days(7))).collect(),
+            force_override: None,
+        };
+        assert!(policy.is_enabled_for("npm"));
+        assert!(!policy.is_enabled_for("pypi"));
     }
 }
