@@ -391,7 +391,7 @@ async fn main() -> Result<()> {
         let cwd = std::env::current_dir()?;
         let (loaded_config, _) = upd::config::UpdConfig::discover(&cwd)
             .unwrap_or_else(|| (upd::config::UpdConfig::default(), cwd.clone()));
-        let policy = loaded_config.to_cooldown_policy(None)?;
+        let policy = loaded_config.to_cooldown_policy(cli.min_age.as_deref())?;
         println!();
         print!("{}", upd::config::render_cooldown_for_show_config(&policy));
 

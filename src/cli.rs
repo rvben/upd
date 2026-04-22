@@ -161,6 +161,17 @@ pub struct Cli {
     #[arg(long, global = true)]
     pub show_config: bool,
 
+    /// Minimum release age before a version is eligible for update.
+    ///
+    /// Overrides the `[cooldown]` config for this run. Setting `--min-age 0`
+    /// disables cooldown entirely. Accepts durations like `72h`, `7d`, `2w`.
+    ///
+    /// Example: `upd --min-age 7d` only updates to versions published at least
+    /// 7 days ago. Protects against supply-chain attacks that rely on freshly
+    /// published malicious packages being installed before detection.
+    #[arg(long, global = true, value_name = "DURATION")]
+    pub min_age: Option<String>,
+
     /// Update only the named package(s), skipping all others.
     ///
     /// Comma-separated or repeatable. Exact case-sensitive match.
@@ -803,5 +814,30 @@ mod tests {
             align_help.contains("monorepos"),
             "align --help should describe monorepo use-case; got:\n{align_help}"
         );
+    }
+
+    #[test]
+    fn test_cli_parses_min_age() {
+        let cli = Cli::try_parse_from(["upd", "--min-age", "7d"]).unwrap();
+        assert_eq!(cli.min_age.as_deref(), Some("7d"));
+    }
+
+    #[test]
+    fn test_cli_min_age_zero_for_disable() {
+        let cli = Cli::try_parse_from(["upd", "--min-age", "0"]).unwrap();
+        assert_eq!(cli.min_age.as_deref(), Some("0"));
+    }
+
+    #[test]
+    fn test_cli_min_age_default_none() {
+        let cli = Cli::try_parse_from(["upd"]).unwrap();
+        assert!(cli.min_age.is_none());
+    }
+
+    #[test]
+    fn test_cli_min_age_is_global_across_subcommands() {
+        let cli = Cli::try_parse_from(["upd", "update", "--min-age", "14d", "path1"]).unwrap();
+        assert_eq!(cli.min_age.as_deref(), Some("14d"));
+        assert!(matches!(cli.command, Some(Command::Update { .. })));
     }
 }
