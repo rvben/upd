@@ -504,12 +504,12 @@ mod tests {
         assert_eq!(compare_semver("0.9.0.2", "0.9.0.10"), Ordering::Less);
     }
 
-    /// Downgrade guard for pre-commit hooks with 4-segment tags (issue #2).
+    /// Downgrade guard for pre-commit hooks with 4-segment tags.
     #[test]
     fn test_compare_versions_precommit_four_segment_downgrade() {
         use std::cmp::Ordering;
-        // Guards against the issue-#2 scenario: if the registry wrongly returns
-        // v0.0.2 for shellcheck-py, PreCommitUpdater must see this as a downgrade.
+        // If the registry returns a lower version, PreCommitUpdater must treat it
+        // as a downgrade and refuse to write the change.
         assert_eq!(
             compare_versions("v0.0.2", "v0.8.0.4", Lang::PreCommit),
             Ordering::Less,
