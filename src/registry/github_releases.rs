@@ -410,10 +410,10 @@ mod tests {
         assert_eq!(version, "v5.0.0-beta.1");
     }
 
-    /// Regression for issue #2: shellcheck-py publishes 4-segment tags
-    /// (v0.11.0.1, v0.8.0.4, …) and does NOT create GitHub Releases.
-    /// Before the fix, semver::Version::parse rejected every 4-segment tag and
-    /// the registry collapsed to the lone 3-segment legacy tag v0.0.2.
+    /// Regression: shellcheck-py publishes 4-segment tags (v0.11.0.1,
+    /// v0.8.0.4, …) and does NOT create GitHub Releases. A semver-only
+    /// parser rejects every 4-segment tag and collapses the stable set to
+    /// the lone 3-segment legacy tag v0.0.2.
     #[tokio::test]
     async fn test_four_segment_tags_shellcheck_py_regression() {
         let server = MockServer::start().await;
