@@ -8,7 +8,7 @@ use crate::updater::{
     Lang, MiseUpdater, PackageJsonUpdater, ParsedDependency, PreCommitUpdater, PyProjectUpdater,
     RequirementsUpdater, TerraformUpdater, Updater,
 };
-use crate::version::is_stable_pep440;
+use crate::version::{TagVersion, is_stable_pep440};
 use anyhow::Result;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -234,18 +234,27 @@ fn compare_pep440(a: &str, b: &str) -> std::cmp::Ordering {
     }
 }
 
-/// Compare semver versions
+/// Compare semver versions. Falls back to `TagVersion` (N-segment numeric
+/// ordering) when strict semver parsing fails, so callers handling git-tag
+/// style versions with 4+ release segments don't collapse to lexical compare.
 fn compare_semver(a: &str, b: &str) -> std::cmp::Ordering {
-    // Clean up version strings (remove ^, ~, = prefixes)
+    // Clean up version strings (remove ^, ~, =, v prefixes)
     let clean_a = a.trim_start_matches(['^', '~', '=', 'v']);
     let clean_b = b.trim_start_matches(['^', '~', '=', 'v']);
 
-    match (
+    // Strict semver path — preserves prerelease ordering for ecosystems
+    // that rely on it (Node, Rust, Ruby, .NET, Go).
+    if let (Ok(va), Ok(vb)) = (
         semver::Version::parse(clean_a),
         semver::Version::parse(clean_b),
     ) {
-        (Ok(va), Ok(vb)) => va.cmp(&vb),
-        _ => clean_a.cmp(clean_b), // Fallback to string comparison
+        return va.cmp(&vb);
+    }
+
+    // Fallback for N-segment tags and other loose version strings.
+    match (TagVersion::parse(clean_a), TagVersion::parse(clean_b)) {
+        (Some(ta), Some(tb)) => ta.cmp(&tb),
+        _ => clean_a.cmp(clean_b),
     }
 }
 
@@ -479,5 +488,52 @@ mod tests {
             !occurrences[0].is_bumpable,
             "pseudo-version occurrence must have is_bumpable == false"
         );
+    }
+
+    /// Regression: compare_semver must not fall back to lexical string compare
+    /// for 4-segment versions. "0.9.0.10" > "0.9.0.2" numerically, but
+    /// lexically "0.9.0.10" < "0.9.0.2".
+    #[test]
+    fn test_compare_semver_four_segment_avoids_lexical_trap() {
+        use std::cmp::Ordering;
+        assert_eq!(
+            compare_semver("0.9.0.10", "0.9.0.2"),
+            Ordering::Greater,
+            "lexical fallback would incorrectly return Less"
+        );
+        assert_eq!(compare_semver("0.9.0.2", "0.9.0.10"), Ordering::Less);
+    }
+
+    /// Downgrade guard for pre-commit hooks with 4-segment tags (issue #2).
+    #[test]
+    fn test_compare_versions_precommit_four_segment_downgrade() {
+        use std::cmp::Ordering;
+        // Guards against the issue-#2 scenario: if the registry wrongly returns
+        // v0.0.2 for shellcheck-py, PreCommitUpdater must see this as a downgrade.
+        assert_eq!(
+            compare_versions("v0.0.2", "v0.8.0.4", Lang::PreCommit),
+            Ordering::Less,
+        );
+        assert_eq!(
+            compare_versions("v0.11.0.1", "v0.8.0.4", Lang::PreCommit),
+            Ordering::Greater,
+        );
+    }
+
+    /// compare_semver must preserve strict semver ordering for prereleases in the
+    /// 3-segment case — this is what Node, Rust, Ruby, .NET depend on.
+    #[test]
+    fn test_compare_semver_preserves_prerelease_ordering() {
+        use std::cmp::Ordering;
+        // Strict semver: 1.0.0-alpha < 1.0.0-alpha.1 < 1.0.0-beta < 1.0.0
+        assert_eq!(
+            compare_semver("1.0.0-alpha", "1.0.0-alpha.1"),
+            Ordering::Less
+        );
+        assert_eq!(
+            compare_semver("1.0.0-alpha.1", "1.0.0-beta"),
+            Ordering::Less
+        );
+        assert_eq!(compare_semver("1.0.0-beta", "1.0.0"), Ordering::Less);
     }
 }
