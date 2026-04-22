@@ -1059,6 +1059,7 @@ jobs:
         let config = UpdConfig {
             ignore: vec!["actions/checkout".to_string()],
             pin: pins,
+            cooldown: None,
         };
 
         let updater = GithubActionsUpdater::new();

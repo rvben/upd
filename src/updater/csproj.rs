@@ -659,6 +659,7 @@ mod tests {
         let config = UpdConfig {
             ignore: vec!["Newtonsoft.Json".to_string()],
             pin: pins,
+            cooldown: None,
         };
 
         let updater = CsprojUpdater::new();
@@ -698,6 +699,7 @@ mod tests {
         let config = UpdConfig {
             ignore: vec![],
             pin: pins,
+            cooldown: None,
         };
 
         let updater = CsprojUpdater::new();

@@ -752,6 +752,7 @@ uv = "latest"
         let config = UpdConfig {
             ignore: vec!["node".to_string()],
             pin: pins,
+            cooldown: None,
         };
 
         let updater = MiseUpdater::new();

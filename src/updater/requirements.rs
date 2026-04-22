@@ -1037,6 +1037,7 @@ flask>=2.0.0
         let config = UpdConfig {
             ignore: vec!["flask".to_string()],
             pin: HashMap::new(),
+            cooldown: None,
         };
 
         let updater = RequirementsUpdater::new();
@@ -1079,6 +1080,7 @@ flask>=2.0.0
         let config = UpdConfig {
             ignore: vec![],
             pin,
+            cooldown: None,
         };
 
         let updater = RequirementsUpdater::new();
@@ -1124,6 +1126,7 @@ flask>=2.0.0
         let config = UpdConfig {
             ignore: vec!["flask".to_string()],
             pin,
+            cooldown: None,
         };
 
         let updater = RequirementsUpdater::new();

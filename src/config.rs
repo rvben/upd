@@ -31,7 +31,19 @@ use std::path::{Path, PathBuf};
 const MAX_CONFIG_FILE_SIZE: u64 = 1024 * 1024;
 
 /// All valid top-level keys in the config schema.
-const KNOWN_KEYS: &[&str] = &["ignore", "pin"];
+const KNOWN_KEYS: &[&str] = &["ignore", "pin", "cooldown"];
+
+/// Raw cooldown config as written in the TOML file. Parsed into a
+/// `crate::cooldown::CooldownPolicy` at runtime via `UpdConfig::to_cooldown_policy`.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct CooldownConfig {
+    /// Default cooldown applied to all ecosystems (e.g. "7d").
+    #[serde(default)]
+    pub default: Option<String>,
+    /// Per-ecosystem overrides, keyed by registry name.
+    #[serde(default)]
+    pub ecosystem: HashMap<String, String>,
+}
 
 /// Configuration loaded from .updrc.toml or upd.toml
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -43,6 +55,10 @@ pub struct UpdConfig {
     /// Package versions to pin (name -> version constraint)
     #[serde(default)]
     pub pin: HashMap<String, String>,
+
+    /// Optional cooldown (minimum release age) policy.
+    #[serde(default)]
+    pub cooldown: Option<CooldownConfig>,
 }
 
 impl UpdConfig {
@@ -171,6 +187,34 @@ impl UpdConfig {
             }
         }
 
+        // Warn on unknown ecosystem keys inside [cooldown.ecosystem].
+        const KNOWN_ECOSYSTEMS: &[&str] = &[
+            "pypi",
+            "npm",
+            "crates.io",
+            "go-proxy",
+            "github-releases",
+            "rubygems",
+            "terraform",
+            "nuget",
+        ];
+        if let toml::Value::Table(table) = &raw
+            && let Some(toml::Value::Table(cooldown)) = table.get("cooldown")
+            && let Some(toml::Value::Table(ecosystem)) = cooldown.get("ecosystem")
+        {
+            for key in ecosystem.keys() {
+                if !KNOWN_ECOSYSTEMS.contains(&key.as_str()) {
+                    warnings.push(format!(
+                        "unknown ecosystem `{}` in [cooldown.ecosystem] in config file {}; \
+                         valid ecosystems are: {}. Run `upd --show-config` for the expected schema.",
+                        key,
+                        source_label,
+                        KNOWN_ECOSYSTEMS.join(", ")
+                    ));
+                }
+            }
+        }
+
         // Parse into typed struct (uses the already-validated TOML)
         let config: Self = raw
             .try_into()
@@ -195,6 +239,46 @@ ignore = []
 # example-package = "1.2.3"
 # another-package = ">=2.0,<3"
 "#
+    }
+
+    /// Resolve the raw config into a `CooldownPolicy`.
+    ///
+    /// `cli_override` corresponds to the `--min-age` CLI flag; when set it
+    /// becomes the policy's `force_override` and wins over all config values.
+    pub fn to_cooldown_policy(
+        &self,
+        cli_override: Option<&str>,
+    ) -> anyhow::Result<crate::cooldown::CooldownPolicy> {
+        use crate::cooldown::{CooldownPolicy, parse_duration};
+
+        let default = match self.cooldown.as_ref().and_then(|c| c.default.as_deref()) {
+            Some(s) => parse_duration(s)
+                .map_err(|e| anyhow::anyhow!("invalid [cooldown] default '{s}': {e}"))?,
+            None => chrono::Duration::zero(),
+        };
+
+        let mut per_ecosystem = std::collections::HashMap::new();
+        if let Some(cc) = self.cooldown.as_ref() {
+            for (ecosystem, raw) in &cc.ecosystem {
+                let d = parse_duration(raw).map_err(|e| {
+                    anyhow::anyhow!("invalid [cooldown.ecosystem.{ecosystem}] '{raw}': {e}")
+                })?;
+                per_ecosystem.insert(ecosystem.clone(), d);
+            }
+        }
+
+        let force_override = match cli_override {
+            Some(s) => Some(
+                parse_duration(s).map_err(|e| anyhow::anyhow!("invalid --min-age '{s}': {e}"))?,
+            ),
+            None => None,
+        };
+
+        Ok(CooldownPolicy {
+            default,
+            per_ecosystem,
+            force_override,
+        })
     }
 
     /// Check if a package should be ignored
@@ -263,6 +347,7 @@ django = ">=3.2,<4"
         let config = UpdConfig {
             ignore: vec!["pkg-a".to_string(), "pkg-b".to_string()],
             pin: HashMap::new(),
+            cooldown: None,
         };
 
         assert!(config.should_ignore("pkg-a"));
@@ -279,6 +364,7 @@ django = ">=3.2,<4"
         let config = UpdConfig {
             ignore: vec![],
             pin,
+            cooldown: None,
         };
 
         assert_eq!(config.get_pinned_version("requests"), Some("2.28.0"));
@@ -375,6 +461,7 @@ ignore = ["parent-pkg"]
         let with_ignore = UpdConfig {
             ignore: vec!["pkg".to_string()],
             pin: HashMap::new(),
+            cooldown: None,
         };
         assert!(with_ignore.has_config());
 
@@ -383,6 +470,7 @@ ignore = ["parent-pkg"]
         let with_pin = UpdConfig {
             ignore: vec![],
             pin,
+            cooldown: None,
         };
         assert!(with_pin.has_config());
     }
@@ -396,6 +484,7 @@ ignore = ["parent-pkg"]
                 m.insert("requests".to_string(), "2.0.0".to_string());
                 m
             },
+            cooldown: None,
         };
 
         let other = UpdConfig {
@@ -406,6 +495,7 @@ ignore = ["parent-pkg"]
                 m.insert("django".to_string(), "3.2".to_string()); // New
                 m
             },
+            cooldown: None,
         };
 
         base.merge(other);
@@ -554,6 +644,7 @@ parent-pkg = "1.0.0"
                 m.insert("flask".to_string(), "2.0.0".to_string());
                 m
             },
+            cooldown: None,
         };
 
         // Create mock registry
@@ -614,6 +705,7 @@ parent-pkg = "1.0.0"
                 m.insert("pinned-pkg".to_string(), "1.5.0".to_string());
                 m
             },
+            cooldown: None,
         });
 
         // Test Requirements
@@ -894,5 +986,116 @@ packages = ["some-package"]
         assert!(result.is_ok());
         let config = result.unwrap();
         assert_eq!(config.ignore.len(), 2);
+    }
+
+    // ==================== Cooldown Config Tests ====================
+
+    #[test]
+    fn test_config_parses_cooldown_default() {
+        let content = r#"
+[cooldown]
+default = "7d"
+"#;
+        let (config, warnings) = UpdConfig::parse_with_warnings(content, "test.toml").unwrap();
+        assert!(warnings.is_empty(), "unexpected warnings: {warnings:?}");
+        let cooldown = config.cooldown.as_ref().expect("cooldown section");
+        assert_eq!(cooldown.default.as_deref(), Some("7d"));
+        assert!(cooldown.ecosystem.is_empty());
+    }
+
+    #[test]
+    fn test_config_parses_cooldown_ecosystem_overrides() {
+        let content = r#"
+[cooldown]
+default = "7d"
+
+[cooldown.ecosystem]
+npm = "14d"
+"crates.io" = "3d"
+"#;
+        let (config, warnings) = UpdConfig::parse_with_warnings(content, "test.toml").unwrap();
+        assert!(warnings.is_empty(), "unexpected warnings: {warnings:?}");
+        let cooldown = config.cooldown.unwrap();
+        assert_eq!(cooldown.default.as_deref(), Some("7d"));
+        assert_eq!(
+            cooldown.ecosystem.get("npm").map(String::as_str),
+            Some("14d")
+        );
+        assert_eq!(
+            cooldown.ecosystem.get("crates.io").map(String::as_str),
+            Some("3d")
+        );
+    }
+
+    #[test]
+    fn test_config_warns_on_unknown_ecosystem_key() {
+        let content = r#"
+[cooldown.ecosystem]
+pipy = "7d"
+"#;
+        let (_, warnings) = UpdConfig::parse_with_warnings(content, "test.toml").unwrap();
+        assert_eq!(warnings.len(), 1, "expected one warning, got: {warnings:?}");
+        assert!(
+            warnings[0].contains("pipy"),
+            "warning should name the bad key: {}",
+            warnings[0]
+        );
+        assert!(
+            warnings[0].contains("ecosystem"),
+            "warning should mention ecosystem context: {}",
+            warnings[0]
+        );
+    }
+
+    #[test]
+    fn test_config_to_cooldown_policy_empty() {
+        let config = UpdConfig::default();
+        let policy = config.to_cooldown_policy(None).unwrap();
+        assert_eq!(policy.default, chrono::Duration::zero());
+        assert!(policy.per_ecosystem.is_empty());
+        assert!(policy.force_override.is_none());
+    }
+
+    #[test]
+    fn test_config_to_cooldown_policy_parses_durations() {
+        let content = r#"
+[cooldown]
+default = "7d"
+
+[cooldown.ecosystem]
+npm = "14d"
+"#;
+        let (config, _) = UpdConfig::parse_with_warnings(content, "test.toml").unwrap();
+        let policy = config.to_cooldown_policy(None).unwrap();
+        assert_eq!(policy.default, chrono::Duration::days(7));
+        assert_eq!(
+            policy.per_ecosystem.get("npm"),
+            Some(&chrono::Duration::days(14))
+        );
+    }
+
+    #[test]
+    fn test_config_to_cooldown_policy_honours_cli_override() {
+        let content = r#"
+[cooldown]
+default = "7d"
+"#;
+        let (config, _) = UpdConfig::parse_with_warnings(content, "test.toml").unwrap();
+        let policy = config.to_cooldown_policy(Some("0")).unwrap();
+        assert_eq!(policy.force_override, Some(chrono::Duration::zero()));
+    }
+
+    #[test]
+    fn test_config_to_cooldown_policy_rejects_bad_duration() {
+        let content = r#"
+[cooldown]
+default = "nope"
+"#;
+        let (config, _) = UpdConfig::parse_with_warnings(content, "test.toml").unwrap();
+        let err = config.to_cooldown_policy(None).unwrap_err().to_string();
+        assert!(
+            err.contains("cooldown"),
+            "error should mention cooldown: {err}"
+        );
     }
 }

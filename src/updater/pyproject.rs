@@ -1604,6 +1604,7 @@ dependencies = [
         let config = UpdConfig {
             ignore: vec!["flask".to_string()],
             pin: std::collections::HashMap::new(),
+            cooldown: None,
         };
 
         let updater = PyProjectUpdater::new();
@@ -1654,6 +1655,7 @@ dependencies = [
         let config = UpdConfig {
             ignore: Vec::new(),
             pin,
+            cooldown: None,
         };
 
         let updater = PyProjectUpdater::new();
@@ -1705,6 +1707,7 @@ flask = "^2.0.0"
         let config = UpdConfig {
             ignore: vec!["requests".to_string()],
             pin: std::collections::HashMap::new(),
+            cooldown: None,
         };
 
         let updater = PyProjectUpdater::new();
@@ -1752,6 +1755,7 @@ requests = "^2.28.0"
         let config = UpdConfig {
             ignore: Vec::new(),
             pin,
+            cooldown: None,
         };
 
         let updater = PyProjectUpdater::new();
@@ -1799,6 +1803,7 @@ dev = [
         let config = UpdConfig {
             ignore: Vec::new(),
             pin,
+            cooldown: None,
         };
 
         let updater = PyProjectUpdater::new();
@@ -1907,6 +1912,7 @@ dependencies = [
         let config = UpdConfig {
             ignore: vec!["flask".to_string()],
             pin,
+            cooldown: None,
         };
 
         let updater = PyProjectUpdater::new();
@@ -1962,6 +1968,7 @@ dev = ["pytest>=7.0.0", "black>=23.0.0"]
         let config = UpdConfig {
             ignore: vec!["pytest".to_string()],
             pin: std::collections::HashMap::new(),
+            cooldown: None,
         };
 
         let updater = PyProjectUpdater::new();
@@ -2012,6 +2019,7 @@ flask = "~2.0.0"
         let config = UpdConfig {
             ignore: Vec::new(),
             pin,
+            cooldown: None,
         };
 
         let updater = PyProjectUpdater::new();

@@ -822,6 +822,7 @@ mod tests {
         let config = UpdConfig {
             ignore: Vec::new(),
             pin,
+            cooldown: None,
         };
 
         let updater = PackageJsonUpdater::new();
@@ -871,6 +872,7 @@ mod tests {
         let config = UpdConfig {
             ignore: Vec::new(),
             pin,
+            cooldown: None,
         };
 
         let updater = PackageJsonUpdater::new();
@@ -952,6 +954,7 @@ mod tests {
         let config = UpdConfig {
             ignore: vec!["lodash".to_string()],
             pin: std::collections::HashMap::new(),
+            cooldown: None,
         };
 
         let updater = PackageJsonUpdater::new();
@@ -1003,6 +1006,7 @@ mod tests {
         let config = UpdConfig {
             ignore: Vec::new(),
             pin,
+            cooldown: None,
         };
 
         let updater = PackageJsonUpdater::new();
@@ -1057,6 +1061,7 @@ mod tests {
         let config = UpdConfig {
             ignore: vec!["lodash".to_string()],
             pin,
+            cooldown: None,
         };
 
         let updater = PackageJsonUpdater::new();
@@ -1107,6 +1112,7 @@ mod tests {
         let config = UpdConfig {
             ignore: vec!["typescript".to_string()],
             pin: std::collections::HashMap::new(),
+            cooldown: None,
         };
 
         let updater = PackageJsonUpdater::new();
@@ -1159,6 +1165,7 @@ mod tests {
         let config = UpdConfig {
             ignore: Vec::new(),
             pin,
+            cooldown: None,
         };
 
         let updater = PackageJsonUpdater::new();

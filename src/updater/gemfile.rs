@@ -541,6 +541,7 @@ mod tests {
         let config = UpdConfig {
             ignore: vec!["rails".to_string()],
             pin: pins,
+            cooldown: None,
         };
 
         let updater = GemfileUpdater::new();

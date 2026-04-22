@@ -808,6 +808,7 @@ require (
         let config = UpdConfig {
             ignore: vec!["github.com/foo/bar".to_string()],
             pin: std::collections::HashMap::new(),
+            cooldown: None,
         };
 
         let updater = GoModUpdater::new();
@@ -858,6 +859,7 @@ require (
         let config = UpdConfig {
             ignore: vec![],
             pin: pins,
+            cooldown: None,
         };
 
         let updater = GoModUpdater::new();
@@ -904,6 +906,7 @@ require github.com/foo/bar v1.0.0
         let config = UpdConfig {
             ignore: vec![],
             pin: pins,
+            cooldown: None,
         };
 
         let updater = GoModUpdater::new();
@@ -953,6 +956,7 @@ require (
         let config = UpdConfig {
             ignore: vec!["github.com/ignored/mod".to_string()],
             pin: pins,
+            cooldown: None,
         };
 
         let updater = GoModUpdater::new();
@@ -1006,6 +1010,7 @@ require github.com/baz/qux v2.0.0
         let config = UpdConfig {
             ignore: vec!["github.com/baz/qux".to_string()],
             pin: pins,
+            cooldown: None,
         };
 
         let updater = GoModUpdater::new();
@@ -1052,6 +1057,7 @@ require (
         let config = UpdConfig {
             ignore: vec![],
             pin: pins,
+            cooldown: None,
         };
 
         let updater = GoModUpdater::new();

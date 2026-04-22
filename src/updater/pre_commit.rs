@@ -614,6 +614,7 @@ mod tests {
         let config = UpdConfig {
             ignore: vec!["pre-commit/pre-commit-hooks".to_string()],
             pin: pins,
+            cooldown: None,
         };
 
         let updater = PreCommitUpdater::new();

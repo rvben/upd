@@ -797,6 +797,7 @@ module "vpc" {{
         let config = UpdConfig {
             ignore: vec!["hashicorp/aws".to_string()],
             pin: pins,
+            cooldown: None,
         };
 
         let updater = TerraformUpdater::new();
