@@ -612,6 +612,7 @@ mod tests {
                 "skipping bar: current version \"%version%\" is not a valid PEP 440 version".into(),
             ],
             unchanged: 4,
+            ..Default::default()
         };
         let report = build_update_file_report(
             Path::new("package.json"),

@@ -392,6 +392,48 @@ impl Updater for RequirementsUpdater {
                                 continue;
                             }
 
+                            // Apply cooldown policy before precision-matching so we select
+                            // from the full version list, not just the pre-matched string.
+                            let constraints_for_cooldown = if parsed.full_constraint.is_empty() {
+                                None
+                            } else {
+                                Some(parsed.full_constraint.as_str())
+                            };
+                            let (outcome, note) = crate::updater::apply_cooldown(
+                                effective_registry,
+                                &parsed.package,
+                                &parsed.first_version,
+                                &latest_version,
+                                constraints_for_cooldown,
+                                current_is_prerelease,
+                                &options,
+                            )
+                            .await;
+                            if let Some(msg) = note {
+                                options.note_cooldown_unavailable(&msg);
+                            }
+                            let (latest_version, held_back_record) = match outcome {
+                                crate::updater::CooldownOutcome::Unchanged(v) => (v, None),
+                                crate::updater::CooldownOutcome::HeldBack {
+                                    chosen,
+                                    skipped_version,
+                                    skipped_published_at,
+                                } => (chosen, Some((skipped_version, skipped_published_at))),
+                                crate::updater::CooldownOutcome::Skipped {
+                                    skipped_version,
+                                    skipped_published_at,
+                                } => {
+                                    result.skipped_by_cooldown.push((
+                                        parsed.package.clone(),
+                                        parsed.first_version.clone(),
+                                        skipped_version,
+                                        skipped_published_at,
+                                    ));
+                                    new_lines.push(line.to_string());
+                                    continue;
+                                }
+                            };
+
                             // Match the precision of the original version (unless full precision requested)
                             let matched_version = if options.full_precision {
                                 latest_version.clone()
@@ -420,6 +462,17 @@ impl Updater for RequirementsUpdater {
                                         matched_version.clone(),
                                         Some(line_num),
                                     ));
+                                    if let Some((skipped_version, skipped_published_at)) =
+                                        held_back_record
+                                    {
+                                        result.held_back.push((
+                                            parsed.package.clone(),
+                                            parsed.first_version.clone(),
+                                            matched_version.clone(),
+                                            skipped_version,
+                                            skipped_published_at,
+                                        ));
+                                    }
                                     new_lines.push(self.update_line(line, &matched_version));
                                     modified = true;
                                 }

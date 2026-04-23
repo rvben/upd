@@ -23,11 +23,14 @@ pub use requirements::RequirementsUpdater;
 pub use terraform::TerraformUpdater;
 
 use crate::config::UpdConfig;
+use crate::cooldown::CooldownPolicy;
 use crate::registry::Registry;
 use anyhow::{Result, anyhow};
+use chrono::{DateTime, Utc};
 use ignore::WalkBuilder;
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 /// Maximum file size allowed for dependency files (10 MB)
 const MAX_FILE_SIZE: u64 = 10 * 1024 * 1024;
@@ -95,6 +98,14 @@ pub struct UpdateOptions {
     /// When non-empty, only packages whose name is in this set are processed.
     /// An empty set means "process all packages" (no filter active).
     pub packages: Vec<String>,
+    /// Active cooldown policy, if configured. None => cooldown disabled.
+    pub cooldown_policy: Option<Arc<CooldownPolicy>>,
+    /// Wall-clock used for cooldown decisions. None => `Utc::now()` at call time.
+    /// Injected by tests for deterministic behaviour.
+    pub cooldown_now: Option<DateTime<Utc>>,
+    /// Notes emitted when a registry cannot supply publish dates. Shared across
+    /// updaters so a single file processing run reports each note once.
+    pub cooldown_unavailable_notes: Arc<Mutex<BTreeSet<String>>>,
 }
 
 impl UpdateOptions {
@@ -105,6 +116,9 @@ impl UpdateOptions {
             full_precision,
             config: None,
             packages: Vec::new(),
+            cooldown_policy: None,
+            cooldown_now: None,
+            cooldown_unavailable_notes: Arc::default(),
         }
     }
 
@@ -139,6 +153,28 @@ impl UpdateOptions {
         self.config
             .as_ref()
             .and_then(|c| c.get_pinned_version(package))
+    }
+
+    /// Activate a cooldown policy with a fixed reference time for decisions.
+    pub fn with_cooldown_policy(mut self, policy: CooldownPolicy, now: DateTime<Utc>) -> Self {
+        self.cooldown_policy = Some(Arc::new(policy));
+        self.cooldown_now = Some(now);
+        self
+    }
+
+    /// Returns `true` when the cooldown policy is active for `ecosystem`.
+    pub fn cooldown_is_enabled_for(&self, ecosystem: &str) -> bool {
+        self.cooldown_policy
+            .as_ref()
+            .map(|p| p.is_enabled_for(ecosystem))
+            .unwrap_or(false)
+    }
+
+    /// Record a note that cooldown metadata was unavailable for an ecosystem.
+    pub fn note_cooldown_unavailable(&self, note: &str) {
+        if let Ok(mut guard) = self.cooldown_unavailable_notes.lock() {
+            guard.insert(note.to_string());
+        }
     }
 }
 
@@ -177,6 +213,14 @@ pub struct UpdateResult {
     pub ignored: Vec<(String, String, Option<usize>)>,
     /// Packages that were pinned to a specific version: (name, current_version, pinned_version, line_number)
     pub pinned: Vec<(String, String, String, Option<usize>)>,
+    /// Packages where cooldown forced us to a safer-older version than the
+    /// absolute latest. Tuple: (name, old_version, chosen_version,
+    /// skipped_latest_version, skipped_latest_published_at).
+    pub held_back: Vec<(String, String, String, String, DateTime<Utc>)>,
+    /// Packages where every newer version sits inside the cooldown window and
+    /// we kept the current version. Tuple: (name, current_version,
+    /// skipped_latest_version, skipped_latest_published_at).
+    pub skipped_by_cooldown: Vec<(String, String, String, DateTime<Utc>)>,
 }
 
 impl UpdateResult {
@@ -187,6 +231,8 @@ impl UpdateResult {
         self.warnings.extend(other.warnings);
         self.ignored.extend(other.ignored);
         self.pinned.extend(other.pinned);
+        self.held_back.extend(other.held_back);
+        self.skipped_by_cooldown.extend(other.skipped_by_cooldown);
     }
 }
 
@@ -398,6 +444,97 @@ pub trait Updater: Send + Sync {
     fn parse_dependencies(&self, path: &Path) -> Result<Vec<ParsedDependency>>;
 }
 
+/// Outcome of applying the cooldown layer to a resolved `(current -> latest)`
+/// transition. See `apply_cooldown`.
+pub enum CooldownOutcome {
+    /// No cooldown policy active, or the latest is already old enough.
+    /// The caller proceeds with this version.
+    Unchanged(String),
+    /// Cooldown held the update back to a safer older version. The caller
+    /// writes `chosen` and records the skip.
+    HeldBack {
+        chosen: String,
+        skipped_version: String,
+        skipped_published_at: DateTime<Utc>,
+    },
+    /// Every candidate was too new. The caller keeps the current version and
+    /// records the skip.
+    Skipped {
+        skipped_version: String,
+        skipped_published_at: DateTime<Utc>,
+    },
+}
+
+/// Apply the active cooldown policy to a resolved `(current -> latest)` pair.
+/// Returns the outcome plus an optional diagnostic note the caller should
+/// stash on `UpdateOptions::note_cooldown_unavailable` for later reporting.
+pub async fn apply_cooldown(
+    registry: &dyn Registry,
+    package: &str,
+    current: &str,
+    latest: &str,
+    constraints: Option<&str>,
+    include_prereleases: bool,
+    options: &UpdateOptions,
+) -> (CooldownOutcome, Option<String>) {
+    let ecosystem = registry.name();
+    let Some(policy) = options.cooldown_policy.as_ref() else {
+        return (CooldownOutcome::Unchanged(latest.to_string()), None);
+    };
+    let cooldown = policy.effective_for(ecosystem);
+    if cooldown <= chrono::Duration::zero() {
+        return (CooldownOutcome::Unchanged(latest.to_string()), None);
+    }
+    let now = options.cooldown_now.unwrap_or_else(Utc::now);
+
+    let versions = match registry.list_versions(package).await {
+        Ok(v) if !v.is_empty() => v,
+        _ => {
+            return (
+                CooldownOutcome::Unchanged(latest.to_string()),
+                Some(format!("cooldown unavailable for {ecosystem}")),
+            );
+        }
+    };
+
+    use crate::cooldown::{CooldownDecision, select};
+    match select(
+        &versions,
+        current,
+        constraints,
+        include_prereleases,
+        cooldown,
+        now,
+    ) {
+        CooldownDecision::Use {
+            version,
+            held_back_from: None,
+        } => (CooldownOutcome::Unchanged(version), None),
+        CooldownDecision::Use {
+            version,
+            held_back_from: Some(info),
+        } => (
+            CooldownOutcome::HeldBack {
+                chosen: version,
+                skipped_version: info.version,
+                skipped_published_at: info.published_at,
+            },
+            None,
+        ),
+        CooldownDecision::Skip { latest_too_new } => (
+            CooldownOutcome::Skipped {
+                skipped_version: latest_too_new.version,
+                skipped_published_at: latest_too_new.published_at.unwrap_or_else(Utc::now),
+            },
+            None,
+        ),
+        CooldownDecision::Unsupported => (
+            CooldownOutcome::Unchanged(latest.to_string()),
+            Some(format!("cooldown unavailable for {ecosystem}")),
+        ),
+    }
+}
+
 /// Scan for GitHub Actions workflow files in .github/workflows/ directories.
 /// This is a separate pass because WalkBuilder::hidden(true) skips dot-directories.
 fn discover_github_actions(path: &Path, files: &mut Vec<(PathBuf, FileType)>) {
@@ -526,6 +663,7 @@ mod tests {
                 "1.5".to_string(),
                 Some(4),
             )],
+            ..Default::default()
         };
 
         let result2 = UpdateResult {
@@ -545,6 +683,7 @@ mod tests {
                 "2.5".to_string(),
                 Some(6),
             )],
+            ..Default::default()
         };
 
         result1.merge(result2);
@@ -975,5 +1114,99 @@ mod tests {
         let temp = tempdir().unwrap();
         let files = discover_files(&[temp.path().to_path_buf()], &[Lang::Actions]);
         assert!(files.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod cooldown_integration_tests {
+    use super::*;
+    use crate::cooldown::CooldownPolicy;
+    use crate::registry::MockRegistry;
+    use crate::updater::RequirementsUpdater;
+    use chrono::{Duration, TimeZone};
+    use std::collections::HashMap;
+    use std::io::Write;
+    use tempfile::NamedTempFile;
+
+    #[tokio::test]
+    async fn test_update_held_back_by_cooldown() {
+        let now = Utc.with_ymd_and_hms(2026, 4, 22, 12, 0, 0).unwrap();
+
+        let mut file = NamedTempFile::new().unwrap();
+        writeln!(file, "requests==2.28.0").unwrap();
+        file.flush().unwrap();
+
+        let registry = MockRegistry::new("pypi")
+            .with_version("requests", "2.31.0")
+            .with_version_meta(
+                "requests",
+                "2.31.0",
+                Some(now - Duration::days(2)),
+                false,
+                false,
+            )
+            .with_version_meta(
+                "requests",
+                "2.30.0",
+                Some(now - Duration::days(30)),
+                false,
+                false,
+            );
+
+        let policy = CooldownPolicy {
+            default: Duration::days(7),
+            per_ecosystem: HashMap::new(),
+            force_override: None,
+        };
+
+        let updater = RequirementsUpdater::new();
+        let options = UpdateOptions::new(true, false).with_cooldown_policy(policy, now);
+        let result = updater
+            .update(file.path(), &registry, options)
+            .await
+            .unwrap();
+
+        assert_eq!(result.held_back.len(), 1, "requests should be held back");
+        let (name, old, new, skipped, _) = &result.held_back[0];
+        assert_eq!(name, "requests");
+        assert_eq!(old, "2.28.0");
+        assert_eq!(new, "2.30.0");
+        assert_eq!(skipped, "2.31.0");
+    }
+
+    #[tokio::test]
+    async fn test_update_skipped_when_nothing_old_enough() {
+        let now = Utc.with_ymd_and_hms(2026, 4, 22, 12, 0, 0).unwrap();
+
+        let mut file = NamedTempFile::new().unwrap();
+        writeln!(file, "requests==2.28.0").unwrap();
+        file.flush().unwrap();
+
+        let registry = MockRegistry::new("pypi")
+            .with_version("requests", "2.31.0")
+            .with_version_meta(
+                "requests",
+                "2.31.0",
+                Some(now - Duration::days(1)),
+                false,
+                false,
+            );
+
+        let policy = CooldownPolicy {
+            default: Duration::days(7),
+            per_ecosystem: HashMap::new(),
+            force_override: None,
+        };
+
+        let updater = RequirementsUpdater::new();
+        let options = UpdateOptions::new(true, false).with_cooldown_policy(policy, now);
+        let result = updater
+            .update(file.path(), &registry, options)
+            .await
+            .unwrap();
+
+        assert_eq!(result.skipped_by_cooldown.len(), 1);
+        assert!(result.updated.is_empty());
+        assert!(result.held_back.is_empty());
     }
 }
