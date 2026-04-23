@@ -1,5 +1,5 @@
 use super::utils::home_dir;
-use super::{Registry, http_error_message};
+use super::{Registry, VersionMeta, http_error_message};
 use anyhow::{Result, anyhow};
 use async_trait::async_trait;
 use reqwest::Client;
@@ -43,6 +43,24 @@ struct NpmAbbreviatedResponse {
 #[derive(Debug, Deserialize)]
 struct DistTags {
     latest: Option<String>,
+}
+
+/// Per-version metadata from the full npm package document.
+#[derive(Debug, Clone, Deserialize)]
+struct NpmVersionMetaDe {
+    #[serde(default)]
+    deprecated: Option<String>,
+}
+
+/// Full npm package metadata, used for `list_versions`.
+/// The full document (no `Accept: application/vnd.npm.install-v1+json`) includes
+/// the `time` map that carries per-version publish timestamps.
+#[derive(Debug, Clone, Deserialize)]
+struct NpmPackageMetadata {
+    #[serde(default)]
+    versions: std::collections::HashMap<String, NpmVersionMetaDe>,
+    #[serde(default)]
+    time: std::collections::HashMap<String, String>,
 }
 
 /// Scoped registry configuration from .npmrc
@@ -408,6 +426,14 @@ impl NpmRegistry {
 
         self.fetch_package(package).await
     }
+
+    /// Return true when `version` contains a pre-release identifier.
+    /// npm follows semver: a hyphen after the version triplet signals pre-release.
+    fn is_prerelease(version: &str) -> bool {
+        semver::Version::parse(version)
+            .map(|v| !v.pre.is_empty())
+            .unwrap_or_else(|_| version.contains('-'))
+    }
 }
 
 impl Default for NpmRegistry {
@@ -477,6 +503,50 @@ impl Registry for NpmRegistry {
             package,
             constraints
         ))
+    }
+
+    async fn list_versions(&self, package: &str) -> Result<Vec<VersionMeta>> {
+        let url = format!("{}/{}", self.registry_url.trim_end_matches('/'), package);
+        // Request the full document (no install-v1 Accept header) so that the
+        // `time` map with per-version publish timestamps is included.
+        let response = self.client.get(&url).send().await?;
+
+        let status = response.status();
+        if status == reqwest::StatusCode::NOT_FOUND {
+            return Ok(Vec::new());
+        }
+        if !status.is_success() {
+            return Err(anyhow!(http_error_message(
+                status,
+                "Package",
+                package,
+                Some("For private npm, add authToken to ~/.npmrc or set NPM_TOKEN.")
+            )));
+        }
+
+        let meta: NpmPackageMetadata = response.json().await?;
+
+        let mut out = Vec::new();
+        for (ver, v_meta) in meta.versions.iter() {
+            let yanked = v_meta
+                .deprecated
+                .as_deref()
+                .map(|s| !s.is_empty())
+                .unwrap_or(false);
+            let published_at = meta
+                .time
+                .get(ver)
+                .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+                .map(|dt| dt.with_timezone(&chrono::Utc));
+            let prerelease = Self::is_prerelease(ver);
+            out.push(VersionMeta {
+                version: ver.clone(),
+                published_at,
+                yanked,
+                prerelease,
+            });
+        }
+        Ok(out)
     }
 
     fn name(&self) -> &'static str {
@@ -692,6 +762,48 @@ mod tests {
         let config = read_npmrc_config_from_path(&path);
 
         assert!(config.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_npm_list_versions_returns_publish_dates() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/lodash"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                r#"{
+              "name": "lodash",
+              "dist-tags": {"latest": "4.17.21"},
+              "versions": {
+                "4.17.20": {"version": "4.17.20"},
+                "4.17.21": {"version": "4.17.21", "deprecated": "use later version"},
+                "5.0.0-rc.1": {"version": "5.0.0-rc.1"}
+              },
+              "time": {
+                "created": "2010-01-01T00:00:00.000Z",
+                "modified": "2024-01-01T00:00:00.000Z",
+                "4.17.20": "2020-04-29T13:00:00.000Z",
+                "4.17.21": "2021-02-20T13:00:00.000Z",
+                "5.0.0-rc.1": "2024-05-01T00:00:00.000Z"
+              }
+            }"#,
+            ))
+            .mount(&mock_server)
+            .await;
+
+        let registry = NpmRegistry::with_registry_url(mock_server.uri());
+        let versions = registry.list_versions("lodash").await.unwrap();
+
+        assert_eq!(versions.len(), 3);
+        let v_21 = versions.iter().find(|v| v.version == "4.17.21").unwrap();
+        assert!(v_21.yanked, "deprecated should mark as yanked for cooldown");
+        assert!(v_21.published_at.is_some());
+
+        let rc = versions.iter().find(|v| v.version == "5.0.0-rc.1").unwrap();
+        assert!(rc.prerelease, "pre-release version should be flagged");
     }
 
     #[test]
