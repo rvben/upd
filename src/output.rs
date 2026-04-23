@@ -724,6 +724,70 @@ mod tests {
     }
 
     #[test]
+    fn update_file_report_serializes_cooldown_entries() {
+        use chrono::{TimeZone, Utc};
+        let published = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
+        let result = UpdateResult {
+            held_back: vec![(
+                "serde".into(),
+                "1.0.0".into(),
+                "1.0.1".into(),
+                "1.0.2".into(),
+                published,
+            )],
+            skipped_by_cooldown: vec![("tokio".into(), "1.0.0".into(), "1.0.1".into(), published)],
+            ..Default::default()
+        };
+        let report = build_update_file_report(
+            Path::new("Cargo.toml"),
+            FileType::CargoToml,
+            &result,
+            604_800,
+            stub_classify,
+        );
+        let json = serde_json::to_value(&report).unwrap();
+
+        assert_eq!(json["held_back"][0]["package"], "serde");
+        assert_eq!(json["held_back"][0]["current"], "1.0.0");
+        assert_eq!(json["held_back"][0]["chosen"], "1.0.1");
+        assert_eq!(json["held_back"][0]["skipped_latest"], "1.0.2");
+        assert_eq!(json["held_back"][0]["cooldown_seconds"], 604_800);
+        assert!(
+            json["held_back"][0]["skipped_published_at"]
+                .as_str()
+                .unwrap()
+                .starts_with("2026-01-01"),
+            "skipped_published_at must be RFC 3339 starting with the ISO date"
+        );
+
+        assert_eq!(json["skipped_by_cooldown"][0]["package"], "tokio");
+        assert_eq!(json["skipped_by_cooldown"][0]["current"], "1.0.0");
+        assert_eq!(json["skipped_by_cooldown"][0]["skipped_latest"], "1.0.1");
+        assert_eq!(json["skipped_by_cooldown"][0]["cooldown_seconds"], 604_800);
+    }
+
+    #[test]
+    fn update_file_report_omits_cooldown_entries_when_empty() {
+        let result = UpdateResult::default();
+        let report = build_update_file_report(
+            Path::new("Cargo.toml"),
+            FileType::CargoToml,
+            &result,
+            0,
+            stub_classify,
+        );
+        let json = serde_json::to_value(&report).unwrap();
+        assert!(
+            json.get("held_back").is_none(),
+            "held_back should be omitted from JSON when empty"
+        );
+        assert!(
+            json.get("skipped_by_cooldown").is_none(),
+            "skipped_by_cooldown should be omitted from JSON when empty"
+        );
+    }
+
+    #[test]
     fn update_file_report_omits_absent_line_numbers() {
         let result = UpdateResult {
             updated: vec![("flask".into(), "2.0".into(), "2.1.0".into(), None)],

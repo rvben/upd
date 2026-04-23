@@ -131,7 +131,7 @@ fn humanize_cooldown(d: Duration) -> String {
     format!("{}s", d.num_seconds())
 }
 
-pub(crate) fn format_held_back_line(
+fn format_held_back_line(
     name: &str,
     old: &str,
     new: &str,
@@ -148,7 +148,7 @@ pub(crate) fn format_held_back_line(
     )
 }
 
-pub(crate) fn format_skipped_by_cooldown_line(
+fn format_skipped_by_cooldown_line(
     name: &str,
     skipped_latest: &str,
     skipped_published_at: DateTime<Utc>,
@@ -3077,38 +3077,38 @@ fn print_file_result(
         );
     }
 
-    // Show held-back packages (cooldown caused downgrade to older safe version)
-    for (package, old, chosen, skipped_latest, skipped_pub_at) in &result.held_back {
-        let location = format!("{}:", path);
+    // Cooldown-related lines share a per-file location and ecosystem-derived
+    // cooldown duration; compute both once.
+    if !result.held_back.is_empty() || !result.skipped_by_cooldown.is_empty() {
+        let file_location = format!("{}:", path);
         let cooldown = cooldown_policy
             .map(|p| p.effective_for(ecosystem_for_file_type(file_type)))
             .unwrap_or_else(Duration::zero);
-        let line = format_held_back_line(
-            package,
-            old,
-            chosen,
-            skipped_latest,
-            *skipped_pub_at,
-            cooldown,
-            Utc::now(),
-        );
-        println!("{} {}", location.blue().underline(), line.yellow());
-    }
+        let now = Utc::now();
 
-    // Show skipped-by-cooldown packages (every newer version is too new)
-    for (package, _current, skipped_latest, skipped_pub_at) in &result.skipped_by_cooldown {
-        let location = format!("{}:", path);
-        let cooldown = cooldown_policy
-            .map(|p| p.effective_for(ecosystem_for_file_type(file_type)))
-            .unwrap_or_else(Duration::zero);
-        let line = format_skipped_by_cooldown_line(
-            package,
-            skipped_latest,
-            *skipped_pub_at,
-            cooldown,
-            Utc::now(),
-        );
-        println!("{} {}", location.blue().underline(), line.dimmed());
+        for (package, old, chosen, skipped_latest, skipped_pub_at) in &result.held_back {
+            let line = format_held_back_line(
+                package,
+                old,
+                chosen,
+                skipped_latest,
+                *skipped_pub_at,
+                cooldown,
+                now,
+            );
+            println!("{} {}", file_location.blue().underline(), line.yellow());
+        }
+
+        for (package, _current, skipped_latest, skipped_pub_at) in &result.skipped_by_cooldown {
+            let line = format_skipped_by_cooldown_line(
+                package,
+                skipped_latest,
+                *skipped_pub_at,
+                cooldown,
+                now,
+            );
+            println!("{} {}", file_location.blue().underline(), line.dimmed());
+        }
     }
 
     // Show ignored packages (only in verbose mode)
@@ -4312,6 +4312,31 @@ mod output_tests {
     #[test]
     fn test_humanize_age_weeks() {
         assert_eq!(humanize_age(Duration::days(21)), "3w ago");
+    }
+
+    #[test]
+    fn test_humanize_age_negative_clamps_to_zero() {
+        assert_eq!(humanize_age(Duration::seconds(-5)), "0s ago");
+    }
+
+    #[test]
+    fn test_humanize_age_boundary_47h_stays_hours() {
+        assert_eq!(humanize_age(Duration::hours(47)), "47h ago");
+    }
+
+    #[test]
+    fn test_humanize_age_boundary_48h_switches_to_days() {
+        assert_eq!(humanize_age(Duration::hours(48)), "2d ago");
+    }
+
+    #[test]
+    fn test_humanize_age_boundary_13d_stays_days() {
+        assert_eq!(humanize_age(Duration::days(13)), "13d ago");
+    }
+
+    #[test]
+    fn test_humanize_age_boundary_14d_switches_to_weeks() {
+        assert_eq!(humanize_age(Duration::days(14)), "2w ago");
     }
 
     #[test]
