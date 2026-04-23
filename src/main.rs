@@ -1,18 +1,20 @@
 use anyhow::Result;
+use chrono::{DateTime, Duration, Utc};
 use clap::Parser;
 use colored::Colorize;
 use futures::stream::{self, StreamExt};
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use upd::align::{PackageAlignment, PackageOccurrence, find_alignments, scan_packages};
 use upd::audit::cache::AuditCache;
 use upd::audit::{AuditResult, Ecosystem, OsvClient, Package as AuditPackage, compute_fix_plan};
 use upd::cache::{Cache, CachedRegistry};
 use upd::cli::{BumpLevel, Cli, Command, REVERT_TIP};
 use upd::config::UpdConfig;
+use upd::cooldown::CooldownPolicy;
 use upd::interactive::{PendingUpdate, prompt_all};
 use upd::lockfile::{LockfileRegenResult, regenerate_lockfiles};
 use upd::registry::{
@@ -92,6 +94,89 @@ fn classify_update(old: &str, new: &str) -> UpdateType {
         UpdateType::Patch
     } else {
         UpdateType::Patch
+    }
+}
+
+fn humanize_age(age: Duration) -> String {
+    let seconds = age.num_seconds().max(0);
+    if seconds < 60 {
+        return format!("{}s ago", seconds);
+    }
+    let minutes = seconds / 60;
+    if minutes < 60 {
+        return format!("{}m ago", minutes);
+    }
+    let hours = minutes / 60;
+    if hours < 48 {
+        return format!("{}h ago", hours);
+    }
+    let days = hours / 24;
+    if days < 14 {
+        return format!("{}d ago", days);
+    }
+    let weeks = days / 7;
+    format!("{}w ago", weeks)
+}
+
+fn humanize_cooldown(d: Duration) -> String {
+    if d.num_seconds() == 0 {
+        return "disabled".to_string();
+    }
+    if d.num_days() > 0 && d.num_days() * 86_400 == d.num_seconds() {
+        return format!("{}d", d.num_days());
+    }
+    if d.num_hours() * 3600 == d.num_seconds() {
+        return format!("{}h", d.num_hours());
+    }
+    format!("{}s", d.num_seconds())
+}
+
+pub(crate) fn format_held_back_line(
+    name: &str,
+    old: &str,
+    new: &str,
+    skipped_latest: &str,
+    skipped_published_at: DateTime<Utc>,
+    cooldown: Duration,
+    now: DateTime<Utc>,
+) -> String {
+    let age = now - skipped_published_at;
+    format!(
+        "Held back {name} {old} → {new} ({skipped_latest} released {}, cooldown {})",
+        humanize_age(age),
+        humanize_cooldown(cooldown),
+    )
+}
+
+pub(crate) fn format_skipped_by_cooldown_line(
+    name: &str,
+    skipped_latest: &str,
+    skipped_published_at: DateTime<Utc>,
+    cooldown: Duration,
+    now: DateTime<Utc>,
+) -> String {
+    let age = now - skipped_published_at;
+    format!(
+        "Skipped {name} (only newer version {skipped_latest} released {}, cooldown {})",
+        humanize_age(age),
+        humanize_cooldown(cooldown),
+    )
+}
+
+/// Map a [`FileType`] to the registry ecosystem name used by cooldown policy keys.
+fn ecosystem_for_file_type(file_type: FileType) -> &'static str {
+    match file_type {
+        FileType::Requirements | FileType::PyProject => "pypi",
+        FileType::PackageJson => "npm",
+        FileType::CargoToml => "crates.io",
+        FileType::GoMod => "go-proxy",
+        FileType::Gemfile => "rubygems",
+        FileType::GithubActions
+        | FileType::PreCommitConfig
+        | FileType::MiseToml
+        | FileType::ToolVersions => "github-releases",
+        FileType::Csproj => "nuget",
+        FileType::TerraformTf => "terraform",
     }
 }
 
@@ -268,12 +353,18 @@ fn build_update_options(
     full_precision: bool,
     config: Option<Arc<UpdConfig>>,
     packages: &[String],
+    cooldown_policy: Option<&CooldownPolicy>,
+    cooldown_notes: Arc<Mutex<BTreeSet<String>>>,
 ) -> UpdateOptions {
     let mut options = UpdateOptions::new(dry_run, full_precision);
     if let Some(config) = config {
         options = options.with_config(config);
     }
     options = options.with_packages(packages.to_vec());
+    if let Some(policy) = cooldown_policy {
+        options = options.with_cooldown_policy(policy.clone(), Utc::now());
+    }
+    options.cooldown_unavailable_notes = cooldown_notes;
     options
 }
 
@@ -351,7 +442,10 @@ fn file_has_manifest_changes(result: &UpdateResult) -> bool {
 
 fn has_checkable_manifest_changes(result: &UpdateResult, filter: UpdateFilter) -> bool {
     let (_, _, _, filtered_total) = count_updates_by_type(&result.updated, filter);
-    filtered_total > 0 || !result.pinned.is_empty()
+    filtered_total > 0
+        || !result.pinned.is_empty()
+        || !result.held_back.is_empty()
+        || !result.skipped_by_cooldown.is_empty()
 }
 
 fn has_interactive_changes(
@@ -467,12 +561,31 @@ async fn run_update(cli: &Cli) -> Result<()> {
                 0,
                 effective_dry_run,
                 UpdateFilter::from_cli(&cli.only_bump, cli.max_bump),
+                None,
+                Vec::new(),
             )?;
         }
         return Ok(());
     }
 
     let file_configs = load_update_configs(cli, &files)?;
+
+    // Build cooldown policy from CLI flag and/or discovered config. Use the
+    // first available config for [cooldown] table settings; CLI --min-age wins
+    // over all config values.
+    let cooldown_policy: Option<CooldownPolicy> = {
+        let any_config = file_configs.values().find_map(|c| c.as_ref());
+        let raw_policy = if let Some(config) = any_config {
+            config.to_cooldown_policy(cli.min_age.as_deref())?
+        } else {
+            UpdConfig::default().to_cooldown_policy(cli.min_age.as_deref())?
+        };
+        let is_noop = raw_policy.force_override.is_none()
+            && raw_policy.default <= Duration::zero()
+            && raw_policy.per_ecosystem.is_empty();
+        if is_noop { None } else { Some(raw_policy) }
+    };
+    let cooldown_notes: Arc<Mutex<BTreeSet<String>>> = Arc::new(Mutex::new(BTreeSet::new()));
 
     if cli.verbose {
         println!(
@@ -623,6 +736,8 @@ async fn run_update(cli: &Cli) -> Result<()> {
             &csproj_updater,
             &cache,
             cache_enabled,
+            cooldown_policy.as_ref(),
+            Arc::clone(&cooldown_notes),
         )
         .await;
     }
@@ -636,7 +751,14 @@ async fn run_update(cli: &Cli) -> Result<()> {
             (
                 path,
                 file_type,
-                build_update_options(dry_run, cli.full_precision, config, &cli.packages),
+                build_update_options(
+                    dry_run,
+                    cli.full_precision,
+                    config,
+                    &cli.packages,
+                    cooldown_policy.as_ref(),
+                    Arc::clone(&cooldown_notes),
+                ),
             )
         })
         .collect();
@@ -752,10 +874,12 @@ async fn run_update(cli: &Cli) -> Result<()> {
                 if text_mode && !cli.quiet {
                     print_file_result(
                         &path.display().to_string(),
+                        file_type,
                         &file_result,
                         dry_run,
                         filter,
                         verbose,
+                        cooldown_policy.as_ref(),
                     );
                 }
                 scanned.push(ScannedFileResult {
@@ -835,6 +959,13 @@ async fn run_update(cli: &Cli) -> Result<()> {
         let _ = Cache::save_shared(&cache);
     }
 
+    // Emit cooldown unavailability notes (deduplicated across all files).
+    if let Ok(notes) = cooldown_notes.lock() {
+        for note in notes.iter() {
+            eprintln!("note: {}", note);
+        }
+    }
+
     if text_mode {
         if !cli.quiet {
             println!();
@@ -853,7 +984,19 @@ async fn run_update(cli: &Cli) -> Result<()> {
             }
         }
     } else {
-        emit_update_json(&scanned, &total_result, file_count, dry_run, filter)?;
+        let notes_vec: Vec<String> = cooldown_notes
+            .lock()
+            .map(|g| g.iter().cloned().collect())
+            .unwrap_or_default();
+        emit_update_json(
+            &scanned,
+            &total_result,
+            file_count,
+            dry_run,
+            filter,
+            cooldown_policy.as_ref(),
+            notes_vec,
+        )?;
     }
 
     let has_errors = !total_result.errors.is_empty();
@@ -872,19 +1015,31 @@ fn emit_update_json(
     file_count: usize,
     dry_run: bool,
     filter: UpdateFilter,
+    cooldown_policy: Option<&CooldownPolicy>,
+    cooldown_notes: Vec<String>,
 ) -> Result<()> {
     use upd::output::{UpdateReport, UpdateSummary, build_update_file_report};
 
     let files: Vec<_> = scanned
         .iter()
         .map(|sf| {
-            build_update_file_report(&sf.path, sf.file_type, &sf.result, |old, new| {
-                match classify_update(old, new) {
+            let cooldown_seconds = cooldown_policy
+                .map(|p| {
+                    p.effective_for(ecosystem_for_file_type(sf.file_type))
+                        .num_seconds()
+                })
+                .unwrap_or(0);
+            build_update_file_report(
+                &sf.path,
+                sf.file_type,
+                &sf.result,
+                cooldown_seconds,
+                |old, new| match classify_update(old, new) {
                     UpdateType::Major => "major",
                     UpdateType::Minor => "minor",
                     UpdateType::Patch => "patch",
-                }
-            })
+                },
+            )
         })
         .collect();
 
@@ -903,6 +1058,8 @@ fn emit_update_json(
         ignored: total_result.ignored.len(),
         errors: total_result.errors.len(),
         warnings: total_result.warnings.len(),
+        held_back: total_result.held_back.len(),
+        skipped_by_cooldown: total_result.skipped_by_cooldown.len(),
     };
 
     let report = UpdateReport {
@@ -910,6 +1067,7 @@ fn emit_update_json(
         mode: if dry_run { "dry-run" } else { "applied" },
         files,
         summary,
+        cooldown_notes,
     };
 
     println!("{}", serde_json::to_string_pretty(&report)?);
@@ -943,6 +1101,8 @@ async fn run_interactive_update(
     csproj_updater: &Arc<CsprojUpdater>,
     cache: &Arc<std::sync::Mutex<Cache>>,
     cache_enabled: bool,
+    cooldown_policy: Option<&CooldownPolicy>,
+    cooldown_notes: Arc<Mutex<BTreeSet<String>>>,
 ) -> Result<()> {
     if !std::io::stdin().is_terminal() {
         eprintln!(
@@ -966,6 +1126,8 @@ async fn run_interactive_update(
             cli.full_precision,
             file_configs.get(path).cloned().flatten(),
             &cli.packages,
+            cooldown_policy,
+            Arc::clone(&cooldown_notes),
         );
 
         if cli.verbose {
@@ -2845,16 +3007,20 @@ fn count_updates_by_type(
 
 fn print_file_result(
     path: &str,
+    file_type: FileType,
     result: &UpdateResult,
     dry_run: bool,
     filter: UpdateFilter,
     verbose: bool,
+    cooldown_policy: Option<&CooldownPolicy>,
 ) {
     if result.updated.is_empty()
         && result.pinned.is_empty()
         && result.ignored.is_empty()
         && result.errors.is_empty()
         && result.warnings.is_empty()
+        && result.held_back.is_empty()
+        && result.skipped_by_cooldown.is_empty()
     {
         return;
     }
@@ -2911,6 +3077,40 @@ fn print_file_result(
         );
     }
 
+    // Show held-back packages (cooldown caused downgrade to older safe version)
+    for (package, old, chosen, skipped_latest, skipped_pub_at) in &result.held_back {
+        let location = format!("{}:", path);
+        let cooldown = cooldown_policy
+            .map(|p| p.effective_for(ecosystem_for_file_type(file_type)))
+            .unwrap_or_else(Duration::zero);
+        let line = format_held_back_line(
+            package,
+            old,
+            chosen,
+            skipped_latest,
+            *skipped_pub_at,
+            cooldown,
+            Utc::now(),
+        );
+        println!("{} {}", location.blue().underline(), line.yellow());
+    }
+
+    // Show skipped-by-cooldown packages (every newer version is too new)
+    for (package, _current, skipped_latest, skipped_pub_at) in &result.skipped_by_cooldown {
+        let location = format!("{}:", path);
+        let cooldown = cooldown_policy
+            .map(|p| p.effective_for(ecosystem_for_file_type(file_type)))
+            .unwrap_or_else(Duration::zero);
+        let line = format_skipped_by_cooldown_line(
+            package,
+            skipped_latest,
+            *skipped_pub_at,
+            cooldown,
+            Utc::now(),
+        );
+        println!("{} {}", location.blue().underline(), line.dimmed());
+    }
+
     // Show ignored packages (only in verbose mode)
     if verbose {
         for (package, version, line_num) in &result.ignored {
@@ -2965,8 +3165,14 @@ fn print_summary(
 
     let pinned_count = result.pinned.len();
     let ignored_count = result.ignored.len();
+    let held_back_count = result.held_back.len();
+    let skipped_cooldown_count = result.skipped_by_cooldown.len();
 
-    if filtered_total == 0 && pinned_count == 0 {
+    if filtered_total == 0
+        && pinned_count == 0
+        && held_back_count == 0
+        && skipped_cooldown_count == 0
+    {
         println!(
             "{} Scanned {} file(s), all dependencies up to date",
             "✓".green(),
@@ -3012,6 +3218,24 @@ fn print_summary(
                 "{} {} package(s) to configured versions",
                 pinned_action,
                 pinned_count.to_string().cyan().bold()
+            );
+        }
+
+        // Show held-back count (cooldown caused selection of older safe version)
+        if held_back_count > 0 {
+            println!(
+                "{} {} package(s) held back by cooldown",
+                "Held back".yellow(),
+                held_back_count.to_string().yellow().bold()
+            );
+        }
+
+        // Show skipped-by-cooldown count (no version old enough)
+        if skipped_cooldown_count > 0 {
+            println!(
+                "{} {} package(s) skipped (cooldown)",
+                "Skipped".dimmed(),
+                skipped_cooldown_count.to_string().dimmed()
             );
         }
     }
@@ -4014,6 +4238,138 @@ serde = "1.0.1"
             result,
             Some(tmp.path().to_path_buf()),
             "find_vcs_root with a file path must check the file's parent"
+        );
+    }
+}
+
+#[cfg(test)]
+mod output_tests {
+    use super::*;
+    use chrono::TimeZone;
+
+    fn fixed_now() -> DateTime<Utc> {
+        Utc.with_ymd_and_hms(2026, 4, 22, 12, 0, 0).unwrap()
+    }
+
+    #[test]
+    fn test_format_held_back_line() {
+        let pub_at = fixed_now() - Duration::days(2);
+        let line = format_held_back_line(
+            "lodash",
+            "4.17.20",
+            "4.17.21",
+            "4.17.22",
+            pub_at,
+            Duration::days(7),
+            fixed_now(),
+        );
+        assert!(line.contains("Held back"), "line: {line}");
+        assert!(line.contains("lodash"), "line: {line}");
+        assert!(line.contains("4.17.20"), "line: {line}");
+        assert!(line.contains("4.17.21"), "line: {line}");
+        assert!(line.contains("4.17.22"), "line: {line}");
+        assert!(line.contains("2d ago"), "line: {line}");
+        assert!(line.contains("cooldown 7d"), "line: {line}");
+    }
+
+    #[test]
+    fn test_format_skipped_by_cooldown_line() {
+        let pub_at = fixed_now() - Duration::hours(6);
+        let line = format_skipped_by_cooldown_line(
+            "express",
+            "4.19.0",
+            pub_at,
+            Duration::days(7),
+            fixed_now(),
+        );
+        assert!(line.contains("Skipped"), "line: {line}");
+        assert!(line.contains("express"), "line: {line}");
+        assert!(line.contains("4.19.0"), "line: {line}");
+        assert!(line.contains("6h ago"), "line: {line}");
+        assert!(line.contains("cooldown 7d"), "line: {line}");
+    }
+
+    #[test]
+    fn test_humanize_age_seconds() {
+        assert_eq!(humanize_age(Duration::seconds(30)), "30s ago");
+    }
+
+    #[test]
+    fn test_humanize_age_minutes() {
+        assert_eq!(humanize_age(Duration::minutes(45)), "45m ago");
+    }
+
+    #[test]
+    fn test_humanize_age_hours() {
+        assert_eq!(humanize_age(Duration::hours(5)), "5h ago");
+    }
+
+    #[test]
+    fn test_humanize_age_days() {
+        assert_eq!(humanize_age(Duration::days(3)), "3d ago");
+    }
+
+    #[test]
+    fn test_humanize_age_weeks() {
+        assert_eq!(humanize_age(Duration::days(21)), "3w ago");
+    }
+
+    #[test]
+    fn test_humanize_cooldown_days() {
+        assert_eq!(humanize_cooldown(Duration::days(7)), "7d");
+    }
+
+    #[test]
+    fn test_humanize_cooldown_hours() {
+        assert_eq!(humanize_cooldown(Duration::hours(6)), "6h");
+    }
+
+    #[test]
+    fn test_humanize_cooldown_disabled() {
+        assert_eq!(humanize_cooldown(Duration::zero()), "disabled");
+    }
+
+    #[test]
+    fn test_has_checkable_manifest_changes_held_back() {
+        let result = UpdateResult {
+            held_back: vec![(
+                "pkg".to_string(),
+                "1.0.0".to_string(),
+                "1.0.1".to_string(),
+                "1.0.2".to_string(),
+                Utc::now(),
+            )],
+            ..Default::default()
+        };
+        assert!(
+            has_checkable_manifest_changes(&result, UpdateFilter::from_cli(&[], None)),
+            "held_back entries must count as pending changes for --check"
+        );
+    }
+
+    #[test]
+    fn test_has_checkable_manifest_changes_skipped_by_cooldown() {
+        let result = UpdateResult {
+            skipped_by_cooldown: vec![(
+                "pkg".to_string(),
+                "1.0.0".to_string(),
+                "1.0.1".to_string(),
+                Utc::now(),
+            )],
+            ..Default::default()
+        };
+        assert!(
+            has_checkable_manifest_changes(&result, UpdateFilter::from_cli(&[], None)),
+            "skipped_by_cooldown entries must count as pending changes for --check"
+        );
+    }
+
+    #[test]
+    fn test_has_checkable_manifest_changes_empty() {
+        let result = UpdateResult::default();
+        assert!(
+            !has_checkable_manifest_changes(&result, UpdateFilter::from_cli(&[], None)),
+            "empty result must not count as pending"
         );
     }
 }

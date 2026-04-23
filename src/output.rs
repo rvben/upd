@@ -59,6 +59,10 @@ pub struct UpdateFileReport {
     pub updates: Vec<UpdateEntry>,
     pub pinned: Vec<PinnedEntry>,
     pub ignored: Vec<IgnoredEntry>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub held_back: Vec<HeldBackEntry>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub skipped_by_cooldown: Vec<SkippedByCooldownEntry>,
     pub errors: Vec<ErrorEntry>,
     pub warnings: Vec<String>,
 }
@@ -71,6 +75,36 @@ pub struct UpdateEntry {
     pub bump: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub line: Option<usize>,
+}
+
+/// A package update held back by cooldown — the chosen version is older than
+/// the absolute latest, which was too new.
+#[derive(Debug, Serialize)]
+pub struct HeldBackEntry {
+    pub package: String,
+    pub current: String,
+    /// The version that was actually written (old enough to pass the cooldown).
+    pub chosen: String,
+    /// The absolute latest that was skipped because it is too new.
+    pub skipped_latest: String,
+    /// RFC 3339 timestamp of when `skipped_latest` was published.
+    pub skipped_published_at: String,
+    /// Cooldown duration that caused the hold-back, in seconds.
+    pub cooldown_seconds: i64,
+}
+
+/// A package skipped by cooldown entirely — every newer version is too new,
+/// so the current version is kept.
+#[derive(Debug, Serialize)]
+pub struct SkippedByCooldownEntry {
+    pub package: String,
+    pub current: String,
+    /// The latest version that was skipped because it is too new.
+    pub skipped_latest: String,
+    /// RFC 3339 timestamp of when `skipped_latest` was published.
+    pub skipped_published_at: String,
+    /// Cooldown duration that caused the skip, in seconds.
+    pub cooldown_seconds: i64,
 }
 
 #[derive(Debug, Serialize)]
@@ -102,6 +136,14 @@ pub struct UpdateSummary {
     pub ignored: usize,
     pub errors: usize,
     pub warnings: usize,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub held_back: usize,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub skipped_by_cooldown: usize,
+}
+
+fn is_zero(n: &usize) -> bool {
+    *n == 0
 }
 
 #[derive(Debug, Serialize)]
@@ -110,6 +152,8 @@ pub struct UpdateReport {
     pub mode: &'static str,
     pub files: Vec<UpdateFileReport>,
     pub summary: UpdateSummary,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub cooldown_notes: Vec<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -183,10 +227,14 @@ pub struct AuditReport {
 }
 
 /// Build an [`UpdateFileReport`] from internal per-file data.
+///
+/// `cooldown_seconds` is the effective cooldown for this file's ecosystem (0
+/// when cooldown is disabled or unknown).
 pub fn build_update_file_report(
     path: &Path,
     file_type: FileType,
     result: &UpdateResult,
+    cooldown_seconds: i64,
     classify: impl Fn(&str, &str) -> &'static str,
 ) -> UpdateFileReport {
     let updates = result
@@ -222,6 +270,31 @@ pub fn build_update_file_report(
         })
         .collect();
 
+    let held_back = result
+        .held_back
+        .iter()
+        .map(|(name, old, chosen, skipped, pub_at)| HeldBackEntry {
+            package: name.clone(),
+            current: old.clone(),
+            chosen: chosen.clone(),
+            skipped_latest: skipped.clone(),
+            skipped_published_at: pub_at.to_rfc3339(),
+            cooldown_seconds,
+        })
+        .collect();
+
+    let skipped_by_cooldown = result
+        .skipped_by_cooldown
+        .iter()
+        .map(|(name, current, skipped, pub_at)| SkippedByCooldownEntry {
+            package: name.clone(),
+            current: current.clone(),
+            skipped_latest: skipped.clone(),
+            skipped_published_at: pub_at.to_rfc3339(),
+            cooldown_seconds,
+        })
+        .collect();
+
     let path_str = path.display().to_string();
     let errors = result
         .errors
@@ -236,6 +309,8 @@ pub fn build_update_file_report(
         updates,
         pinned,
         ignored,
+        held_back,
+        skipped_by_cooldown,
         errors,
         warnings: result.warnings.clone(),
     }
@@ -618,6 +693,7 @@ mod tests {
             Path::new("package.json"),
             FileType::PackageJson,
             &result,
+            0,
             |old, new| {
                 if old == "18.2.0" && new == "19.0.0" {
                     "major"
@@ -657,6 +733,7 @@ mod tests {
             Path::new("requirements.txt"),
             FileType::Requirements,
             &result,
+            0,
             stub_classify,
         );
         let json = serde_json::to_value(&report).unwrap();
