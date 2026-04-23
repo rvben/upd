@@ -1,9 +1,10 @@
 #[cfg(test)]
 use super::utils::read_netrc_credentials_from_path;
 use super::utils::{base64_encode, read_netrc_credentials};
-use super::{Registry, http_error_message};
+use super::{Registry, VersionMeta, http_error_message};
 use anyhow::{Result, anyhow};
 use async_trait::async_trait;
+use futures::future::join_all;
 use reqwest::header::{AUTHORIZATION, HeaderMap, HeaderValue};
 use reqwest::{Client, Response};
 use serde::Deserialize;
@@ -148,6 +149,14 @@ pub struct GoProxyRegistry {
 struct LatestResponse {
     #[serde(rename = "Version")]
     version: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct GoInfoResponse {
+    #[serde(rename = "Version")]
+    version: String,
+    #[serde(rename = "Time", default)]
+    time: Option<String>,
 }
 
 impl GoProxyRegistry {
@@ -398,6 +407,77 @@ impl Registry for GoProxyRegistry {
                 constraints
             )
         })
+    }
+
+    async fn list_versions(&self, package: &str) -> Result<Vec<VersionMeta>> {
+        let encoded = Self::escape_module_path(package);
+        let list_url = format!(
+            "{}/{}/@v/list",
+            self.proxy_url.trim_end_matches('/'),
+            encoded
+        );
+        let response = self.get_with_retry(&list_url).await?;
+        let status = response.status();
+        if status == reqwest::StatusCode::NOT_FOUND {
+            return Ok(Vec::new());
+        }
+        if !status.is_success() {
+            return Err(anyhow!(http_error_message(
+                status,
+                "Module",
+                package,
+                Some("For private modules, configure credentials in ~/.netrc or set GOPRIVATE.")
+            )));
+        }
+        let body = response.text().await?;
+        let versions: Vec<String> = body
+            .lines()
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .collect();
+
+        // `/@v/list` is unordered per protocol; cap the fan-out to the most recent 50 lexical entries.
+        const MAX: usize = 50;
+        let tail: Vec<String> = versions.iter().rev().take(MAX).cloned().collect();
+
+        let fetches = tail.iter().map(|v| {
+            let url = format!(
+                "{}/{}/@v/{}.info",
+                self.proxy_url.trim_end_matches('/'),
+                encoded,
+                v
+            );
+            async move {
+                let resp = self.get_with_retry(&url).await.ok()?;
+                if !resp.status().is_success() {
+                    return None;
+                }
+                let info: GoInfoResponse = resp.json().await.ok()?;
+                Some(info)
+            }
+        });
+        let results = join_all(fetches).await;
+
+        Ok(results
+            .into_iter()
+            .flatten()
+            .map(|info| {
+                let published_at = info
+                    .time
+                    .as_deref()
+                    .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+                    .map(|dt| dt.with_timezone(&chrono::Utc));
+                // Versions with a hyphen before any +incompatible suffix are pre-releases.
+                let is_prerelease =
+                    info.version.contains('-') && !info.version.contains("+incompatible");
+                VersionMeta {
+                    version: info.version,
+                    published_at,
+                    yanked: false,
+                    prerelease: is_prerelease,
+                }
+            })
+            .collect())
     }
 
     fn name(&self) -> &'static str {
@@ -679,6 +759,56 @@ mod tests {
             nosumdb_patterns: vec![],
         };
         assert!(with_noproxy.has_private_patterns());
+    }
+
+    #[tokio::test]
+    async fn test_go_proxy_list_versions_returns_publish_dates() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/github.com/stretchr/testify/@v/list"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("v1.9.0\nv1.10.0\n"))
+            .mount(&mock_server)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path("/github.com/stretchr/testify/@v/v1.9.0.info"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string(r#"{"Version": "v1.9.0", "Time": "2024-01-15T10:00:00Z"}"#),
+            )
+            .mount(&mock_server)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path("/github.com/stretchr/testify/@v/v1.10.0.info"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string(r#"{"Version": "v1.10.0", "Time": "2024-03-20T10:00:00Z"}"#),
+            )
+            .mount(&mock_server)
+            .await;
+
+        let registry = GoProxyRegistry::with_proxy_url(mock_server.uri());
+        let versions = registry
+            .list_versions("github.com/stretchr/testify")
+            .await
+            .unwrap();
+
+        assert_eq!(versions.len(), 2);
+        assert!(
+            versions
+                .iter()
+                .any(|v| v.version == "v1.9.0" && v.published_at.is_some())
+        );
+        assert!(
+            versions
+                .iter()
+                .any(|v| v.version == "v1.10.0" && v.published_at.is_some())
+        );
     }
 
     #[test]
