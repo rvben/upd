@@ -1,7 +1,8 @@
-use super::{Registry, get_with_retry, http_error_message};
+use super::{Registry, VersionMeta, get_with_retry, http_error_message};
 use crate::version::TagVersion;
 use anyhow::{Result, anyhow};
 use async_trait::async_trait;
+use chrono::{DateTime, Utc};
 use reqwest::Client;
 use reqwest::header::{ACCEPT, AUTHORIZATION, HeaderMap, HeaderValue};
 use serde::Deserialize;
@@ -20,6 +21,17 @@ struct ReleaseResponse {
 #[derive(Debug, Deserialize)]
 struct TagResponse {
     name: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct ReleaseListEntry {
+    tag_name: String,
+    #[serde(default)]
+    published_at: Option<String>,
+    #[serde(default)]
+    prerelease: bool,
+    #[serde(default)]
+    draft: bool,
 }
 
 impl GitHubReleasesRegistry {
@@ -186,6 +198,54 @@ impl Registry for GitHubReleasesRegistry {
             .next()
             .map(|(_, tag)| tag)
             .ok_or_else(|| anyhow!("Repository '{}/{}' has no tags available.", owner, repo))
+    }
+
+    async fn list_versions(&self, package: &str) -> Result<Vec<VersionMeta>> {
+        let (owner, repo) = package
+            .split_once('/')
+            .ok_or_else(|| anyhow!("GitHub package must be 'owner/repo': {package}"))?;
+        let url = format!("{}/repos/{}/{}/releases", self.api_url, owner, repo);
+
+        let response = get_with_retry(&self.client, &url).await?;
+        let status = response.status();
+        if status == reqwest::StatusCode::NOT_FOUND {
+            return Ok(Vec::new());
+        }
+        if !status.is_success() {
+            let hint = match status.as_u16() {
+                403 | 429 => Some("Set GITHUB_TOKEN to increase the API rate limit."),
+                _ => None,
+            };
+            return Err(anyhow!(http_error_message(
+                status,
+                "Repository",
+                &format!("{owner}/{repo}"),
+                hint,
+            )));
+        }
+
+        let items: Vec<ReleaseListEntry> = response
+            .json()
+            .await
+            .map_err(|e| anyhow!("Failed to parse GitHub releases for '{package}': {e}"))?;
+
+        Ok(items
+            .into_iter()
+            .filter(|r| !r.draft)
+            .map(|r| {
+                let published_at = r
+                    .published_at
+                    .as_deref()
+                    .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
+                    .map(|dt| dt.with_timezone(&Utc));
+                VersionMeta {
+                    version: r.tag_name,
+                    published_at,
+                    yanked: false,
+                    prerelease: r.prerelease,
+                }
+            })
+            .collect())
     }
 }
 
@@ -512,5 +572,47 @@ mod tests {
             .unwrap();
 
         assert_eq!(version, "v0.12.0.0-rc.1");
+    }
+
+    #[tokio::test]
+    async fn test_list_versions_returns_publish_dates_and_filters_drafts() {
+        let server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/repos/actions/checkout/releases"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                r#"[
+              {"tag_name": "v4.2.0", "published_at": "2024-10-01T10:00:00Z", "prerelease": false, "draft": false},
+              {"tag_name": "v4.2.0-beta", "published_at": "2024-09-20T10:00:00Z", "prerelease": true, "draft": false},
+              {"tag_name": "v4.1.0", "published_at": "2024-08-01T10:00:00Z", "prerelease": false, "draft": false},
+              {"tag_name": "v5.0.0-draft", "published_at": null, "prerelease": false, "draft": true}
+            ]"#,
+            ))
+            .mount(&server)
+            .await;
+
+        let versions = registry(&server)
+            .list_versions("actions/checkout")
+            .await
+            .unwrap();
+
+        assert_eq!(versions.len(), 3, "draft releases must be filtered out");
+        assert!(
+            versions
+                .iter()
+                .any(|v| v.version == "v4.2.0" && !v.prerelease)
+        );
+        assert!(
+            versions
+                .iter()
+                .any(|v| v.version == "v4.2.0-beta" && v.prerelease)
+        );
+        assert!(versions.iter().all(|v| !v.yanked));
+
+        let v420 = versions.iter().find(|v| v.version == "v4.2.0").unwrap();
+        assert!(
+            v420.published_at.is_some(),
+            "published_at should parse from RFC3339"
+        );
     }
 }
