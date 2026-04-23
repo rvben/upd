@@ -151,7 +151,7 @@ struct LatestResponse {
     version: String,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Deserialize)]
 struct GoInfoResponse {
     #[serde(rename = "Version")]
     version: String,
@@ -411,11 +411,7 @@ impl Registry for GoProxyRegistry {
 
     async fn list_versions(&self, package: &str) -> Result<Vec<VersionMeta>> {
         let encoded = Self::escape_module_path(package);
-        let list_url = format!(
-            "{}/{}/@v/list",
-            self.proxy_url.trim_end_matches('/'),
-            encoded
-        );
+        let list_url = format!("{}/{}/@v/list", self.proxy_url, encoded);
         let response = self.get_with_retry(&list_url).await?;
         let status = response.status();
         if status == reqwest::StatusCode::NOT_FOUND {
@@ -436,17 +432,12 @@ impl Registry for GoProxyRegistry {
             .map(str::to_string)
             .collect();
 
-        // `/@v/list` is unordered per protocol; cap the fan-out to the most recent 50 lexical entries.
+        // `/@v/list` is unordered per protocol; cap the fan-out to the last 50 entries.
         const MAX: usize = 50;
         let tail: Vec<String> = versions.iter().rev().take(MAX).cloned().collect();
 
         let fetches = tail.iter().map(|v| {
-            let url = format!(
-                "{}/{}/@v/{}.info",
-                self.proxy_url.trim_end_matches('/'),
-                encoded,
-                v
-            );
+            let url = format!("{}/{}/@v/{}.info", self.proxy_url, encoded, v);
             async move {
                 let resp = self.get_with_retry(&url).await.ok()?;
                 if !resp.status().is_success() {
@@ -467,14 +458,11 @@ impl Registry for GoProxyRegistry {
                     .as_deref()
                     .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
                     .map(|dt| dt.with_timezone(&chrono::Utc));
-                // Versions with a hyphen before any +incompatible suffix are pre-releases.
-                let is_prerelease =
-                    info.version.contains('-') && !info.version.contains("+incompatible");
                 VersionMeta {
+                    prerelease: Self::is_prerelease(&info.version),
                     version: info.version,
                     published_at,
                     yanked: false,
-                    prerelease: is_prerelease,
                 }
             })
             .collect())
