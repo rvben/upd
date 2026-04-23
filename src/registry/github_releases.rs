@@ -201,9 +201,7 @@ impl Registry for GitHubReleasesRegistry {
     }
 
     async fn list_versions(&self, package: &str) -> Result<Vec<VersionMeta>> {
-        let (owner, repo) = package
-            .split_once('/')
-            .ok_or_else(|| anyhow!("GitHub package must be 'owner/repo': {package}"))?;
+        let (owner, repo) = Self::extract_owner_repo(package)?;
         let url = format!("{}/repos/{}/{}/releases", self.api_url, owner, repo);
 
         let response = get_with_retry(&self.client, &url).await?;
@@ -252,6 +250,7 @@ impl Registry for GitHubReleasesRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::TimeZone;
     use wiremock::matchers::{method, path, query_param};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -610,9 +609,11 @@ mod tests {
         assert!(versions.iter().all(|v| !v.yanked));
 
         let v420 = versions.iter().find(|v| v.version == "v4.2.0").unwrap();
-        assert!(
-            v420.published_at.is_some(),
-            "published_at should parse from RFC3339"
+        let expected = chrono::Utc.with_ymd_and_hms(2024, 10, 1, 10, 0, 0).unwrap();
+        assert_eq!(
+            v420.published_at,
+            Some(expected),
+            "published_at should parse from RFC3339 and convert to UTC"
         );
     }
 }
