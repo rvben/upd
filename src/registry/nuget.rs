@@ -5,6 +5,10 @@ use reqwest::Client;
 use serde::Deserialize;
 use std::time::Duration;
 
+// NuGet intentionally does not override `list_versions`: the v3-flatcontainer
+// endpoint we query here returns only version strings, not publish dates, so
+// cooldown reports NuGet as unsupported. Resolving `RegistrationsBaseUrl` from
+// the service index would let us fetch catalog entries with publish dates.
 pub struct NuGetRegistry {
     client: Client,
     api_url: String,
@@ -288,6 +292,16 @@ mod tests {
         assert!(
             err.contains("no stable versions"),
             "error message must mention missing versions, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_nuget_list_versions_is_unsupported_for_now() {
+        let registry = NuGetRegistry::with_api_url("http://localhost:0".to_string());
+        let versions = registry.list_versions("anything").await.unwrap();
+        assert!(
+            versions.is_empty(),
+            "NuGet list_versions is intentionally empty until we wire up registrations-catalog resolution"
         );
     }
 }
