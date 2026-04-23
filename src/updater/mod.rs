@@ -1261,6 +1261,72 @@ mod cooldown_integration_tests {
     }
 
     #[tokio::test]
+    async fn test_poetry_held_back_respects_constraint() {
+        let now = Utc.with_ymd_and_hms(2026, 4, 22, 12, 0, 0).unwrap();
+
+        let mut file = NamedTempFile::with_suffix(".toml").unwrap();
+        writeln!(
+            file,
+            "[tool.poetry]\nname = \"demo\"\nversion = \"0.1.0\"\n\n[tool.poetry.dependencies]\npython = \"^3.10\"\nrequests = \"^1.0\"\n"
+        )
+        .unwrap();
+        file.flush().unwrap();
+
+        // Latest overall is 2.0.0 (outside the ^1.0 constraint). Cooldown must
+        // skip it *and* ignore it when picking a held-back version, so the
+        // chosen fallback is 1.5.0, which satisfies the Poetry specifier.
+        let registry = MockRegistry::new("pypi")
+            .with_version("requests", "2.0.0")
+            .with_version_meta(
+                "requests",
+                "2.0.0",
+                Some(now - Duration::days(30)),
+                false,
+                false,
+            )
+            .with_version_meta(
+                "requests",
+                "1.5.0",
+                Some(now - Duration::days(30)),
+                false,
+                false,
+            )
+            .with_version_meta(
+                "requests",
+                "1.0.0",
+                Some(now - Duration::days(365)),
+                false,
+                false,
+            );
+
+        let policy = CooldownPolicy {
+            default: Duration::days(7),
+            per_ecosystem: HashMap::new(),
+            force_override: None,
+        };
+
+        let updater = PyProjectUpdater::new();
+        let options = UpdateOptions::new(true, false).with_cooldown_policy(policy, now);
+        let result = updater
+            .update(file.path(), &registry, options)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            result.updated.len(),
+            1,
+            "requests should update within its ^1.0 constraint"
+        );
+        let (name, old, new, _) = &result.updated[0];
+        assert_eq!(name, "requests");
+        assert_eq!(old, "1.0");
+        assert_eq!(
+            new, "1.5",
+            "constraint must prevent Poetry from selecting 2.0.0"
+        );
+    }
+
+    #[tokio::test]
     async fn test_package_json_held_back_by_cooldown() {
         let now = Utc.with_ymd_and_hms(2026, 4, 22, 12, 0, 0).unwrap();
 

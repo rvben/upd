@@ -562,12 +562,18 @@ impl PyProjectUpdater {
                         continue;
                     }
 
+                    let full_constraint = format!("{}{}", prefix, version);
+                    let constraints_for_cooldown = if full_constraint.is_empty() {
+                        None
+                    } else {
+                        Some(full_constraint.as_str())
+                    };
                     let (outcome, note) = crate::updater::apply_cooldown(
                         registry,
                         &key,
                         &version,
                         &latest_version,
-                        None,
+                        constraints_for_cooldown,
                         current_is_prerelease,
                         options,
                     )
