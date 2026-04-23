@@ -481,9 +481,9 @@ newer is old enough yet, the package is held back. Output marks these
 packages explicitly:
 
 ```text
-Updated requests 2.28.0 → 2.31.0
-Held back lodash 4.17.20 → 4.17.21 (4.17.22 released 2d ago, cooldown 7d)
-Skipped express (only newer version 4.19.0 released 1d ago, cooldown 7d)
+requirements.txt: Updated requests 2.28.0 → 2.31.0
+package.json: Held back lodash 4.17.20 → 4.17.21 (4.17.22 released 2d ago, cooldown 7d)
+package.json: Skipped express (only newer version 4.19.0 released 1d ago, cooldown 7d)
 ```
 
 **Supported ecosystems:** PyPI, npm, crates.io, Go modules, RubyGems,

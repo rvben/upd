@@ -2,6 +2,8 @@
 //! `.updrc.toml` configured for a 7-day cooldown, using a mock PyPI.
 
 use std::process::Command;
+
+use chrono::{Duration, Utc};
 use tempfile::TempDir;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -10,16 +12,21 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 async fn cooldown_holds_back_fresh_versions_end_to_end() {
     let mock = MockServer::start().await;
 
-    // Latest (2.31.0) is 3 days old; 2.30.0 is 32 days old and safe.
-    // Under a 7-day cooldown, 2.31.0 is in the window and must be held back to 2.30.0.
+    // Dates are computed relative to now so the test stays stable over time.
+    // Under a 7-day cooldown, 2.31.0 (3d old) must be held back to 2.30.0 (32d old).
+    let now = Utc::now();
+    let fresh = (now - Duration::days(3)).to_rfc3339();
+    let safe = (now - Duration::days(32)).to_rfc3339();
+    let body = format!(
+        r#"{{"releases":{{
+            "2.31.0":[{{"yanked":false,"upload_time_iso_8601":"{fresh}"}}],
+            "2.30.0":[{{"yanked":false,"upload_time_iso_8601":"{safe}"}}]
+        }}}}"#,
+    );
+
     Mock::given(method("GET"))
         .and(path("/pypi/requests/json"))
-        .respond_with(ResponseTemplate::new(200).set_body_string(
-            r#"{"releases":{
-                "2.31.0":[{"yanked":false,"upload_time_iso_8601":"2026-04-20T12:00:00Z"}],
-                "2.30.0":[{"yanked":false,"upload_time_iso_8601":"2026-03-22T12:00:00Z"}]
-            }}"#,
-        ))
+        .respond_with(ResponseTemplate::new(200).set_body_string(body))
         .mount(&mock)
         .await;
     Mock::given(method("GET"))
@@ -40,11 +47,13 @@ default = "7d"
 "#,
     )
     .unwrap();
+    let cache_dir = dir.path().join("cache");
 
     let output = Command::new(env!("CARGO_BIN_EXE_upd"))
         .arg("--apply")
         .arg(&req)
         .env("UV_INDEX_URL", mock.uri())
+        .env("UPD_CACHE_DIR", &cache_dir)
         .current_dir(dir.path())
         .output()
         .expect("upd ran");

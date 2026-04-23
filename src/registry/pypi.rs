@@ -827,6 +827,10 @@ impl Registry for MultiPyPiRegistry {
     async fn list_versions(&self, package: &str) -> Result<Vec<VersionMeta>> {
         // Query registries in order; return the first non-empty result so that
         // cooldown decisions are based on the same source used for resolution.
+        // Errors from individual registries are swallowed: cooldown callers
+        // treat an empty result as "metadata unavailable" and fall back to the
+        // regular update path, so a transient failure on one mirror never
+        // turns into a hard failure here.
         for registry in &self.registries {
             let result = registry.list_versions(package).await;
             if let Ok(versions) = result
