@@ -398,20 +398,35 @@ impl CratesIoRegistry {
         Err(last_error.unwrap())
     }
 
-    async fn fetch_crate(&self, name: &str) -> Result<CratesResponse> {
+    async fn fetch_crate_opt(&self, name: &str) -> Result<Option<CratesResponse>> {
         let url = format!("{}/{}", self.registry_url, name);
         let response = self.get_with_retry(&url).await?;
 
-        if !response.status().is_success() {
+        let status = response.status();
+        if status == reqwest::StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        if !status.is_success() {
             return Err(anyhow!(http_error_message(
-                response.status(),
+                status,
                 "Crate",
                 name,
                 Some("For private registries, configure token in ~/.cargo/credentials.toml.")
             )));
         }
 
-        Ok(response.json().await?)
+        Ok(Some(response.json().await?))
+    }
+
+    async fn fetch_crate(&self, name: &str) -> Result<CratesResponse> {
+        self.fetch_crate_opt(name).await?.ok_or_else(|| {
+            anyhow!(http_error_message(
+                reqwest::StatusCode::NOT_FOUND,
+                "Crate",
+                name,
+                Some("For private registries, configure token in ~/.cargo/credentials.toml.")
+            ))
+        })
     }
 
     fn get_sorted_versions(
@@ -506,23 +521,9 @@ impl Registry for CratesIoRegistry {
     }
 
     async fn list_versions(&self, package: &str) -> Result<Vec<VersionMeta>> {
-        let url = format!("{}/{}", self.registry_url.trim_end_matches('/'), package);
-        let response = self.get_with_retry(&url).await?;
-
-        let status = response.status();
-        if status == reqwest::StatusCode::NOT_FOUND {
+        let Some(data) = self.fetch_crate_opt(package).await? else {
             return Ok(Vec::new());
-        }
-        if !status.is_success() {
-            return Err(anyhow!(http_error_message(
-                status,
-                "Crate",
-                package,
-                Some("For private registries, configure token in ~/.cargo/credentials.toml.")
-            )));
-        }
-        let data: CratesResponse = response.json().await?;
-
+        };
         Ok(data
             .versions
             .into_iter()
