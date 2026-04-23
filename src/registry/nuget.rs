@@ -301,7 +301,7 @@ mod tests {
         let versions = registry.list_versions("anything").await.unwrap();
         assert!(
             versions.is_empty(),
-            "NuGet list_versions is intentionally empty until we wire up registrations-catalog resolution"
+            "NuGet list_versions returns empty — flatcontainer exposes no publish dates; resolving RegistrationsBaseUrl would enable catalog-based publish dates"
         );
     }
 }
