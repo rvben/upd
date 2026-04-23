@@ -1,6 +1,4 @@
 //! Cooldown (minimum release age) policy and selection logic.
-//!
-//! See docs/superpowers/specs/2026-04-22-cooldown-release-age-design.md.
 
 use std::collections::HashMap;
 
@@ -116,9 +114,8 @@ pub struct HeldBackInfo {
 
 /// Select a version under the cooldown policy.
 ///
-/// See docs/superpowers/specs/2026-04-22-cooldown-release-age-design.md for
-/// the algorithm spec. Precondition: the caller has already determined an
-/// update is available (current version is not the latest).
+/// Precondition: the caller has already determined an update is available
+/// (current version is not the latest).
 pub fn select(
     versions: &[VersionMeta],
     current: &str,

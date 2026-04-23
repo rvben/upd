@@ -925,11 +925,18 @@ impl Registry for PyPiRegistry {
         let mut out = Vec::new();
         for (version_str, files) in data.releases.iter() {
             let all_yanked = !files.is_empty() && files.iter().all(|f| f.yanked);
+            // `releases` deserialises into a HashMap, so file order is
+            // non-deterministic. Use the earliest upload timestamp across all
+            // files — that's when the version first became fetchable.
             let published_at = files
-                .first()
-                .and_then(|f| f.upload_time_iso_8601.as_deref())
-                .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
-                .map(|dt| dt.with_timezone(&chrono::Utc));
+                .iter()
+                .filter_map(|f| {
+                    f.upload_time_iso_8601
+                        .as_deref()
+                        .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+                        .map(|dt| dt.with_timezone(&chrono::Utc))
+                })
+                .min();
             let prerelease = !Self::is_stable_version(version_str);
             out.push(VersionMeta {
                 version: version_str.clone(),
