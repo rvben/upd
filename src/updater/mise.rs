@@ -331,6 +331,48 @@ impl Updater for MiseUpdater {
 
                 match version_result {
                     Ok(latest_tag) => {
+                        // Apply cooldown policy before writing (registry path only; pins bypass it).
+                        // The registry key for a mise tool is its GitHub owner/repo slug.
+                        let (latest_tag, held_back_record) = if *is_pinned {
+                            (latest_tag, None)
+                        } else {
+                            let repo = tool_to_github_repo(tool_name).unwrap_or(tool_name);
+                            let (outcome, note) = crate::updater::apply_cooldown(
+                                registry,
+                                repo,
+                                current_version,
+                                &latest_tag,
+                                None,
+                                false,
+                                &options,
+                            )
+                            .await;
+                            if let Some(msg) = note {
+                                options.note_cooldown_unavailable(&msg);
+                            }
+                            match outcome {
+                                crate::updater::CooldownOutcome::Unchanged(v) => (v, None),
+                                crate::updater::CooldownOutcome::HeldBack {
+                                    chosen,
+                                    skipped_version,
+                                    skipped_published_at,
+                                } => (chosen, Some((skipped_version, skipped_published_at))),
+                                crate::updater::CooldownOutcome::Skipped {
+                                    skipped_version,
+                                    skipped_published_at,
+                                } => {
+                                    result.skipped_by_cooldown.push((
+                                        tool_name.clone(),
+                                        current_version.clone(),
+                                        skipped_version,
+                                        skipped_published_at,
+                                    ));
+                                    new_lines.push(line.to_string());
+                                    continue;
+                                }
+                            }
+                        };
+
                         let new_version = Self::compute_updated_version(
                             tool_name,
                             current_version,
@@ -366,9 +408,20 @@ impl Updater for MiseUpdater {
                                     result.updated.push((
                                         tool_name.clone(),
                                         current_version.clone(),
-                                        new_version,
+                                        new_version.clone(),
                                         Some(line_num),
                                     ));
+                                    if let Some((skipped_version, skipped_published_at)) =
+                                        held_back_record
+                                    {
+                                        result.held_back.push((
+                                            tool_name.clone(),
+                                            current_version.clone(),
+                                            new_version,
+                                            skipped_version,
+                                            skipped_published_at,
+                                        ));
+                                    }
                                 }
                             }
                         } else {

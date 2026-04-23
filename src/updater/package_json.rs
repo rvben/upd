@@ -355,12 +355,45 @@ impl Updater for PackageJsonUpdater {
                     // When the current version is a pre-release, we fetched the latest
                     // pre-release. If the registry returned a stable version instead
                     // (no newer pre-release exists), refuse silent promotion to stable.
-                    if is_prerelease_semver(&current_version)
-                        && !is_prerelease_semver(&latest_version)
-                    {
+                    let current_is_prerelease = is_prerelease_semver(&current_version);
+                    if current_is_prerelease && !is_prerelease_semver(&latest_version) {
                         result.unchanged += 1;
                         continue;
                     }
+
+                    let (outcome, note) = crate::updater::apply_cooldown(
+                        registry,
+                        &package,
+                        &current_version,
+                        &latest_version,
+                        None,
+                        current_is_prerelease,
+                        &options,
+                    )
+                    .await;
+                    if let Some(msg) = note {
+                        options.note_cooldown_unavailable(&msg);
+                    }
+                    let (latest_version, held_back_record) = match outcome {
+                        crate::updater::CooldownOutcome::Unchanged(v) => (v, None),
+                        crate::updater::CooldownOutcome::HeldBack {
+                            chosen,
+                            skipped_version,
+                            skipped_published_at,
+                        } => (chosen, Some((skipped_version, skipped_published_at))),
+                        crate::updater::CooldownOutcome::Skipped {
+                            skipped_version,
+                            skipped_published_at,
+                        } => {
+                            result.skipped_by_cooldown.push((
+                                package,
+                                current_version,
+                                skipped_version,
+                                skipped_published_at,
+                            ));
+                            continue;
+                        }
+                    };
 
                     // Match the precision of the original version (unless full precision requested)
                     let matched_version = if options.full_precision {
@@ -387,6 +420,16 @@ impl Updater for PackageJsonUpdater {
                                 matched_version.clone(),
                                 line_num,
                             ));
+                            if let Some((skipped_version, skipped_published_at)) = held_back_record
+                            {
+                                result.held_back.push((
+                                    package.clone(),
+                                    current_version,
+                                    matched_version.clone(),
+                                    skipped_version,
+                                    skipped_published_at,
+                                ));
+                            }
 
                             // Update in content preserving formatting
                             new_content = self.update_version_in_content(

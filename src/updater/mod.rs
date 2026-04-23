@@ -1122,7 +1122,7 @@ mod cooldown_integration_tests {
     use super::*;
     use crate::cooldown::CooldownPolicy;
     use crate::registry::MockRegistry;
-    use crate::updater::RequirementsUpdater;
+    use crate::updater::{PackageJsonUpdater, PyProjectUpdater, RequirementsUpdater};
     use chrono::{Duration, TimeZone};
     use std::collections::HashMap;
     use std::io::Write;
@@ -1208,5 +1208,105 @@ mod cooldown_integration_tests {
         assert_eq!(result.skipped_by_cooldown.len(), 1);
         assert!(result.updated.is_empty());
         assert!(result.held_back.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_pyproject_held_back_by_cooldown() {
+        let now = Utc.with_ymd_and_hms(2026, 4, 22, 12, 0, 0).unwrap();
+
+        let mut file = NamedTempFile::with_suffix(".toml").unwrap();
+        writeln!(
+            file,
+            "[project]\nname = \"demo\"\ndependencies = [\"requests==2.28.0\"]"
+        )
+        .unwrap();
+        file.flush().unwrap();
+
+        let registry = MockRegistry::new("pypi")
+            .with_version("requests", "2.31.0")
+            .with_version_meta(
+                "requests",
+                "2.31.0",
+                Some(now - Duration::days(2)),
+                false,
+                false,
+            )
+            .with_version_meta(
+                "requests",
+                "2.30.0",
+                Some(now - Duration::days(30)),
+                false,
+                false,
+            );
+
+        let policy = CooldownPolicy {
+            default: Duration::days(7),
+            per_ecosystem: HashMap::new(),
+            force_override: None,
+        };
+
+        let updater = PyProjectUpdater::new();
+        let options = UpdateOptions::new(true, false).with_cooldown_policy(policy, now);
+        let result = updater
+            .update(file.path(), &registry, options)
+            .await
+            .unwrap();
+
+        assert_eq!(result.held_back.len(), 1, "requests should be held back");
+        let (name, old, new, skipped, _) = &result.held_back[0];
+        assert_eq!(name, "requests");
+        assert_eq!(old, "2.28.0");
+        assert_eq!(new, "2.30.0");
+        assert_eq!(skipped, "2.31.0");
+    }
+
+    #[tokio::test]
+    async fn test_package_json_held_back_by_cooldown() {
+        let now = Utc.with_ymd_and_hms(2026, 4, 22, 12, 0, 0).unwrap();
+
+        let mut file = NamedTempFile::with_suffix(".json").unwrap();
+        writeln!(
+            file,
+            r#"{{"name":"demo","version":"0.0.0","dependencies":{{"lodash":"4.17.20"}}}}"#
+        )
+        .unwrap();
+        file.flush().unwrap();
+
+        let registry = MockRegistry::new("npm")
+            .with_version("lodash", "4.17.22")
+            .with_version_meta(
+                "lodash",
+                "4.17.22",
+                Some(now - Duration::days(2)),
+                false,
+                false,
+            )
+            .with_version_meta(
+                "lodash",
+                "4.17.21",
+                Some(now - Duration::days(30)),
+                false,
+                false,
+            );
+
+        let policy = CooldownPolicy {
+            default: Duration::days(7),
+            per_ecosystem: HashMap::new(),
+            force_override: None,
+        };
+
+        let updater = PackageJsonUpdater::new();
+        let options = UpdateOptions::new(true, false).with_cooldown_policy(policy, now);
+        let result = updater
+            .update(file.path(), &registry, options)
+            .await
+            .unwrap();
+
+        assert_eq!(result.held_back.len(), 1, "lodash should be held back");
+        let (name, old, new, skipped, _) = &result.held_back[0];
+        assert_eq!(name, "lodash");
+        assert_eq!(old, "4.17.20");
+        assert_eq!(new, "4.17.21");
+        assert_eq!(skipped, "4.17.22");
     }
 }

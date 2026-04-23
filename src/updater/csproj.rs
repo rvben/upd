@@ -341,6 +341,48 @@ impl Updater for CsprojUpdater {
                 if let Some(version_result) = version_map.remove(&line_idx) {
                     match version_result {
                         Ok(latest_version) => {
+                            // Apply cooldown policy before writing (registry path only; pins bypass it).
+                            let (latest_version, held_back_record) = if pinned_lines
+                                .contains(&line_idx)
+                            {
+                                (latest_version, None)
+                            } else {
+                                let (outcome, note) = crate::updater::apply_cooldown(
+                                    registry,
+                                    &pkg.name,
+                                    &pkg.version,
+                                    &latest_version,
+                                    None,
+                                    false,
+                                    &options,
+                                )
+                                .await;
+                                if let Some(msg) = note {
+                                    options.note_cooldown_unavailable(&msg);
+                                }
+                                match outcome {
+                                    crate::updater::CooldownOutcome::Unchanged(v) => (v, None),
+                                    crate::updater::CooldownOutcome::HeldBack {
+                                        chosen,
+                                        skipped_version,
+                                        skipped_published_at,
+                                    } => (chosen, Some((skipped_version, skipped_published_at))),
+                                    crate::updater::CooldownOutcome::Skipped {
+                                        skipped_version,
+                                        skipped_published_at,
+                                    } => {
+                                        result.skipped_by_cooldown.push((
+                                            pkg.name.clone(),
+                                            pkg.version.clone(),
+                                            skipped_version,
+                                            skipped_published_at,
+                                        ));
+                                        new_lines.push(line.to_string());
+                                        continue;
+                                    }
+                                }
+                            };
+
                             let matched_version = if options.full_precision {
                                 latest_version.clone()
                             } else {
@@ -367,6 +409,17 @@ impl Updater for CsprojUpdater {
                                             matched_version.clone(),
                                             Some(line_num),
                                         ));
+                                        if let Some((skipped_version, skipped_published_at)) =
+                                            held_back_record
+                                        {
+                                            result.held_back.push((
+                                                pkg.name.clone(),
+                                                pkg.version.clone(),
+                                                matched_version.clone(),
+                                                skipped_version,
+                                                skipped_published_at,
+                                            ));
+                                        }
                                     }
 
                                     if line.contains("Version=") {

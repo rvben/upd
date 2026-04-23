@@ -257,6 +257,46 @@ impl Updater for PreCommitUpdater {
 
                 match version_result {
                     Ok(latest_version) => {
+                        // Apply cooldown policy before writing (registry path only; pins bypass it).
+                        let (latest_version, held_back_record) = if *is_pinned {
+                            (latest_version, None)
+                        } else {
+                            let (outcome, note) = crate::updater::apply_cooldown(
+                                registry,
+                                owner_repo,
+                                current_version,
+                                &latest_version,
+                                None,
+                                false,
+                                &options,
+                            )
+                            .await;
+                            if let Some(msg) = note {
+                                options.note_cooldown_unavailable(&msg);
+                            }
+                            match outcome {
+                                crate::updater::CooldownOutcome::Unchanged(v) => (v, None),
+                                crate::updater::CooldownOutcome::HeldBack {
+                                    chosen,
+                                    skipped_version,
+                                    skipped_published_at,
+                                } => (chosen, Some((skipped_version, skipped_published_at))),
+                                crate::updater::CooldownOutcome::Skipped {
+                                    skipped_version,
+                                    skipped_published_at,
+                                } => {
+                                    result.skipped_by_cooldown.push((
+                                        owner_repo.clone(),
+                                        current_version.clone(),
+                                        skipped_version,
+                                        skipped_published_at,
+                                    ));
+                                    new_lines.push(line.to_string());
+                                    continue;
+                                }
+                            }
+                        };
+
                         let new_version = Self::compute_updated_version(
                             current_version,
                             &latest_version,
@@ -291,9 +331,20 @@ impl Updater for PreCommitUpdater {
                                     result.updated.push((
                                         owner_repo.clone(),
                                         current_version.clone(),
-                                        new_version,
+                                        new_version.clone(),
                                         Some(line_num),
                                     ));
+                                    if let Some((skipped_version, skipped_published_at)) =
+                                        held_back_record
+                                    {
+                                        result.held_back.push((
+                                            owner_repo.clone(),
+                                            current_version.clone(),
+                                            new_version,
+                                            skipped_version,
+                                            skipped_published_at,
+                                        ));
+                                    }
                                 }
                             }
                         } else {

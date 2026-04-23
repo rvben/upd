@@ -274,13 +274,47 @@ impl Updater for GemfileUpdater {
                             // When the current version is a pre-release, we fetched the latest
                             // pre-release. If the registry returned a stable version instead
                             // (no newer pre-release exists), refuse silent promotion to stable.
-                            if Self::is_prerelease_ruby(&parsed.version)
-                                && !Self::is_prerelease_ruby(&latest_version)
-                            {
+                            let current_is_prerelease = Self::is_prerelease_ruby(&parsed.version);
+                            if current_is_prerelease && !Self::is_prerelease_ruby(&latest_version) {
                                 result.unchanged += 1;
                                 new_lines.push(line.to_string());
                                 continue;
                             }
+
+                            let (outcome, note) = crate::updater::apply_cooldown(
+                                registry,
+                                &parsed.name,
+                                &parsed.version,
+                                &latest_version,
+                                None,
+                                current_is_prerelease,
+                                &options,
+                            )
+                            .await;
+                            if let Some(msg) = note {
+                                options.note_cooldown_unavailable(&msg);
+                            }
+                            let (latest_version, held_back_record) = match outcome {
+                                crate::updater::CooldownOutcome::Unchanged(v) => (v, None),
+                                crate::updater::CooldownOutcome::HeldBack {
+                                    chosen,
+                                    skipped_version,
+                                    skipped_published_at,
+                                } => (chosen, Some((skipped_version, skipped_published_at))),
+                                crate::updater::CooldownOutcome::Skipped {
+                                    skipped_version,
+                                    skipped_published_at,
+                                } => {
+                                    result.skipped_by_cooldown.push((
+                                        parsed.name.clone(),
+                                        parsed.version.clone(),
+                                        skipped_version,
+                                        skipped_published_at,
+                                    ));
+                                    new_lines.push(line.to_string());
+                                    continue;
+                                }
+                            };
 
                             let matched_version = if options.full_precision {
                                 latest_version.clone()
@@ -306,6 +340,17 @@ impl Updater for GemfileUpdater {
                                         matched_version.clone(),
                                         Some(line_num),
                                     ));
+                                    if let Some((skipped_version, skipped_published_at)) =
+                                        held_back_record
+                                    {
+                                        result.held_back.push((
+                                            parsed.name.clone(),
+                                            parsed.version.clone(),
+                                            matched_version.clone(),
+                                            skipped_version,
+                                            skipped_published_at,
+                                        ));
+                                    }
                                     new_lines.push(self.update_line(
                                         line,
                                         &parsed.version,

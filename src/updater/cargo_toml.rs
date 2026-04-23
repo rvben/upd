@@ -323,20 +323,62 @@ impl CargoTomlUpdater {
         let version_results = join_all(version_futures).await;
 
         // Process results
-        for ((key, prefix, current_version, _registry_name, line_num), version_result) in
+        for ((key, prefix, current_version, registry_name, line_num), version_result) in
             deps_to_check.into_iter().zip(version_results)
         {
+            let effective_registry: &dyn Registry = if let Some(ref name) = registry_name {
+                registry_cache
+                    .get(name)
+                    .map(|r| r.as_ref())
+                    .unwrap_or(default_registry)
+            } else {
+                default_registry
+            };
+
             match version_result {
                 Ok(latest_version) => {
                     // When the current version is a pre-release, we fetched the latest
                     // pre-release. If the registry returned a stable version instead
                     // (no newer pre-release exists), refuse silent promotion to stable.
-                    if is_prerelease_semver(&current_version)
-                        && !is_prerelease_semver(&latest_version)
-                    {
+                    let current_is_prerelease = is_prerelease_semver(&current_version);
+                    if current_is_prerelease && !is_prerelease_semver(&latest_version) {
                         result.unchanged += 1;
                         continue;
                     }
+
+                    let (outcome, note) = crate::updater::apply_cooldown(
+                        effective_registry,
+                        &key,
+                        &current_version,
+                        &latest_version,
+                        None,
+                        current_is_prerelease,
+                        options,
+                    )
+                    .await;
+                    if let Some(msg) = note {
+                        options.note_cooldown_unavailable(&msg);
+                    }
+                    let (latest_version, held_back_record) = match outcome {
+                        crate::updater::CooldownOutcome::Unchanged(v) => (v, None),
+                        crate::updater::CooldownOutcome::HeldBack {
+                            chosen,
+                            skipped_version,
+                            skipped_published_at,
+                        } => (chosen, Some((skipped_version, skipped_published_at))),
+                        crate::updater::CooldownOutcome::Skipped {
+                            skipped_version,
+                            skipped_published_at,
+                        } => {
+                            result.skipped_by_cooldown.push((
+                                key,
+                                current_version,
+                                skipped_version,
+                                skipped_published_at,
+                            ));
+                            continue;
+                        }
+                    };
 
                     // Match the precision of the original version (unless full precision requested)
                     let matched_version = if options.full_precision {
@@ -362,10 +404,20 @@ impl CargoTomlUpdater {
                             }
                             result.updated.push((
                                 key.clone(),
-                                current_version,
-                                matched_version,
+                                current_version.clone(),
+                                matched_version.clone(),
                                 line_num,
                             ));
+                            if let Some((skipped_version, skipped_published_at)) = held_back_record
+                            {
+                                result.held_back.push((
+                                    key,
+                                    current_version,
+                                    matched_version,
+                                    skipped_version,
+                                    skipped_published_at,
+                                ));
+                            }
                         }
                     } else {
                         result.unchanged += 1;
