@@ -35,6 +35,21 @@ pub struct Cache {
 pub struct CacheEntry {
     pub version: String,
     pub fetched_at: u64, // Unix timestamp
+    /// Full per-version metadata fetched via `list_versions`, when available.
+    /// Older cache files predate this field and deserialize with `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub versions: Option<Vec<CachedVersionMeta>>,
+}
+
+/// Cache-friendly mirror of [`crate::registry::VersionMeta`]. `published_at`
+/// is stored as a Unix timestamp (seconds) so the cache file stays stable
+/// across `chrono` serde format changes.
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct CachedVersionMeta {
+    pub version: String,
+    pub published_at: Option<i64>,
+    pub yanked: bool,
+    pub prerelease: bool,
 }
 
 impl Cache {
@@ -121,6 +136,7 @@ impl Cache {
             CacheEntry {
                 version,
                 fetched_at,
+                versions: None,
             },
         );
     }
@@ -320,6 +336,7 @@ mod tests {
             CacheEntry {
                 version: "0.1.0".to_string(),
                 fetched_at: expired_time,
+                versions: None,
             },
         );
 
@@ -346,6 +363,7 @@ mod tests {
             CacheEntry {
                 version: "0.1.0".to_string(),
                 fetched_at: expired_time,
+                versions: None,
             },
         );
 
@@ -403,6 +421,66 @@ mod tests {
 
         assert_eq!(restored.get("pypi", "requests"), Some("2.31.0".to_string()));
         assert_eq!(restored.get("npm", "lodash"), Some("4.17.21".to_string()));
+    }
+
+    #[test]
+    fn test_cache_entry_deserialises_without_versions_field() {
+        // Older cache files predate the `versions` field and must still
+        // deserialise so upgrades do not invalidate on-disk caches.
+        let json = r#"{"version":"1.2.3","fetched_at":1700000000}"#;
+        let entry: CacheEntry = serde_json::from_str(json).unwrap();
+        assert_eq!(entry.version, "1.2.3");
+        assert_eq!(entry.fetched_at, 1_700_000_000);
+        assert!(entry.versions.is_none(), "missing field defaults to None");
+    }
+
+    #[test]
+    fn test_cache_roundtrip_with_versions() {
+        let entry = CacheEntry {
+            version: "2.0.0".to_string(),
+            fetched_at: 1_700_000_000,
+            versions: Some(vec![
+                CachedVersionMeta {
+                    version: "2.0.0".to_string(),
+                    published_at: Some(1_700_000_000),
+                    yanked: false,
+                    prerelease: false,
+                },
+                CachedVersionMeta {
+                    version: "1.9.0".to_string(),
+                    published_at: None,
+                    yanked: true,
+                    prerelease: false,
+                },
+            ]),
+        };
+        let json = serde_json::to_string(&entry).unwrap();
+        let back: CacheEntry = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.version, entry.version);
+        let metas = back.versions.expect("versions must round-trip");
+        assert_eq!(metas.len(), 2);
+        assert!(metas.iter().any(|m| m.yanked));
+        assert!(
+            metas
+                .iter()
+                .any(|m| m.version == "2.0.0" && m.published_at == Some(1_700_000_000))
+        );
+    }
+
+    #[test]
+    fn test_cache_entry_skips_serializing_none_versions() {
+        // Ensure the new field is omitted from JSON when absent, keeping
+        // file size small and preserving compatibility with older readers.
+        let entry = CacheEntry {
+            version: "1.0.0".to_string(),
+            fetched_at: 1_700_000_000,
+            versions: None,
+        };
+        let json = serde_json::to_string(&entry).unwrap();
+        assert!(
+            !json.contains("versions"),
+            "versions field must be omitted when None, got: {json}"
+        );
     }
 
     #[test]
