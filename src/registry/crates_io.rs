@@ -1,5 +1,5 @@
 use super::utils::home_dir;
-use super::{Registry, http_error_message};
+use super::{Registry, VersionMeta, http_error_message};
 use anyhow::{Result, anyhow};
 use async_trait::async_trait;
 use reqwest::header::{AUTHORIZATION, HeaderMap, HeaderValue};
@@ -47,10 +47,12 @@ struct CrateInfo {
     max_stable_version: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 struct VersionInfo {
     num: String,
     yanked: bool,
+    #[serde(default)]
+    created_at: Option<String>,
 }
 
 /// Cargo registry configuration from config.toml
@@ -503,6 +505,46 @@ impl Registry for CratesIoRegistry {
         ))
     }
 
+    async fn list_versions(&self, package: &str) -> Result<Vec<VersionMeta>> {
+        let url = format!("{}/{}", self.registry_url.trim_end_matches('/'), package);
+        let response = self.get_with_retry(&url).await?;
+
+        let status = response.status();
+        if status == reqwest::StatusCode::NOT_FOUND {
+            return Ok(Vec::new());
+        }
+        if !status.is_success() {
+            return Err(anyhow!(http_error_message(
+                status,
+                "Crate",
+                package,
+                Some("For private registries, configure token in ~/.cargo/credentials.toml.")
+            )));
+        }
+        let data: CratesResponse = response.json().await?;
+
+        Ok(data
+            .versions
+            .into_iter()
+            .map(|v| {
+                let published_at = v
+                    .created_at
+                    .as_deref()
+                    .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+                    .map(|dt| dt.with_timezone(&chrono::Utc));
+                let prerelease = semver::Version::parse(&v.num)
+                    .map(|sv| !sv.pre.is_empty())
+                    .unwrap_or(false);
+                VersionMeta {
+                    version: v.num,
+                    published_at,
+                    yanked: v.yanked,
+                    prerelease,
+                }
+            })
+            .collect())
+    }
+
     fn name(&self) -> &'static str {
         "crates.io"
     }
@@ -525,18 +567,22 @@ mod tests {
                 VersionInfo {
                     num: "1.0.0".to_string(),
                     yanked: false,
+                    created_at: None,
                 },
                 VersionInfo {
                     num: "2.0.0".to_string(),
                     yanked: false,
+                    created_at: None,
                 },
                 VersionInfo {
                     num: "1.5.0".to_string(),
                     yanked: true,
+                    created_at: None,
                 },
                 VersionInfo {
                     num: "3.0.0-alpha.1".to_string(),
                     yanked: false,
+                    created_at: None,
                 },
             ],
         };
@@ -720,5 +766,44 @@ mod tests {
             sparse_index_to_api_url("sparse+https://my-registry.com/"),
             "https://my-registry.com/api/v1/crates"
         );
+    }
+
+    #[tokio::test]
+    async fn test_crates_io_list_versions_returns_publish_dates() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/serde"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                r#"{
+              "crate": {"max_stable_version": "1.0.200"},
+              "versions": [
+                {"num": "1.0.200", "created_at": "2024-03-01T12:00:00Z", "yanked": false},
+                {"num": "1.0.199", "created_at": "2024-02-01T12:00:00Z", "yanked": true},
+                {"num": "2.0.0-alpha.1", "created_at": "2024-04-01T12:00:00Z", "yanked": false}
+              ]
+            }"#,
+            ))
+            .mount(&mock_server)
+            .await;
+
+        let registry = CratesIoRegistry::with_registry_url(mock_server.uri());
+        let versions = registry.list_versions("serde").await.unwrap();
+
+        assert_eq!(versions.len(), 3);
+        let pre = versions
+            .iter()
+            .find(|v| v.version == "2.0.0-alpha.1")
+            .unwrap();
+        assert!(pre.prerelease);
+        let yanked = versions.iter().find(|v| v.version == "1.0.199").unwrap();
+        assert!(yanked.yanked);
+        let stable = versions.iter().find(|v| v.version == "1.0.200").unwrap();
+        assert!(!stable.prerelease);
+        assert!(!stable.yanked);
+        assert!(stable.published_at.is_some());
     }
 }
