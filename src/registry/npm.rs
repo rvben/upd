@@ -1,5 +1,5 @@
 use super::utils::home_dir;
-use super::{Registry, VersionMeta, http_error_message};
+use super::{Registry, VersionMeta, get_with_retry, http_error_message};
 use anyhow::{Result, anyhow};
 use async_trait::async_trait;
 use reqwest::Client;
@@ -427,6 +427,34 @@ impl NpmRegistry {
         self.fetch_package(package).await
     }
 
+    /// Fetch full package metadata (not the abbreviated install-v1 format).
+    /// Resolves scoped packages to their configured private registry so the
+    /// correct endpoint and auth headers are used for `@scope/pkg` packages.
+    /// Uses retry-with-backoff consistent with other registry fetch paths.
+    async fn fetch_full_metadata(
+        &self,
+        package: &str,
+    ) -> Result<(reqwest::StatusCode, Option<NpmPackageMetadata>)> {
+        // For scoped packages, delegate to the scoped-registry instance so that
+        // its configured registry URL and auth headers are used.
+        if let Some(scoped_registry) = Self::for_scoped_package(package) {
+            return Box::pin(scoped_registry.fetch_full_metadata(package)).await;
+        }
+
+        let url = format!("{}/{}", self.registry_url, package);
+        // The `time` publish-date map is only present on the full metadata document.
+        let response = get_with_retry(&self.client, &url).await?;
+        let status = response.status();
+        if !status.is_success() {
+            return Ok((status, None));
+        }
+        let meta: NpmPackageMetadata = response
+            .json()
+            .await
+            .map_err(|e| anyhow!("Failed to parse npm response for '{}': {}", package, e))?;
+        Ok((status, Some(meta)))
+    }
+
     /// Return true when `version` contains a pre-release identifier.
     /// npm follows semver: a hyphen after the version triplet signals pre-release.
     fn is_prerelease(version: &str) -> bool {
@@ -506,12 +534,8 @@ impl Registry for NpmRegistry {
     }
 
     async fn list_versions(&self, package: &str) -> Result<Vec<VersionMeta>> {
-        let url = format!("{}/{}", self.registry_url.trim_end_matches('/'), package);
-        // Request the full document (no install-v1 Accept header) so that the
-        // `time` map with per-version publish timestamps is included.
-        let response = self.client.get(&url).send().await?;
+        let (status, meta) = self.fetch_full_metadata(package).await?;
 
-        let status = response.status();
         if status == reqwest::StatusCode::NOT_FOUND {
             return Ok(Vec::new());
         }
@@ -524,15 +548,13 @@ impl Registry for NpmRegistry {
             )));
         }
 
-        let meta: NpmPackageMetadata = response.json().await?;
+        let Some(meta) = meta else {
+            return Ok(Vec::new());
+        };
 
         let mut out = Vec::new();
         for (ver, v_meta) in meta.versions.iter() {
-            let yanked = v_meta
-                .deprecated
-                .as_deref()
-                .map(|s| !s.is_empty())
-                .unwrap_or(false);
+            let yanked = v_meta.deprecated.as_deref().is_some_and(|s| !s.is_empty());
             let published_at = meta
                 .time
                 .get(ver)
@@ -798,12 +820,27 @@ mod tests {
         let versions = registry.list_versions("lodash").await.unwrap();
 
         assert_eq!(versions.len(), 3);
+
+        let v_20 = versions.iter().find(|v| v.version == "4.17.20").unwrap();
+        assert!(!v_20.yanked, "non-deprecated version should not be yanked");
+        assert!(
+            v_20.published_at.is_some(),
+            "4.17.20 timestamp should parse"
+        );
+
         let v_21 = versions.iter().find(|v| v.version == "4.17.21").unwrap();
         assert!(v_21.yanked, "deprecated should mark as yanked for cooldown");
-        assert!(v_21.published_at.is_some());
+        assert!(
+            v_21.published_at.is_some(),
+            "4.17.21 timestamp should parse"
+        );
 
         let rc = versions.iter().find(|v| v.version == "5.0.0-rc.1").unwrap();
         assert!(rc.prerelease, "pre-release version should be flagged");
+        assert!(
+            rc.published_at.is_some(),
+            "5.0.0-rc.1 timestamp should parse"
+        );
     }
 
     #[test]
