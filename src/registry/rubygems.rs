@@ -1,4 +1,4 @@
-use super::{Registry, get_with_retry, http_error_message};
+use super::{Registry, VersionMeta, get_with_retry, http_error_message};
 use anyhow::{Result, anyhow};
 use async_trait::async_trait;
 use reqwest::Client;
@@ -23,6 +23,8 @@ struct GemVersion {
     /// omit the field; `serde(default)` treats that as "not yanked".
     #[serde(default)]
     yanked: bool,
+    #[serde(default)]
+    created_at: Option<String>,
 }
 
 impl RubyGemsRegistry {
@@ -137,6 +139,41 @@ impl Registry for RubyGemsRegistry {
             package,
             constraints
         ))
+    }
+
+    async fn list_versions(&self, package: &str) -> Result<Vec<VersionMeta>> {
+        let url = format!("{}/api/v1/versions/{}.json", self.api_url, package);
+        let response = get_with_retry(&self.client, &url).await?;
+
+        let status = response.status();
+        if status == reqwest::StatusCode::NOT_FOUND {
+            return Ok(Vec::new());
+        }
+        if !status.is_success() {
+            return Err(anyhow!(http_error_message(status, "Gem", package, None)));
+        }
+
+        let items: Vec<GemVersion> = response
+            .json()
+            .await
+            .map_err(|e| anyhow!("Failed to parse RubyGems versions for '{}': {}", package, e))?;
+
+        Ok(items
+            .into_iter()
+            .map(|v| {
+                let published_at = v
+                    .created_at
+                    .as_deref()
+                    .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+                    .map(|dt| dt.with_timezone(&chrono::Utc));
+                VersionMeta {
+                    version: v.number,
+                    published_at,
+                    yanked: v.yanked,
+                    prerelease: v.prerelease,
+                }
+            })
+            .collect())
     }
 
     fn name(&self) -> &'static str {
@@ -424,5 +461,38 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(version, "7.1.5");
+    }
+
+    #[tokio::test]
+    async fn test_rubygems_list_versions_returns_publish_dates() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/api/v1/versions/rails.json"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                r#"[
+              {"number": "7.1.0", "created_at": "2023-10-05T10:00:00Z", "yanked": false, "prerelease": false},
+              {"number": "7.0.8", "created_at": "2023-11-08T10:00:00Z", "yanked": false, "prerelease": false},
+              {"number": "6.0.0.rc1", "created_at": "2019-04-24T10:00:00Z", "yanked": false, "prerelease": true}
+            ]"#,
+            ))
+            .mount(&mock_server)
+            .await;
+
+        let registry = RubyGemsRegistry::with_api_url(mock_server.uri());
+        let versions = registry.list_versions("rails").await.unwrap();
+
+        assert_eq!(versions.len(), 3);
+        let rc = versions.iter().find(|v| v.version == "6.0.0.rc1").unwrap();
+        assert!(
+            rc.prerelease,
+            "6.0.0.rc1 should be recognised as pre-release"
+        );
+        let stable = versions.iter().find(|v| v.version == "7.1.0").unwrap();
+        assert!(!stable.prerelease);
+        assert!(stable.published_at.is_some());
     }
 }
