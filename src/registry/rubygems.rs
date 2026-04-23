@@ -465,9 +465,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_rubygems_list_versions_returns_publish_dates() {
-        use wiremock::matchers::{method, path};
-        use wiremock::{Mock, MockServer, ResponseTemplate};
-
         let mock_server = MockServer::start().await;
 
         Mock::given(method("GET"))
@@ -475,7 +472,7 @@ mod tests {
             .respond_with(ResponseTemplate::new(200).set_body_string(
                 r#"[
               {"number": "7.1.0", "created_at": "2023-10-05T10:00:00Z", "yanked": false, "prerelease": false},
-              {"number": "7.0.8", "created_at": "2023-11-08T10:00:00Z", "yanked": false, "prerelease": false},
+              {"number": "7.0.8", "created_at": "2023-11-08T10:00:00Z", "yanked": true, "prerelease": false},
               {"number": "6.0.0.rc1", "created_at": "2019-04-24T10:00:00Z", "yanked": false, "prerelease": true}
             ]"#,
             ))
@@ -494,5 +491,10 @@ mod tests {
         let stable = versions.iter().find(|v| v.version == "7.1.0").unwrap();
         assert!(!stable.prerelease);
         assert!(stable.published_at.is_some());
+        let yanked_entry = versions.iter().find(|v| v.version == "7.0.8").unwrap();
+        assert!(
+            yanked_entry.yanked,
+            "yanked flag should round-trip from API"
+        );
     }
 }
