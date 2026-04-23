@@ -824,6 +824,20 @@ impl Registry for MultiPyPiRegistry {
         }))
     }
 
+    async fn list_versions(&self, package: &str) -> Result<Vec<VersionMeta>> {
+        // Query registries in order; return the first non-empty result so that
+        // cooldown decisions are based on the same source used for resolution.
+        for registry in &self.registries {
+            let result = registry.list_versions(package).await;
+            if let Ok(versions) = result
+                && !versions.is_empty()
+            {
+                return Ok(versions);
+            }
+        }
+        Ok(Vec::new())
+    }
+
     fn name(&self) -> &'static str {
         "pypi"
     }

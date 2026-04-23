@@ -446,6 +446,51 @@ upd --verbose
 # pyproject.toml:13: Skipped internal-utils 1.0.0 (ignored)
 ```
 
+## Cooldown (minimum release age)
+
+Hold back updates to versions that have been public for less than N days.
+Reduces exposure to supply-chain attacks that rely on freshly published
+malicious versions being installed before detection. Modelled after
+Renovate's `minimumReleaseAge` / Dependabot's `cooldown`.
+
+Enable in `.updrc.toml`:
+
+```toml
+[cooldown]
+default = "7d"           # applies to every ecosystem unless overridden
+
+[cooldown.ecosystem]
+npm = "14d"              # stricter for npm
+pypi = "14d"
+"crates.io" = "3d"
+```
+
+Duration syntax: `<integer><unit>` where unit is `s`, `m`, `h`, `d`, `w`.
+A bare `0` disables cooldown.
+
+Override from the CLI for one-off runs:
+
+```text
+upd --min-age 14d         # use 14 days regardless of config
+upd --min-age 0           # disable cooldown entirely for this run
+```
+
+**How it works:** when the latest version is still inside the cooldown
+window, `upd` updates to the newest version that *is* old enough. If nothing
+newer is old enough yet, the package is held back. Output marks these
+packages explicitly:
+
+```text
+Updated requests 2.28.0 → 2.31.0
+Held back lodash 4.17.20 → 4.17.21 (4.17.22 released 2d ago, cooldown 7d)
+Skipped express (only newer version 4.19.0 released 1d ago, cooldown 7d)
+```
+
+**Supported ecosystems:** PyPI, npm, crates.io, Go modules, RubyGems,
+GitHub releases (covers GitHub Actions, pre-commit, Mise). NuGet and
+Terraform Registry do not expose per-version publish dates we can
+consume today; cooldown is reported as unavailable for those files.
+
 ## Caching
 
 Version lookups are cached for 24 hours in:

@@ -1,4 +1,4 @@
-use crate::registry::Registry;
+use crate::registry::{Registry, VersionMeta};
 use anyhow::Result;
 use async_trait::async_trait;
 use directories::ProjectDirs;
@@ -269,6 +269,10 @@ impl<R: Registry> Registry for CachedRegistry<R> {
             .await?;
         self.cache_set(&cache_key, &version);
         Ok(version)
+    }
+
+    async fn list_versions(&self, package: &str) -> Result<Vec<VersionMeta>> {
+        self.inner.list_versions(package).await
     }
 
     fn name(&self) -> &'static str {
