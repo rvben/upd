@@ -11,6 +11,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 
 
+
+## [0.1.2](https://github.com/rvben/upd/compare/v0.1.1...v0.1.2) - 2026-04-24
+
+### Added
+
+- **cache**: add optional versions field to CacheEntry for future list_versions caching ([1beb34d](https://github.com/rvben/upd/commit/1beb34dc030f160e3748dff9a63e71bfa1772043))
+- **output**: report held-back and skipped-by-cooldown packages ([3d1a2ce](https://github.com/rvben/upd/commit/3d1a2cef2ae31c59a87b417b074e0d672b7256d2))
+- **updater**: propagate cooldown policy to remaining updaters ([8e80f25](https://github.com/rvben/upd/commit/8e80f252339f022d90f8120694e529c68c3bcf90))
+- **updater**: apply cooldown policy in requirements updater ([5d6cfd3](https://github.com/rvben/upd/commit/5d6cfd32bfe87df7af86453476a93e2945f009ff))
+- **registry**: implement list_versions for GitHub releases ([5f6472b](https://github.com/rvben/upd/commit/5f6472b5d7c4394d59fbabfd4bd9a1d9b736a67a))
+- **registry**: implement list_versions for RubyGems ([1a1dda3](https://github.com/rvben/upd/commit/1a1dda31d73e0f25d8a73e6438aed7c4daadc007))
+- **registry**: implement list_versions for Go module proxy ([196fef6](https://github.com/rvben/upd/commit/196fef634b0ae3c53096222e8bbe3161d8b67a33))
+- **registry**: implement list_versions for crates.io ([8869dec](https://github.com/rvben/upd/commit/8869dec1a69148b5b3db44cc3393a05aaa2b01fb))
+- **registry**: implement list_versions for npm ([b23cd78](https://github.com/rvben/upd/commit/b23cd787e748dfc5404a8fd51981c67f858e1d5a))
+- **registry**: implement list_versions for PyPI ([9aa342c](https://github.com/rvben/upd/commit/9aa342c5c11ae504024aed5aa2d8930c66b4a6df))
+- **cli**: add --min-age flag for cooldown override ([b5bfb30](https://github.com/rvben/upd/commit/b5bfb304c39f6b8099aef3a066e2ef4ed17f606f))
+- **config**: show cooldown policy in --show-config ([9486257](https://github.com/rvben/upd/commit/9486257b22456e55e9af23709089a574cce262be))
+- **config**: add [cooldown] table with default and per-ecosystem overrides ([a9ff8e3](https://github.com/rvben/upd/commit/a9ff8e31050485056a9bb6e03f4d313df1262998))
+- **cooldown**: implement select() selection algorithm ([8b588bb](https://github.com/rvben/upd/commit/8b588bb1b42d84d696a7a17d8e97141a223351a1))
+- **cooldown**: add CooldownPolicy with precedence resolution ([ddba284](https://github.com/rvben/upd/commit/ddba284329dad87bf84cf566ecb487ef665408a1))
+- **cooldown**: add parse_duration for release-age config ([a7e67e0](https://github.com/rvben/upd/commit/a7e67e035764e4d905ace1dc4092f41c27510a5c))
+- **registry**: re-export VersionMeta from crate root ([b2cdd60](https://github.com/rvben/upd/commit/b2cdd6037c09110881f53db4992542e77596f6c3))
+- **registry**: add VersionMeta and list_versions trait method ([09ddbf9](https://github.com/rvben/upd/commit/09ddbf9c2b8f0546feafeb642f27547bed1882da))
+
+### Fixed
+
+- **cooldown**: harden selection against real-world constraints and per-file policy ([a284ea4](https://github.com/rvben/upd/commit/a284ea497dcf3abf65fda2c7e7f6c0c03c3dd8e2))
+- **updater**: pass Poetry constraint to cooldown selection ([a0383e9](https://github.com/rvben/upd/commit/a0383e9167b2ef05cc4583aa23c1035d32268750))
+
 ## [0.1.1](https://github.com/rvben/upd/compare/v0.1.0...v0.1.1) - 2026-04-22
 
 ### Added
