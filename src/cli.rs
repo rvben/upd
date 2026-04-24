@@ -130,8 +130,9 @@ pub struct Cli {
 
     /// Regenerate lockfiles after updating.
     ///
-    /// Runs the appropriate lock command for each ecosystem (e.g. `poetry lock`,
-    /// `npm install`, `cargo update`).
+    /// Runs the narrowest per-ecosystem refresh command that updates only the
+    /// packages `upd` just rewrote (e.g. `cargo update -p <pkg>`,
+    /// `bundle lock --update <pkg>`, `npm install --package-lock-only`).
     #[arg(long, global = true)]
     pub lock: bool,
 

@@ -918,23 +918,31 @@ async fn run_update(cli: &Cli) -> Result<()> {
     if cli.lock && !dry_run && !updated_files.is_empty() {
         // Group changed package names by the directory of their manifest file.
         // Each directory gets its own targeted-command invocation so we never
-        // pull in transitive churn from sibling subprojects.
+        // pull in transitive churn from sibling subprojects. Both registry
+        // updates and config pins modify the manifest, so both contribute —
+        // otherwise pin-only changes would silently degrade to a broad refresh.
         let mut changed_by_dir: HashMap<PathBuf, Vec<String>> = HashMap::new();
         for scanned_file in &scanned {
-            if scanned_file.result.updated.is_empty() {
+            if scanned_file.result.updated.is_empty() && scanned_file.result.pinned.is_empty() {
                 continue;
             }
             let Some(dir) = scanned_file.path.parent() else {
                 continue;
             };
             let entry = changed_by_dir.entry(dir.to_path_buf()).or_default();
-            for (name, _, _, _) in &scanned_file.result.updated {
+            for (name, _, _, _) in scanned_file
+                .result
+                .updated
+                .iter()
+                .chain(scanned_file.result.pinned.iter())
+            {
                 if !entry.iter().any(|n| n == name) {
                     entry.push(name.clone());
                 }
             }
         }
 
+        let empty: Vec<String> = Vec::new();
         let mut processed_dirs: HashSet<PathBuf> = HashSet::new();
         let mut regen_results: Vec<(PathBuf, LockfileRegenResult)> = Vec::new();
 
@@ -942,7 +950,6 @@ async fn run_update(cli: &Cli) -> Result<()> {
             if let Some(dir) = path.parent() {
                 let dir_path = dir.to_path_buf();
                 if processed_dirs.insert(dir_path.clone()) {
-                    let empty: Vec<String> = Vec::new();
                     let changed = changed_by_dir.get(&dir_path).unwrap_or(&empty);
                     let result = regenerate_lockfiles(path, changed, verbose && text_mode);
                     regen_results.push((path.clone(), result));
@@ -1354,17 +1361,21 @@ async fn run_interactive_update(
                 None => format!("{}:", file_str),
             };
 
+            // Record which packages changed per manifest directory so the
+            // lockfile regeneration step can issue targeted commands. Registry
+            // updates and config pins both modify the manifest, so both must
+            // contribute — otherwise a pin-only run would silently emit a
+            // broad refresh (e.g. `cargo update --workspace`).
+            if let Some(dir) = scanned_file.path.parent() {
+                let entry = changed_by_dir.entry(dir.to_path_buf()).or_default();
+                if !entry.iter().any(|n| n == &change.package) {
+                    entry.push(change.package.clone());
+                }
+            }
+
             match change.kind {
                 ChangeKind::RegistryUpdate => {
                     applied_updates += 1;
-                    // Record which packages changed per manifest directory so the
-                    // lockfile regeneration step can issue targeted commands.
-                    if let Some(dir) = scanned_file.path.parent() {
-                        let entry = changed_by_dir.entry(dir.to_path_buf()).or_default();
-                        if !entry.iter().any(|n| n == &change.package) {
-                            entry.push(change.package.clone());
-                        }
-                    }
                     if !cli.quiet {
                         println!(
                             "{} {} {} {} → {}",
@@ -1396,6 +1407,7 @@ async fn run_interactive_update(
 
     // Regenerate lockfiles if requested and files were updated
     if cli.lock && !updated_files.is_empty() {
+        let empty: Vec<String> = Vec::new();
         let mut processed_dirs: HashSet<std::path::PathBuf> = HashSet::new();
         let mut regen_results: Vec<(PathBuf, LockfileRegenResult)> = Vec::new();
 
@@ -1403,8 +1415,7 @@ async fn run_interactive_update(
             if let Some(dir) = path.parent() {
                 let dir_path = dir.to_path_buf();
                 if processed_dirs.insert(dir_path.clone()) {
-                    let empty: Vec<String> = Vec::new();
-                    let changed = changed_by_dir.get(&dir.to_path_buf()).unwrap_or(&empty);
+                    let changed = changed_by_dir.get(&dir_path).unwrap_or(&empty);
                     let result = regenerate_lockfiles(path, changed, cli.verbose);
                     regen_results.push((path.clone(), result));
                 }
