@@ -23,7 +23,10 @@ pipx run --spec upd-cli upd --apply
 
 - **Multi-ecosystem**: Python, Node.js, Rust, Go, Ruby, .NET, Terraform, GitHub Actions, pre-commit, Mise/asdf
 - **Fast**: Parallel registry requests for all dependencies
-- **Constraint-aware**: Respects version constraints like `>=2.0,<3` and `~> 7.1`
+- **Constraint-aware**: Respects `>=2.0,<3` (Python), `~> 7.1` (Ruby), and `^2.0.0` / `~2.0.0` (npm, Cargo).
+  For npm, comparator ranges such as `">=1.0.0 <2.0.0"` are rewritten with a **bump strategy**: the lower
+  bound moves to the highest version satisfying the constraint, preserving the upper bound. Hyphen
+  (`"1 - 2"`) and OR (`"^1 || ^2"`) ranges are reported as warnings and left untouched.
 - **Smart caching**: 24-hour version cache for faster subsequent runs
 - **Update filters**: Filter by bump level with `--only-bump <major|minor|patch>` (repeatable) or cap with `--max-bump`
 - **Interactive mode**: Approve updates individually with `-i`
