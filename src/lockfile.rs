@@ -95,20 +95,67 @@ impl LockfileType {
         }
     }
 
-    /// Get the command to regenerate this lockfile
-    pub fn command(&self) -> (&'static str, &'static [&'static str]) {
+    /// Returns the command + args to regenerate this lockfile.
+    ///
+    /// `changed` is the list of package names that `upd` just rewrote in the
+    /// corresponding manifest. Ecosystems whose CLI supports a targeted form use
+    /// it (`cargo update -p …`, `bundle lock --update …`). Ecosystems whose CLI
+    /// supports a lockfile-only flag prefer that over a full install. Everything
+    /// else falls back to the manifest-wide refresh command.
+    pub fn command(&self, changed: &[String]) -> (&'static str, Vec<String>) {
         match self {
-            LockfileType::PoetryLock => ("poetry", &["lock", "--no-update"]),
-            LockfileType::UvLock => ("uv", &["lock"]),
-            LockfileType::PackageLockJson => ("npm", &["install"]),
-            LockfileType::YarnLock => ("yarn", &["install"]),
-            LockfileType::PnpmLock => ("pnpm", &["install"]),
-            LockfileType::BunLock => ("bun", &["install"]),
-            LockfileType::CargoLock => ("cargo", &["update"]),
-            LockfileType::GoSum => ("go", &["mod", "tidy"]),
-            LockfileType::GemfileLock => ("bundle", &["install"]),
-            LockfileType::PackagesLockJson => ("dotnet", &["restore"]),
-            LockfileType::TerraformLock => ("terraform", &["providers", "lock"]),
+            LockfileType::PoetryLock => (
+                "poetry",
+                vec!["lock".to_string(), "--no-update".to_string()],
+            ),
+            LockfileType::UvLock => ("uv", vec!["lock".to_string()]),
+            LockfileType::PackageLockJson => (
+                "npm",
+                vec!["install".to_string(), "--package-lock-only".to_string()],
+            ),
+            LockfileType::YarnLock => (
+                "yarn",
+                vec![
+                    "install".to_string(),
+                    "--mode".to_string(),
+                    "update-lockfile".to_string(),
+                ],
+            ),
+            LockfileType::PnpmLock => (
+                "pnpm",
+                vec!["install".to_string(), "--lockfile-only".to_string()],
+            ),
+            LockfileType::BunLock => ("bun", vec!["install".to_string()]),
+            LockfileType::CargoLock => {
+                if changed.is_empty() {
+                    (
+                        "cargo",
+                        vec!["update".to_string(), "--workspace".to_string()],
+                    )
+                } else {
+                    let mut args = vec!["update".to_string()];
+                    for pkg in changed {
+                        args.push("-p".to_string());
+                        args.push(pkg.clone());
+                    }
+                    ("cargo", args)
+                }
+            }
+            LockfileType::GoSum => ("go", vec!["mod".to_string(), "tidy".to_string()]),
+            LockfileType::GemfileLock => {
+                if changed.is_empty() {
+                    ("bundle", vec!["lock".to_string()])
+                } else {
+                    let mut args = vec!["lock".to_string(), "--update".to_string()];
+                    args.extend(changed.iter().cloned());
+                    ("bundle", args)
+                }
+            }
+            LockfileType::PackagesLockJson => ("dotnet", vec!["restore".to_string()]),
+            LockfileType::TerraformLock => (
+                "terraform",
+                vec!["providers".to_string(), "lock".to_string()],
+            ),
         }
     }
 
@@ -249,15 +296,21 @@ pub fn tool_available(tool: &str) -> bool {
 
 /// Regenerate a single lockfile by running the appropriate package manager.
 ///
+/// `changed` is the list of package names that `upd` just rewrote in the
+/// corresponding manifest. This is forwarded to [`LockfileType::command`] so
+/// ecosystems that support targeted commands (e.g. `cargo update -p …`) only
+/// touch the packages that actually changed.
+///
 /// Returns a [`RegenOutcome`] distinguishing success, missing tool, and
 /// command failure.
 pub fn regenerate_lockfile(
     manifest_path: &Path,
     lockfile_type: LockfileType,
+    changed: &[String],
     verbose: bool,
 ) -> RegenOutcome {
     let dir = manifest_path.parent().unwrap_or(Path::new("."));
-    let (cmd, args) = lockfile_type.command();
+    let (cmd, args) = lockfile_type.command(changed);
 
     if !tool_available(cmd) {
         return RegenOutcome::ToolMissing {
@@ -279,7 +332,7 @@ pub fn regenerate_lockfile(
         );
     }
 
-    let output = match Command::new(cmd).args(args).current_dir(dir).output() {
+    let output = match Command::new(cmd).args(&args).current_dir(dir).output() {
         Ok(o) => o,
         Err(e) => {
             return RegenOutcome::Failed {
@@ -330,10 +383,19 @@ impl LockfileRegenResult {
 
 /// Regenerate all lockfiles for a manifest, returning a structured result.
 ///
+/// `changed` is the list of package names that `upd` just rewrote in the
+/// corresponding manifest. It is forwarded to each [`regenerate_lockfile`]
+/// call so ecosystems that support targeted commands only touch the packages
+/// that actually changed.
+///
 /// If no lockfiles are detected the caller is responsible for emitting the
 /// `note:` skip message; this function sets `no_lockfiles = true` to signal
 /// that.
-pub fn regenerate_lockfiles(manifest_path: &Path, verbose: bool) -> LockfileRegenResult {
+pub fn regenerate_lockfiles(
+    manifest_path: &Path,
+    changed: &[String],
+    verbose: bool,
+) -> LockfileRegenResult {
     let lockfiles = detect_lockfiles(manifest_path);
 
     if lockfiles.is_empty() {
@@ -345,7 +407,7 @@ pub fn regenerate_lockfiles(manifest_path: &Path, verbose: bool) -> LockfileRege
 
     let outcomes = lockfiles
         .into_iter()
-        .map(|lf| regenerate_lockfile(manifest_path, lf, verbose))
+        .map(|lf| regenerate_lockfile(manifest_path, lf, changed, verbose))
         .collect();
 
     LockfileRegenResult {
@@ -377,29 +439,104 @@ mod tests {
 
     #[test]
     fn test_lockfile_type_command() {
-        let (cmd, args) = LockfileType::PoetryLock.command();
+        let (cmd, args) = LockfileType::PoetryLock.command(&[]);
         assert_eq!(cmd, "poetry");
         assert_eq!(args, &["lock", "--no-update"]);
 
-        let (cmd, args) = LockfileType::UvLock.command();
+        let (cmd, args) = LockfileType::UvLock.command(&[]);
         assert_eq!(cmd, "uv");
         assert_eq!(args, &["lock"]);
+    }
 
-        let (cmd, args) = LockfileType::PackageLockJson.command();
+    #[test]
+    fn test_package_lock_json_uses_package_lock_only_flag() {
+        let (cmd, args) = LockfileType::PackageLockJson.command(&["react".to_string()]);
         assert_eq!(cmd, "npm");
-        assert_eq!(args, &["install"]);
+        assert_eq!(args, vec!["install", "--package-lock-only"]);
+    }
 
-        let (cmd, args) = LockfileType::BunLock.command();
-        assert_eq!(cmd, "bun");
-        assert_eq!(args, &["install"]);
+    #[test]
+    fn test_pnpm_lock_uses_lockfile_only_flag() {
+        let (cmd, args) = LockfileType::PnpmLock.command(&["react".to_string()]);
+        assert_eq!(cmd, "pnpm");
+        assert_eq!(args, vec!["install", "--lockfile-only"]);
+    }
 
-        let (cmd, args) = LockfileType::CargoLock.command();
+    #[test]
+    fn test_yarn_lock_uses_mode_update_lockfile_flag() {
+        // Yarn Berry (2+) supports --mode update-lockfile; it is the only
+        // documented flag that refreshes the lockfile without running install
+        // scripts.
+        let (cmd, args) = LockfileType::YarnLock.command(&["react".to_string()]);
+        assert_eq!(cmd, "yarn");
+        assert_eq!(args, vec!["install", "--mode", "update-lockfile"]);
+    }
+
+    #[test]
+    fn test_cargo_lock_passes_each_changed_package_to_update_p() {
+        let changed = vec!["serde".to_string(), "tokio".to_string()];
+        let (cmd, args) = LockfileType::CargoLock.command(&changed);
         assert_eq!(cmd, "cargo");
-        assert_eq!(args, &["update"]);
+        assert_eq!(args, vec!["update", "-p", "serde", "-p", "tokio"]);
+    }
 
-        let (cmd, args) = LockfileType::GoSum.command();
+    #[test]
+    fn test_cargo_lock_with_empty_changed_list_stays_workspace_broad() {
+        // Defensive: an empty changed list should never reach command() from the
+        // update path, but if it does (e.g. the `upd lock` subcommand) we emit the
+        // broad workspace update so nothing silently regresses.
+        let (cmd, args) = LockfileType::CargoLock.command(&[]);
+        assert_eq!(cmd, "cargo");
+        assert_eq!(args, vec!["update", "--workspace"]);
+    }
+
+    #[test]
+    fn test_gemfile_lock_uses_bundle_lock_update_with_changed_packages() {
+        let changed = vec!["rails".to_string(), "pg".to_string()];
+        let (cmd, args) = LockfileType::GemfileLock.command(&changed);
+        assert_eq!(cmd, "bundle");
+        assert_eq!(args, vec!["lock", "--update", "rails", "pg"]);
+    }
+
+    #[test]
+    fn test_gemfile_lock_with_empty_changed_list_uses_plain_bundle_lock() {
+        // Without targeted packages, `bundle lock --update` would bump every gem;
+        // we emit plain `bundle lock` (refreshes against the current Gemfile
+        // without bumping anything).
+        let (cmd, args) = LockfileType::GemfileLock.command(&[]);
+        assert_eq!(cmd, "bundle");
+        assert_eq!(args, vec!["lock"]);
+    }
+
+    #[test]
+    fn test_go_sum_falls_back_to_mod_tidy_regardless_of_changed_list() {
+        let (cmd, args) = LockfileType::GoSum.command(&["golang.org/x/net".to_string()]);
         assert_eq!(cmd, "go");
-        assert_eq!(args, &["mod", "tidy"]);
+        assert_eq!(args, vec!["mod", "tidy"]);
+    }
+
+    #[test]
+    fn test_packages_lock_json_falls_back_to_dotnet_restore() {
+        let (cmd, args) = LockfileType::PackagesLockJson.command(&["Newtonsoft.Json".to_string()]);
+        assert_eq!(cmd, "dotnet");
+        assert_eq!(args, vec!["restore"]);
+    }
+
+    #[test]
+    fn test_terraform_lock_falls_back_to_providers_lock() {
+        let (cmd, args) = LockfileType::TerraformLock.command(&["hashicorp/aws".to_string()]);
+        assert_eq!(cmd, "terraform");
+        assert_eq!(args, vec!["providers", "lock"]);
+    }
+
+    #[test]
+    fn test_bun_lock_uses_bun_install() {
+        // Bun does not have a stable lockfile-only mode; plain `install` is the
+        // minimum reliable form. Keeping the test pins the decision so changes
+        // here are intentional.
+        let (cmd, args) = LockfileType::BunLock.command(&["react".to_string()]);
+        assert_eq!(cmd, "bun");
+        assert_eq!(args, vec!["install"]);
     }
 
     #[test]
@@ -571,13 +708,6 @@ mod tests {
     }
 
     #[test]
-    fn test_lockfile_type_gemfile_command() {
-        let (cmd, args) = LockfileType::GemfileLock.command();
-        assert_eq!(cmd, "bundle");
-        assert_eq!(args, &["install"]);
-    }
-
-    #[test]
     fn test_lockfile_type_gemfile_manifest() {
         assert_eq!(LockfileType::GemfileLock.manifest(), "Gemfile");
     }
@@ -631,16 +761,6 @@ mod tests {
     }
 
     #[test]
-    fn test_lockfile_type_packages_lock_json_command() {
-        // .NET lockfiles are regenerated via `dotnet restore` (which
-        // rewrites `packages.lock.json` next to each .csproj when
-        // `RestorePackagesWithLockFile` is enabled).
-        let (cmd, args) = LockfileType::PackagesLockJson.command();
-        assert_eq!(cmd, "dotnet");
-        assert_eq!(args, &["restore"]);
-    }
-
-    #[test]
     fn test_detect_lockfiles_packages_lock_json_for_csproj() {
         let dir = tempdir().unwrap();
         let manifest = dir.path().join("App.csproj");
@@ -679,17 +799,6 @@ mod tests {
             LockfileType::TerraformLock.filename(),
             ".terraform.lock.hcl"
         );
-    }
-
-    #[test]
-    fn test_lockfile_type_terraform_lock_hcl_command() {
-        // Terraform's dependency-lock file is regenerated with
-        // `terraform providers lock -platform=...`. We use the bare form
-        // which updates the existing lock in-place for all platforms
-        // currently pinned.
-        let (cmd, args) = LockfileType::TerraformLock.command();
-        assert_eq!(cmd, "terraform");
-        assert_eq!(args, &["providers", "lock"]);
     }
 
     #[test]
@@ -743,7 +852,7 @@ mod tests {
         fs::write(&manifest, "{}").unwrap();
         // Deliberately do NOT create package-lock.json
 
-        let result = regenerate_lockfiles(&manifest, false);
+        let result = regenerate_lockfiles(&manifest, &[], false);
         assert!(
             result.no_lockfiles,
             "no_lockfiles should be true when no lockfile exists beside the manifest"
@@ -762,7 +871,7 @@ mod tests {
         fs::write(&manifest, "[package]").unwrap();
         // Deliberately do NOT create Cargo.lock
 
-        let result = regenerate_lockfiles(&manifest, false);
+        let result = regenerate_lockfiles(&manifest, &[], false);
         assert!(
             result.no_lockfiles,
             "no_lockfiles should be true when Cargo.lock is absent"
