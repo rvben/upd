@@ -134,7 +134,7 @@ pub fn compute_fix_plan(audit: &AuditResult) -> (HashMap<String, String>, Vec<(S
             .vulnerabilities
             .iter()
             .filter_map(|v| v.fixed_version.as_deref())
-            .max_by(|a, b| compare_fix_versions(a, b));
+            .max_by(|a, b| crate::version::compare::compare_versions(a, b));
 
         if let Some(version) = max_fixed {
             fixable.insert(name.clone(), version.to_string());
@@ -142,11 +142,6 @@ pub fn compute_fix_plan(audit: &AuditResult) -> (HashMap<String, String>, Vec<(S
     }
 
     (fixable, unfixable)
-}
-
-/// Compare two fix-version strings using the shared numeric-aware comparator.
-fn compare_fix_versions(a: &str, b: &str) -> std::cmp::Ordering {
-    crate::version::compare::compare_versions(a, b)
 }
 
 /// Return a sort key for a severity string such that Critical sorts first.
