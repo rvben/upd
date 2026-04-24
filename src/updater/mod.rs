@@ -4,7 +4,7 @@ mod gemfile;
 mod github_actions;
 mod go_mod;
 mod mise;
-pub mod npm_range;
+mod npm_range;
 mod package_json;
 mod pre_commit;
 mod pyproject;

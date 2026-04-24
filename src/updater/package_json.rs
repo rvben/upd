@@ -246,9 +246,61 @@ impl Updater for PackageJsonUpdater {
 
                         let (prefix, current_version) = self.extract_version_info(version_str);
 
-                        // Skip invalid versions
+                        // Route comparator-style specs through the range module.
+                        // These fail semver::Version::parse on the extracted token,
+                        // so they must be classified before the validity check below.
                         if semver::Version::parse(&current_version).is_err() {
-                            continue;
+                            use super::npm_range::{SpecShape, classify, rewrite_lower_bound};
+                            match classify(version_str) {
+                                SpecShape::SingleComparator | SpecShape::TwoComparatorRange => {
+                                    match registry
+                                        .get_latest_version_matching(package, version_str)
+                                        .await
+                                    {
+                                        Ok(matched) => {
+                                            if let Some(new_spec) =
+                                                rewrite_lower_bound(version_str, &matched)
+                                            {
+                                                if new_spec != version_str {
+                                                    let line_num =
+                                                        line_index.line_for(section, package);
+                                                    result.updated.push((
+                                                        package.clone(),
+                                                        version_str.to_string(),
+                                                        new_spec.clone(),
+                                                        line_num,
+                                                    ));
+                                                    new_content = self.update_version_in_content(
+                                                        &new_content,
+                                                        package,
+                                                        version_str,
+                                                        &new_spec,
+                                                    );
+                                                } else {
+                                                    result.unchanged += 1;
+                                                }
+                                            } else {
+                                                result.warnings.push(format!(
+                                                    "skipping range spec '{version_str}' for '{package}': no lower bound to bump"
+                                                ));
+                                            }
+                                        }
+                                        Err(e) => {
+                                            result.errors.push(format!("{}: {}", package, e));
+                                        }
+                                    }
+                                    continue;
+                                }
+                                SpecShape::Unsupported => {
+                                    result.warnings.push(format!(
+                                        "skipping unrecognised version spec '{version_str}' for '{package}'"
+                                    ));
+                                    continue;
+                                }
+                                SpecShape::ExactPin | SpecShape::CaretOrTilde => {
+                                    continue;
+                                }
+                            }
                         }
 
                         if options.is_package_filtered_out(package) {
@@ -1469,6 +1521,86 @@ mod tests {
             "version must remain unchanged"
         );
         assert!(!content.contains("2.0.0"), "must not promote to stable");
+    }
+
+    #[tokio::test]
+    async fn test_update_package_json_bumps_lower_bound_of_comparator_range() {
+        use crate::registry::MockRegistry;
+
+        let mut file = NamedTempFile::with_suffix(".json").unwrap();
+        write!(
+            file,
+            r#"{{
+  "dependencies": {{
+    "ranged": ">=1.0.0 <2.0.0"
+  }}
+}}"#
+        )
+        .unwrap();
+
+        let registry = MockRegistry::new("npm")
+            .with_version("ranged", "2.0.0")
+            .with_constrained("ranged", ">=1.0.0 <2.0.0", "1.5.0");
+
+        let updater = PackageJsonUpdater::new();
+        let options = UpdateOptions::new(false, false);
+
+        let result = updater
+            .update(file.path(), &registry, options)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            result.updated.len(),
+            1,
+            "expected comparator range to be updated"
+        );
+        assert_eq!(result.updated[0].0, "ranged");
+        assert_eq!(result.updated[0].1, ">=1.0.0 <2.0.0");
+        assert_eq!(result.updated[0].2, ">=1.5.0 <2.0.0");
+
+        let content = fs::read_to_string(file.path()).unwrap();
+        assert!(
+            content.contains("\">=1.5.0 <2.0.0\""),
+            "file must contain the rewritten range, got: {content}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_update_package_json_warns_on_unsupported_range_shape() {
+        use crate::registry::MockRegistry;
+
+        let mut file = NamedTempFile::with_suffix(".json").unwrap();
+        write!(
+            file,
+            r#"{{
+  "dependencies": {{
+    "orranged": "^1.0.0 || ^2.0.0"
+  }}
+}}"#
+        )
+        .unwrap();
+
+        let registry = MockRegistry::new("npm").with_version("orranged", "3.0.0");
+        let updater = PackageJsonUpdater::new();
+        let options = UpdateOptions::new(false, false);
+
+        let result = updater
+            .update(file.path(), &registry, options)
+            .await
+            .unwrap();
+
+        assert!(result.updated.is_empty(), "OR ranges must not be rewritten");
+        assert_eq!(
+            result.warnings.len(),
+            1,
+            "unsupported shape must surface a warning"
+        );
+        assert!(
+            result.warnings[0].contains("^1.0.0 || ^2.0.0"),
+            "warning should mention the offending spec: {}",
+            result.warnings[0]
+        );
     }
 
     /// Current stable package must still skip pre-releases (regression guard).

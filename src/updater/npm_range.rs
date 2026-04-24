@@ -87,6 +87,9 @@ pub fn rewrite_lower_bound(spec: &str, new_version: &str) -> Option<String> {
     if trimmed.is_empty() || trimmed.contains("||") || trimmed.contains(" - ") {
         return None;
     }
+    if new_version.trim().is_empty() {
+        return None;
+    }
 
     let tokens: Vec<&str> = trimmed.split_whitespace().collect();
     let rewrite_token = |tok: &str| -> Option<String> {
@@ -196,5 +199,27 @@ mod tests {
     fn rewrite_returns_none_for_unsupported_shapes() {
         assert!(rewrite_lower_bound("1.0.0 - 2.0.0", "1.5.0").is_none());
         assert!(rewrite_lower_bound("^1.0.0 || ^2.0.0", "2.5.0").is_none());
+    }
+
+    #[test]
+    fn rewrite_returns_none_for_empty_new_version() {
+        assert!(rewrite_lower_bound(">=1.0.0 <2.0.0", "").is_none());
+        assert!(rewrite_lower_bound(">=1.0.0", "   ").is_none());
+    }
+
+    #[test]
+    fn rewrite_handles_swapped_order_two_comparator_range() {
+        assert_eq!(
+            rewrite_lower_bound("<2.0.0 >=1.0.0", "1.5.0").as_deref(),
+            Some("<2.0.0 >=1.5.0")
+        );
+    }
+
+    #[test]
+    fn classify_two_comparator_range_with_prerelease_anchor() {
+        assert_eq!(
+            classify(">=1.0.0-beta <2.0.0"),
+            SpecShape::TwoComparatorRange
+        );
     }
 }
