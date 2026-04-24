@@ -50,30 +50,20 @@ impl RegenOutcome {
     }
 }
 
-/// Lockfile types and their associated commands
+/// Lockfile variants supported by `upd --lock`. See `command()` for the
+/// concrete invocation used per variant.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LockfileType {
-    /// poetry.lock - regenerated with `poetry lock --no-update`
     PoetryLock,
-    /// uv.lock - regenerated with `uv lock`
     UvLock,
-    /// package-lock.json - regenerated with `npm install`
     PackageLockJson,
-    /// yarn.lock - regenerated with `yarn install`
     YarnLock,
-    /// pnpm-lock.yaml - regenerated with `pnpm install`
     PnpmLock,
-    /// bun.lockb - regenerated with `bun install`
     BunLock,
-    /// Cargo.lock - regenerated with `cargo update`
     CargoLock,
-    /// go.sum - regenerated with `go mod tidy`
     GoSum,
-    /// Gemfile.lock - regenerated with `bundle install`
     GemfileLock,
-    /// packages.lock.json - regenerated with `dotnet restore`
     PackagesLockJson,
-    /// .terraform.lock.hcl - regenerated with `terraform providers lock`
     TerraformLock,
 }
 
