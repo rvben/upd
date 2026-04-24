@@ -144,42 +144,9 @@ pub fn compute_fix_plan(audit: &AuditResult) -> (HashMap<String, String>, Vec<(S
     (fixable, unfixable)
 }
 
-/// Compare two version strings for ordering, preferring semver but falling back
-/// to lexicographic comparison for non-semver ecosystems.
+/// Compare two fix-version strings using the shared numeric-aware comparator.
 fn compare_fix_versions(a: &str, b: &str) -> std::cmp::Ordering {
-    match (semver_parse(a), semver_parse(b)) {
-        (Some(va), Some(vb)) => va.cmp(&vb),
-        _ => a.cmp(b),
-    }
-}
-
-/// Parse a version string as semver, accepting an optional leading `v`.
-///
-/// Returns `(major, minor, patch, is_stable)` where `is_stable` is 1 for stable
-/// releases and 0 for pre-releases (e.g. `2.0.0-rc1`). This ensures stable
-/// versions beat pre-releases when all numeric components are equal.
-fn semver_parse(v: &str) -> Option<(u64, u64, u64, u8)> {
-    let v = v.trim_start_matches('v');
-    let parts: Vec<&str> = v.split('.').collect();
-    if parts.len() < 2 {
-        return None;
-    }
-    let major: u64 = parts[0].parse().ok()?;
-    let minor: u64 = parts[1].parse().ok()?;
-    // Patch may carry a pre-release or build suffix (e.g. "0-rc1", "3+build1").
-    // Take only the leading digit run so "0-rc1" → patch=0, rest="-rc1".
-    let patch_part = parts.get(2).copied().unwrap_or("0");
-    let (patch_digits, rest) = patch_part
-        .split_once(|c: char| !c.is_ascii_digit())
-        .unwrap_or((patch_part, ""));
-    let patch: u64 = if patch_digits.is_empty() {
-        0
-    } else {
-        patch_digits.parse().ok()?
-    };
-    // Stability flag: 1 = stable, 0 = pre-release. Stable wins ties.
-    let is_stable: u8 = if rest.is_empty() { 1 } else { 0 };
-    Some((major, minor, patch, is_stable))
+    crate::version::compare::compare_versions(a, b)
 }
 
 /// Return a sort key for a severity string such that Critical sorts first.
@@ -856,6 +823,43 @@ mod tests {
         };
         let (fixable, _) = compute_fix_plan(&audit);
         assert_eq!(fixable.get("pkg").map(|s| s.as_str()), Some("2.10.0"));
+    }
+
+    #[test]
+    fn test_compute_fix_plan_picks_numerically_highest_non_semver_fix() {
+        // Regression test for 4-segment versions (e.g. Ruby or multi-segment tags)
+        // where the legacy `semver_parse` dropped the 4th segment, making
+        // `1.0.0.10` and `1.0.0.9` compare equal. `max_by` then returned the
+        // *last* element, so the answer depended on fix_version ordering.
+        //
+        // The correct "minimum safe fix" must order by full numeric value.
+        let mut audit = AuditResult::default();
+        audit.vulnerable.push(PackageAuditResult {
+            package: Package {
+                name: "pkg".to_string(),
+                version: "1.0.0.1".to_string(),
+                ecosystem: Ecosystem::RubyGems,
+            },
+            vulnerabilities: vec![
+                Vulnerability {
+                    id: "CVE-A".to_string(),
+                    summary: None,
+                    severity: None,
+                    url: None,
+                    fixed_version: Some("1.0.0.10".to_string()),
+                },
+                Vulnerability {
+                    id: "CVE-B".to_string(),
+                    summary: None,
+                    severity: None,
+                    url: None,
+                    fixed_version: Some("1.0.0.9".to_string()),
+                },
+            ],
+        });
+
+        let (fixable, _) = compute_fix_plan(&audit);
+        assert_eq!(fixable.get("pkg").map(String::as_str), Some("1.0.0.10"));
     }
 
     // ─── check_packages_cached unit tests ────────────────────────────────────
