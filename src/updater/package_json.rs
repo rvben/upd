@@ -260,23 +260,68 @@ impl Updater for PackageJsonUpdater {
                             ));
                             continue;
                         }
+
+                        // Classify the spec once so both the pinned branch and the
+                        // comparator branch below can use the same shape without
+                        // re-parsing the string.
+                        let spec_shape = classify(version_str);
+
                         if let Some(pinned_version) = options.get_pinned_version(package) {
-                            pinned_packages.push((
-                                section.to_string(),
-                                package.clone(),
-                                version_str.to_string(),
-                                prefix,
-                                current_version,
-                                pinned_version.to_string(),
-                            ));
-                            continue;
+                            match spec_shape {
+                                SpecShape::SingleComparator | SpecShape::TwoComparatorRange => {
+                                    // Rewrite the lower bound of the range to the pinned
+                                    // version while preserving the upper bound.  We bypass
+                                    // pinned_packages because its later loop uses
+                                    // match_version_precision on the extracted current_version
+                                    // token, which is garbage for comparator specs.
+                                    if let Some(new_spec) =
+                                        rewrite_lower_bound(version_str, pinned_version)
+                                    {
+                                        if new_spec != version_str {
+                                            let line_num = line_index.line_for(section, package);
+                                            result.pinned.push((
+                                                package.clone(),
+                                                version_str.to_string(),
+                                                new_spec.clone(),
+                                                line_num,
+                                            ));
+                                            new_content = self.update_version_in_content(
+                                                &new_content,
+                                                package,
+                                                version_str,
+                                                &new_spec,
+                                            );
+                                        } else {
+                                            result.unchanged += 1;
+                                        }
+                                    } else {
+                                        result.warnings.push(format!(
+                                            "cannot pin range spec '{version_str}' for '{package}': no lower bound to rewrite"
+                                        ));
+                                    }
+                                    continue;
+                                }
+                                _ => {
+                                    // Non-comparator specs go through the standard
+                                    // pinned_packages flow (processed after the loop).
+                                    pinned_packages.push((
+                                        section.to_string(),
+                                        package.clone(),
+                                        version_str.to_string(),
+                                        prefix,
+                                        current_version,
+                                        pinned_version.to_string(),
+                                    ));
+                                    continue;
+                                }
+                            }
                         }
 
                         // Route comparator-style specs through the range module.
                         // These fail semver::Version::parse on the extracted token,
                         // so they must be classified before the validity check below.
                         if semver::Version::parse(&current_version).is_err() {
-                            match classify(version_str) {
+                            match spec_shape {
                                 SpecShape::SingleComparator | SpecShape::TwoComparatorRange => {
                                     match registry
                                         .get_latest_version_matching(package, version_str)
@@ -1757,9 +1802,9 @@ mod tests {
     #[tokio::test]
     async fn test_update_package_json_comparator_range_respects_cooldown() {
         use crate::cooldown::CooldownPolicy;
-        use chrono::{Duration, TimeZone, Utc};
+        use chrono::{Duration, Utc};
 
-        let now = Utc.with_ymd_and_hms(2026, 4, 24, 12, 0, 0).unwrap();
+        let now = Utc::now();
 
         let mut file = NamedTempFile::with_suffix(".json").unwrap();
         write!(
@@ -1813,6 +1858,63 @@ mod tests {
         assert!(
             content.contains("\">=1.0.0 <2.0.0\""),
             "file must be unchanged when cooldown prevents the update, got: {content}"
+        );
+    }
+
+    /// Regression: pinning a comparator-range spec must preserve the upper bound.
+    ///
+    /// Before the fix, the pinned_packages loop would call match_version_precision on
+    /// the garbage token produced by extract_version_info for ">=1.0.0 <2.0.0", causing
+    /// the upper bound to be silently dropped (result: ">=1.5.0" instead of
+    /// ">=1.5.0 <2.0.0").
+    #[tokio::test]
+    async fn test_update_package_json_pinned_comparator_range_preserves_upper_bound() {
+        use crate::config::UpdConfig;
+        use std::sync::Arc;
+
+        let mut file = NamedTempFile::with_suffix(".json").unwrap();
+        write!(
+            file,
+            r#"{{
+  "dependencies": {{
+    "ranged": ">=1.0.0 <2.0.0"
+  }}
+}}"#
+        )
+        .unwrap();
+
+        let registry = MockRegistry::new("npm").with_version("ranged", "2.0.0");
+
+        let mut pin = std::collections::HashMap::new();
+        pin.insert("ranged".to_string(), "1.5.0".to_string());
+        let config = UpdConfig {
+            ignore: Vec::new(),
+            pin,
+            cooldown: None,
+        };
+        let options = UpdateOptions::new(false, false).with_config(Arc::new(config));
+
+        let updater = PackageJsonUpdater::new();
+        let result = updater
+            .update(file.path(), &registry, options)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            result.pinned.len(),
+            1,
+            "pinned comparator range must be recorded"
+        );
+        assert_eq!(result.pinned[0].0, "ranged");
+        assert_eq!(
+            result.pinned[0].2, ">=1.5.0 <2.0.0",
+            "upper bound must be preserved"
+        );
+
+        let content = fs::read_to_string(file.path()).unwrap();
+        assert!(
+            content.contains("\">=1.5.0 <2.0.0\""),
+            "file must preserve upper bound, got: {content}"
         );
     }
 }
