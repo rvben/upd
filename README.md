@@ -747,6 +747,33 @@ Global flags (accepted on every subcommand):
 
 Subcommands: `update` (default), `align`, `audit`, `clean-cache`, `self-update`.
 
+#### Commands run by `--lock`
+
+`upd --lock` runs the narrowest per-ecosystem refresh command that
+updates only the packages `upd` just rewrote. Targeted forms are used
+wherever the package manager supports them; targeting falls back to
+`--lockfile-only` flags where no per-package form exists; otherwise
+the manifest-wide refresh command is used.
+
+| Ecosystem | Lockfile                 | Command                                        |
+|-----------|--------------------------|------------------------------------------------|
+| Python    | `poetry.lock`            | `poetry lock --no-update`                      |
+| Python    | `uv.lock`                | `uv lock`                                      |
+| Node      | `package-lock.json`      | `npm install --package-lock-only`              |
+| Node      | `yarn.lock`              | `yarn install --mode update-lockfile`          |
+| Node      | `pnpm-lock.yaml`         | `pnpm install --lockfile-only`                 |
+| Node      | `bun.lockb`              | `bun install`                                  |
+| Rust      | `Cargo.lock`             | `cargo update -p <changed> -p <changed> …`     |
+| Go        | `go.sum`                 | `go mod tidy` (no targeted form)               |
+| Ruby      | `Gemfile.lock`           | `bundle lock --update <changed> …`             |
+| .NET      | `packages.lock.json`     | `dotnet restore` (no targeted form)            |
+| Terraform | `.terraform.lock.hcl`    | `terraform providers lock` (no targeted form)  |
+
+Manifests whose `upd` pass produced zero changes have their lockfile
+refresh skipped entirely. A directory where only config pins were
+applied is still refreshed, and the changed-package list includes
+those pinned packages so `cargo update -p <pkg>` / `bundle lock --update <pkg>` stay scoped.
+
 Stable `audit`-specific flags:
 
 | Flag | Purpose |
