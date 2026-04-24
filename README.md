@@ -760,7 +760,7 @@ the manifest-wide refresh command is used.
 | Python    | `poetry.lock`            | `poetry lock --no-update`                      |
 | Python    | `uv.lock`                | `uv lock`                                      |
 | Node      | `package-lock.json`      | `npm install --package-lock-only`              |
-| Node      | `yarn.lock`              | `yarn install --mode update-lockfile`          |
+| Node      | `yarn.lock`              | `yarn install --mode update-lockfile` (Yarn 2+)|
 | Node      | `pnpm-lock.yaml`         | `pnpm install --lockfile-only`                 |
 | Node      | `bun.lockb`              | `bun install`                                  |
 | Rust      | `Cargo.lock`             | `cargo update -p <changed> -p <changed> …`     |

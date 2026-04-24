@@ -103,6 +103,10 @@ impl LockfileType {
                 "npm",
                 vec!["install".to_string(), "--package-lock-only".to_string()],
             ),
+            // Yarn Berry (v2+) only: `--mode update-lockfile` is the only
+            // documented form that refreshes `yarn.lock` without running
+            // install scripts. Yarn 1 (Classic) does not accept `--mode` and
+            // will error; Yarn 1 reached EOL in 2023 and is unsupported here.
             LockfileType::YarnLock => (
                 "yarn",
                 vec![
@@ -293,7 +297,7 @@ pub fn tool_available(tool: &str) -> bool {
 ///
 /// Returns a [`RegenOutcome`] distinguishing success, missing tool, and
 /// command failure.
-pub fn regenerate_lockfile(
+pub(crate) fn regenerate_lockfile(
     manifest_path: &Path,
     lockfile_type: LockfileType,
     changed: &[String],
