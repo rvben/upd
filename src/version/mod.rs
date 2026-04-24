@@ -1,3 +1,4 @@
+pub mod compare;
 pub mod pep440;
 pub mod semver_util;
 pub mod tag;
