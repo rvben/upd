@@ -6,6 +6,7 @@ use anyhow::{Result, anyhow};
 use chrono::{DateTime, Duration, Utc};
 
 use crate::registry::VersionMeta;
+use crate::version::compare::compare_versions;
 
 /// Parse a cooldown duration string.
 ///
@@ -235,46 +236,6 @@ pub fn select(
     // Nothing in the candidate list was old enough.
     CooldownDecision::Skip {
         latest_too_new: top.clone(),
-    }
-}
-
-/// Version comparison: try semver first, fall back to numeric-aware segment
-/// comparison.
-///
-/// The fallback splits on `.` and `-` and compares integer segments as numbers
-/// (so `1.10 > 1.9` and `v0.10.0.0 > v0.9.0.0`). Lexicographic string compare
-/// would get those wrong, which breaks selection across non-strict-semver
-/// ecosystems like PyPI and multi-segment GitHub tags.
-fn compare_versions(a: &str, b: &str) -> std::cmp::Ordering {
-    let stripped_a = a.strip_prefix('v').unwrap_or(a);
-    let stripped_b = b.strip_prefix('v').unwrap_or(b);
-    if let (Ok(va), Ok(vb)) = (
-        semver::Version::parse(stripped_a),
-        semver::Version::parse(stripped_b),
-    ) {
-        return va.cmp(&vb);
-    }
-    compare_loose(stripped_a, stripped_b)
-}
-
-fn compare_loose(a: &str, b: &str) -> std::cmp::Ordering {
-    let mut a_parts = a.split(['.', '-']);
-    let mut b_parts = b.split(['.', '-']);
-    loop {
-        match (a_parts.next(), b_parts.next()) {
-            (None, None) => return std::cmp::Ordering::Equal,
-            (None, Some(_)) => return std::cmp::Ordering::Less,
-            (Some(_), None) => return std::cmp::Ordering::Greater,
-            (Some(x), Some(y)) => {
-                let ord = match (x.parse::<u64>(), y.parse::<u64>()) {
-                    (Ok(nx), Ok(ny)) => nx.cmp(&ny),
-                    _ => x.cmp(y),
-                };
-                if ord != std::cmp::Ordering::Equal {
-                    return ord;
-                }
-            }
-        }
     }
 }
 

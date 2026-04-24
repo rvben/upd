@@ -5,7 +5,7 @@
 /// (so `1.10 > 1.9` and `v0.10.0.0 > v0.9.0.0`). Lexicographic string compare
 /// would get those wrong, which breaks selection across non-strict-semver
 /// ecosystems like PyPI and multi-segment GitHub tags.
-pub fn compare_versions(a: &str, b: &str) -> std::cmp::Ordering {
+pub(crate) fn compare_versions(a: &str, b: &str) -> std::cmp::Ordering {
     let stripped_a = a.strip_prefix('v').unwrap_or(a);
     let stripped_b = b.strip_prefix('v').unwrap_or(b);
     if let (Ok(va), Ok(vb)) = (
@@ -17,7 +17,9 @@ pub fn compare_versions(a: &str, b: &str) -> std::cmp::Ordering {
     compare_loose(stripped_a, stripped_b)
 }
 
-pub fn compare_loose(a: &str, b: &str) -> std::cmp::Ordering {
+/// Compare two version strings segment-by-segment, parsing each segment as `u64`
+/// when possible and falling back to lexicographic string compare per segment.
+pub(crate) fn compare_loose(a: &str, b: &str) -> std::cmp::Ordering {
     let mut a_parts = a.split(['.', '-']);
     let mut b_parts = b.split(['.', '-']);
     loop {
@@ -57,7 +59,7 @@ mod tests {
     }
 
     #[test]
-    fn test_compare_loose_four_segment_numeric() {
+    fn test_compare_versions_four_segment_numeric() {
         // Canonical bug repro: four-segment versions that semver can't parse.
         // Lexicographic compare would return Less ("10" < "9"), numeric gives Greater.
         assert_eq!(compare_versions("1.0.0.10", "1.0.0.9"), Ordering::Greater);
@@ -69,7 +71,7 @@ mod tests {
     }
 
     #[test]
-    fn test_compare_loose_non_numeric_segments() {
+    fn test_compare_versions_non_numeric_segments() {
         // Forces the loose path: non-semver versions with string + numeric segments.
         // "abc" compares equal lexicographically, then numeric segment 1 < 2.
         assert_eq!(compare_versions("abc.1", "abc.2"), Ordering::Less);
