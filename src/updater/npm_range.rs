@@ -122,6 +122,25 @@ pub fn rewrite_lower_bound(spec: &str, new_version: &str) -> Option<String> {
     }
 }
 
+/// Extract the version anchor from the first lower-bound comparator (`>=` or `>`)
+/// found in `spec`.
+///
+/// For `">=1.0.0 <2.0.0"` returns `Some("1.0.0")`.
+/// For `">=1.0.0"` returns `Some("1.0.0")`.
+/// For upper-only specs like `"<3"` or `"<=2.0.0"` returns `None`.
+///
+/// The returned slice points into the original `spec` string.
+pub fn lower_bound_anchor(spec: &str) -> Option<&str> {
+    for tok in spec.split_whitespace() {
+        if let Some(rest) = tok.strip_prefix(">=").or_else(|| tok.strip_prefix('>'))
+            && !rest.is_empty()
+        {
+            return Some(rest);
+        }
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -221,5 +240,18 @@ mod tests {
             classify(">=1.0.0-beta <2.0.0"),
             SpecShape::TwoComparatorRange
         );
+    }
+
+    #[test]
+    fn lower_bound_anchor_extracts_from_two_comparator_range() {
+        assert_eq!(lower_bound_anchor(">=1.0.0 <2.0.0"), Some("1.0.0"));
+        assert_eq!(lower_bound_anchor(">1.0.0 <2.0.0"), Some("1.0.0"));
+        assert_eq!(lower_bound_anchor("<2.0.0 >=1.0.0"), Some("1.0.0"));
+    }
+
+    #[test]
+    fn lower_bound_anchor_returns_none_for_upper_only_specs() {
+        assert_eq!(lower_bound_anchor("<3"), None);
+        assert_eq!(lower_bound_anchor("<=2.0.0"), None);
     }
 }

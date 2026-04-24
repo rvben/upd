@@ -1,3 +1,4 @@
+use super::npm_range::{SpecShape, classify, lower_bound_anchor, rewrite_lower_bound};
 use super::{
     FileType, ParsedDependency, UpdateOptions, UpdateResult, Updater, downgrade_warning,
     read_file_safe, write_file_atomic,
@@ -246,11 +247,35 @@ impl Updater for PackageJsonUpdater {
 
                         let (prefix, current_version) = self.extract_version_info(version_str);
 
+                        // Apply config guards uniformly before any per-shape routing.
+                        if options.is_package_filtered_out(package) {
+                            result.unchanged += 1;
+                            continue;
+                        }
+                        if options.should_ignore(package) {
+                            ignored_packages.push((
+                                section.to_string(),
+                                package.clone(),
+                                current_version,
+                            ));
+                            continue;
+                        }
+                        if let Some(pinned_version) = options.get_pinned_version(package) {
+                            pinned_packages.push((
+                                section.to_string(),
+                                package.clone(),
+                                version_str.to_string(),
+                                prefix,
+                                current_version,
+                                pinned_version.to_string(),
+                            ));
+                            continue;
+                        }
+
                         // Route comparator-style specs through the range module.
                         // These fail semver::Version::parse on the extracted token,
                         // so they must be classified before the validity check below.
                         if semver::Version::parse(&current_version).is_err() {
-                            use super::npm_range::{SpecShape, classify, rewrite_lower_bound};
                             match classify(version_str) {
                                 SpecShape::SingleComparator | SpecShape::TwoComparatorRange => {
                                     match registry
@@ -258,35 +283,113 @@ impl Updater for PackageJsonUpdater {
                                         .await
                                     {
                                         Ok(matched) => {
-                                            if let Some(new_spec) =
-                                                rewrite_lower_bound(version_str, &matched)
-                                            {
-                                                if new_spec != version_str {
-                                                    let line_num =
-                                                        line_index.line_for(section, package);
-                                                    result.updated.push((
-                                                        package.clone(),
-                                                        version_str.to_string(),
-                                                        new_spec.clone(),
-                                                        line_num,
-                                                    ));
-                                                    new_content = self.update_version_in_content(
-                                                        &new_content,
-                                                        package,
-                                                        version_str,
-                                                        &new_spec,
-                                                    );
-                                                } else {
-                                                    result.unchanged += 1;
+                                            // Apply cooldown using the lower-bound anchor as
+                                            // the current-version proxy and the original spec
+                                            // as the constraint so selection stays in-range.
+                                            // held_back_info carries skipped info if cooldown
+                                            // chose an older version; it is pushed to
+                                            // result.held_back only after the update is confirmed.
+                                            let (effective_version, held_back_info) =
+                                                if let Some(anchor) =
+                                                    lower_bound_anchor(version_str)
+                                                {
+                                                    let anchor_is_pre =
+                                                        is_prerelease_semver(anchor);
+                                                    let (outcome, note) =
+                                                        crate::updater::apply_cooldown(
+                                                            registry,
+                                                            package,
+                                                            anchor,
+                                                            &matched,
+                                                            Some(version_str),
+                                                            anchor_is_pre,
+                                                            &options,
+                                                        )
+                                                        .await;
+                                                    if let Some(msg) = note {
+                                                        options.note_cooldown_unavailable(&msg);
+                                                    }
+                                                    match outcome {
+                                                    crate::updater::CooldownOutcome::Unchanged(
+                                                        v,
+                                                    ) => (Some(v), None),
+                                                    crate::updater::CooldownOutcome::HeldBack {
+                                                        chosen,
+                                                        skipped_version,
+                                                        skipped_published_at,
+                                                    } => (
+                                                        Some(chosen),
+                                                        Some((
+                                                            skipped_version,
+                                                            skipped_published_at,
+                                                        )),
+                                                    ),
+                                                    crate::updater::CooldownOutcome::Skipped {
+                                                        skipped_version,
+                                                        skipped_published_at,
+                                                    } => {
+                                                        result.skipped_by_cooldown.push((
+                                                            package.clone(),
+                                                            version_str.to_string(),
+                                                            skipped_version,
+                                                            skipped_published_at,
+                                                        ));
+                                                        (None, None)
+                                                    }
                                                 }
-                                            } else {
-                                                result.warnings.push(format!(
-                                                    "skipping range spec '{version_str}' for '{package}': no lower bound to bump"
-                                                ));
+                                                } else {
+                                                    // No lower bound anchor — no cooldown possible,
+                                                    // proceed with the matched version directly.
+                                                    (Some(matched), None)
+                                                };
+
+                                            if let Some(effective) = effective_version {
+                                                if let Some(new_spec) =
+                                                    rewrite_lower_bound(version_str, &effective)
+                                                {
+                                                    if new_spec != version_str {
+                                                        let line_num =
+                                                            line_index.line_for(section, package);
+                                                        result.updated.push((
+                                                            package.clone(),
+                                                            version_str.to_string(),
+                                                            new_spec.clone(),
+                                                            line_num,
+                                                        ));
+                                                        if let Some((
+                                                            skipped_version,
+                                                            skipped_published_at,
+                                                        )) = held_back_info
+                                                        {
+                                                            result.held_back.push((
+                                                                package.clone(),
+                                                                version_str.to_string(),
+                                                                new_spec.clone(),
+                                                                skipped_version,
+                                                                skipped_published_at,
+                                                            ));
+                                                        }
+                                                        new_content = self
+                                                            .update_version_in_content(
+                                                                &new_content,
+                                                                package,
+                                                                version_str,
+                                                                &new_spec,
+                                                            );
+                                                    } else {
+                                                        result.unchanged += 1;
+                                                    }
+                                                } else {
+                                                    result.warnings.push(format!(
+                                                        "skipping range spec '{version_str}' for '{package}': no lower bound to bump"
+                                                    ));
+                                                }
                                             }
+                                            // If effective_version is None the cooldown Skipped
+                                            // branch already pushed to skipped_by_cooldown.
                                         }
                                         Err(e) => {
-                                            result.errors.push(format!("{}: {}", package, e));
+                                            result.warnings.push(format!("{package}: {e}"));
                                         }
                                     }
                                     continue;
@@ -301,34 +404,6 @@ impl Updater for PackageJsonUpdater {
                                     continue;
                                 }
                             }
-                        }
-
-                        if options.is_package_filtered_out(package) {
-                            result.unchanged += 1;
-                            continue;
-                        }
-
-                        // Check if package should be ignored
-                        if options.should_ignore(package) {
-                            ignored_packages.push((
-                                section.to_string(),
-                                package.clone(),
-                                current_version,
-                            ));
-                            continue;
-                        }
-
-                        // Check if package has a pinned version
-                        if let Some(pinned_version) = options.get_pinned_version(package) {
-                            pinned_packages.push((
-                                section.to_string(),
-                                package.clone(),
-                                version_str.to_string(),
-                                prefix,
-                                current_version,
-                                pinned_version.to_string(),
-                            ));
-                            continue;
                         }
 
                         packages_to_check.push((
@@ -1633,5 +1708,111 @@ mod tests {
         let content = fs::read_to_string(file.path()).unwrap();
         assert!(content.contains("^2.0.0"));
         assert!(!content.contains("3.0.0-rc.1"));
+    }
+
+    /// Regression: a comparator-range spec for an ignored package must not be rewritten.
+    #[tokio::test]
+    async fn test_update_package_json_respects_ignore_for_comparator_range() {
+        use crate::config::UpdConfig;
+        use std::sync::Arc;
+
+        let mut file = NamedTempFile::with_suffix(".json").unwrap();
+        write!(
+            file,
+            r#"{{
+  "dependencies": {{
+    "ranged": ">=1.0.0 <2.0.0"
+  }}
+}}"#
+        )
+        .unwrap();
+
+        let registry = MockRegistry::new("npm")
+            .with_version("ranged", "2.0.0")
+            .with_constrained("ranged", ">=1.0.0 <2.0.0", "1.5.0");
+
+        let config = UpdConfig {
+            ignore: vec!["ranged".to_string()],
+            pin: std::collections::HashMap::new(),
+            cooldown: None,
+        };
+        let options = UpdateOptions::new(false, false).with_config(Arc::new(config));
+
+        let updater = PackageJsonUpdater::new();
+        let result = updater
+            .update(file.path(), &registry, options)
+            .await
+            .unwrap();
+
+        assert!(
+            result.updated.is_empty(),
+            "ignored package must not be updated"
+        );
+        assert_eq!(result.ignored.len(), 1, "ignored package must be recorded");
+        assert_eq!(result.ignored[0].0, "ranged");
+    }
+
+    /// Regression: a fresh comparator-range release within the cooldown window must not
+    /// bump the spec's lower bound.
+    #[tokio::test]
+    async fn test_update_package_json_comparator_range_respects_cooldown() {
+        use crate::cooldown::CooldownPolicy;
+        use chrono::{Duration, TimeZone, Utc};
+
+        let now = Utc.with_ymd_and_hms(2026, 4, 24, 12, 0, 0).unwrap();
+
+        let mut file = NamedTempFile::with_suffix(".json").unwrap();
+        write!(
+            file,
+            r#"{{
+  "dependencies": {{
+    "ranged": ">=1.0.0 <2.0.0"
+  }}
+}}"#
+        )
+        .unwrap();
+
+        // Latest matching version was published just 1 day ago — inside a 7-day cooldown.
+        let registry = MockRegistry::new("npm")
+            .with_version("ranged", "2.0.0")
+            .with_constrained("ranged", ">=1.0.0 <2.0.0", "1.5.0")
+            .with_version_meta(
+                "ranged",
+                "1.5.0",
+                Some(now - Duration::days(1)),
+                false,
+                false,
+            );
+
+        let policy = CooldownPolicy {
+            default: Duration::days(7),
+            per_ecosystem: std::collections::HashMap::new(),
+            force_override: None,
+        };
+
+        let updater = PackageJsonUpdater::new();
+        let options = UpdateOptions::new(false, false).with_cooldown_policy(policy, now);
+
+        let result = updater
+            .update(file.path(), &registry, options)
+            .await
+            .unwrap();
+
+        assert!(
+            result.updated.is_empty(),
+            "spec must not be rewritten when the only candidate is inside the cooldown window"
+        );
+        assert_eq!(
+            result.skipped_by_cooldown.len(),
+            1,
+            "fresh release must be recorded in skipped_by_cooldown"
+        );
+        assert_eq!(result.skipped_by_cooldown[0].0, "ranged");
+
+        let content = fs::read_to_string(file.path()).unwrap();
+        assert!(
+            content.contains("\">=1.0.0 <2.0.0\""),
+            "file must be unchanged when cooldown prevents the update, got: {content}"
+        );
     }
 }
