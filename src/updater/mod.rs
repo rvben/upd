@@ -474,7 +474,7 @@ pub async fn apply_cooldown(
     current: &str,
     latest: &str,
     constraints: Option<&str>,
-    include_prereleases: bool,
+    current_is_prerelease: bool,
     options: &UpdateOptions,
 ) -> (CooldownOutcome, Option<String>) {
     let ecosystem = registry.name();
@@ -501,8 +501,9 @@ pub async fn apply_cooldown(
     match select(
         &versions,
         current,
+        latest,
         constraints,
-        include_prereleases,
+        current_is_prerelease,
         cooldown,
         now,
     ) {

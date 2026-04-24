@@ -116,11 +116,23 @@ pub struct HeldBackInfo {
 ///
 /// Precondition: the caller has already determined an update is available
 /// (current version is not the latest).
+///
+/// `latest` is the version the caller resolved via the registry's
+/// ecosystem-aware logic. It matters when `constraints` is provided but not
+/// parseable as semver: we then refuse to hold back to an arbitrary older
+/// version (we cannot prove it satisfies the constraint) and either accept
+/// `latest` if it is old enough or skip entirely.
+///
+/// `current_is_prerelease` pins the track: when the current version is a
+/// prerelease we admit only prerelease candidates, otherwise only stable ones.
+/// This prevents cooldown from silently promoting a prerelease dependency to a
+/// stable release, which the outer updater explicitly disallows.
 pub fn select(
     versions: &[VersionMeta],
     current: &str,
+    latest: &str,
     constraints: Option<&str>,
-    include_prereleases: bool,
+    current_is_prerelease: bool,
     cooldown: Duration,
     now: DateTime<Utc>,
 ) -> CooldownDecision {
@@ -129,20 +141,46 @@ pub fn select(
         return CooldownDecision::Unsupported;
     }
 
+    // PEP 440 exact pins (`==X`, `===X`) and semver exact pins (`=X`) are the
+    // current version rather than a real upper/lower bound — the outer updater
+    // rewrites them on update. Drop them here so they don't spuriously force
+    // the constraint-unparseable path or reject every candidate.
+    let constraints = constraints.and_then(strip_exact_pin);
+
     // First entry in the raw input list (including potentially yanked versions),
     // used as the diagnostic anchor in Skip when no non-yanked candidates remain.
     let raw_top = versions.first().cloned();
 
-    // Filter: yanked, prerelease, constraints, newer than current.
-    let mut candidates: Vec<&VersionMeta> = versions
-        .iter()
-        .filter(|v| !v.yanked)
-        .filter(|v| include_prereleases || !v.prerelease)
-        .filter(|v| satisfies_constraint(&v.version, constraints))
-        .filter(|v| is_newer(&v.version, current))
-        .collect();
+    // When the constraint is provided but cannot be evaluated with semver
+    // syntax (PyPI `~=1.4`, Ruby `~> 7.1`, etc.), we cannot prove any older
+    // version satisfies it. The caller already resolved a constraint-satisfying
+    // `latest`, so restrict candidates to exactly that version — either it is
+    // old enough to ship, or we skip.
+    let constraint_unparseable = match constraints {
+        Some(spec) => semver::VersionReq::parse(spec).is_err(),
+        None => false,
+    };
 
-    // Sort descending by version (best-effort semver; fall back to string).
+    // Filter: yanked, track, constraints, newer than current.
+    let mut candidates: Vec<&VersionMeta> = if constraint_unparseable {
+        versions
+            .iter()
+            .filter(|v| v.version == latest)
+            .filter(|v| !v.yanked)
+            .filter(|v| v.prerelease == current_is_prerelease)
+            .collect()
+    } else {
+        versions
+            .iter()
+            .filter(|v| !v.yanked)
+            .filter(|v| v.prerelease == current_is_prerelease)
+            .filter(|v| satisfies_constraint(&v.version, constraints))
+            .filter(|v| is_newer(&v.version, current))
+            .collect()
+    };
+
+    // Sort descending by version (best-effort semver; fall back to numeric-aware
+    // segment compare for non-semver ecosystems).
     candidates.sort_by(|a, b| compare_versions(&b.version, &a.version));
 
     // Empty after filtering => Skip with diagnostic top.
@@ -200,25 +238,43 @@ pub fn select(
     }
 }
 
-/// Version comparison: try semver first, fall back to lexicographic.
+/// Version comparison: try semver first, fall back to numeric-aware segment
+/// comparison.
 ///
-/// `upd` already has ecosystem-specific comparators in `src/align.rs` and
-/// `src/version/`. For cooldown selection we use a generic comparator here:
-/// the caller guarantees we are comparing versions within the same ecosystem,
-/// and for most registries semver is accurate enough. Edge cases (PEP 440
-/// pre-releases, Go `+incompatible`, etc.) affect the *ordering* of the
-/// filtered list, not whether cooldown fires — worst case we select a
-/// slightly different version than the existing `get_latest_version*`, which
-/// the caller reconciles by using `select`'s chosen version when it differs.
+/// The fallback splits on `.` and `-` and compares integer segments as numbers
+/// (so `1.10 > 1.9` and `v0.10.0.0 > v0.9.0.0`). Lexicographic string compare
+/// would get those wrong, which breaks selection across non-strict-semver
+/// ecosystems like PyPI and multi-segment GitHub tags.
 fn compare_versions(a: &str, b: &str) -> std::cmp::Ordering {
     let stripped_a = a.strip_prefix('v').unwrap_or(a);
     let stripped_b = b.strip_prefix('v').unwrap_or(b);
-    match (
+    if let (Ok(va), Ok(vb)) = (
         semver::Version::parse(stripped_a),
         semver::Version::parse(stripped_b),
     ) {
-        (Ok(va), Ok(vb)) => va.cmp(&vb),
-        _ => a.cmp(b),
+        return va.cmp(&vb);
+    }
+    compare_loose(stripped_a, stripped_b)
+}
+
+fn compare_loose(a: &str, b: &str) -> std::cmp::Ordering {
+    let mut a_parts = a.split(['.', '-']);
+    let mut b_parts = b.split(['.', '-']);
+    loop {
+        match (a_parts.next(), b_parts.next()) {
+            (None, None) => return std::cmp::Ordering::Equal,
+            (None, Some(_)) => return std::cmp::Ordering::Less,
+            (Some(_), None) => return std::cmp::Ordering::Greater,
+            (Some(x), Some(y)) => {
+                let ord = match (x.parse::<u64>(), y.parse::<u64>()) {
+                    (Ok(nx), Ok(ny)) => nx.cmp(&ny),
+                    _ => x.cmp(y),
+                };
+                if ord != std::cmp::Ordering::Equal {
+                    return ord;
+                }
+            }
+        }
     }
 }
 
@@ -226,18 +282,64 @@ fn is_newer(candidate: &str, current: &str) -> bool {
     compare_versions(candidate, current) == std::cmp::Ordering::Greater
 }
 
+/// Return `Some(spec)` if `spec` represents a real bound, `None` if it is an
+/// exact-pin shortcut (e.g. PEP 440 `==2.28.0` or semver `=1.2.3`).
+///
+/// Exact pins are metadata about the current version, not a constraint on
+/// future versions: the updater rewrites the pin itself. Treating them as a
+/// real constraint would either reject all updates (semver parse of `=X`) or
+/// force cooldown into its conservative "refuse to hold back" branch (PEP 440
+/// `==X` doesn't parse as semver), neither of which is correct.
+fn strip_exact_pin(spec: &str) -> Option<&str> {
+    let trimmed = spec.trim();
+    if trimmed.is_empty() || trimmed.contains(',') {
+        // Compound constraints like `>=2.0,<3` always carry a real bound.
+        return (!trimmed.is_empty()).then_some(trimmed);
+    }
+    if trimmed.starts_with('=') {
+        let stripped = trimmed.trim_start_matches('=').trim();
+        if parse_version_padded(stripped).is_some() {
+            return None;
+        }
+    }
+    Some(trimmed)
+}
+
 fn satisfies_constraint(version: &str, constraints: Option<&str>) -> bool {
     let Some(spec) = constraints else {
         return true;
     };
-    let stripped = version.strip_prefix('v').unwrap_or(version);
-    match (
-        semver::Version::parse(stripped),
-        semver::VersionReq::parse(spec),
-    ) {
-        (Ok(v), Ok(req)) => req.matches(&v),
-        _ => true, // unparseable version or constraint: don't over-restrict
+    let Some(v) = parse_version_padded(version) else {
+        return false;
+    };
+    let Ok(req) = semver::VersionReq::parse(spec) else {
+        // `select()` routes the constraint-unparseable case to a restricted
+        // filter that only admits the caller-provided `latest`, so we should
+        // never land here in that path. Be conservative if we do.
+        return false;
+    };
+    req.matches(&v)
+}
+
+/// Try to parse `v` as semver, padding missing trailing `.0` segments so that
+/// PyPI-style two-part versions like `1.10` also parse. Returns `None` if the
+/// core still will not parse (e.g. multi-suffix GitHub tags `0.10.0.0`).
+fn parse_version_padded(v: &str) -> Option<semver::Version> {
+    let stripped = v.strip_prefix('v').unwrap_or(v);
+    if let Ok(parsed) = semver::Version::parse(stripped) {
+        return Some(parsed);
     }
+    let (core, tail) = match stripped.find(['-', '+']) {
+        Some(idx) => (&stripped[..idx], &stripped[idx..]),
+        None => (stripped, ""),
+    };
+    let segments = core.matches('.').count() + 1;
+    if !(1..3).contains(&segments) {
+        return None;
+    }
+    let padding = ".0".repeat(3 - segments);
+    let padded = format!("{core}{padding}{tail}");
+    semver::Version::parse(&padded).ok()
 }
 
 #[cfg(test)]
@@ -428,6 +530,7 @@ mod tests {
         let decision = select(
             &versions,
             "1.8.0",
+            "2.0.0",
             None,
             false,
             Duration::days(7),
@@ -457,6 +560,7 @@ mod tests {
         let decision = select(
             &versions,
             "1.8.0",
+            "2.0.0",
             None,
             false,
             Duration::days(7),
@@ -484,6 +588,7 @@ mod tests {
         let decision = select(
             &versions,
             "1.8.0",
+            "2.0.0",
             None,
             false,
             Duration::days(7),
@@ -506,6 +611,7 @@ mod tests {
         let decision = select(
             &versions,
             "1.8.0",
+            "1.9.0",
             None,
             false,
             Duration::days(7),
@@ -526,6 +632,7 @@ mod tests {
         let decision = select(
             &versions,
             "1.8.0",
+            "1.9.0",
             None,
             false,
             Duration::days(7),
@@ -538,22 +645,52 @@ mod tests {
     }
 
     #[test]
-    fn test_select_includes_prereleases_when_requested() {
+    fn test_select_prerelease_current_stays_on_prerelease_track() {
+        // Current is a prerelease; only prereleases are eligible, stable 1.9.0
+        // must be rejected even though it looks "newer" by semver ordering.
         let versions = vec![
-            meta("2.0.0-rc.1", 30, false, true),
+            meta("2.0.0-rc.2", 30, false, true),
+            meta("2.0.0-rc.1", 60, false, true),
             meta("1.9.0", 30, false, false),
         ];
         let decision = select(
             &versions,
-            "1.8.0",
+            "2.0.0-rc.0",
+            "2.0.0-rc.2",
             None,
             true,
             Duration::days(7),
             fixed_now(),
         );
         match decision {
-            CooldownDecision::Use { version, .. } => assert_eq!(version, "2.0.0-rc.1"),
+            CooldownDecision::Use { version, .. } => assert_eq!(version, "2.0.0-rc.2"),
             other => panic!("expected Use of prerelease, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_select_stable_current_never_promotes_to_prerelease() {
+        // Only prereleases newer than current exist. Since current is stable,
+        // those must be rejected rather than silently promoting the dep to
+        // a prerelease track.
+        let versions = vec![
+            meta("2.0.0-rc.1", 30, false, true),
+            meta("2.0.0-beta.1", 60, false, true),
+        ];
+        let decision = select(
+            &versions,
+            "1.9.0",
+            "2.0.0-rc.1",
+            None,
+            false,
+            Duration::days(7),
+            fixed_now(),
+        );
+        match decision {
+            CooldownDecision::Skip { latest_too_new } => {
+                assert_eq!(latest_too_new.version, "2.0.0-rc.1");
+            }
+            other => panic!("expected Skip (no stable candidate), got {other:?}"),
         }
     }
 
@@ -567,6 +704,7 @@ mod tests {
         let decision = select(
             &versions,
             "1.8.0",
+            "2.0.0",
             None,
             false,
             Duration::days(7),
@@ -585,6 +723,7 @@ mod tests {
         let decision = select(
             &versions,
             "2.0.0",
+            "1.5.0",
             None,
             false,
             Duration::days(7),
@@ -612,6 +751,7 @@ mod tests {
         let decision = select(
             &versions,
             "2.0.0",
+            "2.5.0",
             Some("<3"),
             false,
             Duration::days(7),
@@ -631,6 +771,7 @@ mod tests {
         let decision = select(
             &versions,
             "1.0.0",
+            "2.0.0",
             None,
             false,
             Duration::zero(),
@@ -650,7 +791,15 @@ mod tests {
 
     #[test]
     fn test_select_empty_input_is_unsupported() {
-        let decision = select(&[], "1.0.0", None, false, Duration::days(7), fixed_now());
+        let decision = select(
+            &[],
+            "1.0.0",
+            "1.0.0",
+            None,
+            false,
+            Duration::days(7),
+            fixed_now(),
+        );
         // Per spec: caller handles empty list as "unsupported"; but if select is
         // called with empty input, fold it to Unsupported too so behaviour is
         // consistent.
@@ -668,6 +817,7 @@ mod tests {
         let decision = select(
             &versions,
             "2.0.0",
+            "3.0.0",
             None,
             false,
             Duration::days(7),
@@ -694,6 +844,7 @@ mod tests {
         let decision = select(
             &versions,
             "1.0.0",
+            "2.0.0",
             None,
             false,
             Duration::days(7),
@@ -706,6 +857,109 @@ mod tests {
                 assert_eq!(latest_too_new.version, "2.0.0");
             }
             other => panic!("expected Skip, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_select_constraint_unparseable_restricts_to_latest() {
+        // `~= 7.1` is PEP 440 and cannot be parsed by semver::VersionReq. The
+        // caller already resolved 7.2 as satisfying that constraint. We must
+        // not silently hold back to 7.0 (which would defeat the constraint).
+        let versions = vec![
+            meta("7.2.0", 30, false, false), // caller's resolved latest, old enough
+            meta("7.1.5", 30, false, false), // NOT the resolved latest; refuse to use
+            meta("7.0.0", 60, false, false),
+        ];
+        let decision = select(
+            &versions,
+            "7.0.0",
+            "7.2.0",
+            Some("~= 7.1"),
+            false,
+            Duration::days(7),
+            fixed_now(),
+        );
+        match decision {
+            CooldownDecision::Use { version, .. } => assert_eq!(version, "7.2.0"),
+            other => panic!("expected Use of 7.2.0, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_select_constraint_unparseable_skips_when_latest_too_new() {
+        let versions = vec![
+            meta("7.2.0", 1, false, false), // too new
+            meta("7.1.5", 30, false, false),
+            meta("7.0.0", 60, false, false),
+        ];
+        let decision = select(
+            &versions,
+            "7.0.0",
+            "7.2.0",
+            Some("~= 7.1"),
+            false,
+            Duration::days(7),
+            fixed_now(),
+        );
+        match decision {
+            CooldownDecision::Skip { latest_too_new } => {
+                assert_eq!(latest_too_new.version, "7.2.0");
+            }
+            other => panic!("expected Skip, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_select_orders_numerically_with_two_digit_segments() {
+        // Lexicographic string compare would rank "1.9.0" > "1.10.0". The
+        // numeric-aware fallback keeps them in the correct order.
+        let versions = vec![
+            meta("1.10.0", 30, false, false), // newest, safe
+            meta("1.9.0", 60, false, false),
+        ];
+        let decision = select(
+            &versions,
+            "1.8.0",
+            "1.10.0",
+            None,
+            false,
+            Duration::days(7),
+            fixed_now(),
+        );
+        match decision {
+            CooldownDecision::Use { version, .. } => assert_eq!(version, "1.10.0"),
+            other => panic!("expected Use of 1.10.0, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_select_orders_multi_segment_non_semver_tags() {
+        // GitHub tags like 0.10.0.0 are not semver. Numeric segment compare
+        // should still sort them correctly when held-back selection walks
+        // down from the top.
+        let versions = vec![
+            meta("0.10.0.0", 2, false, false), // too new
+            meta("0.9.0.0", 30, false, false), // safe
+            meta("0.8.0.0", 60, false, false),
+        ];
+        let decision = select(
+            &versions,
+            "0.7.0.0",
+            "0.10.0.0",
+            None,
+            false,
+            Duration::days(7),
+            fixed_now(),
+        );
+        match decision {
+            CooldownDecision::Use {
+                version,
+                held_back_from,
+            } => {
+                assert_eq!(version, "0.9.0.0");
+                assert_eq!(held_back_from.unwrap().version, "0.10.0.0");
+            }
+            other => panic!("expected Use of 0.9.0.0, got {other:?}"),
         }
     }
 }

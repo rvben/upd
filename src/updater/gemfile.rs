@@ -281,12 +281,24 @@ impl Updater for GemfileUpdater {
                                 continue;
                             }
 
+                            // Reconstruct the Gemfile constraint spec so cooldown's
+                            // held-back selection cannot pick a version that would
+                            // violate the pin (e.g. `~> 7.1` must stay in 7.x).
+                            let constraint_owned;
+                            let constraint_for_cooldown: Option<&str> =
+                                if parsed.operator.trim().is_empty() {
+                                    None
+                                } else {
+                                    constraint_owned =
+                                        format!("{} {}", parsed.operator.trim(), parsed.version);
+                                    Some(constraint_owned.as_str())
+                                };
                             let (outcome, note) = crate::updater::apply_cooldown(
                                 registry,
                                 &parsed.name,
                                 &parsed.version,
                                 &latest_version,
-                                None,
+                                constraint_for_cooldown,
                                 current_is_prerelease,
                                 &options,
                             )

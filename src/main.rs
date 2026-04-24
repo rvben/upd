@@ -441,11 +441,13 @@ fn file_has_manifest_changes(result: &UpdateResult) -> bool {
 }
 
 fn has_checkable_manifest_changes(result: &UpdateResult, filter: UpdateFilter) -> bool {
+    // A cooldown-only "Skipped" outcome is expected steady state: we
+    // deliberately chose to hold the current version. It must NOT trip
+    // `--check` into signaling "pending work". Held-back entries do count:
+    // they mean we are already writing a different version than the registry
+    // latest, so there is something actionable (the safer pin).
     let (_, _, _, filtered_total) = count_updates_by_type(&result.updated, filter);
-    filtered_total > 0
-        || !result.pinned.is_empty()
-        || !result.held_back.is_empty()
-        || !result.skipped_by_cooldown.is_empty()
+    filtered_total > 0 || !result.pinned.is_empty() || !result.held_back.is_empty()
 }
 
 fn has_interactive_changes(
@@ -561,7 +563,7 @@ async fn run_update(cli: &Cli) -> Result<()> {
                 0,
                 effective_dry_run,
                 UpdateFilter::from_cli(&cli.only_bump, cli.max_bump),
-                None,
+                &HashMap::new(),
                 Vec::new(),
             )?;
         }
@@ -570,21 +572,22 @@ async fn run_update(cli: &Cli) -> Result<()> {
 
     let file_configs = load_update_configs(cli, &files)?;
 
-    // Build cooldown policy from CLI flag and/or discovered config. Use the
-    // first available config for [cooldown] table settings; CLI --min-age wins
-    // over all config values.
-    let cooldown_policy: Option<CooldownPolicy> = {
-        let any_config = file_configs.values().find_map(|c| c.as_ref());
-        let raw_policy = if let Some(config) = any_config {
-            config.to_cooldown_policy(cli.min_age.as_deref())?
-        } else {
-            UpdConfig::default().to_cooldown_policy(cli.min_age.as_deref())?
-        };
-        let is_noop = raw_policy.force_override.is_none()
-            && raw_policy.default <= Duration::zero()
-            && raw_policy.per_ecosystem.is_empty();
-        if is_noop { None } else { Some(raw_policy) }
-    };
+    // Resolve a cooldown policy per file so configs attached to one manifest
+    // cannot silently apply to another (e.g. a `.updrc.toml` in a subtree).
+    // CLI --min-age always wins over per-file config values.
+    let file_cooldowns: HashMap<PathBuf, Option<CooldownPolicy>> = file_configs
+        .iter()
+        .map(|(path, config)| {
+            let raw = match config.as_ref() {
+                Some(cfg) => cfg.to_cooldown_policy(cli.min_age.as_deref())?,
+                None => UpdConfig::default().to_cooldown_policy(cli.min_age.as_deref())?,
+            };
+            let is_noop = raw.force_override.is_none()
+                && raw.default <= Duration::zero()
+                && raw.per_ecosystem.is_empty();
+            Ok::<_, anyhow::Error>((path.clone(), if is_noop { None } else { Some(raw) }))
+        })
+        .collect::<Result<HashMap<_, _>>>()?;
     let cooldown_notes: Arc<Mutex<BTreeSet<String>>> = Arc::new(Mutex::new(BTreeSet::new()));
 
     if cli.verbose {
@@ -736,7 +739,7 @@ async fn run_update(cli: &Cli) -> Result<()> {
             &csproj_updater,
             &cache,
             cache_enabled,
-            cooldown_policy.as_ref(),
+            &file_cooldowns,
             Arc::clone(&cooldown_notes),
         )
         .await;
@@ -748,6 +751,7 @@ async fn run_update(cli: &Cli) -> Result<()> {
         .into_iter()
         .map(|(path, file_type)| {
             let config = file_configs.get(&path).cloned().flatten();
+            let cooldown_policy = file_cooldowns.get(&path).and_then(|p| p.as_ref());
             (
                 path,
                 file_type,
@@ -756,7 +760,7 @@ async fn run_update(cli: &Cli) -> Result<()> {
                     cli.full_precision,
                     config,
                     &cli.packages,
-                    cooldown_policy.as_ref(),
+                    cooldown_policy,
                     Arc::clone(&cooldown_notes),
                 ),
             )
@@ -872,6 +876,7 @@ async fn run_update(cli: &Cli) -> Result<()> {
                     updated_files.push(path.clone());
                 }
                 if text_mode && !cli.quiet {
+                    let cooldown_policy = file_cooldowns.get(&path).and_then(|p| p.as_ref());
                     print_file_result(
                         &path.display().to_string(),
                         file_type,
@@ -879,7 +884,7 @@ async fn run_update(cli: &Cli) -> Result<()> {
                         dry_run,
                         filter,
                         verbose,
-                        cooldown_policy.as_ref(),
+                        cooldown_policy,
                     );
                 }
                 scanned.push(ScannedFileResult {
@@ -994,7 +999,7 @@ async fn run_update(cli: &Cli) -> Result<()> {
             file_count,
             dry_run,
             filter,
-            cooldown_policy.as_ref(),
+            &file_cooldowns,
             notes_vec,
         )?;
     }
@@ -1015,7 +1020,7 @@ fn emit_update_json(
     file_count: usize,
     dry_run: bool,
     filter: UpdateFilter,
-    cooldown_policy: Option<&CooldownPolicy>,
+    file_cooldowns: &HashMap<PathBuf, Option<CooldownPolicy>>,
     cooldown_notes: Vec<String>,
 ) -> Result<()> {
     use upd::output::{UpdateReport, UpdateSummary, build_update_file_report};
@@ -1023,7 +1028,9 @@ fn emit_update_json(
     let files: Vec<_> = scanned
         .iter()
         .map(|sf| {
-            let cooldown_seconds = cooldown_policy
+            let cooldown_seconds = file_cooldowns
+                .get(&sf.path)
+                .and_then(|p| p.as_ref())
                 .map(|p| {
                     p.effective_for(ecosystem_for_file_type(sf.file_type))
                         .num_seconds()
@@ -1101,7 +1108,7 @@ async fn run_interactive_update(
     csproj_updater: &Arc<CsprojUpdater>,
     cache: &Arc<std::sync::Mutex<Cache>>,
     cache_enabled: bool,
-    cooldown_policy: Option<&CooldownPolicy>,
+    file_cooldowns: &HashMap<PathBuf, Option<CooldownPolicy>>,
     cooldown_notes: Arc<Mutex<BTreeSet<String>>>,
 ) -> Result<()> {
     if !std::io::stdin().is_terminal() {
@@ -1121,6 +1128,7 @@ async fn run_interactive_update(
     let mut scanned_results: Vec<ScannedFileResult> = Vec::new();
 
     for (path, file_type) in files {
+        let cooldown_policy = file_cooldowns.get(path).and_then(|p| p.as_ref());
         let dry_run_options = build_update_options(
             true,
             cli.full_precision,
@@ -4373,7 +4381,10 @@ mod output_tests {
     }
 
     #[test]
-    fn test_has_checkable_manifest_changes_skipped_by_cooldown() {
+    fn test_has_checkable_manifest_changes_skipped_by_cooldown_is_not_pending() {
+        // A cooldown-only Skipped outcome is steady state, not pending work.
+        // The tool intentionally chose to stay on the current version; that
+        // must not flip `--check` to a non-zero exit.
         let result = UpdateResult {
             skipped_by_cooldown: vec![(
                 "pkg".to_string(),
@@ -4384,8 +4395,8 @@ mod output_tests {
             ..Default::default()
         };
         assert!(
-            has_checkable_manifest_changes(&result, UpdateFilter::from_cli(&[], None)),
-            "skipped_by_cooldown entries must count as pending changes for --check"
+            !has_checkable_manifest_changes(&result, UpdateFilter::from_cli(&[], None)),
+            "skipped_by_cooldown entries are steady state and must not count as pending changes"
         );
     }
 
