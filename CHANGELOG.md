@@ -12,6 +12,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 
 
+
+## [0.1.3](https://github.com/rvben/upd/compare/v0.1.2...v0.1.3) - 2026-04-25
+
+### Added
+
+- **lock**: scope lockfile regeneration to the packages upd actually changed ([6b6cfa6](https://github.com/rvben/upd/commit/6b6cfa6fe3e8e8d787e78c7afea24883ebe67833))
+- **npm**: classify and rewrite comparator-range specs ([a60979a](https://github.com/rvben/upd/commit/a60979acd7edb7eb6adfac554a590412a6cf8271))
+
+### Fixed
+
+- **lock**: include config pins in targeted regenerate and update CLI help ([207fdf9](https://github.com/rvben/upd/commit/207fdf94af95c74865f828f258ec9cfa61d22085))
+- **npm**: preserve upper bound when pinning comparator-range specs ([fb7c863](https://github.com/rvben/upd/commit/fb7c863de9f07201af310ab13a59696d17fcb766))
+- **npm**: apply config policy and cooldown to comparator-range updates ([be095dd](https://github.com/rvben/upd/commit/be095dd30443dd547fb6913dae551cbd530cb019))
+- **npm**: update comparator-range specs via constraint-aware resolution ([4481b8b](https://github.com/rvben/upd/commit/4481b8bad6a02c6f761cf489a547b5546099e871))
+- **audit**: order fix versions numerically, not lexicographically ([069eb1d](https://github.com/rvben/upd/commit/069eb1dc8771640376957339e40ada7b60a82b0a))
+
 ## [0.1.2](https://github.com/rvben/upd/compare/v0.1.1...v0.1.2) - 2026-04-24
 
 ### Added
