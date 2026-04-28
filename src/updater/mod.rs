@@ -384,6 +384,19 @@ impl FileType {
             return Some(FileType::ToolVersions);
         }
 
+        // GitHub Actions workflows: *.yml or *.yaml inside .github/workflows/
+        if (file_name.ends_with(".yml") || file_name.ends_with(".yaml"))
+            && let Some(parent) = path.parent()
+            && parent.file_name().and_then(|n| n.to_str()) == Some("workflows")
+            && parent
+                .parent()
+                .and_then(|gp| gp.file_name())
+                .and_then(|n| n.to_str())
+                == Some(".github")
+        {
+            return Some(FileType::GithubActions);
+        }
+
         // Terraform .tf files (exclude files inside .terraform/ directories)
         if file_name.ends_with(".tf") {
             let path_str = path.to_string_lossy();
@@ -538,102 +551,126 @@ pub async fn apply_cooldown(
     }
 }
 
-/// Scan for GitHub Actions workflow files in .github/workflows/ directories.
-/// This is a separate pass because WalkBuilder::hidden(true) skips dot-directories.
-fn discover_github_actions(path: &Path, files: &mut Vec<(PathBuf, FileType)>) {
-    let workflows_dir = path.join(".github").join("workflows");
-    if !workflows_dir.is_dir() {
-        return;
-    }
+/// Hidden entries the walker is allowed to descend into or yield.
+///
+/// Anything not in this set that starts with `.` is pruned during discovery,
+/// which keeps `.git`, `.cache`, `.venv`, and similar noise out of the scan
+/// while still letting us see the dotfiles `upd` actually updates.
+const ALLOWED_HIDDEN_ENTRIES: &[&str] = &[
+    ".github",
+    ".pre-commit-config.yaml",
+    ".mise.toml",
+    ".tool-versions",
+];
 
-    if let Ok(entries) = std::fs::read_dir(&workflows_dir) {
-        for entry in entries.flatten() {
-            let entry_path = entry.path();
-            if entry_path.is_file()
-                && let Some(ext) = entry_path.extension().and_then(|e| e.to_str())
-                && (ext == "yml" || ext == "yaml")
-            {
-                files.push((entry_path, FileType::GithubActions));
+/// Knobs for [`discover_files_with`].
+#[derive(Debug, Clone, Copy, Default)]
+pub struct DiscoverOptions {
+    /// When true, ignore `.gitignore`, `.git/info/exclude`, and the global
+    /// gitignore — walk every dependency file regardless. Mirrors
+    /// `rg --no-ignore`.
+    pub no_ignore: bool,
+    /// When true, emit one `skipping <path>: gitignored` line on stderr for
+    /// each dependency file the gitignore rules dropped, so users can see
+    /// why `upd` is silent on a given file.
+    pub verbose: bool,
+}
+
+/// Discover dependency files in the given paths, optionally filtered by language.
+///
+/// Directory walks honor `.gitignore`, `.git/info/exclude`, and the global
+/// gitignore — even outside a git repository. Hidden directories and files are
+/// skipped except for the small allowlist in [`ALLOWED_HIDDEN_ENTRIES`]. Explicit
+/// file paths bypass the filter and are always processed.
+///
+/// Convenience wrapper around [`discover_files_with`] with default options.
+pub fn discover_files(paths: &[PathBuf], langs: &[Lang]) -> Vec<(PathBuf, FileType)> {
+    discover_files_with(paths, langs, DiscoverOptions::default())
+}
+
+/// Discover dependency files with explicit [`DiscoverOptions`].
+pub fn discover_files_with(
+    paths: &[PathBuf],
+    langs: &[Lang],
+    options: DiscoverOptions,
+) -> Vec<(PathBuf, FileType)> {
+    let kept = walk_dependency_files(paths, langs, options.no_ignore);
+
+    // In verbose mode, surface the dependency files gitignore rules dropped so
+    // users can answer "why didn't upd touch X?" without guessing. Skipped when
+    // gitignore is already disabled (nothing to diff against).
+    if options.verbose && !options.no_ignore {
+        let unrestricted = walk_dependency_files(paths, langs, true);
+        let kept_set: std::collections::HashSet<&Path> =
+            kept.iter().map(|(p, _)| p.as_path()).collect();
+        for (path, _) in &unrestricted {
+            if !kept_set.contains(path.as_path()) {
+                eprintln!("skipping {}: gitignored", path.display());
             }
         }
     }
+
+    kept
 }
 
-/// Scan for .pre-commit-config.yaml in a directory.
-/// This is a separate pass because WalkBuilder::hidden(true) skips dot-files.
-fn discover_pre_commit_config(path: &Path, files: &mut Vec<(PathBuf, FileType)>) {
-    let config_path = path.join(".pre-commit-config.yaml");
-    if config_path.is_file() {
-        files.push((config_path, FileType::PreCommitConfig));
-    }
-}
-
-/// Scan for .mise.toml and .tool-versions in a directory.
-/// These are dot-files, so WalkBuilder::hidden(true) skips them.
-fn discover_mise_files(path: &Path, files: &mut Vec<(PathBuf, FileType)>) {
-    let mise_path = path.join(".mise.toml");
-    if mise_path.is_file() {
-        files.push((mise_path, FileType::MiseToml));
-    }
-
-    let tool_versions_path = path.join(".tool-versions");
-    if tool_versions_path.is_file() {
-        files.push((tool_versions_path, FileType::ToolVersions));
-    }
-}
-
-fn discover_hidden_dependency_files(
-    path: &Path,
+fn walk_dependency_files(
+    paths: &[PathBuf],
     langs: &[Lang],
-    files: &mut Vec<(PathBuf, FileType)>,
-) {
-    if langs.is_empty() || langs.contains(&Lang::Actions) {
-        discover_github_actions(path, files);
-    }
-
-    if langs.is_empty() || langs.contains(&Lang::PreCommit) {
-        discover_pre_commit_config(path, files);
-    }
-
-    if langs.is_empty() || langs.contains(&Lang::Mise) {
-        discover_mise_files(path, files);
-    }
-}
-
-/// Discover dependency files in the given paths, optionally filtered by language
-pub fn discover_files(paths: &[PathBuf], langs: &[Lang]) -> Vec<(PathBuf, FileType)> {
+    no_ignore: bool,
+) -> Vec<(PathBuf, FileType)> {
     let mut files = Vec::new();
 
     for path in paths {
-        if path.is_file()
-            && let Some(file_type) = FileType::detect(path)
-        {
-            if langs.is_empty() || langs.contains(&file_type.lang()) {
+        if path.is_file() {
+            if let Some(file_type) = FileType::detect(path)
+                && (langs.is_empty() || langs.contains(&file_type.lang()))
+            {
                 files.push((path.clone(), file_type));
             }
-        } else if path.is_dir() {
-            discover_hidden_dependency_files(path, langs, &mut files);
+            continue;
+        }
 
-            // Walk directory respecting .gitignore
-            let walker = WalkBuilder::new(path)
-                .hidden(true)
-                .git_ignore(true)
-                .git_global(true)
-                .git_exclude(true)
-                .build();
+        if !path.is_dir() {
+            continue;
+        }
 
-            for entry in walker.flatten() {
-                let entry_path = entry.path();
-                if entry_path.is_dir() && entry_path != path {
-                    discover_hidden_dependency_files(entry_path, langs, &mut files);
+        let walker = WalkBuilder::new(path)
+            .hidden(false)
+            .git_ignore(!no_ignore)
+            .git_global(!no_ignore)
+            .git_exclude(!no_ignore)
+            .require_git(false)
+            .filter_entry(|entry| {
+                // Always traverse the user-supplied root, even when it is hidden
+                // (e.g. `upd .github/workflows`).
+                if entry.depth() == 0 {
+                    return true;
                 }
 
-                if entry_path.is_file()
-                    && let Some(file_type) = FileType::detect(entry_path)
-                    && (langs.is_empty() || langs.contains(&file_type.lang()))
-                {
-                    files.push((entry_path.to_path_buf(), file_type));
+                let name = entry.file_name().to_string_lossy();
+
+                // `.git` is internal — never descend into it.
+                if name == ".git" {
+                    return false;
                 }
+
+                if !name.starts_with('.') {
+                    return true;
+                }
+
+                ALLOWED_HIDDEN_ENTRIES.contains(&name.as_ref())
+            })
+            .build();
+
+        for entry in walker.flatten() {
+            let entry_path = entry.path();
+            if !entry_path.is_file() {
+                continue;
+            }
+            if let Some(file_type) = FileType::detect(entry_path)
+                && (langs.is_empty() || langs.contains(&file_type.lang()))
+            {
+                files.push((entry_path.to_path_buf(), file_type));
             }
         }
     }
@@ -1117,6 +1154,260 @@ mod tests {
         let temp = tempdir().unwrap();
         let files = discover_files(&[temp.path().to_path_buf()], &[Lang::Actions]);
         assert!(files.is_empty());
+    }
+
+    /// Detection of a workflow file should depend on the .github/workflows
+    /// path components, not just the extension. A bare YAML file elsewhere
+    /// must not be classified as a GitHub Actions workflow.
+    #[test]
+    fn test_filetype_detect_github_actions_requires_workflows_dir() {
+        assert_eq!(
+            FileType::detect(Path::new("/repo/.github/workflows/ci.yml")),
+            Some(FileType::GithubActions)
+        );
+        assert_eq!(
+            FileType::detect(Path::new("/repo/.github/workflows/release.yaml")),
+            Some(FileType::GithubActions)
+        );
+        // A workflow nested under a sub-project still counts.
+        assert_eq!(
+            FileType::detect(Path::new("/repo/apps/api/.github/workflows/ci.yml")),
+            Some(FileType::GithubActions)
+        );
+        // Anything outside .github/workflows is not a workflow.
+        assert_eq!(
+            FileType::detect(Path::new("/repo/.github/dependabot.yml")),
+            None
+        );
+        assert_eq!(FileType::detect(Path::new("/repo/random.yml")), None);
+    }
+
+    /// Files listed in .gitignore must not be discovered when walking a
+    /// directory. This is the single most-requested default — users expect
+    /// `upd` to ignore the same things git does.
+    #[test]
+    fn test_discover_files_respects_gitignore() {
+        let temp = tempdir().unwrap();
+        let root = temp.path();
+
+        fs::write(
+            root.join(".gitignore"),
+            "ignored.txt\nvendor/\n.github/workflows/internal.yml\n.pre-commit-config.yaml\n.mise.toml\n.tool-versions\n",
+        )
+        .unwrap();
+
+        // Regular files: kept.
+        fs::write(root.join("requirements.txt"), "flask>=2.0").unwrap();
+        // Regular file: ignored by name.
+        fs::write(root.join("ignored.txt"), "should-not-appear").unwrap();
+        // Whole gitignored directory.
+        fs::create_dir_all(root.join("vendor")).unwrap();
+        fs::write(
+            root.join("vendor").join("Cargo.toml"),
+            "[package]\nname=\"x\"",
+        )
+        .unwrap();
+
+        // GitHub Actions: one ignored, one kept.
+        let workflows = root.join(".github").join("workflows");
+        fs::create_dir_all(&workflows).unwrap();
+        fs::write(workflows.join("ci.yml"), "name: CI").unwrap();
+        fs::write(workflows.join("internal.yml"), "name: Internal").unwrap();
+
+        // Hidden ecosystem files: gitignored.
+        fs::write(root.join(".pre-commit-config.yaml"), "repos: []").unwrap();
+        fs::write(root.join(".mise.toml"), "[tools]").unwrap();
+        fs::write(root.join(".tool-versions"), "node 20").unwrap();
+
+        let files = discover_files(&[root.to_path_buf()], &[]);
+        let paths: Vec<PathBuf> = files.iter().map(|(p, _)| p.clone()).collect();
+
+        assert!(paths.contains(&root.join("requirements.txt")));
+        assert!(paths.contains(&workflows.join("ci.yml")));
+
+        for forbidden in [
+            root.join("ignored.txt"),
+            root.join("vendor").join("Cargo.toml"),
+            workflows.join("internal.yml"),
+            root.join(".pre-commit-config.yaml"),
+            root.join(".mise.toml"),
+            root.join(".tool-versions"),
+        ] {
+            assert!(
+                !paths.contains(&forbidden),
+                "discover_files should skip gitignored {forbidden:?}; got {paths:#?}"
+            );
+        }
+    }
+
+    /// Negation patterns (`!foo`) must un-ignore matching paths so users
+    /// can ship a top-level ignore but selectively keep individual files.
+    #[test]
+    fn test_discover_files_respects_gitignore_negation() {
+        let temp = tempdir().unwrap();
+        let root = temp.path();
+
+        fs::write(
+            root.join(".gitignore"),
+            ".github/workflows/*.yml\n!.github/workflows/keep.yml\n",
+        )
+        .unwrap();
+
+        let workflows = root.join(".github").join("workflows");
+        fs::create_dir_all(&workflows).unwrap();
+        fs::write(workflows.join("drop.yml"), "name: Drop").unwrap();
+        fs::write(workflows.join("keep.yml"), "name: Keep").unwrap();
+
+        let files = discover_files(&[root.to_path_buf()], &[Lang::Actions]);
+        let paths: Vec<PathBuf> = files.iter().map(|(p, _)| p.clone()).collect();
+
+        assert!(paths.contains(&workflows.join("keep.yml")));
+        assert!(!paths.contains(&workflows.join("drop.yml")));
+    }
+
+    /// Explicit file arguments bypass the gitignore filter — `upd
+    /// path/to/file` should always process the file the user pointed at,
+    /// matching `rg` / `fd` semantics for explicit paths.
+    #[test]
+    fn test_discover_files_explicit_path_bypasses_gitignore() {
+        let temp = tempdir().unwrap();
+        let root = temp.path();
+
+        fs::write(root.join(".gitignore"), ".mise.toml\n").unwrap();
+        let mise = root.join(".mise.toml");
+        fs::write(&mise, "[tools]").unwrap();
+
+        // Directory walk: gitignored, so excluded.
+        let walked = discover_files(&[root.to_path_buf()], &[]);
+        assert!(walked.iter().all(|(p, _)| p != &mise));
+
+        // Explicit path: included regardless of gitignore.
+        let direct = discover_files(std::slice::from_ref(&mise), &[]);
+        assert_eq!(direct, vec![(mise, FileType::MiseToml)]);
+    }
+
+    /// `--no-ignore` (via `DiscoverOptions::no_ignore`) must bypass
+    /// gitignore entirely, including for hidden ecosystem files.
+    #[test]
+    fn test_discover_files_with_no_ignore_bypasses_gitignore() {
+        let temp = tempdir().unwrap();
+        let root = temp.path();
+
+        fs::write(
+            root.join(".gitignore"),
+            "ignored.txt\n.mise.toml\n.tool-versions\n",
+        )
+        .unwrap();
+        fs::write(root.join("ignored.txt"), "x").unwrap();
+        fs::write(root.join("requirements.txt"), "flask>=2.0").unwrap();
+        fs::write(root.join(".mise.toml"), "[tools]").unwrap();
+        fs::write(root.join(".tool-versions"), "node 20").unwrap();
+
+        let unrestricted = discover_files_with(
+            &[root.to_path_buf()],
+            &[],
+            DiscoverOptions {
+                no_ignore: true,
+                verbose: false,
+            },
+        );
+        let paths: Vec<PathBuf> = unrestricted.iter().map(|(p, _)| p.clone()).collect();
+
+        assert!(paths.contains(&root.join("requirements.txt")));
+        assert!(paths.contains(&root.join(".mise.toml")));
+        assert!(paths.contains(&root.join(".tool-versions")));
+        // ignored.txt is not a dependency file, so it never appears regardless;
+        // the meaningful assertion is that the hidden ecosystem files are picked
+        // up despite being gitignored.
+    }
+
+    /// `--lang` filtering must compose with gitignore filtering: ignored
+    /// files of the requested language stay out, kept files of other
+    /// languages also stay out.
+    #[test]
+    fn test_discover_files_lang_filter_composes_with_gitignore() {
+        let temp = tempdir().unwrap();
+        let root = temp.path();
+
+        fs::write(root.join(".gitignore"), "requirements.txt\n").unwrap();
+        fs::write(root.join("requirements.txt"), "flask").unwrap();
+        fs::write(root.join("pyproject.toml"), "[project]\nname='x'").unwrap();
+        fs::write(root.join("package.json"), "{}").unwrap();
+
+        let files = discover_files(&[root.to_path_buf()], &[Lang::Python]);
+        let paths: Vec<PathBuf> = files.iter().map(|(p, _)| p.clone()).collect();
+
+        // gitignored Python file is dropped, non-Python file is dropped by --lang
+        assert_eq!(paths, vec![root.join("pyproject.toml")]);
+    }
+
+    /// Nested `.gitignore` files (in a subdirectory) must be honored — the
+    /// `ignore` crate handles this; this test pins the behavior so a future
+    /// refactor can't regress it.
+    #[test]
+    fn test_discover_files_respects_nested_gitignore() {
+        let temp = tempdir().unwrap();
+        let root = temp.path();
+
+        // Top-level allows everything.
+        fs::write(root.join(".gitignore"), "").unwrap();
+        // Nested .gitignore drops a single file in its directory.
+        let sub = root.join("sub");
+        fs::create_dir_all(&sub).unwrap();
+        fs::write(sub.join(".gitignore"), "secret.toml\n").unwrap();
+        fs::write(sub.join("secret.toml"), "").unwrap();
+        fs::write(sub.join("Cargo.toml"), "[package]\nname='x'").unwrap();
+        fs::write(sub.join("package.json"), "{}").unwrap();
+
+        let files = discover_files(&[root.to_path_buf()], &[]);
+        let paths: Vec<PathBuf> = files.iter().map(|(p, _)| p.clone()).collect();
+
+        assert!(paths.contains(&sub.join("Cargo.toml")));
+        assert!(paths.contains(&sub.join("package.json")));
+        assert!(!paths.contains(&sub.join("secret.toml")));
+    }
+
+    /// A whole-directory ignore (`.github/`) must prune the entire subtree,
+    /// not just a single workflow file.
+    #[test]
+    fn test_discover_files_directory_ignore_prunes_subtree() {
+        let temp = tempdir().unwrap();
+        let root = temp.path();
+
+        fs::write(root.join(".gitignore"), ".github/\n").unwrap();
+        let workflows = root.join(".github").join("workflows");
+        fs::create_dir_all(&workflows).unwrap();
+        fs::write(workflows.join("ci.yml"), "name: CI").unwrap();
+        fs::write(workflows.join("release.yaml"), "name: Release").unwrap();
+        fs::write(root.join("package.json"), "{}").unwrap();
+
+        let files = discover_files(&[root.to_path_buf()], &[]);
+        let paths: Vec<PathBuf> = files.iter().map(|(p, _)| p.clone()).collect();
+
+        assert_eq!(paths, vec![root.join("package.json")]);
+    }
+
+    /// `.git` directories must never be walked into — they are not in
+    /// `.gitignore` (git itself manages them) but still contain YAML/TOML
+    /// content that would otherwise be picked up.
+    #[test]
+    fn test_discover_files_skips_dot_git_directory() {
+        let temp = tempdir().unwrap();
+        let root = temp.path();
+
+        let inner_git = root.join(".git").join("workflows-cache");
+        fs::create_dir_all(&inner_git).unwrap();
+        // A file matching one of our patterns, planted inside .git/.
+        fs::write(inner_git.join(".mise.toml"), "[tools]").unwrap();
+        fs::write(root.join(".git").join("config"), "[core]").unwrap();
+
+        let files = discover_files(&[root.to_path_buf()], &[]);
+        for (path, _) in &files {
+            assert!(
+                !path.to_string_lossy().contains("/.git/"),
+                "discover_files must not descend into .git/, found {path:?}"
+            );
+        }
     }
 }
 

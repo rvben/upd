@@ -183,6 +183,15 @@ pub struct Cli {
         value_delimiter = ','
     )]
     pub packages: Vec<String>,
+
+    /// Disable .gitignore filtering and walk every dependency file in the tree.
+    ///
+    /// By default, `upd` honors `.gitignore`, `.git/info/exclude`, and the
+    /// global gitignore when discovering dependency files. Pass `--no-ignore`
+    /// to scan files git would ignore. Equivalent to `rg --no-ignore`.
+    /// Explicit file paths are always processed regardless of this flag.
+    #[arg(long = "no-ignore", global = true)]
+    pub no_ignore: bool,
 }
 
 #[derive(Subcommand)]
@@ -841,5 +850,28 @@ mod tests {
         let cli = Cli::try_parse_from(["upd", "update", "--min-age", "14d", "path1"]).unwrap();
         assert_eq!(cli.min_age.as_deref(), Some("14d"));
         assert!(matches!(cli.command, Some(Command::Update { .. })));
+    }
+
+    #[test]
+    fn test_cli_no_ignore_default_false() {
+        let cli = Cli::try_parse_from(["upd"]).unwrap();
+        assert!(!cli.no_ignore);
+    }
+
+    #[test]
+    fn test_cli_no_ignore_parses() {
+        let cli = Cli::try_parse_from(["upd", "--no-ignore"]).unwrap();
+        assert!(cli.no_ignore);
+    }
+
+    #[test]
+    fn test_cli_no_ignore_is_global_across_subcommands() {
+        let cli = Cli::try_parse_from(["upd", "audit", "--no-ignore"]).unwrap();
+        assert!(cli.no_ignore);
+        assert!(matches!(cli.command, Some(Command::Audit { .. })));
+
+        let cli = Cli::try_parse_from(["upd", "align", "--no-ignore"]).unwrap();
+        assert!(cli.no_ignore);
+        assert!(matches!(cli.command, Some(Command::Align { .. })));
     }
 }

@@ -22,10 +22,10 @@ use upd::registry::{
     NuGetRegistry, PyPiRegistry, RubyGemsRegistry, TerraformRegistry,
 };
 use upd::updater::{
-    CargoTomlUpdater, CsprojUpdater, FileType, GemfileUpdater, GithubActionsUpdater, GoModUpdater,
-    Lang, MiseUpdater, PackageJsonUpdater, PreCommitUpdater, PyProjectUpdater, RequirementsUpdater,
-    TerraformUpdater, UpdateOptions, UpdateResult, Updater, discover_files, read_file_safe,
-    write_file_atomic,
+    CargoTomlUpdater, CsprojUpdater, DiscoverOptions, FileType, GemfileUpdater,
+    GithubActionsUpdater, GoModUpdater, Lang, MiseUpdater, PackageJsonUpdater, PreCommitUpdater,
+    PyProjectUpdater, RequirementsUpdater, TerraformUpdater, UpdateOptions, UpdateResult, Updater,
+    discover_files_with, read_file_safe, write_file_atomic,
 };
 use upd::version::match_version_precision;
 
@@ -546,7 +546,14 @@ async fn run_update(cli: &Cli) -> Result<()> {
     // or --dry-run), the run behaves as dry-run and tells the user how to apply.
     let effective_dry_run = cli.is_effective_dry_run();
 
-    let files = discover_files(&paths, &cli.langs);
+    let files = discover_files_with(
+        &paths,
+        &cli.langs,
+        DiscoverOptions {
+            no_ignore: cli.no_ignore,
+            verbose: cli.verbose,
+        },
+    );
     let file_count = files.len();
 
     let text_mode_early = cli.format == upd::cli::OutputFormat::Text;
@@ -1493,7 +1500,14 @@ async fn run_align(cli: &Cli) -> Result<()> {
         }
     };
 
-    let files = discover_files(&paths, &cli.langs);
+    let files = discover_files_with(
+        &paths,
+        &cli.langs,
+        DiscoverOptions {
+            no_ignore: cli.no_ignore,
+            verbose: cli.verbose,
+        },
+    );
     let file_count = files.len();
 
     if files.is_empty() {
@@ -1701,7 +1715,14 @@ async fn run_audit(cli: &Cli) -> Result<()> {
             explicit
         }
     };
-    let files = discover_files(&paths, &cli.langs);
+    let files = discover_files_with(
+        &paths,
+        &cli.langs,
+        DiscoverOptions {
+            no_ignore: cli.no_ignore,
+            verbose: cli.verbose,
+        },
+    );
     let file_count = files.len();
 
     if files.is_empty() {

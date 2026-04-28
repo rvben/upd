@@ -34,7 +34,11 @@ pipx run --spec upd-cli upd --apply
 - **Major warnings**: Highlights breaking changes with `(MAJOR)`
 - **Format-preserving**: Keeps formatting, comments, and structure
 - **Pre-release aware**: Updates pre-releases to newer pre-releases
-- **Gitignore-aware**: Respects `.gitignore` when discovering files
+- **Gitignore-aware**: Honors `.gitignore`, `.git/info/exclude`, and the global
+  gitignore — even outside a git repo. Hidden directories are pruned by default;
+  `upd` only opens the dotfiles it actually updates (`.github/workflows`,
+  `.pre-commit-config.yaml`, `.mise.toml`, `.tool-versions`). Use `--no-ignore`
+  to walk every file regardless.
 - **Version alignment**: Align package versions across multiple files
 - **Security auditing**: Check dependencies for known vulnerabilities via OSV
 - **Config file support**: Ignore or pin packages via `.updrc.toml`
@@ -738,6 +742,7 @@ Global flags (accepted on every subcommand):
 | `--full-precision` | | Output full versions |
 | `--no-cache` | | Disable version cache |
 | `--no-color` | | Disable colored output |
+| `--no-ignore` | | Disable `.gitignore` filtering during discovery |
 | `--lock` | | Regenerate lockfiles after updates |
 | `--config <FILE>` | `-c` | Use a specific config file |
 | `--show-config` | | Print effective configuration and exit |

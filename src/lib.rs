@@ -25,7 +25,9 @@ pub use registry::{
     GitHubReleasesRegistry, NpmRegistry, NuGetRegistry, PyPiRegistry, Registry, RubyGemsRegistry,
     TerraformRegistry, VersionMeta,
 };
-pub use updater::{FileType, Lang, UpdateResult, Updater, discover_files};
+pub use updater::{
+    DiscoverOptions, FileType, Lang, UpdateResult, Updater, discover_files, discover_files_with,
+};
 
 /// Determine the process exit code given the outcome of a run.
 ///
