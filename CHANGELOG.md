@@ -14,6 +14,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 
 
+
+## [0.1.5](https://github.com/rvben/upd/compare/v0.1.4...v0.1.5) - 2026-04-28
+
+### Added
+
+- **audit**: include package names and HTTP body in OSV error diagnostics ([87b9aa8](https://github.com/rvben/upd/commit/87b9aa8d27545abf449461c3c3d096a661fa377f))
+
 ## [0.1.4](https://github.com/rvben/upd/compare/v0.1.3...v0.1.4) - 2026-04-28
 
 ### Added
