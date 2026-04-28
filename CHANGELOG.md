@@ -13,6 +13,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 
 
+
+## [0.1.4](https://github.com/rvben/upd/compare/v0.1.3...v0.1.4) - 2026-04-28
+
+### Added
+
+- **discovery**: respect .gitignore for hidden ecosystem files and add --no-ignore ([bd44269](https://github.com/rvben/upd/commit/bd442692e4e7c5ab96e1163128ac8f274a771f30))
+
 ## [0.1.3](https://github.com/rvben/upd/compare/v0.1.2...v0.1.3) - 2026-04-25
 
 ### Added
