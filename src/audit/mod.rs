@@ -20,6 +20,35 @@ const BATCH_SIZE: usize = 1000;
 /// Maximum concurrent requests for fetching vulnerability details
 const MAX_CONCURRENT_REQUESTS: usize = 20;
 
+/// Cap for how many bytes of a non-success OSV response body we surface in
+/// an error message. A proxy or CDN can return arbitrarily large HTML error
+/// pages on the failure path, so we bound the read at the network layer
+/// (via `Response::chunk`) rather than buffering the whole body and then
+/// truncating. 1 KiB comfortably fits typical OSV/proxy diagnostics.
+const ERROR_BODY_LIMIT: usize = 1024;
+
+/// Read up to `max` bytes from `response`'s body and return them as a
+/// lossy UTF-8 string. Stops early at the first chunk that fills the cap
+/// so an oversized or slow body cannot stall the call up to the client
+/// timeout or balloon memory beyond `max` bytes.
+async fn read_bounded_body(response: &mut reqwest::Response, max: usize) -> String {
+    let mut buf: Vec<u8> = Vec::with_capacity(max);
+    while buf.len() < max {
+        match response.chunk().await {
+            Ok(Some(chunk)) => {
+                let remaining = max - buf.len();
+                let take = chunk.len().min(remaining);
+                buf.extend_from_slice(&chunk[..take]);
+                if take < chunk.len() {
+                    break;
+                }
+            }
+            Ok(None) | Err(_) => break,
+        }
+    }
+    String::from_utf8_lossy(&buf).into_owned()
+}
+
 /// Ecosystem names for OSV API
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Ecosystem {
@@ -273,7 +302,12 @@ impl OsvClient {
                     }
                 }
                 Err(e) => {
-                    result.errors.push(format!("Batch query failed: {}", e));
+                    let pkg_names: Vec<&str> = chunk.iter().map(|p| p.name.as_str()).collect();
+                    result.errors.push(format!(
+                        "Batch query failed for [{}]: {}",
+                        pkg_names.join(", "),
+                        e
+                    ));
                 }
             }
         }
@@ -299,7 +333,7 @@ impl OsvClient {
 
         let request = OsvBatchRequest { queries };
 
-        let response = self
+        let mut response = self
             .client
             .post(format!("{}/querybatch", self.base_url))
             .json(&request)
@@ -307,7 +341,13 @@ impl OsvClient {
             .await?;
 
         if !response.status().is_success() {
-            anyhow::bail!("OSV API error: HTTP {}", response.status());
+            let status = response.status();
+            let snippet = read_bounded_body(&mut response, ERROR_BODY_LIMIT).await;
+            if snippet.is_empty() {
+                anyhow::bail!("OSV API error: HTTP {}", status);
+            } else {
+                anyhow::bail!("OSV API error: HTTP {}: {}", status, snippet);
+            }
         }
 
         let batch_response: OsvBatchResponse = response.json().await?;
@@ -1002,5 +1042,170 @@ mod tests {
         assert!(result.errors.is_empty());
         assert_eq!(result.safe_count, 1);
         // wiremock will assert that no requests were received when the server drops.
+    }
+
+    // ─── batch failure error message ─────────────────────────────────────────
+
+    #[tokio::test]
+    async fn batch_failure_error_includes_package_names_status_and_body() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+
+        // OSV returns a non-success response with a body. Both should surface
+        // in the AuditResult error so operators can diagnose the failure.
+        Mock::given(method("POST"))
+            .and(path("/querybatch"))
+            .respond_with(
+                ResponseTemplate::new(503).set_body_string("upstream temporarily unavailable"),
+            )
+            .mount(&server)
+            .await;
+
+        let client = OsvClient::with_base_url(server.uri());
+        let pkgs = vec![
+            Package {
+                name: "requests".into(),
+                version: "2.0.0".into(),
+                ecosystem: Ecosystem::PyPI,
+            },
+            Package {
+                name: "boto3".into(),
+                version: "1.0.0".into(),
+                ecosystem: Ecosystem::PyPI,
+            },
+        ];
+
+        let result = client.check_packages(&pkgs).await.unwrap();
+
+        assert!(result.vulnerable.is_empty());
+        assert_eq!(
+            result.errors.len(),
+            1,
+            "one error for the failing batch, got {:?}",
+            result.errors
+        );
+        let err = &result.errors[0];
+        assert!(
+            err.contains("requests") && err.contains("boto3"),
+            "error should list the failing batch's package names: {err}"
+        );
+        assert!(
+            err.contains("503"),
+            "error should include the HTTP status: {err}"
+        );
+        assert!(
+            err.contains("upstream temporarily unavailable"),
+            "error should include the response body: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn batch_failure_stops_reading_at_cap_when_body_stalls() {
+        // Stand up a TCP server that lies about Content-Length: it claims
+        // 1 MB but only delivers 2 KiB, then stalls forever. The bounded
+        // read in query_batch must fill its 1 KiB cap from the head of
+        // the body and return immediately. An unbounded read (e.g.
+        // `response.text().await`) would block until either the rest of
+        // the body arrives or the 30 s client timeout fires.
+        use std::time::{Duration, Instant};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+
+            // Drain the request until we see the empty header line.
+            let mut buf = [0u8; 4096];
+            loop {
+                let n = match stream.read(&mut buf).await {
+                    Ok(n) if n > 0 => n,
+                    _ => return,
+                };
+                if buf[..n].windows(4).any(|w| w == b"\r\n\r\n") {
+                    break;
+                }
+            }
+
+            // Headers promise 1 MB; we send only 2 KiB then stall.
+            let head = b"HTTP/1.1 503 Service Unavailable\r\n\
+                         Content-Type: text/plain\r\n\
+                         Content-Length: 1000000\r\n\
+                         Connection: close\r\n\r\n";
+            let _ = stream.write_all(head).await;
+            let _ = stream.write_all(&vec![b'x'; 2048]).await;
+            let _ = stream.flush().await;
+
+            // Park the task so the connection stays open without further
+            // bytes. The test will abort the handle after the client
+            // returns.
+            std::future::pending::<()>().await;
+        });
+
+        let client = OsvClient::with_base_url(format!("http://{}", addr));
+        let started = Instant::now();
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(10),
+            client.check_packages(&[Package {
+                name: "pkg".into(),
+                version: "1.0.0".into(),
+                ecosystem: Ecosystem::PyPI,
+            }]),
+        )
+        .await;
+        let elapsed = started.elapsed();
+
+        server.abort();
+
+        let result = outcome
+            .expect(
+                "OSV call must return promptly when the body stalls; \
+                 if it didn't, the body is being read unbounded",
+            )
+            .unwrap();
+
+        assert_eq!(result.errors.len(), 1, "{:?}", result.errors);
+        let err = &result.errors[0];
+        assert!(err.contains("503"), "should include status: {err}");
+        // 5 s leaves a >100x margin over the expected ~1 RTT return
+        // time, while staying well under the 30 s client timeout that
+        // the buggy implementation would hit.
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "bounded read should return promptly; took {:?}",
+            elapsed
+        );
+    }
+
+    #[tokio::test]
+    async fn batch_failure_error_includes_package_names_on_network_error() {
+        // Point at a closed port so reqwest fails to connect. Package names
+        // should still be embedded in the resulting error message.
+        let client = OsvClient::with_base_url("http://127.0.0.1:1/".to_string());
+        let pkgs = vec![
+            Package {
+                name: "lonely-pkg".into(),
+                version: "1.0.0".into(),
+                ecosystem: Ecosystem::PyPI,
+            },
+            Package {
+                name: "another-pkg".into(),
+                version: "2.0.0".into(),
+                ecosystem: Ecosystem::PyPI,
+            },
+        ];
+
+        let result = client.check_packages(&pkgs).await.unwrap();
+
+        assert_eq!(result.errors.len(), 1, "{:?}", result.errors);
+        let err = &result.errors[0];
+        assert!(
+            err.contains("lonely-pkg") && err.contains("another-pkg"),
+            "network-level errors should still name the failing packages: {err}"
+        );
     }
 }
