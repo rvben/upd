@@ -15,6 +15,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 
 
+
+## [0.1.6](https://github.com/rvben/upd/compare/v0.1.5...v0.1.6) - 2026-04-29
+
+### Added
+
+- **http**: wire TLS init into networked subcommand entry points ([04f7b0d](https://github.com/rvben/upd/commit/04f7b0d6362f32ff2a6212386f310b481bfd7d56))
+- **cli**: add --insecure global flag ([df1943f](https://github.com/rvben/upd/commit/df1943ff53369b0cc0b32401cbbedb1095f07230))
+- **http**: attach TLS hint to send errors via wrap_send_err ([9b1fd2c](https://github.com/rvben/upd/commit/9b1fd2cef7e307a6d3328074a82353a772a5b44c))
+- **http**: apply TLS options to ClientBuilder ([7d8f616](https://github.com/rvben/upd/commit/7d8f6161f5f7be31e829f89ba9aaeb332532229f))
+- **http**: implement init() over pure helpers ([79556c6](https://github.com/rvben/upd/commit/79556c6d5a34cf5eda97e645b4d62c62ad706809))
+- **http**: detect TLS trust failures in error chains ([e63be5d](https://github.com/rvben/upd/commit/e63be5d62cfa82f2a73f3e78e294c65868c53ba7))
+- **http**: parse PEM CA bundle with multi-cert support ([07e3983](https://github.com/rvben/upd/commit/07e3983a9477dad042ea0f5b10ee8efa9382b384))
+- **http**: resolve CA bundle path from env vars ([2bd42ec](https://github.com/rvben/upd/commit/2bd42ec7018094e1daf399af8fb2e7e288e9e206))
+- **http**: scaffold TLS options module ([3f797cc](https://github.com/rvben/upd/commit/3f797cc658298b9b952e566b49d4998a4decfc64))
+
+### Fixed
+
+- **http**: propagate --insecure global flag to self-update ([88b397e](https://github.com/rvben/upd/commit/88b397ee4a169eab94b56247050e8b1814c8ccf3))
+- **http**: defer TLS init past offline and no-op early returns ([41cfb40](https://github.com/rvben/upd/commit/41cfb40f2f72e6090fc0f083c13371c3a4269347))
+- **http**: skip CA bundle resolution when --insecure is set ([8d73e27](https://github.com/rvben/upd/commit/8d73e27aadaa5ac488bbbf7f556476cf9bfaa0e6))
+
 ## [0.1.5](https://github.com/rvben/upd/compare/v0.1.4...v0.1.5) - 2026-04-28
 
 ### Added
