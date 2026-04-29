@@ -4,6 +4,7 @@ pub mod cache;
 pub mod cli;
 pub mod config;
 pub mod cooldown;
+pub mod http;
 pub mod interactive;
 pub mod lockfile;
 pub mod output;
