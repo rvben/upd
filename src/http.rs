@@ -63,6 +63,41 @@ pub(crate) fn parse_pem_bundle(bytes: &[u8]) -> Result<Vec<Certificate>> {
     Ok(certs)
 }
 
+const TLS_MARKERS: &[&str] = &[
+    "unknown issuer",
+    "unknownissuer",
+    "invalidcertificate",
+    "self-signed",
+    "self signed",
+    "certificate verify",
+    "certificateverification",
+    "tls handshake",
+    "certnotvalidforname",
+    "certificate not valid for name",
+    "certexpired",
+    "cert expired",
+    "certnotvalidyet",
+    "certrevoked",
+    "unknownrevocationstatus",
+];
+
+/// Walk an error chain and return true if any source's `Display` contains a
+/// known TLS-trust-failure marker (case-insensitive).
+///
+/// Generic over `dyn std::error::Error` so it can be unit-tested with synthetic
+/// error types — `reqwest::Error` has no public constructor for arbitrary chains.
+pub(crate) fn chain_indicates_tls_failure(err: &(dyn std::error::Error + 'static)) -> bool {
+    let mut current: Option<&(dyn std::error::Error + 'static)> = Some(err);
+    while let Some(e) = current {
+        let msg = e.to_string().to_lowercase();
+        if TLS_MARKERS.iter().any(|m| msg.contains(m)) {
+            return true;
+        }
+        current = e.source();
+    }
+    false
+}
+
 /// Initialize TLS options. Called from the entry point of every networked
 /// subcommand (`run_update`, `run_align`, `run_audit`, `self_update`) before
 /// any [`reqwest::Client`] is built.
@@ -79,6 +114,7 @@ pub fn init(insecure: bool) -> Result<()> {
     let _ = insecure;
     let _ = resolve_ca_path(|k| std::env::var(k).ok());
     let _ = parse_pem_bundle(b"-----BEGIN CERTIFICATE-----\n-----END CERTIFICATE-----\n");
+    let _ = chain_indicates_tls_failure(&std::io::Error::other("placeholder"));
     Ok(())
 }
 
@@ -230,6 +266,98 @@ uMhJbUlN9AYtL2pAGNPK
         assert!(
             msg.contains("empty") || msg.contains("no certificate") || msg.contains("pem"),
             "expected empty/no-cert error, got: {msg}"
+        );
+    }
+
+    use std::error::Error as StdError;
+    use std::fmt;
+
+    #[derive(Debug)]
+    struct TestError {
+        msg: String,
+        source: Option<Box<dyn StdError + Send + Sync + 'static>>,
+    }
+
+    impl TestError {
+        fn new(msg: &str) -> Self {
+            Self {
+                msg: msg.to_string(),
+                source: None,
+            }
+        }
+        fn with_source(mut self, src: Box<dyn StdError + Send + Sync + 'static>) -> Self {
+            self.source = Some(src);
+            self
+        }
+    }
+
+    impl fmt::Display for TestError {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.write_str(&self.msg)
+        }
+    }
+
+    impl StdError for TestError {
+        fn source(&self) -> Option<&(dyn StdError + 'static)> {
+            self.source
+                .as_deref()
+                .map(|s| s as &(dyn StdError + 'static))
+        }
+    }
+
+    #[test]
+    fn test_chain_indicates_tls_failure_for_each_marker() {
+        let markers = [
+            "UnknownIssuer",
+            "unknown issuer",
+            "InvalidCertificate",
+            "invalidcertificate",
+            "self-signed",
+            "self signed",
+            "certificate verify failed",
+            "CertificateVerification",
+            "tls handshake failure",
+            "CertNotValidForName",
+            "certificate not valid for name",
+            "CertExpired",
+            "cert expired",
+            "CertNotValidYet",
+            "CertRevoked",
+            "UnknownRevocationStatus",
+        ];
+        for m in markers {
+            let e = TestError::new(m);
+            assert!(
+                chain_indicates_tls_failure(&e),
+                "expected marker {m:?} to indicate TLS failure"
+            );
+        }
+    }
+
+    #[test]
+    fn test_chain_indicates_tls_failure_passthrough() {
+        for msg in [
+            "connection refused",
+            "dns lookup failed",
+            "timed out",
+            "operation cancelled",
+            "broken pipe",
+        ] {
+            let e = TestError::new(msg);
+            assert!(
+                !chain_indicates_tls_failure(&e),
+                "non-TLS message {msg:?} must not match"
+            );
+        }
+    }
+
+    #[test]
+    fn test_chain_indicates_tls_failure_walks_sources() {
+        let inner = TestError::new("InvalidCertificate(UnknownIssuer)");
+        let outer = TestError::new("error sending request").with_source(Box::new(inner));
+        assert!(
+            chain_indicates_tls_failure(&outer),
+            "matcher must walk Error::source"
         );
     }
 }
