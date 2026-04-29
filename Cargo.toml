@@ -34,7 +34,7 @@ clap = { version = "4.6.1", features = ["derive"] }
 
 # Async runtime + HTTP
 tokio = { version = "1.52.1", features = ["full"] }
-reqwest = { version = "0.13.2", default-features = false, features = ["json", "gzip", "rustls"] }
+reqwest = { version = "0.13.2", default-features = false, features = ["json", "gzip", "native-tls-vendored"] }
 
 # Serialization
 serde = { version = "1.0.228", features = ["derive"] }
