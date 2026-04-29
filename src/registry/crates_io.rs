@@ -287,19 +287,21 @@ impl CratesIoRegistry {
             headers.insert(AUTHORIZATION, header_value);
         }
 
-        let client = Client::builder()
-            .gzip(true)
-            // crates.io requires a descriptive User-Agent
-            .user_agent(concat!(
-                "upd/",
-                env!("CARGO_PKG_VERSION"),
-                " (https://github.com/rvben/upd)"
-            ))
-            .timeout(Duration::from_secs(30))
-            .connect_timeout(Duration::from_secs(10))
-            .default_headers(headers)
-            .build()
-            .expect("Failed to create HTTP client. This usually indicates a TLS/SSL configuration issue on your system.");
+        let client = crate::http::apply(
+            Client::builder()
+                .gzip(true)
+                // crates.io requires a descriptive User-Agent
+                .user_agent(concat!(
+                    "upd/",
+                    env!("CARGO_PKG_VERSION"),
+                    " (https://github.com/rvben/upd)"
+                ))
+                .timeout(Duration::from_secs(30))
+                .connect_timeout(Duration::from_secs(10))
+                .default_headers(headers),
+        )
+        .build()
+        .expect("Failed to create HTTP client. This usually indicates a TLS/SSL configuration issue on your system.");
 
         Self {
             client,

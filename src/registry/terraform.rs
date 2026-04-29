@@ -42,26 +42,30 @@ impl TerraformRegistry {
 
     #[cfg(test)]
     pub fn with_api_url(api_url: String) -> Self {
-        let client = Client::builder()
-            .gzip(true)
-            .user_agent(concat!("upd/", env!("CARGO_PKG_VERSION")))
-            .timeout(Duration::from_secs(30))
-            .connect_timeout(Duration::from_secs(10))
-            .build()
-            .expect("Failed to create HTTP client");
+        let client = crate::http::apply(
+            Client::builder()
+                .gzip(true)
+                .user_agent(concat!("upd/", env!("CARGO_PKG_VERSION")))
+                .timeout(Duration::from_secs(30))
+                .connect_timeout(Duration::from_secs(10)),
+        )
+        .build()
+        .expect("Failed to create HTTP client");
 
         Self { client, api_url }
     }
 
     #[cfg(not(test))]
     fn with_api_url(api_url: String) -> Self {
-        let client = Client::builder()
-            .gzip(true)
-            .user_agent(concat!("upd/", env!("CARGO_PKG_VERSION")))
-            .timeout(Duration::from_secs(30))
-            .connect_timeout(Duration::from_secs(10))
-            .build()
-            .expect("Failed to create HTTP client");
+        let client = crate::http::apply(
+            Client::builder()
+                .gzip(true)
+                .user_agent(concat!("upd/", env!("CARGO_PKG_VERSION")))
+                .timeout(Duration::from_secs(30))
+                .connect_timeout(Duration::from_secs(10)),
+        )
+        .build()
+        .expect("Failed to create HTTP client");
 
         Self { client, api_url }
     }

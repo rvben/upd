@@ -59,13 +59,15 @@ impl GitHubReleasesRegistry {
 
         let user_agent = concat!("upd/", env!("CARGO_PKG_VERSION"));
 
-        let client = Client::builder()
-            .user_agent(user_agent)
-            .timeout(Duration::from_secs(30))
-            .connect_timeout(Duration::from_secs(10))
-            .default_headers(headers)
-            .build()
-            .expect("Failed to create HTTP client for GitHub API.");
+        let client = crate::http::apply(
+            Client::builder()
+                .user_agent(user_agent)
+                .timeout(Duration::from_secs(30))
+                .connect_timeout(Duration::from_secs(10))
+                .default_headers(headers),
+        )
+        .build()
+        .expect("Failed to create HTTP client for GitHub API.");
 
         Self { client, api_url }
     }

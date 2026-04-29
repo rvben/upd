@@ -203,10 +203,11 @@ impl OsvClient {
     /// Create a client pointing at a custom base URL (used by tests).
     pub fn with_base_url(base_url: String) -> Self {
         Self {
-            client: Client::builder()
-                .timeout(Duration::from_secs(30))
-                .build()
-                .expect("Failed to create HTTP client. This usually indicates a TLS/SSL configuration issue on your system."),
+            client: crate::http::apply(
+                Client::builder().timeout(Duration::from_secs(30))
+            )
+            .build()
+            .expect("Failed to create HTTP client. This usually indicates a TLS/SSL configuration issue on your system."),
             base_url,
         }
     }
