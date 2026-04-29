@@ -7,7 +7,7 @@
 //! Pure helpers ([`resolve_ca_path`], [`parse_pem_bundle`], [`chain_indicates_tls_failure`])
 //! contain the testable logic; [`init`] is a thin shell over them.
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use reqwest::{Certificate, ClientBuilder};
 use std::path::PathBuf;
 use std::sync::OnceLock;
@@ -45,6 +45,24 @@ where
         .map(PathBuf::from)
 }
 
+/// Parse one or more PEM-encoded certificates from a byte buffer.
+///
+/// Treats `from_pem_bundle` failures as fatal. An empty buffer (or a buffer with
+/// no `BEGIN CERTIFICATE` markers) returns an `Err` so callers can surface a
+/// meaningful diagnostic — silently producing an empty cert list would mask a
+/// misconfigured CA bundle path.
+pub(crate) fn parse_pem_bundle(bytes: &[u8]) -> Result<Vec<Certificate>> {
+    if bytes.is_empty() {
+        anyhow::bail!("CA bundle is empty (no PEM data)");
+    }
+    let certs =
+        Certificate::from_pem_bundle(bytes).context("failed to parse PEM certificate bundle")?;
+    if certs.is_empty() {
+        anyhow::bail!("no certificates found in PEM bundle");
+    }
+    Ok(certs)
+}
+
 /// Initialize TLS options. Called from the entry point of every networked
 /// subcommand (`run_update`, `run_align`, `run_audit`, `self_update`) before
 /// any [`reqwest::Client`] is built.
@@ -60,6 +78,7 @@ pub fn init(insecure: bool) -> Result<()> {
     // Implemented in Task 5.
     let _ = insecure;
     let _ = resolve_ca_path(|k| std::env::var(k).ok());
+    let _ = parse_pem_bundle(b"-----BEGIN CERTIFICATE-----\n-----END CERTIFICATE-----\n");
     Ok(())
 }
 
@@ -136,5 +155,81 @@ mod tests {
     fn test_resolve_ca_path_returns_none_when_all_unset() {
         let env = fake_env(&[]);
         assert_eq!(resolve_ca_path(&env), None);
+    }
+
+    const TEST_CERT_1: &[u8] = br#"-----BEGIN CERTIFICATE-----
+MIIDCzCCAfOgAwIBAgIUKZ0KJZK5GE4JM+j0245augoh8OwwDQYJKoZIhvcNAQEL
+BQAwFTETMBEGA1UEAwwKdXBkLXRlc3QtMTAeFw0yNjA0MjkwODI5MjhaFw0zNjA0
+MjYwODI5MjhaMBUxEzARBgNVBAMMCnVwZC10ZXN0LTEwggEiMA0GCSqGSIb3DQEB
+AQUAA4IBDwAwggEKAoIBAQDc44mX7cV5VLqtFGPGnEjjRLC+vO6Tk2SSO3eC9S3M
+6Ryy3sAl11ZeSLzBOhdE3rZC4+oZjiy7Ht8TJuz8XxMH4ASUrfdkO7CyJfbxE5FJ
+FAb+ZbHE9K+SKiCiVPd367v05Tra2P31+k3qFYnqH9jklwj1RwdMNhNLNUDd0f7I
+xiTEGnSEfNUy1opwAcwYdRIAYAWi9TQxLy6+JyVHaDSG9s05SbinKaRWb/5Elopc
+QJZ0fa8caCW7t+6caQQNE4pbgwj9iLSstyo28MAiZcQ7vgOzxCvyxf/fhQbbuCjg
+uCUlTb9QsToXjF6GrQ6ZY5ze0KslQIa1KHfEtt8C9PnlAgMBAAGjUzBRMB0GA1Ud
+DgQWBBSMYjXeEDAT+plKMitN3kuxrtU+eTAfBgNVHSMEGDAWgBSMYjXeEDAT+plK
+MitN3kuxrtU+eTAPBgNVHRMBAf8EBTADAQH/MA0GCSqGSIb3DQEBCwUAA4IBAQB3
+k413BI7F3FEOsjaCaSqr+Cp+xaPytGFxwjB7y7lXk3Ep0sCwSO99QDze+hXAWY+L
+32JHgNXjvKccgfb+VP8Cv7XR5vNBmOm8RXfE90r3YwgPQo2GfAK3KAclFabil9ek
+Dhjy52Y3Kw3S1ZfjizJbKlT0WvLLIaFVAHxOKCxwTNnYzu9j4rF2krE74yTdaPBm
+bOIOTW/JL8Xlux+k0jV+BvLYK8/rlKgjUlCUlQFwKfQVVTagnh66jQbvtLqGT/1z
+5AQ1MkjwT9arAOD+xWKXd3F1e2uEFl8QTGSqCTv85gKFM2BAVS04295SUUfllbNd
+wVzHoiFTA+cbUjjOxjGM
+-----END CERTIFICATE-----
+"#;
+    const TEST_CERT_2: &[u8] = br#"-----BEGIN CERTIFICATE-----
+MIIDCzCCAfOgAwIBAgIUTRxLSgg2B1Nv53xT2+s2LrPEze4wDQYJKoZIhvcNAQEL
+BQAwFTETMBEGA1UEAwwKdXBkLXRlc3QtMjAeFw0yNjA0MjkwODI5MjhaFw0zNjA0
+MjYwODI5MjhaMBUxEzARBgNVBAMMCnVwZC10ZXN0LTIwggEiMA0GCSqGSIb3DQEB
+AQUAA4IBDwAwggEKAoIBAQDaP51Ef0k52LrqC9PZ1kW/XlSqNXuTLgHeOPFPJmxQ
+lVQ9/3dRAE3gnJUZmOsoZ5lgceNhBuPArrHJytDMUFJ5auRZhF1i7LOSRYF9B7KW
+gQmlniAI9+rYBMTgc/2+PnnB3dGHcg23sVwtYWzTW6DZl6z28cpUXgLES7sSPi+0
+hleTvfsEW2idjFcZO6sOFEeyPA3PJUA0YtWdKLANRp5kIEEqQO5Bln8MOEbl6r2O
+vJOZnUTCoqP1Y2xExAj2gUw/+CWzAjC0rp4uPKUWP0ckHGlbCm7KmqxYLE6o0obg
+c9vXxyeZ0FbZLc60e/mB3iakxJWa8DK1T9DH7gt5cXBfAgMBAAGjUzBRMB0GA1Ud
+DgQWBBQLAmfP5m+XU+67B7/u6l89s6p7wTAfBgNVHSMEGDAWgBQLAmfP5m+XU+67
+B7/u6l89s6p7wTAPBgNVHRMBAf8EBTADAQH/MA0GCSqGSIb3DQEBCwUAA4IBAQBW
+L0eKTSQx7KJ4F5N7WDgdZvp3QtonBWIgQzRxgWEpS8oQyS0Jtr5esOmCSMbPnPNj
+2xSE001niyxlsgjd4/UQ3P9Kj8jHfElnNB/qjSGPWzTRb/T+2LLXWQZ3ptcN8p4O
+JeCGZf6GyCJEu9ToiPddNZl0B9IELCUSBJ8QPbIVBRHCIbCDIe5bIt3gJKBnK+Vl
+8eUKTvF8cnnvw2Nr0umbxCoVjbmbyKpL/3ZsT70QF4eyQZ0JAmYQg7Ufx+pj09FX
+j6KbS4KlY8roCKAlQEAxJ1qXTvl2/6QcWHvux1nue0KcBfHvFBAIHfNVUj7NslXX
+uMhJbUlN9AYtL2pAGNPK
+-----END CERTIFICATE-----
+"#;
+
+    fn two_cert_bundle() -> Vec<u8> {
+        let mut out = Vec::with_capacity(TEST_CERT_1.len() + TEST_CERT_2.len());
+        out.extend_from_slice(TEST_CERT_1);
+        out.extend_from_slice(TEST_CERT_2);
+        out
+    }
+
+    #[test]
+    fn test_parse_pem_bundle_loads_multiple_certs() {
+        let bytes = two_cert_bundle();
+        let certs = parse_pem_bundle(&bytes).expect("two-cert bundle must parse");
+        assert_eq!(certs.len(), 2, "expected 2 certs, got {}", certs.len());
+    }
+
+    #[test]
+    fn test_parse_pem_bundle_rejects_garbage() {
+        let bytes = b"this is not a PEM file at all";
+        let err = parse_pem_bundle(bytes).expect_err("garbage must not parse");
+        let msg = err.to_string().to_lowercase();
+        assert!(
+            msg.contains("pem") || msg.contains("certificate"),
+            "expected PEM-related error, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_parse_pem_bundle_handles_empty_input() {
+        let err = parse_pem_bundle(&[]).expect_err("empty input must not parse");
+        let msg = err.to_string().to_lowercase();
+        assert!(
+            msg.contains("empty") || msg.contains("no certificate") || msg.contains("pem"),
+            "expected empty/no-cert error, got: {msg}"
+        );
     }
 }
