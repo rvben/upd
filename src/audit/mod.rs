@@ -334,12 +334,14 @@ impl OsvClient {
 
         let request = OsvBatchRequest { queries };
 
+        let url = format!("{}/querybatch", self.base_url);
         let mut response = self
             .client
-            .post(format!("{}/querybatch", self.base_url))
+            .post(&url)
             .json(&request)
             .send()
-            .await?;
+            .await
+            .map_err(|e| crate::http::wrap_send_err(e, &url))?;
 
         if !response.status().is_success() {
             let status = response.status();
@@ -398,11 +400,13 @@ impl OsvClient {
 
     /// Fetch vulnerability details by ID
     async fn fetch_vuln_by_id(&self, id: &str) -> Result<Vulnerability> {
+        let url = format!("{}/vulns/{}", self.base_url, id);
         let response = self
             .client
-            .get(format!("{}/vulns/{}", self.base_url, id))
+            .get(&url)
             .send()
-            .await?;
+            .await
+            .map_err(|e| crate::http::wrap_send_err(e, &url))?;
 
         if !response.status().is_success() {
             anyhow::bail!(

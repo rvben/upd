@@ -354,7 +354,8 @@ impl NpmRegistry {
             .get(&url)
             .header("Accept", "application/vnd.npm.install-v1+json")
             .send()
-            .await?;
+            .await
+            .map_err(|e| crate::http::wrap_send_err(e, &url))?;
 
         if !response.status().is_success() {
             return Err(anyhow!(http_error_message(
