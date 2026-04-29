@@ -140,8 +140,16 @@ pub fn options() -> &'static HttpOptions {
 }
 
 /// Apply the configured TLS options to a [`ClientBuilder`].
-pub fn apply(builder: ClientBuilder) -> ClientBuilder {
-    // Implemented in Task 6.
+pub fn apply(mut builder: ClientBuilder) -> ClientBuilder {
+    let opts = options();
+    for cert in &opts.extra_certs {
+        builder = builder.add_root_certificate(cert.clone());
+    }
+    if opts.insecure {
+        builder = builder
+            .danger_accept_invalid_certs(true)
+            .danger_accept_invalid_hostnames(true);
+    }
     builder
 }
 
@@ -408,5 +416,18 @@ uMhJbUlN9AYtL2pAGNPK
         let path = PathBuf::from("/this/path/definitely/does/not/exist/upd-ca.pem");
         let read_err = std::fs::read(&path).expect_err("read of missing path must fail");
         assert_eq!(read_err.kind(), std::io::ErrorKind::NotFound);
+    }
+
+    #[test]
+    fn test_apply_with_default_options_builds() {
+        // Contract test: we can't introspect a ClientBuilder's TLS state, so the
+        // best we can do is assert that the chain compiles and produces a usable
+        // Client. With default options (no extra certs, not insecure), apply
+        // must be a no-op that doesn't break the builder.
+        let client = apply(reqwest::Client::builder()).build();
+        assert!(
+            client.is_ok(),
+            "apply(builder).build() must succeed: {client:?}"
+        );
     }
 }
