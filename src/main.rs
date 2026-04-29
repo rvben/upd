@@ -523,7 +523,7 @@ async fn main() -> Result<()> {
             clean_cache()?;
         }
         Some(Command::SelfUpdate) => {
-            self_update().await?;
+            self_update(&cli).await?;
         }
         Some(Command::Align { .. }) => {
             run_align(&cli).await?;
@@ -3365,8 +3365,8 @@ fn clean_cache() -> Result<()> {
     Ok(())
 }
 
-async fn self_update() -> Result<()> {
-    upd::http::init(false).context("Failed to initialize TLS options")?;
+async fn self_update(cli: &Cli) -> Result<()> {
+    init_tls(cli)?;
     println!("Checking for updates...");
 
     let url = "https://api.github.com/repos/rvben/upd/releases/latest";
