@@ -540,7 +540,6 @@ async fn main() -> Result<()> {
 }
 
 async fn run_update(cli: &Cli) -> Result<()> {
-    init_tls(cli)?;
     if cli.interactive && cli.format == upd::cli::OutputFormat::Json {
         anyhow::bail!("--interactive cannot be combined with --format json");
     }
@@ -588,6 +587,10 @@ async fn run_update(cli: &Cli) -> Result<()> {
         }
         return Ok(());
     }
+
+    // Init TLS only after we know we're going to network. The empty-files
+    // early return above must not be killed by a malformed CA bundle env var.
+    init_tls(cli)?;
 
     let file_configs = load_update_configs(cli, &files)?;
 
@@ -1501,7 +1504,6 @@ async fn run_interactive_update(
 }
 
 async fn run_align(cli: &Cli) -> Result<()> {
-    init_tls(cli)?;
     let text_mode = cli.format == upd::cli::OutputFormat::Text;
 
     // Resolve paths: explicit > VCS root > error
@@ -1533,6 +1535,10 @@ async fn run_align(cli: &Cli) -> Result<()> {
         }
         return Ok(());
     }
+
+    // Init TLS only after we know we're going to network. The empty-files
+    // early return above must not be killed by a malformed CA bundle env var.
+    init_tls(cli)?;
 
     if cli.verbose && text_mode {
         println!(
@@ -1714,7 +1720,6 @@ pub(crate) fn build_audit_packages(
 type FileEdits = (FileType, Vec<(String, String, String, Option<usize>)>);
 
 async fn run_audit(cli: &Cli) -> Result<()> {
-    init_tls(cli)?;
     let no_fail = matches!(&cli.command, Some(Command::Audit { no_fail, .. }) if *no_fail);
     let fix_audit = matches!(&cli.command, Some(Command::Audit { fix_audit, .. }) if *fix_audit);
     let offline = matches!(&cli.command, Some(Command::Audit { offline, .. }) if *offline);
@@ -1790,6 +1795,15 @@ async fn run_audit(cli: &Cli) -> Result<()> {
             emit_audit_json(&AuditResult::default(), "complete")?;
         }
         return Ok(());
+    }
+
+    // Init TLS only when we're actually going to contact OSV. `--offline` reads
+    // exclusively from the on-disk cache and must not be killed by a malformed
+    // CA bundle env var; empty-files / empty-packages early returns above are
+    // similarly network-free. Initialized before the user-visible "Checking…"
+    // line so the `--insecure` warning lands on stderr first.
+    if !offline {
+        init_tls(cli)?;
     }
 
     if text_mode && !cli.quiet {
