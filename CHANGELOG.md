@@ -16,6 +16,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 
 
+
+## [0.1.7](https://github.com/rvben/upd/compare/v0.1.6...v0.1.7) - 2026-04-29
+
+### Fixed
+
+- **tls**: switch reqwest backend from rustls to native-tls ([dd8375d](https://github.com/rvben/upd/commit/dd8375de58dc8c024476dbec4d171a2af56f7ebc))
+
 ## [0.1.6](https://github.com/rvben/upd/compare/v0.1.5...v0.1.6) - 2026-04-29
 
 ### Added
