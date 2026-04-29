@@ -192,6 +192,16 @@ pub struct Cli {
     /// Explicit file paths are always processed regardless of this flag.
     #[arg(long = "no-ignore", global = true)]
     pub no_ignore: bool,
+
+    /// Disable TLS certificate verification.
+    ///
+    /// Skips verification of server certificates for all HTTPS requests this run.
+    /// Hostname verification is also disabled on a best-effort basis (may not be
+    /// honored under every TLS backend). Use only as a last resort in environments
+    /// where the system trust store cannot be configured. Prefer setting
+    /// REQUESTS_CA_BUNDLE or SSL_CERT_FILE to your corporate CA bundle.
+    #[arg(long, global = true)]
+    pub insecure: bool,
 }
 
 #[derive(Subcommand)]
@@ -297,6 +307,7 @@ mod tests {
         assert!(cli.paths.is_empty());
         assert!(cli.command.is_none());
         assert!(cli.min_age.is_none());
+        assert!(!cli.insecure);
     }
 
     #[test]
@@ -873,5 +884,25 @@ mod tests {
         let cli = Cli::try_parse_from(["upd", "align", "--no-ignore"]).unwrap();
         assert!(cli.no_ignore);
         assert!(matches!(cli.command, Some(Command::Align { .. })));
+    }
+
+    #[test]
+    fn test_cli_parses_insecure() {
+        let cli = Cli::try_parse_from(["upd", "--insecure"]).unwrap();
+        assert!(cli.insecure);
+    }
+
+    #[test]
+    fn test_cli_insecure_default_false() {
+        let cli = Cli::try_parse_from(["upd"]).unwrap();
+        assert!(!cli.insecure);
+    }
+
+    #[test]
+    fn test_cli_insecure_is_global_across_subcommands() {
+        for sub in ["audit", "update", "align"] {
+            let cli = Cli::try_parse_from(["upd", sub, "--insecure"]).unwrap();
+            assert!(cli.insecure, "--insecure must be accepted under `{sub}`");
+        }
     }
 }
