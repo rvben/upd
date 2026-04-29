@@ -126,8 +126,6 @@ pub fn init(insecure: bool) -> Result<()> {
         insecure,
         extra_certs,
     });
-    // Suppress dead-code warning until Task 7 wires this into wrap_send_err.
-    let _ = chain_indicates_tls_failure(&std::io::Error::other("placeholder"));
     Ok(())
 }
 
@@ -153,13 +151,30 @@ pub fn apply(mut builder: ClientBuilder) -> ClientBuilder {
     builder
 }
 
+/// Build the user-facing TLS hint for a given URL.
+fn tls_hint(url: &str) -> String {
+    let host = url::Url::parse(url)
+        .ok()
+        .and_then(|u| u.host_str().map(str::to_owned))
+        .unwrap_or_else(|| url.to_string());
+    format!(
+        "TLS certificate verification failed for {host}. \
+         If you're behind a corporate proxy, install your CA into the system trust store \
+         or set REQUESTS_CA_BUNDLE / SSL_CERT_FILE to your CA bundle path. \
+         As a last resort, pass --insecure to skip verification (not recommended)."
+    )
+}
+
 /// Map a [`reqwest::Error`] from `.send()` into an [`anyhow::Error`], attaching
 /// a TLS-trust hint when the error chain indicates a certificate-verification
 /// failure.
 pub fn wrap_send_err(err: reqwest::Error, url: &str) -> anyhow::Error {
-    // Implemented in Task 7.
-    let _ = url;
-    anyhow::Error::from(err)
+    if chain_indicates_tls_failure(&err) {
+        let hint = tls_hint(url);
+        anyhow::Error::from(err).context(hint)
+    } else {
+        anyhow::Error::from(err)
+    }
 }
 
 #[cfg(test)]
