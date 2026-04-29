@@ -9,7 +9,15 @@
 
 use anyhow::Result;
 use reqwest::{Certificate, ClientBuilder};
+use std::path::PathBuf;
 use std::sync::OnceLock;
+
+const CA_BUNDLE_ENV_VARS: &[&str] = &[
+    "UPD_CA_BUNDLE",
+    "REQUESTS_CA_BUNDLE",
+    "CURL_CA_BUNDLE",
+    "SSL_CERT_FILE",
+];
 
 #[derive(Debug, Default)]
 pub struct HttpOptions {
@@ -20,6 +28,22 @@ pub struct HttpOptions {
 
 static HTTP_OPTIONS: OnceLock<HttpOptions> = OnceLock::new();
 static DEFAULT_OPTIONS: OnceLock<HttpOptions> = OnceLock::new();
+
+/// Resolve which CA-bundle env var holds the path we should load.
+///
+/// Returns the first non-empty value among `UPD_CA_BUNDLE`, `REQUESTS_CA_BUNDLE`,
+/// `CURL_CA_BUNDLE`, `SSL_CERT_FILE` (in that order), or `None` when none are set.
+/// Empty strings are treated as unset.
+pub(crate) fn resolve_ca_path<E>(env: E) -> Option<PathBuf>
+where
+    E: Fn(&str) -> Option<String>,
+{
+    CA_BUNDLE_ENV_VARS
+        .iter()
+        .filter_map(|name| env(name))
+        .find(|v| !v.is_empty())
+        .map(PathBuf::from)
+}
 
 /// Initialize TLS options. Called from the entry point of every networked
 /// subcommand (`run_update`, `run_align`, `run_audit`, `self_update`) before
@@ -35,6 +59,7 @@ static DEFAULT_OPTIONS: OnceLock<HttpOptions> = OnceLock::new();
 pub fn init(insecure: bool) -> Result<()> {
     // Implemented in Task 5.
     let _ = insecure;
+    let _ = resolve_ca_path(|k| std::env::var(k).ok());
     Ok(())
 }
 
@@ -59,4 +84,57 @@ pub fn wrap_send_err(err: reqwest::Error, url: &str) -> anyhow::Error {
     // Implemented in Task 7.
     let _ = url;
     anyhow::Error::from(err)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn fake_env<'a>(map: &'a [(&'a str, Option<&'a str>)]) -> impl Fn(&str) -> Option<String> + 'a {
+        move |k: &str| {
+            map.iter()
+                .find(|(name, _)| *name == k)
+                .and_then(|(_, v)| v.map(str::to_owned))
+        }
+    }
+
+    #[test]
+    fn test_resolve_ca_path_priority_order() {
+        // UPD_CA_BUNDLE wins
+        let env = fake_env(&[
+            ("UPD_CA_BUNDLE", Some("/upd")),
+            ("REQUESTS_CA_BUNDLE", Some("/requests")),
+            ("CURL_CA_BUNDLE", Some("/curl")),
+            ("SSL_CERT_FILE", Some("/ssl")),
+        ]);
+        assert_eq!(resolve_ca_path(&env), Some(PathBuf::from("/upd")));
+
+        // Without UPD_CA_BUNDLE, REQUESTS_CA_BUNDLE wins
+        let env = fake_env(&[
+            ("UPD_CA_BUNDLE", None),
+            ("REQUESTS_CA_BUNDLE", Some("/requests")),
+            ("CURL_CA_BUNDLE", Some("/curl")),
+            ("SSL_CERT_FILE", Some("/ssl")),
+        ]);
+        assert_eq!(resolve_ca_path(&env), Some(PathBuf::from("/requests")));
+
+        // Down to SSL_CERT_FILE
+        let env = fake_env(&[("SSL_CERT_FILE", Some("/ssl"))]);
+        assert_eq!(resolve_ca_path(&env), Some(PathBuf::from("/ssl")));
+    }
+
+    #[test]
+    fn test_resolve_ca_path_skips_empty_strings() {
+        let env = fake_env(&[
+            ("UPD_CA_BUNDLE", Some("")),
+            ("REQUESTS_CA_BUNDLE", Some("/requests")),
+        ]);
+        assert_eq!(resolve_ca_path(&env), Some(PathBuf::from("/requests")));
+    }
+
+    #[test]
+    fn test_resolve_ca_path_returns_none_when_all_unset() {
+        let env = fake_env(&[]);
+        assert_eq!(resolve_ca_path(&env), None);
+    }
 }
