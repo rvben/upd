@@ -9,7 +9,7 @@
 
 use anyhow::{Context, Result};
 use reqwest::{Certificate, ClientBuilder};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
 const CA_BUNDLE_ENV_VARS: &[&str] = &[
@@ -98,6 +98,25 @@ pub(crate) fn chain_indicates_tls_failure(err: &(dyn std::error::Error + 'static
     false
 }
 
+/// Compute the extra-certs vector that `init` would set, given injectable env
+/// and file-read closures. Pulled out so the short-circuit and error paths can
+/// be exercised hermetically without touching the process-global `OnceLock`.
+fn compute_extra_certs<E, R>(insecure: bool, env: E, read: R) -> Result<Vec<Certificate>>
+where
+    E: Fn(&str) -> Option<String>,
+    R: Fn(&Path) -> std::io::Result<Vec<u8>>,
+{
+    if insecure {
+        return Ok(Vec::new());
+    }
+    let Some(p) = resolve_ca_path(env) else {
+        return Ok(Vec::new());
+    };
+    let bytes = read(&p).with_context(|| format!("failed to read CA bundle at {}", p.display()))?;
+    parse_pem_bundle(&bytes)
+        .with_context(|| format!("failed to parse CA bundle at {}", p.display()))
+}
+
 /// Initialize TLS options. Called from the entry point of every networked
 /// subcommand (`run_update`, `run_align`, `run_audit`, `self_update`) before
 /// any [`reqwest::Client`] is built.
@@ -106,20 +125,16 @@ pub(crate) fn chain_indicates_tls_failure(err: &(dyn std::error::Error + 'static
 /// `SSL_CERT_FILE` (priority order; first non-empty wins). Returns `Err` with the
 /// path in the message if the chosen file cannot be read or parsed.
 ///
+/// When `insecure` is true, env-var-resolved bundles are not read or parsed: the
+/// user has opted out of verification entirely, so a stale or malformed bundle
+/// path must not block the run.
+///
 /// **Library callers:** clients constructed before `init` is called see
 /// [`HttpOptions::default`] forever — only clients constructed after `init`
 /// pick up the configured CAs and `--insecure` flag.
 pub fn init(insecure: bool) -> Result<()> {
-    let path = resolve_ca_path(|k| std::env::var(k).ok());
-    let extra_certs = match path {
-        Some(p) => {
-            let bytes = std::fs::read(&p)
-                .with_context(|| format!("failed to read CA bundle at {}", p.display()))?;
-            parse_pem_bundle(&bytes)
-                .with_context(|| format!("failed to parse CA bundle at {}", p.display()))?
-        }
-        None => Vec::new(),
-    };
+    let extra_certs =
+        compute_extra_certs(insecure, |k| std::env::var(k).ok(), |p| std::fs::read(p))?;
     // OnceLock::set is fallible if already set; that's fine — first init wins, later
     // calls in the same process are silent no-ops (the value is already correct).
     let _ = HTTP_OPTIONS.set(HttpOptions {
@@ -431,6 +446,59 @@ uMhJbUlN9AYtL2pAGNPK
         let path = PathBuf::from("/this/path/definitely/does/not/exist/upd-ca.pem");
         let read_err = std::fs::read(&path).expect_err("read of missing path must fail");
         assert_eq!(read_err.kind(), std::io::ErrorKind::NotFound);
+    }
+
+    #[test]
+    fn test_compute_extra_certs_insecure_short_circuits() {
+        // With insecure=true, env vars and file reads must not be consulted at all.
+        // We assert this by passing closures that would panic if called.
+        let env =
+            |_: &str| -> Option<String> { panic!("env should not be read when insecure=true") };
+        let read = |_: &Path| -> std::io::Result<Vec<u8>> {
+            panic!("read should not be called when insecure=true")
+        };
+        let certs = compute_extra_certs(true, env, read).expect("insecure must succeed");
+        assert!(certs.is_empty(), "insecure mode must yield no extra certs");
+    }
+
+    #[test]
+    fn test_compute_extra_certs_insecure_ignores_broken_bundle() {
+        // Even with a stale env var pointing at a bogus path, insecure=true must succeed.
+        let env = fake_env(&[("UPD_CA_BUNDLE", Some("/nope/missing.pem"))]);
+        let read = |_: &Path| -> std::io::Result<Vec<u8>> {
+            Err(std::io::Error::from(std::io::ErrorKind::NotFound))
+        };
+        let certs = compute_extra_certs(true, env, read).expect("insecure must ignore bad bundle");
+        assert!(certs.is_empty());
+    }
+
+    #[test]
+    fn test_compute_extra_certs_secure_propagates_read_error_with_path() {
+        // With insecure=false, a read error must surface and include the resolved path.
+        let env = fake_env(&[("UPD_CA_BUNDLE", Some("/nope/missing.pem"))]);
+        let read = |_: &Path| -> std::io::Result<Vec<u8>> {
+            Err(std::io::Error::from(std::io::ErrorKind::NotFound))
+        };
+        let err = compute_extra_certs(false, env, read).expect_err("missing path must error");
+        let chain = format!("{err:#}");
+        assert!(
+            chain.contains("/nope/missing.pem"),
+            "error should mention path, got: {chain}"
+        );
+        assert!(
+            chain.to_lowercase().contains("failed to read"),
+            "error should describe read failure, got: {chain}"
+        );
+    }
+
+    #[test]
+    fn test_compute_extra_certs_no_env_returns_empty() {
+        let env = fake_env(&[]);
+        let read = |_: &Path| -> std::io::Result<Vec<u8>> {
+            panic!("read should not be called when no env var is set")
+        };
+        let certs = compute_extra_certs(false, env, read).expect("no env must succeed");
+        assert!(certs.is_empty());
     }
 
     #[test]
