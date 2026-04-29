@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use chrono::{DateTime, Duration, Utc};
 use clap::Parser;
 use colored::Colorize;
@@ -129,6 +129,17 @@ fn humanize_cooldown(d: Duration) -> String {
         return format!("{}h", d.num_hours());
     }
     format!("{}s", d.num_seconds())
+}
+
+fn init_tls(cli: &Cli) -> anyhow::Result<()> {
+    upd::http::init(cli.insecure).context("Failed to initialize TLS options")?;
+    if cli.insecure {
+        eprintln!(
+            "{}: TLS certificate verification disabled \u{2014} connections are not authenticated",
+            "warning".yellow().bold()
+        );
+    }
+    Ok(())
 }
 
 fn format_held_back_line(
@@ -529,6 +540,7 @@ async fn main() -> Result<()> {
 }
 
 async fn run_update(cli: &Cli) -> Result<()> {
+    init_tls(cli)?;
     if cli.interactive && cli.format == upd::cli::OutputFormat::Json {
         anyhow::bail!("--interactive cannot be combined with --format json");
     }
@@ -1489,6 +1501,7 @@ async fn run_interactive_update(
 }
 
 async fn run_align(cli: &Cli) -> Result<()> {
+    init_tls(cli)?;
     let text_mode = cli.format == upd::cli::OutputFormat::Text;
 
     // Resolve paths: explicit > VCS root > error
@@ -1701,6 +1714,7 @@ pub(crate) fn build_audit_packages(
 type FileEdits = (FileType, Vec<(String, String, String, Option<usize>)>);
 
 async fn run_audit(cli: &Cli) -> Result<()> {
+    init_tls(cli)?;
     let no_fail = matches!(&cli.command, Some(Command::Audit { no_fail, .. }) if *no_fail);
     let fix_audit = matches!(&cli.command, Some(Command::Audit { fix_audit, .. }) if *fix_audit);
     let offline = matches!(&cli.command, Some(Command::Audit { offline, .. }) if *offline);
@@ -3338,14 +3352,19 @@ fn clean_cache() -> Result<()> {
 }
 
 async fn self_update() -> Result<()> {
+    upd::http::init(false).context("Failed to initialize TLS options")?;
     println!("Checking for updates...");
 
-    let client = reqwest::Client::new();
+    let url = "https://api.github.com/repos/rvben/upd/releases/latest";
+    let client =
+        upd::http::apply(reqwest::Client::builder().timeout(std::time::Duration::from_secs(30)))
+            .build()?;
     let response = client
-        .get("https://api.github.com/repos/rvben/upd/releases/latest")
+        .get(url)
         .header("User-Agent", "upd")
         .send()
-        .await?;
+        .await
+        .map_err(|e| upd::http::wrap_send_err(e, url))?;
 
     if !response.status().is_success() {
         anyhow::bail!("Failed to check for updates: HTTP {}", response.status());
