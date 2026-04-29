@@ -371,7 +371,7 @@ impl CratesIoRegistry {
     }
 
     /// Execute a GET request with retry
-    async fn get_with_retry(&self, url: &str) -> Result<Response, reqwest::Error> {
+    async fn get_with_retry(&self, url: &str) -> anyhow::Result<Response> {
         let mut last_error = None;
 
         for attempt in 0..MAX_RETRIES {
@@ -397,7 +397,7 @@ impl CratesIoRegistry {
             }
         }
 
-        Err(last_error.unwrap())
+        Err(crate::http::wrap_send_err(last_error.unwrap(), url))
     }
 
     async fn fetch_crate_opt(&self, name: &str) -> Result<Option<CratesResponse>> {

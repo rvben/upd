@@ -328,7 +328,7 @@ impl PyPiRegistry {
     }
 
     /// Execute a GET request with retry and authentication
-    async fn get_with_retry(&self, url: &str) -> Result<Response, reqwest::Error> {
+    async fn get_with_retry(&self, url: &str) -> anyhow::Result<Response> {
         self.get_with_retry_and_headers(url, None).await
     }
 
@@ -337,7 +337,7 @@ impl PyPiRegistry {
         &self,
         url: &str,
         headers: Option<HeaderMap>,
-    ) -> Result<Response, reqwest::Error> {
+    ) -> anyhow::Result<Response> {
         let mut last_error = None;
 
         for attempt in 0..MAX_RETRIES {
@@ -374,7 +374,7 @@ impl PyPiRegistry {
             }
         }
 
-        Err(last_error.unwrap())
+        Err(crate::http::wrap_send_err(last_error.unwrap(), url))
     }
 
     fn is_stable_version(version_str: &str) -> bool {

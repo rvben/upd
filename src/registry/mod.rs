@@ -34,7 +34,7 @@ const BASE_DELAY_MS: u64 = 100;
 
 /// Execute an HTTP GET request with retry and exponential backoff.
 /// Retries on transient errors (network issues, 5xx server errors).
-pub async fn get_with_retry(client: &Client, url: &str) -> Result<Response, reqwest::Error> {
+pub async fn get_with_retry(client: &Client, url: &str) -> anyhow::Result<Response> {
     let mut last_error = None;
 
     for attempt in 0..MAX_RETRIES {
@@ -66,7 +66,7 @@ pub async fn get_with_retry(client: &Client, url: &str) -> Result<Response, reqw
         }
     }
 
-    Err(last_error.unwrap())
+    Err(crate::http::wrap_send_err(last_error.unwrap(), url))
 }
 
 /// Create a descriptive error message for HTTP failures
