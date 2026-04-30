@@ -17,6 +17,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 
 
+
+## [0.1.8](https://github.com/rvben/upd/compare/v0.1.7...v0.1.8) - 2026-04-30
+
+### Added
+
+- **packaging**: add upd-cli shim binary so `uvx upd-cli` works directly ([17fc581](https://github.com/rvben/upd/commit/17fc581015d2a44dcaa16a547597f4bfd0013751))
+
 ## [0.1.7](https://github.com/rvben/upd/compare/v0.1.6...v0.1.7) - 2026-04-29
 
 ### Fixed
