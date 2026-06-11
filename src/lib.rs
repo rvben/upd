@@ -9,6 +9,7 @@ pub mod interactive;
 pub mod lockfile;
 pub mod output;
 pub mod registry;
+pub mod schema;
 pub mod updater;
 pub mod version;
 

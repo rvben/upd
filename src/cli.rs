@@ -4,6 +4,22 @@ use std::path::PathBuf;
 
 pub const REVERT_TIP: &str = "Tip: changes are applied in-place \u{2014} use git to revert.";
 
+/// Three-valued output mode for clispec P1 compliance.
+///
+/// `auto` selects JSON when stdout is not a TTY and text otherwise.
+/// An explicit value always wins over TTY detection.
+#[derive(ValueEnum, Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[value(rename_all = "lower")]
+pub enum OutputMode {
+    /// JSON when piped, human-readable text in a terminal (default).
+    #[default]
+    Auto,
+    /// Human-readable coloured text.
+    Text,
+    /// Machine-readable JSON.
+    Json,
+}
+
 /// Kind of version bump to include when filtering updates.
 #[derive(ValueEnum, Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[value(rename_all = "lower")]
@@ -36,7 +52,7 @@ pub enum OutputFormat {
     author,
     version,
     about = "A fast dependency updater for Python, Node.js, Rust, Go, Ruby, .NET, Terraform, GitHub Actions, pre-commit, and Mise/asdf projects",
-    after_help = REVERT_TIP
+    after_help = "Run 'upd schema' for machine-readable interface description (clispec v0.2).\n\nTip: changes are applied in-place \u{2014} use git to revert."
 )]
 pub struct Cli {
     #[command(subcommand)]
@@ -202,6 +218,36 @@ pub struct Cli {
     /// REQUESTS_CA_BUNDLE or SSL_CERT_FILE to your corporate CA bundle.
     #[arg(long, global = true)]
     pub insecure: bool,
+
+    /// Output format for structured consumers (auto/text/json).
+    ///
+    /// `auto` emits JSON when stdout is not a TTY and human-readable text
+    /// otherwise. An explicit value always wins over TTY detection.
+    /// Equivalent to --format but with three-valued auto-detection semantics.
+    #[arg(
+        short = 'o',
+        long = "output",
+        value_name = "FORMAT",
+        global = true,
+        default_value = "auto"
+    )]
+    pub output: OutputMode,
+
+    /// Alias for --apply: apply updates without prompting (for scripted use).
+    #[arg(long, global = true, hide = true)]
+    pub yes: bool,
+
+    /// Limit output to N items (for list-shaped JSON output).
+    #[arg(long, value_name = "N", global = true)]
+    pub limit: Option<usize>,
+
+    /// Skip first N items (for list-shaped JSON output).
+    #[arg(long, value_name = "N", global = true, default_value = "0")]
+    pub offset: usize,
+
+    /// Comma-separated list of fields to include in JSON output.
+    #[arg(long, value_name = "FIELDS", global = true)]
+    pub fields: Option<String>,
 }
 
 #[derive(Subcommand)]
@@ -259,15 +305,37 @@ pub enum Command {
 
     /// Update upd itself
     SelfUpdate,
+
+    /// Print machine-readable schema (clispec v0.2 JSON).
+    ///
+    /// Works offline with no authentication or configuration required.
+    /// Consumers can use this to discover commands, arguments, output fields,
+    /// and error kinds without parsing --help text.
+    Schema,
 }
 
 impl Cli {
     /// Returns true when a run should be dry-run.
     ///
-    /// Dry-run is implied by --check, --dry-run, or the absence of --apply
+    /// Dry-run is implied by --check, --dry-run, or the absence of --apply/--yes
     /// when --interactive is not set.
     pub fn is_effective_dry_run(&self) -> bool {
-        self.check || self.dry_run || (!self.apply && !self.interactive)
+        self.check || self.dry_run || (!self.apply && !self.yes && !self.interactive)
+    }
+
+    /// Returns true when JSON output should be emitted to stdout.
+    ///
+    /// Respects the three-valued --output flag: auto selects JSON when stdout
+    /// is not a TTY, explicit text/json always wins.
+    pub fn is_json_output(&self) -> bool {
+        match self.output {
+            OutputMode::Json => true,
+            OutputMode::Text => false,
+            OutputMode::Auto => {
+                use std::io::IsTerminal;
+                !std::io::stdout().is_terminal()
+            }
+        }
     }
 
     /// Returns explicitly provided paths, or an empty vec when none were given.

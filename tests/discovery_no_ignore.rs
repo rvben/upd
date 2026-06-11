@@ -51,7 +51,10 @@ fn discovery_skips_gitignored_files_by_default() {
     let (tmp, _kept, _ignored) = workspace_with_gitignored_package_json();
     let path = tmp.path().to_str().unwrap();
 
-    let (stdout, stderr, _code) = run(&["--check", "--no-cache", path], tmp.path());
+    let (stdout, stderr, _code) = run(
+        &["--check", "--no-cache", "--output", "text", path],
+        tmp.path(),
+    );
 
     let combined = format!("{stdout}\n{stderr}");
     assert!(
@@ -66,7 +69,17 @@ fn discovery_no_ignore_flag_includes_gitignored_files() {
     let (tmp, _kept, _ignored) = workspace_with_gitignored_package_json();
     let path = tmp.path().to_str().unwrap();
 
-    let (stdout, stderr, _code) = run(&["--check", "--no-cache", "--no-ignore", path], tmp.path());
+    let (stdout, stderr, _code) = run(
+        &[
+            "--check",
+            "--no-cache",
+            "--no-ignore",
+            "--output",
+            "text",
+            path,
+        ],
+        tmp.path(),
+    );
 
     let combined = format!("{stdout}\n{stderr}");
     assert!(

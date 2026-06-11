@@ -51,7 +51,10 @@ fn parse_error_goes_to_stderr_not_stdout() {
     fs::write(tmp.path().join("package.json"), b"{ BROKEN JSON }").unwrap();
     let path_str = tmp.path().to_str().unwrap().to_string();
 
-    let (stdout, stderr, code) = run(&["--dry-run", "--no-cache", &path_str], tmp.path());
+    let (stdout, stderr, code) = run(
+        &["--dry-run", "--no-cache", "--output", "text", &path_str],
+        tmp.path(),
+    );
 
     assert_eq!(code, 2, "parse error must exit 2; stderr: {stderr}");
     assert!(
@@ -70,7 +73,7 @@ fn normal_text_run_prints_summary_to_stdout() {
     let tmp = tempfile::tempdir().unwrap();
     let path_str = tmp.path().to_str().unwrap().to_string();
     // Empty workspace → "No dependency files found."
-    let (stdout, _stderr, code) = run(&["--dry-run", &path_str], tmp.path());
+    let (stdout, _stderr, code) = run(&["--dry-run", "--output", "text", &path_str], tmp.path());
     assert_eq!(
         code, 0,
         "expected exit 0 on empty workspace; stdout: {stdout}"
@@ -86,7 +89,10 @@ fn normal_text_run_prints_summary_to_stdout() {
 fn quiet_on_empty_workspace_produces_empty_stdout() {
     let tmp = tempfile::tempdir().unwrap();
     let path_str = tmp.path().to_str().unwrap().to_string();
-    let (stdout, _stderr, code) = run(&["-q", "--dry-run", &path_str], tmp.path());
+    let (stdout, _stderr, code) = run(
+        &["-q", "--dry-run", "--output", "text", &path_str],
+        tmp.path(),
+    );
     assert_eq!(code, 0, "expected exit 0; stderr was not checked");
     assert!(
         stdout.trim().is_empty(),
@@ -124,7 +130,17 @@ fn quiet_does_not_silence_errors_on_stderr() {
     fs::write(tmp.path().join("package.json"), b"NOT JSON AT ALL").unwrap();
     let path_str = tmp.path().to_str().unwrap().to_string();
 
-    let (stdout, stderr, code) = run(&["-q", "--dry-run", "--no-cache", &path_str], tmp.path());
+    let (stdout, stderr, code) = run(
+        &[
+            "-q",
+            "--dry-run",
+            "--no-cache",
+            "--output",
+            "text",
+            &path_str,
+        ],
+        tmp.path(),
+    );
 
     assert_eq!(code, 2, "parse error must exit 2 even with --quiet");
     assert!(
@@ -152,7 +168,7 @@ fn registry_error_goes_to_stderr_not_stdout() {
     let path_str = tmp.path().to_str().unwrap().to_string();
 
     let (stdout, stderr, code) = run_with_env(
-        &["--dry-run", "--no-cache", &path_str],
+        &["--dry-run", "--no-cache", "--output", "text", &path_str],
         tmp.path(),
         &[("NPM_REGISTRY", "http://127.0.0.1:1")],
     );
@@ -173,7 +189,10 @@ fn registry_error_goes_to_stderr_not_stdout() {
 fn quiet_check_on_empty_workspace_produces_empty_stdout() {
     let tmp = tempfile::tempdir().unwrap();
     let path_str = tmp.path().to_str().unwrap().to_string();
-    let (stdout, _stderr, code) = run(&["-q", "--check", &path_str], tmp.path());
+    let (stdout, _stderr, code) = run(
+        &["-q", "--check", "--output", "text", &path_str],
+        tmp.path(),
+    );
     assert_eq!(code, 0, "expected exit 0");
     assert!(
         stdout.trim().is_empty(),

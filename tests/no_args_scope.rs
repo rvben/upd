@@ -117,7 +117,7 @@ async fn no_args_inside_git_repo_is_dry_run_with_hint() {
     fs::write(&req_path, "requests==1.0.0\n").unwrap();
 
     let (stdout, stderr, code) = run_with_env(
-        &["--no-cache"],
+        &["--no-cache", "--output", "text"],
         tmp.path(),
         &[("UV_INDEX_URL", &server.uri())],
     );
@@ -234,7 +234,7 @@ async fn explicit_path_without_apply_is_dry_run() {
     let dir_str = tmp.path().to_str().expect("non-UTF-8 path");
 
     let (stdout, stderr, code) = run_with_env(
-        &["--no-cache", dir_str],
+        &["--no-cache", "--output", "text", dir_str],
         tmp.path(),
         &[("UV_INDEX_URL", &server.uri())],
     );

@@ -66,6 +66,8 @@ futures = "0.3.32"
 url = "2.5"
 chrono = { version = "0.4", default-features = false, features = ["serde", "clock"] }
 
+jsonschema = { version = "0.46.5", default-features = false }
+
 [dev-dependencies]
 tempfile = "3.27.0"
 wiremock = "0.6"

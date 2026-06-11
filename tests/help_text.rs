@@ -153,7 +153,7 @@ async fn mutating_run_with_applied_update_prints_tip() {
     let path_str = tmp.path().to_str().unwrap().to_string();
 
     let (stdout, stderr, _code) = run_with_env(
-        &["--apply", "--no-cache", &path_str],
+        &["--apply", "--no-cache", "--output", "text", &path_str],
         tmp.path(),
         &[("UV_INDEX_URL", &server.uri())],
     );

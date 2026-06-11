@@ -51,6 +51,8 @@ default = "7d"
 
     let output = Command::new(env!("CARGO_BIN_EXE_upd"))
         .arg("--apply")
+        .arg("--output")
+        .arg("text")
         .arg(&req)
         .env("UV_INDEX_URL", mock.uri())
         .env("UPD_CACHE_DIR", &cache_dir)

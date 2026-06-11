@@ -12,7 +12,7 @@ use upd::align::{PackageAlignment, PackageOccurrence, find_alignments, scan_pack
 use upd::audit::cache::AuditCache;
 use upd::audit::{AuditResult, Ecosystem, OsvClient, Package as AuditPackage, compute_fix_plan};
 use upd::cache::{Cache, CachedRegistry};
-use upd::cli::{BumpLevel, Cli, Command, REVERT_TIP};
+use upd::cli::{BumpLevel, Cli, Command, OutputMode, REVERT_TIP};
 use upd::config::UpdConfig;
 use upd::cooldown::CooldownPolicy;
 use upd::interactive::{PendingUpdate, prompt_all};
@@ -481,13 +481,70 @@ fn audit_status(audit_result: &AuditResult) -> AuditStatus {
     }
 }
 
+/// Classify an anyhow error into a clispec structured error kind and exit code.
+fn classify_error(e: &anyhow::Error) -> serde_json::Value {
+    let msg = e.to_string();
+    let (kind, exit_code) = if msg.contains("No such file")
+        || msg.contains("Permission denied")
+        || msg.contains("os error")
+        || msg.contains("does not exist")
+    {
+        ("io_error", 2)
+    } else if msg.contains("network")
+        || msg.contains("connection")
+        || msg.contains("timeout")
+        || msg.contains("HTTP")
+        || msg.contains("reqwest")
+    {
+        ("network_error", 3)
+    } else if msg.contains("parse") || msg.contains("invalid") || msg.contains("malformed") {
+        ("parse_error", 4)
+    } else {
+        ("io_error", 2)
+    };
+    serde_json::json!({
+        "error": {
+            "kind": kind,
+            "message": msg,
+            "exit_code": exit_code
+        }
+    })
+}
+
 #[tokio::main]
-async fn main() -> Result<()> {
-    let cli = Cli::parse();
+async fn main() {
+    if let Err(e) = run().await {
+        let error_json = classify_error(&e);
+        eprintln!("{}", serde_json::to_string(&error_json).unwrap());
+        std::process::exit(error_json["error"]["exit_code"].as_i64().unwrap_or(2) as i32);
+    }
+}
+
+async fn run() -> Result<()> {
+    let cli = Cli::try_parse().unwrap_or_else(|e| {
+        // Clap uses Err for help/version display too; those are not real errors.
+        // Only emit the structured envelope for genuine parse failures.
+        if e.kind() != clap::error::ErrorKind::DisplayHelp
+            && e.kind() != clap::error::ErrorKind::DisplayVersion
+            && e.kind() != clap::error::ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand
+        {
+            eprintln!(
+                "{}",
+                serde_json::json!({"error": {"kind": "parse_error", "message": e.to_string(), "exit_code": 4}})
+            );
+        }
+        e.exit()
+    });
 
     // Handle no-color flag
     if cli.no_color {
         colored::control::set_override(false);
+    }
+
+    // Schema subcommand: works offline with no config or auth required.
+    if matches!(cli.command, Some(Command::Schema)) {
+        upd::schema::print_schema();
+        return Ok(());
     }
 
     // --show-config: print the canonical config schema and exit
@@ -507,14 +564,17 @@ async fn main() -> Result<()> {
 
     // Reject non-existent paths before any I/O; known subcommands are routed by clap before this point.
     let invalid: Vec<_> = cli.paths.iter().filter(|p| !p.exists()).collect();
-    for path in &invalid {
-        eprintln!(
-            "{} '{}' is not a known subcommand or existing path",
-            "error:".red(),
-            path.display()
-        );
-    }
     if !invalid.is_empty() {
+        for path in &invalid {
+            let msg = format!(
+                "'{}' is not a known subcommand or existing path",
+                path.display()
+            );
+            eprintln!(
+                "{}",
+                serde_json::json!({"error": {"kind": "io_error", "message": msg, "exit_code": 2}})
+            );
+        }
         std::process::exit(2);
     }
 
@@ -531,6 +591,10 @@ async fn main() -> Result<()> {
         Some(Command::Audit { .. }) => {
             run_audit(&cli).await?;
         }
+        Some(Command::Schema) => {
+            // Already handled above before show_config check.
+            unreachable!("Schema handled earlier");
+        }
         Some(Command::Update { .. }) | None => {
             run_update(&cli).await?;
         }
@@ -539,22 +603,60 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
+/// Returns true when JSON output should be emitted, honoring both --output/-o
+/// (three-valued, clispec P1 compliant) and --format (legacy).
+///
+/// --output/-o takes precedence when set explicitly. When --output is auto
+/// (the default), --format wins if set explicitly. Auto-detection (TTY check)
+/// fires only when both are at their defaults.
+///
+/// --format sarif overrides everything: SARIF is never treated as plain JSON.
+fn effective_json_mode(cli: &Cli) -> bool {
+    // SARIF is its own mode; never treat it as JSON.
+    if cli.format == upd::cli::OutputFormat::Sarif {
+        return false;
+    }
+    match cli.output {
+        // Explicit --output wins unconditionally.
+        OutputMode::Json => true,
+        OutputMode::Text => false,
+        // Auto: use --format if set to json, otherwise TTY-detect.
+        OutputMode::Auto => {
+            if cli.format == upd::cli::OutputFormat::Json {
+                true
+            } else {
+                cli.is_json_output()
+            }
+        }
+    }
+}
+
 async fn run_update(cli: &Cli) -> Result<()> {
-    if cli.interactive && cli.format == upd::cli::OutputFormat::Json {
-        anyhow::bail!("--interactive cannot be combined with --format json");
+    let json_mode = effective_json_mode(cli);
+
+    // Reject --interactive with an explicit JSON output request. When output is
+    // auto-detected as JSON (stdout piped), the TTY check inside
+    // run_interactive_update fires first and gives a clearer error message.
+    let explicit_json =
+        matches!(cli.output, OutputMode::Json) || cli.format == upd::cli::OutputFormat::Json;
+    if cli.interactive && explicit_json {
+        anyhow::bail!("--interactive cannot be combined with --format json or --output json");
     }
 
     // Resolve paths: explicit > VCS root > error
     let paths = match resolve_scan_paths(cli) {
         Ok(p) => p,
         Err(msg) => {
-            eprintln!("{} {}", "error:".red(), msg);
+            eprintln!(
+                "{}",
+                serde_json::json!({"error": {"kind": "io_error", "message": msg, "exit_code": 2}})
+            );
             std::process::exit(2);
         }
     };
 
-    // Mutations are opt-in. Without --apply (and not --interactive, --check,
-    // or --dry-run), the run behaves as dry-run and tells the user how to apply.
+    // Mutations are opt-in. Without --apply/--yes (and not --interactive,
+    // --check, or --dry-run), the run behaves as dry-run.
     let effective_dry_run = cli.is_effective_dry_run();
 
     let files = discover_files_with(
@@ -567,7 +669,7 @@ async fn run_update(cli: &Cli) -> Result<()> {
     );
     let file_count = files.len();
 
-    let text_mode_early = cli.format == upd::cli::OutputFormat::Text;
+    let text_mode_early = !json_mode;
 
     if files.is_empty() {
         if text_mode_early {
@@ -882,7 +984,7 @@ async fn run_update(cli: &Cli) -> Result<()> {
         .await;
 
     // Process results, preserving per-file attribution for both text and JSON output.
-    let text_mode = cli.format == upd::cli::OutputFormat::Text;
+    let text_mode = !json_mode;
     let mut total_result = UpdateResult::default();
     let mut updated_files: Vec<PathBuf> = Vec::new();
     let mut scanned: Vec<ScannedFileResult> = Vec::new();
@@ -1504,13 +1606,16 @@ async fn run_interactive_update(
 }
 
 async fn run_align(cli: &Cli) -> Result<()> {
-    let text_mode = cli.format == upd::cli::OutputFormat::Text;
+    let text_mode = !effective_json_mode(cli);
 
     // Resolve paths: explicit > VCS root > error
     let paths = match resolve_scan_paths(cli) {
         Ok(p) => p,
         Err(msg) => {
-            eprintln!("{} {}", "error:".red(), msg);
+            eprintln!(
+                "{}",
+                serde_json::json!({"error": {"kind": "io_error", "message": msg, "exit_code": 2}})
+            );
             std::process::exit(2);
         }
     };
@@ -1723,8 +1828,9 @@ async fn run_audit(cli: &Cli) -> Result<()> {
     let no_fail = matches!(&cli.command, Some(Command::Audit { no_fail, .. }) if *no_fail);
     let fix_audit = matches!(&cli.command, Some(Command::Audit { fix_audit, .. }) if *fix_audit);
     let offline = matches!(&cli.command, Some(Command::Audit { offline, .. }) if *offline);
-    let text_mode = cli.format == upd::cli::OutputFormat::Text;
-    let sarif_mode = cli.format == upd::cli::OutputFormat::Sarif;
+    let json_mode = effective_json_mode(cli);
+    let text_mode = !json_mode && cli.format != upd::cli::OutputFormat::Sarif;
+    let sarif_mode = cli.format == upd::cli::OutputFormat::Sarif && !json_mode;
     // Audit never mutates files, so no VCS check is needed. Fall back to CWD.
     let paths = {
         let explicit = cli.get_paths();
@@ -1873,10 +1979,18 @@ async fn run_audit(cli: &Cli) -> Result<()> {
             eprintln!("{} {}", "Error:".red(), error);
         }
     } else if sarif_mode {
+        // Errors always go to stderr; structured data to stdout.
+        for error in &audit_result.errors {
+            eprintln!("{} {}", "Error:".red(), error);
+        }
         // Build the per-package occurrence map from already-scanned data.
         let sarif_occurrences = build_sarif_occurrences(&packages);
         emit_audit_sarif(&audit_result, &sarif_occurrences)?;
     } else {
+        // JSON mode: errors to stderr, structured data to stdout.
+        for error in &audit_result.errors {
+            eprintln!("{} {}", "Error:".red(), error);
+        }
         let status_str = match status {
             AuditStatus::Clean | AuditStatus::Vulnerable => "complete",
             AuditStatus::Incomplete => "incomplete",
@@ -1888,8 +2002,9 @@ async fn run_audit(cli: &Cli) -> Result<()> {
     if fix_audit && !audit_result.vulnerable.is_empty() {
         let (fixable, unfixable) = compute_fix_plan(&audit_result);
 
-        // Report unfixable packages.
-        if text_mode && !cli.quiet {
+        // Report unfixable packages to stderr (diagnostics always go to stderr
+        // regardless of output mode, so agents can detect them).
+        if !cli.quiet {
             for (name, reason) in &unfixable {
                 eprintln!(
                     "{} Cannot auto-fix {}: {}",

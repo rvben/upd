@@ -86,22 +86,51 @@ fn interactive_with_format_json_is_rejected() {
         &["--format", "json", "--interactive", "--dry-run"],
         tmp.path(),
     );
-    assert_ne!(code, 0, "interactive + json should fail");
+    assert_ne!(code, 0, "interactive + --format json should fail");
     let combined = format!("{stdout}{stderr}");
     assert!(
-        combined.contains("--interactive") && combined.contains("--format json"),
-        "error should mention the conflicting flags, got: {combined}"
+        combined.contains("--interactive") && combined.contains("json"),
+        "error should mention --interactive and json, got: {combined}"
     );
 }
 
 #[test]
-fn format_text_is_default_and_not_json() {
+fn interactive_with_output_json_is_rejected() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (stdout, stderr, code) = run(
+        &["--output", "json", "--interactive", "--dry-run"],
+        tmp.path(),
+    );
+    assert_ne!(code, 0, "interactive + --output json should fail");
+    let combined = format!("{stdout}{stderr}");
+    assert!(
+        combined.contains("--interactive") && combined.contains("json"),
+        "error should mention --interactive and json, got: {combined}"
+    );
+}
+
+#[test]
+fn format_text_is_explicit_and_not_json() {
+    // Passing --output text forces text even when stdout is piped.
+    let tmp = tempfile::tempdir().unwrap();
+    let path_str = tmp.path().to_str().unwrap().to_string();
+    let (stdout, _stderr, code) = run(&["--dry-run", "--output", "text", &path_str], tmp.path());
+    assert_eq!(code, 0);
+    assert!(
+        serde_json::from_str::<Value>(stdout.trim()).is_err(),
+        "--output text must produce non-JSON output when piped, got: {stdout}"
+    );
+}
+
+#[test]
+fn auto_output_emits_json_when_piped() {
+    // When no --output or --format flag is set, stdout piped → JSON (clispec P1).
     let tmp = tempfile::tempdir().unwrap();
     let path_str = tmp.path().to_str().unwrap().to_string();
     let (stdout, _stderr, code) = run(&["--dry-run", &path_str], tmp.path());
     assert_eq!(code, 0);
     assert!(
-        serde_json::from_str::<Value>(stdout.trim()).is_err(),
-        "default text output should not parse as JSON, got: {stdout}"
+        serde_json::from_str::<Value>(stdout.trim()).is_ok(),
+        "auto mode must emit JSON when stdout is piped, got: {stdout}"
     );
 }
