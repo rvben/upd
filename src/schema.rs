@@ -251,13 +251,14 @@ fn build_schema() -> Value {
                 ]
             }
         ],
-        "errors": [
+        "outcomes": [
             {
-                "kind": "updates_available",
-                "description": "Updates are available (dry-run mode only). Run with --apply to write changes",
-                "exit_code": 1,
-                "retryable": false
-            },
+                "code": 1,
+                "name": "updates_available",
+                "description": "Updates are available (dry-run mode only); the report is on stdout. Not an error. Run with --apply to write changes"
+            }
+        ],
+        "errors": [
             {
                 "kind": "io_error",
                 "description": "File read or write failed, or a required path does not exist",
@@ -358,18 +359,32 @@ mod tests {
     }
 
     #[test]
-    fn schema_declares_updates_available_error_with_exit_code_1() {
+    fn schema_declares_updates_available_outcome_with_code_1() {
         let s = build_schema();
-        let errors = s["errors"].as_array().expect("errors must be an array");
-        let updates_available = errors
+        let outcomes = s["outcomes"].as_array().expect("outcomes must be an array");
+        let updates_available = outcomes
             .iter()
-            .find(|e| e["kind"].as_str() == Some("updates_available"))
-            .expect("must declare an 'updates_available' error kind");
+            .find(|o| o["name"].as_str() == Some("updates_available"))
+            .expect("must declare an 'updates_available' outcome");
         assert_eq!(
-            updates_available["exit_code"].as_u64(),
+            updates_available["code"].as_u64(),
             Some(1),
             "updates_available must map to exit code 1 (the dry-run signal)"
         );
+        let errors = s["errors"].as_array().expect("errors must be an array");
+        assert!(
+            !errors
+                .iter()
+                .any(|e| e["kind"].as_str() == Some("updates_available")),
+            "updates_available is an outcome, not an error kind"
+        );
+        for outcome in outcomes {
+            let code = outcome["code"].as_u64().expect("outcome must have a code");
+            assert!(
+                !errors.iter().any(|e| e["exit_code"].as_u64() == Some(code)),
+                "outcome code {code} must not overlap with error exit codes"
+            );
+        }
     }
 
     #[test]
