@@ -21,6 +21,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 
 
+
+## [0.2.1](https://github.com/rvben/upd/compare/v0.2.0...v0.2.1) - 2026-06-11
+
+### Fixed
+
+- correct five scripted-consumer defects in CLI contract ([936687d](https://github.com/rvben/upd/commit/936687da01d2af39b884415a9e0262a8197490d7))
+
 ## [0.2.0](https://github.com/rvben/upd/compare/v0.1.10...v0.2.0) - 2026-06-11
 
 ### Breaking Changes
