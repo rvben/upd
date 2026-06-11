@@ -169,8 +169,8 @@ pub struct Cli {
     /// Use --format json for machine-readable output in scripts or CI.
     /// Use --format sarif with `upd audit` to emit a SARIF 2.1.0 document
     /// suitable for upload to GitHub Code Scanning.
-    #[arg(long, global = true, value_enum, default_value_t = OutputFormat::Text, value_name = "FORMAT")]
-    pub format: OutputFormat,
+    #[arg(long, global = true, value_enum, value_name = "FORMAT")]
+    pub format: Option<OutputFormat>,
 
     /// Print the effective configuration and exit.
     ///
@@ -791,40 +791,41 @@ mod tests {
     }
 
     #[test]
-    fn test_cli_format_defaults_to_text() {
+    fn test_cli_format_defaults_to_none() {
+        // --format not passed: None (distinguishable from explicitly passing --format text)
         let cli = Cli::try_parse_from(["upd"]).unwrap();
-        assert_eq!(cli.format, OutputFormat::Text);
+        assert_eq!(cli.format, None);
     }
 
     #[test]
     fn test_cli_format_accepts_json() {
         let cli = Cli::try_parse_from(["upd", "--format", "json"]).unwrap();
-        assert_eq!(cli.format, OutputFormat::Json);
+        assert_eq!(cli.format, Some(OutputFormat::Json));
     }
 
     #[test]
     fn test_cli_format_accepts_text() {
         let cli = Cli::try_parse_from(["upd", "--format", "text"]).unwrap();
-        assert_eq!(cli.format, OutputFormat::Text);
+        assert_eq!(cli.format, Some(OutputFormat::Text));
     }
 
     #[test]
     fn test_cli_format_accepts_sarif() {
         let cli = Cli::try_parse_from(["upd", "--format", "sarif"]).unwrap();
-        assert_eq!(cli.format, OutputFormat::Sarif);
+        assert_eq!(cli.format, Some(OutputFormat::Sarif));
     }
 
     #[test]
     fn test_cli_format_sarif_is_global_across_subcommands() {
         let cli = Cli::try_parse_from(["upd", "audit", "--format", "sarif"]).unwrap();
-        assert_eq!(cli.format, OutputFormat::Sarif);
+        assert_eq!(cli.format, Some(OutputFormat::Sarif));
         assert!(matches!(cli.command, Some(Command::Audit { .. })));
     }
 
     #[test]
     fn test_cli_format_is_global_across_subcommands() {
         let cli = Cli::try_parse_from(["upd", "audit", "--format", "json"]).unwrap();
-        assert_eq!(cli.format, OutputFormat::Json);
+        assert_eq!(cli.format, Some(OutputFormat::Json));
         assert!(matches!(cli.command, Some(Command::Audit { .. })));
     }
 

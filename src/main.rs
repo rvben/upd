@@ -524,16 +524,21 @@ async fn run() -> Result<()> {
     let cli = Cli::try_parse().unwrap_or_else(|e| {
         // Clap uses Err for help/version display too; those are not real errors.
         // Only emit the structured envelope for genuine parse failures.
-        if e.kind() != clap::error::ErrorKind::DisplayHelp
-            && e.kind() != clap::error::ErrorKind::DisplayVersion
-            && e.kind() != clap::error::ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand
-        {
-            eprintln!(
-                "{}",
-                serde_json::json!({"error": {"kind": "parse_error", "message": e.to_string(), "exit_code": 4}})
-            );
+        // Help and version display are not errors; let clap handle them with its
+        // own exit code (0 for help/version, which is correct).
+        let is_display = e.kind() == clap::error::ErrorKind::DisplayHelp
+            || e.kind() == clap::error::ErrorKind::DisplayVersion
+            || e.kind() == clap::error::ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand;
+        if is_display {
+            e.exit();
         }
-        e.exit()
+        // Genuine parse errors: emit the structured envelope, then exit with
+        // the code the envelope declares (4), not the code clap would use (2).
+        eprintln!(
+            "{}",
+            serde_json::json!({"error": {"kind": "parse_error", "message": e.to_string(), "exit_code": 4}})
+        );
+        std::process::exit(4)
     });
 
     // Handle no-color flag
@@ -612,22 +617,23 @@ async fn run() -> Result<()> {
 ///
 /// --format sarif overrides everything: SARIF is never treated as plain JSON.
 fn effective_json_mode(cli: &Cli) -> bool {
+    use upd::cli::OutputFormat;
     // SARIF is its own mode; never treat it as JSON.
-    if cli.format == upd::cli::OutputFormat::Sarif {
+    if cli.format == Some(OutputFormat::Sarif) {
         return false;
     }
     match cli.output {
-        // Explicit --output wins unconditionally.
+        // Explicit --output/-o wins unconditionally (three-valued clispec P1 rule).
         OutputMode::Json => true,
         OutputMode::Text => false,
-        // Auto: use --format if set to json, otherwise TTY-detect.
-        OutputMode::Auto => {
-            if cli.format == upd::cli::OutputFormat::Json {
-                true
-            } else {
-                cli.is_json_output()
-            }
-        }
+        // Auto: an explicit --format value always wins over TTY detection.
+        // None means --format was not passed, so fall through to TTY detection.
+        OutputMode::Auto => match cli.format {
+            Some(OutputFormat::Json) => true,
+            Some(OutputFormat::Text) => false,
+            Some(OutputFormat::Sarif) => false,
+            None => cli.is_json_output(),
+        },
     }
 }
 
@@ -638,7 +644,7 @@ async fn run_update(cli: &Cli) -> Result<()> {
     // auto-detected as JSON (stdout piped), the TTY check inside
     // run_interactive_update fires first and gives a clearer error message.
     let explicit_json =
-        matches!(cli.output, OutputMode::Json) || cli.format == upd::cli::OutputFormat::Json;
+        matches!(cli.output, OutputMode::Json) || cli.format == Some(upd::cli::OutputFormat::Json);
     if cli.interactive && explicit_json {
         anyhow::bail!("--interactive cannot be combined with --format json or --output json");
     }
@@ -678,13 +684,16 @@ async fn run_update(cli: &Cli) -> Result<()> {
             }
         } else {
             emit_update_json(
-                &[],
-                &UpdateResult::default(),
-                0,
-                effective_dry_run,
-                UpdateFilter::from_cli(&cli.only_bump, cli.max_bump),
-                &HashMap::new(),
-                Vec::new(),
+                UpdateReportInput {
+                    scanned: &[],
+                    total_result: &UpdateResult::default(),
+                    file_count: 0,
+                    dry_run: effective_dry_run,
+                    filter: UpdateFilter::from_cli(&cli.only_bump, cli.max_bump),
+                    file_cooldowns: &HashMap::new(),
+                    cooldown_notes: Vec::new(),
+                },
+                &BoundedOutputParams::from_cli(cli),
             )?;
         }
         return Ok(());
@@ -1146,13 +1155,16 @@ async fn run_update(cli: &Cli) -> Result<()> {
             .map(|g| g.iter().cloned().collect())
             .unwrap_or_default();
         emit_update_json(
-            &scanned,
-            &total_result,
-            file_count,
-            dry_run,
-            filter,
-            &file_cooldowns,
-            notes_vec,
+            UpdateReportInput {
+                scanned: &scanned,
+                total_result: &total_result,
+                file_count,
+                dry_run,
+                filter,
+                file_cooldowns: &file_cooldowns,
+                cooldown_notes: notes_vec,
+            },
+            &BoundedOutputParams::from_cli(cli),
         )?;
     }
 
@@ -1166,16 +1178,93 @@ async fn run_update(cli: &Cli) -> Result<()> {
     Ok(())
 }
 
-fn emit_update_json(
-    scanned: &[ScannedFileResult],
-    total_result: &UpdateResult,
+/// Parameters controlling bounded JSON output (--limit, --offset, --fields).
+struct BoundedOutputParams<'a> {
+    limit: Option<usize>,
+    offset: usize,
+    fields: &'a Option<String>,
+}
+
+impl<'a> BoundedOutputParams<'a> {
+    fn from_cli(cli: &'a Cli) -> Self {
+        Self {
+            limit: cli.limit,
+            offset: cli.offset,
+            fields: &cli.fields,
+        }
+    }
+}
+
+/// Inputs needed to build the update JSON report.
+struct UpdateReportInput<'a> {
+    scanned: &'a [ScannedFileResult],
+    total_result: &'a UpdateResult,
     file_count: usize,
     dry_run: bool,
     filter: UpdateFilter,
-    file_cooldowns: &HashMap<PathBuf, Option<CooldownPolicy>>,
+    file_cooldowns: &'a HashMap<PathBuf, Option<CooldownPolicy>>,
     cooldown_notes: Vec<String>,
-) -> Result<()> {
+}
+
+/// Apply --limit, --offset, and --fields to a JSON document for bounded output.
+///
+/// `list_key` is the name of the top-level array field that is paginated
+/// (e.g. "files" for update, "packages" for align, "vulnerabilities" for audit).
+/// When limit/offset truncate the list, truncation metadata is injected at the
+/// top level so consumers know they received a partial result.
+fn apply_bounded_output(
+    mut doc: serde_json::Value,
+    list_key: &str,
+    params: &BoundedOutputParams<'_>,
+) -> serde_json::Value {
+    let limit = params.limit;
+    let offset = params.offset;
+    let fields = params.fields;
+    // Apply limit/offset to the list-shaped field.
+    if let Some(arr) = doc.get_mut(list_key).and_then(|v| v.as_array_mut()) {
+        let total = arr.len();
+        let start = offset.min(total);
+        let sliced: Vec<serde_json::Value> = arr[start..]
+            .iter()
+            .take(limit.unwrap_or(usize::MAX))
+            .cloned()
+            .collect();
+        let returned = sliced.len();
+        *arr = sliced;
+
+        // Inject truncation metadata when the output is bounded.
+        let is_truncated =
+            offset > 0 || limit.is_some_and(|l| returned < total - start || l < total);
+        if is_truncated && let Some(obj) = doc.as_object_mut() {
+            obj.insert("total".to_string(), serde_json::json!(total));
+            obj.insert("limit".to_string(), serde_json::json!(limit));
+            obj.insert("offset".to_string(), serde_json::json!(offset));
+        }
+    }
+
+    // Apply --fields to filter top-level keys.
+    if let Some(fields_str) = fields {
+        let keep: std::collections::HashSet<&str> = fields_str.split(',').map(str::trim).collect();
+        if let Some(obj) = doc.as_object_mut() {
+            obj.retain(|k, _| keep.contains(k.as_str()));
+        }
+    }
+
+    doc
+}
+
+fn emit_update_json(input: UpdateReportInput<'_>, bounded: &BoundedOutputParams<'_>) -> Result<()> {
     use upd::output::{UpdateReport, UpdateSummary, build_update_file_report};
+
+    let UpdateReportInput {
+        scanned,
+        total_result,
+        file_count,
+        dry_run,
+        filter,
+        file_cooldowns,
+        cooldown_notes,
+    } = input;
 
     let files: Vec<_> = scanned
         .iter()
@@ -1229,7 +1318,9 @@ fn emit_update_json(
         cooldown_notes,
     };
 
-    println!("{}", serde_json::to_string_pretty(&report)?);
+    let doc = serde_json::to_value(&report)?;
+    let doc = apply_bounded_output(doc, "files", bounded);
+    println!("{}", serde_json::to_string_pretty(&doc)?);
     Ok(())
 }
 
@@ -1265,12 +1356,15 @@ async fn run_interactive_update(
 ) -> Result<()> {
     if !std::io::stdin().is_terminal() {
         eprintln!(
-            "{} --interactive requires a terminal on stdin",
-            "error:".red()
-        );
-        eprintln!(
-            "{} use --check to preview updates, or --dry-run to print proposed changes",
-            "hint:".dimmed()
+            "{}",
+            serde_json::json!({
+                "error": {
+                    "kind": "confirmation_required",
+                    "message": "--interactive requires a terminal on stdin",
+                    "hint": "Use --check to preview updates, or --dry-run to print proposed changes.",
+                    "exit_code": 2
+                }
+            })
         );
         std::process::exit(2);
     }
@@ -1555,6 +1649,7 @@ async fn run_interactive_update(
         }
 
         let mut had_error = false;
+        let mut error_messages: Vec<String> = Vec::new();
         for (path, result) in regen_results {
             if result.no_lockfiles {
                 let manifest_name = path
@@ -1562,7 +1657,7 @@ async fn run_interactive_update(
                     .map(|n| n.to_string_lossy().into_owned())
                     .unwrap_or_default();
                 eprintln!(
-                    "note: no lockfile found for {} — skipping (nothing to regenerate)",
+                    "note: no lockfile found for {} - skipping (nothing to regenerate)",
                     manifest_name
                 );
                 continue;
@@ -1571,10 +1666,22 @@ async fn run_interactive_update(
                 if let Some(msg) = outcome.error_message() {
                     eprintln!("{}", format!("error: {msg}").red());
                     had_error = true;
+                    error_messages.push(msg);
                 }
             }
         }
         if had_error {
+            let combined = error_messages.join("; ");
+            eprintln!(
+                "{}",
+                serde_json::json!({
+                    "error": {
+                        "kind": "io_error",
+                        "message": combined,
+                        "exit_code": 2
+                    }
+                })
+            );
             std::process::exit(2);
         }
     }
@@ -1636,7 +1743,7 @@ async fn run_align(cli: &Cli) -> Result<()> {
                 println!("{}", "No dependency files found.".yellow());
             }
         } else {
-            emit_align_json(&[], 0)?;
+            emit_align_json(&[], 0, &BoundedOutputParams::from_cli(cli))?;
         }
         return Ok(());
     }
@@ -1678,7 +1785,7 @@ async fn run_align(cli: &Cli) -> Result<()> {
             .filter(|p| p.has_misalignment())
             .cloned()
             .collect();
-        emit_align_json(&to_report, file_count)?;
+        emit_align_json(&to_report, file_count, &BoundedOutputParams::from_cli(cli))?;
     }
 
     if misaligned.is_empty() {
@@ -1692,8 +1799,8 @@ async fn run_align(cli: &Cli) -> Result<()> {
         return Ok(());
     }
 
-    // Mutations are opt-in for align as well.
-    let dry_run = cli.check || cli.dry_run || (!cli.apply && !cli.interactive);
+    // Mutations are opt-in for align as well. --yes is an alias for --apply.
+    let dry_run = cli.is_effective_dry_run();
 
     if text_mode && !cli.quiet {
         let action_prefix = if dry_run { "Would align" } else { "Aligning" };
@@ -1740,7 +1847,11 @@ async fn run_align(cli: &Cli) -> Result<()> {
     Ok(())
 }
 
-fn emit_align_json(packages: &[PackageAlignment], file_count: usize) -> Result<()> {
+fn emit_align_json(
+    packages: &[PackageAlignment],
+    file_count: usize,
+    bounded: &BoundedOutputParams<'_>,
+) -> Result<()> {
     use upd::output::{AlignReport, AlignSummary, build_align_package};
 
     let pkgs: Vec<_> = packages.iter().map(build_align_package).collect();
@@ -1762,7 +1873,9 @@ fn emit_align_json(packages: &[PackageAlignment], file_count: usize) -> Result<(
         packages: pkgs,
     };
 
-    println!("{}", serde_json::to_string_pretty(&report)?);
+    let doc = serde_json::to_value(&report)?;
+    let doc = apply_bounded_output(doc, "packages", bounded);
+    println!("{}", serde_json::to_string_pretty(&doc)?);
     Ok(())
 }
 
@@ -1829,8 +1942,8 @@ async fn run_audit(cli: &Cli) -> Result<()> {
     let fix_audit = matches!(&cli.command, Some(Command::Audit { fix_audit, .. }) if *fix_audit);
     let offline = matches!(&cli.command, Some(Command::Audit { offline, .. }) if *offline);
     let json_mode = effective_json_mode(cli);
-    let text_mode = !json_mode && cli.format != upd::cli::OutputFormat::Sarif;
-    let sarif_mode = cli.format == upd::cli::OutputFormat::Sarif && !json_mode;
+    let text_mode = !json_mode && cli.format != Some(upd::cli::OutputFormat::Sarif);
+    let sarif_mode = cli.format == Some(upd::cli::OutputFormat::Sarif) && !json_mode;
     // Audit never mutates files, so no VCS check is needed. Fall back to CWD.
     let paths = {
         let explicit = cli.get_paths();
@@ -1858,7 +1971,11 @@ async fn run_audit(cli: &Cli) -> Result<()> {
         } else if sarif_mode {
             emit_audit_sarif(&AuditResult::default(), &HashMap::new())?;
         } else {
-            emit_audit_json(&AuditResult::default(), "complete")?;
+            emit_audit_json(
+                &AuditResult::default(),
+                "complete",
+                &BoundedOutputParams::from_cli(cli),
+            )?;
         }
         return Ok(());
     }
@@ -1898,7 +2015,11 @@ async fn run_audit(cli: &Cli) -> Result<()> {
         } else if sarif_mode {
             emit_audit_sarif(&AuditResult::default(), &HashMap::new())?;
         } else {
-            emit_audit_json(&AuditResult::default(), "complete")?;
+            emit_audit_json(
+                &AuditResult::default(),
+                "complete",
+                &BoundedOutputParams::from_cli(cli),
+            )?;
         }
         return Ok(());
     }
@@ -1995,7 +2116,11 @@ async fn run_audit(cli: &Cli) -> Result<()> {
             AuditStatus::Clean | AuditStatus::Vulnerable => "complete",
             AuditStatus::Incomplete => "incomplete",
         };
-        emit_audit_json(&audit_result, status_str)?;
+        emit_audit_json(
+            &audit_result,
+            status_str,
+            &BoundedOutputParams::from_cli(cli),
+        )?;
     }
 
     // --fix-audit: bump each vulnerable package to its minimum safe version.
@@ -2178,7 +2303,20 @@ async fn run_audit(cli: &Cli) -> Result<()> {
                 0
             };
 
-            if fix_exit_code != 0 {
+            if fix_exit_code == 2 {
+                let combined = fix_errors.join("; ");
+                eprintln!(
+                    "{}",
+                    serde_json::json!({
+                        "error": {
+                            "kind": "io_error",
+                            "message": combined,
+                            "exit_code": 2
+                        }
+                    })
+                );
+                std::process::exit(2);
+            } else if fix_exit_code != 0 {
                 std::process::exit(fix_exit_code);
             }
             return Ok(());
@@ -2197,10 +2335,16 @@ async fn run_audit(cli: &Cli) -> Result<()> {
     Ok(())
 }
 
-fn emit_audit_json(audit: &AuditResult, status: &'static str) -> Result<()> {
+fn emit_audit_json(
+    audit: &AuditResult,
+    status: &'static str,
+    bounded: &BoundedOutputParams<'_>,
+) -> Result<()> {
     use upd::output::build_audit_report;
     let report = build_audit_report(audit, 0, status);
-    println!("{}", serde_json::to_string_pretty(&report)?);
+    let doc = serde_json::to_value(&report)?;
+    let doc = apply_bounded_output(doc, "vulnerabilities", bounded);
+    println!("{}", serde_json::to_string_pretty(&doc)?);
     Ok(())
 }
 
