@@ -18,6 +18,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 
 
+
+## [0.1.9](https://github.com/rvben/upd/compare/v0.1.8...v0.1.9) - 2026-06-11
+
+### Added
+
+- **clispec**: implement clispec v0.2 compliance (24/24) ([1c477cc](https://github.com/rvben/upd/commit/1c477cc11252dbad4f6d46fa7f393dcb48fb170d))
+
 ## [0.1.8](https://github.com/rvben/upd/compare/v0.1.7...v0.1.8) - 2026-04-30
 
 ### Added
