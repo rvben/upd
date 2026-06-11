@@ -256,6 +256,11 @@ fn build_schema() -> Value {
                 "code": 1,
                 "name": "updates_available",
                 "description": "Updates are available (dry-run mode only); the report is on stdout. Not an error. Run with --apply to write changes"
+            },
+            {
+                "code": 6,
+                "name": "vulnerabilities_found",
+                "description": "Security vulnerabilities found during audit; the report is on stdout. Not an error. Use --no-fail to exit 0 instead"
             }
         ],
         "errors": [
@@ -281,12 +286,6 @@ fn build_schema() -> Value {
                 "kind": "conflict",
                 "description": "Version conflict detected between files",
                 "exit_code": 5,
-                "retryable": false
-            },
-            {
-                "kind": "vulnerabilities_found",
-                "description": "Security vulnerabilities found during audit (use --no-fail to suppress non-zero exit)",
-                "exit_code": 3,
                 "retryable": false
             }
         ]

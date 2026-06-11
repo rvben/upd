@@ -159,9 +159,9 @@ async fn fix_audit_dry_run_exits_1_and_leaves_file_unchanged() {
 }
 
 /// When a vulnerability has no `fixed_version`, emit a warning and don't touch the file.
-/// Falls through to normal audit exit code (3 = vulnerable, !no_fail).
+/// Falls through to normal audit exit code (6 = vulnerabilities_found outcome, !no_fail).
 #[tokio::test]
-async fn fix_audit_no_fixed_version_warns_and_exits_3() {
+async fn fix_audit_no_fixed_version_warns_and_exits_6() {
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -198,10 +198,10 @@ async fn fix_audit_no_fixed_version_warns_and_exits_3() {
     );
 
     // No fixable packages → falls through to normal audit exit code.
-    // Normal audit with vulnerabilities and !no_fail → exit 3.
+    // Normal audit with vulnerabilities and !no_fail → exit 6.
     assert_eq!(
-        code, 3,
-        "should exit 3 (vulnerable, no fix available); stdout: {stdout}\nstderr: {stderr}"
+        code, 6,
+        "should exit 6 (vulnerabilities_found outcome, no fix available); stdout: {stdout}\nstderr: {stderr}"
     );
 
     let content = fs::read_to_string(&req_path).unwrap();

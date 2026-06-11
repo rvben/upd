@@ -344,8 +344,8 @@ fn decide_audit_exit_code_clean() {
 #[test]
 fn decide_audit_exit_code_vulns_without_no_fail() {
     use upd::decide_audit_exit_code;
-    assert_eq!(decide_audit_exit_code(1, 0, false), 3);
-    assert_eq!(decide_audit_exit_code(162, 0, false), 3);
+    assert_eq!(decide_audit_exit_code(1, 0, false), 6);
+    assert_eq!(decide_audit_exit_code(162, 0, false), 6);
 }
 
 /// Unit test: vulns found, --no-fail present → exit 0.
@@ -388,7 +388,7 @@ fn audit_on_empty_workspace_exits_zero() {
 /// A wiremock server stands in for the OSV API and reports one vulnerability
 /// for `requests==1.0.0`.
 #[tokio::test]
-async fn audit_with_vulns_exits_three() {
+async fn audit_with_vulns_exits_six() {
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -422,8 +422,8 @@ async fn audit_with_vulns_exits_three() {
     );
 
     assert_eq!(
-        code, 3,
-        "audit with vulns must exit 3 (no --no-fail); stderr: {stderr}"
+        code, 6,
+        "audit with vulns must exit 6, the vulnerabilities_found outcome (no --no-fail); stderr: {stderr}"
     );
 }
 
