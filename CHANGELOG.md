@@ -20,6 +20,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 
 
+
+## [0.2.0](https://github.com/rvben/upd/compare/v0.1.10...v0.2.0) - 2026-06-11
+
+### Breaking Changes
+
+- **audit**: give vulnerabilities_found its own exit code 6 as a declared outcome ([0037dc4](https://github.com/rvben/upd/commit/0037dc4e075f7d3cca7e51096fc11d07e1aa1cdb))
+
+### Added
+
+- **audit**: give vulnerabilities_found its own exit code 6 as a declared outcome ([0037dc4](https://github.com/rvben/upd/commit/0037dc4e075f7d3cca7e51096fc11d07e1aa1cdb))
+
 ## [0.1.10](https://github.com/rvben/upd/compare/v0.1.9...v0.1.10) - 2026-06-11
 
 ### Added
