@@ -392,7 +392,18 @@ impl Updater for PackageJsonUpdater {
                                                 if let Some(new_spec) =
                                                     rewrite_lower_bound(version_str, &effective)
                                                 {
-                                                    if new_spec != version_str {
+                                                    if new_spec != version_str
+                                                        && lower_bound_anchor(version_str)
+                                                            .is_some_and(|cur| {
+                                                                !options
+                                                                    .allows_bump(cur, &effective)
+                                                            })
+                                                    {
+                                                        // Bump level exceeds the
+                                                        // --only-bump/--max-bump ceiling: leave the
+                                                        // dependency spec untouched.
+                                                        result.unchanged += 1;
+                                                    } else if new_spec != version_str {
                                                         let line_num =
                                                             line_index.line_for(section, package);
                                                         result.updated.push((
@@ -505,10 +516,17 @@ impl Updater for PackageJsonUpdater {
         // pre-release to avoid silently promoting the package to stable.
         let version_futures: Vec<_> = packages_to_check
             .iter()
-            .map(|(_, package, _, _, current_version)| async {
+            .map(|(_, package, version_str, prefix, current_version)| async {
                 if is_prerelease_semver(current_version) {
                     registry
                         .get_latest_version_including_prereleases(package)
+                        .await
+                } else if matches!(prefix.as_str(), "^" | "~") {
+                    // Honor the caret/tilde bound: select the highest version that
+                    // satisfies the original spec, never crossing the implied
+                    // range (`^4.0.0` stays <5, `~4.17.0` stays <4.18).
+                    registry
+                        .get_latest_version_matching(package, version_str)
                         .await
                 } else {
                     registry.get_latest_version(package).await
@@ -583,6 +601,9 @@ impl Updater for PackageJsonUpdater {
                                 &matched_version,
                                 &current_version,
                             ));
+                            result.unchanged += 1;
+                        } else if !options.allows_bump(&current_version, &matched_version) {
+                            // Bump level exceeds the --only-bump/--max-bump ceiling.
                             result.unchanged += 1;
                         } else {
                             let line_num = line_index.line_for(&section, &package);
@@ -897,6 +918,57 @@ mod tests {
         assert!(content.contains("\"~2.0.0\""));
         assert!(content.contains("\"2.0.0\"")); // exact version
         assert!(content.contains("\">=2.0.0\""));
+    }
+
+    #[tokio::test]
+    async fn test_update_package_json_honors_caret_and_tilde_bounds() {
+        // A caret/tilde spec must not be bumped past the version range it implies:
+        // `^4.0.0` stays in 4.x and `~4.17.0` stays in 4.17.x, even when a newer
+        // major/minor exists. The registry's range-matching returns the highest
+        // in-range version; the updater must consult it rather than the absolute
+        // latest.
+        let mut file = NamedTempFile::with_suffix(".json").unwrap();
+        write!(
+            file,
+            r#"{{
+  "dependencies": {{
+    "express": "^4.0.0",
+    "lodash": "~4.17.0"
+  }}
+}}"#
+        )
+        .unwrap();
+
+        let registry = MockRegistry::new("npm")
+            .with_version("express", "5.2.1")
+            .with_constrained("express", "^4.0.0", "4.21.2")
+            .with_version("lodash", "4.18.1")
+            .with_constrained("lodash", "~4.17.0", "4.17.21");
+
+        let updater = PackageJsonUpdater::new();
+        let result = updater
+            .update(file.path(), &registry, UpdateOptions::new(false, false))
+            .await
+            .unwrap();
+        assert!(result.errors.is_empty(), "errors: {:?}", result.errors);
+
+        let content = fs::read_to_string(file.path()).unwrap();
+        assert!(
+            content.contains("\"express\": \"^4.21.2\""),
+            "caret must stay within 4.x (expected ^4.21.2); got: {content}"
+        );
+        assert!(
+            content.contains("\"lodash\": \"~4.17.21\""),
+            "tilde must stay within 4.17.x (expected ~4.17.21); got: {content}"
+        );
+        assert!(
+            !content.contains("5.2.1"),
+            "must not cross the caret major bound; got: {content}"
+        );
+        assert!(
+            !content.contains("4.18.1"),
+            "must not cross the tilde minor bound; got: {content}"
+        );
     }
 
     #[tokio::test]

@@ -455,6 +455,13 @@ impl Updater for RequirementsUpdater {
                                     ));
                                     result.unchanged += 1;
                                     new_lines.push(line.to_string());
+                                } else if !options
+                                    .allows_bump(&parsed.first_version, &matched_version)
+                                {
+                                    // Bump level exceeds the --only-bump/--max-bump
+                                    // ceiling: leave the line untouched.
+                                    result.unchanged += 1;
+                                    new_lines.push(line.to_string());
                                 } else {
                                     result.updated.push((
                                         parsed.package.clone(),

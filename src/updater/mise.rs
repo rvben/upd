@@ -393,6 +393,13 @@ impl Updater for MiseUpdater {
                                 ));
                                 result.unchanged += 1;
                                 new_lines.push(line.to_string());
+                            } else if !is_pinned
+                                && !options.allows_bump(current_version, &new_version)
+                            {
+                                // Bump level exceeds the --only-bump/--max-bump ceiling.
+                                // Configured pins are intentional and bypass the ceiling.
+                                result.unchanged += 1;
+                                new_lines.push(line.to_string());
                             } else {
                                 let new_line = line.replacen(current_version, &new_version, 1);
                                 new_lines.push(new_line);

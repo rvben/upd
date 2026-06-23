@@ -298,7 +298,7 @@ impl CargoTomlUpdater {
         // Fetch all versions in parallel for non-ignored, non-pinned packages
         let version_futures: Vec<_> = deps_to_check
             .iter()
-            .map(|(key, _, current_version, registry_name, _)| {
+            .map(|(key, prefix, current_version, registry_name, _)| {
                 let effective_registry: &dyn Registry = if let Some(name) = registry_name {
                     registry_cache
                         .get(name)
@@ -309,12 +309,20 @@ impl CargoTomlUpdater {
                 };
 
                 async move {
-                    if is_stable_semver(current_version) {
-                        effective_registry.get_latest_version(key).await
-                    } else {
+                    if !is_stable_semver(current_version) {
                         effective_registry
                             .get_latest_version_including_prereleases(key)
                             .await
+                    } else if matches!(prefix.as_str(), "^" | "~") {
+                        // Honor explicit caret/tilde bounds: select the highest
+                        // version satisfying the original requirement, never
+                        // crossing the implied range (`^3.0.0` stays <4).
+                        let req = format!("{prefix}{current_version}");
+                        effective_registry
+                            .get_latest_version_matching(key, &req)
+                            .await
+                    } else {
+                        effective_registry.get_latest_version(key).await
                     }
                 }
             })
@@ -396,6 +404,10 @@ impl CargoTomlUpdater {
                                 &matched_version,
                                 &current_version,
                             ));
+                            result.unchanged += 1;
+                        } else if !options.allows_bump(&current_version, &matched_version) {
+                            // Bump level exceeds the --only-bump/--max-bump ceiling:
+                            // leave the dependency untouched.
                             result.unchanged += 1;
                         } else {
                             let new_version_req = format!("{}{}", prefix, matched_version);
@@ -920,6 +932,50 @@ gte = ">=1.0.0"
         assert!(content.contains("\"~2.0.0\""));
         assert!(content.contains("\"=2.0.0\""));
         assert!(content.contains("\">=2.0.0\""));
+    }
+
+    #[tokio::test]
+    async fn test_update_cargo_toml_honors_caret_and_tilde_bounds() {
+        // Explicit caret/tilde must not cross the version range they imply:
+        // `^3.0.0` stays in 3.x and `~3.0.0` stays in 3.0.x, even when a newer
+        // major/minor exists. The registry's range-matching returns the highest
+        // in-range version; the updater must consult it rather than the latest.
+        let mut file = NamedTempFile::with_suffix(".toml").unwrap();
+        write!(
+            file,
+            r#"[dependencies]
+clap = "^3.0.0"
+rand = "~3.0.0"
+"#
+        )
+        .unwrap();
+
+        let registry = MockRegistry::new("crates.io")
+            .with_version("clap", "4.6.1")
+            .with_constrained("clap", "^3.0.0", "3.2.25")
+            .with_version("rand", "3.5.0")
+            .with_constrained("rand", "~3.0.0", "3.0.9");
+
+        let updater = CargoTomlUpdater::new();
+        let result = updater
+            .update(file.path(), &registry, UpdateOptions::new(false, false))
+            .await
+            .unwrap();
+        assert!(result.errors.is_empty(), "errors: {:?}", result.errors);
+
+        let content = fs::read_to_string(file.path()).unwrap();
+        assert!(
+            content.contains("clap = \"^3.2.25\""),
+            "caret must stay within 3.x (expected ^3.2.25); got: {content}"
+        );
+        assert!(
+            content.contains("rand = \"~3.0.9\""),
+            "tilde must stay within 3.0.x (expected ~3.0.9); got: {content}"
+        );
+        assert!(
+            !content.contains("4.6.1") && !content.contains("3.5.0"),
+            "must not cross the caret/tilde bound; got: {content}"
+        );
     }
 
     #[tokio::test]

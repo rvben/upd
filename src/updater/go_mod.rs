@@ -353,6 +353,13 @@ impl Updater for GoModUpdater {
                                 ));
                                 result.unchanged += 1;
                                 new_lines.push(line.to_string());
+                            } else if !is_pinned
+                                && !options.allows_bump(current_version, &matched_version)
+                            {
+                                // Bump level exceeds the --only-bump/--max-bump ceiling.
+                                // Configured pins are intentional and bypass the ceiling.
+                                result.unchanged += 1;
+                                new_lines.push(line.to_string());
                             } else {
                                 // Replace version in the line, preserving everything else
                                 let new_line = line.replacen(current_version, &matched_version, 1);

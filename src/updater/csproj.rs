@@ -401,6 +401,10 @@ impl Updater for CsprojUpdater {
                                     ));
                                     result.unchanged += 1;
                                     new_lines.push(line.to_string());
+                                } else if !options.allows_bump(&pkg.version, &matched_version) {
+                                    // Bump level exceeds the --only-bump/--max-bump ceiling.
+                                    result.unchanged += 1;
+                                    new_lines.push(line.to_string());
                                 } else {
                                     if !pinned_lines.contains(&line_idx) {
                                         result.updated.push((

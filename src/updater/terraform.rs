@@ -482,6 +482,10 @@ impl Updater for TerraformUpdater {
                                     ));
                                     result.unchanged += 1;
                                     new_lines.push(line.to_string());
+                                } else if !options.allows_bump(&dep.version, &matched_version) {
+                                    // Bump level exceeds the --only-bump/--max-bump ceiling.
+                                    result.unchanged += 1;
+                                    new_lines.push(line.to_string());
                                 } else {
                                     result.updated.push((
                                         dep.source.clone(),

@@ -77,6 +77,12 @@ pub fn write_file_atomic(path: &Path, content: &str) -> Result<()> {
         .unwrap_or_else(|| "temp".to_string());
     let tmp_path = parent.join(format!(".{}.upd.tmp", file_name));
 
+    // Capture the original file's permissions so the atomic rename does not
+    // silently change them. Without this, a read-only (0o444) manifest is
+    // rewritten as 0o644: the rename replaces the inode with the temp file,
+    // which was created with the umask default.
+    let original_perms = std::fs::metadata(path).ok().map(|m| m.permissions());
+
     // Write to temporary file
     let mut file = std::fs::File::create(&tmp_path)?;
     file.write_all(content.as_bytes())?;
@@ -85,7 +91,92 @@ pub fn write_file_atomic(path: &Path, content: &str) -> Result<()> {
     // Atomically rename to target path
     std::fs::rename(&tmp_path, path)?;
 
+    // Restore the original permissions onto the renamed file so updating a
+    // manifest never changes its mode (read-only stays read-only).
+    if let Some(perms) = original_perms {
+        let _ = std::fs::set_permissions(path, perms);
+    }
+
     Ok(())
+}
+
+/// Coarse bump classification of a version change, used to honor the
+/// `--only-bump` / `--max-bump` ceiling at write time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BumpKind {
+    Major,
+    Minor,
+    Patch,
+}
+
+/// Classify a version change as major / minor / patch.
+///
+/// This mirrors the reporting classifier in the binary so the write-time gate
+/// and the printed counts always agree: parse the leading `major.minor.patch`
+/// (tolerating a leading `v` and missing segments), and fall back to `Patch`
+/// for anything unparseable or non-increasing.
+fn classify_bump(old: &str, new: &str) -> BumpKind {
+    fn parse(v: &str) -> Option<(u64, u64, u64)> {
+        let v = v.trim_start_matches('v');
+        let parts: Vec<&str> = v.split('.').collect();
+        let major = parts.first()?.parse().ok()?;
+        let minor = parts.get(1).and_then(|s| s.parse().ok()).unwrap_or(0);
+        let patch = parts.get(2).and_then(|s| s.parse().ok()).unwrap_or(0);
+        Some((major, minor, patch))
+    }
+    match (parse(old), parse(new)) {
+        (Some((om, oi, _)), Some((nm, ni, _))) => {
+            if nm > om {
+                BumpKind::Major
+            } else if ni > oi {
+                BumpKind::Minor
+            } else {
+                BumpKind::Patch
+            }
+        }
+        _ => BumpKind::Patch,
+    }
+}
+
+/// Which bump levels are permitted to be written.
+///
+/// The default permits everything, so updaters that are unaware of the filter
+/// (and the no-flag case) behave exactly as before.
+#[derive(Debug, Clone, Copy)]
+pub struct BumpFilter {
+    pub major: bool,
+    pub minor: bool,
+    pub patch: bool,
+}
+
+impl Default for BumpFilter {
+    fn default() -> Self {
+        Self {
+            major: true,
+            minor: true,
+            patch: true,
+        }
+    }
+}
+
+impl BumpFilter {
+    /// Returns `true` when a change from `old` to `new` is permitted and may be
+    /// written.
+    ///
+    /// A missing/blank `old` or `new` is never writable: an empty current
+    /// version means the updater failed to extract a real version, and
+    /// substituting would corrupt the file (for example a non-version string
+    /// gaining an appended digit, `"hello"` -> `"hello1"`).
+    pub fn allows(&self, old: &str, new: &str) -> bool {
+        if old.trim().is_empty() || new.trim().is_empty() {
+            return false;
+        }
+        match classify_bump(old, new) {
+            BumpKind::Major => self.major,
+            BumpKind::Minor => self.minor,
+            BumpKind::Patch => self.patch,
+        }
+    }
 }
 
 /// Options for updating dependencies
@@ -108,6 +199,10 @@ pub struct UpdateOptions {
     /// Notes emitted when a registry cannot supply publish dates. Shared across
     /// updaters so a single file processing run reports each note once.
     pub cooldown_unavailable_notes: Arc<Mutex<BTreeSet<String>>>,
+    /// Bump-level ceiling enforced at write time. Defaults to permitting every
+    /// level, so updates are only skipped when `--only-bump` / `--max-bump`
+    /// narrow it.
+    pub bump_filter: BumpFilter,
 }
 
 impl UpdateOptions {
@@ -121,7 +216,21 @@ impl UpdateOptions {
             cooldown_policy: None,
             cooldown_now: None,
             cooldown_unavailable_notes: Arc::default(),
+            bump_filter: BumpFilter::default(),
         }
+    }
+
+    /// Restrict which bump levels may be written.
+    pub fn with_bump_filter(mut self, filter: BumpFilter) -> Self {
+        self.bump_filter = filter;
+        self
+    }
+
+    /// Returns `true` when an update from `current` to `new` is within the
+    /// permitted bump levels. Updaters consult this immediately before recording
+    /// and writing a change so a capped-out update never reaches disk.
+    pub fn allows_bump(&self, current: &str, new: &str) -> bool {
+        self.bump_filter.allows(current, new)
     }
 
     /// Set the configuration
@@ -755,6 +864,63 @@ mod tests {
     use super::*;
     use std::fs;
     use tempfile::tempdir;
+
+    #[test]
+    fn bump_filter_rejects_empty_current_version() {
+        // An empty/missing current version means the updater failed to extract a
+        // real version. Writing would corrupt the file (e.g. a non-version string
+        // gaining an appended digit: "hello" -> "hello1"). The default filter must
+        // refuse such a write even though it permits every bump level.
+        let filter = BumpFilter::default();
+        assert!(
+            !filter.allows("", "1.0.0"),
+            "an empty current version must never be writable"
+        );
+        assert!(
+            !filter.allows("   ", "1.0.0"),
+            "a blank current version must never be writable"
+        );
+        assert!(
+            !filter.allows("1.0.0", ""),
+            "an empty target version must never be writable"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_file_atomic_preserves_original_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("Cargo.toml");
+        fs::write(&path, "old = 1\n").unwrap();
+        // Mark the manifest read-only (0o444): a common "do not modify" signal.
+        fs::set_permissions(&path, std::fs::Permissions::from_mode(0o444)).unwrap();
+
+        write_file_atomic(&path, "new = 2\n").unwrap();
+
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            "new = 2\n",
+            "atomic write must still update the content"
+        );
+        let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            mode, 0o444,
+            "atomic write must preserve original permissions, not reset them to the umask default"
+        );
+    }
+
+    #[test]
+    fn bump_filter_allows_normal_updates_by_default() {
+        let filter = BumpFilter::default();
+        assert!(filter.allows("1.0.0", "2.0.0"), "major allowed by default");
+        assert!(filter.allows("1.0.0", "1.1.0"), "minor allowed by default");
+        assert!(filter.allows("1.0.0", "1.0.1"), "patch allowed by default");
+        assert!(
+            filter.allows("v3", "v4"),
+            "tag-style major allowed by default"
+        );
+    }
 
     #[test]
     fn test_update_result_merge() {
@@ -1488,7 +1654,7 @@ mod tests {
 
         let patterns = vec!["**/archive/**".to_string()];
         let files = discover_files_with(
-            &[archived.clone()],
+            std::slice::from_ref(&archived),
             &[],
             DiscoverOptions {
                 no_ignore: false,
