@@ -857,6 +857,7 @@ require (
 
         // Configure to ignore github.com/foo/bar
         let config = UpdConfig {
+            exclude: Vec::new(),
             ignore: vec!["github.com/foo/bar".to_string()],
             pin: std::collections::HashMap::new(),
             cooldown: None,
@@ -908,6 +909,7 @@ require (
         pins.insert("github.com/foo/bar".to_string(), "v1.2.0".to_string());
 
         let config = UpdConfig {
+            exclude: Vec::new(),
             ignore: vec![],
             pin: pins,
             cooldown: None,
@@ -955,6 +957,7 @@ require github.com/foo/bar v1.0.0
         pins.insert("github.com/foo/bar".to_string(), "v1.2.0".to_string());
 
         let config = UpdConfig {
+            exclude: Vec::new(),
             ignore: vec![],
             pin: pins,
             cooldown: None,
@@ -1005,6 +1008,7 @@ require (
         pins.insert("github.com/pinned/mod".to_string(), "v2.3.0".to_string());
 
         let config = UpdConfig {
+            exclude: Vec::new(),
             ignore: vec!["github.com/ignored/mod".to_string()],
             pin: pins,
             cooldown: None,
@@ -1059,6 +1063,7 @@ require github.com/baz/qux v2.0.0
         pins.insert("github.com/foo/bar".to_string(), "v1.2.0".to_string());
 
         let config = UpdConfig {
+            exclude: Vec::new(),
             ignore: vec!["github.com/baz/qux".to_string()],
             pin: pins,
             cooldown: None,
@@ -1106,6 +1111,7 @@ require (
         pins.insert("github.com/foo/bar".to_string(), "v1.2.0".to_string());
 
         let config = UpdConfig {
+            exclude: Vec::new(),
             ignore: vec![],
             pin: pins,
             cooldown: None,

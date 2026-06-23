@@ -803,6 +803,7 @@ uv = "latest"
         let mut pins = std::collections::HashMap::new();
         pins.insert("zig".to_string(), "0.13.1".to_string());
         let config = UpdConfig {
+            exclude: Vec::new(),
             ignore: vec!["node".to_string()],
             pin: pins,
             cooldown: None,

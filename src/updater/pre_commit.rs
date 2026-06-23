@@ -663,6 +663,7 @@ mod tests {
         let mut pins = std::collections::HashMap::new();
         pins.insert("psf/black".to_string(), "24.0.0".to_string());
         let config = UpdConfig {
+            exclude: Vec::new(),
             ignore: vec!["pre-commit/pre-commit-hooks".to_string()],
             pin: pins,
             cooldown: None,

@@ -1088,6 +1088,7 @@ flask>=2.0.0
 
         // Create config that ignores "flask"
         let config = UpdConfig {
+            exclude: Vec::new(),
             ignore: vec!["flask".to_string()],
             pin: HashMap::new(),
             cooldown: None,
@@ -1131,6 +1132,7 @@ flask>=2.0.0
         pin.insert("requests".to_string(), "2.30.0".to_string());
 
         let config = UpdConfig {
+            exclude: Vec::new(),
             ignore: vec![],
             pin,
             cooldown: None,
@@ -1177,6 +1179,7 @@ flask>=2.0.0
         pin.insert("requests".to_string(), "2.29.0".to_string());
 
         let config = UpdConfig {
+            exclude: Vec::new(),
             ignore: vec!["flask".to_string()],
             pin,
             cooldown: None,

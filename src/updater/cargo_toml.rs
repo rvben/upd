@@ -1225,6 +1225,7 @@ anyhow = "1.0.0"
 
         // Create config that ignores tokio
         let config = UpdConfig {
+            exclude: Vec::new(),
             ignore: vec!["tokio".to_string()],
             pin: std::collections::HashMap::new(),
             cooldown: None,
@@ -1277,6 +1278,7 @@ tokio = "1.0.0"
         let mut pin = std::collections::HashMap::new();
         pin.insert("serde".to_string(), "1.0.150".to_string());
         let config = UpdConfig {
+            exclude: Vec::new(),
             ignore: Vec::new(),
             pin,
             cooldown: None,
@@ -1327,6 +1329,7 @@ serde = "1.0.1"
         let mut pin = std::collections::HashMap::new();
         pin.insert("serde".to_string(), "1.0.150".to_string());
         let config = UpdConfig {
+            exclude: Vec::new(),
             ignore: Vec::new(),
             pin,
             cooldown: None,
@@ -1380,6 +1383,7 @@ anyhow = "1.0.0"
         let mut pin = std::collections::HashMap::new();
         pin.insert("serde".to_string(), "1.0.150".to_string());
         let config = UpdConfig {
+            exclude: Vec::new(),
             ignore: vec!["tokio".to_string()],
             pin,
             cooldown: None,
@@ -1432,6 +1436,7 @@ tempfile = "3.0.0"
 
         // Config: ignore tempfile
         let config = UpdConfig {
+            exclude: Vec::new(),
             ignore: vec!["tempfile".to_string()],
             pin: std::collections::HashMap::new(),
             cooldown: None,
@@ -1486,6 +1491,7 @@ anyhow = "=1.0.0"
         pin.insert("tokio".to_string(), "1.20.0".to_string());
         pin.insert("anyhow".to_string(), "1.0.70".to_string());
         let config = UpdConfig {
+            exclude: Vec::new(),
             ignore: Vec::new(),
             pin,
             cooldown: None,
@@ -1532,6 +1538,7 @@ tokio = {{ version = "1.0.0", features = ["full"] }}
 
         // Config: ignore serde
         let config = UpdConfig {
+            exclude: Vec::new(),
             ignore: vec!["serde".to_string()],
             pin: std::collections::HashMap::new(),
             cooldown: None,

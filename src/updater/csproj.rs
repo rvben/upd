@@ -710,6 +710,7 @@ mod tests {
         let mut pins = std::collections::HashMap::new();
         pins.insert("Serilog".to_string(), "3.2.0".to_string());
         let config = UpdConfig {
+            exclude: Vec::new(),
             ignore: vec!["Newtonsoft.Json".to_string()],
             pin: pins,
             cooldown: None,
@@ -750,6 +751,7 @@ mod tests {
         let mut pins = std::collections::HashMap::new();
         pins.insert("Serilog".to_string(), "3.2.0".to_string());
         let config = UpdConfig {
+            exclude: Vec::new(),
             ignore: vec![],
             pin: pins,
             cooldown: None,

@@ -1108,6 +1108,7 @@ jobs:
         let mut pins = std::collections::HashMap::new();
         pins.insert("actions/setup-node".to_string(), "v4.0.0".to_string());
         let config = UpdConfig {
+            exclude: Vec::new(),
             ignore: vec!["actions/checkout".to_string()],
             pin: pins,
             cooldown: None,

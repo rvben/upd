@@ -1035,6 +1035,7 @@ mod tests {
         let mut pin = std::collections::HashMap::new();
         pin.insert("react".to_string(), "19.0.0".to_string());
         let config = UpdConfig {
+            exclude: Vec::new(),
             ignore: Vec::new(),
             pin,
             cooldown: None,
@@ -1085,6 +1086,7 @@ mod tests {
         let mut pin = std::collections::HashMap::new();
         pin.insert("react".to_string(), "19.0.0".to_string());
         let config = UpdConfig {
+            exclude: Vec::new(),
             ignore: Vec::new(),
             pin,
             cooldown: None,
@@ -1167,6 +1169,7 @@ mod tests {
 
         // Create config that ignores lodash
         let config = UpdConfig {
+            exclude: Vec::new(),
             ignore: vec!["lodash".to_string()],
             pin: std::collections::HashMap::new(),
             cooldown: None,
@@ -1219,6 +1222,7 @@ mod tests {
         let mut pin = std::collections::HashMap::new();
         pin.insert("react".to_string(), "17.0.2".to_string());
         let config = UpdConfig {
+            exclude: Vec::new(),
             ignore: Vec::new(),
             pin,
             cooldown: None,
@@ -1274,6 +1278,7 @@ mod tests {
         let mut pin = std::collections::HashMap::new();
         pin.insert("express".to_string(), "4.17.3".to_string());
         let config = UpdConfig {
+            exclude: Vec::new(),
             ignore: vec!["lodash".to_string()],
             pin,
             cooldown: None,
@@ -1325,6 +1330,7 @@ mod tests {
 
         // Config: ignore typescript
         let config = UpdConfig {
+            exclude: Vec::new(),
             ignore: vec!["typescript".to_string()],
             pin: std::collections::HashMap::new(),
             cooldown: None,
@@ -1378,6 +1384,7 @@ mod tests {
         pin.insert("tilde".to_string(), "1.5.0".to_string());
         pin.insert("exact".to_string(), "1.5.0".to_string());
         let config = UpdConfig {
+            exclude: Vec::new(),
             ignore: Vec::new(),
             pin,
             cooldown: None,
@@ -1777,6 +1784,7 @@ mod tests {
             .with_constrained("ranged", ">=1.0.0 <2.0.0", "1.5.0");
 
         let config = UpdConfig {
+            exclude: Vec::new(),
             ignore: vec!["ranged".to_string()],
             pin: std::collections::HashMap::new(),
             cooldown: None,
@@ -1888,6 +1896,7 @@ mod tests {
         let mut pin = std::collections::HashMap::new();
         pin.insert("ranged".to_string(), "1.5.0".to_string());
         let config = UpdConfig {
+            exclude: Vec::new(),
             ignore: Vec::new(),
             pin,
             cooldown: None,

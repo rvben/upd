@@ -7,13 +7,19 @@
 //! All configuration fields are top-level keys:
 //!
 //! ```toml
-//! # Packages to ignore (never update) — top-level array
+//! # Packages to ignore (never update or align) - top-level array
 //! ignore = [
 //!     "some-legacy-package",
 //!     "pinned-for-compatibility",
 //! ]
 //!
-//! # Pin packages to specific versions or constraints — top-level table
+//! # Paths to exclude from discovery (glob patterns) - top-level array
+//! exclude = [
+//!     "**/archive/**",
+//!     "**/vendored/requirements.txt",
+//! ]
+//!
+//! # Pin packages to specific versions or constraints - top-level table
 //! [pin]
 //! requests = "2.28.0"  # Pin to exact version
 //! django = ">=3.2,<4"  # Pin to version range
@@ -47,7 +53,7 @@ use std::path::{Path, PathBuf};
 const MAX_CONFIG_FILE_SIZE: u64 = 1024 * 1024;
 
 /// All valid top-level keys in the config schema.
-const KNOWN_KEYS: &[&str] = &["ignore", "pin", "cooldown"];
+const KNOWN_KEYS: &[&str] = &["ignore", "exclude", "pin", "cooldown"];
 
 /// Raw cooldown config as written in the TOML file. Parsed into a
 /// `crate::cooldown::CooldownPolicy` at runtime via `UpdConfig::to_cooldown_policy`.
@@ -64,9 +70,18 @@ pub struct CooldownConfig {
 /// Configuration loaded from .updrc.toml or upd.toml
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct UpdConfig {
-    /// Package names to ignore (never update)
+    /// Package names to ignore (never update or align)
     #[serde(default)]
     pub ignore: Vec<String>,
+
+    /// Path glob patterns to exclude from file discovery.
+    ///
+    /// Matched against each discovered dependency file path (e.g.
+    /// `**/archive/**`). Because this is honored during discovery, it applies
+    /// uniformly to every subcommand that scans for files (align, update,
+    /// audit). Explicit file-path CLI arguments bypass it.
+    #[serde(default)]
+    pub exclude: Vec<String>,
 
     /// Package versions to pin (name -> version constraint)
     #[serde(default)]
@@ -247,8 +262,20 @@ impl UpdConfig {
 # File names: .updrc.toml, upd.toml, or .updrc
 # Searched from the current directory upward.
 
-# ignore: packages that upd should never update (top-level array of strings)
+# ignore: packages that upd should never update or align (top-level array of
+# strings). Names are compared case-insensitively using PEP 503 normalization
+# (lowercased; runs of `-`, `_`, and `.` are treated as equivalent).
 ignore = []
+
+# exclude: path glob patterns dropped during file discovery (top-level array of
+# strings). Honored by every subcommand that scans for files (align, update,
+# audit). Patterns are matched against the discovered file path; a leading
+# `**/` makes them depth-independent. Explicit file-path CLI arguments bypass
+# this list.
+exclude = [
+    # "**/archive/**",
+    # "**/vendored/requirements.txt",
+]
 
 # pin: packages pinned to a specific version or constraint (top-level table)
 [pin]
@@ -309,9 +336,19 @@ ignore = []
         })
     }
 
-    /// Check if a package should be ignored
+    /// Check if a package should be ignored.
+    ///
+    /// Comparison is case-insensitive and uses PEP 503 normalization on both
+    /// the configured entries and the queried name (lowercased; runs of `-`,
+    /// `_`, and `.` collapse to a single `-`). This makes `ignore = ["NumPy"]`
+    /// match `numpy` and treats Python's `foo_bar`/`foo.bar`/`foo-bar`
+    /// spellings as one package. Normalization is applied uniformly across
+    /// ecosystems so the denylist behaves predictably regardless of registry.
     pub fn should_ignore(&self, package: &str) -> bool {
-        self.ignore.iter().any(|p| p == package)
+        let target = normalize_package_name(package);
+        self.ignore
+            .iter()
+            .any(|p| normalize_package_name(p) == target)
     }
 
     /// Get the pinned version for a package (if any)
@@ -321,7 +358,10 @@ ignore = []
 
     /// Check if any configuration is present
     pub fn has_config(&self) -> bool {
-        !self.ignore.is_empty() || !self.pin.is_empty() || self.cooldown.is_some()
+        !self.ignore.is_empty()
+            || !self.exclude.is_empty()
+            || !self.pin.is_empty()
+            || self.cooldown.is_some()
     }
 
     /// Merge another configuration into this one (other takes precedence)
@@ -330,6 +370,12 @@ ignore = []
         for pkg in other.ignore {
             if !self.ignore.contains(&pkg) {
                 self.ignore.push(pkg);
+            }
+        }
+        // Extend exclude list
+        for pattern in other.exclude {
+            if !self.exclude.contains(&pattern) {
+                self.exclude.push(pattern);
             }
         }
         // Override pinned versions
@@ -341,6 +387,28 @@ ignore = []
             self.cooldown = other.cooldown;
         }
     }
+}
+
+/// Normalize a package name to PEP 503 canonical form for ignore comparison.
+///
+/// Lowercases the name and collapses any run of `-`, `_`, or `.` into a single
+/// `-`. Applied to both sides of an ignore-list comparison so spellings that
+/// differ only in case or separator are treated as the same package.
+fn normalize_package_name(name: &str) -> String {
+    let mut out = String::with_capacity(name.len());
+    let mut prev_separator = false;
+    for ch in name.chars() {
+        if matches!(ch, '-' | '_' | '.') {
+            if !prev_separator {
+                out.push('-');
+                prev_separator = true;
+            }
+        } else {
+            out.extend(ch.to_lowercase());
+            prev_separator = false;
+        }
+    }
+    out
 }
 
 /// Render the resolved cooldown for human display in `--show-config`.
@@ -417,6 +485,7 @@ django = ">=3.2,<4"
     #[test]
     fn test_should_ignore() {
         let config = UpdConfig {
+            exclude: Vec::new(),
             ignore: vec!["pkg-a".to_string(), "pkg-b".to_string()],
             pin: HashMap::new(),
             cooldown: None,
@@ -428,12 +497,94 @@ django = ">=3.2,<4"
     }
 
     #[test]
+    fn test_should_ignore_is_case_insensitive_and_pep503_normalized() {
+        let config = UpdConfig {
+            ignore: vec!["NumPy".to_string(), "foo.bar".to_string()],
+            ..Default::default()
+        };
+
+        // Case-insensitive (the primary motivating case).
+        assert!(config.should_ignore("numpy"));
+        assert!(config.should_ignore("NUMPY"));
+
+        // PEP 503 separators: `-`, `_`, `.` are equivalent.
+        assert!(config.should_ignore("foo_bar"));
+        assert!(config.should_ignore("foo-bar"));
+        assert!(config.should_ignore("FOO.BAR"));
+
+        // Distinct names still differ.
+        assert!(!config.should_ignore("numpyy"));
+        assert!(!config.should_ignore("foobar"));
+    }
+
+    #[test]
+    fn test_normalize_package_name_collapses_separator_runs() {
+        assert_eq!(normalize_package_name("Foo__Bar.._Baz"), "foo-bar-baz");
+        assert_eq!(normalize_package_name("a-b_c.d"), "a-b-c-d");
+        // Non-separator characters (e.g. the `/` in actions) are preserved.
+        assert_eq!(
+            normalize_package_name("Actions/Checkout"),
+            "actions/checkout"
+        );
+    }
+
+    #[test]
+    fn test_exclude_parses_and_is_a_known_key() {
+        let content = r#"
+exclude = ["**/archive/**", "**/vendored/requirements.txt"]
+"#;
+        let (config, warnings) = UpdConfig::parse_with_warnings(content, "test.toml").unwrap();
+        assert!(
+            warnings.is_empty(),
+            "exclude must be a known top-level key (no warning); got: {warnings:?}"
+        );
+        assert_eq!(config.exclude.len(), 2);
+        assert!(config.exclude.contains(&"**/archive/**".to_string()));
+    }
+
+    #[test]
+    fn test_has_config_true_with_only_exclude() {
+        let config = UpdConfig {
+            exclude: vec!["**/archive/**".to_string()],
+            ..Default::default()
+        };
+        assert!(config.has_config());
+    }
+
+    #[test]
+    fn test_merge_extends_exclude_without_duplicates() {
+        let mut base = UpdConfig {
+            exclude: vec!["**/a/**".to_string()],
+            ..Default::default()
+        };
+        let other = UpdConfig {
+            exclude: vec!["**/a/**".to_string(), "**/b/**".to_string()],
+            ..Default::default()
+        };
+        base.merge(other);
+        assert_eq!(
+            base.exclude,
+            vec!["**/a/**".to_string(), "**/b/**".to_string()]
+        );
+    }
+
+    #[test]
+    fn test_schema_toml_documents_exclude() {
+        let schema = UpdConfig::schema_toml();
+        assert!(
+            schema.contains("exclude"),
+            "schema must document the exclude key: {schema}"
+        );
+    }
+
+    #[test]
     fn test_get_pinned_version() {
         let mut pin = HashMap::new();
         pin.insert("requests".to_string(), "2.28.0".to_string());
         pin.insert("django".to_string(), ">=3.2,<4".to_string());
 
         let config = UpdConfig {
+            exclude: Vec::new(),
             ignore: vec![],
             pin,
             cooldown: None,
@@ -531,6 +682,7 @@ ignore = ["parent-pkg"]
         assert!(!empty.has_config());
 
         let with_ignore = UpdConfig {
+            exclude: Vec::new(),
             ignore: vec!["pkg".to_string()],
             pin: HashMap::new(),
             cooldown: None,
@@ -540,6 +692,7 @@ ignore = ["parent-pkg"]
         let mut pin = HashMap::new();
         pin.insert("pkg".to_string(), "1.0".to_string());
         let with_pin = UpdConfig {
+            exclude: Vec::new(),
             ignore: vec![],
             pin,
             cooldown: None,
@@ -550,6 +703,7 @@ ignore = ["parent-pkg"]
     #[test]
     fn test_merge_configs() {
         let mut base = UpdConfig {
+            exclude: Vec::new(),
             ignore: vec!["pkg-a".to_string()],
             pin: {
                 let mut m = HashMap::new();
@@ -560,6 +714,7 @@ ignore = ["parent-pkg"]
         };
 
         let other = UpdConfig {
+            exclude: Vec::new(),
             ignore: vec!["pkg-b".to_string()],
             pin: {
                 let mut m = HashMap::new();
@@ -710,6 +865,7 @@ parent-pkg = "1.0.0"
 
         // Create config
         let config = UpdConfig {
+            exclude: Vec::new(),
             ignore: vec!["requests".to_string()],
             pin: {
                 let mut m = HashMap::new();
@@ -771,6 +927,7 @@ parent-pkg = "1.0.0"
 
         // Shared config
         let config = Arc::new(UpdConfig {
+            exclude: Vec::new(),
             ignore: vec!["ignored-pkg".to_string()],
             pin: {
                 let mut m = HashMap::new();

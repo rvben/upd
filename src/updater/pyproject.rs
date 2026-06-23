@@ -1704,6 +1704,7 @@ dependencies = [
 
         // Create config that ignores flask
         let config = UpdConfig {
+            exclude: Vec::new(),
             ignore: vec!["flask".to_string()],
             pin: std::collections::HashMap::new(),
             cooldown: None,
@@ -1755,6 +1756,7 @@ dependencies = [
         let mut pin = std::collections::HashMap::new();
         pin.insert("flask".to_string(), "2.3.0".to_string());
         let config = UpdConfig {
+            exclude: Vec::new(),
             ignore: Vec::new(),
             pin,
             cooldown: None,
@@ -1807,6 +1809,7 @@ flask = "^2.0.0"
 
         // Create config that ignores requests
         let config = UpdConfig {
+            exclude: Vec::new(),
             ignore: vec!["requests".to_string()],
             pin: std::collections::HashMap::new(),
             cooldown: None,
@@ -1855,6 +1858,7 @@ requests = "^2.28.0"
         let mut pin = std::collections::HashMap::new();
         pin.insert("requests".to_string(), "2.29.0".to_string());
         let config = UpdConfig {
+            exclude: Vec::new(),
             ignore: Vec::new(),
             pin,
             cooldown: None,
@@ -1903,6 +1907,7 @@ dev = [
         let mut pin = std::collections::HashMap::new();
         pin.insert("requests".to_string(), "2.29.0".to_string());
         let config = UpdConfig {
+            exclude: Vec::new(),
             ignore: Vec::new(),
             pin,
             cooldown: None,
@@ -2012,6 +2017,7 @@ dependencies = [
         let mut pin = std::collections::HashMap::new();
         pin.insert("django".to_string(), "4.2.0".to_string());
         let config = UpdConfig {
+            exclude: Vec::new(),
             ignore: vec!["flask".to_string()],
             pin,
             cooldown: None,
@@ -2068,6 +2074,7 @@ dev = ["pytest>=7.0.0", "black>=23.0.0"]
 
         // Config: ignore pytest
         let config = UpdConfig {
+            exclude: Vec::new(),
             ignore: vec!["pytest".to_string()],
             pin: std::collections::HashMap::new(),
             cooldown: None,
@@ -2119,6 +2126,7 @@ flask = "~2.0.0"
         pin.insert("requests".to_string(), "2.30.0".to_string());
         pin.insert("flask".to_string(), "2.5.0".to_string());
         let config = UpdConfig {
+            exclude: Vec::new(),
             ignore: Vec::new(),
             pin,
             cooldown: None,

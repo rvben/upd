@@ -795,6 +795,7 @@ module "vpc" {{
         let mut pins = std::collections::HashMap::new();
         pins.insert("hashicorp/random".to_string(), "3.6.0".to_string());
         let config = UpdConfig {
+            exclude: Vec::new(),
             ignore: vec!["hashicorp/aws".to_string()],
             pin: pins,
             cooldown: None,

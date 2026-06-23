@@ -596,6 +596,7 @@ mod tests {
         let mut pins = std::collections::HashMap::new();
         pins.insert("devise".to_string(), "4.9.3".to_string());
         let config = UpdConfig {
+            exclude: Vec::new(),
             ignore: vec!["rails".to_string()],
             pin: pins,
             cooldown: None,
