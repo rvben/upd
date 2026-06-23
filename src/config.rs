@@ -351,9 +351,20 @@ exclude = [
             .any(|p| normalize_package_name(p) == target)
     }
 
-    /// Get the pinned version for a package (if any)
+    /// Get the pinned version for a package (if any).
+    ///
+    /// Matching is case-insensitive and PEP 503 separator-normalized, identical
+    /// to `should_ignore`, so a `flask` pin applies to `Flask` in the manifest.
     pub fn get_pinned_version(&self, package: &str) -> Option<&str> {
-        self.pin.get(package).map(|s| s.as_str())
+        // Fast path: exact key hit (the common case).
+        if let Some(v) = self.pin.get(package) {
+            return Some(v.as_str());
+        }
+        let target = normalize_package_name(package);
+        self.pin
+            .iter()
+            .find(|(k, _)| normalize_package_name(k) == target)
+            .map(|(_, v)| v.as_str())
     }
 
     /// Check if any configuration is present
@@ -515,6 +526,26 @@ django = ">=3.2,<4"
         // Distinct names still differ.
         assert!(!config.should_ignore("numpyy"));
         assert!(!config.should_ignore("foobar"));
+    }
+
+    #[test]
+    fn test_get_pinned_version_is_case_insensitive_and_pep503_normalized() {
+        let mut pin = std::collections::HashMap::new();
+        pin.insert("flask".to_string(), "2.3.0".to_string());
+        pin.insert("foo.bar".to_string(), "1.0.0".to_string());
+        let config = UpdConfig {
+            pin,
+            ..Default::default()
+        };
+
+        // Case-insensitive: a `flask` pin must apply to `Flask` in the manifest.
+        assert_eq!(config.get_pinned_version("Flask"), Some("2.3.0"));
+        assert_eq!(config.get_pinned_version("FLASK"), Some("2.3.0"));
+        // PEP 503 separator equivalence, matching `should_ignore`.
+        assert_eq!(config.get_pinned_version("foo_bar"), Some("1.0.0"));
+        assert_eq!(config.get_pinned_version("FOO-BAR"), Some("1.0.0"));
+        // Distinct names still miss.
+        assert_eq!(config.get_pinned_version("flasky"), None);
     }
 
     #[test]
