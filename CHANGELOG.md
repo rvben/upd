@@ -22,6 +22,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 
 
+
+## [0.2.2](https://github.com/rvben/upd/compare/v0.2.1...v0.2.2) - 2026-06-23
+
+### Added
+
+- **align**: honor ignore and exclude config in align ([d856f3b](https://github.com/rvben/upd/commit/d856f3b351d569ba8cba5e368e73fc3bbe08a7f4))
+- **config**: add exclude key and case-insensitive ignore matching ([95d40f5](https://github.com/rvben/upd/commit/95d40f5f5547438625336d90f35c7ecdea55cd62))
+
 ## [0.2.1](https://github.com/rvben/upd/compare/v0.2.0...v0.2.1) - 2026-06-11
 
 ### Fixed
