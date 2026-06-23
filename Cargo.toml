@@ -52,6 +52,7 @@ semver = "1.0.28"
 
 # File handling
 ignore = "0.4.25"
+globset = "0.4.18"
 directories = "6.0.0"
 
 # Error handling

@@ -2024,6 +2024,7 @@ dependencies = [
  "colored",
  "directories",
  "futures",
+ "globset",
  "ignore",
  "jsonschema",
  "pep440_rs",

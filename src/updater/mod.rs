@@ -565,15 +565,21 @@ const ALLOWED_HIDDEN_ENTRIES: &[&str] = &[
 
 /// Knobs for [`discover_files_with`].
 #[derive(Debug, Clone, Copy, Default)]
-pub struct DiscoverOptions {
+pub struct DiscoverOptions<'a> {
     /// When true, ignore `.gitignore`, `.git/info/exclude`, and the global
     /// gitignore — walk every dependency file regardless. Mirrors
     /// `rg --no-ignore`.
     pub no_ignore: bool,
-    /// When true, emit one `skipping <path>: gitignored` line on stderr for
-    /// each dependency file the gitignore rules dropped, so users can see
-    /// why `upd` is silent on a given file.
+    /// When true, emit one `skipping <path>: gitignored` (or `excluded by
+    /// config`) line on stderr for each dependency file discovery dropped, so
+    /// users can see why `upd` is silent on a given file.
     pub verbose: bool,
+    /// Path glob patterns (from config `exclude`) dropped during discovery.
+    ///
+    /// Matched against each discovered dependency file path; a leading `**/`
+    /// makes a pattern depth-independent. Explicit file-path arguments bypass
+    /// this list, mirroring the gitignore bypass for explicit files.
+    pub exclude: &'a [String],
 }
 
 /// Discover dependency files in the given paths, optionally filtered by language.
@@ -588,25 +594,91 @@ pub fn discover_files(paths: &[PathBuf], langs: &[Lang]) -> Vec<(PathBuf, FileTy
     discover_files_with(paths, langs, DiscoverOptions::default())
 }
 
+/// Compile the config `exclude` globs into a matcher.
+///
+/// Returns `None` when there are no usable patterns. Individual invalid
+/// patterns emit a warning on stderr and are skipped so one typo does not
+/// silently disable the rest of the list.
+fn build_exclude_set(patterns: &[String]) -> Option<globset::GlobSet> {
+    if patterns.is_empty() {
+        return None;
+    }
+
+    let mut builder = globset::GlobSetBuilder::new();
+    let mut added = 0;
+    for pattern in patterns {
+        match globset::Glob::new(pattern) {
+            Ok(glob) => {
+                builder.add(glob);
+                added += 1;
+            }
+            Err(e) => eprintln!("warning: invalid exclude pattern '{pattern}': {e}"),
+        }
+    }
+
+    if added == 0 {
+        return None;
+    }
+
+    match builder.build() {
+        Ok(set) => Some(set),
+        Err(e) => {
+            eprintln!("warning: failed to compile exclude patterns: {e}");
+            None
+        }
+    }
+}
+
 /// Discover dependency files with explicit [`DiscoverOptions`].
 pub fn discover_files_with(
     paths: &[PathBuf],
     langs: &[Lang],
-    options: DiscoverOptions,
+    options: DiscoverOptions<'_>,
 ) -> Vec<(PathBuf, FileType)> {
-    let kept = walk_dependency_files(paths, langs, options.no_ignore);
+    let after_gitignore = walk_dependency_files(paths, langs, options.no_ignore);
 
-    // In verbose mode, surface the dependency files gitignore rules dropped so
-    // users can answer "why didn't upd touch X?" without guessing. Skipped when
-    // gitignore is already disabled (nothing to diff against).
-    if options.verbose && !options.no_ignore {
-        let unrestricted = walk_dependency_files(paths, langs, true);
-        let kept_set: std::collections::HashSet<&Path> =
-            kept.iter().map(|(p, _)| p.as_path()).collect();
-        for (path, _) in &unrestricted {
-            if !kept_set.contains(path.as_path()) {
-                eprintln!("skipping {}: gitignored", path.display());
+    // Explicit file-path arguments bypass the exclude list, just as they bypass
+    // gitignore (the directory walker is never consulted for them).
+    let explicit_files: std::collections::HashSet<&Path> = paths
+        .iter()
+        .filter(|p| p.is_file())
+        .map(|p| p.as_path())
+        .collect();
+
+    let exclude_set = build_exclude_set(options.exclude);
+
+    let mut kept: Vec<(PathBuf, FileType)> = Vec::with_capacity(after_gitignore.len());
+    let mut excluded: Vec<PathBuf> = Vec::new();
+    for (path, file_type) in after_gitignore {
+        let dropped = !explicit_files.contains(path.as_path())
+            && exclude_set.as_ref().is_some_and(|set| set.is_match(&path));
+        if dropped {
+            excluded.push(path);
+        } else {
+            kept.push((path, file_type));
+        }
+    }
+
+    // In verbose mode, surface the dependency files discovery dropped so users
+    // can answer "why didn't upd touch X?" without guessing.
+    if options.verbose {
+        // Gitignored files: present without ignore rules but absent after them.
+        // Diff against the pre-exclude set so exclude drops are not mislabeled.
+        if !options.no_ignore {
+            let unrestricted = walk_dependency_files(paths, langs, true);
+            let after_gitignore_set: std::collections::HashSet<&Path> = kept
+                .iter()
+                .map(|(p, _)| p.as_path())
+                .chain(excluded.iter().map(|p| p.as_path()))
+                .collect();
+            for (path, _) in &unrestricted {
+                if !after_gitignore_set.contains(path.as_path()) {
+                    eprintln!("skipping {}: gitignored", path.display());
+                }
             }
+        }
+        for path in &excluded {
+            eprintln!("skipping {}: excluded by config", path.display());
         }
     }
 
@@ -1309,6 +1381,7 @@ mod tests {
             DiscoverOptions {
                 no_ignore: true,
                 verbose: false,
+                exclude: &[],
             },
         );
         let paths: Vec<PathBuf> = unrestricted.iter().map(|(p, _)| p.clone()).collect();
@@ -1365,6 +1438,103 @@ mod tests {
         assert!(paths.contains(&sub.join("Cargo.toml")));
         assert!(paths.contains(&sub.join("package.json")));
         assert!(!paths.contains(&sub.join("secret.toml")));
+    }
+
+    /// `exclude` path globs drop matching files from a directory walk while
+    /// leaving non-matching files untouched.
+    #[test]
+    fn test_discover_files_exclude_drops_matching_paths() {
+        let temp = tempdir().unwrap();
+        let root = temp.path();
+
+        fs::write(root.join("requirements.txt"), "flask").unwrap();
+        let archive = root.join("archive");
+        fs::create_dir_all(&archive).unwrap();
+        fs::write(archive.join("requirements.txt"), "flask").unwrap();
+
+        let patterns = vec!["**/archive/**".to_string()];
+        let files = discover_files_with(
+            &[root.to_path_buf()],
+            &[],
+            DiscoverOptions {
+                no_ignore: false,
+                verbose: false,
+                exclude: &patterns,
+            },
+        );
+        let paths: Vec<PathBuf> = files.iter().map(|(p, _)| p.clone()).collect();
+
+        assert!(
+            paths.contains(&root.join("requirements.txt")),
+            "non-excluded file must remain; got: {paths:?}"
+        );
+        assert!(
+            !paths.contains(&archive.join("requirements.txt")),
+            "file under archive/ must be excluded; got: {paths:?}"
+        );
+    }
+
+    /// An explicit file-path argument bypasses `exclude` even when the glob
+    /// would match it in a directory walk.
+    #[test]
+    fn test_discover_files_explicit_path_bypasses_exclude() {
+        let temp = tempdir().unwrap();
+        let root = temp.path();
+
+        let archive = root.join("archive");
+        fs::create_dir_all(&archive).unwrap();
+        let archived = archive.join("requirements.txt");
+        fs::write(&archived, "flask").unwrap();
+
+        let patterns = vec!["**/archive/**".to_string()];
+        let files = discover_files_with(
+            &[archived.clone()],
+            &[],
+            DiscoverOptions {
+                no_ignore: false,
+                verbose: false,
+                exclude: &patterns,
+            },
+        );
+        let paths: Vec<PathBuf> = files.iter().map(|(p, _)| p.clone()).collect();
+
+        assert_eq!(
+            paths,
+            vec![archived],
+            "explicit file path must bypass exclude; got: {paths:?}"
+        );
+    }
+
+    /// An invalid exclude pattern is skipped (with a warning) rather than
+    /// disabling the whole list; valid patterns still apply.
+    #[test]
+    fn test_discover_files_invalid_exclude_pattern_is_skipped() {
+        let temp = tempdir().unwrap();
+        let root = temp.path();
+
+        fs::write(root.join("requirements.txt"), "flask").unwrap();
+        let archive = root.join("archive");
+        fs::create_dir_all(&archive).unwrap();
+        fs::write(archive.join("requirements.txt"), "flask").unwrap();
+
+        // First pattern is an invalid glob (unclosed class); second is valid.
+        let patterns = vec!["**/[".to_string(), "**/archive/**".to_string()];
+        let files = discover_files_with(
+            &[root.to_path_buf()],
+            &[],
+            DiscoverOptions {
+                no_ignore: false,
+                verbose: false,
+                exclude: &patterns,
+            },
+        );
+        let paths: Vec<PathBuf> = files.iter().map(|(p, _)| p.clone()).collect();
+
+        assert!(paths.contains(&root.join("requirements.txt")));
+        assert!(
+            !paths.contains(&archive.join("requirements.txt")),
+            "valid pattern must still apply when another pattern is invalid; got: {paths:?}"
+        );
     }
 
     /// A whole-directory ignore (`.github/`) must prune the entire subtree,

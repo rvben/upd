@@ -295,6 +295,17 @@ fn log_update_config_usage(resolved: &ResolvedUpdateConfig) {
             format!("  Pinning {} package(s)", resolved.config.pin.len()).dimmed()
         );
     }
+
+    if !resolved.config.exclude.is_empty() {
+        println!(
+            "{}",
+            format!(
+                "  Excluding {} path pattern(s)",
+                resolved.config.exclude.len()
+            )
+            .dimmed()
+        );
+    }
 }
 
 fn discover_update_config(start_dir: &Path) -> Option<ResolvedUpdateConfig> {
@@ -303,6 +314,46 @@ fn discover_update_config(start_dir: &Path) -> Option<ResolvedUpdateConfig> {
         path,
         explicit: false,
     })
+}
+
+/// Resolve the single config that governs discovery-level settings.
+///
+/// Discovery-level settings (the `exclude` path globs, and the `ignore` list
+/// for `align`) describe the whole scan rather than an individual file, so they
+/// are resolved once from a single config: an explicit `--config` when given,
+/// otherwise the nearest config discovered upward from the first scan path.
+/// Falls back to an empty config when none is found.
+fn resolve_root_config(cli: &Cli, paths: &[PathBuf]) -> Result<ResolvedUpdateConfig> {
+    if let Some(config_path) = &cli.config {
+        return Ok(ResolvedUpdateConfig {
+            config: Arc::new(
+                UpdConfig::load_from_path_with_error(config_path).map_err(anyhow::Error::msg)?,
+            ),
+            path: config_path.clone(),
+            explicit: true,
+        });
+    }
+
+    let start_dir = paths
+        .first()
+        .map(|p| {
+            if p.is_dir() {
+                p.clone()
+            } else {
+                p.parent()
+                    .map(Path::to_path_buf)
+                    .unwrap_or_else(|| PathBuf::from("."))
+            }
+        })
+        .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
+
+    Ok(
+        discover_update_config(&start_dir).unwrap_or_else(|| ResolvedUpdateConfig {
+            config: Arc::new(UpdConfig::default()),
+            path: start_dir,
+            explicit: false,
+        }),
+    )
 }
 
 fn load_update_configs(
@@ -665,12 +716,17 @@ async fn run_update(cli: &Cli) -> Result<()> {
     // --check, or --dry-run), the run behaves as dry-run.
     let effective_dry_run = cli.is_effective_dry_run();
 
+    // `exclude` is a discovery-level setting resolved once from the root config;
+    // per-file `ignore`/`pin` are loaded separately by `load_update_configs`.
+    let root_config = resolve_root_config(cli, &paths)?;
+
     let files = discover_files_with(
         &paths,
         &cli.langs,
         DiscoverOptions {
             no_ignore: cli.no_ignore,
             verbose: cli.verbose,
+            exclude: &root_config.config.exclude,
         },
     );
     let file_count = files.len();
@@ -1727,12 +1783,24 @@ async fn run_align(cli: &Cli) -> Result<()> {
         }
     };
 
+    // Resolve config before discovery: `exclude` decides which files to scan
+    // and `ignore` decides which packages to align, so both must be known up
+    // front. Precedence mirrors `update`: explicit `--config` wins, else the
+    // nearest discovered config.
+    let resolved_config = resolve_root_config(cli, &paths)?;
+    let config = Arc::clone(&resolved_config.config);
+
+    if cli.verbose && text_mode {
+        log_update_config_usage(&resolved_config);
+    }
+
     let files = discover_files_with(
         &paths,
         &cli.langs,
         DiscoverOptions {
             no_ignore: cli.no_ignore,
             verbose: cli.verbose,
+            exclude: &config.exclude,
         },
     );
     let file_count = files.len();
@@ -1771,10 +1839,23 @@ async fn run_align(cli: &Cli) -> Result<()> {
     // Find alignments
     let align_result = find_alignments(packages);
 
-    // Filter to only misaligned packages
+    // Surface packages the config ignores so a green `--check` is explainable.
+    // Goes to stderr (like the discovery "skipping <path>" lines) so it never
+    // pollutes JSON on stdout.
+    if cli.verbose {
+        for p in &align_result.packages {
+            if p.has_misalignment() && config.should_ignore(&p.package_name) {
+                eprintln!("skipping {}: ignored by config", p.package_name);
+            }
+        }
+    }
+
+    // Filter to only misaligned packages the config does not ignore. The same
+    // filter is applied to the JSON path so both output modes agree.
     let misaligned: Vec<&PackageAlignment> = align_result
         .packages
         .iter()
+        .filter(|p| !config.should_ignore(&p.package_name))
         .filter(|p| p.has_misalignment())
         .collect();
 
@@ -1782,6 +1863,7 @@ async fn run_align(cli: &Cli) -> Result<()> {
         let to_report: Vec<PackageAlignment> = align_result
             .packages
             .iter()
+            .filter(|p| !config.should_ignore(&p.package_name))
             .filter(|p| p.has_misalignment())
             .cloned()
             .collect();
@@ -1953,12 +2035,16 @@ async fn run_audit(cli: &Cli) -> Result<()> {
             explicit
         }
     };
+    // `exclude` path globs are honored uniformly across subcommands; resolve the
+    // root config so audit drops the same files `update`/`align` would.
+    let root_config = resolve_root_config(cli, &paths)?;
     let files = discover_files_with(
         &paths,
         &cli.langs,
         DiscoverOptions {
             no_ignore: cli.no_ignore,
             verbose: cli.verbose,
+            exclude: &root_config.config.exclude,
         },
     );
     let file_count = files.len();
