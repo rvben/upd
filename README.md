@@ -176,8 +176,7 @@ upd align
 upd align --check  # Exit 1 if misalignments found (for CI)
 
 # Check for security vulnerabilities
-upd audit
-upd audit --check  # Exit 1 if vulnerabilities are found or the audit can't complete (for CI)
+upd audit          # Exit 6 if vulnerabilities are found (for CI)
 
 # Auto-fix vulnerable packages to minimum safe version, then write changes
 upd audit --fix-audit --apply
@@ -325,9 +324,9 @@ upd align --lang python # Align only Python packages
 Check your dependencies for known security vulnerabilities using the [OSV (Open Source Vulnerabilities)](https://osv.dev/) database:
 
 ```bash
-upd audit              # Scan all dependency files
+upd audit              # Scan all dependency files (exit 6 if vulnerabilities found)
 upd audit --dry-run    # Same as audit (read-only operation)
-upd audit --check      # Exit 1 if vulnerabilities are found or the audit can't complete
+upd audit --no-fail    # Report vulnerabilities but exit 0
 upd audit --lang python # Audit only Python packages
 upd audit ./services   # Audit specific directory
 
@@ -373,7 +372,7 @@ Summary: 2 vulnerable package(s), 3 total vulnerability/ies
 ```yaml
 # GitHub Actions example — fail the build on vulnerabilities
 - name: Check for vulnerabilities
-  run: upd audit --check
+  run: upd audit   # non-zero exit (6) fails the build when vulnerabilities are found
 
 # Upload SARIF results to GitHub Code Scanning
 - name: Audit dependencies (SARIF)
@@ -391,11 +390,11 @@ Summary: 2 vulnerable package(s), 3 total vulnerability/ies
 | Constraint | Behavior |
 |------------|----------|
 | `>=2.0,<3` | Updates within 2.x range only |
-| `^2.0.0` | Updates within 2.x range (npm/Cargo) |
-| `~2.0.0` | Updates within 2.0.x range (npm) |
+| `^2.0.0` | Updates within 2.x range (npm/Cargo); never crosses the major bound |
+| `~2.0.0` | Updates within 2.0.x range (npm); `~2.0.0` (Cargo) stays within 2.0.x |
 | `~> 7.1` | Updates within 7.x range (Ruby pessimistic) |
 | `>=2.0` | Updates to any version >= 2.0 |
-| `==2.0.0` | No updates (pinned) |
+| `==2.0.0` | Updates the exact pin to the latest version (e.g. `==2.0.0` → `==3.1.5`). To freeze a package, use `[pin]` or `ignore` in `.updrc.toml`. |
 
 ## Configuration File
 
@@ -734,7 +733,7 @@ Global flags (accepted on every subcommand):
 | `--verbose` | `-v` | Verbose output |
 | `--quiet` | `-q` | Suppress decorative output (errors still shown) |
 | `--interactive` | `-i` | Approve each update individually |
-| `--check` | | Exit 1 if updates/misalignments/vulnerabilities found |
+| `--check` | | Make `align` exit 1 if misalignments are found (`update` and `audit` already exit non-zero; see exit codes) |
 | `--only-bump <major\|minor\|patch>` | | Restrict to exactly these bump levels (repeatable, comma-separated) |
 | `--max-bump <major\|minor\|patch>` | | Include updates up to and including this level |
 | `--package <NAME>` | | Restrict to named packages (repeatable, comma-separated) |
@@ -792,9 +791,15 @@ Stable `audit`-specific flags:
 | Code | Meaning |
 |------|---------|
 | `0` | Success — no action required, or updates applied cleanly |
-| `1` | `--check` flagged pending updates / misalignments / vulnerabilities, or an audit could not complete |
-| `2` | Invalid CLI arguments or unparseable configuration (clap default) |
-| `3` | Vulnerabilities found (`upd audit`). Pass `--no-fail` to force exit 0. |
+| `1` | Pending updates or misalignments found (dry-run / `--check`). Not an error. |
+| `2` | I/O error — a file could not be read/written, or a required path does not exist |
+| `3` | Network error — a registry was unreachable or timed out |
+| `4` | Invalid CLI arguments or an unparseable dependency file / configuration |
+| `6` | Vulnerabilities found (`upd audit`). Pass `--no-fail` to force exit 0. |
+
+> The authoritative exit-code contract is emitted by `upd schema` (`outcomes` and
+> `errors`). A bare `upd` / `upd audit` already signals these codes; `--check` does
+> not change `update`/`audit` exit codes (it gates `align`, which otherwise exits 0).
 
 ### Stable output
 
