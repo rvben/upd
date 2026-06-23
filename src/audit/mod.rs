@@ -438,15 +438,26 @@ impl OsvClient {
         // matching the same position as None would have occupied.
         let severity = Some(resolved.as_severity_string());
 
-        // Extract fixed version from affected ranges
+        // Extract the fixed version from affected ranges. Only version-typed
+        // ranges (ECOSYSTEM/SEMVER, or untyped) qualify: a GIT range's `fixed`
+        // event is a commit SHA, which is not an installable version. As a
+        // belt-and-suspenders, any SHA-shaped value is rejected even if a range
+        // is mislabelled. When no installable fix exists (e.g. a GIT-only
+        // advisory), this resolves to `None`.
         let fixed_version = vuln
             .affected
-            .as_ref()
-            .and_then(|affected| affected.first())
-            .and_then(|a| a.ranges.as_ref())
-            .and_then(|ranges| ranges.first())
-            .and_then(|r| r.events.as_ref())
-            .and_then(|events| events.iter().find_map(|e| e.fixed.clone()));
+            .iter()
+            .flatten()
+            .flat_map(|a| a.ranges.iter().flatten())
+            .filter(|r| match r.range_type.as_deref() {
+                Some(t) => t.eq_ignore_ascii_case("ECOSYSTEM") || t.eq_ignore_ascii_case("SEMVER"),
+                None => true,
+            })
+            .flat_map(|r| r.events.iter().flatten())
+            .find_map(|e| {
+                let fixed = e.fixed.as_deref()?;
+                (!looks_like_git_sha(fixed)).then(|| fixed.to_string())
+            });
 
         // Get reference URL
         let url = vuln
@@ -534,7 +545,17 @@ struct OsvAffected {
 
 #[derive(Debug, Deserialize)]
 struct OsvRange {
+    /// OSV range type: `ECOSYSTEM`, `SEMVER`, or `GIT`. A `GIT` range's `fixed`
+    /// event is a commit SHA, not an installable version.
+    #[serde(rename = "type")]
+    range_type: Option<String>,
     events: Option<Vec<OsvEvent>>,
+}
+
+/// Returns `true` when a string looks like a 40-character Git commit SHA, which
+/// must never be treated as an installable package version.
+fn looks_like_git_sha(s: &str) -> bool {
+    s.len() == 40 && s.chars().all(|c| c.is_ascii_hexdigit())
 }
 
 #[derive(Debug, Deserialize)]
@@ -676,6 +697,117 @@ mod tests {
                 .fixed_version
                 .as_deref(),
             Some("13.0.1")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_fixed_version_prefers_ecosystem_over_git_sha() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/querybatch"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "results": [{ "vulns": [{ "id": "PYSEC-git-test" }] }]
+            })))
+            .mount(&server)
+            .await;
+
+        // OSV record where the GIT range (a commit SHA) is listed first and an
+        // ECOSYSTEM range carries the real fixed version.
+        Mock::given(method("GET"))
+            .and(path("/vulns/PYSEC-git-test"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "PYSEC-git-test",
+                "summary": "test",
+                "affected": [{
+                    "ranges": [
+                        { "type": "GIT", "events": [
+                            { "introduced": "0" },
+                            { "fixed": "c45d7c49ea75133e52ab22a8e9e13173938e36ff" }
+                        ]},
+                        { "type": "ECOSYSTEM", "events": [
+                            { "introduced": "0" },
+                            { "fixed": "2.20.0" }
+                        ]}
+                    ]
+                }],
+                "references": [{ "url": "https://example/git" }]
+            })))
+            .mount(&server)
+            .await;
+
+        let client = OsvClient::with_base_url(server.uri());
+        let audit = client
+            .check_packages(&[Package {
+                name: "requests".into(),
+                version: "2.19.0".into(),
+                ecosystem: Ecosystem::PyPI,
+            }])
+            .await
+            .unwrap();
+
+        assert_eq!(audit.vulnerable.len(), 1);
+        assert_eq!(
+            audit.vulnerable[0].vulnerabilities[0]
+                .fixed_version
+                .as_deref(),
+            Some("2.20.0"),
+            "fixed_version must come from the ECOSYSTEM range, never the GIT commit SHA"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_fixed_version_is_none_when_only_git_range() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/querybatch"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "results": [{ "vulns": [{ "id": "PYSEC-git-only" }] }]
+            })))
+            .mount(&server)
+            .await;
+
+        // OSV record with only a GIT range: there is no installable version fix,
+        // so fixed_version must be None (not a commit SHA).
+        Mock::given(method("GET"))
+            .and(path("/vulns/PYSEC-git-only"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "PYSEC-git-only",
+                "summary": "test",
+                "affected": [{
+                    "ranges": [
+                        { "type": "GIT", "events": [
+                            { "fixed": "644124ecd0b6e417c527191f866daa05a5a2056d" }
+                        ]}
+                    ]
+                }],
+                "references": [{ "url": "https://example/git" }]
+            })))
+            .mount(&server)
+            .await;
+
+        let client = OsvClient::with_base_url(server.uri());
+        let audit = client
+            .check_packages(&[Package {
+                name: "requests".into(),
+                version: "2.19.0".into(),
+                ecosystem: Ecosystem::PyPI,
+            }])
+            .await
+            .unwrap();
+
+        assert_eq!(audit.vulnerable.len(), 1);
+        assert_eq!(
+            audit.vulnerable[0].vulnerabilities[0]
+                .fixed_version
+                .as_deref(),
+            None,
+            "a GIT-only advisory has no installable version fix; must not surface the SHA"
         );
     }
 
