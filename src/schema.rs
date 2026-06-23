@@ -14,7 +14,7 @@ fn build_schema() -> Value {
         "clispec": "0.2",
         "name": "upd",
         "version": env!("CARGO_PKG_VERSION"),
-        "description": "A fast dependency updater for Python, Node.js, Rust, Go, Ruby, .NET, Terraform, GitHub Actions, pre-commit, and Mise projects",
+        "description": "A fast dependency updater for Python, Node.js, Rust, Go, Ruby, .NET, Terraform, GitHub Actions, pre-commit, and Mise/asdf projects",
         "global_args": [
             {
                 "name": "paths",
@@ -59,14 +59,16 @@ fn build_schema() -> Value {
             },
             {
                 "name": "only-bump",
-                "description": "Include only updates whose bump level exactly matches. Repeatable or comma-separated",
-                "type": "string[]"
+                "description": "Include only updates whose bump level exactly matches. Repeatable or comma-separated. Mutually exclusive with --max-bump",
+                "type": "string[]",
+                "enum": ["patch", "minor", "major"]
             },
             {
                 "name": "lang",
                 "short": "l",
                 "description": "Filter by language/ecosystem (repeatable or comma-separated)",
-                "type": "string[]"
+                "type": "string[]",
+                "enum": ["python", "node", "rust", "go", "ruby", "dotnet", "actions", "pre-commit", "mise", "terraform"]
             },
             {
                 "name": "limit",
@@ -191,6 +193,11 @@ fn build_schema() -> Value {
                         "type": "path[]",
                         "required": false
                     }
+                ],
+                "output_fields": [
+                    {"name": "command", "type": "string", "description": "Always \"align\""},
+                    {"name": "packages", "type": "array", "description": "Per-package alignment records (name, highest_version, occurrences with file/line/is_misaligned)"},
+                    {"name": "summary", "type": "object", "description": "Aggregate counts (files_scanned, misaligned_packages, misaligned_occurrences, packages)"}
                 ]
             },
             {
@@ -211,7 +218,7 @@ fn build_schema() -> Value {
                     },
                     {
                         "name": "fix-audit",
-                        "description": "Bump vulnerable packages to the minimum version that clears all known CVEs. Requires --apply to write",
+                        "description": "Bump vulnerable packages to the minimum version that clears all known CVEs. Read-only on its own; combined with --apply this makes `audit` MUTATING (it writes to dependency files), despite the command-level mutating:false default",
                         "type": "boolean"
                     },
                     {
@@ -221,10 +228,11 @@ fn build_schema() -> Value {
                     }
                 ],
                 "output_fields": [
-                    {"name": "items", "type": "array", "description": "List of vulnerable packages"},
-                    {"name": "changed", "type": "boolean", "description": "Whether any files were modified (true only with --fix-audit --apply)"},
-                    {"name": "vulnerabilities", "type": "integer", "description": "Total vulnerability count"},
-                    {"name": "packages_checked", "type": "integer", "description": "Number of packages checked"}
+                    {"name": "command", "type": "string", "description": "Always \"audit\""},
+                    {"name": "status", "type": "string", "description": "\"ok\", \"vulnerable\", or \"incomplete\" (e.g. an offline cache miss)"},
+                    {"name": "vulnerabilities", "type": "array", "description": "Vulnerable packages, each with package, ecosystem, version, and a vulnerabilities list (id, severity, fixed_version, url)"},
+                    {"name": "summary", "type": "object", "description": "Aggregate counts (packages_checked, vulnerabilities, vulnerable_packages, errors)"},
+                    {"name": "errors", "type": "array", "description": "Per-package audit errors (e.g. unreachable registry, offline cache miss)"}
                 ]
             },
             {
@@ -395,6 +403,117 @@ mod tests {
                 .iter()
                 .any(|e| e["kind"].as_str() == Some("conflict")),
             "schema must declare a 'conflict' error kind"
+        );
+    }
+
+    /// Helper: find a command by name.
+    fn find_command<'a>(s: &'a Value, name: &str) -> &'a Value {
+        s["commands"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["name"].as_str() == Some(name))
+            .unwrap_or_else(|| panic!("command '{name}' must exist"))
+    }
+
+    fn find_global_arg<'a>(s: &'a Value, name: &str) -> &'a Value {
+        s["global_args"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|a| a["name"].as_str() == Some(name))
+            .unwrap_or_else(|| panic!("global arg '{name}' must exist"))
+    }
+
+    fn output_field_names(cmd: &Value) -> Vec<String> {
+        cmd["output_fields"]
+            .as_array()
+            .map(|fs| {
+                fs.iter()
+                    .filter_map(|f| f["name"].as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    #[test]
+    fn schema_audit_output_fields_match_actual_json() {
+        // The audit JSON document has top-level keys: command, status, errors,
+        // vulnerabilities (the list), summary. The schema must describe these and
+        // must NOT advertise the non-existent items/changed/packages_checked keys.
+        let s = build_schema();
+        let cmd = find_command(&s, "audit");
+        let names = output_field_names(cmd);
+        for expected in ["command", "status", "vulnerabilities", "summary"] {
+            assert!(
+                names.iter().any(|n| n == expected),
+                "audit output_fields must include '{expected}'; got {names:?}"
+            );
+        }
+        for stale in ["items", "changed", "packages_checked"] {
+            assert!(
+                !names.iter().any(|n| n == stale),
+                "audit output_fields must not advertise the non-existent '{stale}' key; got {names:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn schema_align_has_output_fields() {
+        let s = build_schema();
+        let cmd = find_command(&s, "align");
+        let names = output_field_names(cmd);
+        for expected in ["command", "packages", "summary"] {
+            assert!(
+                names.iter().any(|n| n == expected),
+                "align output_fields must include '{expected}'; got {names:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn schema_lang_arg_enumerates_valid_ecosystems() {
+        let s = build_schema();
+        let arg = find_global_arg(&s, "lang");
+        let values: Vec<String> = arg["enum"]
+            .as_array()
+            .expect("--lang must have an enum of valid ecosystems")
+            .iter()
+            .filter_map(|v| v.as_str().map(str::to_string))
+            .collect();
+        for eco in [
+            "python",
+            "node",
+            "rust",
+            "go",
+            "ruby",
+            "dotnet",
+            "actions",
+            "pre-commit",
+            "mise",
+            "terraform",
+        ] {
+            assert!(
+                values.iter().any(|v| v == eco),
+                "--lang enum must include '{eco}'; got {values:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn schema_only_bump_arg_has_enum() {
+        let s = build_schema();
+        let arg = find_global_arg(&s, "only-bump");
+        let values: Vec<String> = arg["enum"]
+            .as_array()
+            .expect("--only-bump must have an enum")
+            .iter()
+            .filter_map(|v| v.as_str().map(str::to_string))
+            .collect();
+        assert_eq!(
+            values,
+            vec!["patch", "minor", "major"],
+            "--only-bump enum must match --max-bump"
         );
     }
 
