@@ -200,6 +200,47 @@ fn quiet_check_on_empty_workspace_produces_empty_stdout() {
     );
 }
 
+/// `--verbose --format json` must keep stdout as pure JSON.
+///
+/// Verbose diagnostics ("Found N dependency file(s)", "Using authenticated …")
+/// are progress information and belong on stderr; if any leak to stdout they
+/// corrupt the JSON document and break `upd --verbose --format json | jq`.
+#[tokio::test]
+async fn verbose_json_keeps_stdout_pure_json() {
+    use wiremock::matchers::{method, path_regex};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    let html = r#"<!DOCTYPE html><html><body>
+<a href="requests-1.1.0.tar.gz">requests-1.1.0.tar.gz</a>
+</body></html>"#;
+    Mock::given(method("GET"))
+        .and(path_regex(r"^/simple/requests/?$"))
+        .respond_with(ResponseTemplate::new(200).set_body_raw(html.as_bytes(), "text/html"))
+        .mount(&server)
+        .await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    fs::write(tmp.path().join("requirements.txt"), "requests==1.0.0\n").unwrap();
+    let path_str = tmp.path().to_str().unwrap().to_string();
+
+    let (stdout, stderr, _code) = run_with_env(
+        &["--verbose", "--format", "json", "--no-cache", &path_str],
+        tmp.path(),
+        &[("UV_INDEX_URL", &server.uri())],
+    );
+
+    let parsed: Result<serde_json::Value, _> = serde_json::from_str(stdout.trim());
+    assert!(
+        parsed.is_ok(),
+        "stdout must be pure JSON under --verbose --format json; got stdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(
+        !stdout.contains("Found ") && !stdout.contains("Using authenticated"),
+        "verbose progress lines must not appear on stdout; got:\n{stdout}"
+    );
+}
+
 /// A pure-Python scan with --verbose must NOT mention crates.io auth,
 /// even when CARGO_REGISTRY_TOKEN is set.
 ///

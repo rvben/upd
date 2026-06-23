@@ -22,7 +22,7 @@ use upd::registry::{
     NuGetRegistry, PyPiRegistry, RubyGemsRegistry, TerraformRegistry,
 };
 use upd::updater::{
-    CargoTomlUpdater, CsprojUpdater, DiscoverOptions, FileType, GemfileUpdater,
+    BumpFilter, CargoTomlUpdater, CsprojUpdater, DiscoverOptions, FileType, GemfileUpdater,
     GithubActionsUpdater, GoModUpdater, Lang, MiseUpdater, PackageJsonUpdater, PreCommitUpdater,
     PyProjectUpdater, RequirementsUpdater, TerraformUpdater, UpdateOptions, UpdateResult, Updater,
     discover_files_with, read_file_safe, write_file_atomic,
@@ -417,12 +417,14 @@ fn build_update_options(
     packages: &[String],
     cooldown_policy: Option<&CooldownPolicy>,
     cooldown_notes: Arc<Mutex<BTreeSet<String>>>,
+    bump_filter: BumpFilter,
 ) -> UpdateOptions {
     let mut options = UpdateOptions::new(dry_run, full_precision);
     if let Some(config) = config {
         options = options.with_config(config);
     }
     options = options.with_packages(packages.to_vec());
+    options = options.with_bump_filter(bump_filter);
     if let Some(policy) = cooldown_policy {
         options = options.with_cooldown_policy(policy.clone(), Utc::now());
     }
@@ -780,7 +782,7 @@ async fn run_update(cli: &Cli) -> Result<()> {
     let cooldown_notes: Arc<Mutex<BTreeSet<String>>> = Arc::new(Mutex::new(BTreeSet::new()));
 
     if cli.verbose {
-        println!(
+        eprintln!(
             "{}",
             format!("Found {} dependency file(s)", file_count).cyan()
         );
@@ -799,14 +801,14 @@ async fn run_update(cli: &Cli) -> Result<()> {
             PyPiRegistry::detect_index_url().unwrap_or_else(|| "https://pypi.org".to_string());
         let credentials = PyPiRegistry::detect_credentials(&index_url);
         if cli.verbose && credentials.is_some() {
-            println!("{}", "Using authenticated PyPI access".cyan());
+            eprintln!("{}", "Using authenticated PyPI access".cyan());
         }
         let primary = PyPiRegistry::with_index_url_and_credentials(index_url, credentials);
 
         // Check for extra index URLs (UV_EXTRA_INDEX_URL, PIP_EXTRA_INDEX_URL)
         let extra_urls = PyPiRegistry::detect_extra_index_urls();
         if cli.verbose && !extra_urls.is_empty() {
-            println!(
+            eprintln!(
                 "{}",
                 format!("Using {} extra PyPI index(es)", extra_urls.len()).cyan()
             );
@@ -823,7 +825,7 @@ async fn run_update(cli: &Cli) -> Result<()> {
             .unwrap_or_else(|| "https://registry.npmjs.org".to_string());
         let credentials = NpmRegistry::detect_credentials(&registry_url);
         if cli.verbose && credentials.is_some() {
-            println!("{}", "Using authenticated npm access".cyan());
+            eprintln!("{}", "Using authenticated npm access".cyan());
         }
         NpmRegistry::with_registry_url_and_credentials(registry_url, credentials)
     };
@@ -837,7 +839,7 @@ async fn run_update(cli: &Cli) -> Result<()> {
         let credentials = CratesIoRegistry::detect_credentials("crates-io");
         let has_cargo_files = files.iter().any(|(_, ft)| *ft == FileType::CargoToml);
         if cli.verbose && credentials.is_some() && has_cargo_files {
-            println!("{}", "Using authenticated crates.io access".cyan());
+            eprintln!("{}", "Using authenticated crates.io access".cyan());
         }
         CratesIoRegistry::with_registry_url_and_credentials(registry_url, credentials)
     };
@@ -850,7 +852,7 @@ async fn run_update(cli: &Cli) -> Result<()> {
             .unwrap_or_else(|| "https://proxy.golang.org".to_string());
         let credentials = GoProxyRegistry::detect_credentials(&proxy_url);
         if cli.verbose && credentials.is_some() {
-            println!("{}", "Using authenticated Go proxy access".cyan());
+            eprintln!("{}", "Using authenticated Go proxy access".cyan());
         }
         GoProxyRegistry::with_proxy_url_and_credentials(proxy_url, credentials)
     };
@@ -872,7 +874,7 @@ async fn run_update(cli: &Cli) -> Result<()> {
     // Create GitHub releases registry with optional token
     let github_releases_registry = GitHubReleasesRegistry::new();
     if cli.verbose && GitHubReleasesRegistry::detect_token().is_some() {
-        println!("{}", "Using authenticated GitHub access".cyan());
+        eprintln!("{}", "Using authenticated GitHub access".cyan());
     }
     let github_releases =
         CachedRegistry::new(github_releases_registry, Arc::clone(&cache), cache_enabled);
@@ -951,6 +953,7 @@ async fn run_update(cli: &Cli) -> Result<()> {
                     &cli.packages,
                     cooldown_policy,
                     Arc::clone(&cooldown_notes),
+                    filter.to_bump_filter(),
                 ),
             )
         })
@@ -1438,10 +1441,11 @@ async fn run_interactive_update(
             &cli.packages,
             cooldown_policy,
             Arc::clone(&cooldown_notes),
+            filter.to_bump_filter(),
         );
 
         if cli.verbose {
-            println!("{}", format!("Scanning: {}", path.display()).cyan());
+            eprintln!("{}", format!("Scanning: {}", path.display()).cyan());
         }
 
         let result = match file_type {
@@ -1919,10 +1923,12 @@ async fn run_align(cli: &Cli) -> Result<()> {
             "Found".yellow(),
             total_misaligned.to_string().yellow().bold()
         );
+        println!("Run with --apply to write changes.");
     }
 
-    // In check mode, exit with code 1 if any misalignments exist
-    if cli.check && !misaligned.is_empty() {
+    // Dry-run (including --check) signals pending misalignments with exit 1,
+    // the same "changes available" signal `update` uses. Applying exits 0.
+    if dry_run && !misaligned.is_empty() {
         std::process::exit(1);
     }
 
@@ -3423,6 +3429,16 @@ impl UpdateFilter {
             UpdateType::Major => self.major,
             UpdateType::Minor => self.minor,
             UpdateType::Patch => self.patch,
+        }
+    }
+
+    /// Convert to the library-side filter that updaters consult at write time,
+    /// so the bump ceiling gates the actual file writes (not just reporting).
+    fn to_bump_filter(self) -> BumpFilter {
+        BumpFilter {
+            major: self.major,
+            minor: self.minor,
+            patch: self.patch,
         }
     }
 }

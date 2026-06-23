@@ -220,6 +220,87 @@ async fn only_bump_minor_skips_major_update() {
     );
 }
 
+/// `--apply --max-bump minor` must NOT write a major bump to disk. The bump
+/// ceiling is a write-time guard, not merely a reporting filter: a capped-out
+/// update must leave the file byte-for-byte unchanged.
+#[tokio::test]
+async fn apply_max_bump_minor_does_not_write_major() {
+    use wiremock::matchers::{method, path_regex};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+
+    // Advertise version 2.0.0 — a major bump from 1.0.0.
+    let html = r#"<!DOCTYPE html><html><body>
+<a href="requests-2.0.0.tar.gz">requests-2.0.0.tar.gz</a>
+</body></html>"#;
+
+    Mock::given(method("GET"))
+        .and(path_regex(r"^/simple/requests/?$"))
+        .respond_with(ResponseTemplate::new(200).set_body_raw(html.as_bytes(), "text/html"))
+        .mount(&server)
+        .await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let manifest = tmp.path().join("requirements.txt");
+    fs::write(&manifest, "requests==1.0.0\n").unwrap();
+    let path_str = tmp.path().to_str().unwrap().to_string();
+
+    let (_stdout, stderr, code) = run_with_env(
+        &["--apply", "--no-cache", "--max-bump", "minor", &path_str],
+        tmp.path(),
+        &[("UV_INDEX_URL", &server.uri())],
+    );
+
+    let after = fs::read_to_string(&manifest).unwrap();
+    assert_eq!(
+        after, "requests==1.0.0\n",
+        "--apply --max-bump minor must not write the major bump 1.0.0→2.0.0; file was modified to: {after:?}; stderr: {stderr}"
+    );
+    assert_eq!(
+        code, 0,
+        "clean apply (nothing within cap) should exit 0; stderr: {stderr}"
+    );
+}
+
+/// `--apply --max-bump minor` MUST write an in-cap minor bump (guards against
+/// the gate over-filtering and skipping allowed updates).
+#[tokio::test]
+async fn apply_max_bump_minor_writes_minor() {
+    use wiremock::matchers::{method, path_regex};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+
+    // Advertise version 1.1.0 — a minor bump from 1.0.0.
+    let html = r#"<!DOCTYPE html><html><body>
+<a href="requests-1.1.0.tar.gz">requests-1.1.0.tar.gz</a>
+</body></html>"#;
+
+    Mock::given(method("GET"))
+        .and(path_regex(r"^/simple/requests/?$"))
+        .respond_with(ResponseTemplate::new(200).set_body_raw(html.as_bytes(), "text/html"))
+        .mount(&server)
+        .await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let manifest = tmp.path().join("requirements.txt");
+    fs::write(&manifest, "requests==1.0.0\n").unwrap();
+    let path_str = tmp.path().to_str().unwrap().to_string();
+
+    let (_stdout, stderr, _code) = run_with_env(
+        &["--apply", "--no-cache", "--max-bump", "minor", &path_str],
+        tmp.path(),
+        &[("UV_INDEX_URL", &server.uri())],
+    );
+
+    let after = fs::read_to_string(&manifest).unwrap();
+    assert_eq!(
+        after, "requests==1.1.0\n",
+        "--apply --max-bump minor must write the in-cap minor bump 1.0.0→1.1.0; file is: {after:?}; stderr: {stderr}"
+    );
+}
+
 /// `--max-bump patch` must skip both a minor and a major update.
 #[tokio::test]
 async fn max_bump_patch_skips_minor_and_major_updates() {

@@ -79,6 +79,24 @@ fn align_check_flags_all_misalignments_without_config() {
     );
 }
 
+/// Plain `align` (dry-run, no `--check`, no `--apply`) must exit 1 when
+/// misalignments exist - the same "changes available" signal `update` uses -
+/// and must hint at `--apply` so the next step is discoverable.
+#[test]
+fn align_dry_run_exits_1_and_hints_apply() {
+    let tmp = workspace("");
+    let (stdout, _stderr, code) = run(&["align", "--output", "text", "."], tmp.path());
+
+    assert_eq!(
+        code, 1,
+        "misalignments in a plain dry-run must exit 1; got:\n{stdout}"
+    );
+    assert!(
+        stdout.to_lowercase().contains("--apply"),
+        "align dry-run must hint at --apply to write changes; got:\n{stdout}"
+    );
+}
+
 /// `ignore = ["numpy"]` drops numpy from the report but leaves flask flagged,
 /// so `--check` still exits 1.
 #[test]
