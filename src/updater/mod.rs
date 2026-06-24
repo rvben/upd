@@ -65,6 +65,40 @@ pub(crate) fn downgrade_warning(pkg: &str, latest: &str, current: &str) -> Strin
     format!("skipping {pkg}: latest \"{latest}\" is not greater than current \"{current}\"")
 }
 
+/// UTF-8 byte-order mark, as bytes.
+const UTF8_BOM_BYTES: [u8; 3] = [0xEF, 0xBB, 0xBF];
+
+/// Re-apply the original file's byte-level encoding (UTF-8 BOM and dominant line
+/// ending) to rewritten `content`.
+///
+/// In-memory edits canonicalize to LF and drop any BOM; without this a CRLF or
+/// BOM-prefixed manifest would be silently reformatted on `--apply`, producing
+/// noisy diffs on cross-platform repos. New files (no original) are written as-is.
+fn apply_original_encoding(original: Option<&[u8]>, content: &str) -> Vec<u8> {
+    let Some(original) = original else {
+        return content.as_bytes().to_vec();
+    };
+
+    let had_bom = original.starts_with(&UTF8_BOM_BYTES);
+    let uses_crlf = original.windows(2).any(|w| w == b"\r\n");
+
+    // Canonicalize to LF first so re-applying CRLF is idempotent regardless of
+    // what the updater emitted.
+    let normalized = content.replace("\r\n", "\n");
+    let body = if uses_crlf {
+        normalized.replace('\n', "\r\n")
+    } else {
+        normalized
+    };
+
+    let mut out = Vec::with_capacity(body.len() + 3);
+    if had_bom && !body.as_bytes().starts_with(&UTF8_BOM_BYTES) {
+        out.extend_from_slice(&UTF8_BOM_BYTES);
+    }
+    out.extend_from_slice(body.as_bytes());
+    out
+}
+
 /// Write a file atomically (write to temp file, then rename)
 pub fn write_file_atomic(path: &Path, content: &str) -> Result<()> {
     use std::io::Write;
@@ -77,15 +111,18 @@ pub fn write_file_atomic(path: &Path, content: &str) -> Result<()> {
         .unwrap_or_else(|| "temp".to_string());
     let tmp_path = parent.join(format!(".{}.upd.tmp", file_name));
 
-    // Capture the original file's permissions so the atomic rename does not
-    // silently change them. Without this, a read-only (0o444) manifest is
-    // rewritten as 0o644: the rename replaces the inode with the temp file,
-    // which was created with the umask default.
+    // Capture the original file's bytes (to preserve BOM + line endings) and
+    // permissions so the atomic rename does not silently change them. Without
+    // the permission capture, a read-only (0o444) manifest is rewritten as
+    // 0o644: the rename replaces the inode with the temp file, which was
+    // created with the umask default.
+    let original_bytes = std::fs::read(path).ok();
     let original_perms = std::fs::metadata(path).ok().map(|m| m.permissions());
+    let final_bytes = apply_original_encoding(original_bytes.as_deref(), content);
 
     // Write to temporary file
     let mut file = std::fs::File::create(&tmp_path)?;
-    file.write_all(content.as_bytes())?;
+    file.write_all(&final_bytes)?;
     file.sync_all()?;
 
     // Atomically rename to target path
@@ -883,6 +920,40 @@ mod tests {
         assert!(
             !filter.allows("1.0.0", ""),
             "an empty target version must never be writable"
+        );
+    }
+
+    #[test]
+    fn write_file_atomic_preserves_crlf_and_bom() {
+        // Original: UTF-8 BOM + CRLF line endings (a Windows/.NET style file).
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("Cargo.toml");
+        let mut original = vec![0xEF, 0xBB, 0xBF];
+        original.extend_from_slice(b"a = 1\r\nb = 2\r\n");
+        fs::write(&path, &original).unwrap();
+
+        // The in-memory rewrite produces plain LF with no BOM.
+        write_file_atomic(&path, "a = 1\nb = 3\n").unwrap();
+
+        let mut expected = vec![0xEF, 0xBB, 0xBF];
+        expected.extend_from_slice(b"a = 1\r\nb = 3\r\n");
+        assert_eq!(
+            fs::read(&path).unwrap(),
+            expected,
+            "atomic write must preserve the original BOM and CRLF line endings"
+        );
+    }
+
+    #[test]
+    fn write_file_atomic_lf_file_stays_lf_without_bom() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("x.txt");
+        fs::write(&path, b"a\nb\n").unwrap();
+        write_file_atomic(&path, "a\nc\n").unwrap();
+        assert_eq!(
+            fs::read(&path).unwrap(),
+            b"a\nc\n",
+            "an LF file must stay LF with no BOM introduced"
         );
     }
 
