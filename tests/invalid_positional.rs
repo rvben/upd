@@ -140,3 +140,34 @@ fn typo_subcommand_exits_two_with_error() {
         "stderr must name the offending argument; got:\n{stderr}"
     );
 }
+
+/// A near-miss subcommand typo should suggest the closest match.
+#[test]
+fn typo_subcommand_suggests_closest_match() {
+    let tmp = tempfile::tempdir().unwrap();
+
+    let (_o, stderr, code) = run(&["aling"], tmp.path());
+    assert_eq!(code, 2);
+    assert!(
+        stderr.to_lowercase().contains("did you mean") && stderr.contains("align"),
+        "'aling' should suggest 'align'; got:\n{stderr}"
+    );
+
+    let (_o2, stderr2, _c2) = run(&["updat"], tmp.path());
+    assert!(
+        stderr2.to_lowercase().contains("did you mean") && stderr2.contains("update"),
+        "'updat' should suggest 'update'; got:\n{stderr2}"
+    );
+}
+
+/// A positional that is nowhere near a subcommand must NOT get a spurious
+/// suggestion.
+#[test]
+fn unrelated_positional_gets_no_suggestion() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (_o, stderr, _c) = run(&["zzzzzztotallyunrelated"], tmp.path());
+    assert!(
+        !stderr.to_lowercase().contains("did you mean"),
+        "an unrelated token must not get a 'did you mean' hint; got:\n{stderr}"
+    );
+}

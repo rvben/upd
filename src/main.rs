@@ -535,6 +535,43 @@ fn audit_status(audit_result: &AuditResult) -> AuditStatus {
 }
 
 /// Classify an anyhow error into a clispec structured error kind and exit code.
+/// Levenshtein edit distance between two ASCII-ish strings.
+fn levenshtein(a: &str, b: &str) -> usize {
+    let a: Vec<char> = a.chars().collect();
+    let b: Vec<char> = b.chars().collect();
+    let mut prev: Vec<usize> = (0..=b.len()).collect();
+    let mut curr = vec![0usize; b.len() + 1];
+    for (i, ca) in a.iter().enumerate() {
+        curr[0] = i + 1;
+        for (j, cb) in b.iter().enumerate() {
+            let cost = usize::from(ca != cb);
+            curr[j + 1] = (prev[j + 1] + 1).min(curr[j] + 1).min(prev[j] + cost);
+        }
+        std::mem::swap(&mut prev, &mut curr);
+    }
+    prev[b.len()]
+}
+
+/// Suggest the closest known subcommand for a mistyped positional argument,
+/// when one is within a small edit distance (a typo, not an arbitrary word).
+fn suggest_subcommand(input: &str) -> Option<&'static str> {
+    const SUBCOMMANDS: [&str; 6] = [
+        "update",
+        "align",
+        "audit",
+        "clean-cache",
+        "self-update",
+        "schema",
+    ];
+    SUBCOMMANDS
+        .iter()
+        .copied()
+        .map(|cmd| (levenshtein(input, cmd), cmd))
+        .filter(|(dist, _)| *dist <= 2)
+        .min_by_key(|(dist, _)| *dist)
+        .map(|(_, cmd)| cmd)
+}
+
 fn classify_error(e: &anyhow::Error) -> serde_json::Value {
     let msg = e.to_string();
     let (kind, exit_code) = if msg.contains("No such file")
@@ -624,10 +661,11 @@ async fn run() -> Result<()> {
     let invalid: Vec<_> = cli.paths.iter().filter(|p| !p.exists()).collect();
     if !invalid.is_empty() {
         for path in &invalid {
-            let msg = format!(
-                "'{}' is not a known subcommand or existing path",
-                path.display()
-            );
+            let arg = path.display().to_string();
+            let mut msg = format!("'{arg}' is not a known subcommand or existing path");
+            if let Some(suggestion) = suggest_subcommand(&arg) {
+                msg.push_str(&format!(". Did you mean '{suggestion}'?"));
+            }
             eprintln!(
                 "{}",
                 serde_json::json!({"error": {"kind": "io_error", "message": msg, "exit_code": 2}})
