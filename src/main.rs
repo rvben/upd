@@ -308,12 +308,14 @@ fn log_update_config_usage(resolved: &ResolvedUpdateConfig) {
     }
 }
 
-fn discover_update_config(start_dir: &Path) -> Option<ResolvedUpdateConfig> {
-    UpdConfig::discover(start_dir).map(|(config, path)| ResolvedUpdateConfig {
-        config: Arc::new(config),
-        path,
-        explicit: false,
-    })
+fn discover_update_config(start_dir: &Path) -> Result<Option<ResolvedUpdateConfig>, String> {
+    Ok(
+        UpdConfig::discover(start_dir)?.map(|(config, path)| ResolvedUpdateConfig {
+            config: Arc::new(config),
+            path,
+            explicit: false,
+        }),
+    )
 }
 
 /// Resolve the single config that governs discovery-level settings.
@@ -347,13 +349,13 @@ fn resolve_root_config(cli: &Cli, paths: &[PathBuf]) -> Result<ResolvedUpdateCon
         })
         .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
 
-    Ok(
-        discover_update_config(&start_dir).unwrap_or_else(|| ResolvedUpdateConfig {
+    Ok(discover_update_config(&start_dir)
+        .map_err(anyhow::Error::msg)?
+        .unwrap_or_else(|| ResolvedUpdateConfig {
             config: Arc::new(UpdConfig::default()),
             path: start_dir,
             explicit: false,
-        }),
-    )
+        }))
 }
 
 fn load_update_configs(
@@ -391,7 +393,7 @@ fn load_update_configs(
             if let Some(cached) = discovered_by_dir.get(&start_dir) {
                 cached.clone()
             } else {
-                let discovered = discover_update_config(&start_dir);
+                let discovered = discover_update_config(&start_dir).map_err(anyhow::Error::msg)?;
                 discovered_by_dir.insert(start_dir, discovered.clone());
                 discovered
             }
@@ -649,6 +651,8 @@ async fn run() -> Result<()> {
         // Also render the active cooldown policy (if any).
         let cwd = std::env::current_dir()?;
         let (loaded_config, _) = upd::config::UpdConfig::discover(&cwd)
+            .ok()
+            .flatten()
             .unwrap_or_else(|| (upd::config::UpdConfig::default(), cwd.clone()));
         let policy = loaded_config.to_cooldown_policy(cli.min_age.as_deref())?;
         println!();

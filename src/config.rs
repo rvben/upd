@@ -93,24 +93,31 @@ pub struct UpdConfig {
 }
 
 impl UpdConfig {
-    /// Load configuration by searching for config files in the given directory and parents
-    pub fn discover(start_dir: &Path) -> Option<(Self, PathBuf)> {
+    /// Discover the nearest config file, walking up from `start_dir`.
+    ///
+    /// Returns `Ok(None)` when no config file exists. A config file that is
+    /// present but fails to parse is a hard error (`Err`): silently falling back
+    /// to defaults would drop the user's `ignore`/`pin` rules and let unwanted
+    /// updates through.
+    pub fn discover(start_dir: &Path) -> Result<Option<(Self, PathBuf)>, String> {
         let config_names = [".updrc.toml", "upd.toml", ".updrc"];
 
         let mut current = Some(start_dir);
         while let Some(dir) = current {
             for name in &config_names {
                 let config_path = dir.join(name);
-                if config_path.exists()
-                    && let Some(config) = Self::load_from_path(&config_path)
-                {
-                    return Some((config, config_path));
+                if config_path.exists() {
+                    let (config, warnings) = Self::load_with_warnings(&config_path)?;
+                    for w in &warnings {
+                        eprintln!("warning: {w}");
+                    }
+                    return Ok(Some((config, config_path)));
                 }
             }
             current = dir.parent();
         }
 
-        None
+        Ok(None)
     }
 
     /// Load configuration from a specific file path.
@@ -636,7 +643,7 @@ ignore = ["test-pkg"]
 "#;
         fs::write(&config_path, content).unwrap();
 
-        let result = UpdConfig::discover(temp_dir.path());
+        let result = UpdConfig::discover(temp_dir.path()).unwrap();
         assert!(result.is_some());
         let (config, path) = result.unwrap();
         assert_eq!(config.ignore.len(), 1);
@@ -655,7 +662,7 @@ ignore = ["parent-pkg"]
 "#;
         fs::write(&config_path, content).unwrap();
 
-        let result = UpdConfig::discover(&subdir);
+        let result = UpdConfig::discover(&subdir).unwrap();
         assert!(result.is_some());
         let (config, path) = result.unwrap();
         assert_eq!(config.ignore.len(), 1);
@@ -677,7 +684,7 @@ ignore = ["parent-pkg"]
         let child_config = subdir.join(".updrc.toml");
         fs::write(&child_config, "ignore = [\"child-pkg\"]").unwrap();
 
-        let result = UpdConfig::discover(&subdir);
+        let result = UpdConfig::discover(&subdir).unwrap();
         assert!(result.is_some());
         let (config, path) = result.unwrap();
         // Should find the child config, not the parent
@@ -689,7 +696,7 @@ ignore = ["parent-pkg"]
     #[test]
     fn test_discover_no_config() {
         let temp_dir = TempDir::new().unwrap();
-        let result = UpdConfig::discover(temp_dir.path());
+        let result = UpdConfig::discover(temp_dir.path()).unwrap();
         assert!(result.is_none());
     }
 
@@ -777,7 +784,7 @@ ignore = ["alt-config-pkg"]
 "#;
         fs::write(&config_path, content).unwrap();
 
-        let result = UpdConfig::discover(temp_dir.path());
+        let result = UpdConfig::discover(temp_dir.path()).unwrap();
         assert!(result.is_some());
         let (config, _) = result.unwrap();
         assert!(config.should_ignore("alt-config-pkg"));
@@ -793,7 +800,7 @@ ignore = ["no-ext-pkg"]
 "#;
         fs::write(&config_path, content).unwrap();
 
-        let result = UpdConfig::discover(temp_dir.path());
+        let result = UpdConfig::discover(temp_dir.path()).unwrap();
         assert!(result.is_some());
         let (config, _) = result.unwrap();
         assert!(config.should_ignore("no-ext-pkg"));
@@ -820,7 +827,7 @@ flask = "2.0.0"
         fs::write(&config_path, content).unwrap();
 
         // Discover and load config
-        let result = UpdConfig::discover(temp_dir.path());
+        let result = UpdConfig::discover(temp_dir.path()).unwrap();
         assert!(result.is_some());
         let (config, discovered_path) = result.unwrap();
 
@@ -865,7 +872,7 @@ parent-pkg = "1.0.0"
         fs::create_dir(&project_dir).unwrap();
 
         // Discover from subdirectory (should find parent config)
-        let result = UpdConfig::discover(&project_dir);
+        let result = UpdConfig::discover(&project_dir).unwrap();
         assert!(result.is_some());
         let (config, discovered_path) = result.unwrap();
 
