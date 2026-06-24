@@ -35,6 +35,10 @@ fn malformed_autodiscovered_config_hard_fails() {
         stderr.to_lowercase().contains("parse") || stderr.contains("Invalid TOML"),
         "the error must name the config parse failure; stderr: {stderr}"
     );
+    assert!(
+        stderr.contains("\"kind\":\"parse_error\""),
+        "the structured error kind must be parse_error, matching --config; stderr: {stderr}"
+    );
 }
 
 #[test]

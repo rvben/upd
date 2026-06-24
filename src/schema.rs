@@ -286,7 +286,7 @@ fn build_schema() -> Value {
             },
             {
                 "kind": "parse_error",
-                "description": "Failed to parse a dependency file or CLI argument",
+                "description": "Failed to parse a dependency file, a config file (.updrc.toml), or a CLI argument",
                 "exit_code": 4,
                 "retryable": false
             },
