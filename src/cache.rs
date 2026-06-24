@@ -283,6 +283,7 @@ impl<R: Registry> Registry for CachedRegistry<R> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serial_test::serial;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
@@ -488,17 +489,22 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_cache_file_operations() {
         use tempfile::tempdir;
 
         // Capture the current value so we can restore it after the test.
+        // `#[serial]` makes this mutually exclusive with every other env-mutating
+        // test in the crate, so the process-global UPD_CACHE_DIR write below
+        // cannot race under a parallel `cargo test`.
         let original_cache_dir = std::env::var("UPD_CACHE_DIR").ok();
 
         // Use a temp directory for cache
         let temp = tempdir().unwrap();
         let cache_dir = temp.path().join("upd-test-cache");
-        // SAFETY: Single-threaded test (`--test-threads=1`). The original
-        // value is restored unconditionally in the cleanup block below.
+        // SAFETY: `#[serial]` guarantees no other env-touching test runs
+        // concurrently. The original value is restored unconditionally in the
+        // cleanup block below.
         unsafe {
             std::env::set_var("UPD_CACHE_DIR", &cache_dir);
         }
@@ -524,7 +530,7 @@ mod tests {
         assert!(after_clean.pypi.is_empty());
 
         // Restore the environment to the state before this test ran.
-        // SAFETY: Same single-threaded constraint as the set above.
+        // SAFETY: Same `#[serial]` exclusivity as the set above.
         unsafe {
             match original_cache_dir {
                 Some(val) => std::env::set_var("UPD_CACHE_DIR", val),
