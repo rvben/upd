@@ -19,6 +19,13 @@ impl TagVersion {
     /// Build metadata is dropped (per semver, it does not affect identity or ordering).
     pub fn parse(s: &str) -> Option<Self> {
         let s = s.strip_prefix('v').unwrap_or(s);
+        // golang/go tags releases with a `go` prefix (e.g. `go1.21.0`). Strip it
+        // only when a digit follows, so unrelated tags like `gopls` are left to
+        // fail the numeric parse below as before.
+        let s = match s.strip_prefix("go") {
+            Some(rest) if rest.starts_with(|c: char| c.is_ascii_digit()) => rest,
+            _ => s,
+        };
         if s.is_empty() {
             return None;
         }
@@ -161,6 +168,30 @@ mod tests {
         assert!(TagVersion::parse("nightly").is_none());
         assert!(TagVersion::parse("v").is_none());
         assert!(TagVersion::parse("").is_none());
+    }
+
+    #[test]
+    fn parses_go_prefixed_release_tags() {
+        // golang/go tags its releases as `go1.21.0`, `go1.22`, etc.
+        let v = TagVersion::parse("go1.21.0").unwrap();
+        assert_eq!(v.release, vec![1, 21, 0]);
+        assert_eq!(v.prerelease, None);
+        assert_eq!(TagVersion::parse("go1.22").unwrap().release, vec![1, 22]);
+        // Highest go release ranks first.
+        let mut parsed: Vec<_> = ["go1.21.0", "go1.22.4", "go1.20.14"]
+            .iter()
+            .map(|t| TagVersion::parse(t).unwrap())
+            .collect();
+        parsed.sort();
+        parsed.reverse();
+        assert_eq!(parsed[0], TagVersion::parse("go1.22.4").unwrap());
+    }
+
+    #[test]
+    fn go_prefix_strip_does_not_misparse_unrelated_tags() {
+        // A bare "go" or "go"+non-digit must not become a phantom version.
+        assert!(TagVersion::parse("go").is_none());
+        assert!(TagVersion::parse("gopls").is_none());
     }
 
     #[test]
