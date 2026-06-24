@@ -23,6 +23,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 
 
+
+## [0.2.3](https://github.com/rvben/upd/compare/v0.2.2...v0.2.3) - 2026-06-24
+
+### Fixed
+
+- **config**: hard-fail on a malformed config instead of using defaults ([6e892bc](https://github.com/rvben/upd/commit/6e892bc45c70609f7a07f3502b3f329ef13434c0))
+- **go**: warn on a go.mod with no module directive ([c71e3ea](https://github.com/rvben/upd/commit/c71e3ea667144fe7ae5d4cedbf581a97672bffc0))
+- **update**: preserve original BOM and line endings on write ([64a6a99](https://github.com/rvben/upd/commit/64a6a99c603b4049f37fce11beda270dfec7f767))
+- **mise**: resolve golang/go releases by parsing go-prefixed tags ([09f0dc1](https://github.com/rvben/upd/commit/09f0dc1d84a7a696235353749b9aa21dd59584fd))
+- **cli**: suggest the closest subcommand for a mistyped positional ([3a77e96](https://github.com/rvben/upd/commit/3a77e962fe098c0a68c98f4806f39b1a8a107ce7))
+- **cli**: thread bump filter into writes, fix verbose JSON, signal align dry-run ([a53166f](https://github.com/rvben/upd/commit/a53166fa3a0818f56645e3cde71b49cb148182f0))
+- **update**: add write-time bump gate, version bounds, and file safety ([092ccf3](https://github.com/rvben/upd/commit/092ccf366ba18402d498b00c7939f707869899c3))
+- **schema**: correct audit/align output_fields and add arg enums ([543b02b](https://github.com/rvben/upd/commit/543b02bdcb9b78b3f262795403fece1998242d19))
+- **config**: match [pin] package names case-insensitively ([1dd55c7](https://github.com/rvben/upd/commit/1dd55c7cce72b5c6596b0572f3a11f52ea4cb0e6))
+- **audit**: never surface a Git commit SHA as the fixed version ([1e0d580](https://github.com/rvben/upd/commit/1e0d5800b44f102d25e425e23066aeb9234178fa))
+
 ## [0.2.2](https://github.com/rvben/upd/compare/v0.2.1...v0.2.2) - 2026-06-23
 
 ### Added
