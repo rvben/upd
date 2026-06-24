@@ -137,6 +137,24 @@ impl Updater for GoModUpdater {
         let content = read_file_safe(path)?;
         let mut result = UpdateResult::default();
 
+        // A valid go.mod must declare a module path. If a non-empty file has no
+        // `module` directive, it is not a parseable go.mod; warn rather than
+        // silently reporting zero updates (which reads as "all up to date").
+        let has_module_directive = content
+            .lines()
+            .any(|l| l.trim_start().starts_with("module "));
+        let has_meaningful_content = content.lines().any(|l| {
+            let t = l.trim();
+            !t.is_empty() && !t.starts_with("//")
+        });
+        if has_meaningful_content && !has_module_directive {
+            result.warnings.push(format!(
+                "{}: no `module` directive found; not a valid go.mod (skipped)",
+                path.display()
+            ));
+            return Ok(result);
+        }
+
         // Find modules with replace directives (we'll skip these)
         let replaced_modules = self.find_replaced_modules(&content);
 
@@ -614,6 +632,31 @@ replace (
         assert!(!GoModUpdater::is_pseudo_version("v1.0.0-rc1"));
         assert!(!GoModUpdater::is_pseudo_version("v2.0.0+incompatible"));
         assert!(!GoModUpdater::is_pseudo_version("v1.0.0-beta"));
+    }
+
+    #[tokio::test]
+    async fn test_garbage_go_mod_warns_instead_of_silent_accept() {
+        // A file with content but no `module` directive is not a valid go.mod.
+        // It must warn (visible to the user) rather than silently report zero
+        // updates, which reads as "all dependencies up to date".
+        let mut file = NamedTempFile::new().unwrap();
+        writeln!(file, "this is not a valid go.mod file at all {{garbage}}").unwrap();
+
+        let registry = MockRegistry::new("go-proxy");
+        let updater = GoModUpdater::new();
+        let result = updater
+            .update(file.path(), &registry, UpdateOptions::new(true, false))
+            .await
+            .unwrap();
+
+        assert!(
+            !result.warnings.is_empty(),
+            "a go.mod with no module directive must produce a warning"
+        );
+        assert!(
+            result.updated.is_empty(),
+            "no updates should be reported for a malformed go.mod"
+        );
     }
 
     #[tokio::test]
