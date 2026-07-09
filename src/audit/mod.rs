@@ -128,11 +128,37 @@ impl AuditResult {
     }
 }
 
+/// Convert an OSV fixed version into the format the package's manifest expects.
+///
+/// OSV reports Go versions in canonical form without the `v` prefix
+/// (e.g. `1.7.17`), but go.mod require directives need `v1.7.17`. Modules
+/// pinned at a `+incompatible` version stay `+incompatible` after a bump, so
+/// that suffix is carried over from the installed version when the advisory's
+/// fixed version has no build metadata of its own. All other ecosystems use
+/// the OSV string as-is.
+fn manifest_fix_version(package: &Package, fixed: &str) -> String {
+    match package.ecosystem {
+        Ecosystem::Go => {
+            let mut version = if fixed.starts_with('v') {
+                fixed.to_string()
+            } else {
+                format!("v{fixed}")
+            };
+            if package.version.ends_with("+incompatible") && !version.contains('+') {
+                version.push_str("+incompatible");
+            }
+            version
+        }
+        _ => fixed.to_string(),
+    }
+}
+
 /// Compute which packages can be auto-fixed and which cannot.
 ///
 /// Returns two collections:
 /// - `fixable`: a map of `package_name → min_safe_version`. The min safe version
-///   is the maximum `fixed_version` across all vulnerabilities for that package;
+///   is the maximum `fixed_version` across all vulnerabilities for that package,
+///   normalized to the manifest's native format (see [`manifest_fix_version`]);
 ///   upgrading to this version clears every known CVE.
 /// - `unfixable`: a list of `(package_name, reason)` for packages that have at
 ///   least one vulnerability with no `fixed_version`.
@@ -166,7 +192,10 @@ pub fn compute_fix_plan(audit: &AuditResult) -> (HashMap<String, String>, Vec<(S
             .max_by(|a, b| crate::version::compare::compare_versions(a, b));
 
         if let Some(version) = max_fixed {
-            fixable.insert(name.clone(), version.to_string());
+            fixable.insert(
+                name.clone(),
+                manifest_fix_version(&pkg_result.package, version),
+            );
         }
     }
 
@@ -977,6 +1006,117 @@ mod tests {
                 "stable 2.0.0 must beat pre-release 2.0.0-rc1"
             );
         }
+    }
+
+    fn make_go_pkg_result(
+        name: &str,
+        installed: &str,
+        vulns: Vec<Vulnerability>,
+    ) -> PackageAuditResult {
+        PackageAuditResult {
+            package: Package {
+                name: name.to_string(),
+                version: installed.to_string(),
+                ecosystem: Ecosystem::Go,
+            },
+            vulnerabilities: vulns,
+        }
+    }
+
+    #[test]
+    fn fix_plan_go_fixed_version_gets_v_prefix() {
+        // OSV reports Go fixed versions in canonical form without the `v`
+        // prefix (e.g. "1.7.17"), but go.mod require directives need "v1.7.17".
+        // Writing the bare form corrupts go.mod.
+        let audit = AuditResult {
+            vulnerable: vec![make_go_pkg_result(
+                "github.com/yuin/goldmark",
+                "v1.7.13",
+                vec![make_vuln("GO-2026-5320", Some("1.7.17"))],
+            )],
+            safe_count: 0,
+            errors: vec![],
+        };
+        let (fixable, unfixable) = compute_fix_plan(&audit);
+        assert!(unfixable.is_empty());
+        assert_eq!(
+            fixable.get("github.com/yuin/goldmark").map(|s| s.as_str()),
+            Some("v1.7.17"),
+            "Go fix versions must carry the v prefix required by go.mod"
+        );
+    }
+
+    #[test]
+    fn fix_plan_go_keeps_existing_v_prefix() {
+        // Defensive: if an advisory already carries the `v`, don't double it.
+        let audit = AuditResult {
+            vulnerable: vec![make_go_pkg_result(
+                "github.com/foo/bar",
+                "v1.0.0",
+                vec![make_vuln("GO-X", Some("v1.2.0"))],
+            )],
+            safe_count: 0,
+            errors: vec![],
+        };
+        let (fixable, _) = compute_fix_plan(&audit);
+        assert_eq!(
+            fixable.get("github.com/foo/bar").map(|s| s.as_str()),
+            Some("v1.2.0")
+        );
+    }
+
+    #[test]
+    fn fix_plan_go_carries_incompatible_suffix_from_installed_version() {
+        // A module pinned at v2+ without a go.mod stays `+incompatible` after
+        // the bump; go.mod rejects the bare form for such modules.
+        let audit = AuditResult {
+            vulnerable: vec![make_go_pkg_result(
+                "github.com/legacy/mod",
+                "v2.0.0+incompatible",
+                vec![make_vuln("GO-Y", Some("2.0.1"))],
+            )],
+            safe_count: 0,
+            errors: vec![],
+        };
+        let (fixable, _) = compute_fix_plan(&audit);
+        assert_eq!(
+            fixable.get("github.com/legacy/mod").map(|s| s.as_str()),
+            Some("v2.0.1+incompatible")
+        );
+    }
+
+    #[test]
+    fn fix_plan_go_does_not_double_incompatible_suffix() {
+        // Some advisories already include `+incompatible` in the fixed version.
+        let audit = AuditResult {
+            vulnerable: vec![make_go_pkg_result(
+                "github.com/legacy/mod",
+                "v2.0.0+incompatible",
+                vec![make_vuln("GO-Z", Some("2.0.1+incompatible"))],
+            )],
+            safe_count: 0,
+            errors: vec![],
+        };
+        let (fixable, _) = compute_fix_plan(&audit);
+        assert_eq!(
+            fixable.get("github.com/legacy/mod").map(|s| s.as_str()),
+            Some("v2.0.1+incompatible")
+        );
+    }
+
+    #[test]
+    fn fix_plan_non_go_versions_pass_through_unchanged() {
+        // The v prefix is a Go-ism; PyPI/npm/crates versions must not gain one.
+        let audit = AuditResult {
+            vulnerable: vec![make_pkg_result(
+                "requests",
+                vec![make_vuln("CVE-1", Some("2.28.0"))],
+            )],
+            safe_count: 0,
+            errors: vec![],
+        };
+        let (fixable, _) = compute_fix_plan(&audit);
+        assert_eq!(fixable.get("requests").map(|s| s.as_str()), Some("2.28.0"));
     }
 
     #[test]

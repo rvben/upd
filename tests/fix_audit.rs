@@ -7,6 +7,8 @@
 //!   unchanged; falls through to the normal audit exit code (3 for unfixed vulns).
 //! - `--fix-audit --no-fail` exits 0 even when pending fixes exist in dry-run mode.
 //! - An already-clean audit (no vulnerabilities) with `--fix-audit` exits 0.
+//! - Go fixes keep the `v` prefix go.mod requires, even though OSV reports Go
+//!   versions without it.
 
 use std::fs;
 use std::process::Command;
@@ -94,6 +96,73 @@ async fn fix_audit_apply_rewrites_vulnerable_package() {
     assert!(
         stdout.contains("Fixed") || stdout.contains("fix"),
         "output should mention the fix; stdout: {stdout}"
+    );
+}
+
+/// Go module fix: OSV reports the fixed version without the `v` prefix
+/// ("1.7.17"), but go.mod require directives need "v1.7.17". The applied fix
+/// must keep the prefix or the file no longer parses.
+#[tokio::test]
+async fn fix_audit_apply_go_mod_keeps_v_prefix() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .and(path("/querybatch"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "results": [{ "vulns": [{ "id": "GO-2026-5320" }] }]
+        })))
+        .mount(&server)
+        .await;
+
+    // Mirrors a real Go vulndb OSV entry: SEMVER range, fixed version in
+    // canonical Go form without the `v` prefix.
+    Mock::given(method("GET"))
+        .and(path("/vulns/GO-2026-5320"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "id": "GO-2026-5320",
+            "summary": "XSS in goldmark",
+            "database_specific": { "severity": "MODERATE" },
+            "affected": [{
+                "ranges": [{
+                    "type": "SEMVER",
+                    "events": [{ "introduced": "0" }, { "fixed": "1.7.17" }]
+                }]
+            }],
+            "references": [{ "url": "https://example.com/go-2026-5320" }]
+        })))
+        .mount(&server)
+        .await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let mod_path = tmp.path().join("go.mod");
+    fs::write(
+        &mod_path,
+        "module example.com/test\n\ngo 1.25\n\nrequire github.com/yuin/goldmark v1.7.13 // indirect\n",
+    )
+    .unwrap();
+
+    let (stdout, stderr, code) = run_with_env(
+        &["audit", "--fix-audit", "--apply", "--no-cache"],
+        tmp.path(),
+        &[("OSV_API_URL", &server.uri())],
+    );
+
+    assert_eq!(
+        code, 0,
+        "--fix-audit --apply should exit 0 on success; stdout: {stdout}\nstderr: {stderr}"
+    );
+
+    let content = fs::read_to_string(&mod_path).unwrap();
+    assert!(
+        content.contains("github.com/yuin/goldmark v1.7.17 // indirect"),
+        "go.mod must keep the v prefix on the fixed version; got: {content}"
+    );
+    assert!(
+        !content.contains("goldmark 1.7.17"),
+        "go.mod must not contain a bare version without the v prefix; got: {content}"
     );
 }
 
