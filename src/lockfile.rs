@@ -337,11 +337,8 @@ pub(crate) fn regenerate_lockfile(
     };
 
     if output.status.success() {
-        println!(
-            "{} Regenerated {}",
-            "✓".green(),
-            lockfile_type.filename().bold()
-        );
+        // Success reporting is the caller's job: this module cannot know
+        // whether stdout is a JSON report that stray text would corrupt.
         RegenOutcome::Ok(lockfile_type)
     } else {
         let stderr = String::from_utf8_lossy(&output.stderr);

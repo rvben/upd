@@ -144,11 +144,12 @@ pub struct Cli {
     #[arg(long, global = true)]
     pub check: bool,
 
-    /// Regenerate lockfiles after updating.
+    /// Regenerate lockfiles after updating or fixing.
     ///
     /// Runs the narrowest per-ecosystem refresh command that updates only the
     /// packages `upd` just rewrote (e.g. `cargo update -p <pkg>`,
     /// `bundle lock --update <pkg>`, `npm install --package-lock-only`).
+    /// Honored by `update` and `audit --fix-audit --apply`.
     #[arg(long, global = true)]
     pub lock: bool,
 

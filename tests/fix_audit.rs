@@ -9,6 +9,7 @@
 //! - An already-clean audit (no vulnerabilities) with `--fix-audit` exits 0.
 //! - Go fixes keep the `v` prefix go.mod requires, even though OSV reports Go
 //!   versions without it.
+//! - `--lock` regenerates lockfiles for manifests changed by `--fix-audit --apply`.
 
 use std::fs;
 use std::process::Command;
@@ -163,6 +164,176 @@ async fn fix_audit_apply_go_mod_keeps_v_prefix() {
     assert!(
         !content.contains("goldmark 1.7.17"),
         "go.mod must not contain a bare version without the v prefix; got: {content}"
+    );
+}
+
+/// `--lock` with `--fix-audit --apply` regenerates the lockfile of each
+/// manifest that received a fix, exactly like the update path does.
+///
+/// A fake `go` binary is prepended to PATH so the test observes the actual
+/// `go mod tidy` invocation without requiring network access.
+#[cfg(unix)]
+#[tokio::test]
+async fn fix_audit_apply_lock_regenerates_go_sum() {
+    use std::os::unix::fs::PermissionsExt;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .and(path("/querybatch"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "results": [{ "vulns": [{ "id": "GO-lock-001" }] }]
+        })))
+        .mount(&server)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/vulns/GO-lock-001"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "id": "GO-lock-001",
+            "summary": "test vulnerability",
+            "database_specific": { "severity": "HIGH" },
+            "affected": [{
+                "ranges": [{
+                    "type": "SEMVER",
+                    "events": [{ "introduced": "0" }, { "fixed": "1.7.17" }]
+                }]
+            }],
+            "references": [{ "url": "https://example.com/go-lock-001" }]
+        })))
+        .mount(&server)
+        .await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    fs::write(
+        tmp.path().join("go.mod"),
+        "module example.com/test\n\ngo 1.25\n\nrequire github.com/yuin/goldmark v1.7.13\n",
+    )
+    .unwrap();
+    // go.sum must exist for lockfile detection to consider it.
+    fs::write(tmp.path().join("go.sum"), "").unwrap();
+
+    // Fake `go` binary: records `mod tidy` invocations, answers `--version`.
+    let bin_dir = tmp.path().join("fakebin");
+    fs::create_dir(&bin_dir).unwrap();
+    let marker = tmp.path().join("go-invoked.txt");
+    let fake_go = bin_dir.join("go");
+    fs::write(
+        &fake_go,
+        format!(
+            "#!/bin/sh\nif [ \"$1\" = \"mod\" ]; then echo \"$@\" >> {} ; fi\nexit 0\n",
+            marker.display()
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&fake_go, fs::Permissions::from_mode(0o755)).unwrap();
+
+    let path_env = format!(
+        "{}:{}",
+        bin_dir.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+
+    let (stdout, stderr, code) = run_with_env(
+        &["audit", "--fix-audit", "--apply", "--lock", "--no-cache"],
+        tmp.path(),
+        &[("OSV_API_URL", &server.uri()), ("PATH", &path_env)],
+    );
+
+    assert_eq!(
+        code, 0,
+        "--fix-audit --apply --lock should exit 0 on success; stdout: {stdout}\nstderr: {stderr}"
+    );
+
+    let invocations = fs::read_to_string(&marker).unwrap_or_default();
+    assert!(
+        invocations.contains("mod tidy"),
+        "--lock must run `go mod tidy` after applying the fix; fake go saw: {invocations:?}\nstdout: {stdout}\nstderr: {stderr}"
+    );
+
+    // Piped stdout means JSON mode: the report must stay a single valid JSON
+    // document; regen progress must not leak into it.
+    serde_json::from_str::<serde_json::Value>(&stdout)
+        .unwrap_or_else(|e| panic!("stdout must be valid JSON with --lock: {e}\nstdout: {stdout}"));
+}
+
+/// `--lock` in fix-audit dry-run mode must NOT touch lockfiles: nothing was
+/// written, so there is nothing to regenerate.
+#[cfg(unix)]
+#[tokio::test]
+async fn fix_audit_dry_run_lock_does_not_regenerate() {
+    use std::os::unix::fs::PermissionsExt;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .and(path("/querybatch"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "results": [{ "vulns": [{ "id": "GO-lock-002" }] }]
+        })))
+        .mount(&server)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/vulns/GO-lock-002"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "id": "GO-lock-002",
+            "summary": "test vulnerability",
+            "database_specific": { "severity": "HIGH" },
+            "affected": [{
+                "ranges": [{
+                    "type": "SEMVER",
+                    "events": [{ "introduced": "0" }, { "fixed": "1.7.17" }]
+                }]
+            }],
+            "references": [{ "url": "https://example.com/go-lock-002" }]
+        })))
+        .mount(&server)
+        .await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    fs::write(
+        tmp.path().join("go.mod"),
+        "module example.com/test\n\ngo 1.25\n\nrequire github.com/yuin/goldmark v1.7.13\n",
+    )
+    .unwrap();
+    fs::write(tmp.path().join("go.sum"), "").unwrap();
+
+    let bin_dir = tmp.path().join("fakebin");
+    fs::create_dir(&bin_dir).unwrap();
+    let marker = tmp.path().join("go-invoked.txt");
+    let fake_go = bin_dir.join("go");
+    fs::write(
+        &fake_go,
+        format!(
+            "#!/bin/sh\nif [ \"$1\" = \"mod\" ]; then echo \"$@\" >> {} ; fi\nexit 0\n",
+            marker.display()
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&fake_go, fs::Permissions::from_mode(0o755)).unwrap();
+
+    let path_env = format!(
+        "{}:{}",
+        bin_dir.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+
+    let (_stdout, _stderr, code) = run_with_env(
+        &["audit", "--fix-audit", "--lock", "--no-cache"],
+        tmp.path(),
+        &[("OSV_API_URL", &server.uri()), ("PATH", &path_env)],
+    );
+
+    assert_eq!(code, 1, "dry-run with pending fixes should exit 1");
+    assert!(
+        !marker.exists(),
+        "dry-run must not regenerate lockfiles; fake go saw: {:?}",
+        fs::read_to_string(&marker).unwrap_or_default()
     );
 }
 

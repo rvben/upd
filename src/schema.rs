@@ -110,7 +110,7 @@ fn build_schema() -> Value {
             },
             {
                 "name": "lock",
-                "description": "Regenerate lockfiles after updating",
+                "description": "Regenerate lockfiles after applying changes. Honored by update and by audit --fix-audit --apply",
                 "type": "boolean"
             },
             {
@@ -218,7 +218,7 @@ fn build_schema() -> Value {
                     },
                     {
                         "name": "fix-audit",
-                        "description": "Bump vulnerable packages to the minimum version that clears all known CVEs. Read-only on its own; combined with --apply this makes `audit` MUTATING (it writes to dependency files), despite the command-level mutating:false default",
+                        "description": "Bump vulnerable packages to the minimum version that clears all known CVEs. Read-only on its own; combined with --apply this makes `audit` MUTATING (it writes to dependency files), despite the command-level mutating:false default. Add --lock to also regenerate the lockfiles of fixed manifests",
                         "type": "boolean"
                     },
                     {

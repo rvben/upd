@@ -16,7 +16,7 @@ use upd::cli::{BumpLevel, Cli, Command, OutputMode, REVERT_TIP};
 use upd::config::UpdConfig;
 use upd::cooldown::CooldownPolicy;
 use upd::interactive::{PendingUpdate, prompt_all};
-use upd::lockfile::{LockfileRegenResult, regenerate_lockfiles};
+use upd::lockfile::{LockfileRegenResult, RegenOutcome, regenerate_lockfiles};
 use upd::registry::{
     CratesIoRegistry, GitHubReleasesRegistry, GoProxyRegistry, MultiPyPiRegistry, NpmRegistry,
     NuGetRegistry, PyPiRegistry, RubyGemsRegistry, TerraformRegistry,
@@ -1213,9 +1213,18 @@ async fn run_update(cli: &Cli) -> Result<()> {
                 continue;
             }
             for outcome in result.outcomes {
-                if let Some(msg) = outcome.error_message() {
-                    eprintln!("{}", format!("error: {msg}").red());
-                    total_result.errors.push(msg);
+                match outcome {
+                    RegenOutcome::Ok(lockfile) => {
+                        if text_mode && !cli.quiet {
+                            println!("{} Regenerated {}", "✓".green(), lockfile.filename().bold());
+                        }
+                    }
+                    other => {
+                        if let Some(msg) = other.error_message() {
+                            eprintln!("{}", format!("error: {msg}").red());
+                            total_result.errors.push(msg);
+                        }
+                    }
                 }
             }
         }
@@ -1765,10 +1774,19 @@ async fn run_interactive_update(
                 continue;
             }
             for outcome in result.outcomes {
-                if let Some(msg) = outcome.error_message() {
-                    eprintln!("{}", format!("error: {msg}").red());
-                    had_error = true;
-                    error_messages.push(msg);
+                match outcome {
+                    RegenOutcome::Ok(lockfile) => {
+                        if !cli.quiet {
+                            println!("{} Regenerated {}", "✓".green(), lockfile.filename().bold());
+                        }
+                    }
+                    other => {
+                        if let Some(msg) = other.error_message() {
+                            eprintln!("{}", format!("error: {msg}").red());
+                            had_error = true;
+                            error_messages.push(msg);
+                        }
+                    }
                 }
             }
         }
@@ -2322,6 +2340,9 @@ async fn run_audit(cli: &Cli) -> Result<()> {
 
             let mut total_fixed: usize = 0;
             let mut fix_errors: Vec<String> = Vec::new();
+            // Manifests that were actually rewritten, with the packages that
+            // changed in each, so --lock can issue targeted regen commands.
+            let mut fixed_manifests: Vec<(PathBuf, Vec<String>)> = Vec::new();
 
             for (path, (file_type, edits)) in &edits_by_file {
                 if text_mode && !cli.quiet {
@@ -2382,6 +2403,13 @@ async fn run_audit(cli: &Cli) -> Result<()> {
                                             fix_errors.push(msg);
                                         } else {
                                             total_fixed += applied.applied_count();
+                                            let mut changed: Vec<String> = Vec::new();
+                                            for (name, _, _, _) in edits {
+                                                if !changed.iter().any(|n| n == name) {
+                                                    changed.push(name.clone());
+                                                }
+                                            }
+                                            fixed_manifests.push((path.clone(), changed));
                                         }
                                     }
                                 }
@@ -2404,6 +2432,57 @@ async fn run_audit(cli: &Cli) -> Result<()> {
                     }
                 } else {
                     total_fixed += edits.len();
+                }
+            }
+
+            // Regenerate lockfiles for manifests that received a fix. Dry-run
+            // writes nothing, so there is nothing to regenerate.
+            if cli.lock && !effective_dry_run && !fixed_manifests.is_empty() {
+                let regen_results: Vec<(PathBuf, LockfileRegenResult)> = fixed_manifests
+                    .iter()
+                    .map(|(path, changed)| {
+                        let result = regenerate_lockfiles(path, changed, cli.verbose && text_mode);
+                        (path.clone(), result)
+                    })
+                    .collect();
+
+                let has_work = regen_results.iter().any(|(_, r)| !r.no_lockfiles);
+                if text_mode && has_work && !cli.quiet {
+                    println!();
+                    println!("{}", "Regenerating lockfiles...".cyan());
+                }
+
+                for (path, result) in regen_results {
+                    if result.no_lockfiles {
+                        let manifest_name = path
+                            .file_name()
+                            .map(|n| n.to_string_lossy().into_owned())
+                            .unwrap_or_default();
+                        eprintln!(
+                            "note: no lockfile found for {} - skipping (nothing to regenerate)",
+                            manifest_name
+                        );
+                        continue;
+                    }
+                    for outcome in result.outcomes {
+                        match outcome {
+                            RegenOutcome::Ok(lockfile) => {
+                                if text_mode && !cli.quiet {
+                                    println!(
+                                        "{} Regenerated {}",
+                                        "✓".green(),
+                                        lockfile.filename().bold()
+                                    );
+                                }
+                            }
+                            other => {
+                                if let Some(msg) = other.error_message() {
+                                    eprintln!("{}", format!("error: {msg}").red());
+                                    fix_errors.push(msg);
+                                }
+                            }
+                        }
+                    }
                 }
             }
 

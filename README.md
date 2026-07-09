@@ -335,6 +335,9 @@ upd audit ./services   # Audit specific directory
 # no fixed_version are reported but left untouched.
 upd audit --fix-audit --apply
 
+# Auto-fix and refresh the affected lockfiles (e.g. go.sum, Cargo.lock)
+upd audit --fix-audit --apply --lock
+
 # Offline mode: use only cached OSV responses; cache misses are errors
 upd audit --offline
 
@@ -742,7 +745,7 @@ Global flags (accepted on every subcommand):
 | `--no-cache` | | Disable version cache |
 | `--no-color` | | Disable colored output |
 | `--no-ignore` | | Disable `.gitignore` filtering during discovery |
-| `--lock` | | Regenerate lockfiles after updates |
+| `--lock` | | Regenerate lockfiles after updates or security fixes |
 | `--config <FILE>` | `-c` | Use a specific config file |
 | `--show-config` | | Print effective configuration and exit |
 | `--format <text\|json\|sarif>` | | Output format (`sarif` applies to `audit`) |
@@ -757,7 +760,8 @@ Subcommands: `update` (default), `align`, `audit`, `clean-cache`, `self-update`.
 updates only the packages `upd` just rewrote. Targeted forms are used
 wherever the package manager supports them; targeting falls back to
 `--lockfile-only` flags where no per-package form exists; otherwise
-the manifest-wide refresh command is used.
+the manifest-wide refresh command is used. The flag is honored by
+`update` (including `--interactive`) and by `audit --fix-audit --apply`.
 
 | Ecosystem | Lockfile                 | Command                                        |
 |-----------|--------------------------|------------------------------------------------|
