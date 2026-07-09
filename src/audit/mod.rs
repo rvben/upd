@@ -1755,6 +1755,25 @@ mod tests {
     }
 
     #[test]
+    fn fixed_version_reset_after_last_affected_blocks_stale_window() {
+        // The 1.x branch closes unfixed via last_affected; the fixed event
+        // that follows belongs to a new window with no introduced event, so
+        // it must not be attributed to the queried version stuck in the
+        // already-closed 1.x branch.
+        let affected = vec![affected_for(
+            "mypkg",
+            "PyPI",
+            vec![range(vec![
+                introduced("1.0.0"),
+                last_affected("1.9.9"),
+                fixed("9.9.9"),
+            ])],
+        )];
+        let got = fixed_version_for(&affected, &pypi_pkg("mypkg", "1.5.0"));
+        assert_eq!(got, None);
+    }
+
+    #[test]
     fn fixed_version_matches_pypi_names_pep503_normalized() {
         let affected = vec![affected_for(
             "typing-extensions",
