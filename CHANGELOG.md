@@ -24,6 +24,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 
 
+
+## [0.2.4](https://github.com/rvben/upd/compare/v0.2.3...v0.2.4) - 2026-07-09
+
+### Added
+
+- **audit**: honor --lock in audit --fix-audit --apply ([cd48a6e](https://github.com/rvben/upd/commit/cd48a6eba70aac563eef2e2d93180e0c77ab65ec))
+
+### Fixed
+
+- **audit**: keep the v prefix when writing Go fix versions to go.mod ([607ddc1](https://github.com/rvben/upd/commit/607ddc14dd48ed7418294f6b4e7a5a2041379fa6))
+
 ## [0.2.3](https://github.com/rvben/upd/compare/v0.2.2...v0.2.3) - 2026-06-24
 
 ### Fixed
