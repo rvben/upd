@@ -15,6 +15,11 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const CACHE_TTL_HOURS: u64 = 24;
 
+/// Bump when the entry shape or key normalization changes. Entries written
+/// under another schema version are treated as expired and refetched once -
+/// v2 added Vulnerability aliases/source and PEP 503-normalized PyPI keys.
+const AUDIT_CACHE_SCHEMA_VERSION: u32 = 2;
+
 /// Composite key that uniquely identifies a package version within an ecosystem.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct AuditKey {
@@ -25,9 +30,14 @@ pub struct AuditKey {
 
 impl AuditKey {
     pub fn new(ecosystem: &str, name: &str, version: &str) -> Self {
+        let name = if ecosystem == "PyPI" {
+            crate::normalize::pep503_normalize(name)
+        } else {
+            name.to_string()
+        };
         Self {
             ecosystem: ecosystem.to_string(),
-            name: name.to_string(),
+            name,
             version: version.to_string(),
         }
     }
@@ -40,6 +50,10 @@ pub struct AuditCacheEntry {
     pub vulnerabilities: Vec<Vulnerability>,
     /// Unix timestamp (seconds) when this entry was fetched from OSV.
     pub fetched_at: u64,
+    /// Schema version this entry was written under; pre-v2 entries
+    /// deserialize as 0 via the serde default and read as misses.
+    #[serde(default)]
+    pub schema_version: u32,
 }
 
 /// On-disk audit cache. Keyed by `ecosystem::name::version` string to remain
@@ -91,7 +105,9 @@ impl AuditCache {
     pub fn get(&self, key: &AuditKey) -> Option<&AuditCacheEntry> {
         let k = Self::map_key(key);
         self.entries.get(&k).and_then(|entry| {
-            if Self::is_expired(entry.fetched_at) {
+            if Self::is_expired(entry.fetched_at)
+                || entry.schema_version != AUDIT_CACHE_SCHEMA_VERSION
+            {
                 None
             } else {
                 Some(entry)
@@ -110,6 +126,7 @@ impl AuditCache {
             AuditCacheEntry {
                 vulnerabilities,
                 fetched_at,
+                schema_version: AUDIT_CACHE_SCHEMA_VERSION,
             },
         );
     }
@@ -229,6 +246,7 @@ mod tests {
             AuditCacheEntry {
                 vulnerabilities: vec![make_vuln("CVE-OLD")],
                 fetched_at: expired_timestamp(),
+                schema_version: AUDIT_CACHE_SCHEMA_VERSION,
             },
         );
         assert!(
@@ -256,6 +274,41 @@ mod tests {
 
         let entry = cache.get(&key).expect("safe entry should be present");
         assert!(entry.vulnerabilities.is_empty());
+    }
+
+    #[test]
+    fn legacy_entry_without_schema_version_is_a_miss() {
+        // Pre-v2 on-disk entries lack schema_version; they must be treated as
+        // expired (refetched once), because their PyPI keys are unnormalized
+        // and their Vulnerability records lack aliases/source.
+        let mut cache = AuditCache::default();
+        cache.entries.insert(
+            "PyPI::requests::2.31.0".to_string(),
+            AuditCacheEntry {
+                vulnerabilities: vec![make_vuln("CVE-OLD")],
+                fetched_at: fresh_timestamp(),
+                schema_version: 0,
+            },
+        );
+        let key = AuditKey::new("PyPI", "requests", "2.31.0");
+        assert!(cache.get(&key).is_none(), "legacy entry must be a miss");
+    }
+
+    #[test]
+    fn pypi_key_spelling_variants_share_one_entry() {
+        let mut cache = AuditCache::default();
+        let k1 = AuditKey::new("PyPI", "typing_extensions", "4.0.0");
+        cache.set(&k1, vec![make_vuln("GHSA-x")]);
+
+        let k2 = AuditKey::new("PyPI", "typing-extensions", "4.0.0");
+        let entry = cache.get(&k2).expect("normalized variants must hit");
+        assert_eq!(entry.vulnerabilities[0].id, "GHSA-x");
+    }
+
+    #[test]
+    fn non_pypi_key_names_are_not_normalized() {
+        let k = AuditKey::new("npm", "My_Weird.Name", "1.0.0");
+        assert_eq!(k.name, "My_Weird.Name");
     }
 
     // ── serialization round-trip ───────────────────────────────────────────────

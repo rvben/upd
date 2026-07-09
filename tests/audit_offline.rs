@@ -45,7 +45,8 @@ fn write_pre_populated_cache(cache_dir: &Path) {
         "entries": {
             "PyPI::requests::2.31.0": {
                 "vulnerabilities": [],
-                "fetched_at": now
+                "fetched_at": now,
+                "schema_version": 2
             },
             "PyPI::django::3.2.0": {
                 "vulnerabilities": [
@@ -57,7 +58,8 @@ fn write_pre_populated_cache(cache_dir: &Path) {
                         "fixed_version": "3.2.1"
                     }
                 ],
-                "fetched_at": now
+                "fetched_at": now,
+                "schema_version": 2
             }
         }
     });
