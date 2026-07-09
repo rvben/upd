@@ -95,6 +95,14 @@ pub struct Vulnerability {
     pub url: Option<String>,
     /// Fixed version if available
     pub fixed_version: Option<String>,
+    /// Alternate identifiers for the same advisory (CVE-*, PYSEC-*, ...),
+    /// straight from the OSV record. Lets findings be cross-referenced with
+    /// scanners that report CVE ids.
+    #[serde(default)]
+    pub aliases: Vec<String>,
+    /// Advisory database prefix of `id` (GHSA, PYSEC, GO, RUSTSEC, CVE, ...).
+    #[serde(default)]
+    pub source: String,
 }
 
 /// Result of checking a package for vulnerabilities
@@ -416,6 +424,8 @@ impl OsvClient {
                             severity: None,
                             url: Some(format!("https://osv.dev/vulnerability/{}", vuln_ref.id)),
                             fixed_version: None,
+                            aliases: Vec::new(),
+                            source: advisory_source(&vuln_ref.id),
                         }
                     }
                 }
@@ -496,12 +506,15 @@ impl OsvClient {
             .map(|r| r.url.clone())
             .unwrap_or_else(|| format!("https://osv.dev/vulnerability/{}", id));
 
+        let source = advisory_source(&vuln.id);
         Ok(Vulnerability {
             id: vuln.id,
             summary: vuln.summary,
             severity,
             url: Some(url),
             fixed_version,
+            aliases: vuln.aliases.unwrap_or_default(),
+            source,
         })
     }
 }
@@ -551,6 +564,8 @@ struct OsvVulnRef {
 struct OsvVulnerability {
     id: String,
     summary: Option<String>,
+    #[serde(default)]
+    aliases: Option<Vec<String>>,
     severity: Option<Vec<OsvSeverity>>,
     references: Option<Vec<OsvReference>>,
     affected: Option<Vec<OsvAffected>>,
@@ -585,6 +600,12 @@ struct OsvRange {
 /// must never be treated as an installable package version.
 fn looks_like_git_sha(s: &str) -> bool {
     s.len() == 40 && s.chars().all(|c| c.is_ascii_hexdigit())
+}
+
+/// Advisory database prefix of an OSV id: the segment before the first `-`.
+/// `GO-2026-5029` -> `GO`, `GHSA-x-y-z` -> `GHSA`, `CVE-2026-1` -> `CVE`.
+pub fn advisory_source(id: &str) -> String {
+    id.split('-').next().unwrap_or_default().to_string()
 }
 
 #[derive(Debug, Deserialize)]
@@ -649,6 +670,8 @@ mod tests {
                     severity: Some("HIGH".to_string()),
                     url: None,
                     fixed_version: Some("1.0.1".to_string()),
+                    aliases: Vec::new(),
+                    source: String::new(),
                 },
                 Vulnerability {
                     id: "CVE-2024-002".to_string(),
@@ -656,6 +679,8 @@ mod tests {
                     severity: None,
                     url: None,
                     fixed_version: None,
+                    aliases: Vec::new(),
+                    source: String::new(),
                 },
             ],
         });
@@ -879,6 +904,8 @@ mod tests {
             severity: None,
             url: None,
             fixed_version: fixed.map(str::to_string),
+            aliases: Vec::new(),
+            source: String::new(),
         }
     }
 
@@ -1159,6 +1186,8 @@ mod tests {
                     severity: None,
                     url: None,
                     fixed_version: Some("1.0.0.10".to_string()),
+                    aliases: Vec::new(),
+                    source: String::new(),
                 },
                 Vulnerability {
                     id: "CVE-B".to_string(),
@@ -1166,6 +1195,8 @@ mod tests {
                     severity: None,
                     url: None,
                     fixed_version: Some("1.0.0.9".to_string()),
+                    aliases: Vec::new(),
+                    source: String::new(),
                 },
             ],
         });
@@ -1229,6 +1260,8 @@ mod tests {
                     severity: None,
                     url: None,
                     fixed_version: None,
+                    aliases: Vec::new(),
+                    source: String::new(),
                 }],
             );
         }
@@ -1484,5 +1517,24 @@ mod tests {
             err.contains("lonely-pkg") && err.contains("another-pkg"),
             "network-level errors should still name the failing packages: {err}"
         );
+    }
+
+    #[test]
+    fn advisory_source_is_id_prefix() {
+        assert_eq!(advisory_source("GHSA-82w8-qh3p-5jfq"), "GHSA");
+        assert_eq!(advisory_source("GO-2026-5029"), "GO");
+        assert_eq!(advisory_source("PYSEC-2026-249"), "PYSEC");
+        assert_eq!(advisory_source("RUSTSEC-2026-0001"), "RUSTSEC");
+        assert_eq!(advisory_source("CVE-2026-25681"), "CVE");
+        assert_eq!(advisory_source(""), "");
+    }
+
+    #[test]
+    fn vulnerability_deserializes_without_new_fields() {
+        // Old cache entries lack aliases/source; deserialization must not fail.
+        let json = r#"{"id":"GO-2026-5029","summary":null,"severity":null,"url":null,"fixed_version":null}"#;
+        let v: Vulnerability = serde_json::from_str(json).unwrap();
+        assert!(v.aliases.is_empty());
+        assert!(v.source.is_empty());
     }
 }

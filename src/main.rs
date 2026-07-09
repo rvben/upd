@@ -4341,6 +4341,8 @@ mod tests {
                 severity: None,
                 url: None,
                 fixed_version: None,
+                aliases: Vec::new(),
+                source: String::new(),
             }],
         });
 
@@ -4362,6 +4364,8 @@ mod tests {
                 severity: None,
                 url: None,
                 fixed_version: None,
+                aliases: Vec::new(),
+                source: String::new(),
             }],
         });
         result.errors.push("network timeout".into());

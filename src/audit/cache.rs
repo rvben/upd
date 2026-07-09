@@ -156,6 +156,8 @@ mod tests {
             severity: None,
             url: None,
             fixed_version: None,
+            aliases: Vec::new(),
+            source: String::new(),
         }
     }
 
@@ -270,6 +272,8 @@ mod tests {
                 severity: Some("High".to_string()),
                 url: Some("https://example.com".to_string()),
                 fixed_version: Some("3.2.1".to_string()),
+                aliases: vec!["CVE-2026-1".to_string()],
+                source: "GHSA".to_string(),
             }],
         );
 
@@ -283,6 +287,8 @@ mod tests {
             entry.vulnerabilities[0].fixed_version.as_deref(),
             Some("3.2.1")
         );
+        assert_eq!(entry.vulnerabilities[0].aliases, vec!["CVE-2026-1"]);
+        assert_eq!(entry.vulnerabilities[0].source, "GHSA");
     }
 
     // ── file I/O ──────────────────────────────────────────────────────────────
