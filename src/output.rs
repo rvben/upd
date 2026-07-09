@@ -205,6 +205,12 @@ pub struct AuditVulnerability {
     pub fixed_version: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub url: Option<String>,
+    /// Alternate advisory ids (CVE-*, PYSEC-*, ...) for cross-referencing.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub aliases: Vec<String>,
+    /// Advisory database prefix of `id` (GHSA, PYSEC, GO, RUSTSEC, ...).
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub source: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -653,6 +659,8 @@ fn build_vulnerability(
         severity: v.severity.clone(),
         fixed_version: v.fixed_version.clone(),
         url: v.url.clone(),
+        aliases: v.aliases.clone(),
+        source: v.source.clone(),
     }
 }
 
@@ -1119,5 +1127,43 @@ mod tests {
                 || second_result["properties"]["fixedVersion"].is_null(),
             "fixedVersion must be absent when not set"
         );
+    }
+
+    #[test]
+    fn audit_vulnerability_serializes_aliases_and_source_only_when_present() {
+        let v = AuditVulnerability {
+            package: "starlette".to_string(),
+            version: "0.40.0".to_string(),
+            ecosystem: "PyPI".to_string(),
+            id: "GHSA-82w8-qh3p-5jfq".to_string(),
+            summary: None,
+            severity: None,
+            fixed_version: None,
+            url: None,
+            aliases: vec!["CVE-2026-54283".to_string()],
+            source: "GHSA".to_string(),
+        };
+        let json = serde_json::to_value(&v).unwrap();
+        assert_eq!(json["aliases"][0], "CVE-2026-54283");
+        assert_eq!(json["source"], "GHSA");
+
+        let empty = AuditVulnerability {
+            package: "starlette".to_string(),
+            version: "0.40.0".to_string(),
+            ecosystem: "PyPI".to_string(),
+            id: "GHSA-82w8-qh3p-5jfq".to_string(),
+            summary: None,
+            severity: None,
+            fixed_version: None,
+            url: None,
+            aliases: vec![],
+            source: String::new(),
+        };
+        let json = serde_json::to_value(&empty).unwrap();
+        assert!(
+            json.get("aliases").is_none(),
+            "empty aliases must be omitted"
+        );
+        assert!(json.get("source").is_none(), "empty source must be omitted");
     }
 }

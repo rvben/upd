@@ -2700,10 +2700,22 @@ fn print_audit_vulnerabilities(audit_result: &AuditResult) {
                 })
                 .unwrap_or_else(|| "No description".to_string());
 
+            let cve_aliases: Vec<&str> = vuln
+                .aliases
+                .iter()
+                .filter(|a| a.starts_with("CVE-"))
+                .map(String::as_str)
+                .collect();
+            let id_display = if cve_aliases.is_empty() {
+                vuln.id.clone()
+            } else {
+                format!("{} ({})", vuln.id, cve_aliases.join(", "))
+            };
+
             println!(
                 "    {} {} {} {}",
                 "├──".dimmed(),
-                vuln.id.yellow(),
+                id_display.yellow(),
                 severity_str,
                 summary.dimmed()
             );
