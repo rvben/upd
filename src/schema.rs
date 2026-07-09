@@ -232,7 +232,8 @@ fn build_schema() -> Value {
                     {"name": "status", "type": "string", "description": "\"complete\" or \"incomplete\" (an offline cache miss or coverage warning)"},
                     {"name": "vulnerabilities", "type": "array", "description": "Vulnerable packages, each with package, ecosystem, version, id, severity, fixed_version, url, aliases (alternate ids such as CVEs, omitted when empty), and source (advisory database prefix of id, e.g. GHSA/PYSEC/GO)"},
                     {"name": "summary", "type": "object", "description": "Aggregate counts (packages_checked, vulnerabilities, vulnerable_packages, errors)"},
-                    {"name": "errors", "type": "array", "description": "Per-package audit errors (e.g. unreachable registry, offline cache miss)"}
+                    {"name": "errors", "type": "array", "description": "Per-package audit errors (e.g. unreachable registry, offline cache miss)"},
+                    {"name": "warnings", "type": "array", "description": "Coverage warnings (e.g. go.mod predating go 1.17): the audit ran but could not fully cover these inputs; status becomes \"incomplete\" without a nonzero exit"}
                 ]
             },
             {

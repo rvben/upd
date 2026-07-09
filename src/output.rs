@@ -229,6 +229,8 @@ pub struct AuditReport {
     pub status: &'static str,
     pub vulnerabilities: Vec<AuditVulnerability>,
     pub errors: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<String>,
     pub summary: AuditSummary,
 }
 
@@ -627,6 +629,7 @@ pub fn build_audit_report(
         status,
         vulnerabilities,
         errors: audit.errors.clone(),
+        warnings: audit.warnings.clone(),
         summary: AuditSummary {
             packages_checked,
             vulnerable_packages: audit.vulnerable.len(),
@@ -897,6 +900,7 @@ mod tests {
             }],
             safe_count: 5,
             errors: Vec::new(),
+            warnings: Vec::new(),
         };
         let report = build_audit_report(&audit, 2, "complete");
         let json = serde_json::to_value(&report).unwrap();
@@ -921,6 +925,7 @@ mod tests {
             vulnerable: Vec::new(),
             safe_count: 0,
             errors: vec!["network error".into()],
+            warnings: Vec::new(),
         };
         let report = build_audit_report(&audit, 0, "incomplete");
         let json = serde_json::to_value(&report).unwrap();
@@ -964,6 +969,7 @@ mod tests {
             }],
             safe_count: 2,
             errors: Vec::new(),
+            warnings: Vec::new(),
         }
     }
 
@@ -1031,6 +1037,7 @@ mod tests {
             ],
             safe_count: 0,
             errors: Vec::new(),
+            warnings: Vec::new(),
         };
 
         let occurrences = std::collections::HashMap::new();

@@ -527,13 +527,54 @@ fn has_interactive_changes(
 }
 
 fn audit_status(audit_result: &AuditResult) -> AuditStatus {
-    if !audit_result.errors.is_empty() {
+    if !audit_result.errors.is_empty() || !audit_result.warnings.is_empty() {
         AuditStatus::Incomplete
     } else if audit_result.vulnerable.is_empty() {
         AuditStatus::Clean
     } else {
         AuditStatus::Vulnerable
     }
+}
+
+/// Coverage warnings for go.mod files whose `go` directive predates 1.17.
+/// Such files do not list the full transitive module set (the go tool only
+/// records the complete graph from 1.17 on; a missing directive means 1.16
+/// semantics), so audit findings for them may be incomplete.
+fn go_mod_coverage_warnings(files: &[(std::path::PathBuf, FileType)]) -> Vec<String> {
+    let mut warnings = Vec::new();
+    for (path, file_type) in files {
+        if *file_type != FileType::GoMod {
+            continue;
+        }
+        let Ok(content) = std::fs::read_to_string(path) else {
+            continue;
+        };
+        let version = content.lines().find_map(|line| {
+            // Tokenize on any whitespace: `go 1.22` and `go\t1.22` are both
+            // valid directives (matching go_mod.rs's whitespace-tolerant style).
+            let mut tokens = line.split_whitespace();
+            if tokens.next() != Some("go") {
+                return None;
+            }
+            let mut parts = tokens.next()?.split('.');
+            let major: u32 = parts.next()?.parse().ok()?;
+            let minor_txt = parts.next()?;
+            let digits: String = minor_txt
+                .chars()
+                .take_while(|c| c.is_ascii_digit())
+                .collect();
+            let minor: u32 = digits.parse().ok()?;
+            Some((major, minor))
+        });
+        let modern = matches!(version, Some((maj, min)) if maj > 1 || (maj == 1 && min >= 17));
+        if !modern {
+            warnings.push(format!(
+                "{}: go.mod predates go 1.17 module graph pruning: transitive coverage may be incomplete; run 'go mod tidy' with a modern toolchain",
+                path.display()
+            ));
+        }
+    }
+    warnings
 }
 
 /// Classify an anyhow error into a clispec structured error kind and exit code.
@@ -2114,6 +2155,7 @@ async fn run_audit(cli: &Cli) -> Result<()> {
         },
     );
     let file_count = files.len();
+    let coverage_warnings = go_mod_coverage_warnings(&files);
 
     if files.is_empty() {
         if text_mode {
@@ -2156,6 +2198,18 @@ async fn run_audit(cli: &Cli) -> Result<()> {
     let audit_packages = build_audit_packages(&packages);
 
     if audit_packages.is_empty() {
+        let empty_result = AuditResult {
+            warnings: coverage_warnings.clone(),
+            ..Default::default()
+        };
+        let status_str = if empty_result.warnings.is_empty() {
+            "complete"
+        } else {
+            "incomplete"
+        };
+        for warning in &empty_result.warnings {
+            eprintln!("{} {}", "Warning:".yellow(), warning);
+        }
         if text_mode {
             if !cli.quiet {
                 println!(
@@ -2165,11 +2219,11 @@ async fn run_audit(cli: &Cli) -> Result<()> {
                 );
             }
         } else if sarif_mode {
-            emit_audit_sarif(&AuditResult::default(), &HashMap::new())?;
+            emit_audit_sarif(&empty_result, &HashMap::new())?;
         } else {
             emit_audit_json(
-                &AuditResult::default(),
-                "complete",
+                &empty_result,
+                status_str,
                 &BoundedOutputParams::from_cli(cli),
             )?;
         }
@@ -2203,9 +2257,10 @@ async fn run_audit(cli: &Cli) -> Result<()> {
     } else {
         Some(AuditCache::new_shared())
     };
-    let audit_result = osv_client
+    let mut audit_result = osv_client
         .check_packages_cached(&audit_packages, audit_cache.as_ref(), offline)
         .await?;
+    audit_result.warnings.extend(coverage_warnings);
 
     // Persist cache to disk after a successful query.
     if let Some(ref c) = audit_cache {
@@ -2229,19 +2284,20 @@ async fn run_audit(cli: &Cli) -> Result<()> {
                     print_audit_vulnerabilities(&audit_result);
                 }
                 AuditStatus::Incomplete => {
+                    let issue_count = audit_result.errors.len() + audit_result.warnings.len();
                     if audit_result.vulnerable.is_empty() {
                         println!(
-                            "\n{} Audit incomplete: {} error(s) occurred while checking {} package(s)",
+                            "\n{} Audit incomplete: {} issue(s) occurred while checking {} package(s)",
                             "⚠".yellow().bold(),
-                            audit_result.errors.len().to_string().yellow().bold(),
+                            issue_count.to_string().yellow().bold(),
                             audit_packages.len()
                         );
                     } else {
                         print_audit_vulnerabilities(&audit_result);
                         println!(
-                            "\n{} Audit incomplete: {} error(s) occurred while checking dependencies",
+                            "\n{} Audit incomplete: {} issue(s) occurred while checking dependencies",
                             "⚠".yellow().bold(),
-                            audit_result.errors.len().to_string().yellow().bold()
+                            issue_count.to_string().yellow().bold()
                         );
                     }
                 }
@@ -2251,10 +2307,16 @@ async fn run_audit(cli: &Cli) -> Result<()> {
         for error in &audit_result.errors {
             eprintln!("{} {}", "Error:".red(), error);
         }
+        for warning in &audit_result.warnings {
+            eprintln!("{} {}", "Warning:".yellow(), warning);
+        }
     } else if sarif_mode {
         // Errors always go to stderr; structured data to stdout.
         for error in &audit_result.errors {
             eprintln!("{} {}", "Error:".red(), error);
+        }
+        for warning in &audit_result.warnings {
+            eprintln!("{} {}", "Warning:".yellow(), warning);
         }
         // Build the per-package occurrence map from already-scanned data.
         let sarif_occurrences = build_sarif_occurrences(&packages);
@@ -2263,6 +2325,9 @@ async fn run_audit(cli: &Cli) -> Result<()> {
         // JSON mode: errors to stderr, structured data to stdout.
         for error in &audit_result.errors {
             eprintln!("{} {}", "Error:".red(), error);
+        }
+        for warning in &audit_result.warnings {
+            eprintln!("{} {}", "Warning:".yellow(), warning);
         }
         let status_str = match status {
             AuditStatus::Clean | AuditStatus::Vulnerable => "complete",

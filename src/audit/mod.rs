@@ -119,8 +119,12 @@ pub struct AuditResult {
     pub vulnerable: Vec<PackageAuditResult>,
     /// Packages that are safe
     pub safe_count: usize,
-    /// Errors encountered during audit
+    /// Errors encountered during audit (drive exit code 2)
     pub errors: Vec<String>,
+    /// Coverage warnings: the audit ran, but some inputs could not be fully
+    /// covered (e.g. go.mod predating go 1.17). Mark the report incomplete
+    /// without failing the run.
+    pub warnings: Vec<String>,
 }
 
 impl AuditResult {
@@ -1022,6 +1026,7 @@ mod tests {
             )],
             safe_count: 0,
             errors: vec![],
+            warnings: vec![],
         };
         let (fixable, unfixable) = compute_fix_plan(&audit);
         assert!(unfixable.is_empty());
@@ -1040,6 +1045,7 @@ mod tests {
             )],
             safe_count: 0,
             errors: vec![],
+            warnings: vec![],
         };
         let (fixable, unfixable) = compute_fix_plan(&audit);
         assert!(fixable.is_empty());
@@ -1061,6 +1067,7 @@ mod tests {
             ],
             safe_count: 1,
             errors: vec![],
+            warnings: vec![],
         };
         let (fixable, unfixable) = compute_fix_plan(&audit);
         assert_eq!(fixable.len(), 1);
@@ -1082,6 +1089,7 @@ mod tests {
             )],
             safe_count: 0,
             errors: vec![],
+            warnings: vec![],
         };
         let (fixable, unfixable) = compute_fix_plan(&audit);
         assert!(unfixable.is_empty());
@@ -1106,6 +1114,7 @@ mod tests {
                 vulnerable: vec![make_pkg_result("mypkg", vulns)],
                 safe_count: 0,
                 errors: vec![],
+                warnings: vec![],
             };
             let (fixable, unfixable) = compute_fix_plan(&audit);
             assert!(unfixable.is_empty());
@@ -1145,6 +1154,7 @@ mod tests {
             )],
             safe_count: 0,
             errors: vec![],
+            warnings: vec![],
         };
         let (fixable, unfixable) = compute_fix_plan(&audit);
         assert!(unfixable.is_empty());
@@ -1166,6 +1176,7 @@ mod tests {
             )],
             safe_count: 0,
             errors: vec![],
+            warnings: vec![],
         };
         let (fixable, _) = compute_fix_plan(&audit);
         assert_eq!(
@@ -1186,6 +1197,7 @@ mod tests {
             )],
             safe_count: 0,
             errors: vec![],
+            warnings: vec![],
         };
         let (fixable, _) = compute_fix_plan(&audit);
         assert_eq!(
@@ -1205,6 +1217,7 @@ mod tests {
             )],
             safe_count: 0,
             errors: vec![],
+            warnings: vec![],
         };
         let (fixable, _) = compute_fix_plan(&audit);
         assert_eq!(
@@ -1223,6 +1236,7 @@ mod tests {
             )],
             safe_count: 0,
             errors: vec![],
+            warnings: vec![],
         };
         let (fixable, _) = compute_fix_plan(&audit);
         assert_eq!(fixable.get("requests").map(|s| s.as_str()), Some("2.28.0"));
@@ -1241,6 +1255,7 @@ mod tests {
             )],
             safe_count: 0,
             errors: vec![],
+            warnings: vec![],
         };
         let (fixable, _) = compute_fix_plan(&audit);
         assert_eq!(fixable.get("pkg").map(|s| s.as_str()), Some("2.10.0"));
