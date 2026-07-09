@@ -93,7 +93,7 @@ async fn audit_sarif_with_vulnerability_emits_correct_structure() {
             "summary": "Test vulnerability in requests",
             "database_specific": { "severity": "High" },
             "affected": [{
-                "ranges": [{ "events": [{ "fixed": "2.28.0" }] }]
+                "ranges": [{ "events": [{ "introduced": "0" }, { "fixed": "2.28.0" }] }]
             }],
             "references": [{ "url": "https://example.com/GHSA-test-sarif-xxxx" }]
         })))

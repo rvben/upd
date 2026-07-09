@@ -61,7 +61,7 @@ async fn fix_audit_apply_rewrites_vulnerable_package() {
             "database_specific": { "severity": "HIGH" },
             "affected": [{
                 "ranges": [{
-                    "events": [{ "fixed": "2.28.0" }]
+                    "events": [{ "introduced": "0" }, { "fixed": "2.28.0" }]
                 }]
             }],
             "references": [{ "url": "https://example.com/fix-001" }]
@@ -361,7 +361,7 @@ async fn fix_audit_dry_run_exits_1_and_leaves_file_unchanged() {
             "database_specific": { "severity": "HIGH" },
             "affected": [{
                 "ranges": [{
-                    "events": [{ "fixed": "2.28.0" }]
+                    "events": [{ "introduced": "0" }, { "fixed": "2.28.0" }]
                 }]
             }],
             "references": [{ "url": "https://example.com/fix-002" }]
@@ -481,7 +481,7 @@ async fn fix_audit_no_fail_exits_0_on_pending_fixes() {
             "database_specific": { "severity": "HIGH" },
             "affected": [{
                 "ranges": [{
-                    "events": [{ "fixed": "2.28.0" }]
+                    "events": [{ "introduced": "0" }, { "fixed": "2.28.0" }]
                 }]
             }],
             "references": [{ "url": "https://example.com/fix-004" }]

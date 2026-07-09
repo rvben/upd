@@ -400,7 +400,9 @@ impl OsvClient {
             }
 
             let package = packages[i].clone();
-            let vulns = self.fetch_vulnerability_details(&osv_result.vulns).await?;
+            let vulns = self
+                .fetch_vulnerability_details(&osv_result.vulns, &package)
+                .await?;
             results.push((package, vulns));
         }
 
@@ -411,10 +413,11 @@ impl OsvClient {
     async fn fetch_vulnerability_details(
         &self,
         vuln_refs: &[OsvVulnRef],
+        package: &Package,
     ) -> Result<Vec<Vulnerability>> {
         let vulnerabilities: Vec<Vulnerability> = stream::iter(vuln_refs)
             .map(|vuln_ref| async move {
-                match self.fetch_vuln_by_id(&vuln_ref.id).await {
+                match self.fetch_vuln_by_id(&vuln_ref.id, package).await {
                     Ok(vuln) => vuln,
                     Err(_) => {
                         // If we can't fetch details, create a minimal entry
@@ -438,7 +441,7 @@ impl OsvClient {
     }
 
     /// Fetch vulnerability details by ID
-    async fn fetch_vuln_by_id(&self, id: &str) -> Result<Vulnerability> {
+    async fn fetch_vuln_by_id(&self, id: &str, package: &Package) -> Result<Vulnerability> {
         let url = format!("{}/vulns/{}", self.base_url, id);
         let response = self
             .client
@@ -477,26 +480,15 @@ impl OsvClient {
         // matching the same position as None would have occupied.
         let severity = Some(resolved.as_severity_string());
 
-        // Extract the fixed version from affected ranges. Only version-typed
-        // ranges (ECOSYSTEM/SEMVER, or untyped) qualify: a GIT range's `fixed`
-        // event is a commit SHA, which is not an installable version. As a
-        // belt-and-suspenders, any SHA-shaped value is rejected even if a range
-        // is mislabelled. When no installable fix exists (e.g. a GIT-only
-        // advisory), this resolves to `None`.
+        // Extract the fixed version from affected ranges, scoped to the
+        // queried package and the range branch containing its version. See
+        // `fixed_version_for` for why: a multi-package advisory can list
+        // another package's fix, and a multi-branch advisory (LTS series)
+        // can list a fix for a branch the installed version isn't on.
         let fixed_version = vuln
             .affected
-            .iter()
-            .flatten()
-            .flat_map(|a| a.ranges.iter().flatten())
-            .filter(|r| match r.range_type.as_deref() {
-                Some(t) => t.eq_ignore_ascii_case("ECOSYSTEM") || t.eq_ignore_ascii_case("SEMVER"),
-                None => true,
-            })
-            .flat_map(|r| r.events.iter().flatten())
-            .find_map(|e| {
-                let fixed = e.fixed.as_deref()?;
-                (!looks_like_git_sha(fixed)).then(|| fixed.to_string())
-            });
+            .as_deref()
+            .and_then(|affected| fixed_version_for(affected, package));
 
         // Get reference URL
         let url = vuln
@@ -584,7 +576,18 @@ struct OsvReference {
 
 #[derive(Debug, Deserialize)]
 struct OsvAffected {
+    #[serde(default)]
+    package: Option<OsvAffectedPackage>,
     ranges: Option<Vec<OsvRange>>,
+}
+
+/// The `affected[].package` field of an OSV record: identifies which package
+/// (name + ecosystem) an affected entry's ranges apply to. Multi-package
+/// advisories carry one entry per package.
+#[derive(Debug, Deserialize)]
+struct OsvAffectedPackage {
+    name: Option<String>,
+    ecosystem: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -610,7 +613,86 @@ pub fn advisory_source(id: &str) -> String {
 
 #[derive(Debug, Deserialize)]
 struct OsvEvent {
+    #[serde(default)]
+    introduced: Option<String>,
+    #[serde(default)]
     fixed: Option<String>,
+    #[serde(default)]
+    last_affected: Option<String>,
+}
+
+/// True when an `affected[]` entry applies to the queried package. Entries
+/// without a package field match defensively (single-package advisories from
+/// some sources omit it). PyPI names compare PEP 503-normalized; all other
+/// ecosystems compare exactly. Ecosystem strings compare case-insensitively.
+fn affected_matches(affected_pkg: Option<&OsvAffectedPackage>, package: &Package) -> bool {
+    let Some(ap) = affected_pkg else { return true };
+    let eco_ok = ap
+        .ecosystem
+        .as_deref()
+        .map(|e| e.eq_ignore_ascii_case(package.ecosystem.as_str()))
+        .unwrap_or(true);
+    let name_ok = ap
+        .name
+        .as_deref()
+        .map(|n| match package.ecosystem {
+            Ecosystem::PyPI => {
+                crate::normalize::pep503_normalize(n)
+                    == crate::normalize::pep503_normalize(&package.name)
+            }
+            _ => n == package.name,
+        })
+        .unwrap_or(true);
+    eco_ok && name_ok
+}
+
+/// The fixed version for `package` from an advisory's `affected[]` entries.
+/// Only entries matching the queried package are considered, and within them
+/// only the range branch CONTAINING the queried version contributes its
+/// `fixed` event - a multi-branch advisory (LTS series) must never yield a
+/// fix from a different branch, or automated floors would write a
+/// satisfiable-but-useless constraint. Returns `None` when the containing
+/// branch has no installable fix.
+fn fixed_version_for(affected: &[OsvAffected], package: &Package) -> Option<String> {
+    use crate::version::compare::compare_versions;
+    use std::cmp::Ordering;
+    for entry in affected
+        .iter()
+        .filter(|a| affected_matches(a.package.as_ref(), package))
+    {
+        for range in entry.ranges.iter().flatten() {
+            let version_typed = match range.range_type.as_deref() {
+                Some(t) => t.eq_ignore_ascii_case("ECOSYSTEM") || t.eq_ignore_ascii_case("SEMVER"),
+                None => true,
+            };
+            if !version_typed {
+                continue;
+            }
+            // Walk events in order, tracking whether the queried version is
+            // inside the currently open introduced..fixed window. The shared
+            // comparator strips a leading `v` (Go) and is total, so every
+            // comparison yields an Ordering.
+            let mut in_window = false;
+            for event in range.events.iter().flatten() {
+                if let Some(intro) = event.introduced.as_deref() {
+                    in_window =
+                        intro == "0" || compare_versions(&package.version, intro) != Ordering::Less;
+                } else if let Some(fix) = event.fixed.as_deref() {
+                    if in_window
+                        && !looks_like_git_sha(fix)
+                        && compare_versions(&package.version, fix) == Ordering::Less
+                    {
+                        return Some(fix.to_string());
+                    }
+                    in_window = false;
+                } else if event.last_affected.is_some() {
+                    // Window closes with no fix; nothing to return from it.
+                    in_window = false;
+                }
+            }
+        }
+    }
+    None
 }
 
 #[cfg(test)]
@@ -724,7 +806,7 @@ mod tests {
                 "summary": "test",
                 "affected": [{
                     "ranges": [{
-                        "events": [{ "fixed": "13.0.1" }]
+                        "events": [{ "introduced": "0" }, { "fixed": "13.0.1" }]
                     }]
                 }],
                 "references": [{ "url": "https://example/nuget" }]
@@ -1536,5 +1618,152 @@ mod tests {
         let v: Vulnerability = serde_json::from_str(json).unwrap();
         assert!(v.aliases.is_empty());
         assert!(v.source.is_empty());
+    }
+
+    fn range(events: Vec<OsvEvent>) -> OsvRange {
+        OsvRange {
+            range_type: Some("ECOSYSTEM".to_string()),
+            events: Some(events),
+        }
+    }
+
+    fn introduced(v: &str) -> OsvEvent {
+        OsvEvent {
+            introduced: Some(v.to_string()),
+            fixed: None,
+            last_affected: None,
+        }
+    }
+
+    fn fixed(v: &str) -> OsvEvent {
+        OsvEvent {
+            introduced: None,
+            fixed: Some(v.to_string()),
+            last_affected: None,
+        }
+    }
+
+    fn affected_for(name: &str, ecosystem: &str, ranges: Vec<OsvRange>) -> OsvAffected {
+        OsvAffected {
+            package: Some(OsvAffectedPackage {
+                name: Some(name.to_string()),
+                ecosystem: Some(ecosystem.to_string()),
+            }),
+            ranges: Some(ranges),
+        }
+    }
+
+    fn pypi_pkg(name: &str, version: &str) -> Package {
+        Package {
+            name: name.to_string(),
+            version: version.to_string(),
+            ecosystem: Ecosystem::PyPI,
+        }
+    }
+
+    #[test]
+    fn fixed_version_ignores_other_packages_in_multi_package_advisory() {
+        let affected = vec![
+            affected_for(
+                "otherpkg",
+                "PyPI",
+                vec![range(vec![introduced("0"), fixed("9.9.9")])],
+            ),
+            affected_for(
+                "mypkg",
+                "PyPI",
+                vec![range(vec![introduced("0"), fixed("1.2.5")])],
+            ),
+        ];
+        let got = fixed_version_for(&affected, &pypi_pkg("mypkg", "1.0.0"));
+        assert_eq!(got.as_deref(), Some("1.2.5"));
+    }
+
+    #[test]
+    fn fixed_version_comes_from_branch_containing_queried_version() {
+        // Two branches in one range: 1.x fixed at 1.2.5, 2.x fixed at 2.1.3.
+        let affected = vec![affected_for(
+            "mypkg",
+            "PyPI",
+            vec![range(vec![
+                introduced("1.0.0"),
+                fixed("1.2.5"),
+                introduced("2.0.0"),
+                fixed("2.1.3"),
+            ])],
+        )];
+        let v2 = fixed_version_for(&affected, &pypi_pkg("mypkg", "2.0.5"));
+        assert_eq!(v2.as_deref(), Some("2.1.3"));
+        let v1 = fixed_version_for(&affected, &pypi_pkg("mypkg", "1.1.0"));
+        assert_eq!(v1.as_deref(), Some("1.2.5"));
+    }
+
+    #[test]
+    fn fixed_version_none_when_containing_branch_has_no_fix() {
+        // 1.x has a fix; the 2.x branch is introduced with no fixed event.
+        let affected = vec![affected_for(
+            "mypkg",
+            "PyPI",
+            vec![range(vec![
+                introduced("1.0.0"),
+                fixed("1.2.5"),
+                introduced("2.0.0"),
+            ])],
+        )];
+        let got = fixed_version_for(&affected, &pypi_pkg("mypkg", "2.0.5"));
+        assert_eq!(got, None);
+    }
+
+    #[test]
+    fn fixed_version_matches_pypi_names_pep503_normalized() {
+        let affected = vec![affected_for(
+            "typing-extensions",
+            "PyPI",
+            vec![range(vec![introduced("0"), fixed("4.7.1")])],
+        )];
+        let got = fixed_version_for(&affected, &pypi_pkg("typing_extensions", "4.0.0"));
+        assert_eq!(got.as_deref(), Some("4.7.1"));
+    }
+
+    #[test]
+    fn fixed_version_entry_without_package_field_matches() {
+        let affected = vec![OsvAffected {
+            package: None,
+            ranges: Some(vec![range(vec![introduced("0"), fixed("3.1.0")])]),
+        }];
+        let got = fixed_version_for(&affected, &pypi_pkg("mypkg", "3.0.0"));
+        assert_eq!(got.as_deref(), Some("3.1.0"));
+    }
+
+    #[test]
+    fn fixed_version_rejects_git_sha_and_git_ranges() {
+        let sha = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let git_range = OsvRange {
+            range_type: Some("GIT".to_string()),
+            events: Some(vec![introduced("0"), fixed(sha)]),
+        };
+        let affected = vec![affected_for("mypkg", "PyPI", vec![git_range])];
+        assert_eq!(
+            fixed_version_for(&affected, &pypi_pkg("mypkg", "1.0.0")),
+            None
+        );
+    }
+
+    #[test]
+    fn fixed_version_go_v_prefix_versions_compare() {
+        let affected = vec![affected_for(
+            "golang.org/x/net",
+            "Go",
+            vec![range(vec![introduced("0"), fixed("0.39.0")])],
+        )];
+        let pkg = Package {
+            name: "golang.org/x/net".to_string(),
+            version: "v0.30.0".to_string(),
+            ecosystem: Ecosystem::Go,
+        };
+        assert_eq!(
+            fixed_version_for(&affected, &pkg).as_deref(),
+            Some("0.39.0")
+        );
     }
 }
