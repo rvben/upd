@@ -7,6 +7,7 @@ pub mod cooldown;
 pub mod http;
 pub mod interactive;
 pub mod lockfile;
+pub mod normalize;
 pub mod output;
 pub mod registry;
 pub mod schema;
