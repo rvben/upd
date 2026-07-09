@@ -1643,6 +1643,14 @@ mod tests {
         }
     }
 
+    fn last_affected(v: &str) -> OsvEvent {
+        OsvEvent {
+            introduced: None,
+            fixed: None,
+            last_affected: Some(v.to_string()),
+        }
+    }
+
     fn affected_for(name: &str, ecosystem: &str, ranges: Vec<OsvRange>) -> OsvAffected {
         OsvAffected {
             package: Some(OsvAffectedPackage {
@@ -1712,6 +1720,38 @@ mod tests {
         )];
         let got = fixed_version_for(&affected, &pypi_pkg("mypkg", "2.0.5"));
         assert_eq!(got, None);
+    }
+
+    #[test]
+    fn fixed_version_none_when_window_closed_by_last_affected() {
+        // The 1.x branch closes via last_affected with no fixed event; the
+        // queried version falls inside that window and must not get a fix
+        // from a different branch.
+        let affected = vec![affected_for(
+            "mypkg",
+            "PyPI",
+            vec![range(vec![introduced("1.0.0"), last_affected("1.9.9")])],
+        )];
+        let got = fixed_version_for(&affected, &pypi_pkg("mypkg", "1.5.0"));
+        assert_eq!(got, None);
+    }
+
+    #[test]
+    fn fixed_version_branch_after_last_affected_still_selected() {
+        // The 1.x branch closes unfixed via last_affected; a later 2.x
+        // branch with its own fixed event must still match.
+        let affected = vec![affected_for(
+            "mypkg",
+            "PyPI",
+            vec![range(vec![
+                introduced("1.0.0"),
+                last_affected("1.9.9"),
+                introduced("2.0.0"),
+                fixed("2.1.3"),
+            ])],
+        )];
+        let got = fixed_version_for(&affected, &pypi_pkg("mypkg", "2.0.5"));
+        assert_eq!(got.as_deref(), Some("2.1.3"));
     }
 
     #[test]
