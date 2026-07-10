@@ -5,6 +5,8 @@
 //! They never write lockfiles and never shell out; regeneration stays in
 //! `crate::lockfile`.
 
+pub mod cargo;
+pub mod poetry;
 pub mod uv;
 
 use crate::audit::Ecosystem;
