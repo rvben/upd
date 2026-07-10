@@ -1,7 +1,7 @@
 //! poetry.lock reader: `[[package]]` entries from PyPI or a legacy
 //! (alternate registry index) source.
 
-use super::{LockScan, LockedPackage, find_entry_line};
+use super::{LockScan, LockedPackage, index_name_lines};
 use crate::audit::Ecosystem;
 use anyhow::{Context, Result};
 use std::path::Path;
@@ -21,6 +21,7 @@ pub fn scan_poetry_lock(path: &Path) -> Result<LockScan> {
     let Some(packages) = doc.get("package").and_then(|p| p.as_array()) else {
         return Ok(scan);
     };
+    let name_lines = index_name_lines(&content);
     for entry in packages {
         let Some(name) = entry.get("name").and_then(|v| v.as_str()) else {
             continue;
@@ -43,7 +44,7 @@ pub fn scan_poetry_lock(path: &Path) -> Result<LockScan> {
             version: version.to_string(),
             ecosystem: Ecosystem::PyPI,
             lockfile_path: path.to_path_buf(),
-            line_number: find_entry_line(&content, &format!("name = \"{name}\"")),
+            line_number: name_lines.get(name).copied(),
         });
     }
     Ok(scan)

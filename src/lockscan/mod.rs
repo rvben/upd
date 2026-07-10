@@ -13,6 +13,7 @@ pub mod uv;
 
 use crate::audit::Ecosystem;
 use crate::updater::FileType;
+use std::collections::HashMap;
 use std::path::PathBuf;
 
 /// A registry-resolved package read from a lockfile.
@@ -34,14 +35,27 @@ pub struct LockScan {
     pub warnings: Vec<String>,
 }
 
-/// Best-effort 1-based line number of the first line that STARTS WITH
-/// `needle` (after leading whitespace) - entry keys start their line, while
-/// references inside arrays/inline tables do not.
-pub(crate) fn find_entry_line(content: &str, needle: &str) -> Option<usize> {
-    content
-        .lines()
-        .position(|line| line.trim_start().starts_with(needle))
-        .map(|idx| idx + 1)
+/// Single forward pass over a TOML lockfile's lines, indexing package name
+/// to the 1-based line of its first `name = "..."` key (after leading
+/// whitespace) - entry keys start their line, while references inside
+/// arrays/inline tables (e.g. `{ name = "x" }`) do not and are skipped.
+///
+/// Used by uv.lock and poetry.lock readers, whose `[[package]]` entries both
+/// carry a top-level `name = "..."` key. Called once per lockfile rather
+/// than rescanned per package, so anchoring the whole file is O(lines)
+/// instead of O(packages x lines).
+pub(crate) fn index_name_lines(content: &str) -> HashMap<String, usize> {
+    let mut index = HashMap::new();
+    for (idx, line) in content.lines().enumerate() {
+        let Some(rest) = line.trim_start().strip_prefix("name = \"") else {
+            continue;
+        };
+        let Some(end) = rest.find('"') else {
+            continue;
+        };
+        index.entry(rest[..end].to_string()).or_insert(idx + 1);
+    }
+    index
 }
 
 /// Discover and scan all scannable lockfiles for the discovered manifests.
@@ -79,17 +93,19 @@ mod tests {
     use super::*;
 
     #[test]
-    fn find_entry_line_is_one_based_first_match() {
+    fn index_name_lines_is_one_based_first_match() {
         let content = "a\nb\nname = \"x\"\nname = \"x\"\n";
-        assert_eq!(find_entry_line(content, "name = \"x\""), Some(3));
-        assert_eq!(find_entry_line(content, "absent"), None);
+        let index = index_name_lines(content);
+        assert_eq!(index.get("x"), Some(&3));
+        assert_eq!(index.get("absent"), None);
     }
 
     #[test]
-    fn find_entry_line_ignores_indented_references() {
+    fn index_name_lines_ignores_indented_references() {
         // A reference inside an array/inline table (indented, not at line
         // start) must not shadow the real entry key further down.
         let content = "deps = [\n  { name = \"x\" },\n]\nname = \"x\"\n";
-        assert_eq!(find_entry_line(content, "name = \"x\""), Some(4));
+        let index = index_name_lines(content);
+        assert_eq!(index.get("x"), Some(&4));
     }
 }

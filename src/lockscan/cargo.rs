@@ -3,6 +3,7 @@
 use super::{LockScan, LockedPackage};
 use crate::audit::Ecosystem;
 use anyhow::{Context, Result};
+use std::collections::HashMap;
 use std::path::Path;
 
 /// Scan a Cargo.lock. Only entries whose `source` starts with `registry+`
@@ -19,6 +20,7 @@ pub fn scan_cargo_lock(path: &Path) -> Result<LockScan> {
     let Some(packages) = doc.get("package").and_then(|p| p.as_array()) else {
         return Ok(scan);
     };
+    let blocks = index_package_blocks(&content);
     for entry in packages {
         let Some(name) = entry.get("name").and_then(|v| v.as_str()) else {
             continue;
@@ -38,33 +40,44 @@ pub fn scan_cargo_lock(path: &Path) -> Result<LockScan> {
             version: version.to_string(),
             ecosystem: Ecosystem::CratesIo,
             lockfile_path: path.to_path_buf(),
-            line_number: find_cargo_entry_line(&content, name, version),
+            line_number: blocks.get(&(name.to_string(), version.to_string())).copied(),
         });
     }
     Ok(scan)
 }
 
-/// Line of the `name = "<name>"` entry whose block also declares
-/// `version = "<version>"`. Cargo.lock holds duplicate versions of one
-/// crate as separate `[[package]]` blocks; anchoring by name alone would
-/// point every duplicate at the first block.
-fn find_cargo_entry_line(content: &str, name: &str, version: &str) -> Option<usize> {
-    let name_line = format!("name = \"{name}\"");
-    let version_line = format!("version = \"{version}\"");
-    let lines: Vec<&str> = content.lines().collect();
-    for (idx, line) in lines.iter().enumerate() {
-        if !line.contains(&name_line) {
+/// Single forward pass over the raw Cargo.lock text, indexing each
+/// `[[package]]` block's `name = "..."` line by `(name, version)`.
+/// Cargo.lock holds duplicate versions of one crate as separate blocks, so
+/// anchoring by name alone would point every duplicate at the first block;
+/// the version disambiguates. Called once per lockfile rather than
+/// rescanned per package, so anchoring the whole file is O(lines) instead
+/// of O(packages x lines).
+fn index_package_blocks(content: &str) -> HashMap<(String, String), usize> {
+    let mut index = HashMap::new();
+    let mut current_name: Option<(String, usize)> = None;
+    for (idx, line) in content.lines().enumerate() {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with("[[package]]") {
+            current_name = None;
             continue;
         }
-        let block_matches = lines[idx + 1..]
-            .iter()
-            .take_while(|l| !l.contains("[[package]]"))
-            .any(|l| l.contains(&version_line));
-        if block_matches {
-            return Some(idx + 1);
+        if let Some(rest) = trimmed.strip_prefix("name = \"") {
+            if let Some(end) = rest.find('"') {
+                current_name = Some((rest[..end].to_string(), idx + 1));
+            }
+            continue;
+        }
+        if let Some(rest) = trimmed.strip_prefix("version = \"")
+            && let Some(end) = rest.find('"')
+            && let Some((name, name_line)) = &current_name
+        {
+            index
+                .entry((name.clone(), rest[..end].to_string()))
+                .or_insert(*name_line);
         }
     }
-    None
+    index
 }
 
 #[cfg(test)]

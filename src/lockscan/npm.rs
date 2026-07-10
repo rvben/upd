@@ -1,8 +1,9 @@
 //! package-lock.json / npm-shrinkwrap.json reader (identical formats).
 
-use super::{LockScan, LockedPackage, find_entry_line};
+use super::{LockScan, LockedPackage};
 use crate::audit::Ecosystem;
 use anyhow::{Context, Result};
+use std::collections::HashMap;
 use std::path::Path;
 
 /// Package name for a `packages`-map key: everything after the LAST
@@ -13,6 +14,27 @@ fn name_from_key(key: &str) -> Option<&str> {
     let idx = key.rfind("node_modules/")?;
     let name = &key[idx + "node_modules/".len()..];
     (!name.is_empty()).then_some(name)
+}
+
+/// Single forward pass over the raw JSON text, indexing each object key's
+/// 1-based line by the key text (quotes stripped): the first line (after
+/// leading whitespace) that starts with a `"` has its first quoted token
+/// extracted as the key. `packages`-map keys are unique, so this is an
+/// exact anchor. Called once per lockfile rather than rescanned per
+/// package, so anchoring the whole file is O(lines) instead of
+/// O(packages x lines).
+fn index_key_lines(content: &str) -> HashMap<String, usize> {
+    let mut index = HashMap::new();
+    for (idx, line) in content.lines().enumerate() {
+        let Some(rest) = line.trim_start().strip_prefix('"') else {
+            continue;
+        };
+        let Some(end) = rest.find('"') else {
+            continue;
+        };
+        index.entry(rest[..end].to_string()).or_insert(idx + 1);
+    }
+    index
 }
 
 /// Scan a package-lock.json or npm-shrinkwrap.json. lockfileVersion 1
@@ -36,6 +58,7 @@ pub fn scan_npm_lock(path: &Path) -> Result<LockScan> {
     let Some(packages) = doc.get("packages").and_then(|p| p.as_object()) else {
         return Ok(scan);
     };
+    let key_lines = index_key_lines(&content);
     for (key, entry) in packages {
         let Some(path_name) = name_from_key(key) else {
             continue;
@@ -57,7 +80,7 @@ pub fn scan_npm_lock(path: &Path) -> Result<LockScan> {
             version: version.to_string(),
             ecosystem: Ecosystem::Npm,
             lockfile_path: path.to_path_buf(),
-            line_number: find_entry_line(&content, &format!("\"{key}\"")),
+            line_number: key_lines.get(key).copied(),
         });
     }
     Ok(scan)
