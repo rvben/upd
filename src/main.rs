@@ -17,6 +17,8 @@ use upd::config::UpdConfig;
 use upd::cooldown::CooldownPolicy;
 use upd::interactive::{PendingUpdate, prompt_all};
 use upd::lockfile::{LockfileRegenResult, RegenOutcome, regenerate_lockfiles};
+use upd::lockscan;
+use upd::normalize::pep503_normalize;
 use upd::registry::{
     CratesIoRegistry, GitHubReleasesRegistry, GoProxyRegistry, MultiPyPiRegistry, NpmRegistry,
     NuGetRegistry, PyPiRegistry, RubyGemsRegistry, TerraformRegistry,
@@ -2076,9 +2078,34 @@ fn emit_align_json(
 /// as `AuditPackage::name` so OSV queries reach the correct advisory.
 pub(crate) fn build_audit_packages(
     packages: &HashMap<(String, Lang), Vec<PackageOccurrence>>,
+    lock_packages: &[lockscan::LockedPackage],
 ) -> Vec<AuditPackage> {
     let mut audit_packages: Vec<AuditPackage> = Vec::new();
     let mut seen: HashSet<(String, String, String)> = HashSet::new();
+
+    // LOCK-IS-GROUND-TRUTH SUPPRESSION: manifest-derived versions are often
+    // range fragments with the operator stripped (`pkg>=1.0` parses as
+    // version "1.0"), i.e. versions that may not exist or aren't what is
+    // installed. When a scanned lock resolves a package, the lock version is
+    // authoritative, so the package is audited ONLY at its locked version(s):
+    // no fabricated range-fragment query, no duplicate findings. Manifests
+    // with no scanned lock (unlocked subprojects, partial-workspace skips)
+    // keep today's manifest-derived behavior unchanged. Accepted imprecision:
+    // in a multi-subproject scan where one subproject's lock resolves `pkg`
+    // and another, unlocked subproject also declares `pkg`, that unlocked
+    // entry is suppressed too - strictly no worse than today's
+    // fabricated-version query.
+    let locked_names: HashSet<(String, String)> = lock_packages
+        .iter()
+        .map(|lp| {
+            let name = if lp.ecosystem == Ecosystem::PyPI {
+                pep503_normalize(&lp.name)
+            } else {
+                lp.name.to_lowercase()
+            };
+            (name, lp.ecosystem.as_str().to_string())
+        })
+        .collect();
 
     for ((name, lang), occurrences) in packages {
         // OSV doesn't cover GitHub Actions, pre-commit hooks, mise tools, or Terraform; skip
@@ -2102,9 +2129,20 @@ pub(crate) fn build_audit_packages(
             }
         };
 
+        // PyPI names are PEP 503-normalized so `typing_extensions` (manifest)
+        // and `typing-extensions` (lock) dedup and suppress as the same name.
+        let key_name = if ecosystem == Ecosystem::PyPI {
+            pep503_normalize(name)
+        } else {
+            name.clone()
+        };
+        if locked_names.contains(&(key_name.clone(), ecosystem.as_str().to_string())) {
+            continue;
+        }
+
         for occurrence in occurrences {
             let key = (
-                name.clone(),
+                key_name.clone(),
                 occurrence.version.clone(),
                 ecosystem.as_str().to_string(),
             );
@@ -2115,6 +2153,26 @@ pub(crate) fn build_audit_packages(
                     ecosystem,
                 });
             }
+        }
+    }
+
+    for lp in lock_packages {
+        let key_name = if lp.ecosystem == Ecosystem::PyPI {
+            pep503_normalize(&lp.name)
+        } else {
+            lp.name.to_lowercase()
+        };
+        let key = (
+            key_name,
+            lp.version.clone(),
+            lp.ecosystem.as_str().to_string(),
+        );
+        if seen.insert(key) {
+            audit_packages.push(AuditPackage {
+                name: lp.name.clone(),
+                version: lp.version.clone(),
+                ecosystem: lp.ecosystem,
+            });
         }
     }
 
@@ -2155,7 +2213,9 @@ async fn run_audit(cli: &Cli) -> Result<()> {
         },
     );
     let file_count = files.len();
-    let coverage_warnings = go_mod_coverage_warnings(&files);
+    let mut coverage_warnings = go_mod_coverage_warnings(&files);
+    let lock_scan = lockscan::scan_locks(&files, &paths);
+    coverage_warnings.extend(lock_scan.warnings.iter().cloned());
 
     if files.is_empty() {
         if text_mode {
@@ -2195,7 +2255,7 @@ async fn run_audit(cli: &Cli) -> Result<()> {
     };
 
     // Convert to audit packages (deduplicate by name+version+ecosystem)
-    let audit_packages = build_audit_packages(&packages);
+    let audit_packages = build_audit_packages(&packages, &lock_scan.packages);
 
     if audit_packages.is_empty() {
         let empty_result = AuditResult {
@@ -2319,7 +2379,7 @@ async fn run_audit(cli: &Cli) -> Result<()> {
             eprintln!("{} {}", "Warning:".yellow(), warning);
         }
         // Build the per-package occurrence map from already-scanned data.
-        let sarif_occurrences = build_sarif_occurrences(&packages);
+        let sarif_occurrences = build_sarif_occurrences(&packages, &lock_scan.packages);
         emit_audit_sarif(&audit_result, &sarif_occurrences)?;
     } else {
         // JSON mode: errors to stderr, structured data to stdout.
@@ -2670,8 +2730,11 @@ fn relativize_for_sarif(
 /// being the list of `(file_path, line_number)` where that pin appears.
 fn build_sarif_occurrences(
     packages: &HashMap<(String, Lang), Vec<PackageOccurrence>>,
+    lock_packages: &[lockscan::LockedPackage],
 ) -> upd::output::SarifOccurrenceMap {
     let mut map: upd::output::SarifOccurrenceMap = HashMap::new();
+    let cwd = std::env::current_dir().ok();
+    let cwd_canonical = cwd.as_ref().and_then(|c| c.canonicalize().ok());
 
     for ((_, lang), occurrences) in packages {
         // Only ecosystems that OSV covers and that will appear in the audit result.
@@ -2695,8 +2758,6 @@ fn build_sarif_occurrences(
             }
         };
 
-        let cwd = std::env::current_dir().ok();
-        let cwd_canonical = cwd.as_ref().and_then(|c| c.canonicalize().ok());
         for occ in occurrences {
             let key = (
                 occ.original_name.clone(),
@@ -2707,6 +2768,19 @@ fn build_sarif_occurrences(
                 relativize_for_sarif(&occ.file_path, cwd.as_deref(), cwd_canonical.as_deref());
             map.entry(key).or_default().push((uri, occ.line_number));
         }
+    }
+
+    // Lockfile anchors: a lock-only or lock-suppressed package's finding
+    // is anchored to its lockfile entry instead of (or in addition to) any
+    // manifest occurrence.
+    for lp in lock_packages {
+        let key = (
+            lp.name.clone(),
+            lp.version.clone(),
+            lp.ecosystem.as_str().to_string(),
+        );
+        let uri = relativize_for_sarif(&lp.lockfile_path, cwd.as_deref(), cwd_canonical.as_deref());
+        map.entry(key).or_default().push((uri, lp.line_number));
     }
 
     map
@@ -4787,7 +4861,7 @@ serde = "1.0.1"
         let mut packages = HashMap::new();
         packages.insert(key, occurrences);
 
-        let audit_pkgs = build_audit_packages(&packages);
+        let audit_pkgs = build_audit_packages(&packages, &[]);
 
         assert_eq!(audit_pkgs.len(), 1);
         assert_eq!(
@@ -4821,7 +4895,7 @@ serde = "1.0.1"
         let mut packages = HashMap::new();
         packages.insert(key, occurrences);
 
-        let audit_pkgs = build_audit_packages(&packages);
+        let audit_pkgs = build_audit_packages(&packages, &[]);
 
         assert_eq!(
             audit_pkgs.len(),

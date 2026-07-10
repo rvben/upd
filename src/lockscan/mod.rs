@@ -12,6 +12,7 @@ pub mod poetry;
 pub mod uv;
 
 use crate::audit::Ecosystem;
+use crate::updater::FileType;
 use std::path::PathBuf;
 
 /// A registry-resolved package read from a lockfile.
@@ -41,6 +42,36 @@ pub(crate) fn find_entry_line(content: &str, needle: &str) -> Option<usize> {
         .lines()
         .position(|line| line.trim_start().starts_with(needle))
         .map(|idx| idx + 1)
+}
+
+/// Discover and scan all scannable lockfiles for the discovered manifests.
+/// Reader errors (malformed lockfiles) become warnings, not hard failures -
+/// a broken lockfile must not abort the manifest audit.
+pub fn scan_locks(files: &[(PathBuf, FileType)], scan_roots: &[PathBuf]) -> LockScan {
+    let discovery = discover::discover_locks(files, scan_roots);
+    let mut result = LockScan {
+        packages: Vec::new(),
+        warnings: discovery.warnings,
+    };
+    for lock in discovery.locks {
+        let scanned = match lock.kind {
+            discover::LockKind::Uv => uv::scan_uv_lock(&lock.path),
+            discover::LockKind::Poetry => poetry::scan_poetry_lock(&lock.path),
+            discover::LockKind::Npm => npm::scan_npm_lock(&lock.path),
+            discover::LockKind::Cargo => cargo::scan_cargo_lock(&lock.path),
+        };
+        match scanned {
+            Ok(mut scan) => {
+                result.packages.append(&mut scan.packages);
+                result.warnings.append(&mut scan.warnings);
+            }
+            Err(e) => result.warnings.push(format!(
+                "{}: could not scan lockfile: {e:#}",
+                lock.path.display()
+            )),
+        }
+    }
+    result
 }
 
 #[cfg(test)]
