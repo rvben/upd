@@ -364,6 +364,84 @@ pub(crate) fn regenerate_lockfile(
     }
 }
 
+/// Build the `cargo update -p {package}@{locked} --precise {precise}` args.
+///
+/// Extracted so the arg construction can be asserted without spawning
+/// `cargo`, mirroring how [`LockfileType::command`] is tested.
+fn cargo_precise_args(package: &str, locked: &str, precise: &str) -> Vec<String> {
+    vec![
+        "update".to_string(),
+        "-p".to_string(),
+        format!("{package}@{locked}"),
+        "--precise".to_string(),
+        precise.to_string(),
+    ]
+}
+
+/// Pin one transitive crate to an exact version with
+/// `cargo update -p {package}@{locked} --precise {precise}`, run in
+/// `lock_dir`. The `name@version` spec disambiguates duplicate versions of
+/// the same crate in the dependency graph. Returns the same [`RegenOutcome`]
+/// shape as [`regenerate_lockfile`] so callers report tool-missing and
+/// failure uniformly.
+pub(crate) fn cargo_update_precise(
+    lock_dir: &Path,
+    package: &str,
+    locked: &str,
+    precise: &str,
+    verbose: bool,
+) -> RegenOutcome {
+    let lockfile = LockfileType::CargoLock;
+    let args = cargo_precise_args(package, locked, precise);
+
+    if !tool_available("cargo") {
+        return RegenOutcome::ToolMissing {
+            lockfile,
+            tool: "cargo",
+        };
+    }
+
+    if verbose {
+        println!(
+            "{}",
+            format!(
+                "Running `cargo {}` in {}...",
+                args.join(" "),
+                lock_dir.display()
+            )
+            .cyan()
+        );
+    }
+
+    let output = match Command::new("cargo")
+        .args(&args)
+        .current_dir(lock_dir)
+        .output()
+    {
+        Ok(o) => o,
+        Err(e) => {
+            return RegenOutcome::Failed {
+                lockfile,
+                message: format!("Failed to run `cargo`: {e}"),
+            };
+        }
+    };
+
+    if output.status.success() {
+        RegenOutcome::Ok(lockfile)
+    } else {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        RegenOutcome::Failed {
+            lockfile,
+            message: format!(
+                "Failed to run `cargo {}`: {}",
+                args.join(" "),
+                stderr.trim()
+            ),
+        }
+    }
+}
+
 /// The result of running lockfile regeneration for a single manifest path.
 #[derive(Debug, Default)]
 pub struct LockfileRegenResult {
@@ -448,6 +526,15 @@ mod tests {
         let (cmd, args) = LockfileType::UvLock.command(&[]);
         assert_eq!(cmd, "uv");
         assert_eq!(args, &["lock"]);
+    }
+
+    #[test]
+    fn test_cargo_precise_args() {
+        let args = cargo_precise_args("examplecrate", "1.0.0", "1.2.0");
+        assert_eq!(
+            args,
+            vec!["update", "-p", "examplecrate@1.0.0", "--precise", "1.2.0"]
+        );
     }
 
     #[test]

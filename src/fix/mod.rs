@@ -1,10 +1,8 @@
 //! Explicit per-target fix actions: routing vulnerable (name, version) pairs
 //! into manifest edits and version floors. Writers live in uv/npm;
 //! transactional application in apply.
-//!
-//! `pub mod apply;` lands in a later task that adds the transactional apply
-//! layer this module's targets feed into; this module only computes targets.
 
+pub mod apply;
 pub mod npm;
 pub mod uv;
 
