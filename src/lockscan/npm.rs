@@ -81,6 +81,7 @@ pub fn scan_npm_lock(path: &Path) -> Result<LockScan> {
             ecosystem: Ecosystem::Npm,
             lockfile_path: path.to_path_buf(),
             line_number: key_lines.get(key).copied(),
+            locator: Some(key.clone()),
         });
     }
     Ok(scan)
@@ -151,5 +152,21 @@ mod tests {
     fn npm_reader_malformed_json_is_an_error() {
         let (_dir, path) = write_lock("{ not json");
         assert!(scan_npm_lock(&path).is_err());
+    }
+
+    #[test]
+    fn npm_reader_records_packages_map_key_as_locator() {
+        let (_dir, path) = write_lock(NPM_LOCK); // the existing fixture in this file
+        let scan = scan_npm_lock(&path).unwrap();
+        let nested = scan
+            .packages
+            .iter()
+            .find(|p| p.name == "@scope/nested")
+            .expect("nested entry present");
+        assert_eq!(
+            nested.locator.as_deref(),
+            Some("node_modules/examplepkg/node_modules/@scope/nested")
+        );
+        assert!(scan.packages.iter().all(|p| p.locator.is_some()));
     }
 }

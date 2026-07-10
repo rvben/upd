@@ -41,6 +41,7 @@ pub fn scan_uv_lock(path: &Path) -> Result<LockScan> {
             ecosystem: Ecosystem::PyPI,
             lockfile_path: path.to_path_buf(),
             line_number: name_lines.get(name).copied(),
+            locator: None,
         });
     }
     Ok(scan)

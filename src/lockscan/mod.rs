@@ -9,6 +9,7 @@ pub mod cargo;
 pub mod discover;
 pub mod npm;
 pub mod poetry;
+pub mod provenance;
 pub mod uv;
 
 use crate::audit::Ecosystem;
@@ -25,6 +26,10 @@ pub struct LockedPackage {
     pub lockfile_path: PathBuf,
     /// Best-effort 1-based line of the package entry, for SARIF anchoring.
     pub line_number: Option<usize>,
+    /// Format-specific locator of the entry inside the lockfile. npm: the
+    /// `packages`-map key (encodes nesting, drives positional provenance).
+    /// Other formats: None.
+    pub locator: Option<String>,
 }
 
 /// Result of scanning one lockfile.

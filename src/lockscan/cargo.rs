@@ -40,7 +40,10 @@ pub fn scan_cargo_lock(path: &Path) -> Result<LockScan> {
             version: version.to_string(),
             ecosystem: Ecosystem::CratesIo,
             lockfile_path: path.to_path_buf(),
-            line_number: blocks.get(&(name.to_string(), version.to_string())).copied(),
+            line_number: blocks
+                .get(&(name.to_string(), version.to_string()))
+                .copied(),
+            locator: None,
         });
     }
     Ok(scan)
