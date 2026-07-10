@@ -176,7 +176,7 @@ pub fn discover_locks(files: &[(PathBuf, FileType)], scan_roots: &[PathBuf]) -> 
                 walk_manifests(dir, member_manifest_name(kind), &mut members);
                 if let Some(missing) = members.iter().find(|m| !discovered.contains(m.as_path())) {
                     discovery.warnings.push(format!(
-                        "{}: workspace membership incomplete ({} not in the discovered set): lockfile not scanned",
+                        "{}: workspace membership incomplete ({} not in the discovered set): lockfile not scanned (no workspace member gets lock-based transitive coverage until this is resolved)",
                         lock.display(),
                         missing.display()
                     ));
@@ -297,6 +297,12 @@ mod tests {
         assert!(d.locks.is_empty(), "partial workspace must not be scanned");
         assert_eq!(d.warnings.len(), 1);
         assert!(d.warnings[0].contains("workspace membership incomplete"));
+        assert!(
+            d.warnings[0]
+                .contains("no workspace member gets lock-based transitive coverage until this is resolved"),
+            "warning must spell out the scope of the coverage gap: {}",
+            d.warnings[0]
+        );
     }
 
     #[test]
