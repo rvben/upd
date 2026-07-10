@@ -148,7 +148,7 @@ impl AuditResult {
 /// that suffix is carried over from the installed version when the advisory's
 /// fixed version has no build metadata of its own. All other ecosystems use
 /// the OSV string as-is.
-fn manifest_fix_version(package: &Package, fixed: &str) -> String {
+pub(crate) fn manifest_fix_version(package: &Package, fixed: &str) -> String {
     match package.ecosystem {
         Ecosystem::Go => {
             let mut version = if fixed.starts_with('v') {

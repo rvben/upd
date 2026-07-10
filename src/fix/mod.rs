@@ -1,0 +1,1349 @@
+//! Explicit per-target fix actions: routing vulnerable (name, version) pairs
+//! into manifest edits and version floors. Writers live in uv/npm;
+//! transactional application in apply.
+//!
+//! `pub mod apply;`, `pub mod npm;`, and `pub mod uv;` land in later tasks
+//! that add the floor writers and the transactional apply layer this
+//! module's targets feed into; this module only computes targets.
+
+use crate::align::PackageOccurrence;
+use crate::audit::{AuditResult, Ecosystem, Package, manifest_fix_version};
+use crate::lockscan::discover::LockKind;
+use crate::lockscan::provenance::{Owner, Provenance, ProvenanceIndex};
+use crate::normalize::pep503_normalize;
+use crate::updater::{FileType, Lang};
+use std::cmp::Ordering;
+use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
+
+/// How a fix is applied: an in-place manifest edit, or a version floor
+/// written through a package-manager-specific mechanism.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FixKind {
+    ManifestEdit,
+    UvConstraint,
+    NpmOverride,
+    CargoPrecise,
+}
+
+impl FixKind {
+    pub fn method(&self) -> &'static str {
+        match self {
+            FixKind::ManifestEdit => "manifest",
+            FixKind::UvConstraint => "uv-constraint",
+            FixKind::NpmOverride => "npm-override",
+            FixKind::CargoPrecise => "cargo-precise",
+        }
+    }
+}
+
+/// Which form an npm `overrides` entry takes, per the EOVERRIDE guard: a
+/// plain semver range when the package is not also a direct dependency, or
+/// a `$name` reference (plus a companion manifest edit bumping the direct
+/// spec) when it is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NpmOverrideForm {
+    Range,
+    DollarName,
+}
+
+/// A single concrete fix action: bump one manifest entry, or write one
+/// version floor.
+#[derive(Debug, Clone)]
+pub struct FixTarget {
+    pub package: String,
+    pub dependency_key: Option<String>,
+    pub from_version: String,
+    pub to_version: String,
+    pub vulnerable_version: String,
+    pub kind: FixKind,
+    pub path: PathBuf,
+    pub file_type: Option<FileType>,
+    pub lockfile: Option<PathBuf>,
+    pub line_number: Option<usize>,
+    pub npm_form: Option<NpmOverrideForm>,
+}
+
+/// A vulnerable pair (or manifest occurrence) that routing could not turn
+/// into a fix target, with a human-readable reason.
+#[derive(Debug, Clone)]
+pub struct UnfixableTarget {
+    pub package: String,
+    pub dependency_key: Option<String>,
+    pub from_version: String,
+    pub to_version: Option<String>,
+    pub method: Option<&'static str>,
+    pub path: Option<PathBuf>,
+    pub reason: String,
+    pub no_fixed_version: bool,
+}
+
+/// The full routing outcome across every vulnerable pair.
+#[derive(Debug, Default)]
+pub struct FixRouting {
+    pub targets: Vec<FixTarget>,
+    pub unfixable: Vec<UnfixableTarget>,
+}
+
+/// Accumulator for the per-pair walk. Manifest edits, npm `$name` companion
+/// edits, uv/npm floor targets, and Cargo precise targets are tracked
+/// separately because [`route_fix_targets`] merges each group under a
+/// different policy (see the merge functions below) before combining them
+/// into the final [`FixRouting::targets`].
+#[derive(Default)]
+struct Sink {
+    manifest_edits: Vec<FixTarget>,
+    npm_companions: Vec<FixTarget>,
+    floor_targets: Vec<FixTarget>,
+    cargo_targets: Vec<FixTarget>,
+    unfixable: Vec<UnfixableTarget>,
+}
+
+/// PyPI names are matched PEP 503-normalized; every other ecosystem matches
+/// on a plain lowercase (npm and crates.io names are already
+/// lowercase-only by registry convention, and Go/RubyGems/NuGet have no
+/// equivalent canonicalization in this codebase).
+fn normalized_name(name: &str, ecosystem: Ecosystem) -> String {
+    if ecosystem == Ecosystem::PyPI {
+        pep503_normalize(name)
+    } else {
+        name.to_lowercase()
+    }
+}
+
+/// The `Lang` an OSV `Ecosystem` corresponds to, mirroring the reverse
+/// mapping used when packages are queued for audit (main.rs).
+fn ecosystem_lang(ecosystem: Ecosystem) -> Lang {
+    match ecosystem {
+        Ecosystem::PyPI => Lang::Python,
+        Ecosystem::Npm => Lang::Node,
+        Ecosystem::CratesIo => Lang::Rust,
+        Ecosystem::Go => Lang::Go,
+        Ecosystem::RubyGems => Lang::Ruby,
+        Ecosystem::NuGet => Lang::DotNet,
+    }
+}
+
+/// `Some(key)` when a manifest-declared key differs from the registry name
+/// (Cargo renames, npm aliases); `None` otherwise, so ordinary occurrences
+/// don't carry a redundant `dependency_key`.
+fn dependency_key_if_different(key: &str, package: &str) -> Option<String> {
+    if key == package {
+        None
+    } else {
+        Some(key.to_string())
+    }
+}
+
+/// Every occurrence of `norm` (already normalized per `ecosystem`) across
+/// the languages files scanned for `ecosystem`. The occurrence map key is
+/// `(name.to_lowercase(), Lang)` (align.rs), never PEP 503-normalized, so
+/// PyPI candidates are normalized again here before comparing.
+fn matching_occurrences<'a>(
+    packages: &'a HashMap<(String, Lang), Vec<PackageOccurrence>>,
+    norm: &str,
+    ecosystem: Ecosystem,
+) -> Vec<&'a PackageOccurrence> {
+    let lang = ecosystem_lang(ecosystem);
+    let mut result = Vec::new();
+    for ((name, l), occs) in packages {
+        if *l != lang {
+            continue;
+        }
+        let candidate = if ecosystem == Ecosystem::PyPI {
+            pep503_normalize(name)
+        } else {
+            name.clone()
+        };
+        if candidate == norm {
+            result.extend(occs.iter());
+        }
+    }
+    result
+}
+
+/// Route a Manifest-covered pair (rule 2): one `ManifestEdit` per occurrence
+/// of the pair's name in each owner's manifest, unless the owner declared it
+/// as an npm alias (unfixable) or the occurrence is unbumpable (unfixable).
+fn route_manifest_covered(
+    pkg: &Package,
+    owners: &[Owner],
+    lockfile: &Path,
+    to_version: &str,
+    packages: &HashMap<(String, Lang), Vec<PackageOccurrence>>,
+    sink: &mut Sink,
+) {
+    let norm = normalized_name(&pkg.name, pkg.ecosystem);
+    for owner in owners {
+        if owner.npm_alias {
+            sink.unfixable.push(UnfixableTarget {
+                package: pkg.name.clone(),
+                dependency_key: Some(owner.dependency_key.clone()),
+                from_version: pkg.version.clone(),
+                to_version: Some(to_version.to_string()),
+                method: Some(FixKind::ManifestEdit.method()),
+                path: Some(owner.manifest.clone()),
+                reason: format!(
+                    "declared as npm alias \"{}\" in {}; upd cannot rewrite alias specs - update it manually to \"{}\": \"npm:{}@>={}\"",
+                    owner.dependency_key,
+                    owner.manifest.display(),
+                    owner.dependency_key,
+                    pkg.name,
+                    to_version
+                ),
+                no_fixed_version: false,
+            });
+            continue;
+        }
+
+        let dep_key = dependency_key_if_different(&owner.dependency_key, &pkg.name);
+        let occurrences: Vec<&PackageOccurrence> =
+            matching_occurrences(packages, &norm, pkg.ecosystem)
+                .into_iter()
+                .filter(|o| o.file_path == owner.manifest)
+                .collect();
+
+        for occ in occurrences {
+            if !occ.is_bumpable {
+                sink.unfixable.push(UnfixableTarget {
+                    package: pkg.name.clone(),
+                    dependency_key: dep_key.clone(),
+                    from_version: occ.version.clone(),
+                    to_version: Some(to_version.to_string()),
+                    method: Some(FixKind::ManifestEdit.method()),
+                    path: Some(owner.manifest.clone()),
+                    reason: "no bumpable manifest entry (e.g. a commit-pinned version)".to_string(),
+                    no_fixed_version: false,
+                });
+                continue;
+            }
+            sink.manifest_edits.push(FixTarget {
+                package: pkg.name.clone(),
+                dependency_key: dep_key.clone(),
+                from_version: occ.version.clone(),
+                to_version: to_version.to_string(),
+                vulnerable_version: pkg.version.clone(),
+                kind: FixKind::ManifestEdit,
+                path: owner.manifest.clone(),
+                file_type: Some(occ.file_type),
+                lockfile: Some(lockfile.to_path_buf()),
+                line_number: occ.line_number,
+                npm_form: None,
+            });
+        }
+    }
+}
+
+/// Route a pair with no provenance entry at all (rule 4: Go, RubyGems,
+/// NuGet, or any manifest whose lock wasn't scanned): one `ManifestEdit` per
+/// occurrence of the name across the pair's ecosystem, unchanged from
+/// pre-lockscan behavior.
+fn route_no_provenance(
+    pkg: &Package,
+    to_version: &str,
+    packages: &HashMap<(String, Lang), Vec<PackageOccurrence>>,
+    sink: &mut Sink,
+) {
+    let norm = normalized_name(&pkg.name, pkg.ecosystem);
+    for occ in matching_occurrences(packages, &norm, pkg.ecosystem) {
+        let dep_key = dependency_key_if_different(&occ.original_name, &pkg.name);
+        if !occ.is_bumpable {
+            sink.unfixable.push(UnfixableTarget {
+                package: pkg.name.clone(),
+                dependency_key: dep_key,
+                from_version: occ.version.clone(),
+                to_version: Some(to_version.to_string()),
+                method: Some(FixKind::ManifestEdit.method()),
+                path: Some(occ.file_path.clone()),
+                reason: "no bumpable manifest entry (e.g. a commit-pinned version)".to_string(),
+                no_fixed_version: false,
+            });
+            continue;
+        }
+        sink.manifest_edits.push(FixTarget {
+            package: pkg.name.clone(),
+            dependency_key: dep_key,
+            from_version: occ.version.clone(),
+            to_version: to_version.to_string(),
+            vulnerable_version: pkg.version.clone(),
+            kind: FixKind::ManifestEdit,
+            path: occ.file_path.clone(),
+            file_type: Some(occ.file_type),
+            lockfile: None,
+            line_number: occ.line_number,
+            npm_form: None,
+        });
+    }
+}
+
+/// Route a LockOnly pair (rule 3) by lock kind: uv floors via
+/// `constraint-dependencies`, poetry has no floor mechanism, Cargo floors
+/// via `cargo update --precise`, npm goes through the EOVERRIDE guard.
+fn route_lock_only(
+    pkg: &Package,
+    lockfile: &Path,
+    kind: LockKind,
+    to_version: &str,
+    prov: &ProvenanceIndex,
+    packages: &HashMap<(String, Lang), Vec<PackageOccurrence>>,
+    sink: &mut Sink,
+) {
+    match kind {
+        LockKind::Uv => {
+            let Some(dir) = lockfile.parent() else {
+                return;
+            };
+            let host = dir.join("pyproject.toml");
+            sink.floor_targets.push(FixTarget {
+                package: pkg.name.clone(),
+                dependency_key: None,
+                from_version: pkg.version.clone(),
+                to_version: to_version.to_string(),
+                vulnerable_version: pkg.version.clone(),
+                kind: FixKind::UvConstraint,
+                path: host,
+                file_type: Some(FileType::PyProject),
+                lockfile: Some(lockfile.to_path_buf()),
+                line_number: None,
+                npm_form: None,
+            });
+        }
+        LockKind::Poetry => {
+            sink.unfixable.push(UnfixableTarget {
+                package: pkg.name.clone(),
+                dependency_key: None,
+                from_version: pkg.version.clone(),
+                to_version: Some(to_version.to_string()),
+                method: None,
+                path: Some(lockfile.to_path_buf()),
+                reason: format!(
+                    "no floor mechanism exists for poetry.lock; add {}>={} as a direct dependency",
+                    pkg.name, to_version
+                ),
+                no_fixed_version: false,
+            });
+        }
+        LockKind::Cargo => {
+            sink.cargo_targets.push(FixTarget {
+                package: pkg.name.clone(),
+                dependency_key: None,
+                from_version: pkg.version.clone(),
+                to_version: to_version.to_string(),
+                vulnerable_version: pkg.version.clone(),
+                kind: FixKind::CargoPrecise,
+                path: lockfile.to_path_buf(),
+                file_type: None,
+                lockfile: Some(lockfile.to_path_buf()),
+                line_number: None,
+                npm_form: None,
+            });
+        }
+        LockKind::Npm => {
+            route_npm_lock_only(pkg, lockfile, to_version, prov, packages, sink);
+        }
+    }
+}
+
+/// The npm EOVERRIDE guard (rule 3, npm branch): npm refuses to override a
+/// package that is also a direct dependency unless the override uses a
+/// `$name` reference, which in turn requires the direct spec itself to be
+/// bumped to at least the floor (the companion `ManifestEdit`).
+fn route_npm_lock_only(
+    pkg: &Package,
+    lockfile: &Path,
+    to_version: &str,
+    prov: &ProvenanceIndex,
+    packages: &HashMap<(String, Lang), Vec<PackageOccurrence>>,
+    sink: &mut Sink,
+) {
+    let Some(dir) = lockfile.parent() else {
+        return;
+    };
+    let host = dir.join("package.json");
+    let norm = normalized_name(&pkg.name, pkg.ecosystem);
+
+    let matching_direct = prov.npm_direct.get(&host).and_then(|deps| {
+        deps.iter()
+            .find(|d| normalized_name(&d.package, pkg.ecosystem) == norm)
+    });
+
+    match matching_direct {
+        None => {
+            sink.floor_targets.push(FixTarget {
+                package: pkg.name.clone(),
+                dependency_key: None,
+                from_version: pkg.version.clone(),
+                to_version: to_version.to_string(),
+                vulnerable_version: pkg.version.clone(),
+                kind: FixKind::NpmOverride,
+                path: host,
+                file_type: Some(FileType::PackageJson),
+                lockfile: Some(lockfile.to_path_buf()),
+                line_number: None,
+                npm_form: Some(NpmOverrideForm::Range),
+            });
+        }
+        Some(d) if d.spec.starts_with("npm:") => {
+            sink.unfixable.push(UnfixableTarget {
+                package: pkg.name.clone(),
+                dependency_key: Some(d.key.clone()),
+                from_version: pkg.version.clone(),
+                to_version: Some(to_version.to_string()),
+                method: None,
+                path: Some(host),
+                reason: format!(
+                    "only reachable through npm alias \"{}\"; an npm override cannot be expressed with a $-reference here - add \"{}\": \">={}\" to overrides manually if desired",
+                    d.key, pkg.name, to_version
+                ),
+                no_fixed_version: false,
+            });
+        }
+        Some(d) => {
+            let occ = matching_occurrences(packages, &norm, pkg.ecosystem)
+                .into_iter()
+                .find(|o| o.file_path == host);
+            match occ {
+                Some(o) => {
+                    sink.floor_targets.push(FixTarget {
+                        package: pkg.name.clone(),
+                        dependency_key: None,
+                        from_version: pkg.version.clone(),
+                        to_version: to_version.to_string(),
+                        vulnerable_version: pkg.version.clone(),
+                        kind: FixKind::NpmOverride,
+                        path: host.clone(),
+                        file_type: Some(FileType::PackageJson),
+                        lockfile: Some(lockfile.to_path_buf()),
+                        line_number: None,
+                        npm_form: Some(NpmOverrideForm::DollarName),
+                    });
+                    let dep_key = dependency_key_if_different(&d.key, &pkg.name);
+                    sink.npm_companions.push(FixTarget {
+                        package: pkg.name.clone(),
+                        dependency_key: dep_key,
+                        from_version: o.version.clone(),
+                        to_version: to_version.to_string(),
+                        vulnerable_version: pkg.version.clone(),
+                        kind: FixKind::ManifestEdit,
+                        path: host,
+                        file_type: Some(o.file_type),
+                        lockfile: Some(lockfile.to_path_buf()),
+                        line_number: o.line_number,
+                        npm_form: None,
+                    });
+                }
+                None => {
+                    sink.unfixable.push(UnfixableTarget {
+                        package: pkg.name.clone(),
+                        dependency_key: Some(d.key.clone()),
+                        from_version: pkg.version.clone(),
+                        to_version: Some(to_version.to_string()),
+                        method: None,
+                        path: Some(host),
+                        reason: format!(
+                            "direct dependency \"{}\" has a spec upd cannot bump; floor it manually",
+                            d.key
+                        ),
+                        no_fixed_version: false,
+                    });
+                }
+            }
+        }
+    }
+}
+
+/// Exact-duplicate dedup only: the same `(path, dependency_key,
+/// from_version, to_version)` reached via two different provenance entries
+/// (e.g. test 15's dual-lock pair) collapses to one edit. Distinct
+/// occurrences of the same package in the same manifest (different lines,
+/// different declared versions) are never collapsed since they differ in
+/// `from_version` or are filtered upstream by owner/manifest.
+fn merge_manifest_edits(edits: Vec<FixTarget>) -> Vec<FixTarget> {
+    let mut seen: HashSet<(PathBuf, Option<String>, String, String)> = HashSet::new();
+    let mut out = Vec::new();
+    for edit in edits {
+        let key = (
+            edit.path.clone(),
+            edit.dependency_key.clone(),
+            edit.from_version.clone(),
+            edit.to_version.clone(),
+        );
+        if seen.insert(key) {
+            out.push(edit);
+        }
+    }
+    out
+}
+
+/// Prefer the `DollarName` form once any merged pair required it: the
+/// direct-dependency relationship that triggers `DollarName` is a static
+/// property of the package/host pair, not of which vulnerable version
+/// triggered routing, so a mix only arises from routing order, never from
+/// conflicting facts.
+fn merge_npm_form(
+    a: Option<NpmOverrideForm>,
+    b: Option<NpmOverrideForm>,
+) -> Option<NpmOverrideForm> {
+    match (a, b) {
+        (Some(NpmOverrideForm::DollarName), _) | (_, Some(NpmOverrideForm::DollarName)) => {
+            Some(NpmOverrideForm::DollarName)
+        }
+        (Some(f), _) | (_, Some(f)) => Some(f),
+        (None, None) => None,
+    }
+}
+
+/// npm `$name` companion `ManifestEdit`s merge by `(path, dependency_key)`:
+/// multiple lock-only vulnerable versions of the same transitive package
+/// synthesize a companion edit for the same direct occurrence each time, so
+/// keep the max floor rather than emitting (or conflicting on) duplicates.
+fn merge_npm_companions(companions: Vec<FixTarget>) -> Vec<FixTarget> {
+    let mut map: HashMap<(PathBuf, String), FixTarget> = HashMap::new();
+    for edit in companions {
+        let effective_key = edit
+            .dependency_key
+            .clone()
+            .unwrap_or_else(|| edit.package.clone());
+        let map_key = (edit.path.clone(), effective_key);
+        map.entry(map_key)
+            .and_modify(|existing| {
+                if compare_versions(&edit.to_version, &existing.to_version) == Ordering::Greater {
+                    existing.to_version = edit.to_version.clone();
+                }
+                if compare_versions(&edit.from_version, &existing.from_version) == Ordering::Greater
+                {
+                    existing.from_version = edit.from_version.clone();
+                }
+                if compare_versions(&edit.vulnerable_version, &existing.vulnerable_version)
+                    == Ordering::Greater
+                {
+                    existing.vulnerable_version = edit.vulnerable_version.clone();
+                }
+            })
+            .or_insert(edit);
+    }
+    map.into_values().collect()
+}
+
+/// `(kind, path, normalized package)` for grouping uv/npm floor targets;
+/// `kind` alone determines which normalization applies since `UvConstraint`
+/// targets are always PyPI and `NpmOverride` targets are always npm.
+fn floor_group_key(target: &FixTarget) -> (&'static str, PathBuf, String) {
+    let norm = if target.kind == FixKind::UvConstraint {
+        pep503_normalize(&target.package)
+    } else {
+        target.package.to_lowercase()
+    };
+    (target.kind.method(), target.path.clone(), norm)
+}
+
+/// uv/npm floor targets merge by `(kind, path, normalized package)`: keep
+/// the max `to_version` (the floor must clear every vulnerable version) and
+/// the max `from_version`/`vulnerable_version` (the highest vulnerable
+/// locked version among the merged group).
+fn merge_floor_group(targets: Vec<FixTarget>) -> Vec<FixTarget> {
+    let mut map: HashMap<(&'static str, PathBuf, String), FixTarget> = HashMap::new();
+    for target in targets {
+        let key = floor_group_key(&target);
+        map.entry(key)
+            .and_modify(|existing| {
+                if compare_versions(&target.to_version, &existing.to_version) == Ordering::Greater {
+                    existing.to_version = target.to_version.clone();
+                }
+                if compare_versions(&target.from_version, &existing.from_version)
+                    == Ordering::Greater
+                {
+                    existing.from_version = target.from_version.clone();
+                }
+                if compare_versions(&target.vulnerable_version, &existing.vulnerable_version)
+                    == Ordering::Greater
+                {
+                    existing.vulnerable_version = target.vulnerable_version.clone();
+                }
+                existing.npm_form = merge_npm_form(existing.npm_form, target.npm_form);
+            })
+            .or_insert(target);
+    }
+    map.into_values().collect()
+}
+
+fn compare_versions(a: &str, b: &str) -> Ordering {
+    crate::version::compare::compare_versions(a, b)
+}
+
+/// Route every vulnerable (name, version) pair in `audit` into explicit
+/// manifest-edit and version-floor targets, or into `unfixable` with a
+/// human-readable reason. See the module's routing rules (spec Section
+/// 2-4): a pair with no fix at all is unfixable; a Manifest-covered pair
+/// gets one edit per occurrence per owner; a LockOnly pair floors by lock
+/// kind; a pair with no provenance entry falls back to today's
+/// occurrence-based manifest edits. Multiple provenance entries for the
+/// same pair (one per lockfile that resolves it) are all routed, and
+/// same-target floors/edits from different pairs are merged rather than
+/// duplicated or left conflicting.
+pub fn route_fix_targets(
+    audit: &AuditResult,
+    prov: &ProvenanceIndex,
+    packages: &HashMap<(String, Lang), Vec<PackageOccurrence>>,
+) -> FixRouting {
+    let mut sink = Sink::default();
+
+    for pkg_result in &audit.vulnerable {
+        let pkg = &pkg_result.package;
+
+        let blocker = pkg_result
+            .vulnerabilities
+            .iter()
+            .find(|v| v.fixed_version.is_none());
+        if let Some(v) = blocker {
+            sink.unfixable.push(UnfixableTarget {
+                package: pkg.name.clone(),
+                dependency_key: None,
+                from_version: pkg.version.clone(),
+                to_version: None,
+                method: None,
+                path: None,
+                reason: format!("{} has no fixed version", v.id),
+                no_fixed_version: true,
+            });
+            continue;
+        }
+
+        let Some(fixed) = pkg_result
+            .vulnerabilities
+            .iter()
+            .filter_map(|v| v.fixed_version.as_deref())
+            .max_by(|a, b| compare_versions(a, b))
+        else {
+            continue;
+        };
+        let to_version = manifest_fix_version(pkg, fixed);
+
+        let norm = normalized_name(&pkg.name, pkg.ecosystem);
+        let pair_key = (norm, pkg.version.clone(), pkg.ecosystem.as_str());
+
+        match prov.map.get(&pair_key) {
+            Some(entries) if !entries.is_empty() => {
+                for entry in entries {
+                    match entry {
+                        Provenance::Manifest { owners, lockfile } => {
+                            route_manifest_covered(
+                                pkg,
+                                owners,
+                                lockfile,
+                                &to_version,
+                                packages,
+                                &mut sink,
+                            );
+                        }
+                        Provenance::LockOnly { lockfile, kind } => {
+                            route_lock_only(
+                                pkg,
+                                lockfile,
+                                *kind,
+                                &to_version,
+                                prov,
+                                packages,
+                                &mut sink,
+                            );
+                        }
+                    }
+                }
+            }
+            _ => {
+                route_no_provenance(pkg, &to_version, packages, &mut sink);
+            }
+        }
+    }
+
+    let mut targets = merge_manifest_edits(sink.manifest_edits);
+    targets.extend(merge_npm_companions(sink.npm_companions));
+    targets.extend(merge_floor_group(sink.floor_targets));
+    targets.extend(sink.cargo_targets);
+
+    FixRouting {
+        targets,
+        unfixable: sink.unfixable,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::audit::{PackageAuditResult, Vulnerability};
+    use crate::lockscan::provenance::DirectDep;
+
+    fn vuln(id: &str, fixed: Option<&str>) -> Vulnerability {
+        Vulnerability {
+            id: id.to_string(),
+            summary: None,
+            severity: None,
+            url: None,
+            fixed_version: fixed.map(str::to_string),
+            aliases: Vec::new(),
+            source: String::new(),
+        }
+    }
+
+    fn pkg(name: &str, version: &str, ecosystem: Ecosystem) -> Package {
+        Package {
+            name: name.to_string(),
+            version: version.to_string(),
+            ecosystem,
+        }
+    }
+
+    fn vulnerable(package: Package, vulns: Vec<Vulnerability>) -> PackageAuditResult {
+        PackageAuditResult {
+            package,
+            vulnerabilities: vulns,
+        }
+    }
+
+    fn audit_of(results: Vec<PackageAuditResult>) -> AuditResult {
+        AuditResult {
+            vulnerable: results,
+            safe_count: 0,
+            errors: Vec::new(),
+            warnings: Vec::new(),
+        }
+    }
+
+    fn occ(
+        file_path: &str,
+        file_type: FileType,
+        version: &str,
+        line_number: Option<usize>,
+        original_name: &str,
+        is_bumpable: bool,
+    ) -> PackageOccurrence {
+        PackageOccurrence {
+            file_path: PathBuf::from(file_path),
+            file_type,
+            version: version.to_string(),
+            line_number,
+            has_upper_bound: false,
+            original_name: original_name.to_string(),
+            is_bumpable,
+        }
+    }
+
+    fn packages_map(
+        entries: Vec<((&str, Lang), Vec<PackageOccurrence>)>,
+    ) -> HashMap<(String, Lang), Vec<PackageOccurrence>> {
+        entries
+            .into_iter()
+            .map(|((name, lang), occs)| ((name.to_string(), lang), occs))
+            .collect()
+    }
+
+    fn owner(manifest: &str, file_type: FileType, key: &str, alias: bool) -> Owner {
+        Owner {
+            manifest: PathBuf::from(manifest),
+            file_type,
+            dependency_key: key.to_string(),
+            npm_alias: alias,
+        }
+    }
+
+    fn manifest_prov(owners: Vec<Owner>, lockfile: &str) -> Provenance {
+        Provenance::Manifest {
+            owners,
+            lockfile: PathBuf::from(lockfile),
+        }
+    }
+
+    fn lock_only_prov(lockfile: &str, kind: LockKind) -> Provenance {
+        Provenance::LockOnly {
+            lockfile: PathBuf::from(lockfile),
+            kind,
+        }
+    }
+
+    type ProvEntry<'a> = ((&'a str, &'a str, &'static str), Vec<Provenance>);
+
+    fn prov_index(
+        entries: Vec<ProvEntry<'_>>,
+        npm_direct: Vec<(&str, Vec<DirectDep>)>,
+    ) -> ProvenanceIndex {
+        let mut map = HashMap::new();
+        for ((name, version, eco), provs) in entries {
+            map.insert((name.to_string(), version.to_string(), eco), provs);
+        }
+        let mut nd = HashMap::new();
+        for (host, deps) in npm_direct {
+            nd.insert(PathBuf::from(host), deps);
+        }
+        ProvenanceIndex {
+            map,
+            npm_direct: nd,
+        }
+    }
+
+    fn direct(key: &str, package: &str, spec: &str) -> DirectDep {
+        DirectDep {
+            key: key.to_string(),
+            package: package.to_string(),
+            spec: spec.to_string(),
+        }
+    }
+
+    #[test]
+    fn no_fixed_version_pair_is_unfixable_with_flag() {
+        let audit = audit_of(vec![vulnerable(
+            pkg("examplepkg", "1.0.0", Ecosystem::PyPI),
+            vec![vuln("GHSA-aaaa-bbbb-cccc", None)],
+        )]);
+        let prov = ProvenanceIndex::default();
+        let packages = HashMap::new();
+
+        let routing = route_fix_targets(&audit, &prov, &packages);
+
+        assert!(routing.targets.is_empty());
+        assert_eq!(routing.unfixable.len(), 1);
+        let u = &routing.unfixable[0];
+        assert!(u.no_fixed_version);
+        assert_eq!(u.reason, "GHSA-aaaa-bbbb-cccc has no fixed version");
+        assert_eq!(u.package, "examplepkg");
+    }
+
+    #[test]
+    fn lock_only_uv_pair_floors_to_adjacent_pyproject() {
+        let audit = audit_of(vec![vulnerable(
+            pkg("examplepkg", "1.0.0", Ecosystem::PyPI),
+            vec![vuln("GHSA-1", Some("1.2.0"))],
+        )]);
+        let prov = prov_index(
+            vec![(
+                ("examplepkg", "1.0.0", "PyPI"),
+                vec![lock_only_prov("proj/uv.lock", LockKind::Uv)],
+            )],
+            vec![],
+        );
+        let packages = HashMap::new();
+
+        let routing = route_fix_targets(&audit, &prov, &packages);
+
+        assert!(routing.unfixable.is_empty());
+        assert_eq!(routing.targets.len(), 1);
+        let t = &routing.targets[0];
+        assert_eq!(t.kind, FixKind::UvConstraint);
+        assert_eq!(t.path, PathBuf::from("proj/pyproject.toml"));
+        assert_eq!(t.from_version, "1.0.0");
+        assert_eq!(t.to_version, "1.2.0");
+        assert_eq!(t.vulnerable_version, "1.0.0");
+        assert_eq!(t.lockfile, Some(PathBuf::from("proj/uv.lock")));
+    }
+
+    #[test]
+    fn lock_only_poetry_pair_is_unfixable_with_guidance() {
+        let audit = audit_of(vec![vulnerable(
+            pkg("examplepkg", "1.0.0", Ecosystem::PyPI),
+            vec![vuln("GHSA-1", Some("1.2.0"))],
+        )]);
+        let prov = prov_index(
+            vec![(
+                ("examplepkg", "1.0.0", "PyPI"),
+                vec![lock_only_prov("proj/poetry.lock", LockKind::Poetry)],
+            )],
+            vec![],
+        );
+        let packages = HashMap::new();
+
+        let routing = route_fix_targets(&audit, &prov, &packages);
+
+        assert!(routing.targets.is_empty());
+        assert_eq!(routing.unfixable.len(), 1);
+        assert_eq!(
+            routing.unfixable[0].reason,
+            "no floor mechanism exists for poetry.lock; add examplepkg>=1.2.0 as a direct dependency"
+        );
+    }
+
+    #[test]
+    fn lock_only_cargo_duplicates_get_one_precise_each() {
+        let audit = audit_of(vec![
+            vulnerable(
+                pkg("examplecrate", "1.0.0", Ecosystem::CratesIo),
+                vec![vuln("RUSTSEC-1", Some("1.2.0"))],
+            ),
+            vulnerable(
+                pkg("examplecrate", "1.1.0", Ecosystem::CratesIo),
+                vec![vuln("RUSTSEC-2", Some("1.2.0"))],
+            ),
+        ]);
+        let prov = prov_index(
+            vec![
+                (
+                    ("examplecrate", "1.0.0", "crates.io"),
+                    vec![lock_only_prov("proj/Cargo.lock", LockKind::Cargo)],
+                ),
+                (
+                    ("examplecrate", "1.1.0", "crates.io"),
+                    vec![lock_only_prov("proj/Cargo.lock", LockKind::Cargo)],
+                ),
+            ],
+            vec![],
+        );
+        let packages = HashMap::new();
+
+        let routing = route_fix_targets(&audit, &prov, &packages);
+
+        assert!(routing.unfixable.is_empty());
+        assert_eq!(routing.targets.len(), 2);
+        assert!(
+            routing
+                .targets
+                .iter()
+                .all(|t| t.kind == FixKind::CargoPrecise)
+        );
+        let mut froms: Vec<&str> = routing
+            .targets
+            .iter()
+            .map(|t| t.from_version.as_str())
+            .collect();
+        froms.sort();
+        assert_eq!(froms, vec!["1.0.0", "1.1.0"]);
+        assert!(routing.targets.iter().all(|t| t.to_version == "1.2.0"));
+        assert!(
+            routing
+                .targets
+                .iter()
+                .all(|t| t.path == Path::new("proj/Cargo.lock"))
+        );
+    }
+
+    #[test]
+    fn npm_lock_only_not_reachable_gets_range_override() {
+        let audit = audit_of(vec![vulnerable(
+            pkg("examplepkg", "1.2.0", Ecosystem::Npm),
+            vec![vuln("GHSA-1", Some("1.5.0"))],
+        )]);
+        let prov = prov_index(
+            vec![(
+                ("examplepkg", "1.2.0", "npm"),
+                vec![lock_only_prov("proj/package-lock.json", LockKind::Npm)],
+            )],
+            vec![("proj/package.json", vec![])],
+        );
+        let packages = HashMap::new();
+
+        let routing = route_fix_targets(&audit, &prov, &packages);
+
+        assert!(routing.unfixable.is_empty());
+        assert_eq!(routing.targets.len(), 1);
+        let t = &routing.targets[0];
+        assert_eq!(t.kind, FixKind::NpmOverride);
+        assert_eq!(t.npm_form, Some(NpmOverrideForm::Range));
+        assert_eq!(t.path, PathBuf::from("proj/package.json"));
+        assert_eq!(t.to_version, "1.5.0");
+    }
+
+    #[test]
+    fn npm_both_direct_and_transitive_gets_dollar_name_plus_manifest_edit() {
+        let audit = audit_of(vec![vulnerable(
+            pkg("examplepkg", "1.2.0", Ecosystem::Npm),
+            vec![vuln("GHSA-1", Some("1.5.0"))],
+        )]);
+        let prov = prov_index(
+            vec![(
+                ("examplepkg", "1.2.0", "npm"),
+                vec![lock_only_prov("proj/package-lock.json", LockKind::Npm)],
+            )],
+            vec![(
+                "proj/package.json",
+                vec![direct("examplepkg", "examplepkg", "^1.0.0")],
+            )],
+        );
+        let packages = packages_map(vec![(
+            ("examplepkg", Lang::Node),
+            vec![occ(
+                "proj/package.json",
+                FileType::PackageJson,
+                "^1.0.0",
+                Some(5),
+                "examplepkg",
+                true,
+            )],
+        )]);
+
+        let routing = route_fix_targets(&audit, &prov, &packages);
+
+        assert!(routing.unfixable.is_empty());
+        assert_eq!(routing.targets.len(), 2);
+
+        let override_target = routing
+            .targets
+            .iter()
+            .find(|t| t.kind == FixKind::NpmOverride)
+            .unwrap();
+        assert_eq!(override_target.npm_form, Some(NpmOverrideForm::DollarName));
+        assert_eq!(override_target.to_version, "1.5.0");
+
+        let edit_target = routing
+            .targets
+            .iter()
+            .find(|t| t.kind == FixKind::ManifestEdit)
+            .unwrap();
+        assert_eq!(edit_target.from_version, "^1.0.0");
+        assert_eq!(edit_target.to_version, "1.5.0");
+        assert_eq!(edit_target.line_number, Some(5));
+        assert_eq!(edit_target.dependency_key, None);
+    }
+
+    #[test]
+    fn npm_alias_reachable_only_is_unfixable() {
+        let audit = audit_of(vec![vulnerable(
+            pkg("realpkg", "1.2.0", Ecosystem::Npm),
+            vec![vuln("GHSA-1", Some("1.5.0"))],
+        )]);
+        let prov = prov_index(
+            vec![(
+                ("realpkg", "1.2.0", "npm"),
+                vec![lock_only_prov("proj/package-lock.json", LockKind::Npm)],
+            )],
+            vec![(
+                "proj/package.json",
+                vec![direct("my-react", "realpkg", "npm:realpkg@^1.0.0")],
+            )],
+        );
+        let packages = HashMap::new();
+
+        let routing = route_fix_targets(&audit, &prov, &packages);
+
+        assert!(routing.targets.is_empty());
+        assert_eq!(routing.unfixable.len(), 1);
+        assert_eq!(
+            routing.unfixable[0].reason,
+            "only reachable through npm alias \"my-react\"; an npm override cannot be expressed with a $-reference here - add \"realpkg\": \">=1.5.0\" to overrides manually if desired"
+        );
+    }
+
+    #[test]
+    fn manifest_covered_alias_owner_is_unfixable() {
+        let audit = audit_of(vec![vulnerable(
+            pkg("realpkg", "18.0.0", Ecosystem::Npm),
+            vec![vuln("GHSA-1", Some("18.2.0"))],
+        )]);
+        let prov = prov_index(
+            vec![(
+                ("realpkg", "18.0.0", "npm"),
+                vec![manifest_prov(
+                    vec![owner(
+                        "proj/package.json",
+                        FileType::PackageJson,
+                        "my-react",
+                        true,
+                    )],
+                    "proj/package-lock.json",
+                )],
+            )],
+            vec![],
+        );
+        let packages = HashMap::new();
+
+        let routing = route_fix_targets(&audit, &prov, &packages);
+
+        assert!(routing.targets.is_empty());
+        assert_eq!(routing.unfixable.len(), 1);
+        assert_eq!(
+            routing.unfixable[0].reason,
+            "declared as npm alias \"my-react\" in proj/package.json; upd cannot rewrite alias specs - update it manually to \"my-react\": \"npm:realpkg@>=18.2.0\""
+        );
+    }
+
+    #[test]
+    fn cargo_rename_manifest_edit_carries_dependency_key() {
+        let audit = audit_of(vec![vulnerable(
+            pkg("serde", "1.0.5", Ecosystem::CratesIo),
+            vec![vuln("RUSTSEC-1", Some("1.0.10"))],
+        )]);
+        let prov = prov_index(
+            vec![(
+                ("serde", "1.0.5", "crates.io"),
+                vec![manifest_prov(
+                    vec![owner(
+                        "proj/Cargo.toml",
+                        FileType::CargoToml,
+                        "old_serde",
+                        false,
+                    )],
+                    "proj/Cargo.lock",
+                )],
+            )],
+            vec![],
+        );
+        let packages = packages_map(vec![(
+            ("serde", Lang::Rust),
+            vec![occ(
+                "proj/Cargo.toml",
+                FileType::CargoToml,
+                "1.0.5",
+                Some(8),
+                "serde",
+                true,
+            )],
+        )]);
+
+        let routing = route_fix_targets(&audit, &prov, &packages);
+
+        assert!(routing.unfixable.is_empty());
+        assert_eq!(routing.targets.len(), 1);
+        let t = &routing.targets[0];
+        assert_eq!(t.kind, FixKind::ManifestEdit);
+        assert_eq!(t.dependency_key, Some("old_serde".to_string()));
+        assert_eq!(t.package, "serde");
+        assert_eq!(t.from_version, "1.0.5");
+        assert_eq!(t.to_version, "1.0.10");
+        assert_eq!(t.line_number, Some(8));
+    }
+
+    #[test]
+    fn unbumpable_occurrence_is_unfixable() {
+        let audit = audit_of(vec![vulnerable(
+            pkg(
+                "example.com/mod",
+                "v0.0.0-20240101000000-abcdef123456",
+                Ecosystem::Go,
+            ),
+            vec![vuln("GO-1", Some("1.2.0"))],
+        )]);
+        let prov = ProvenanceIndex::default();
+        let packages = packages_map(vec![(
+            ("example.com/mod", Lang::Go),
+            vec![occ(
+                "proj/go.mod",
+                FileType::GoMod,
+                "v0.0.0-20240101000000-abcdef123456",
+                Some(12),
+                "example.com/mod",
+                false,
+            )],
+        )]);
+
+        let routing = route_fix_targets(&audit, &prov, &packages);
+
+        assert!(routing.targets.is_empty());
+        assert_eq!(routing.unfixable.len(), 1);
+        assert_eq!(
+            routing.unfixable[0].reason,
+            "no bumpable manifest entry (e.g. a commit-pinned version)"
+        );
+    }
+
+    #[test]
+    fn multiple_lock_only_versions_merge_to_max_floor() {
+        let audit = audit_of(vec![
+            vulnerable(
+                pkg("examplepkg", "1.0.0", Ecosystem::PyPI),
+                vec![vuln("GHSA-1", Some("1.2.0"))],
+            ),
+            vulnerable(
+                pkg("examplepkg", "1.1.0", Ecosystem::PyPI),
+                vec![vuln("GHSA-2", Some("1.3.0"))],
+            ),
+        ]);
+        let prov = prov_index(
+            vec![
+                (
+                    ("examplepkg", "1.0.0", "PyPI"),
+                    vec![lock_only_prov("proj/uv.lock", LockKind::Uv)],
+                ),
+                (
+                    ("examplepkg", "1.1.0", "PyPI"),
+                    vec![lock_only_prov("proj/uv.lock", LockKind::Uv)],
+                ),
+            ],
+            vec![],
+        );
+        let packages = HashMap::new();
+
+        let routing = route_fix_targets(&audit, &prov, &packages);
+
+        assert!(routing.unfixable.is_empty());
+        assert_eq!(routing.targets.len(), 1);
+        let t = &routing.targets[0];
+        assert_eq!(t.kind, FixKind::UvConstraint);
+        assert_eq!(t.to_version, "1.3.0");
+        assert_eq!(t.from_version, "1.1.0");
+    }
+
+    #[test]
+    fn go_pair_without_provenance_routes_manifest_edits_as_today() {
+        let audit = audit_of(vec![vulnerable(
+            pkg("example.com/mod", "v1.0.0", Ecosystem::Go),
+            vec![vuln("GO-1", Some("1.2.0"))],
+        )]);
+        let prov = ProvenanceIndex::default();
+        let packages = packages_map(vec![(
+            ("example.com/mod", Lang::Go),
+            vec![occ(
+                "proj/go.mod",
+                FileType::GoMod,
+                "v1.0.0",
+                Some(6),
+                "example.com/mod",
+                true,
+            )],
+        )]);
+
+        let routing = route_fix_targets(&audit, &prov, &packages);
+
+        assert!(routing.unfixable.is_empty());
+        assert_eq!(routing.targets.len(), 1);
+        let t = &routing.targets[0];
+        assert_eq!(t.kind, FixKind::ManifestEdit);
+        assert_eq!(t.path, PathBuf::from("proj/go.mod"));
+        assert_eq!(
+            t.to_version, "v1.2.0",
+            "Go fixed version normalized with v prefix"
+        );
+        assert_eq!(t.lockfile, None);
+        assert_eq!(t.dependency_key, None);
+    }
+
+    #[test]
+    fn multiple_npm_lock_only_versions_merge_override_and_companion_edit() {
+        let audit = audit_of(vec![
+            vulnerable(
+                pkg("examplepkg", "1.2.0", Ecosystem::Npm),
+                vec![vuln("GHSA-1", Some("1.5.0"))],
+            ),
+            vulnerable(
+                pkg("examplepkg", "1.3.0", Ecosystem::Npm),
+                vec![vuln("GHSA-2", Some("1.6.0"))],
+            ),
+        ]);
+        let prov = prov_index(
+            vec![
+                (
+                    ("examplepkg", "1.2.0", "npm"),
+                    vec![lock_only_prov("proj/package-lock.json", LockKind::Npm)],
+                ),
+                (
+                    ("examplepkg", "1.3.0", "npm"),
+                    vec![lock_only_prov("proj/package-lock.json", LockKind::Npm)],
+                ),
+            ],
+            vec![(
+                "proj/package.json",
+                vec![direct("examplepkg", "examplepkg", "^1.0.0")],
+            )],
+        );
+        let packages = packages_map(vec![(
+            ("examplepkg", Lang::Node),
+            vec![occ(
+                "proj/package.json",
+                FileType::PackageJson,
+                "^1.0.0",
+                Some(5),
+                "examplepkg",
+                true,
+            )],
+        )]);
+
+        let routing = route_fix_targets(&audit, &prov, &packages);
+
+        assert!(routing.unfixable.is_empty());
+        assert_eq!(routing.targets.len(), 2);
+
+        let override_target = routing
+            .targets
+            .iter()
+            .find(|t| t.kind == FixKind::NpmOverride)
+            .unwrap();
+        assert_eq!(override_target.npm_form, Some(NpmOverrideForm::DollarName));
+        assert_eq!(override_target.to_version, "1.6.0");
+        assert_eq!(override_target.from_version, "1.3.0");
+
+        let edit_target = routing
+            .targets
+            .iter()
+            .find(|t| t.kind == FixKind::ManifestEdit)
+            .unwrap();
+        assert_eq!(edit_target.to_version, "1.6.0");
+        assert_eq!(edit_target.from_version, "^1.0.0");
+    }
+
+    #[test]
+    fn npm_own_name_direct_without_occurrence_is_unfixable() {
+        let audit = audit_of(vec![vulnerable(
+            pkg("examplepkg", "1.2.0", Ecosystem::Npm),
+            vec![vuln("GHSA-1", Some("1.5.0"))],
+        )]);
+        let prov = prov_index(
+            vec![(
+                ("examplepkg", "1.2.0", "npm"),
+                vec![lock_only_prov("proj/package-lock.json", LockKind::Npm)],
+            )],
+            vec![(
+                "proj/package.json",
+                vec![direct("examplepkg", "examplepkg", "file:../local")],
+            )],
+        );
+        let packages = HashMap::new();
+
+        let routing = route_fix_targets(&audit, &prov, &packages);
+
+        assert!(routing.targets.is_empty());
+        assert_eq!(routing.unfixable.len(), 1);
+        assert_eq!(
+            routing.unfixable[0].reason,
+            "direct dependency \"examplepkg\" has a spec upd cannot bump; floor it manually"
+        );
+    }
+
+    #[test]
+    fn pair_covered_in_one_lock_and_lock_only_in_another_routes_both() {
+        let audit = audit_of(vec![vulnerable(
+            pkg("examplecrate", "1.2.3", Ecosystem::CratesIo),
+            vec![vuln("RUSTSEC-1", Some("1.3.0"))],
+        )]);
+        let prov = prov_index(
+            vec![(
+                ("examplecrate", "1.2.3", "crates.io"),
+                vec![
+                    manifest_prov(
+                        vec![owner(
+                            "a/Cargo.toml",
+                            FileType::CargoToml,
+                            "examplecrate",
+                            false,
+                        )],
+                        "a/Cargo.lock",
+                    ),
+                    lock_only_prov("b/Cargo.lock", LockKind::Cargo),
+                ],
+            )],
+            vec![],
+        );
+        let packages = packages_map(vec![(
+            ("examplecrate", Lang::Rust),
+            vec![occ(
+                "a/Cargo.toml",
+                FileType::CargoToml,
+                "1.2.3",
+                Some(4),
+                "examplecrate",
+                true,
+            )],
+        )]);
+
+        let routing = route_fix_targets(&audit, &prov, &packages);
+
+        assert!(routing.unfixable.is_empty());
+        assert_eq!(routing.targets.len(), 2);
+        assert!(
+            routing
+                .targets
+                .iter()
+                .any(|t| t.kind == FixKind::ManifestEdit && t.path == Path::new("a/Cargo.toml"))
+        );
+        assert!(
+            routing
+                .targets
+                .iter()
+                .any(|t| t.kind == FixKind::CargoPrecise && t.path == Path::new("b/Cargo.lock"))
+        );
+    }
+}
