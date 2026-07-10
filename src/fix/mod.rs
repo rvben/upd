@@ -2,9 +2,11 @@
 //! into manifest edits and version floors. Writers live in uv/npm;
 //! transactional application in apply.
 //!
-//! `pub mod apply;`, `pub mod npm;`, and `pub mod uv;` land in later tasks
-//! that add the floor writers and the transactional apply layer this
-//! module's targets feed into; this module only computes targets.
+//! `pub mod apply;` and `pub mod npm;` land in later tasks that add the npm
+//! override writer and the transactional apply layer this module's targets
+//! feed into; this module only computes targets.
+
+pub mod uv;
 
 use crate::align::PackageOccurrence;
 use crate::audit::{AuditResult, Ecosystem, Package, manifest_fix_version};
@@ -15,6 +17,21 @@ use crate::updater::{FileType, Lang};
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+
+/// Outcome of writing (or checking) a version floor through a
+/// package-manager-specific mechanism (uv constraint-dependencies, npm
+/// overrides, `cargo update --precise`). Shared across the floor writers so
+/// callers (Task 6's dispatcher, Task 7's transactional apply) handle all of
+/// them uniformly.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FloorWriteOutcome {
+    /// The floor entry was written (or would be written, in dry-run).
+    Written,
+    /// An existing entry already floors at or above the target; no write.
+    AlreadySatisfied,
+    /// Refused; guidance for the user in the payload.
+    Unfixable(String),
+}
 
 /// How a fix is applied: an in-place manifest edit, or a version floor
 /// written through a package-manager-specific mechanism.
