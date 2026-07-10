@@ -357,8 +357,9 @@ mod tests {
         assert_eq!(d.warnings.len(), 1);
         assert!(d.warnings[0].contains("workspace membership incomplete"));
         assert!(
-            d.warnings[0]
-                .contains("no workspace member gets lock-based transitive coverage until this is resolved"),
+            d.warnings[0].contains(
+                "no workspace member gets lock-based transitive coverage until this is resolved"
+            ),
             "warning must spell out the scope of the coverage gap: {}",
             d.warnings[0]
         );
