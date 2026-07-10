@@ -2,10 +2,10 @@
 //! into manifest edits and version floors. Writers live in uv/npm;
 //! transactional application in apply.
 //!
-//! `pub mod apply;` and `pub mod npm;` land in later tasks that add the npm
-//! override writer and the transactional apply layer this module's targets
-//! feed into; this module only computes targets.
+//! `pub mod apply;` lands in a later task that adds the transactional apply
+//! layer this module's targets feed into; this module only computes targets.
 
+pub mod npm;
 pub mod uv;
 
 use crate::align::PackageOccurrence;
