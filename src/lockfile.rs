@@ -57,6 +57,7 @@ pub enum LockfileType {
     PoetryLock,
     UvLock,
     PackageLockJson,
+    NpmShrinkwrap,
     YarnLock,
     PnpmLock,
     BunLock,
@@ -74,6 +75,7 @@ impl LockfileType {
             LockfileType::PoetryLock => "poetry.lock",
             LockfileType::UvLock => "uv.lock",
             LockfileType::PackageLockJson => "package-lock.json",
+            LockfileType::NpmShrinkwrap => "npm-shrinkwrap.json",
             LockfileType::YarnLock => "yarn.lock",
             LockfileType::PnpmLock => "pnpm-lock.yaml",
             LockfileType::BunLock => "bun.lockb",
@@ -99,9 +101,13 @@ impl LockfileType {
                 vec!["lock".to_string(), "--no-update".to_string()],
             ),
             LockfileType::UvLock => ("uv", vec!["lock".to_string()]),
-            LockfileType::PackageLockJson => (
+            LockfileType::PackageLockJson | LockfileType::NpmShrinkwrap => (
                 "npm",
-                vec!["install".to_string(), "--package-lock-only".to_string()],
+                vec![
+                    "install".to_string(),
+                    "--package-lock-only".to_string(),
+                    "--ignore-scripts".to_string(),
+                ],
             ),
             // Yarn Berry (v2+) only: `--mode update-lockfile` is the only
             // documented form that refreshes `yarn.lock` without running
@@ -158,6 +164,7 @@ impl LockfileType {
         match self {
             LockfileType::PoetryLock | LockfileType::UvLock => "pyproject.toml",
             LockfileType::PackageLockJson
+            | LockfileType::NpmShrinkwrap
             | LockfileType::YarnLock
             | LockfileType::PnpmLock
             | LockfileType::BunLock => "package.json",
@@ -207,7 +214,11 @@ pub fn detect_lockfiles(manifest_path: &Path) -> Vec<LockfileType> {
         .map(|n| n == "package.json")
         .unwrap_or(false)
     {
-        if dir.join("package-lock.json").exists() {
+        // npm ignores package-lock.json when npm-shrinkwrap.json exists, so
+        // shrinkwrap takes priority and package-lock.json is not also reported.
+        if dir.join("npm-shrinkwrap.json").exists() {
+            lockfiles.push(LockfileType::NpmShrinkwrap);
+        } else if dir.join("package-lock.json").exists() {
             lockfiles.push(LockfileType::PackageLockJson);
         }
         if dir.join("yarn.lock").exists() {
@@ -443,7 +454,21 @@ mod tests {
     fn test_package_lock_json_uses_package_lock_only_flag() {
         let (cmd, args) = LockfileType::PackageLockJson.command(&["react".to_string()]);
         assert_eq!(cmd, "npm");
-        assert_eq!(args, vec!["install", "--package-lock-only"]);
+        assert_eq!(
+            args,
+            vec!["install", "--package-lock-only", "--ignore-scripts"]
+        );
+    }
+
+    #[test]
+    fn npm_relock_commands_ignore_scripts() {
+        let (cmd, args) = LockfileType::PackageLockJson.command(&[]);
+        assert_eq!(cmd, "npm");
+        assert!(args.contains(&"--ignore-scripts".to_string()));
+        let (cmd, args) = LockfileType::NpmShrinkwrap.command(&[]);
+        assert_eq!(cmd, "npm");
+        assert!(args.contains(&"--package-lock-only".to_string()));
+        assert!(args.contains(&"--ignore-scripts".to_string()));
     }
 
     #[test]
@@ -582,6 +607,31 @@ mod tests {
         let detected = detect_lockfiles(&manifest);
         assert_eq!(detected.len(), 1);
         assert_eq!(detected[0], LockfileType::PackageLockJson);
+    }
+
+    #[test]
+    fn detect_prefers_shrinkwrap_over_package_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let manifest = dir.path().join("package.json");
+        std::fs::write(&manifest, "{}").unwrap();
+        std::fs::write(dir.path().join("package-lock.json"), "{}").unwrap();
+        std::fs::write(dir.path().join("npm-shrinkwrap.json"), "{}").unwrap();
+
+        let detected = detect_lockfiles(&manifest);
+        assert!(detected.contains(&LockfileType::NpmShrinkwrap));
+        assert!(
+            !detected.contains(&LockfileType::PackageLockJson),
+            "npm ignores package-lock.json when a shrinkwrap exists"
+        );
+    }
+
+    #[test]
+    fn detect_shrinkwrap_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let manifest = dir.path().join("package.json");
+        std::fs::write(&manifest, "{}").unwrap();
+        std::fs::write(dir.path().join("npm-shrinkwrap.json"), "{}").unwrap();
+        assert!(detect_lockfiles(&manifest).contains(&LockfileType::NpmShrinkwrap));
     }
 
     #[test]
