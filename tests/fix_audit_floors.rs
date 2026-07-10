@@ -1070,3 +1070,135 @@ async fn cargo_precise_group_failure_distinguishes_failed_from_rolled_back() {
         "cratec's error must be its OWN message, not the combined one: {cratec_error}"
     );
 }
+
+/// (m) An apply-time `Unfixable` outcome (the floor WRITER refuses, as
+/// opposed to a routing-time unfixable) must still surface in default
+/// text-mode `--fix-audit --apply`: `print_fix_outcome` previously swallowed
+/// `FixStatus::Unfixable` on the (wrong) assumption that every unfixable was
+/// already reported by the routing-time diagnostics loop, which only walks
+/// `routing.unfixable` (targets never routed) - not targets that WERE routed
+/// as fixable and only failed once the writer inspected the existing entry.
+/// Here `lockonly` routes to a `UvConstraint` floor (lock-only, like fixture
+/// (a)), but the pyproject already carries a non-simple multi-clause
+/// `[tool.uv] constraint-dependencies` entry the writer refuses to touch, so
+/// the outcome resolves to `Unfixable` only after routing succeeded.
+#[cfg(unix)]
+#[tokio::test]
+async fn text_mode_reports_apply_time_unfixable() {
+    let server = wiremock::MockServer::start().await;
+    mount_osv_single(&server, "GHSA-floors-m", "lockonly", "PyPI", "0.49.1").await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let pyproject_path = tmp.path().join("pyproject.toml");
+    fs::write(
+        &pyproject_path,
+        "[project]\nname = \"t\"\nversion = \"1.0.0\"\ndependencies = []\n\n[tool.uv]\nconstraint-dependencies = [\"lockonly>=0.30,<0.40\"]\n",
+    )
+    .unwrap();
+    fs::write(tmp.path().join("uv.lock"), uv_lock_at("lockonly", "0.35.0")).unwrap();
+    let pyproject_before = fs::read(&pyproject_path).unwrap();
+
+    // Poison pill: the writer refuses before any relock would help, so `uv`
+    // must never run for this fixture. If it somehow does, fail loudly
+    // rather than silently depending on (or hanging on) a real `uv`.
+    let bin_dir = tmp.path().join("fakebin");
+    fs::create_dir(&bin_dir).unwrap();
+    write_fake_tool(&bin_dir, "uv", "#!/bin/sh\nexit 1\n");
+
+    let (stdout, stderr, code) = run_with_env(
+        &[
+            "audit",
+            "--fix-audit",
+            "--apply",
+            "--no-cache",
+            "--output",
+            "text",
+        ],
+        tmp.path(),
+        &[
+            ("OSV_API_URL", &server.uri()),
+            ("PATH", &path_with(&bin_dir)),
+        ],
+    );
+
+    assert_eq!(code, 0, "stdout: {stdout}\nstderr: {stderr}");
+    assert!(stderr.contains("Cannot auto-fix"), "{stderr}");
+    assert!(stderr.contains("lockonly"), "{stderr}");
+    assert!(stderr.contains("not a simple form"), "{stderr}");
+
+    assert_eq!(
+        fs::read(&pyproject_path).unwrap(),
+        pyproject_before,
+        "the writer must refuse without touching the file"
+    );
+}
+
+/// (n) `FixStatus::PendingRelock` text wording must distinguish a manifest
+/// `ManifestEdit` (the direct dependency spec was bumped in place) from a
+/// version-floor write (uv-constraint / npm-override): only the latter is a
+/// "floor". A plain manifest-covered package with a lockfile sibling, fixed
+/// under `--no-lock`, previously printed "floor written to ..." for an edit
+/// that never touched a floor mechanism at all.
+#[cfg(unix)]
+#[tokio::test]
+async fn no_lock_manifest_edit_wording_is_not_floor() {
+    let server = wiremock::MockServer::start().await;
+    mount_osv_single(&server, "GHSA-floors-n", "lockonly", "PyPI", "0.49.1").await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    fs::write(
+        tmp.path().join("pyproject.toml"),
+        "[project]\nname = \"t\"\nversion = \"1.0.0\"\ndependencies = [\"lockonly==0.40.0\"]\n",
+    )
+    .unwrap();
+    fs::write(tmp.path().join("uv.lock"), uv_lock_at("lockonly", "0.40.0")).unwrap();
+
+    // Poison pill: --no-lock must never invoke uv.
+    let bin_dir = tmp.path().join("fakebin");
+    fs::create_dir(&bin_dir).unwrap();
+    let uv_marker = tmp.path().join("uv-invoked.marker");
+    write_fake_tool(
+        &bin_dir,
+        "uv",
+        &format!("#!/bin/sh\ntouch {}\nexit 1\n", uv_marker.display()),
+    );
+
+    let (stdout, stderr, code) = run_with_env(
+        &[
+            "audit",
+            "--fix-audit",
+            "--apply",
+            "--no-lock",
+            "--no-cache",
+            "--output",
+            "text",
+        ],
+        tmp.path(),
+        &[
+            ("OSV_API_URL", &server.uri()),
+            ("PATH", &path_with(&bin_dir)),
+        ],
+    );
+
+    assert_eq!(code, 0, "stdout: {stdout}\nstderr: {stderr}");
+    assert!(
+        !uv_marker.exists(),
+        "uv must never be invoked under --no-lock"
+    );
+
+    let combined = format!("{stdout}{stderr}");
+    assert!(
+        combined.contains("edit written to"),
+        "manifest edit wording expected: {combined}"
+    );
+    assert!(
+        !combined.contains("floor written to"),
+        "a manifest edit is not a floor: {combined}"
+    );
+
+    let pyproject = fs::read_to_string(tmp.path().join("pyproject.toml")).unwrap();
+    assert!(
+        pyproject.contains("0.49.1"),
+        "manifest entry should have been bumped in place: {pyproject}"
+    );
+}

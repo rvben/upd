@@ -2623,6 +2623,13 @@ fn print_fix_outcome(outcome: &AppliedFix) {
                 target.kind.method(),
             );
         }
+        (FixKind::ManifestEdit, FixStatus::PendingRelock) => {
+            println!(
+                "{} {}: edit written to {path} but lockfile not regenerated (--no-lock)",
+                "⚠".yellow().bold(),
+                target.package.bold(),
+            );
+        }
         (_, FixStatus::PendingRelock) => {
             println!(
                 "{} {}: floor written to {path} but lockfile not regenerated (--no-lock)",
@@ -2638,14 +2645,28 @@ fn print_fix_outcome(outcome: &AppliedFix) {
                 outcome.error.as_deref().unwrap_or("skipped"),
             );
         }
-        (_, FixStatus::AlreadySatisfied)
-        | (_, FixStatus::Failed)
-        | (_, FixStatus::RolledBack)
-        | (_, FixStatus::Unfixable) => {
-            // AlreadySatisfied is silent in text mode (nothing changed);
-            // Failed/RolledBack/Unfixable outcomes are already reported via
-            // the stderr channel (fix errors, or the unfixable diagnostics
-            // printed before routing.targets is applied).
+        (_, FixStatus::Unfixable) => {
+            // Apply-time unfixable: routing placed this target as fixable,
+            // but the floor writer refused once it inspected the existing
+            // entry (e.g. a non-simple uv constraint, an object-valued npm
+            // override, or another unexpected shape). This is distinct from
+            // a routing-time unfixable target (`routing.unfixable`, printed
+            // before this loop runs) and must get its own report here or a
+            // default text-mode run prints nothing and exits 0.
+            eprintln!(
+                "{} Cannot auto-fix {}: {}",
+                "⚠".yellow().bold(),
+                target.package.bold(),
+                outcome.error.as_deref().unwrap_or("unfixable"),
+            );
+        }
+        (_, FixStatus::AlreadySatisfied) => {
+            // Silent in text mode by design: nothing changed.
+        }
+        (_, FixStatus::Failed) | (_, FixStatus::RolledBack) => {
+            // Silent here; these reach the combined fix-errors stderr dump
+            // emitted after this loop (see `fix_errors` below), which exits
+            // the process with code 2.
         }
     }
 }
