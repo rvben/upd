@@ -17,6 +17,9 @@ pub enum LockKind {
 pub struct ScannableLock {
     pub path: PathBuf,
     pub kind: LockKind,
+    /// Discovered same-ecosystem manifests this lock resolves for, per the
+    /// nearest-ancestor rule (always contains at least the sibling manifest).
+    pub associated_manifests: Vec<PathBuf>,
 }
 
 #[derive(Debug, Default)]
@@ -184,7 +187,63 @@ pub fn discover_locks(files: &[(PathBuf, FileType)], scan_roots: &[PathBuf]) -> 
                 }
             }
 
-            discovery.locks.push(ScannableLock { path: lock, kind });
+            discovery.locks.push(ScannableLock {
+                path: lock,
+                kind,
+                associated_manifests: Vec::new(),
+            });
+        }
+    }
+
+    // Association: each discovered same-ecosystem manifest belongs to the
+    // scannable lock of its nearest ancestor directory (mirroring how cargo
+    // and uv themselves resolve the workspace root); a manifest with a
+    // closer lock of its own belongs to that lock instead. Npm and poetry
+    // locks cover adjacent manifests only. Only already-scannable locks
+    // participate: skipped locks (guards, workspaces) associate nothing.
+    for (manifest, file_type) in files {
+        let kinds: &[LockKind] = match file_type {
+            FileType::PyProject => &[LockKind::Uv, LockKind::Poetry],
+            FileType::PackageJson => &[LockKind::Npm],
+            FileType::CargoToml => &[LockKind::Cargo],
+            _ => continue,
+        };
+        let Some(dir) = manifest.parent() else {
+            continue;
+        };
+        for &kind in kinds {
+            let adjacent_only = matches!(kind, LockKind::Npm | LockKind::Poetry);
+            let mut best: Option<usize> = None;
+            for (idx, lock) in discovery.locks.iter().enumerate() {
+                if lock.kind != kind {
+                    continue;
+                }
+                let Some(lock_dir) = lock.path.parent() else {
+                    continue;
+                };
+                if adjacent_only {
+                    if lock_dir == dir {
+                        best = Some(idx);
+                        break;
+                    }
+                } else if dir.starts_with(lock_dir) {
+                    let deeper = |i: usize| {
+                        discovery.locks[i]
+                            .path
+                            .parent()
+                            .map(|p| p.components().count())
+                            .unwrap_or(0)
+                    };
+                    if best.is_none_or(|b| deeper(idx) > deeper(b)) {
+                        best = Some(idx);
+                    }
+                }
+            }
+            if let Some(idx) = best {
+                discovery.locks[idx]
+                    .associated_manifests
+                    .push(manifest.clone());
+            }
         }
     }
 
@@ -421,6 +480,92 @@ mod tests {
         assert!(
             d.warnings.is_empty(),
             "no git root: probe stays inside the scan root"
+        );
+    }
+
+    #[test]
+    fn virtual_cargo_workspace_root_associates_member_manifests() {
+        let dir = tempfile::tempdir().unwrap();
+        // Virtual workspace root: bare [workspace] Cargo.toml + Cargo.lock.
+        let root = dir.path().join("Cargo.toml");
+        touch(&root, "[workspace]\nmembers=[\"member\"]\n");
+        touch(&dir.path().join("Cargo.lock"), "version = 4\n");
+        let member = dir.path().join("member/Cargo.toml");
+        touch(&member, "[package]\nname='m'\nversion='0.1.0'\n");
+        let files = vec![
+            (root.clone(), FileType::CargoToml),
+            (member.clone(), FileType::CargoToml),
+        ];
+        let scan_roots = vec![dir.path().to_path_buf()];
+        let d = discover_locks(&files, &scan_roots);
+        assert_eq!(d.locks.len(), 1);
+        let assoc = &d.locks[0].associated_manifests;
+        assert!(assoc.contains(&root), "sibling root manifest associated");
+        assert!(
+            assoc.contains(&member),
+            "member manifest associated to ancestor lock"
+        );
+    }
+
+    #[test]
+    fn nested_crate_with_closer_lock_associates_there_not_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("Cargo.toml");
+        touch(&root, "[workspace]\nmembers=[\"member\"]\n");
+        touch(&dir.path().join("Cargo.lock"), "version = 4\n");
+        let nested = dir.path().join("member/Cargo.toml");
+        touch(&nested, "[package]\nname='m'\nversion='0.1.0'\n");
+        touch(&dir.path().join("member/Cargo.lock"), "version = 4\n");
+        let files = vec![
+            (root.clone(), FileType::CargoToml),
+            (nested.clone(), FileType::CargoToml),
+        ];
+        let scan_roots = vec![dir.path().to_path_buf()];
+        let d = discover_locks(&files, &scan_roots);
+        assert_eq!(d.locks.len(), 2);
+        let root_lock = d
+            .locks
+            .iter()
+            .find(|l| l.path == dir.path().join("Cargo.lock"))
+            .unwrap();
+        let nested_lock = d
+            .locks
+            .iter()
+            .find(|l| l.path == dir.path().join("member/Cargo.lock"))
+            .unwrap();
+        assert!(
+            nested_lock.associated_manifests.contains(&nested),
+            "closer lock wins"
+        );
+        assert!(
+            !root_lock.associated_manifests.contains(&nested),
+            "member no longer belongs to the root lock"
+        );
+        assert!(root_lock.associated_manifests.contains(&root));
+    }
+
+    #[test]
+    fn npm_and_poetry_locks_associate_adjacent_manifest_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let pj = dir.path().join("package.json");
+        touch(&pj, r#"{ "name": "t", "version": "1.0.0" }"#);
+        touch(
+            &dir.path().join("package-lock.json"),
+            r#"{ "lockfileVersion": 3 }"#,
+        );
+        let sub_pj = dir.path().join("sub/package.json");
+        touch(&sub_pj, r#"{ "name": "s", "version": "1.0.0" }"#);
+        let files = vec![
+            (pj.clone(), FileType::PackageJson),
+            (sub_pj.clone(), FileType::PackageJson),
+        ];
+        let scan_roots = vec![dir.path().to_path_buf()];
+        let d = discover_locks(&files, &scan_roots);
+        assert_eq!(d.locks.len(), 1);
+        assert_eq!(
+            d.locks[0].associated_manifests,
+            vec![pj],
+            "npm association is adjacent-only; the subdirectory manifest is not a member"
         );
     }
 

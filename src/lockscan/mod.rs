@@ -38,6 +38,9 @@ pub struct LockScan {
     pub packages: Vec<LockedPackage>,
     /// Incomplete-coverage warnings (merged into `AuditResult.warnings`).
     pub warnings: Vec<String>,
+    /// The scannable locks (with manifest associations) the packages came
+    /// from; provenance classification consumes this.
+    pub locks: Vec<discover::ScannableLock>,
 }
 
 /// Single forward pass over a TOML lockfile's lines, indexing package name
@@ -71,6 +74,7 @@ pub fn scan_locks(files: &[(PathBuf, FileType)], scan_roots: &[PathBuf]) -> Lock
     let mut result = LockScan {
         packages: Vec::new(),
         warnings: discovery.warnings,
+        locks: Vec::new(),
     };
     for lock in discovery.locks {
         let scanned = match lock.kind {
@@ -89,6 +93,7 @@ pub fn scan_locks(files: &[(PathBuf, FileType)], scan_roots: &[PathBuf]) -> Lock
                 lock.path.display()
             )),
         }
+        result.locks.push(lock);
     }
     result
 }
