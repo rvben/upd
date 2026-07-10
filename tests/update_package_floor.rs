@@ -538,6 +538,18 @@ async fn own_name_direct_with_unbumpable_spec_is_unfixable() {
         !package_json_after.contains("overrides"),
         "{package_json_after}"
     );
+
+    // The entry itself stays visible in files[].updates[], but an
+    // `unfixable` floor is a zero-change diagnostic: it must not inflate
+    // updates_total/updates_major or files_with_changes the way a real
+    // planned/applied floor does.
+    assert_eq!(json["summary"]["updates_total"], 0, "{}", json["summary"]);
+    assert_eq!(json["summary"]["updates_major"], 0, "{}", json["summary"]);
+    assert_eq!(
+        json["summary"]["files_with_changes"], 0,
+        "{}",
+        json["summary"]
+    );
 }
 
 /// (7) A config `ignore` entry suppresses the floor entirely, before any
@@ -582,6 +594,12 @@ async fn ignored_lock_only_package_gets_no_floor() {
         "{ignored:?}"
     );
     assert_eq!(json["summary"]["ignored"], 1, "{}", json["summary"]);
+    assert_eq!(json["summary"]["updates_total"], 0, "{}", json["summary"]);
+    assert_eq!(
+        json["summary"]["files_with_changes"], 0,
+        "{}",
+        json["summary"]
+    );
 }
 
 // Rule 9 (the `--interactive` early-path note for a lock-only `--package`

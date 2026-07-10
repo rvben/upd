@@ -1877,6 +1877,16 @@ fn apply_bounded_output(
     doc
 }
 
+/// A floor's `UpdateEntry.status` counts toward the update summary
+/// (`updates_total`, the bump buckets, `files_with_changes`) only when it
+/// reflects an actual or would-be manifest write. `unfixable`, `failed`,
+/// `rolled_back`, `skipped`, and `already_satisfied` are zero-change
+/// diagnostics: the entry stays visible in `files[].updates[]`, but must not
+/// be counted as a completed update.
+fn floor_entry_counts_as_update(status: Option<&str>) -> bool {
+    matches!(status, Some("planned" | "applied" | "pending_relock"))
+}
+
 fn emit_update_json(input: UpdateReportInput<'_>, bounded: &BoundedOutputParams<'_>) -> Result<()> {
     use upd::output::{UpdateReport, UpdateSummary, build_update_file_report};
 
@@ -1921,9 +1931,16 @@ fn emit_update_json(input: UpdateReportInput<'_>, bounded: &BoundedOutputParams<
 
     // Floor entries are gated by allows_bump/cooldown inside resolve_floor_version
     // already, so they count toward the summary unconditionally (rule 7) rather
-    // than through count_updates_by_type's own filter re-application.
-    let (floor_major, floor_minor, floor_patch, floor_total) =
-        floor_reports.iter().flat_map(|r| &r.updates).fold(
+    // than through count_updates_by_type's own filter re-application. But a
+    // floor entry can also carry a diagnostic status (unfixable, failed,
+    // rolled_back, skipped, already_satisfied) that made no manifest change,
+    // so only entries whose status reflects an actual or would-be write count
+    // toward the summary; every entry stays visible in files[].updates[].
+    let (floor_major, floor_minor, floor_patch, floor_total) = floor_reports
+        .iter()
+        .flat_map(|r| &r.updates)
+        .filter(|entry| floor_entry_counts_as_update(entry.status))
+        .fold(
             (0usize, 0usize, 0usize, 0usize),
             |(maj, min, pat, tot), entry| match entry.bump {
                 "major" => (maj + 1, min, pat, tot + 1),
@@ -1934,7 +1951,11 @@ fn emit_update_json(input: UpdateReportInput<'_>, bounded: &BoundedOutputParams<
     let floor_ignored: usize = floor_reports.iter().map(|r| r.ignored.len()).sum();
     let floor_files_with_changes = floor_reports
         .iter()
-        .filter(|r| !r.updates.is_empty())
+        .filter(|r| {
+            r.updates
+                .iter()
+                .any(|entry| floor_entry_counts_as_update(entry.status))
+        })
         .count();
 
     let summary = UpdateSummary {
