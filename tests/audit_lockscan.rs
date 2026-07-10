@@ -456,3 +456,77 @@ async fn npm_workspace_lock_is_skipped_with_warning() {
         "no lock packages scanned"
     );
 }
+
+/// A lock-only vulnerable package with a fixed_version lands in the
+/// fixable set, but --fix-audit's edit loop only iterates manifest-scanned
+/// occurrences, so a lock-only package (no manifest entry to bump) gets no
+/// edit. Without a diagnostic this silently reports "Fixed 0" at exit 0 as
+/// if there were nothing to fix. Assert the diagnostic appears and the exit
+/// code matches the dry-run contract observed for this exact scenario
+/// (total_fixed stays 0, so `effective_dry_run && total_fixed > 0` is
+/// false): exit 0.
+#[tokio::test]
+async fn fix_audit_reports_lock_only_package_it_cannot_edit() {
+    let server = wiremock::MockServer::start().await;
+    wiremock::Mock::given(wiremock::matchers::method("POST"))
+        .and(wiremock::matchers::path("/querybatch"))
+        .respond_with(
+            wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "results": [ { "vulns": [ { "id": "GHSA-fixaudit-1" } ] } ]
+            })),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    wiremock::Mock::given(wiremock::matchers::method("GET"))
+        .and(wiremock::matchers::path("/vulns/GHSA-fixaudit-1"))
+        .respond_with(
+            wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "GHSA-fixaudit-1",
+                "summary": "lock-only fixable vuln",
+                "affected": [{
+                    "package": { "name": "fixauditpkg", "ecosystem": "PyPI" },
+                    "ranges": [{ "type": "ECOSYSTEM",
+                        "events": [{ "introduced": "0" }, { "fixed": "0.49.1" }] }]
+                }]
+            })),
+        )
+        .mount(&server)
+        .await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(
+        tmp.path().join("pyproject.toml"),
+        "[project]\nname = \"t\"\nversion = \"1.0.0\"\ndependencies = []\n",
+    )
+    .unwrap();
+    std::fs::write(
+        tmp.path().join("uv.lock"),
+        r#"version = 1
+
+[[package]]
+name = "fixauditpkg"
+version = "0.40.0"
+source = { registry = "https://pypi.org/simple" }
+"#,
+    )
+    .unwrap();
+
+    let (_stdout, stderr, code) = run_with_env(
+        &["audit", "--fix-audit", "--no-cache", "--format", "json"],
+        tmp.path(),
+        &[("OSV_API_URL", &server.uri())],
+    );
+    assert_eq!(
+        code, 0,
+        "observed dry-run contract for a lock-only fixable package: no edit means total_fixed stays 0"
+    );
+    assert!(
+        stderr.contains("Cannot auto-fix"),
+        "stderr must report the unfixed package: {stderr}"
+    );
+    assert!(
+        stderr.contains("lock-only"),
+        "stderr must explain why it could not be fixed: {stderr}"
+    );
+}

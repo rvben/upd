@@ -2424,6 +2424,10 @@ async fn run_audit(cli: &Cli) -> Result<()> {
             // We use the same approach as apply_alignments: collect edits per file,
             // then apply them with apply_version_updates.
             let mut edits_by_file: HashMap<PathBuf, FileEdits> = HashMap::new();
+            // Names from `fixable` that produced at least one edit, so we can
+            // report the ones that did not (e.g. lock-only transitive
+            // dependencies with no manifest entry to bump).
+            let mut edited_names: HashSet<&str> = HashSet::new();
 
             for ((name_lower, lang), occurrences) in &packages {
                 // Only ecosystems OSV covers.
@@ -2441,12 +2445,13 @@ async fn run_audit(cli: &Cli) -> Result<()> {
                     }
                     // Match against the fixable map using original_name (preserves casing).
                     // Fall back to the lowercased key if not found.
-                    let fix_version = fixable
-                        .get(&occ.original_name)
-                        .or_else(|| fixable.get(name_lower.as_str()));
-                    let Some(new_version) = fix_version else {
+                    let fix_entry = fixable
+                        .get_key_value(&occ.original_name)
+                        .or_else(|| fixable.get_key_value(name_lower.as_str()));
+                    let Some((matched_name, new_version)) = fix_entry else {
                         continue;
                     };
+                    edited_names.insert(matched_name.as_str());
 
                     let entry = edits_by_file
                         .entry(occ.file_path.clone())
@@ -2457,6 +2462,27 @@ async fn run_audit(cli: &Cli) -> Result<()> {
                         new_version.clone(),
                         occ.line_number,
                     ));
+                }
+            }
+
+            // Report fixable packages that produced NO edit in any file -
+            // lock-only transitive dependencies have a fixed_version but no
+            // manifest occurrence to bump, so the loop above never touches
+            // them. Without this, --fix-audit silently "fixes" nothing for
+            // them while reporting success.
+            if !cli.quiet {
+                let mut unedited: Vec<&str> = fixable
+                    .keys()
+                    .filter(|name| !edited_names.contains(name.as_str()))
+                    .map(|name| name.as_str())
+                    .collect();
+                unedited.sort_unstable();
+                for name in unedited {
+                    eprintln!(
+                        "{} Cannot auto-fix {}: no manifest entry to edit (lock-only transitive dependency; version flooring lands in a future release)",
+                        "⚠".yellow().bold(),
+                        name.bold(),
+                    );
                 }
             }
 
