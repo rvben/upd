@@ -1,6 +1,7 @@
 //! Which lockfiles are scannable, and which coverage warnings apply.
 
 use crate::updater::FileType;
+use ignore::WalkBuilder;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
@@ -47,20 +48,34 @@ fn member_manifest_name(kind: LockKind) -> &'static str {
 }
 
 /// Raw recursive walk for `name` files under `root`, skipping INSTALL_TREES.
+///
+/// Built on `ignore::WalkBuilder` rather than a hand-rolled `read_dir`
+/// recursion for one reason: WalkBuilder does not follow symlinks unless
+/// told to, so a symlink cycle under `root` (e.g. a farm of directories that
+/// symlink each other) terminates instead of recursing unboundedly. Standard
+/// ignore filtering is explicitly OFF (`.standard_filters(false)`) because
+/// this walk's whole purpose is finding workspace members that discovery may
+/// have dropped for being gitignored or config-excluded - the raw membership
+/// walk must still see them, or the very files it exists to catch become
+/// invisible to it.
 fn walk_manifests(root: &Path, name: &str, out: &mut Vec<PathBuf>) {
-    let Ok(entries) = std::fs::read_dir(root) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.is_dir() {
-            let dirname = entry.file_name();
-            let skip = dirname.to_str().is_some_and(|d| INSTALL_TREES.contains(&d));
-            if !skip {
-                walk_manifests(&path, name, out);
+    let walker = WalkBuilder::new(root)
+        .standard_filters(false)
+        .filter_entry(|entry| {
+            if entry.depth() == 0 {
+                return true;
             }
-        } else if path.file_name().and_then(|n| n.to_str()) == Some(name) {
-            out.push(path);
+            !entry
+                .file_name()
+                .to_str()
+                .is_some_and(|d| INSTALL_TREES.contains(&d))
+        })
+        .build();
+
+    for entry in walker.flatten() {
+        let is_file = entry.file_type().is_some_and(|ft| ft.is_file());
+        if is_file && entry.path().file_name().and_then(|n| n.to_str()) == Some(name) {
+            out.push(entry.path().to_path_buf());
         }
     }
 }
@@ -304,6 +319,42 @@ mod tests {
             "installation trees never make membership partial"
         );
         assert!(d.warnings.is_empty());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn walk_manifests_does_not_follow_symlink_cycles() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("Cargo.toml");
+        touch(&root, "[package]\nname='t'\nversion='0.1.0'\n");
+        touch(&dir.path().join("Cargo.lock"), "version = 4\n");
+
+        // A symlink farm: three directories, each holding a symlink to all
+        // three (including itself), forming cycles. Following symlinks here
+        // recurses forever; the walk must simply never follow them. The
+        // test completing at all (well within nextest's default timeout) is
+        // the assertion.
+        let farm = dir.path().join("farm");
+        for name in ["a", "b", "c"] {
+            fs::create_dir_all(farm.join(name)).unwrap();
+        }
+        for from in ["a", "b", "c"] {
+            for to in ["a", "b", "c"] {
+                symlink(farm.join(to), farm.join(from).join(format!("to_{to}"))).unwrap();
+            }
+        }
+
+        let files = vec![(root, FileType::CargoToml)];
+        let scan_roots = vec![dir.path().to_path_buf()];
+        let d = discover_locks(&files, &scan_roots);
+        assert_eq!(
+            d.locks.len(),
+            1,
+            "lock still scannable despite the symlink farm"
+        );
+        assert!(d.warnings.is_empty(), "no spurious membership warnings");
     }
 
     #[test]
