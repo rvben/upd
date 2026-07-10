@@ -1202,3 +1202,249 @@ async fn no_lock_manifest_edit_wording_is_not_floor() {
         "manifest entry should have been bumped in place: {pyproject}"
     );
 }
+
+/// (o) An npm workspace's lock is never scanned at all - not even under
+/// `--fix-audit`. Mirrors `npm_workspace_lock_is_skipped_with_warning` in
+/// `tests/audit_lockscan.rs` but drives `--fix-audit` and asserts `fixes[]`
+/// carries no `npm-override` entry for the lock-only vulnerable package that
+/// would otherwise be found there.
+#[tokio::test]
+async fn npm_workspace_lock_is_never_floored() {
+    let tmp = tempfile::tempdir().unwrap();
+    fs::write(
+        tmp.path().join("package.json"),
+        r#"{ "name": "t", "version": "1.0.0", "workspaces": ["packages/*"] }"#,
+    )
+    .unwrap();
+    fs::write(
+        tmp.path().join("package-lock.json"),
+        r#"{ "name": "t", "lockfileVersion": 3, "packages": { "": {},
+            "node_modules/vulnpkg": { "version": "1.0.0" } } }"#,
+    )
+    .unwrap();
+
+    // No OSV server: the workspace lock is skipped before anything is
+    // queried, and the manifest itself declares no dependencies.
+    let (stdout, stderr, code) = run_with_env(
+        &["audit", "--fix-audit", "--offline", "--format", "json"],
+        tmp.path(),
+        &[],
+    );
+    assert_eq!(code, 0, "stdout: {stdout}\nstderr: {stderr}");
+
+    let json: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(json["status"], "incomplete");
+    let warnings = json["warnings"].as_array().expect("warnings present");
+    assert!(warnings[0].as_str().unwrap().contains("npm workspaces"));
+
+    // `fixes` is omitted entirely (not an empty array) when nothing was
+    // ever routed: the skipped workspace lock means audit found zero
+    // vulnerabilities to fix in the first place.
+    let fixes: Vec<serde_json::Value> = json
+        .get("fixes")
+        .and_then(|f| f.as_array())
+        .cloned()
+        .unwrap_or_default();
+    assert!(
+        !fixes.iter().any(|f| f["method"] == "npm-override"),
+        "the workspace lock must never be floored: {fixes:?}"
+    );
+}
+
+/// (p) A Cargo workspace lock with an undiscovered member manifest (dropped
+/// by `.gitignore`) is never scanned, so a lock-only vulnerable package it
+/// resolves is never even audited, let alone floored. Mirrors
+/// `partial_workspace_guard_skips_lock_with_undiscovered_member` in
+/// `src/lockscan/discover.rs`, driven through the binary end to end (that
+/// unit test constructs the "undiscovered" condition directly via the
+/// `files` list; this test produces it the way it actually happens, via a
+/// real `.gitignore`).
+#[tokio::test]
+async fn partial_workspace_lock_is_never_floored() {
+    let tmp = tempfile::tempdir().unwrap();
+    fs::write(
+        tmp.path().join("Cargo.toml"),
+        "[workspace]\nmembers = [\"member\"]\n",
+    )
+    .unwrap();
+    fs::write(
+        tmp.path().join("Cargo.lock"),
+        "version = 4\n\n[[package]]\nname = \"dupcrate\"\nversion = \"1.2.3\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\n",
+    )
+    .unwrap();
+    // The member manifest exists on disk but is never discovered: the
+    // .gitignore drops it from the discovered set, the same way a real
+    // gitignored workspace member would.
+    fs::create_dir(tmp.path().join("member")).unwrap();
+    fs::write(
+        tmp.path().join("member/Cargo.toml"),
+        "[package]\nname = \"m\"\nversion = \"0.1.0\"\n",
+    )
+    .unwrap();
+    fs::write(tmp.path().join(".gitignore"), "member/\n").unwrap();
+
+    // No OSV server: the guarded lock is never scanned, so nothing at all
+    // is queried.
+    let (stdout, stderr, code) = run_with_env(
+        &["audit", "--fix-audit", "--offline", "--format", "json"],
+        tmp.path(),
+        &[],
+    );
+    assert_eq!(code, 0, "stdout: {stdout}\nstderr: {stderr}");
+
+    let json: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    let warnings = json["warnings"].as_array().expect("warnings present");
+    assert!(
+        warnings.iter().any(|w| w
+            .as_str()
+            .unwrap()
+            .contains("workspace membership incomplete")),
+        "{warnings:?}"
+    );
+    // `fixes` is omitted entirely (not an empty array) when nothing was
+    // ever routed: the guarded lock means audit found zero vulnerabilities
+    // to fix in the first place.
+    let fixes: Vec<serde_json::Value> = json
+        .get("fixes")
+        .and_then(|f| f.as_array())
+        .cloned()
+        .unwrap_or_default();
+    assert!(
+        !fixes.iter().any(|f| f["method"] == "cargo-precise"),
+        "the partial workspace lock must never be floored: {fixes:?}"
+    );
+}
+
+/// (q) A `file:` local dependency (and its matching `"link": true` lock
+/// entry) is excluded from lockscan's registry package list but must not
+/// disqualify the rest of the lockfile from being scanned or floored: only a
+/// `workspaces` field trips the workspace guard. A lock-only vulnerable
+/// registry package elsewhere in the same lock still floors via
+/// `npm-override`.
+#[cfg(unix)]
+#[tokio::test]
+async fn single_package_npm_with_file_dep_still_floors() {
+    let server = wiremock::MockServer::start().await;
+    mount_osv_single(&server, "GHSA-floors-filedep", "vulnpkg", "npm", "2.0.1").await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    fs::write(
+        tmp.path().join("package.json"),
+        "{\n  \"name\": \"t\",\n  \"version\": \"1.0.0\",\n  \"dependencies\": {\n    \"locallib\": \"file:../local-lib\"\n  }\n}\n",
+    )
+    .unwrap();
+    fs::write(
+        tmp.path().join("package-lock.json"),
+        r#"{ "name": "t", "lockfileVersion": 3, "packages": {
+            "": {},
+            "node_modules/locallib": { "resolved": "../local-lib", "link": true },
+            "../local-lib": { "name": "local-lib", "version": "1.0.0" },
+            "node_modules/vulnpkg": { "version": "1.0.0" }
+        } }"#,
+    )
+    .unwrap();
+
+    let bin_dir = tmp.path().join("fakebin");
+    fs::create_dir(&bin_dir).unwrap();
+    write_fake_tool(&bin_dir, "npm", "#!/bin/sh\nexit 0\n");
+
+    let (stdout, stderr, code) = run_with_env(
+        &[
+            "audit",
+            "--fix-audit",
+            "--apply",
+            "--no-cache",
+            "--format",
+            "json",
+        ],
+        tmp.path(),
+        &[
+            ("OSV_API_URL", &server.uri()),
+            ("PATH", &path_with(&bin_dir)),
+        ],
+    );
+
+    assert_eq!(code, 0, "stdout: {stdout}\nstderr: {stderr}");
+
+    let json: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    assert!(
+        json.get("warnings")
+            .and_then(|w| w.as_array())
+            .map(|w| w.is_empty())
+            .unwrap_or(true),
+        "a file: dependency must not trip the workspace guard: {json:?}"
+    );
+
+    let package_json: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(tmp.path().join("package.json")).unwrap())
+            .unwrap();
+    assert_eq!(package_json["overrides"]["vulnpkg"], ">=2.0.1");
+
+    let fixes = json["fixes"].as_array().unwrap();
+    assert!(
+        fixes.iter().any(|f| f["package"] == "vulnpkg"
+            && f["method"] == "npm-override"
+            && f["status"] == "applied"),
+        "{fixes:?}"
+    );
+}
+
+/// (r) `--format sarif` under `--fix-audit` is the same SARIF document shape
+/// as a plain audit - no `fixes` key anywhere, since SARIF has no schema for
+/// it. Mirrors the structural assertions in `tests/audit_sarif.rs`. A
+/// dry-run pending floor still exits 1, per the fix exit-code matrix (a
+/// pending fix with neither `--apply` nor `--no-fail`).
+#[tokio::test]
+async fn sarif_output_with_fix_audit_is_unchanged() {
+    let server = wiremock::MockServer::start().await;
+    mount_osv_single(&server, "GHSA-floors-sarif", "lockonly", "PyPI", "0.49.1").await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    fs::write(tmp.path().join("pyproject.toml"), PYPROJECT_BARE).unwrap();
+    fs::write(tmp.path().join("uv.lock"), uv_lock_at("lockonly", "0.40.0")).unwrap();
+
+    let (stdout, stderr, code) = run_with_env(
+        &["audit", "--fix-audit", "--no-cache", "--format", "sarif"],
+        tmp.path(),
+        &[("OSV_API_URL", &server.uri())],
+    );
+
+    assert_eq!(code, 1, "stdout: {stdout}\nstderr: {stderr}");
+    assert!(
+        !stdout.contains("\"fixes\""),
+        "SARIF output must never carry a fixes key: {stdout}"
+    );
+
+    let json: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(
+        json["$schema"],
+        "https://json.schemastore.org/sarif-2.1.0.json"
+    );
+    assert_eq!(json["version"], "2.1.0");
+
+    let run = &json["runs"][0];
+    assert_eq!(run["tool"]["driver"]["name"], "upd");
+
+    let rules = run["tool"]["driver"]["rules"].as_array().unwrap();
+    assert_eq!(
+        rules.len(),
+        1,
+        "exactly one rule for one unique vulnerability"
+    );
+    assert_eq!(rules[0]["id"], "GHSA-floors-sarif");
+
+    let results = run["results"].as_array().unwrap();
+    assert_eq!(results.len(), 1);
+    let result = &results[0];
+    assert_eq!(result["ruleId"], "GHSA-floors-sarif");
+
+    let locations = result["locations"].as_array().unwrap();
+    assert!(!locations.is_empty(), "at least one location expected");
+    let uri = locations[0]["physicalLocation"]["artifactLocation"]["uri"]
+        .as_str()
+        .unwrap();
+    assert!(
+        uri.ends_with("uv.lock"),
+        "lock-only finding must anchor to the lockfile, got: {uri}"
+    );
+}

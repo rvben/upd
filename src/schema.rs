@@ -110,7 +110,12 @@ fn build_schema() -> Value {
             },
             {
                 "name": "lock",
-                "description": "Regenerate lockfiles after applying changes. Honored by update and by audit --fix-audit --apply",
+                "description": "Regenerate lockfiles after applying changes. Honored by update and by audit --fix-audit --apply. Implied by 'audit --fix-audit --apply'; see --no-lock.",
+                "type": "boolean"
+            },
+            {
+                "name": "no-lock",
+                "description": "Do not regenerate lockfiles after fixing; floor and manifest edits are reported as pending_relock, cargo-precise floors as skipped. Conflicts with --lock.",
                 "type": "boolean"
             },
             {
@@ -178,8 +183,9 @@ fn build_schema() -> Value {
                 "output_fields": [
                     {"name": "command", "type": "string", "description": "Always \"update\""},
                     {"name": "mode", "type": "string", "description": "\"dry-run\" or \"applied\""},
-                    {"name": "files", "type": "array", "description": "Per-file update reports"},
-                    {"name": "summary", "type": "object", "description": "Aggregate counts (files_scanned, updates_total, etc.)"}
+                    {"name": "files", "type": "array", "description": "Per-file update reports. Each entry in a file's updates[] may carry method (manifest|uv-constraint|npm-override|cargo-precise) and status (planned|applied|pending_relock|skipped|unfixable|already_satisfied|failed|rolled_back), present only for version floors created when --package targets a lock-only package; error carries guidance for an unfixable floor, or resolver/tool stderr for a failed or rolled-back floor"},
+                    {"name": "summary", "type": "object", "description": "Aggregate counts (files_scanned, updates_total, etc.)"},
+                    {"name": "warnings", "type": "array", "description": "Lockfile-discovery warnings (e.g. an ancestor lock outside the scanned paths), populated only when --package triggers lockfile scanning for version floors; signals incomplete coverage without failing the command"}
                 ]
             },
             {
@@ -218,7 +224,7 @@ fn build_schema() -> Value {
                     },
                     {
                         "name": "fix-audit",
-                        "description": "Bump vulnerable packages to the minimum version that clears all known CVEs. Read-only on its own; combined with --apply this makes `audit` MUTATING (it writes to dependency files), despite the command-level mutating:false default. Add --lock to also regenerate the lockfiles of fixed manifests",
+                        "description": "Bump vulnerable packages to the minimum version that clears all known CVEs. Read-only on its own; combined with --apply this makes `audit` MUTATING (it writes to dependency files), despite the command-level mutating:false default. Implies --lock (regenerates the lockfiles of fixed manifests); pass --no-lock to skip",
                         "type": "boolean"
                     },
                     {
@@ -233,7 +239,8 @@ fn build_schema() -> Value {
                     {"name": "vulnerabilities", "type": "array", "description": "Vulnerable packages, each with package, ecosystem, version, id, severity, fixed_version, url, aliases (alternate ids such as CVEs, omitted when empty), and source (advisory database prefix of id, e.g. GHSA/PYSEC/GO)"},
                     {"name": "summary", "type": "object", "description": "Aggregate counts (packages_checked, vulnerabilities, vulnerable_packages, errors)"},
                     {"name": "errors", "type": "array", "description": "Per-package audit errors (e.g. unreachable registry, offline cache miss)"},
-                    {"name": "warnings", "type": "array", "description": "Coverage warnings (e.g. go.mod predating go 1.17): the audit ran but could not fully cover these inputs; status becomes \"incomplete\" without a nonzero exit"}
+                    {"name": "warnings", "type": "array", "description": "Coverage warnings (e.g. go.mod predating go 1.17): the audit ran but could not fully cover these inputs; status becomes \"incomplete\" without a nonzero exit"},
+                    {"name": "fixes", "type": "array", "description": "Fix outcomes for each vulnerable pair targeted by --fix-audit, present only under --fix-audit. Each entry: package, dependency_key? (composite key disambiguating aliased or multi-section declarations), from_version, to_version? (absent when unfixable), method? (manifest|uv-constraint|npm-override|cargo-precise), path?, status (planned|applied|pending_relock|skipped|unfixable|already_satisfied|failed|rolled_back), error? (guidance for an unfixable floor, or resolver/tool stderr for a failed or rolled-back floor)"}
                 ]
             },
             {

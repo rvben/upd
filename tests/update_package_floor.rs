@@ -602,6 +602,63 @@ async fn ignored_lock_only_package_gets_no_floor() {
     );
 }
 
+/// (8) `--no-lock` under `update --package` writes the constraint but never
+/// relocks, reporting `pending_relock`. A `pending_relock` entry is still a
+/// would-be change: it must count in `updates_total`/`files_with_changes`
+/// the same way `planned`/`applied` do, guarding the
+/// `floor_entry_counts_as_update` predicate arm that distinguishes it from
+/// `already_satisfied`/`unfixable` (zero-change diagnostics, see test 6). No
+/// fake `uv` binary is needed: `--no-lock` never shells out.
+#[cfg(unix)]
+#[tokio::test]
+async fn update_no_lock_pending_relock_counts_in_summary() {
+    let server = wiremock::MockServer::start().await;
+    mount_pypi_latest(&server, "lockonly", "0.49.1").await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    fs::write(tmp.path().join("pyproject.toml"), PYPROJECT_BARE).unwrap();
+    fs::write(tmp.path().join("uv.lock"), uv_lock_at("lockonly", "0.40.0")).unwrap();
+
+    let (stdout, stderr, code) = run_with_env(
+        &[
+            "update",
+            "--package",
+            "lockonly",
+            "--apply",
+            "--no-lock",
+            "--format",
+            "json",
+            "--no-cache",
+            ".",
+        ],
+        tmp.path(),
+        &[("UV_INDEX_URL", &server.uri())],
+    );
+
+    assert_eq!(code, 0, "stdout: {stdout}\nstderr: {stderr}");
+
+    let pyproject = fs::read_to_string(tmp.path().join("pyproject.toml")).unwrap();
+    assert!(pyproject.contains("[tool.uv]"), "{pyproject}");
+    assert!(pyproject.contains("lockonly>=0.49.1"), "{pyproject}");
+
+    let json: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    let files = json["files"].as_array().unwrap();
+    let updates = collect_for_path(files, "pyproject.toml", "updates");
+    assert!(
+        updates.iter().any(|u| u["package"] == "lockonly"
+            && u["method"] == "uv-constraint"
+            && u["status"] == "pending_relock"),
+        "{updates:?}"
+    );
+
+    assert_eq!(json["summary"]["updates_total"], 1, "{}", json["summary"]);
+    assert_eq!(
+        json["summary"]["files_with_changes"], 1,
+        "{}",
+        json["summary"]
+    );
+}
+
 // Rule 9 (the `--interactive` early-path note for a lock-only `--package`
 // name) is covered by `interactive_lock_only_package_gets_note` in
 // src/main.rs's own unit test module, not here: `run_interactive_update`'s
