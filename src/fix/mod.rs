@@ -58,6 +58,8 @@ pub struct FixTarget {
     pub vulnerable_version: String,
     pub kind: FixKind,
     pub path: PathBuf,
+    /// File type of `path` when known (drives the manifest-edit dispatcher;
+    /// informational for floors).
     pub file_type: Option<FileType>,
     pub lockfile: Option<PathBuf>,
     pub line_number: Option<usize>,
@@ -85,11 +87,14 @@ pub struct FixRouting {
     pub unfixable: Vec<UnfixableTarget>,
 }
 
-/// Accumulator for the per-pair walk. Manifest edits, npm `$name` companion
-/// edits, uv/npm floor targets, and Cargo precise targets are tracked
-/// separately because [`route_fix_targets`] merges each group under a
-/// different policy (see the merge functions below) before combining them
-/// into the final [`FixRouting::targets`].
+/// Accumulator for the per-pair walk. `manifest_edits` and `npm_companions`
+/// are tracked in separate `Vec`s only to keep their producers readable;
+/// [`route_fix_targets`] concatenates them into ONE pool before merging
+/// (see [`merge_manifest_edits`]), since a direct-vulnerable pair's own
+/// edit and its DollarName companion edit can target the very same
+/// manifest line. `floor_targets` and `cargo_targets` merge under their own
+/// separate policies (see the merge functions below) before all four
+/// groups combine into the final [`FixRouting::targets`].
 #[derive(Default)]
 struct Sink {
     manifest_edits: Vec<FixTarget>,
@@ -162,9 +167,18 @@ fn matching_occurrences<'a>(
     result
 }
 
-/// Route a Manifest-covered pair (rule 2): one `ManifestEdit` per occurrence
-/// of the pair's name in each owner's manifest, unless the owner declared it
-/// as an npm alias (unfixable) or the occurrence is unbumpable (unfixable).
+/// Route a Manifest-covered pair (rule 2). Attribution depends on how many
+/// DISTINCT dependency keys the pair's owners declare in a given manifest:
+/// with exactly one key, one `ManifestEdit` per occurrence of the pair's
+/// name in that manifest (unchanged from pre-lockscan behavior); with more
+/// than one key (e.g. a Cargo rename `old_serde = { package = "serde", ... }`
+/// coexisting with a plain `serde = "..."`, both admitting the same locked
+/// version), occurrences can no longer be attributed by manifest path alone,
+/// because matching every occurrence in the manifest against every owner
+/// would emit an owners-by-occurrences cross product. Each owner instead
+/// gets exactly one edit, sourced from its own requirement fragment (see
+/// [`route_manifest_covered_owner`]). An owner declared as an npm alias is
+/// always unfixable, regardless of how many keys share the manifest.
 fn route_manifest_covered(
     pkg: &Package,
     owners: &[Owner],
@@ -174,6 +188,18 @@ fn route_manifest_covered(
     sink: &mut Sink,
 ) {
     let norm = normalized_name(&pkg.name, pkg.ecosystem);
+
+    let mut manifest_keys: HashMap<&Path, HashSet<&str>> = HashMap::new();
+    for owner in owners {
+        if owner.npm_alias {
+            continue;
+        }
+        manifest_keys
+            .entry(owner.manifest.as_path())
+            .or_default()
+            .insert(owner.dependency_key.as_str());
+    }
+
     for owner in owners {
         if owner.npm_alias {
             sink.unfixable.push(UnfixableTarget {
@@ -197,6 +223,15 @@ fn route_manifest_covered(
         }
 
         let dep_key = dependency_key_if_different(&owner.dependency_key, &pkg.name);
+        let multi_owner = manifest_keys
+            .get(owner.manifest.as_path())
+            .is_some_and(|keys| keys.len() > 1);
+
+        if multi_owner {
+            route_manifest_covered_owner(pkg, owner, dep_key, lockfile, to_version, packages, sink);
+            continue;
+        }
+
         let occurrences: Vec<&PackageOccurrence> =
             matching_occurrences(packages, &norm, pkg.ecosystem)
                 .into_iter()
@@ -232,6 +267,74 @@ fn route_manifest_covered(
             });
         }
     }
+}
+
+/// One `ManifestEdit` for a single owner sharing its manifest with at least
+/// one other distinct dependency key for the same pair (the multi-owner
+/// branch of rule 2). The edit cannot be attributed to a specific occurrence,
+/// because every occurrence of the pair's name in the manifest would
+/// otherwise be attributed to every owner, so `from_version` is re-derived
+/// directly from the owner's own requirement fragment in the manifest, and
+/// no specific line is claimed. `cargo_direct_deps` is the only
+/// re-derivation source today because Cargo renames are the only manifest
+/// shape that reaches this branch in practice; a manifest of another kind
+/// whose direct deps can't be re-derived this way falls back to unfixable
+/// rather than guessing.
+fn route_manifest_covered_owner(
+    pkg: &Package,
+    owner: &Owner,
+    dep_key: Option<String>,
+    lockfile: &Path,
+    to_version: &str,
+    packages: &HashMap<(String, Lang), Vec<PackageOccurrence>>,
+    sink: &mut Sink,
+) {
+    let norm = normalized_name(&pkg.name, pkg.ecosystem);
+    let spec = crate::lockscan::provenance::cargo_direct_deps(&owner.manifest)
+        .ok()
+        .and_then(|deps| {
+            deps.into_iter()
+                .find(|d| d.key == owner.dependency_key)
+                .map(|d| d.spec)
+        });
+
+    let Some(from_version) = spec else {
+        sink.unfixable.push(UnfixableTarget {
+            package: pkg.name.clone(),
+            dependency_key: dep_key,
+            from_version: pkg.version.clone(),
+            to_version: Some(to_version.to_string()),
+            method: Some(FixKind::ManifestEdit.method()),
+            path: Some(owner.manifest.clone()),
+            reason: format!(
+                "could not re-derive the manifest requirement for \"{}\" in {}",
+                owner.dependency_key,
+                owner.manifest.display()
+            ),
+            no_fixed_version: false,
+        });
+        return;
+    };
+
+    let file_type = matching_occurrences(packages, &norm, pkg.ecosystem)
+        .into_iter()
+        .find(|o| o.file_path == owner.manifest)
+        .map(|o| o.file_type)
+        .unwrap_or(owner.file_type);
+
+    sink.manifest_edits.push(FixTarget {
+        package: pkg.name.clone(),
+        dependency_key: dep_key,
+        from_version,
+        to_version: to_version.to_string(),
+        vulnerable_version: pkg.version.clone(),
+        kind: FixKind::ManifestEdit,
+        path: owner.manifest.clone(),
+        file_type: Some(file_type),
+        lockfile: Some(lockfile.to_path_buf()),
+        line_number: None,
+        npm_form: None,
+    });
 }
 
 /// Route a pair with no provenance entry at all (rule 4: Go, RubyGems,
@@ -452,27 +555,55 @@ fn route_npm_lock_only(
     }
 }
 
-/// Exact-duplicate dedup only: the same `(path, dependency_key,
-/// from_version, to_version)` reached via two different provenance entries
-/// (e.g. test 15's dual-lock pair) collapses to one edit. Distinct
-/// occurrences of the same package in the same manifest (different lines,
-/// different declared versions) are never collapsed since they differ in
-/// `from_version` or are filtered upstream by owner/manifest.
+/// Grouping key for the unified `ManifestEdit` merge pool: `dependency_key`
+/// (falling back to the registry `package` name when the manifest declares
+/// no distinct key), lowercased for case-insensitive matching, plus `path`
+/// and `line_number` so two declarations of the same package on different
+/// lines of the same manifest (multi-section declarations, e.g.
+/// `dependencies` and `dev-dependencies`) are never collapsed into one
+/// edit. `from_version` is included too: two edits at the same location but
+/// starting from different declared versions describe different states and
+/// must not merge.
+fn manifest_edit_key(target: &FixTarget) -> (PathBuf, String, Option<usize>, String) {
+    let effective_key = target
+        .dependency_key
+        .clone()
+        .unwrap_or_else(|| target.package.clone())
+        .to_lowercase();
+    (
+        target.path.clone(),
+        effective_key,
+        target.line_number,
+        target.from_version.clone(),
+    )
+}
+
+/// All `ManifestEdit` targets - rule-2 owner edits AND npm `$name` companion
+/// edits - merge in ONE pool keyed by [`manifest_edit_key`], keeping the max
+/// `to_version` and `vulnerable_version`. A single pool (rather than two
+/// disjoint ones keyed differently) is required because a direct-vulnerable
+/// pair's own edit and its DollarName companion edit for a nested copy of
+/// the same package can target the exact same manifest line: merging them
+/// here is what keeps that line to one edit at the highest required
+/// version instead of two conflicting edits.
 fn merge_manifest_edits(edits: Vec<FixTarget>) -> Vec<FixTarget> {
-    let mut seen: HashSet<(PathBuf, Option<String>, String, String)> = HashSet::new();
-    let mut out = Vec::new();
+    let mut map: HashMap<(PathBuf, String, Option<usize>, String), FixTarget> = HashMap::new();
     for edit in edits {
-        let key = (
-            edit.path.clone(),
-            edit.dependency_key.clone(),
-            edit.from_version.clone(),
-            edit.to_version.clone(),
-        );
-        if seen.insert(key) {
-            out.push(edit);
-        }
+        let key = manifest_edit_key(&edit);
+        map.entry(key)
+            .and_modify(|existing| {
+                if compare_versions(&edit.to_version, &existing.to_version) == Ordering::Greater {
+                    existing.to_version = edit.to_version.clone();
+                }
+                if compare_versions(&edit.vulnerable_version, &existing.vulnerable_version)
+                    == Ordering::Greater
+                {
+                    existing.vulnerable_version = edit.vulnerable_version.clone();
+                }
+            })
+            .or_insert(edit);
     }
-    out
+    map.into_values().collect()
 }
 
 /// Prefer the `DollarName` form once any merged pair required it: the
@@ -491,38 +622,6 @@ fn merge_npm_form(
         (Some(f), _) | (_, Some(f)) => Some(f),
         (None, None) => None,
     }
-}
-
-/// npm `$name` companion `ManifestEdit`s merge by `(path, dependency_key)`:
-/// multiple lock-only vulnerable versions of the same transitive package
-/// synthesize a companion edit for the same direct occurrence each time, so
-/// keep the max floor rather than emitting (or conflicting on) duplicates.
-fn merge_npm_companions(companions: Vec<FixTarget>) -> Vec<FixTarget> {
-    let mut map: HashMap<(PathBuf, String), FixTarget> = HashMap::new();
-    for edit in companions {
-        let effective_key = edit
-            .dependency_key
-            .clone()
-            .unwrap_or_else(|| edit.package.clone());
-        let map_key = (edit.path.clone(), effective_key);
-        map.entry(map_key)
-            .and_modify(|existing| {
-                if compare_versions(&edit.to_version, &existing.to_version) == Ordering::Greater {
-                    existing.to_version = edit.to_version.clone();
-                }
-                if compare_versions(&edit.from_version, &existing.from_version) == Ordering::Greater
-                {
-                    existing.from_version = edit.from_version.clone();
-                }
-                if compare_versions(&edit.vulnerable_version, &existing.vulnerable_version)
-                    == Ordering::Greater
-                {
-                    existing.vulnerable_version = edit.vulnerable_version.clone();
-                }
-            })
-            .or_insert(edit);
-    }
-    map.into_values().collect()
 }
 
 /// `(kind, path, normalized package)` for grouping uv/npm floor targets;
@@ -575,7 +674,9 @@ fn compare_versions(a: &str, b: &str) -> Ordering {
 /// manifest-edit and version-floor targets, or into `unfixable` with a
 /// human-readable reason. See the module's routing rules (spec Section
 /// 2-4): a pair with no fix at all is unfixable; a Manifest-covered pair
-/// gets one edit per occurrence per owner; a LockOnly pair floors by lock
+/// gets one edit per occurrence when its manifest declares a single owner
+/// key, or one edit per owner (never a cross product) when it declares
+/// several (see [`route_manifest_covered`]); a LockOnly pair floors by lock
 /// kind; a pair with no provenance entry falls back to today's
 /// occurrence-based manifest edits. Multiple provenance entries for the
 /// same pair (one per lockfile that resolves it) are all routed, and
@@ -656,8 +757,10 @@ pub fn route_fix_targets(
         }
     }
 
-    let mut targets = merge_manifest_edits(sink.manifest_edits);
-    targets.extend(merge_npm_companions(sink.npm_companions));
+    let mut manifest_edit_pool = sink.manifest_edits;
+    manifest_edit_pool.extend(sink.npm_companions);
+
+    let mut targets = merge_manifest_edits(manifest_edit_pool);
     targets.extend(merge_floor_group(sink.floor_targets));
     targets.extend(sink.cargo_targets);
 
@@ -1345,5 +1448,271 @@ mod tests {
                 .iter()
                 .any(|t| t.kind == FixKind::CargoPrecise && t.path == Path::new("b/Cargo.lock"))
         );
+    }
+
+    #[test]
+    fn rename_and_plain_declaration_of_same_crate_get_one_edit_per_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let manifest = dir.path().join("Cargo.toml");
+        std::fs::write(
+            &manifest,
+            "[package]\nname = \"t\"\nversion = \"0.1.0\"\n\n[dependencies]\nserde = \"1.0\"\nold_serde = { package = \"serde\", version = \"1.0\" }\n",
+        )
+        .unwrap();
+        let manifest_str = manifest.to_str().unwrap();
+
+        let audit = audit_of(vec![vulnerable(
+            pkg("serde", "1.0.5", Ecosystem::CratesIo),
+            vec![vuln("RUSTSEC-1", Some("1.0.10"))],
+        )]);
+        let prov = prov_index(
+            vec![(
+                ("serde", "1.0.5", "crates.io"),
+                vec![manifest_prov(
+                    vec![
+                        owner(manifest_str, FileType::CargoToml, "serde", false),
+                        owner(manifest_str, FileType::CargoToml, "old_serde", false),
+                    ],
+                    "proj/Cargo.lock",
+                )],
+            )],
+            vec![],
+        );
+        // Occurrences parse_dependencies would yield for both declarations:
+        // the resolved registry name "serde" for each, on distinct lines.
+        let packages = packages_map(vec![(
+            ("serde", Lang::Rust),
+            vec![
+                occ(
+                    manifest_str,
+                    FileType::CargoToml,
+                    "1.0.5",
+                    Some(5),
+                    "serde",
+                    true,
+                ),
+                occ(
+                    manifest_str,
+                    FileType::CargoToml,
+                    "1.0.5",
+                    Some(6),
+                    "serde",
+                    true,
+                ),
+            ],
+        )]);
+
+        let routing = route_fix_targets(&audit, &prov, &packages);
+
+        assert!(routing.unfixable.is_empty());
+        assert_eq!(
+            routing.targets.len(),
+            2,
+            "must never be a cross product of owners and occurrences: {:?}",
+            routing.targets
+        );
+
+        let plain = routing
+            .targets
+            .iter()
+            .find(|t| t.dependency_key.is_none())
+            .expect("plain serde key edit");
+        assert_eq!(
+            plain.from_version, "1.0",
+            "re-derived from serde's own spec fragment"
+        );
+        assert_eq!(plain.line_number, None);
+
+        let renamed = routing
+            .targets
+            .iter()
+            .find(|t| t.dependency_key.as_deref() == Some("old_serde"))
+            .expect("old_serde key edit");
+        assert_eq!(
+            renamed.from_version, "1.0",
+            "re-derived from old_serde's own spec fragment"
+        );
+        assert_eq!(renamed.line_number, None);
+    }
+
+    #[test]
+    fn same_key_in_two_sections_keeps_one_edit_per_line() {
+        let audit = audit_of(vec![vulnerable(
+            pkg("serde", "1.0.5", Ecosystem::CratesIo),
+            vec![vuln("RUSTSEC-1", Some("1.0.10"))],
+        )]);
+        let prov = prov_index(
+            vec![(
+                ("serde", "1.0.5", "crates.io"),
+                vec![manifest_prov(
+                    vec![owner(
+                        "proj/Cargo.toml",
+                        FileType::CargoToml,
+                        "serde",
+                        false,
+                    )],
+                    "proj/Cargo.lock",
+                )],
+            )],
+            vec![],
+        );
+        let packages = packages_map(vec![(
+            ("serde", Lang::Rust),
+            vec![
+                occ(
+                    "proj/Cargo.toml",
+                    FileType::CargoToml,
+                    "1.0.5",
+                    Some(5),
+                    "serde",
+                    true,
+                ),
+                occ(
+                    "proj/Cargo.toml",
+                    FileType::CargoToml,
+                    "1.0.5",
+                    Some(12),
+                    "serde",
+                    true,
+                ),
+            ],
+        )]);
+
+        let routing = route_fix_targets(&audit, &prov, &packages);
+
+        assert!(routing.unfixable.is_empty());
+        assert_eq!(
+            routing.targets.len(),
+            2,
+            "one edit per declaration line; the merge key must not lose line_number: {:?}",
+            routing.targets
+        );
+        let mut lines: Vec<Option<usize>> = routing.targets.iter().map(|t| t.line_number).collect();
+        lines.sort();
+        assert_eq!(lines, vec![Some(5), Some(12)]);
+        assert!(routing.targets.iter().all(|t| t.to_version == "1.0.10"));
+    }
+
+    #[test]
+    fn direct_vulnerable_pair_and_companion_edit_merge_to_max() {
+        let audit = audit_of(vec![
+            vulnerable(
+                pkg("examplepkg", "2.4.0", Ecosystem::Npm),
+                vec![vuln("GHSA-1", Some("2.5.0"))],
+            ),
+            vulnerable(
+                pkg("examplepkg", "1.2.0", Ecosystem::Npm),
+                vec![vuln("GHSA-2", Some("2.6.0"))],
+            ),
+        ]);
+        let prov = prov_index(
+            vec![
+                (
+                    ("examplepkg", "2.4.0", "npm"),
+                    vec![manifest_prov(
+                        vec![owner(
+                            "proj/package.json",
+                            FileType::PackageJson,
+                            "examplepkg",
+                            false,
+                        )],
+                        "proj/package-lock.json",
+                    )],
+                ),
+                (
+                    ("examplepkg", "1.2.0", "npm"),
+                    vec![lock_only_prov("proj/package-lock.json", LockKind::Npm)],
+                ),
+            ],
+            vec![(
+                "proj/package.json",
+                vec![direct("examplepkg", "examplepkg", "^2.0.0")],
+            )],
+        );
+        let packages = packages_map(vec![(
+            ("examplepkg", Lang::Node),
+            vec![occ(
+                "proj/package.json",
+                FileType::PackageJson,
+                "^2.0.0",
+                Some(7),
+                "examplepkg",
+                true,
+            )],
+        )]);
+
+        let routing = route_fix_targets(&audit, &prov, &packages);
+
+        assert!(routing.unfixable.is_empty());
+        assert_eq!(
+            routing.targets.len(),
+            2,
+            "the direct pair's own edit and its DollarName companion must merge on the same line, not conflict: {:?}",
+            routing.targets
+        );
+
+        let edits: Vec<_> = routing
+            .targets
+            .iter()
+            .filter(|t| t.kind == FixKind::ManifestEdit)
+            .collect();
+        assert_eq!(edits.len(), 1);
+        assert_eq!(edits[0].to_version, "2.6.0");
+        assert_eq!(edits[0].from_version, "^2.0.0");
+        assert_eq!(edits[0].line_number, Some(7));
+
+        let overrides: Vec<_> = routing
+            .targets
+            .iter()
+            .filter(|t| t.kind == FixKind::NpmOverride)
+            .collect();
+        assert_eq!(overrides.len(), 1);
+        assert_eq!(overrides[0].npm_form, Some(NpmOverrideForm::DollarName));
+        assert_eq!(overrides[0].to_version, "2.6.0");
+    }
+
+    #[test]
+    fn manifest_covered_unbumpable_occurrence_is_unfixable() {
+        let audit = audit_of(vec![vulnerable(
+            pkg("examplecrate", "1.0.0", Ecosystem::CratesIo),
+            vec![vuln("RUSTSEC-1", Some("1.2.0"))],
+        )]);
+        let prov = prov_index(
+            vec![(
+                ("examplecrate", "1.0.0", "crates.io"),
+                vec![manifest_prov(
+                    vec![owner(
+                        "proj/Cargo.toml",
+                        FileType::CargoToml,
+                        "examplecrate",
+                        false,
+                    )],
+                    "proj/Cargo.lock",
+                )],
+            )],
+            vec![],
+        );
+        let packages = packages_map(vec![(
+            ("examplecrate", Lang::Rust),
+            vec![occ(
+                "proj/Cargo.toml",
+                FileType::CargoToml,
+                "1.0.0",
+                Some(4),
+                "examplecrate",
+                false,
+            )],
+        )]);
+
+        let routing = route_fix_targets(&audit, &prov, &packages);
+
+        assert!(routing.targets.is_empty());
+        assert_eq!(routing.unfixable.len(), 1);
+        let u = &routing.unfixable[0];
+        assert_eq!(
+            u.reason,
+            "no bumpable manifest entry (e.g. a commit-pinned version)"
+        );
+        assert!(!u.no_fixed_version);
     }
 }
