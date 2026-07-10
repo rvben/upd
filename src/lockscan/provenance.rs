@@ -135,6 +135,251 @@ pub fn cargo_direct_deps(cargo_toml: &Path) -> Result<Vec<DirectDep>> {
     Ok(deps)
 }
 
+use super::LockedPackage;
+use super::discover::{LockKind, ScannableLock};
+use crate::align::PackageOccurrence;
+use crate::normalize::pep503_normalize;
+use crate::updater::{FileType, Lang};
+use std::collections::HashMap;
+use std::path::PathBuf;
+
+/// A single manifest declaration behind a Manifest-classified pair.
+#[derive(Debug, Clone)]
+pub struct Owner {
+    pub manifest: PathBuf,
+    pub file_type: FileType,
+    /// Key under which the manifest declares the dependency; differs from
+    /// the registry name for Cargo renames and npm aliases.
+    pub dependency_key: String,
+    /// True when the declaration is an npm `npm:` alias spec; v1 cannot
+    /// rewrite alias specs (routing reports unfixable-with-guidance).
+    pub npm_alias: bool,
+}
+
+/// Where a locked (name, version) pair came from: a direct manifest
+/// declaration (one or more owners) or the lockfile alone.
+#[derive(Debug, Clone)]
+pub enum Provenance {
+    Manifest {
+        owners: Vec<Owner>,
+        lockfile: PathBuf,
+    },
+    LockOnly {
+        lockfile: PathBuf,
+        kind: LockKind,
+    },
+}
+
+/// (normalized name, version, OSV ecosystem string) -> provenance.
+pub type PairKey = (String, String, &'static str);
+
+#[derive(Debug, Default)]
+pub struct ProvenanceIndex {
+    pub map: HashMap<PairKey, Provenance>,
+    /// Direct deps per npm host package.json, for the EOVERRIDE guard.
+    pub npm_direct: HashMap<PathBuf, Vec<DirectDep>>,
+}
+
+/// The package identity of a TOP-LEVEL `packages`-map entry: the path must
+/// be exactly `node_modules/` + one identity (two path components when the
+/// first begins with `@`). Deeper paths return None - such entries are
+/// never direct, even when a direct range would admit their version.
+pub(crate) fn top_level_identity(locator: &str) -> Option<&str> {
+    let rest = locator.strip_prefix("node_modules/")?;
+    let mut parts = rest.split('/');
+    match (parts.next(), parts.next(), parts.next()) {
+        (Some(single), None, _) if !single.is_empty() && !single.starts_with('@') => Some(rest),
+        (Some(scope), Some(name), None) if scope.starts_with('@') && !name.is_empty() => Some(rest),
+        _ => None,
+    }
+}
+
+/// Insert preferring Manifest: a Manifest classification is never replaced
+/// by LockOnly; two Manifest classifications for one pair merge owners
+/// (deduped by manifest + dependency key).
+fn insert_provenance(map: &mut HashMap<PairKey, Provenance>, key: PairKey, prov: Provenance) {
+    match (map.get_mut(&key), prov) {
+        (Some(Provenance::Manifest { owners, .. }), Provenance::Manifest { owners: new, .. }) => {
+            for owner in new {
+                if !owners.iter().any(|o| {
+                    o.manifest == owner.manifest && o.dependency_key == owner.dependency_key
+                }) {
+                    owners.push(owner);
+                }
+            }
+        }
+        (Some(Provenance::Manifest { .. }), Provenance::LockOnly { .. }) => {}
+        (Some(slot @ Provenance::LockOnly { .. }), prov @ Provenance::Manifest { .. }) => {
+            *slot = prov;
+        }
+        (Some(Provenance::LockOnly { .. }), Provenance::LockOnly { .. }) => {}
+        (None, prov) => {
+            map.insert(key, prov);
+        }
+    }
+}
+
+/// Classify every locked (name, version) pair across `locks` as
+/// manifest-owned or lock-only, per the positional rules: npm identity is
+/// the top-level `packages`-map path matching a manifest dependency key,
+/// Cargo direct requirements cover only the maximal admitted locked
+/// version, and uv/poetry coverage follows PEP 503-normalized declared
+/// names from the production occurrence map.
+pub fn classify(
+    locks: &[ScannableLock],
+    lock_packages: &[LockedPackage],
+    packages: &HashMap<(String, Lang), Vec<PackageOccurrence>>,
+) -> ProvenanceIndex {
+    let mut index = ProvenanceIndex::default();
+    for lock in locks {
+        let entries: Vec<&LockedPackage> = lock_packages
+            .iter()
+            .filter(|lp| lp.lockfile_path == lock.path)
+            .collect();
+        match lock.kind {
+            LockKind::Uv | LockKind::Poetry => {
+                // Declared names across associated manifests, from the
+                // production parse output (the occurrence map) so config,
+                // extras, and spelling behavior cannot diverge from audit.
+                let mut declared: HashMap<String, Vec<Owner>> = HashMap::new();
+                for ((_, lang), occs) in packages {
+                    if *lang != Lang::Python {
+                        continue;
+                    }
+                    for occ in occs {
+                        if !lock.associated_manifests.contains(&occ.file_path) {
+                            continue;
+                        }
+                        declared
+                            .entry(pep503_normalize(&occ.original_name))
+                            .or_default()
+                            .push(Owner {
+                                manifest: occ.file_path.clone(),
+                                file_type: occ.file_type,
+                                dependency_key: occ.original_name.clone(),
+                                npm_alias: false,
+                            });
+                    }
+                }
+                for lp in &entries {
+                    let norm = pep503_normalize(&lp.name);
+                    let prov = match declared.get(&norm) {
+                        Some(owners) => Provenance::Manifest {
+                            owners: owners.clone(),
+                            lockfile: lock.path.clone(),
+                        },
+                        None => Provenance::LockOnly {
+                            lockfile: lock.path.clone(),
+                            kind: lock.kind,
+                        },
+                    };
+                    insert_provenance(
+                        &mut index.map,
+                        (norm, lp.version.clone(), lp.ecosystem.as_str()),
+                        prov,
+                    );
+                }
+            }
+            LockKind::Cargo => {
+                for lp in &entries {
+                    insert_provenance(
+                        &mut index.map,
+                        (
+                            lp.name.to_lowercase(),
+                            lp.version.clone(),
+                            lp.ecosystem.as_str(),
+                        ),
+                        Provenance::LockOnly {
+                            lockfile: lock.path.clone(),
+                            kind: LockKind::Cargo,
+                        },
+                    );
+                }
+                for manifest in &lock.associated_manifests {
+                    let Ok(deps) = cargo_direct_deps(manifest) else {
+                        continue;
+                    };
+                    for d in deps {
+                        let Ok(req) = semver::VersionReq::parse(&d.spec) else {
+                            continue;
+                        };
+                        // The requirement's Manifest-covered version is the
+                        // MAXIMAL locked version it admits; other locked
+                        // versions of the package stay LockOnly.
+                        let covered = entries
+                            .iter()
+                            .filter(|lp| lp.name.eq_ignore_ascii_case(&d.package))
+                            .filter(|lp| {
+                                semver::Version::parse(&lp.version).is_ok_and(|v| req.matches(&v))
+                            })
+                            .max_by(|a, b| {
+                                crate::version::compare::compare_versions(&a.version, &b.version)
+                            });
+                        if let Some(lp) = covered {
+                            insert_provenance(
+                                &mut index.map,
+                                (
+                                    lp.name.to_lowercase(),
+                                    lp.version.clone(),
+                                    lp.ecosystem.as_str(),
+                                ),
+                                Provenance::Manifest {
+                                    owners: vec![Owner {
+                                        manifest: manifest.clone(),
+                                        file_type: FileType::CargoToml,
+                                        dependency_key: d.key.clone(),
+                                        npm_alias: false,
+                                    }],
+                                    lockfile: lock.path.clone(),
+                                },
+                            );
+                        }
+                    }
+                }
+            }
+            LockKind::Npm => {
+                let Some(dir) = lock.path.parent() else {
+                    continue;
+                };
+                let host = dir.join("package.json");
+                let direct = npm_direct_deps(&host).unwrap_or_default();
+                for lp in &entries {
+                    let identity = lp.locator.as_deref().and_then(top_level_identity);
+                    let owner = identity
+                        .and_then(|id| direct.iter().find(|d| d.key == id))
+                        .map(|d| Owner {
+                            manifest: host.clone(),
+                            file_type: FileType::PackageJson,
+                            dependency_key: d.key.clone(),
+                            npm_alias: d.spec.starts_with("npm:"),
+                        });
+                    let prov = match owner {
+                        Some(o) => Provenance::Manifest {
+                            owners: vec![o],
+                            lockfile: lock.path.clone(),
+                        },
+                        None => Provenance::LockOnly {
+                            lockfile: lock.path.clone(),
+                            kind: LockKind::Npm,
+                        },
+                    };
+                    insert_provenance(
+                        &mut index.map,
+                        (
+                            lp.name.to_lowercase(),
+                            lp.version.clone(),
+                            lp.ecosystem.as_str(),
+                        ),
+                        prov,
+                    );
+                }
+                index.npm_direct.insert(host, direct);
+            }
+        }
+    }
+    index
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -233,5 +478,277 @@ unixdep = "0.3"
         assert_eq!(by_key("devcrate").package, "devcrate");
         assert_eq!(by_key("shared").package, "shared");
         assert_eq!(by_key("unixdep").package, "unixdep");
+    }
+
+    use crate::align::scan_packages;
+    use crate::audit::Ecosystem;
+    use crate::lockscan::LockedPackage;
+    use crate::lockscan::discover::{LockKind, ScannableLock};
+    use crate::updater::FileType;
+    use std::path::Path;
+
+    fn lp(
+        name: &str,
+        version: &str,
+        eco: Ecosystem,
+        lock: &Path,
+        locator: Option<&str>,
+    ) -> LockedPackage {
+        LockedPackage {
+            name: name.to_string(),
+            version: version.to_string(),
+            ecosystem: eco,
+            lockfile_path: lock.to_path_buf(),
+            line_number: None,
+            locator: locator.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn top_level_identity_rules() {
+        assert_eq!(top_level_identity("node_modules/react"), Some("react"));
+        assert_eq!(
+            top_level_identity("node_modules/@scope/name"),
+            Some("@scope/name")
+        );
+        assert_eq!(top_level_identity("node_modules/a/node_modules/b"), None);
+        assert_eq!(top_level_identity("node_modules/@scope/name/extra"), None);
+        assert_eq!(top_level_identity("../local-lib"), None);
+    }
+
+    #[test]
+    fn npm_nested_duplicate_satisfying_direct_range_stays_lock_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let pj = write(
+            &dir,
+            "package.json",
+            r#"{ "name": "t", "dependencies": { "examplepkg": "^1.0.0" } }"#,
+        );
+        let lock = dir.path().join("package-lock.json");
+        let locks = vec![ScannableLock {
+            path: lock.clone(),
+            kind: LockKind::Npm,
+            associated_manifests: vec![pj.clone()],
+        }];
+        // Top-level direct copy AND a nested duplicate whose version a direct
+        // range would admit. Positional rule: nested is LockOnly regardless.
+        let lps = vec![
+            lp(
+                "examplepkg",
+                "1.5.0",
+                Ecosystem::Npm,
+                &lock,
+                Some("node_modules/examplepkg"),
+            ),
+            lp(
+                "examplepkg",
+                "1.2.0",
+                Ecosystem::Npm,
+                &lock,
+                Some("node_modules/other/node_modules/examplepkg"),
+            ),
+        ];
+        let idx = classify(&locks, &lps, &Default::default());
+        match idx
+            .map
+            .get(&("examplepkg".into(), "1.5.0".into(), "npm"))
+            .unwrap()
+        {
+            Provenance::Manifest { owners, .. } => {
+                assert_eq!(owners[0].dependency_key, "examplepkg");
+                assert!(!owners[0].npm_alias);
+            }
+            other => panic!("top-level direct must be Manifest, got {other:?}"),
+        }
+        assert!(
+            matches!(
+                idx.map
+                    .get(&("examplepkg".into(), "1.2.0".into(), "npm"))
+                    .unwrap(),
+                Provenance::LockOnly { .. }
+            ),
+            "nested copy admitted by the direct range is still LockOnly"
+        );
+    }
+
+    #[test]
+    fn npm_hoisted_transitive_without_key_stays_lock_only_and_alias_is_covered() {
+        let dir = tempfile::tempdir().unwrap();
+        let pj = write(
+            &dir,
+            "package.json",
+            r#"{ "name": "t", "dependencies": { "my-react": "npm:realpkg@^18" } }"#,
+        );
+        let lock = dir.path().join("package-lock.json");
+        let locks = vec![ScannableLock {
+            path: lock.clone(),
+            kind: LockKind::Npm,
+            associated_manifests: vec![pj.clone()],
+        }];
+        let lps = vec![
+            // Aliased direct: reified under the alias folder, name field = registry name.
+            lp(
+                "realpkg",
+                "18.0.0",
+                Ecosystem::Npm,
+                &lock,
+                Some("node_modules/my-react"),
+            ),
+            // Hoisted transitive at top level under its own name: no key match.
+            lp(
+                "hoisted",
+                "3.0.0",
+                Ecosystem::Npm,
+                &lock,
+                Some("node_modules/hoisted"),
+            ),
+        ];
+        let idx = classify(&locks, &lps, &Default::default());
+        match idx
+            .map
+            .get(&("realpkg".into(), "18.0.0".into(), "npm"))
+            .unwrap()
+        {
+            Provenance::Manifest { owners, .. } => {
+                assert_eq!(owners[0].dependency_key, "my-react");
+                assert!(owners[0].npm_alias, "alias declaration flagged");
+            }
+            other => panic!("aliased direct must be Manifest under registry name, got {other:?}"),
+        }
+        assert!(matches!(
+            idx.map
+                .get(&("hoisted".into(), "3.0.0".into(), "npm"))
+                .unwrap(),
+            Provenance::LockOnly { .. }
+        ));
+        assert!(
+            idx.npm_direct.contains_key(&pj),
+            "direct deps cached for the EOVERRIDE guard"
+        );
+    }
+
+    #[test]
+    fn cargo_rename_and_max_admitted_version_rules() {
+        let dir = tempfile::tempdir().unwrap();
+        let ct = write(
+            &dir,
+            "Cargo.toml",
+            "[package]\nname = \"t\"\nversion = \"0.1.0\"\n\n[dependencies]\nold_serde = { package = \"serde\", version = \"1.0\" }\n",
+        );
+        let lock = dir.path().join("Cargo.lock");
+        let locks = vec![ScannableLock {
+            path: lock.clone(),
+            kind: LockKind::Cargo,
+            associated_manifests: vec![ct.clone()],
+        }];
+        // Duplicate locked versions: the requirement ^1.0 admits both 1.0.5
+        // and 1.2.0; only the MAXIMAL admitted version is Manifest-covered.
+        let lps = vec![
+            lp("serde", "1.0.5", Ecosystem::CratesIo, &lock, None),
+            lp("serde", "1.2.0", Ecosystem::CratesIo, &lock, None),
+        ];
+        let idx = classify(&locks, &lps, &Default::default());
+        match idx
+            .map
+            .get(&("serde".into(), "1.2.0".into(), "crates.io"))
+            .unwrap()
+        {
+            Provenance::Manifest { owners, .. } => {
+                assert_eq!(
+                    owners[0].dependency_key, "old_serde",
+                    "edits go through the TOML key"
+                );
+            }
+            other => panic!("max admitted version must be Manifest, got {other:?}"),
+        }
+        assert!(matches!(
+            idx.map
+                .get(&("serde".into(), "1.0.5".into(), "crates.io"))
+                .unwrap(),
+            Provenance::LockOnly { .. }
+        ));
+    }
+
+    #[test]
+    fn uv_declared_name_is_covered_and_transitive_is_lock_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let py = write(
+            &dir,
+            "pyproject.toml",
+            "[project]\nname = \"t\"\nversion = \"1.0.0\"\ndependencies = [\"Typing_Extensions>=4.0\"]\n",
+        );
+        let lock = dir.path().join("uv.lock");
+        let locks = vec![ScannableLock {
+            path: lock.clone(),
+            kind: LockKind::Uv,
+            associated_manifests: vec![py.clone()],
+        }];
+        let lps = vec![
+            lp("typing-extensions", "4.9.0", Ecosystem::PyPI, &lock, None),
+            lp("lockonly", "0.40.0", Ecosystem::PyPI, &lock, None),
+        ];
+        let files = vec![(py.clone(), FileType::PyProject)];
+        let occurrences = scan_packages(&files).unwrap();
+        let idx = classify(&locks, &lps, &occurrences);
+        match idx
+            .map
+            .get(&("typing-extensions".into(), "4.9.0".into(), "PyPI"))
+            .unwrap()
+        {
+            Provenance::Manifest { owners, .. } => {
+                assert_eq!(
+                    owners[0].dependency_key, "Typing_Extensions",
+                    "original spelling retained for display/edit"
+                );
+            }
+            other => panic!("declared name (PEP 503 variant) must be Manifest, got {other:?}"),
+        }
+        assert!(matches!(
+            idx.map
+                .get(&("lockonly".into(), "0.40.0".into(), "PyPI"))
+                .unwrap(),
+            Provenance::LockOnly { .. }
+        ));
+    }
+
+    #[test]
+    fn two_manifests_declaring_same_direct_dep_yield_two_owners() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = write(
+            &dir,
+            "Cargo.toml",
+            "[workspace]\nmembers=[\"m\"]\n\n[workspace.dependencies]\nshared = \"1.0\"\n",
+        );
+        std::fs::create_dir_all(dir.path().join("m")).unwrap();
+        let member = dir.path().join("m/Cargo.toml");
+        std::fs::write(
+            &member,
+            "[package]\nname = \"m\"\nversion = \"0.1.0\"\n\n[dependencies]\nshared = \"1.0\"\n",
+        )
+        .unwrap();
+        let lock = dir.path().join("Cargo.lock");
+        let locks = vec![ScannableLock {
+            path: lock.clone(),
+            kind: LockKind::Cargo,
+            associated_manifests: vec![root.clone(), member.clone()],
+        }];
+        let lps = vec![lp("shared", "1.3.0", Ecosystem::CratesIo, &lock, None)];
+        let idx = classify(&locks, &lps, &Default::default());
+        match idx
+            .map
+            .get(&("shared".into(), "1.3.0".into(), "crates.io"))
+            .unwrap()
+        {
+            Provenance::Manifest { owners, .. } => {
+                let mut manifests: Vec<_> = owners.iter().map(|o| o.manifest.clone()).collect();
+                manifests.sort();
+                assert_eq!(
+                    manifests,
+                    vec![root, member],
+                    "one owner per declaring manifest"
+                );
+            }
+            other => panic!("expected Manifest with two owners, got {other:?}"),
+        }
     }
 }
