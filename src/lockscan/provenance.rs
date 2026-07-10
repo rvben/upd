@@ -170,12 +170,28 @@ pub enum Provenance {
     },
 }
 
+impl Provenance {
+    /// The lockfile that produced this classification; entries for the same
+    /// pair only merge when this matches (see `ProvenanceIndex::map`).
+    fn lockfile(&self) -> &Path {
+        match self {
+            Provenance::Manifest { lockfile, .. } | Provenance::LockOnly { lockfile, .. } => {
+                lockfile
+            }
+        }
+    }
+}
+
 /// (normalized name, version, OSV ecosystem string) -> provenance.
 pub type PairKey = (String, String, &'static str);
 
 #[derive(Debug, Default)]
 pub struct ProvenanceIndex {
-    pub map: HashMap<PairKey, Provenance>,
+    /// One entry PER LOCKFILE that resolves the pair: a monorepo with two
+    /// independent same-ecosystem projects must not shadow one project's
+    /// lock-only copy behind the other project's direct dependency. Merging
+    /// (Manifest-wins, owner dedup) happens only WITHIN a lockfile.
+    pub map: std::collections::HashMap<PairKey, Vec<Provenance>>,
     /// Direct deps per npm host package.json, for the EOVERRIDE guard.
     pub npm_direct: HashMap<PathBuf, Vec<DirectDep>>,
 }
@@ -194,11 +210,21 @@ pub(crate) fn top_level_identity(locator: &str) -> Option<&str> {
     }
 }
 
-/// Insert preferring Manifest: a Manifest classification is never replaced
-/// by LockOnly; two Manifest classifications for one pair merge owners
-/// (deduped by manifest + dependency key).
-fn insert_provenance(map: &mut HashMap<PairKey, Provenance>, key: PairKey, prov: Provenance) {
-    match (map.get_mut(&key), prov) {
+/// Insert preferring Manifest, merging only WITHIN the same lockfile: a
+/// monorepo with two independent same-ecosystem projects gets one
+/// Provenance entry per lockfile that resolves the pair, so one project's
+/// direct dependency never shadows another's lock-only copy. Within a
+/// lockfile, a Manifest classification is never replaced by LockOnly; two
+/// Manifest classifications merge owners (deduped by manifest + dependency
+/// key).
+fn insert_provenance(
+    map: &mut std::collections::HashMap<PairKey, Vec<Provenance>>,
+    key: PairKey,
+    prov: Provenance,
+) {
+    let entries = map.entry(key).or_default();
+    let existing = entries.iter_mut().find(|p| p.lockfile() == prov.lockfile());
+    match (existing, prov) {
         (Some(Provenance::Manifest { owners, .. }), Provenance::Manifest { owners: new, .. }) => {
             for owner in new {
                 if !owners.iter().any(|o| {
@@ -214,7 +240,7 @@ fn insert_provenance(map: &mut HashMap<PairKey, Provenance>, key: PairKey, prov:
         }
         (Some(Provenance::LockOnly { .. }), Provenance::LockOnly { .. }) => {}
         (None, prov) => {
-            map.insert(key, prov);
+            entries.push(prov);
         }
     }
 }
@@ -549,24 +575,25 @@ unixdep = "0.3"
             ),
         ];
         let idx = classify(&locks, &lps, &Default::default());
-        match idx
+        let entries = idx
             .map
             .get(&("examplepkg".into(), "1.5.0".into(), "npm"))
-            .unwrap()
-        {
+            .unwrap();
+        assert_eq!(entries.len(), 1);
+        match &entries[0] {
             Provenance::Manifest { owners, .. } => {
                 assert_eq!(owners[0].dependency_key, "examplepkg");
                 assert!(!owners[0].npm_alias);
             }
             other => panic!("top-level direct must be Manifest, got {other:?}"),
         }
+        let entries = idx
+            .map
+            .get(&("examplepkg".into(), "1.2.0".into(), "npm"))
+            .unwrap();
+        assert_eq!(entries.len(), 1);
         assert!(
-            matches!(
-                idx.map
-                    .get(&("examplepkg".into(), "1.2.0".into(), "npm"))
-                    .unwrap(),
-                Provenance::LockOnly { .. }
-            ),
+            matches!(&entries[0], Provenance::LockOnly { .. }),
             "nested copy admitted by the direct range is still LockOnly"
         );
     }
@@ -604,23 +631,24 @@ unixdep = "0.3"
             ),
         ];
         let idx = classify(&locks, &lps, &Default::default());
-        match idx
+        let entries = idx
             .map
             .get(&("realpkg".into(), "18.0.0".into(), "npm"))
-            .unwrap()
-        {
+            .unwrap();
+        assert_eq!(entries.len(), 1);
+        match &entries[0] {
             Provenance::Manifest { owners, .. } => {
                 assert_eq!(owners[0].dependency_key, "my-react");
                 assert!(owners[0].npm_alias, "alias declaration flagged");
             }
             other => panic!("aliased direct must be Manifest under registry name, got {other:?}"),
         }
-        assert!(matches!(
-            idx.map
-                .get(&("hoisted".into(), "3.0.0".into(), "npm"))
-                .unwrap(),
-            Provenance::LockOnly { .. }
-        ));
+        let entries = idx
+            .map
+            .get(&("hoisted".into(), "3.0.0".into(), "npm"))
+            .unwrap();
+        assert_eq!(entries.len(), 1);
+        assert!(matches!(&entries[0], Provenance::LockOnly { .. }));
         assert!(
             idx.npm_direct.contains_key(&pj),
             "direct deps cached for the EOVERRIDE guard"
@@ -648,11 +676,12 @@ unixdep = "0.3"
             lp("serde", "1.2.0", Ecosystem::CratesIo, &lock, None),
         ];
         let idx = classify(&locks, &lps, &Default::default());
-        match idx
+        let entries = idx
             .map
             .get(&("serde".into(), "1.2.0".into(), "crates.io"))
-            .unwrap()
-        {
+            .unwrap();
+        assert_eq!(entries.len(), 1);
+        match &entries[0] {
             Provenance::Manifest { owners, .. } => {
                 assert_eq!(
                     owners[0].dependency_key, "old_serde",
@@ -661,12 +690,12 @@ unixdep = "0.3"
             }
             other => panic!("max admitted version must be Manifest, got {other:?}"),
         }
-        assert!(matches!(
-            idx.map
-                .get(&("serde".into(), "1.0.5".into(), "crates.io"))
-                .unwrap(),
-            Provenance::LockOnly { .. }
-        ));
+        let entries = idx
+            .map
+            .get(&("serde".into(), "1.0.5".into(), "crates.io"))
+            .unwrap();
+        assert_eq!(entries.len(), 1);
+        assert!(matches!(&entries[0], Provenance::LockOnly { .. }));
     }
 
     #[test]
@@ -690,11 +719,12 @@ unixdep = "0.3"
         let files = vec![(py.clone(), FileType::PyProject)];
         let occurrences = scan_packages(&files).unwrap();
         let idx = classify(&locks, &lps, &occurrences);
-        match idx
+        let entries = idx
             .map
             .get(&("typing-extensions".into(), "4.9.0".into(), "PyPI"))
-            .unwrap()
-        {
+            .unwrap();
+        assert_eq!(entries.len(), 1);
+        match &entries[0] {
             Provenance::Manifest { owners, .. } => {
                 assert_eq!(
                     owners[0].dependency_key, "Typing_Extensions",
@@ -703,12 +733,12 @@ unixdep = "0.3"
             }
             other => panic!("declared name (PEP 503 variant) must be Manifest, got {other:?}"),
         }
-        assert!(matches!(
-            idx.map
-                .get(&("lockonly".into(), "0.40.0".into(), "PyPI"))
-                .unwrap(),
-            Provenance::LockOnly { .. }
-        ));
+        let entries = idx
+            .map
+            .get(&("lockonly".into(), "0.40.0".into(), "PyPI"))
+            .unwrap();
+        assert_eq!(entries.len(), 1);
+        assert!(matches!(&entries[0], Provenance::LockOnly { .. }));
     }
 
     #[test]
@@ -734,11 +764,12 @@ unixdep = "0.3"
         }];
         let lps = vec![lp("shared", "1.3.0", Ecosystem::CratesIo, &lock, None)];
         let idx = classify(&locks, &lps, &Default::default());
-        match idx
+        let entries = idx
             .map
             .get(&("shared".into(), "1.3.0".into(), "crates.io"))
-            .unwrap()
-        {
+            .unwrap();
+        assert_eq!(entries.len(), 1);
+        match &entries[0] {
             Provenance::Manifest { owners, .. } => {
                 let mut manifests: Vec<_> = owners.iter().map(|o| o.manifest.clone()).collect();
                 manifests.sort();
@@ -750,5 +781,70 @@ unixdep = "0.3"
             }
             other => panic!("expected Manifest with two owners, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn independent_locks_do_not_shadow_each_other() {
+        // Two SEPARATE Cargo projects in one scan: foo is a direct dep in
+        // project a (Manifest under a's lock) and a transitive-only copy in
+        // project b (LockOnly under b's lock). Both classifications must
+        // coexist; the original single-entry map let a's direct dep shadow
+        // b's floor action.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("a")).unwrap();
+        std::fs::create_dir_all(dir.path().join("b")).unwrap();
+        let a_manifest = dir.path().join("a/Cargo.toml");
+        std::fs::write(
+            &a_manifest,
+            "[package]\nname = \"a\"\nversion = \"0.1.0\"\n\n[dependencies]\nfoo = \"1.0\"\n",
+        )
+        .unwrap();
+        let b_manifest = dir.path().join("b/Cargo.toml");
+        std::fs::write(
+            &b_manifest,
+            "[package]\nname = \"b\"\nversion = \"0.1.0\"\n",
+        )
+        .unwrap();
+        let a_lock = dir.path().join("a/Cargo.lock");
+        let b_lock = dir.path().join("b/Cargo.lock");
+        let locks = vec![
+            ScannableLock {
+                path: a_lock.clone(),
+                kind: LockKind::Cargo,
+                associated_manifests: vec![a_manifest.clone()],
+            },
+            ScannableLock {
+                path: b_lock.clone(),
+                kind: LockKind::Cargo,
+                associated_manifests: vec![b_manifest.clone()],
+            },
+        ];
+        let lps = vec![
+            lp("foo", "1.2.3", Ecosystem::CratesIo, &a_lock, None),
+            lp("foo", "1.2.3", Ecosystem::CratesIo, &b_lock, None),
+        ];
+        let idx = classify(&locks, &lps, &Default::default());
+        let entries = idx
+            .map
+            .get(&("foo".into(), "1.2.3".into(), "crates.io"))
+            .expect("pair classified");
+        assert_eq!(
+            entries.len(),
+            2,
+            "one provenance entry per lockfile: {entries:?}"
+        );
+        let a_entry = entries
+            .iter()
+            .find(|p| matches!(p, Provenance::Manifest { lockfile, .. } if *lockfile == a_lock))
+            .expect("project a's direct dep is Manifest under a's lock");
+        if let Provenance::Manifest { owners, .. } = a_entry {
+            assert_eq!(owners[0].dependency_key, "foo");
+        }
+        assert!(
+            entries
+                .iter()
+                .any(|p| matches!(p, Provenance::LockOnly { lockfile, .. } if *lockfile == b_lock)),
+            "project b's transitive copy stays LockOnly under b's lock: {entries:?}"
+        );
     }
 }
