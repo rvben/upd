@@ -785,6 +785,53 @@ pub fn route_fix_targets(
     }
 }
 
+/// Resolve the floor version for a lock-only package: config pin if above
+/// the locked version, else registry latest gated by cooldown and the bump
+/// filter. Ok(None) = no floor needed (candidate at/below the locked
+/// version, or capped by cooldown/--max-bump). Registry failures return
+/// Err - the caller pushes them into the update error channel (exit 2);
+/// they are NEVER collapsed into Ok(None), which would silently exit 0.
+/// Lives here rather than in the binary because the per-lang comparison
+/// (crate::align::compare_versions) is crate-private.
+pub async fn resolve_floor_version(
+    registry: &dyn crate::registry::Registry,
+    package: &str,
+    locked: &str,
+    lang: Lang,
+    options: &crate::updater::UpdateOptions,
+) -> anyhow::Result<Option<String>> {
+    if let Some(pinned) = options.get_pinned_version(package) {
+        return Ok(
+            if crate::align::compare_versions(pinned, locked, lang) == Ordering::Greater {
+                Some(pinned.to_string())
+            } else {
+                None
+            },
+        );
+    }
+
+    let latest = registry.get_latest_version(package).await?;
+    let (outcome, note) =
+        crate::updater::apply_cooldown(registry, package, locked, &latest, None, false, options)
+            .await;
+    if let Some(msg) = note {
+        options.note_cooldown_unavailable(&msg);
+    }
+    let candidate = match outcome {
+        crate::updater::CooldownOutcome::Unchanged(v) => v,
+        crate::updater::CooldownOutcome::HeldBack { chosen, .. } => chosen,
+        crate::updater::CooldownOutcome::Skipped { .. } => return Ok(None),
+    };
+
+    if crate::align::compare_versions(&candidate, locked, lang) != Ordering::Greater {
+        return Ok(None);
+    }
+    if !options.allows_bump(locked, &candidate) {
+        return Ok(None);
+    }
+    Ok(Some(candidate))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1729,5 +1776,107 @@ mod tests {
             "no bumpable manifest entry (e.g. a commit-pinned version)"
         );
         assert!(!u.no_fixed_version);
+    }
+
+    mod resolve_floor_version_tests {
+        use super::*;
+        use crate::config::UpdConfig;
+        use crate::registry::mock::MockRegistry;
+        use crate::updater::{BumpFilter, UpdateOptions};
+        use std::sync::Arc;
+
+        #[tokio::test]
+        async fn registry_latest_above_locked_is_floored() {
+            let registry = MockRegistry::new("PyPI").with_version("lockonly", "0.49.1");
+            let options = UpdateOptions::new(false, false);
+
+            let result =
+                resolve_floor_version(&registry, "lockonly", "0.40.0", Lang::Python, &options)
+                    .await
+                    .unwrap();
+
+            assert_eq!(result, Some("0.49.1".to_string()));
+        }
+
+        #[tokio::test]
+        async fn candidate_at_or_below_locked_yields_no_floor() {
+            let registry = MockRegistry::new("PyPI").with_version("lockonly", "0.40.0");
+            let options = UpdateOptions::new(false, false);
+
+            let result =
+                resolve_floor_version(&registry, "lockonly", "0.40.0", Lang::Python, &options)
+                    .await
+                    .unwrap();
+
+            assert_eq!(result, None);
+        }
+
+        #[tokio::test]
+        async fn max_bump_caps_the_floor() {
+            let registry = MockRegistry::new("PyPI").with_version("lockonly", "1.2.0");
+            let options = UpdateOptions::new(false, false).with_bump_filter(BumpFilter {
+                major: false,
+                minor: true,
+                patch: true,
+            });
+
+            let result =
+                resolve_floor_version(&registry, "lockonly", "0.40.0", Lang::Python, &options)
+                    .await
+                    .unwrap();
+
+            assert_eq!(result, None);
+        }
+
+        #[tokio::test]
+        async fn config_pin_above_locked_wins_over_registry() {
+            let registry = MockRegistry::new("PyPI").with_version("lockonly", "0.49.1");
+            let config = Arc::new(UpdConfig {
+                pin: HashMap::from([("lockonly".to_string(), "0.45.0".to_string())]),
+                ..Default::default()
+            });
+            let options = UpdateOptions::new(false, false).with_config(config);
+
+            let result =
+                resolve_floor_version(&registry, "lockonly", "0.40.0", Lang::Python, &options)
+                    .await
+                    .unwrap();
+
+            assert_eq!(result, Some("0.45.0".to_string()));
+        }
+
+        #[tokio::test]
+        async fn config_pin_at_or_below_locked_yields_no_floor() {
+            let registry = MockRegistry::new("PyPI").with_version("lockonly", "0.49.1");
+            let config = Arc::new(UpdConfig {
+                pin: HashMap::from([("lockonly".to_string(), "0.40.0".to_string())]),
+                ..Default::default()
+            });
+            let options = UpdateOptions::new(false, false).with_config(config);
+
+            let result =
+                resolve_floor_version(&registry, "lockonly", "0.40.0", Lang::Python, &options)
+                    .await
+                    .unwrap();
+
+            assert_eq!(result, None);
+        }
+
+        #[tokio::test]
+        async fn registry_failure_is_an_error_not_none() {
+            let registry = MockRegistry::new("PyPI");
+            let options = UpdateOptions::new(false, false);
+
+            let result = resolve_floor_version(
+                &registry,
+                "missing-package",
+                "0.40.0",
+                Lang::Python,
+                &options,
+            )
+            .await;
+
+            assert!(result.is_err());
+        }
     }
 }

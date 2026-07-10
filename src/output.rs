@@ -75,6 +75,18 @@ pub struct UpdateEntry {
     pub bump: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub line: Option<usize>,
+    /// Fix method for a version floor (`"uv-constraint"`, `"npm-override"`,
+    /// `"cargo-precise"`); absent for a plain manifest update.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub method: Option<&'static str>,
+    /// Outcome status for a version floor (see `FixStatus::as_str`); absent
+    /// for a plain manifest update.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub status: Option<&'static str>,
+    /// Guidance for an unfixable floor; resolver stderr for a failed or
+    /// rolled-back floor. Absent for a plain manifest update.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
 }
 
 /// A package update held back by cooldown — the chosen version is older than
@@ -154,6 +166,11 @@ pub struct UpdateReport {
     pub summary: UpdateSummary,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub cooldown_notes: Vec<String>,
+    /// Lockfile-discovery warnings (e.g. an ancestor lock outside the
+    /// scanned paths). Only populated when `--package` triggers lockfile
+    /// scanning for version floors.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -311,6 +328,9 @@ pub fn build_update_file_report(
             latest: new.clone(),
             bump: classify(old, new),
             line: *line,
+            method: None,
+            status: None,
+            error: None,
         })
         .collect();
 

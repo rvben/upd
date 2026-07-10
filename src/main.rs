@@ -10,13 +10,15 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use upd::align::{PackageAlignment, PackageOccurrence, find_alignments, scan_packages};
 use upd::audit::cache::AuditCache;
-use upd::audit::{AuditResult, Ecosystem, OsvClient, Package as AuditPackage};
+use upd::audit::{
+    AuditResult, Ecosystem, OsvClient, Package as AuditPackage, PackageAuditResult, Vulnerability,
+};
 use upd::cache::{Cache, CachedRegistry};
 use upd::cli::{BumpLevel, Cli, Command, OutputMode, REVERT_TIP};
 use upd::config::UpdConfig;
 use upd::cooldown::CooldownPolicy;
 use upd::fix::apply::{AppliedFix, FixApplyOptions, FixStatus, apply_fix_targets};
-use upd::fix::{FixKind, FixTarget, route_fix_targets};
+use upd::fix::{FixKind, FixTarget, UnfixableTarget, resolve_floor_version, route_fix_targets};
 use upd::interactive::{PendingUpdate, prompt_all};
 use upd::lockfile::{LockfileRegenResult, RegenOutcome, regenerate_lockfiles};
 use upd::lockscan;
@@ -438,6 +440,168 @@ fn build_update_options(
     options
 }
 
+/// The `Lang` an OSV `Ecosystem` corresponds to (mirrors the private
+/// `fix::ecosystem_lang`; duplicated here since `main.rs` is a separate
+/// crate from the `upd` library and cannot see its private items). Drives
+/// `scan_packages`'s occurrence-map lookups and `resolve_floor_version`'s
+/// per-lang version comparison for `--package` lock-only floors.
+fn ecosystem_to_lang(ecosystem: Ecosystem) -> Lang {
+    match ecosystem {
+        Ecosystem::PyPI => Lang::Python,
+        Ecosystem::Npm => Lang::Node,
+        Ecosystem::CratesIo => Lang::Rust,
+        Ecosystem::Go => Lang::Go,
+        Ecosystem::RubyGems => Lang::Ruby,
+        Ecosystem::NuGet => Lang::DotNet,
+    }
+}
+
+/// Normalize a package name per ecosystem convention: PEP 503 for PyPI,
+/// lowercase otherwise (mirrors the private `fix::normalized_name`).
+fn normalized_package_name(name: &str, ecosystem: Ecosystem) -> String {
+    if ecosystem == Ecosystem::PyPI {
+        pep503_normalize(name)
+    } else {
+        name.to_lowercase()
+    }
+}
+
+/// Whether `norm` (already normalized per `ecosystem`) matches any manifest
+/// occurrence scanned by `scan_packages`. A `--package` name that matches a
+/// manifest occurrence keeps today's update path untouched (rule 2); a name
+/// matching only a scanned lockfile is a version-floor candidate.
+fn matches_manifest_occurrence(
+    packages: &HashMap<(String, Lang), Vec<PackageOccurrence>>,
+    norm: &str,
+    ecosystem: Ecosystem,
+) -> bool {
+    let lang = ecosystem_to_lang(ecosystem);
+    packages.iter().any(|((name, l), occs)| {
+        if *l != lang || occs.is_empty() {
+            return false;
+        }
+        let candidate = if ecosystem == Ecosystem::PyPI {
+            pep503_normalize(name)
+        } else {
+            name.clone()
+        };
+        candidate == norm
+    })
+}
+
+/// Whether `name` (as requested via `--package`) resolves only through a
+/// scanned lockfile: no manifest occurrence, but at least one lock-scanned
+/// package under the same normalized name (rule 2). Shared between the
+/// non-interactive floor branch and the `--interactive` early-return note
+/// (rule 9).
+fn is_lock_only_name(
+    name: &str,
+    lock_packages: &[upd::lockscan::LockedPackage],
+    manifest_packages: &HashMap<(String, Lang), Vec<PackageOccurrence>>,
+) -> bool {
+    lock_packages.iter().any(|lp| {
+        let norm = normalized_package_name(&lp.name, lp.ecosystem);
+        normalized_package_name(name, lp.ecosystem) == norm
+            && !matches_manifest_occurrence(manifest_packages, &norm, lp.ecosystem)
+    })
+}
+
+/// The report/apply path a version floor targets for a given lock, mirroring
+/// `fix::route_lock_only`'s path assignment: the host manifest for Uv/Npm,
+/// the lockfile itself for Cargo (a pure lockfile mutation) and Poetry (no
+/// floor mechanism exists, so the diagnostic is anchored on the lock).
+fn floor_report_path(lockfile: &Path, kind: lockscan::discover::LockKind) -> PathBuf {
+    let dir = lockfile.parent().unwrap_or_else(|| Path::new("."));
+    match kind {
+        lockscan::discover::LockKind::Uv => dir.join("pyproject.toml"),
+        lockscan::discover::LockKind::Npm => dir.join("package.json"),
+        lockscan::discover::LockKind::Cargo | lockscan::discover::LockKind::Poetry => {
+            lockfile.to_path_buf()
+        }
+    }
+}
+
+/// The manifest path used to resolve `--package` floor config (ignore/pin):
+/// always the ecosystem's manifest file, even for Cargo/Poetry where the
+/// floor's own report path is the lockfile.
+fn floor_config_lookup_path(lockfile: &Path, kind: lockscan::discover::LockKind) -> PathBuf {
+    let dir = lockfile.parent().unwrap_or_else(|| Path::new("."));
+    match kind {
+        lockscan::discover::LockKind::Uv | lockscan::discover::LockKind::Poetry => {
+            dir.join("pyproject.toml")
+        }
+        lockscan::discover::LockKind::Npm => dir.join("package.json"),
+        lockscan::discover::LockKind::Cargo => dir.join("Cargo.toml"),
+    }
+}
+
+/// `(file_type, lang)` for a floor report grouped under `path`, derived from
+/// the path's filename since a floor's report path can be a lockfile (Cargo,
+/// Poetry) that has no dedicated `FileType` variant.
+fn floor_file_type_and_lang(path: &Path) -> (&'static str, &'static str) {
+    match path.file_name().and_then(|n| n.to_str()) {
+        Some("package.json") => (FileType::PackageJson.as_str(), Lang::Node.as_str()),
+        Some("Cargo.toml") => (FileType::CargoToml.as_str(), Lang::Rust.as_str()),
+        Some("Cargo.lock") => ("cargo_lock", Lang::Rust.as_str()),
+        Some("poetry.lock") => ("poetry_lock", Lang::Python.as_str()),
+        _ => (FileType::PyProject.as_str(), Lang::Python.as_str()),
+    }
+}
+
+/// An empty `UpdateFileReport` anchored on `path`, ready for a floor loop to
+/// push into one of its vecs. Shared by every floor grouping site (outcomes,
+/// unfixables, ignored, resolution errors) so the field list lives in one
+/// place.
+fn empty_floor_report(path: &Path) -> upd::output::UpdateFileReport {
+    let (file_type, lang) = floor_file_type_and_lang(path);
+    upd::output::UpdateFileReport {
+        path: path.display().to_string(),
+        file_type,
+        lang,
+        updates: Vec::new(),
+        pinned: Vec::new(),
+        ignored: Vec::new(),
+        held_back: Vec::new(),
+        skipped_by_cooldown: Vec::new(),
+        errors: Vec::new(),
+        warnings: Vec::new(),
+    }
+}
+
+/// Resolve the `UpdConfig` governing a `--package` floor target's
+/// ignore/pin rules. Reuses an already-discovered file config when the
+/// floor's config lookup path was itself a discovered manifest (the common
+/// case); falls back to a fresh discovery walk for lockfile-only hosts
+/// (Cargo, Poetry) that `load_update_configs` never saw because it only
+/// walks from discovered manifest files.
+fn resolve_floor_config(
+    cli: &Cli,
+    file_configs: &HashMap<PathBuf, Option<Arc<UpdConfig>>>,
+    lookup_path: &Path,
+) -> Result<Option<Arc<UpdConfig>>> {
+    if let Some(existing) = file_configs.get(lookup_path) {
+        return Ok(existing.clone());
+    }
+    if let Some(config_path) = &cli.config {
+        return Ok(Some(Arc::new(
+            UpdConfig::load_from_path_with_error(config_path).map_err(anyhow::Error::msg)?,
+        )));
+    }
+    let start_dir = lookup_path.parent().unwrap_or(lookup_path).to_path_buf();
+    Ok(discover_update_config(&start_dir)
+        .map_err(anyhow::Error::msg)?
+        .map(|resolved| resolved.config))
+}
+
+/// Message printed to stderr when `--interactive --package <name>` names a
+/// lock-only dependency (rule 9): interactive floor prompting is out of
+/// scope, so the note tells the user to rerun without `--interactive`.
+fn lock_only_interactive_note(package: &str) -> String {
+    format!(
+        "note: {package} is a lock-only dependency; version floors are not offered interactively - rerun without --interactive"
+    )
+}
+
 fn build_approved_change_counts(
     updates_with_decisions: &[PendingUpdate],
     planned_changes: &[PlannedChange],
@@ -837,6 +1001,8 @@ async fn run_update(cli: &Cli) -> Result<()> {
                     filter: UpdateFilter::from_cli(&cli.only_bump, cli.max_bump),
                     file_cooldowns: &HashMap::new(),
                     cooldown_notes: Vec::new(),
+                    floor_reports: Vec::new(),
+                    lockscan_warnings: Vec::new(),
                 },
                 &BoundedOutputParams::from_cli(cli),
             )?;
@@ -994,6 +1160,7 @@ async fn run_update(cli: &Cli) -> Result<()> {
         return run_interactive_update(
             cli,
             &files,
+            &paths,
             &file_configs,
             filter,
             &pypi,
@@ -1025,6 +1192,15 @@ async fn run_update(cli: &Cli) -> Result<()> {
 
     // Non-interactive mode: process files in parallel
     let dry_run = effective_dry_run;
+    // Only cloned when --package narrows to specific names: the version-floor
+    // branch below needs the discovered (path, FileType) list again after
+    // `files` is consumed by `.into_iter()` just below, but every other run
+    // must not pay for a clone it never uses.
+    let discovered_files: Vec<(PathBuf, FileType)> = if cli.packages.is_empty() {
+        Vec::new()
+    } else {
+        files.clone()
+    };
     let file_jobs: Vec<_> = files
         .into_iter()
         .map(|(path, file_type)| {
@@ -1193,6 +1369,291 @@ async fn run_update(cli: &Cli) -> Result<()> {
         }
     }
 
+    // Version-floor branch (rules 1-9 of the --package lock-only design):
+    // lockfiles are parsed only when --package narrows to specific names. A
+    // requested name with no manifest occurrence but a hit in a scanned
+    // lockfile is floored to the registry latest (or a config pin) through
+    // the lock's own mechanism (uv constraint, npm override, cargo
+    // --precise); poetry has no floor mechanism and is reported unfixable.
+    let mut floor_reports: Vec<upd::output::UpdateFileReport> = Vec::new();
+    let mut lockscan_warnings: Vec<String> = Vec::new();
+    let mut floor_has_planned = false;
+
+    if !cli.packages.is_empty() {
+        let lock_scan = lockscan::scan_locks(&discovered_files, &paths);
+        lockscan_warnings = lock_scan.warnings.clone();
+        if text_mode {
+            for warning in &lockscan_warnings {
+                eprintln!("{} {}", "Warning:".yellow(), warning);
+            }
+        }
+
+        let manifest_packages = match scan_packages(&discovered_files) {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("{}", format!("Error scanning files: {}", e).red());
+                return Err(e);
+            }
+        };
+
+        let lock_kind_by_path: HashMap<PathBuf, lockscan::discover::LockKind> = lock_scan
+            .locks
+            .iter()
+            .map(|l| (l.path.clone(), l.kind))
+            .collect();
+
+        // Rule 2: a requested name is lock-only when it matches no manifest
+        // occurrence but resolves via at least one scanned lockfile.
+        let mut lock_only: Vec<&upd::lockscan::LockedPackage> = Vec::new();
+        for locked in &lock_scan.packages {
+            let norm = normalized_package_name(&locked.name, locked.ecosystem);
+            let requested = cli
+                .packages
+                .iter()
+                .any(|p| normalized_package_name(p, locked.ecosystem) == norm);
+            if !requested
+                || matches_manifest_occurrence(&manifest_packages, &norm, locked.ecosystem)
+            {
+                continue;
+            }
+            lock_only.push(locked);
+        }
+
+        // Distinct (name, version, ecosystem) triples: classify()/
+        // route_fix_targets fan a single triple out to every lockfile that
+        // resolves it, so the floor candidate is resolved once per triple
+        // (not per lockfile) to match that fan-out instead of duplicating
+        // registry calls.
+        let mut distinct: Vec<&upd::lockscan::LockedPackage> = Vec::new();
+        for lp in &lock_only {
+            if !distinct.iter().any(|d: &&upd::lockscan::LockedPackage| {
+                d.name == lp.name && d.version == lp.version && d.ecosystem == lp.ecosystem
+            }) {
+                distinct.push(lp);
+            }
+        }
+
+        let mut synthetic_vulnerable: Vec<PackageAuditResult> = Vec::new();
+        let mut floor_ignored: HashMap<PathBuf, Vec<upd::output::IgnoredEntry>> = HashMap::new();
+        let mut floor_errors: HashMap<PathBuf, Vec<upd::output::ErrorEntry>> = HashMap::new();
+
+        for locked in &distinct {
+            let Some(kind) = lock_kind_by_path.get(&locked.lockfile_path).copied() else {
+                continue;
+            };
+            let report_path = floor_report_path(&locked.lockfile_path, kind);
+            let lookup_path = floor_config_lookup_path(&locked.lockfile_path, kind);
+            let config = resolve_floor_config(cli, &file_configs, &lookup_path)?;
+            let lang = ecosystem_to_lang(locked.ecosystem);
+
+            let raw_policy = match config.as_ref() {
+                Some(cfg) => cfg.to_cooldown_policy(cli.min_age.as_deref())?,
+                None => UpdConfig::default().to_cooldown_policy(cli.min_age.as_deref())?,
+            };
+            let is_noop_cooldown = raw_policy.force_override.is_none()
+                && raw_policy.default <= Duration::zero()
+                && raw_policy.per_ecosystem.is_empty();
+            let cooldown_policy = if is_noop_cooldown {
+                None
+            } else {
+                Some(raw_policy)
+            };
+
+            let options = build_update_options(
+                dry_run,
+                cli.full_precision,
+                config,
+                &cli.packages,
+                cooldown_policy.as_ref(),
+                Arc::clone(&cooldown_notes),
+                filter.to_bump_filter(),
+            );
+
+            if options.should_ignore(&locked.name) {
+                floor_ignored.entry(report_path.clone()).or_default().push(
+                    upd::output::IgnoredEntry {
+                        package: locked.name.clone(),
+                        current: locked.version.clone(),
+                        line: None,
+                    },
+                );
+                continue;
+            }
+
+            let registry: &dyn upd::registry::Registry = match locked.ecosystem {
+                Ecosystem::PyPI => pypi.as_ref(),
+                Ecosystem::Npm => npm.as_ref(),
+                Ecosystem::CratesIo => crates_io.as_ref(),
+                Ecosystem::Go | Ecosystem::RubyGems | Ecosystem::NuGet => continue,
+            };
+
+            match resolve_floor_version(registry, &locked.name, &locked.version, lang, &options)
+                .await
+            {
+                Ok(Some(candidate)) => {
+                    synthetic_vulnerable.push(PackageAuditResult {
+                        package: AuditPackage {
+                            name: locked.name.clone(),
+                            version: locked.version.clone(),
+                            ecosystem: locked.ecosystem,
+                        },
+                        vulnerabilities: vec![Vulnerability {
+                            id: "floor".to_string(),
+                            summary: None,
+                            severity: None,
+                            url: None,
+                            fixed_version: Some(candidate),
+                            aliases: Vec::new(),
+                            source: String::new(),
+                        }],
+                    });
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    let msg = format!("Error resolving floor for {}: {}", locked.name, e);
+                    eprintln!("{}", msg.red());
+                    total_result.errors.push(msg.clone());
+                    // Registry-resolution failures never become a FixTarget, so
+                    // they need their own file-anchored entry: without this the
+                    // error would only bump summary.errors, invisible in files[].
+                    floor_errors.entry(report_path.clone()).or_default().push(
+                        upd::output::ErrorEntry::with_file(
+                            report_path.display().to_string(),
+                            "registry",
+                            msg,
+                        ),
+                    );
+                }
+            }
+        }
+
+        let (outcomes, unfixable, apply_notes): (
+            Vec<AppliedFix>,
+            Vec<UnfixableTarget>,
+            Vec<String>,
+        ) = if synthetic_vulnerable.is_empty() {
+            (Vec::new(), Vec::new(), Vec::new())
+        } else {
+            let synthetic_audit = AuditResult {
+                vulnerable: synthetic_vulnerable,
+                safe_count: 0,
+                errors: Vec::new(),
+                warnings: Vec::new(),
+            };
+            let prov = lockscan::provenance::classify(
+                &lock_scan.locks,
+                &lock_scan.packages,
+                &manifest_packages,
+            );
+            let routing = route_fix_targets(&synthetic_audit, &prov, &manifest_packages);
+
+            if !cli.quiet {
+                for u in &routing.unfixable {
+                    eprintln!(
+                        "{} Cannot auto-fix {}: {}",
+                        "⚠".yellow().bold(),
+                        u.package.bold(),
+                        u.reason
+                    );
+                }
+            }
+
+            let opts = FixApplyOptions {
+                dry_run,
+                relock_manifests: cli.lock && !cli.no_lock,
+                relock_floors: !cli.no_lock,
+                verbose: verbose && text_mode,
+            };
+            let (outcomes, notes) = apply_fix_targets(routing.targets, &opts, &|_, _, _| Ok(false));
+            (outcomes, routing.unfixable, notes)
+        };
+
+        for note in &apply_notes {
+            eprintln!("note: {note}");
+        }
+
+        if text_mode && !cli.quiet {
+            for outcome in &outcomes {
+                print_fix_outcome(outcome);
+            }
+        }
+
+        let mut grouped: std::collections::BTreeMap<PathBuf, upd::output::UpdateFileReport> =
+            std::collections::BTreeMap::new();
+
+        for outcome in &outcomes {
+            let target = &outcome.target;
+            if matches!(outcome.status, FixStatus::Failed | FixStatus::RolledBack)
+                && let Some(err) = &outcome.error
+            {
+                let msg = format!("{}: {}", target.package, err);
+                eprintln!("{}", msg.red());
+                total_result.errors.push(msg);
+            }
+            if outcome.status == FixStatus::Planned {
+                floor_has_planned = true;
+            }
+            let report = grouped
+                .entry(target.path.clone())
+                .or_insert_with(|| empty_floor_report(&target.path));
+            report.updates.push(upd::output::UpdateEntry {
+                package: target.package.clone(),
+                current: target.from_version.clone(),
+                latest: target.to_version.clone(),
+                bump: match classify_update(&target.from_version, &target.to_version) {
+                    UpdateType::Major => "major",
+                    UpdateType::Minor => "minor",
+                    UpdateType::Patch => "patch",
+                },
+                line: None,
+                method: Some(target.kind.method()),
+                status: Some(outcome.status.as_str()),
+                error: outcome.error.clone(),
+            });
+        }
+
+        for u in &unfixable {
+            let Some(path) = u.path.clone() else {
+                continue;
+            };
+            let current = u.from_version.clone();
+            let latest = u.to_version.clone().unwrap_or_else(|| current.clone());
+            let report = grouped
+                .entry(path.clone())
+                .or_insert_with(|| empty_floor_report(&path));
+            report.updates.push(upd::output::UpdateEntry {
+                package: u.package.clone(),
+                current: current.clone(),
+                latest: latest.clone(),
+                bump: match classify_update(&current, &latest) {
+                    UpdateType::Major => "major",
+                    UpdateType::Minor => "minor",
+                    UpdateType::Patch => "patch",
+                },
+                line: None,
+                method: u.method,
+                status: Some("unfixable"),
+                error: Some(u.reason.clone()),
+            });
+        }
+
+        for (path, ignored) in floor_ignored {
+            let report = grouped
+                .entry(path.clone())
+                .or_insert_with(|| empty_floor_report(&path));
+            report.ignored.extend(ignored);
+        }
+
+        for (path, errors) in floor_errors {
+            let report = grouped
+                .entry(path.clone())
+                .or_insert_with(|| empty_floor_report(&path));
+            report.errors.extend(errors);
+        }
+
+        floor_reports = grouped.into_values().collect();
+    }
+
     // Regenerate lockfiles if requested and at least one manifest changed.
     if cli.lock && !dry_run && !updated_files.is_empty() {
         // Group changed package names by the directory of their manifest file.
@@ -1318,13 +1779,15 @@ async fn run_update(cli: &Cli) -> Result<()> {
                 filter,
                 file_cooldowns: &file_cooldowns,
                 cooldown_notes: notes_vec,
+                floor_reports,
+                lockscan_warnings,
             },
             &BoundedOutputParams::from_cli(cli),
         )?;
     }
 
     let has_errors = !total_result.errors.is_empty();
-    let has_pending = has_checkable_manifest_changes(&total_result, filter);
+    let has_pending = has_checkable_manifest_changes(&total_result, filter) || floor_has_planned;
     let exit_code = upd::decide_exit_code(dry_run, has_pending, has_errors);
     if exit_code != 0 {
         std::process::exit(exit_code);
@@ -1359,6 +1822,12 @@ struct UpdateReportInput<'a> {
     filter: UpdateFilter,
     file_cooldowns: &'a HashMap<PathBuf, Option<CooldownPolicy>>,
     cooldown_notes: Vec<String>,
+    /// Version-floor file reports for lock-only `--package` targets (rule 6);
+    /// empty when `--package` matched no lock-only names or was not given.
+    floor_reports: Vec<upd::output::UpdateFileReport>,
+    /// Lockscan discovery/guard warnings surfaced by the version-floor branch
+    /// (rule 1); folded into `UpdateReport.warnings`.
+    lockscan_warnings: Vec<String>,
 }
 
 /// Apply --limit, --offset, and --fields to a JSON document for bounded output.
@@ -1419,9 +1888,11 @@ fn emit_update_json(input: UpdateReportInput<'_>, bounded: &BoundedOutputParams<
         filter,
         file_cooldowns,
         cooldown_notes,
+        floor_reports,
+        lockscan_warnings,
     } = input;
 
-    let files: Vec<_> = scanned
+    let mut files: Vec<_> = scanned
         .iter()
         .map(|sf| {
             let cooldown_seconds = file_cooldowns
@@ -1447,23 +1918,45 @@ fn emit_update_json(input: UpdateReportInput<'_>, bounded: &BoundedOutputParams<
         .collect();
 
     let (major, minor, patch, total) = count_updates_by_type(&total_result.updated, filter);
+
+    // Floor entries are gated by allows_bump/cooldown inside resolve_floor_version
+    // already, so they count toward the summary unconditionally (rule 7) rather
+    // than through count_updates_by_type's own filter re-application.
+    let (floor_major, floor_minor, floor_patch, floor_total) =
+        floor_reports.iter().flat_map(|r| &r.updates).fold(
+            (0usize, 0usize, 0usize, 0usize),
+            |(maj, min, pat, tot), entry| match entry.bump {
+                "major" => (maj + 1, min, pat, tot + 1),
+                "minor" => (maj, min + 1, pat, tot + 1),
+                _ => (maj, min, pat + 1, tot + 1),
+            },
+        );
+    let floor_ignored: usize = floor_reports.iter().map(|r| r.ignored.len()).sum();
+    let floor_files_with_changes = floor_reports
+        .iter()
+        .filter(|r| !r.updates.is_empty())
+        .count();
+
     let summary = UpdateSummary {
         files_scanned: file_count,
         files_with_changes: scanned
             .iter()
             .filter(|sf| file_has_manifest_changes(&sf.result))
-            .count(),
-        updates_total: total,
-        updates_major: major,
-        updates_minor: minor,
-        updates_patch: patch,
+            .count()
+            + floor_files_with_changes,
+        updates_total: total + floor_total,
+        updates_major: major + floor_major,
+        updates_minor: minor + floor_minor,
+        updates_patch: patch + floor_patch,
         pinned: total_result.pinned.len(),
-        ignored: total_result.ignored.len(),
+        ignored: total_result.ignored.len() + floor_ignored,
         errors: total_result.errors.len(),
-        warnings: total_result.warnings.len(),
+        warnings: total_result.warnings.len() + lockscan_warnings.len(),
         held_back: total_result.held_back.len(),
         skipped_by_cooldown: total_result.skipped_by_cooldown.len(),
     };
+
+    files.extend(floor_reports);
 
     let report = UpdateReport {
         command: "update",
@@ -1471,6 +1964,7 @@ fn emit_update_json(input: UpdateReportInput<'_>, bounded: &BoundedOutputParams<
         files,
         summary,
         cooldown_notes,
+        warnings: lockscan_warnings,
     };
 
     let doc = serde_json::to_value(&report)?;
@@ -1483,6 +1977,7 @@ fn emit_update_json(input: UpdateReportInput<'_>, bounded: &BoundedOutputParams<
 async fn run_interactive_update(
     cli: &Cli,
     files: &[(std::path::PathBuf, FileType)],
+    paths: &[PathBuf],
     file_configs: &HashMap<PathBuf, Option<Arc<UpdConfig>>>,
     filter: UpdateFilter,
     pypi: &Arc<CachedRegistry<MultiPyPiRegistry>>,
@@ -1522,6 +2017,24 @@ async fn run_interactive_update(
             })
         );
         std::process::exit(2);
+    }
+
+    // Rule 9: version floors write constraint hosts and relock, which does not
+    // fit the per-package accept/reject prompt, so interactive floor
+    // prompting is out of scope for v1. When a requested --package name is
+    // lock-only (no manifest occurrence, but a hit in a scanned lockfile),
+    // tell the user instead of silently doing nothing for that name. This
+    // scan is best-effort: unlike the non-interactive floor branch, a
+    // failure here must not abort the interactive session.
+    if !cli.packages.is_empty()
+        && let Ok(manifest_packages) = scan_packages(files)
+    {
+        let lock_scan = lockscan::scan_locks(files, paths);
+        for name in &cli.packages {
+            if is_lock_only_name(name, &lock_scan.packages, &manifest_packages) {
+                eprintln!("{}", lock_only_interactive_note(name));
+            }
+        }
     }
 
     let mut pending_updates: Vec<PendingUpdate> = Vec::new();
@@ -4048,6 +4561,57 @@ mod tests {
         assert_eq!(parse_version(""), None);
         assert_eq!(parse_version("abc"), None);
         assert_eq!(parse_version("a.b.c"), None);
+    }
+
+    /// A name with no manifest occurrence but a hit in a scanned lockfile is
+    /// lock-only (rule 2); a name occurring in the manifest is not, even
+    /// when the same name also appears in the lockfile.
+    #[test]
+    fn is_lock_only_name_detects_lock_only_and_manifest_matched() {
+        let locked = vec![upd::lockscan::LockedPackage {
+            name: "lockonly".to_string(),
+            version: "0.40.0".to_string(),
+            ecosystem: Ecosystem::PyPI,
+            lockfile_path: PathBuf::from("uv.lock"),
+            line_number: None,
+            locator: None,
+        }];
+        let empty_manifest: HashMap<(String, Lang), Vec<PackageOccurrence>> = HashMap::new();
+        assert!(is_lock_only_name("lockonly", &locked, &empty_manifest));
+        assert!(!is_lock_only_name("unrelated", &locked, &empty_manifest));
+
+        let mut manifest_with_occurrence: HashMap<(String, Lang), Vec<PackageOccurrence>> =
+            HashMap::new();
+        manifest_with_occurrence.insert(
+            ("lockonly".to_string(), Lang::Python),
+            vec![PackageOccurrence {
+                file_path: PathBuf::from("pyproject.toml"),
+                file_type: FileType::PyProject,
+                version: "0.40.0".to_string(),
+                line_number: None,
+                has_upper_bound: false,
+                original_name: "lockonly".to_string(),
+                is_bumpable: true,
+            }],
+        );
+        assert!(!is_lock_only_name(
+            "lockonly",
+            &locked,
+            &manifest_with_occurrence
+        ));
+    }
+
+    /// Rule 9: the interactive early path's note names the package and
+    /// tells the user to rerun without `--interactive`, since a version
+    /// floor cannot be offered through the per-package accept/reject prompt.
+    #[test]
+    fn interactive_lock_only_package_gets_note() {
+        let note = lock_only_interactive_note("lockonly");
+        assert!(
+            note.contains("lockonly is a lock-only dependency"),
+            "{note}"
+        );
+        assert!(note.contains("rerun without --interactive"), "{note}");
     }
 
     #[test]
