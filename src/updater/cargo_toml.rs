@@ -116,6 +116,24 @@ impl CargoTomlUpdater {
         }
     }
 
+    /// Extract the real package name from a dependency item, for renamed deps
+    /// (e.g. `old_serde = { package = "serde", version = "1.0" }`). Returns
+    /// `None` when the item carries no `package` key, so callers fall back
+    /// to the TOML key as the name.
+    fn get_package_name(item: &Item) -> Option<String> {
+        match item {
+            Item::Value(Value::InlineTable(t)) => t
+                .get("package")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string()),
+            Item::Table(t) => t
+                .get("package")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string()),
+            _ => None,
+        }
+    }
+
     /// Set version on a dependency item, preserving structure
     fn set_version(item: &mut Item, new_version: &str) {
         match item {
@@ -717,8 +735,9 @@ impl Updater for CargoTomlUpdater {
                     if let Some(version_req) = Self::get_version(item) {
                         let (_, version) = Self::parse_version_req(&version_req);
                         let line_num = line_index.line_for(section_path, key);
+                        let name = Self::get_package_name(item).unwrap_or_else(|| key.to_string());
                         deps.push(ParsedDependency {
-                            name: key.to_string(),
+                            name,
                             version,
                             line_number: line_num,
                             has_upper_bound: false, // Cargo.toml doesn't use same constraint syntax as Python
@@ -830,6 +849,33 @@ mod tests {
             CargoTomlUpdater::get_version(&item),
             Some("1.0.0".to_string())
         );
+    }
+
+    #[test]
+    fn parse_dependencies_uses_package_name_for_renamed_deps() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("Cargo.toml");
+        std::fs::write(
+            &path,
+            r#"[package]
+name = "t"
+version = "0.1.0"
+
+[dependencies]
+plain = "1.0"
+old_serde = { package = "serde", version = "1.0" }
+"#,
+        )
+        .unwrap();
+        let updater = CargoTomlUpdater::new();
+        let deps = updater.parse_dependencies(&path).unwrap();
+        let names: Vec<&str> = deps.iter().map(|d| d.name.as_str()).collect();
+        assert!(names.contains(&"plain"));
+        assert!(
+            names.contains(&"serde"),
+            "renamed dep must be reported under its real package name, got {names:?}"
+        );
+        assert!(!names.contains(&"old_serde"));
     }
 
     #[tokio::test]
