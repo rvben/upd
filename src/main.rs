@@ -2428,6 +2428,12 @@ async fn run_audit(cli: &Cli) -> Result<()> {
             // report the ones that did not (e.g. lock-only transitive
             // dependencies with no manifest entry to bump).
             let mut edited_names: HashSet<&str> = HashSet::new();
+            // Names from `fixable` that matched a manifest occurrence at all
+            // (bumpable or not), so the post-loop diagnostic can tell "no
+            // manifest entry exists" (lock-only transitive dependency) apart
+            // from "a manifest entry exists but isn't bumpable" (e.g. a
+            // commit-pinned Go pseudo-version).
+            let mut matched_names: HashSet<&str> = HashSet::new();
 
             for ((name_lower, lang), occurrences) in &packages {
                 // Only ecosystems OSV covers.
@@ -2440,9 +2446,6 @@ async fn run_audit(cli: &Cli) -> Result<()> {
                 }
 
                 for occ in occurrences {
-                    if !occ.is_bumpable {
-                        continue;
-                    }
                     // Match against the fixable map using original_name (preserves casing).
                     // Fall back to the lowercased key if not found.
                     let fix_entry = fixable
@@ -2451,6 +2454,11 @@ async fn run_audit(cli: &Cli) -> Result<()> {
                     let Some((matched_name, new_version)) = fix_entry else {
                         continue;
                     };
+                    matched_names.insert(matched_name.as_str());
+
+                    if !occ.is_bumpable {
+                        continue;
+                    }
                     edited_names.insert(matched_name.as_str());
 
                     let entry = edits_by_file
@@ -2465,11 +2473,14 @@ async fn run_audit(cli: &Cli) -> Result<()> {
                 }
             }
 
-            // Report fixable packages that produced NO edit in any file -
-            // lock-only transitive dependencies have a fixed_version but no
-            // manifest occurrence to bump, so the loop above never touches
-            // them. Without this, --fix-audit silently "fixes" nothing for
-            // them while reporting success.
+            // Report fixable packages that produced NO edit in any file.
+            // Two distinct causes need distinct messages: a lock-only
+            // transitive dependency has a fixed_version but no manifest
+            // occurrence to bump at all, while a manifest occurrence can
+            // exist yet still be unbumpable (e.g. a commit-pinned Go
+            // pseudo-version, which the edit loop above skips via
+            // `is_bumpable`). Without this, --fix-audit silently "fixes"
+            // nothing for them while reporting success.
             if !cli.quiet {
                 let mut unedited: Vec<&str> = fixable
                     .keys()
@@ -2478,11 +2489,19 @@ async fn run_audit(cli: &Cli) -> Result<()> {
                     .collect();
                 unedited.sort_unstable();
                 for name in unedited {
-                    eprintln!(
-                        "{} Cannot auto-fix {}: no manifest entry to edit (lock-only transitive dependency; version flooring lands in a future release)",
-                        "⚠".yellow().bold(),
-                        name.bold(),
-                    );
+                    if matched_names.contains(name) {
+                        eprintln!(
+                            "{} Cannot auto-fix {}: no bumpable manifest entry (e.g. a commit-pinned version)",
+                            "⚠".yellow().bold(),
+                            name.bold(),
+                        );
+                    } else {
+                        eprintln!(
+                            "{} Cannot auto-fix {}: no manifest entry to edit (lock-only transitive dependency; version flooring lands in a future release)",
+                            "⚠".yellow().bold(),
+                            name.bold(),
+                        );
+                    }
                 }
             }
 

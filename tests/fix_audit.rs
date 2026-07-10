@@ -542,3 +542,73 @@ async fn fix_audit_clean_audit_exits_0() {
         "file must be unchanged on clean audit; got: {content}"
     );
 }
+
+/// A vulnerable Go pseudo-version pin (commit-based, not a release tag) DOES
+/// have a manifest entry - the go.mod require line is right there - but the
+/// edit loop skips it via `is_bumpable == false` (pseudo-versions cannot be
+/// floored to a semver fix). The post-loop diagnostic must not call this
+/// "lock-only" (that phrase means no manifest entry exists at all, and Go
+/// isn't lockscan territory to begin with); it must say the manifest entry
+/// exists but isn't bumpable.
+#[tokio::test]
+async fn fix_audit_reports_pseudo_version_as_unbumpable_not_lock_only() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .and(path("/querybatch"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "results": [{ "vulns": [{ "id": "GO-PSEUDO-1" }] }]
+        })))
+        .mount(&server)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/vulns/GO-PSEUDO-1"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "id": "GO-PSEUDO-1",
+            "summary": "vuln in a commit-pinned Go module",
+            "database_specific": { "severity": "HIGH" },
+            "affected": [{
+                "ranges": [{
+                    "type": "SEMVER",
+                    "events": [{ "introduced": "0" }, { "fixed": "1.2.3" }]
+                }]
+            }],
+            "references": [{ "url": "https://example.com/go-pseudo-1" }]
+        })))
+        .mount(&server)
+        .await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    fs::write(
+        tmp.path().join("go.mod"),
+        "module example.com/test\n\ngo 1.25\n\nrequire example.com/foo v0.0.0-20200101000000-abcdef123456\n",
+    )
+    .unwrap();
+
+    let (_stdout, stderr, code) = run_with_env(
+        &["audit", "--fix-audit", "--no-cache", "--format", "json"],
+        tmp.path(),
+        &[("OSV_API_URL", &server.uri())],
+    );
+
+    assert_eq!(
+        code, 0,
+        "no edit means total_fixed stays 0, matching the lock-only dry-run contract; stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("Cannot auto-fix"),
+        "stderr must report the unfixed package: {stderr}"
+    );
+    assert!(
+        stderr.contains("no bumpable manifest entry"),
+        "stderr must explain the manifest entry exists but can't be bumped: {stderr}"
+    );
+    assert!(
+        !stderr.contains("lock-only"),
+        "a commit-pinned manifest entry is not a lock-only transitive dependency: {stderr}"
+    );
+}
