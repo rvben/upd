@@ -149,9 +149,18 @@ pub struct Cli {
     /// Runs the narrowest per-ecosystem refresh command that updates only the
     /// packages `upd` just rewrote (e.g. `cargo update -p <pkg>`,
     /// `bundle lock --update <pkg>`, `npm install --package-lock-only`).
-    /// Honored by `update` and `audit --fix-audit --apply`.
+    /// Honored by `update`. `audit --fix-audit --apply` implies this and does
+    /// not require it explicitly; see `--no-lock`.
     #[arg(long, global = true)]
     pub lock: bool,
+
+    /// Do not regenerate lockfiles after fixing.
+    ///
+    /// `audit --fix-audit --apply` implies --lock; this opts out. Constraint
+    /// and manifest edits are still written and reported as pending_relock;
+    /// cargo-precise floors (pure lockfile mutations) are skipped.
+    #[arg(long = "no-lock", global = true, conflicts_with = "lock")]
+    pub no_lock: bool,
 
     /// Apply updates to files. Without --apply, runs in dry-run mode.
     ///
@@ -404,6 +413,21 @@ mod tests {
     fn test_cli_parses_lock() {
         let cli = Cli::try_parse_from(["upd", "--lock"]).unwrap();
         assert!(cli.lock);
+    }
+
+    #[test]
+    fn test_cli_parses_no_lock() {
+        let cli = Cli::try_parse_from(["upd", "--no-lock"]).unwrap();
+        assert!(cli.no_lock);
+    }
+
+    #[test]
+    fn test_cli_lock_conflicts_with_no_lock() {
+        let result = Cli::try_parse_from(["upd", "--lock", "--no-lock"]);
+        assert!(
+            result.is_err(),
+            "--lock and --no-lock must conflict; got Ok"
+        );
     }
 
     #[test]

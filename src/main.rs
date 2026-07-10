@@ -10,11 +10,13 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use upd::align::{PackageAlignment, PackageOccurrence, find_alignments, scan_packages};
 use upd::audit::cache::AuditCache;
-use upd::audit::{AuditResult, Ecosystem, OsvClient, Package as AuditPackage, compute_fix_plan};
+use upd::audit::{AuditResult, Ecosystem, OsvClient, Package as AuditPackage};
 use upd::cache::{Cache, CachedRegistry};
 use upd::cli::{BumpLevel, Cli, Command, OutputMode, REVERT_TIP};
 use upd::config::UpdConfig;
 use upd::cooldown::CooldownPolicy;
+use upd::fix::apply::{AppliedFix, FixApplyOptions, FixStatus, apply_fix_targets};
+use upd::fix::{FixKind, FixTarget, route_fix_targets};
 use upd::interactive::{PendingUpdate, prompt_all};
 use upd::lockfile::{LockfileRegenResult, RegenOutcome, regenerate_lockfiles};
 use upd::lockscan;
@@ -2179,11 +2181,6 @@ pub(crate) fn build_audit_packages(
     audit_packages
 }
 
-/// Per-file edit list used by the --fix-audit apply path.
-///
-/// Each entry is `(file_type, [(package_name, old_version, new_version, line_num)])`.
-type FileEdits = (FileType, Vec<(String, String, String, Option<usize>)>);
-
 async fn run_audit(cli: &Cli) -> Result<()> {
     let no_fail = matches!(&cli.command, Some(Command::Audit { no_fail, .. }) if *no_fail);
     let fix_audit = matches!(&cli.command, Some(Command::Audit { fix_audit, .. }) if *fix_audit);
@@ -2228,6 +2225,7 @@ async fn run_audit(cli: &Cli) -> Result<()> {
             emit_audit_json(
                 &AuditResult::default(),
                 "complete",
+                Vec::new(),
                 &BoundedOutputParams::from_cli(cli),
             )?;
         }
@@ -2284,6 +2282,7 @@ async fn run_audit(cli: &Cli) -> Result<()> {
             emit_audit_json(
                 &empty_result,
                 status_str,
+                Vec::new(),
                 &BoundedOutputParams::from_cli(cli),
             )?;
         }
@@ -2329,6 +2328,10 @@ async fn run_audit(cli: &Cli) -> Result<()> {
     }
 
     let status = audit_status(&audit_result);
+    let status_str = match status {
+        AuditStatus::Clean | AuditStatus::Vulnerable => "complete",
+        AuditStatus::Incomplete => "incomplete",
+    };
 
     if text_mode {
         if !cli.quiet {
@@ -2389,298 +2392,136 @@ async fn run_audit(cli: &Cli) -> Result<()> {
         for warning in &audit_result.warnings {
             eprintln!("{} {}", "Warning:".yellow(), warning);
         }
-        let status_str = match status {
-            AuditStatus::Clean | AuditStatus::Vulnerable => "complete",
-            AuditStatus::Incomplete => "incomplete",
-        };
-        emit_audit_json(
-            &audit_result,
-            status_str,
-            &BoundedOutputParams::from_cli(cli),
-        )?;
+        if !fix_audit {
+            emit_audit_json(
+                &audit_result,
+                status_str,
+                Vec::new(),
+                &BoundedOutputParams::from_cli(cli),
+            )?;
+        }
     }
 
-    // --fix-audit: bump each vulnerable package to its minimum safe version.
-    if fix_audit && !audit_result.vulnerable.is_empty() {
-        let (fixable, unfixable) = compute_fix_plan(&audit_result);
+    // --fix-audit: route every vulnerable (name, version) pair to a concrete
+    // fix action (manifest edit or version floor) and apply the routing in
+    // transactional per-file/per-lockfile groups. Runs even when nothing is
+    // vulnerable so the deferred JSON emission below always fires exactly
+    // once under `--fix-audit && json_mode` (rule 2).
+    if fix_audit {
+        let prov =
+            upd::lockscan::provenance::classify(&lock_scan.locks, &lock_scan.packages, &packages);
+        let routing = route_fix_targets(&audit_result, &prov, &packages);
 
-        // Report unfixable packages to stderr (diagnostics always go to stderr
-        // regardless of output mode, so agents can detect them).
+        // Diagnostics always go to stderr regardless of output mode, so
+        // agents can detect them even in JSON/SARIF mode.
         if !cli.quiet {
-            for (name, reason) in &unfixable {
+            for u in &routing.unfixable {
                 eprintln!(
                     "{} Cannot auto-fix {}: {}",
                     "⚠".yellow().bold(),
-                    name.bold(),
-                    reason
+                    u.package.bold(),
+                    u.reason
                 );
             }
         }
 
-        if !fixable.is_empty() {
-            // Build a per-file map of (package_name, old_version, new_version, line_num)
-            // using the already-scanned package occurrences.
-            //
-            // We use the same approach as apply_alignments: collect edits per file,
-            // then apply them with apply_version_updates.
-            let mut edits_by_file: HashMap<PathBuf, FileEdits> = HashMap::new();
-            // Names from `fixable` that produced at least one edit, so we can
-            // report the ones that did not (e.g. lock-only transitive
-            // dependencies with no manifest entry to bump).
-            let mut edited_names: HashSet<&str> = HashSet::new();
-            // Names from `fixable` that matched a manifest occurrence at all
-            // (bumpable or not), so the post-loop diagnostic can tell "no
-            // manifest entry exists" (lock-only transitive dependency) apart
-            // from "a manifest entry exists but isn't bumpable" (e.g. a
-            // commit-pinned Go pseudo-version).
-            let mut matched_names: HashSet<&str> = HashSet::new();
+        let all_blocked =
+            routing.targets.is_empty() && routing.unfixable.iter().all(|u| u.no_fixed_version);
+        let effective_dry_run = cli.is_effective_dry_run();
 
-            for ((name_lower, lang), occurrences) in &packages {
-                // Only ecosystems OSV covers.
-                if *lang == Lang::Actions
-                    || *lang == Lang::PreCommit
-                    || *lang == Lang::Mise
-                    || *lang == Lang::Terraform
-                {
-                    continue;
-                }
-
-                for occ in occurrences {
-                    // Match against the fixable map using original_name (preserves casing).
-                    // Fall back to the lowercased key if not found.
-                    let fix_entry = fixable
-                        .get_key_value(&occ.original_name)
-                        .or_else(|| fixable.get_key_value(name_lower.as_str()));
-                    let Some((matched_name, new_version)) = fix_entry else {
-                        continue;
-                    };
-                    matched_names.insert(matched_name.as_str());
-
-                    if !occ.is_bumpable {
-                        continue;
-                    }
-                    edited_names.insert(matched_name.as_str());
-
-                    let entry = edits_by_file
-                        .entry(occ.file_path.clone())
-                        .or_insert_with(|| (occ.file_type, Vec::new()));
-                    entry.1.push((
-                        occ.original_name.clone(),
-                        occ.version.clone(),
-                        new_version.clone(),
-                        occ.line_number,
-                    ));
-                }
-            }
-
-            // Report fixable packages that produced NO edit in any file.
-            // Two distinct causes need distinct messages: a lock-only
-            // transitive dependency has a fixed_version but no manifest
-            // occurrence to bump at all, while a manifest occurrence can
-            // exist yet still be unbumpable (e.g. a commit-pinned Go
-            // pseudo-version, which the edit loop above skips via
-            // `is_bumpable`). Without this, --fix-audit silently "fixes"
-            // nothing for them while reporting success.
-            if !cli.quiet {
-                let mut unedited: Vec<&str> = fixable
-                    .keys()
-                    .filter(|name| !edited_names.contains(name.as_str()))
-                    .map(|name| name.as_str())
-                    .collect();
-                unedited.sort_unstable();
-                for name in unedited {
-                    if matched_names.contains(name) {
-                        eprintln!(
-                            "{} Cannot auto-fix {}: no bumpable manifest entry (e.g. a commit-pinned version)",
-                            "⚠".yellow().bold(),
-                            name.bold(),
-                        );
-                    } else {
-                        eprintln!(
-                            "{} Cannot auto-fix {}: no manifest entry to edit (lock-only transitive dependency; version flooring lands in a future release)",
-                            "⚠".yellow().bold(),
-                            name.bold(),
-                        );
-                    }
-                }
-            }
-
-            // Mutations are opt-in; without --apply this is a dry-run preview.
-            let effective_dry_run = cli.is_effective_dry_run();
-
-            let mut total_fixed: usize = 0;
-            let mut fix_errors: Vec<String> = Vec::new();
-            // Manifests that were actually rewritten, with the packages that
-            // changed in each, so --lock can issue targeted regen commands.
-            let mut fixed_manifests: Vec<(PathBuf, Vec<String>)> = Vec::new();
-
-            for (path, (file_type, edits)) in &edits_by_file {
-                if text_mode && !cli.quiet {
-                    for (name, old_ver, new_ver, line_num) in edits {
-                        let location = match line_num {
-                            Some(n) => format!("{}:{}:", path.display(), n),
-                            None => format!("{}:", path.display()),
-                        };
-                        if effective_dry_run {
-                            println!(
-                                "{} {} {} {} → {} {}",
-                                location.blue().underline(),
-                                "Would fix".yellow(),
-                                name.bold(),
-                                old_ver.dimmed(),
-                                new_ver.yellow(),
-                                "(security fix)".dimmed(),
-                            );
-                        } else {
-                            println!(
-                                "{} {} {} {} → {} {}",
-                                location.blue().underline(),
-                                "Fixed".green(),
-                                name.bold(),
-                                old_ver.dimmed(),
-                                new_ver.green(),
-                                "(security fix)".dimmed(),
-                            );
-                        }
-                    }
-                }
-
-                if !effective_dry_run {
-                    let updates: Vec<VersionEdit<'_>> = edits
+        let (outcomes, notes): (Vec<AppliedFix>, Vec<String>) = if all_blocked {
+            (Vec::new(), Vec::new())
+        } else {
+            let opts = FixApplyOptions {
+                dry_run: effective_dry_run,
+                relock_manifests: !cli.no_lock,
+                relock_floors: !cli.no_lock,
+                verbose: cli.verbose && text_mode,
+            };
+            let manifest_editor =
+                |path: &Path, file_type: FileType, targets: &[&FixTarget]| -> Result<bool> {
+                    let content = read_file_safe(path)?;
+                    let updates: Vec<VersionEdit<'_>> = targets
                         .iter()
-                        .map(|(name, old_ver, new_ver, line_num)| VersionEdit {
-                            package: name.as_str(),
-                            old_version: old_ver.as_str(),
-                            new_version: new_ver.as_str(),
-                            line_num: *line_num,
+                        .map(|t| VersionEdit {
+                            package: t.dependency_key.as_deref().unwrap_or(t.package.as_str()),
+                            old_version: t.from_version.as_str(),
+                            new_version: t.to_version.as_str(),
+                            line_num: t.line_number,
                         })
                         .collect();
-
-                    match read_file_safe(path) {
-                        Ok(content) => {
-                            match apply_version_updates(
-                                &content,
-                                &updates,
-                                *file_type,
-                                cli.full_precision,
-                            ) {
-                                Ok(applied) => {
-                                    if applied.content != content {
-                                        if let Err(e) = write_file_atomic(path, &applied.content) {
-                                            let msg =
-                                                format!("Error writing {}: {}", path.display(), e);
-                                            eprintln!("{}", msg.red());
-                                            fix_errors.push(msg);
-                                        } else {
-                                            total_fixed += applied.applied_count();
-                                            let mut changed: Vec<String> = Vec::new();
-                                            for (name, _, _, _) in edits {
-                                                if !changed.iter().any(|n| n == name) {
-                                                    changed.push(name.clone());
-                                                }
-                                            }
-                                            fixed_manifests.push((path.clone(), changed));
-                                        }
-                                    }
-                                }
-                                Err(e) => {
-                                    let msg = format!(
-                                        "Error applying fixes to {}: {}",
-                                        path.display(),
-                                        e
-                                    );
-                                    eprintln!("{}", msg.red());
-                                    fix_errors.push(msg);
-                                }
-                            }
-                        }
-                        Err(e) => {
-                            let msg = format!("Error reading {}: {}", path.display(), e);
-                            eprintln!("{}", msg.red());
-                            fix_errors.push(msg);
-                        }
+                    let applied =
+                        apply_version_updates(&content, &updates, file_type, cli.full_precision)?;
+                    if applied.content != content {
+                        write_file_atomic(path, &applied.content)?;
+                        Ok(true)
+                    } else {
+                        Ok(false)
                     }
-                } else {
-                    total_fixed += edits.len();
-                }
-            }
+                };
+            apply_fix_targets(routing.targets, &opts, &manifest_editor)
+        };
 
-            // Regenerate lockfiles for manifests that received a fix. Dry-run
-            // writes nothing, so there is nothing to regenerate.
-            if cli.lock && !effective_dry_run && !fixed_manifests.is_empty() {
-                let regen_results: Vec<(PathBuf, LockfileRegenResult)> = fixed_manifests
-                    .iter()
-                    .map(|(path, changed)| {
-                        let result = regenerate_lockfiles(path, changed, cli.verbose && text_mode);
-                        (path.clone(), result)
-                    })
-                    .collect();
-
-                let has_work = regen_results.iter().any(|(_, r)| !r.no_lockfiles);
-                if text_mode && has_work && !cli.quiet {
-                    println!();
-                    println!("{}", "Regenerating lockfiles...".cyan());
-                }
-
-                for (path, result) in regen_results {
-                    if result.no_lockfiles {
-                        let manifest_name = path
-                            .file_name()
-                            .map(|n| n.to_string_lossy().into_owned())
-                            .unwrap_or_default();
-                        eprintln!(
-                            "note: no lockfile found for {} - skipping (nothing to regenerate)",
-                            manifest_name
-                        );
-                        continue;
-                    }
-                    for outcome in result.outcomes {
-                        match outcome {
-                            RegenOutcome::Ok(lockfile) => {
-                                if text_mode && !cli.quiet {
-                                    println!(
-                                        "{} Regenerated {}",
-                                        "✓".green(),
-                                        lockfile.filename().bold()
-                                    );
-                                }
-                            }
-                            other => {
-                                if let Some(msg) = other.error_message() {
-                                    eprintln!("{}", format!("error: {msg}").red());
-                                    fix_errors.push(msg);
-                                }
-                            }
-                        }
-                    }
-                }
+        if !all_blocked {
+            for note in &notes {
+                eprintln!("note: {note}");
             }
 
             if text_mode && !cli.quiet {
+                for outcome in &outcomes {
+                    print_fix_outcome(outcome);
+                }
+
+                let planned = outcomes
+                    .iter()
+                    .filter(|o| o.status == FixStatus::Planned)
+                    .count();
+                let applied = outcomes
+                    .iter()
+                    .filter(|o| o.status == FixStatus::Applied)
+                    .count();
                 if effective_dry_run {
-                    if total_fixed > 0 {
+                    if planned > 0 {
                         println!(
                             "\n{} Would fix {} vulnerable package occurrence(s). Run with --apply to write changes.",
                             "→".yellow(),
-                            total_fixed.to_string().yellow().bold()
+                            planned.to_string().yellow().bold()
                         );
                     }
                 } else {
                     println!(
                         "\n{} Fixed {} vulnerable package occurrence(s)",
                         "✓".green(),
-                        total_fixed.to_string().green().bold()
+                        applied.to_string().green().bold()
                     );
                 }
             }
+        }
 
+        let fix_entries = upd::output::build_fix_entries(&outcomes, &routing.unfixable);
+        if json_mode {
+            emit_audit_json(
+                &audit_result,
+                status_str,
+                fix_entries,
+                &BoundedOutputParams::from_cli(cli),
+            )?;
+        }
+
+        if !all_blocked {
             // Exit-code contract for --fix-audit:
-            // - errors during fix → 2
+            // - errors during fix (any Failed/RolledBack outcome) → 2
             // - dry-run with pending fixes and !no_fail → 1
             // - applied successfully (or no_fail) → 0
+            let fix_errors: Vec<String> = outcomes
+                .iter()
+                .filter(|o| matches!(o.status, FixStatus::Failed | FixStatus::RolledBack))
+                .filter_map(|o| o.error.clone())
+                .collect();
+            let has_planned = outcomes.iter().any(|o| o.status == FixStatus::Planned);
             let fix_exit_code = if !fix_errors.is_empty() {
                 2
-            } else if effective_dry_run && total_fixed > 0 && !no_fail {
+            } else if effective_dry_run && has_planned && !no_fail {
                 1
             } else {
                 0
@@ -2721,14 +2562,92 @@ async fn run_audit(cli: &Cli) -> Result<()> {
 fn emit_audit_json(
     audit: &AuditResult,
     status: &'static str,
+    fixes: Vec<upd::output::FixEntry>,
     bounded: &BoundedOutputParams<'_>,
 ) -> Result<()> {
     use upd::output::build_audit_report;
-    let report = build_audit_report(audit, 0, status);
+    let report = build_audit_report(audit, 0, status, fixes);
     let doc = serde_json::to_value(&report)?;
     let doc = apply_bounded_output(doc, "vulnerabilities", bounded);
     println!("{}", serde_json::to_string_pretty(&doc)?);
     Ok(())
+}
+
+/// Print a single `--fix-audit` outcome line in text mode.
+///
+/// Manifest edits keep the pre-existing "Would fix"/"Fixed" wording; version
+/// floors (uv constraints, npm overrides, cargo-precise) get their own
+/// "Would floor"/"Floored" wording naming the write target and method, since
+/// they don't touch a version pin at a known line the way manifest edits do.
+fn print_fix_outcome(outcome: &AppliedFix) {
+    let target = &outcome.target;
+    let path = target.path.display();
+    match (target.kind, outcome.status) {
+        (FixKind::ManifestEdit, FixStatus::Planned) => {
+            println!(
+                "{} {} {} {} → {} {}",
+                format!("{path}:").blue().underline(),
+                "Would fix".yellow(),
+                target.package.bold(),
+                target.from_version.dimmed(),
+                target.to_version.yellow(),
+                "(security fix)".dimmed(),
+            );
+        }
+        (FixKind::ManifestEdit, FixStatus::Applied) => {
+            println!(
+                "{} {} {} {} → {} {}",
+                format!("{path}:").blue().underline(),
+                "Fixed".green(),
+                target.package.bold(),
+                target.from_version.dimmed(),
+                target.to_version.green(),
+                "(security fix)".dimmed(),
+            );
+        }
+        (_, FixStatus::Planned) => {
+            println!(
+                "{path}: Would floor {} {} → {} ({})",
+                target.package.bold(),
+                target.from_version.dimmed(),
+                target.to_version.yellow(),
+                target.kind.method(),
+            );
+        }
+        (_, FixStatus::Applied) => {
+            println!(
+                "{path}: Floored {} {} → {} ({})",
+                target.package.bold(),
+                target.from_version.dimmed(),
+                target.to_version.green(),
+                target.kind.method(),
+            );
+        }
+        (_, FixStatus::PendingRelock) => {
+            println!(
+                "{} {}: floor written to {path} but lockfile not regenerated (--no-lock)",
+                "⚠".yellow().bold(),
+                target.package.bold(),
+            );
+        }
+        (_, FixStatus::Skipped) => {
+            println!(
+                "{} {}: {}",
+                "⚠".yellow().bold(),
+                target.package.bold(),
+                outcome.error.as_deref().unwrap_or("skipped"),
+            );
+        }
+        (_, FixStatus::AlreadySatisfied)
+        | (_, FixStatus::Failed)
+        | (_, FixStatus::RolledBack)
+        | (_, FixStatus::Unfixable) => {
+            // AlreadySatisfied is silent in text mode (nothing changed);
+            // Failed/RolledBack/Unfixable outcomes are already reported via
+            // the stderr channel (fix errors, or the unfixable diagnostics
+            // printed before routing.targets is applied).
+        }
+    }
 }
 
 /// Emit a SARIF 2.1.0 document for the audit result.

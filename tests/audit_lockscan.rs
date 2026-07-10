@@ -457,16 +457,13 @@ async fn npm_workspace_lock_is_skipped_with_warning() {
     );
 }
 
-/// A lock-only vulnerable package with a fixed_version lands in the
-/// fixable set, but --fix-audit's edit loop only iterates manifest-scanned
-/// occurrences, so a lock-only package (no manifest entry to bump) gets no
-/// edit. Without a diagnostic this silently reports "Fixed 0" at exit 0 as
-/// if there were nothing to fix. Assert the diagnostic appears and the exit
-/// code matches the dry-run contract observed for this exact scenario
-/// (total_fixed stays 0, so `effective_dry_run && total_fixed > 0` is
-/// false): exit 0.
+/// A lock-only vulnerable package with a fixed_version routes to a
+/// `uv-constraint` version floor (no manifest entry to bump, but `uv`
+/// supports pinning a transitive via `[tool.uv].constraint-dependencies`).
+/// Dry-run reports it as `planned` in `fixes[]`, not as unfixable, and exits
+/// 1 (a pending fix exists and `--no-fail` was not passed).
 #[tokio::test]
-async fn fix_audit_reports_lock_only_package_it_cannot_edit() {
+async fn fix_audit_lock_only_package_gets_uv_constraint_floor_plan() {
     let server = wiremock::MockServer::start().await;
     wiremock::Mock::given(wiremock::matchers::method("POST"))
         .and(wiremock::matchers::path("/querybatch"))
@@ -512,21 +509,28 @@ source = { registry = "https://pypi.org/simple" }
     )
     .unwrap();
 
-    let (_stdout, stderr, code) = run_with_env(
+    let (stdout, stderr, code) = run_with_env(
         &["audit", "--fix-audit", "--no-cache", "--format", "json"],
         tmp.path(),
         &[("OSV_API_URL", &server.uri())],
     );
     assert_eq!(
-        code, 0,
-        "observed dry-run contract for a lock-only fixable package: no edit means total_fixed stays 0"
+        code, 1,
+        "dry-run with a pending uv-constraint floor exits 1; stdout: {stdout}\nstderr: {stderr}"
     );
     assert!(
-        stderr.contains("Cannot auto-fix"),
-        "stderr must report the unfixed package: {stderr}"
+        !stderr.contains("Cannot auto-fix fixauditpkg"),
+        "fixauditpkg now routes to a floor, not an unfixable diagnostic: {stderr}"
     );
+
+    let json: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    let fixes = json["fixes"].as_array().expect("fixes array present");
     assert!(
-        stderr.contains("lock-only"),
-        "stderr must explain why it could not be fixed: {stderr}"
+        fixes.iter().any(|f| f["package"] == "fixauditpkg"
+            && f["method"] == "uv-constraint"
+            && f["status"] == "planned"
+            && f["from_version"] == "0.40.0"
+            && f["to_version"] == "0.49.1"),
+        "fixes[] must contain a planned uv-constraint floor for fixauditpkg: {fixes:?}"
     );
 }

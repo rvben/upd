@@ -221,6 +221,26 @@ pub struct AuditSummary {
     pub errors: usize,
 }
 
+/// One `--fix-audit` outcome: either an applied/planned/skipped/rolled-back
+/// [`crate::fix::apply::AppliedFix`], or an unfixable
+/// [`crate::fix::UnfixableTarget`] reported with `status: "unfixable"`.
+#[derive(Debug, Serialize)]
+pub struct FixEntry {
+    pub package: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dependency_key: Option<String>,
+    pub from_version: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub to_version: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub method: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    pub status: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
 #[derive(Debug, Serialize)]
 pub struct AuditReport {
     pub command: &'static str,
@@ -232,6 +252,43 @@ pub struct AuditReport {
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub warnings: Vec<String>,
     pub summary: AuditSummary,
+    /// `--fix-audit` outcomes; empty (and omitted) when `--fix-audit` was
+    /// not requested.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub fixes: Vec<FixEntry>,
+}
+
+/// Map `apply_fix_targets` outcomes and routing's unfixable targets into the
+/// JSON report's `fixes[]` list: one entry per [`crate::fix::apply::AppliedFix`],
+/// plus one `status: "unfixable"` entry per [`crate::fix::UnfixableTarget`].
+pub fn build_fix_entries(
+    outcomes: &[crate::fix::apply::AppliedFix],
+    unfixable: &[crate::fix::UnfixableTarget],
+) -> Vec<FixEntry> {
+    let mut entries: Vec<FixEntry> = outcomes
+        .iter()
+        .map(|outcome| FixEntry {
+            package: outcome.target.package.clone(),
+            dependency_key: outcome.target.dependency_key.clone(),
+            from_version: outcome.target.from_version.clone(),
+            to_version: Some(outcome.target.to_version.clone()),
+            method: Some(outcome.target.kind.method()),
+            path: Some(outcome.target.path.display().to_string()),
+            status: outcome.status.as_str(),
+            error: outcome.error.clone(),
+        })
+        .collect();
+    entries.extend(unfixable.iter().map(|u| FixEntry {
+        package: u.package.clone(),
+        dependency_key: u.dependency_key.clone(),
+        from_version: u.from_version.clone(),
+        to_version: u.to_version.clone(),
+        method: u.method,
+        path: u.path.as_ref().map(|p| p.display().to_string()),
+        status: "unfixable",
+        error: Some(u.reason.clone()),
+    }));
+    entries
 }
 
 /// Build an [`UpdateFileReport`] from internal per-file data.
@@ -604,6 +661,7 @@ pub fn build_audit_report(
     audit: &AuditResult,
     ecosystems_audited: usize,
     status: &'static str,
+    fixes: Vec<FixEntry>,
 ) -> AuditReport {
     let mut vulnerabilities = Vec::new();
     for pkg in &audit.vulnerable {
@@ -636,6 +694,7 @@ pub fn build_audit_report(
             vulnerabilities: vulnerability_count,
             errors: audit.errors.len(),
         },
+        fixes,
     }
     .with_ecosystem_noop(ecosystems_audited)
 }
@@ -902,7 +961,7 @@ mod tests {
             errors: Vec::new(),
             warnings: Vec::new(),
         };
-        let report = build_audit_report(&audit, 2, "complete");
+        let report = build_audit_report(&audit, 2, "complete", Vec::new());
         let json = serde_json::to_value(&report).unwrap();
         assert_eq!(json["command"], "audit");
         assert_eq!(json["status"], "complete");
@@ -927,7 +986,7 @@ mod tests {
             errors: vec!["network error".into()],
             warnings: Vec::new(),
         };
-        let report = build_audit_report(&audit, 0, "incomplete");
+        let report = build_audit_report(&audit, 0, "incomplete", Vec::new());
         let json = serde_json::to_value(&report).unwrap();
         assert_eq!(json["status"], "incomplete");
         assert_eq!(json["errors"][0], "network error");
