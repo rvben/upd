@@ -29,11 +29,13 @@ pub struct LockScan {
     pub warnings: Vec<String>,
 }
 
-/// Best-effort 1-based line number of the first line containing `needle`.
+/// Best-effort 1-based line number of the first line that STARTS WITH
+/// `needle` (after leading whitespace) - entry keys start their line, while
+/// references inside arrays/inline tables do not.
 pub(crate) fn find_entry_line(content: &str, needle: &str) -> Option<usize> {
     content
         .lines()
-        .position(|line| line.contains(needle))
+        .position(|line| line.trim_start().starts_with(needle))
         .map(|idx| idx + 1)
 }
 
@@ -46,5 +48,13 @@ mod tests {
         let content = "a\nb\nname = \"x\"\nname = \"x\"\n";
         assert_eq!(find_entry_line(content, "name = \"x\""), Some(3));
         assert_eq!(find_entry_line(content, "absent"), None);
+    }
+
+    #[test]
+    fn find_entry_line_ignores_indented_references() {
+        // A reference inside an array/inline table (indented, not at line
+        // start) must not shadow the real entry key further down.
+        let content = "deps = [\n  { name = \"x\" },\n]\nname = \"x\"\n";
+        assert_eq!(find_entry_line(content, "name = \"x\""), Some(4));
     }
 }

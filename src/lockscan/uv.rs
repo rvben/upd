@@ -112,13 +112,11 @@ source = { editable = "pkgs/editdep" }
         let (_dir, path) = write_lock(UV_LOCK);
         let scan = scan_uv_lock(&path).unwrap();
         let line = scan.packages[0].line_number.expect("line recorded");
-        // The `name = "examplepkg"` line in UV_LOCK (1-based).
-        let expected = UV_LOCK
-            .lines()
-            .position(|l| l.contains(r#"name = "examplepkg""#))
-            .unwrap()
-            + 1;
-        assert_eq!(line, expected);
+        // Line 14 of UV_LOCK is the examplepkg entry's own `name = "examplepkg"`
+        // key (inside its `[[package]]` block). The dependency reference
+        // `{ name = "examplepkg" }` on line 10 (inside myproject's
+        // `dependencies` array) must NOT be the anchor.
+        assert_eq!(line, 14);
     }
 
     #[test]
