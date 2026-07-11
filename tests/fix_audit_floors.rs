@@ -391,6 +391,71 @@ async fn no_lock_reports_pending_relock_and_skipped() {
     );
 }
 
+/// (c2) `--no-lock` must skip a lock-only `CargoPrecise` target under
+/// dry-run too, not just under `--apply`: a dry run previews what `--apply`
+/// would actually do. Without `--apply`, running `--fix-audit --no-lock`
+/// must report the cargo-precise target as `skipped` (never `planned`) and
+/// must never emit a "would regenerate" note for a lockfile that
+/// `--apply --no-lock` then turns around and leaves untouched.
+#[tokio::test]
+async fn no_lock_dry_run_reports_cargo_precise_skipped() {
+    let server = wiremock::MockServer::start().await;
+    mount_osv_single(&server, "GHSA-floors-c2", "dupcrate", "crates.io", "2.0.1").await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    fs::write(
+        tmp.path().join("Cargo.toml"),
+        "[package]\nname = \"t\"\nversion = \"0.1.0\"\n",
+    )
+    .unwrap();
+    let cargo_lock_content = "version = 4\n\n[[package]]\nname = \"t\"\nversion = \"0.1.0\"\n\n[[package]]\nname = \"dupcrate\"\nversion = \"1.2.3\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\n";
+    fs::write(tmp.path().join("Cargo.lock"), cargo_lock_content).unwrap();
+
+    let (stdout, stderr, code) = run_with_env(
+        &[
+            "audit",
+            "--fix-audit",
+            "--no-lock",
+            "--no-cache",
+            "--format",
+            "json",
+        ],
+        tmp.path(),
+        &[("OSV_API_URL", &server.uri())],
+    );
+
+    assert_eq!(
+        fs::read_to_string(tmp.path().join("Cargo.lock")).unwrap(),
+        cargo_lock_content,
+        "dry-run must never write, cargo-precise floors mutate only Cargo.lock"
+    );
+    assert!(
+        !stdout.contains("would regenerate"),
+        "stdout must not promise a relock that --apply --no-lock will not perform: {stdout}"
+    );
+    assert!(
+        !stderr.contains("would regenerate"),
+        "stderr must not promise a relock that --apply --no-lock will not perform: {stderr}"
+    );
+
+    let json: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    let fixes = json["fixes"].as_array().unwrap();
+    let cargo_entry = fixes.iter().find(|f| f["package"] == "dupcrate").unwrap();
+    assert_eq!(cargo_entry["status"], "skipped");
+    assert!(
+        cargo_entry["error"]
+            .as_str()
+            .unwrap()
+            .contains("rerun without --no-lock"),
+        "{cargo_entry:?}"
+    );
+
+    // A skipped-under---no-lock target is not a pending fix (only `planned`
+    // outcomes count as pending in the exit-code matrix), so this dry run
+    // exits 0 rather than promising work that `--apply` would not perform.
+    assert_eq!(code, 0, "stdout: {stdout}\nstderr: {stderr}");
+}
+
 /// (d) Dry-run lists pending floors, never writes, and exits 1 (or 0 with
 /// `--no-fail`).
 #[tokio::test]

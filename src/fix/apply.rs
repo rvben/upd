@@ -573,10 +573,13 @@ fn apply_edit_group(
     }
 }
 
-/// Apply one `CargoPrecise` group: dry-run plans and emits a "would
-/// regenerate" note (rule 8), `--no-lock` skips with guidance, otherwise
-/// each target self-repairs (if its vulnerable pair is no longer locked) or
-/// runs `cargo update --precise`; any failure restores Cargo.lock and rolls
+/// Apply one `CargoPrecise` group: `--no-lock` skips with guidance
+/// regardless of dry-run (a dry run must preview what `--apply` would
+/// actually do, and cargo-precise floors only ever mutate Cargo.lock, so
+/// `--no-lock` leaves nothing for either mode to do), otherwise dry-run
+/// plans and emits a "would regenerate" note (rule 8), and a real run has
+/// each target self-repair (if its vulnerable pair is no longer locked) or
+/// run `cargo update --precise`; any failure restores Cargo.lock and rolls
 /// back the group (rule 7).
 fn apply_cargo_precise_group(
     group: Group,
@@ -591,6 +594,17 @@ fn apply_cargo_precise_group(
         cargo_precise: _,
     } = group;
 
+    if !opts.relock_floors {
+        for target in targets {
+            outcomes.push(AppliedFix {
+                target,
+                status: FixStatus::Skipped,
+                error: Some(CARGO_PRECISE_NO_LOCK_HINT.to_string()),
+            });
+        }
+        return;
+    }
+
     if opts.dry_run {
         let lock_name = filename_of(lockfile.as_deref().unwrap_or(&path));
         notes.push(format!("{lock_name}: would regenerate"));
@@ -599,17 +613,6 @@ fn apply_cargo_precise_group(
                 target,
                 status: FixStatus::Planned,
                 error: None,
-            });
-        }
-        return;
-    }
-
-    if !opts.relock_floors {
-        for target in targets {
-            outcomes.push(AppliedFix {
-                target,
-                status: FixStatus::Skipped,
-                error: Some(CARGO_PRECISE_NO_LOCK_HINT.to_string()),
             });
         }
         return;
@@ -810,6 +813,54 @@ mod tests {
         assert_eq!(outcomes[0].status, FixStatus::Skipped);
         let error = outcomes[0].error.as_ref().expect("error present");
         assert!(error.contains("rerun without --no-lock"), "{error}");
+        assert_eq!(std::fs::read_to_string(&cargo_lock).unwrap(), before);
+    }
+
+    /// Sibling of `no_lock_skips_cargo_precise_with_guidance`: `--no-lock`
+    /// must skip a `CargoPrecise` target under dry-run too, not just under
+    /// `--apply`. A dry run previews what `--apply` would actually do, so it
+    /// must not report `Planned` (and a "would regenerate" note) for a
+    /// target that `--apply` would then turn around and skip.
+    #[test]
+    fn no_lock_skips_cargo_precise_with_guidance_in_dry_run() {
+        let dir = tempfile::tempdir().unwrap();
+        let cargo_lock = write(
+            dir.path(),
+            "Cargo.lock",
+            "# Cargo.lock placeholder\nversion = 3\n",
+        );
+        let before = std::fs::read_to_string(&cargo_lock).unwrap();
+
+        let target = FixTarget {
+            package: "dupcrate".to_string(),
+            dependency_key: None,
+            from_version: "1.2.3".to_string(),
+            to_version: "2.0.1".to_string(),
+            vulnerable_version: "1.2.3".to_string(),
+            kind: FixKind::CargoPrecise,
+            path: cargo_lock.clone(),
+            file_type: None,
+            lockfile: Some(cargo_lock.clone()),
+            line_number: None,
+            npm_form: None,
+        };
+        let opts = FixApplyOptions {
+            dry_run: true,
+            relock_manifests: true,
+            relock_floors: false,
+            verbose: false,
+        };
+        let closure = noop_closure();
+        let (outcomes, notes) = apply_fix_targets(vec![target], &opts, &closure);
+
+        assert_eq!(outcomes.len(), 1);
+        assert_eq!(outcomes[0].status, FixStatus::Skipped);
+        let error = outcomes[0].error.as_ref().expect("error present");
+        assert!(error.contains("rerun without --no-lock"), "{error}");
+        assert!(
+            !notes.iter().any(|n| n.contains("would regenerate")),
+            "{notes:?}"
+        );
         assert_eq!(std::fs::read_to_string(&cargo_lock).unwrap(), before);
     }
 
