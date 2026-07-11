@@ -450,7 +450,7 @@ async fn no_lock_dry_run_reports_cargo_precise_skipped() {
         "{cargo_entry:?}"
     );
 
-    // A skipped-under---no-lock target is not a pending fix (only `planned`
+    // A target skipped under --no-lock is not a pending fix (only `planned`
     // outcomes count as pending in the exit-code matrix), so this dry run
     // exits 0 rather than promising work that `--apply` would not perform.
     assert_eq!(code, 0, "stdout: {stdout}\nstderr: {stderr}");
