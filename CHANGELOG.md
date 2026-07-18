@@ -25,6 +25,50 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 
 
+
+## [0.3.0](https://github.com/rvben/upd/compare/v0.2.4...v0.3.0) - 2026-07-18
+
+### Added
+
+- **update**: floor lock-only packages named by --package to the registry latest ([4747adf](https://github.com/rvben/upd/commit/4747adf863e8122b116719053b534976669bb067))
+- **audit**: fix lock-only findings with transactional floors, implied --lock, and structured fixes reporting ([0c42c33](https://github.com/rvben/upd/commit/0c42c33fe109fff09e315b380a643959714a72c4))
+- **fix**: apply fix targets in transactional groups with lockfile snapshots and rollback ([e2d2814](https://github.com/rvben/upd/commit/e2d28140691b5292e54d302c99c439c91b8ce8da))
+- **fix**: write npm override floors with EOVERRIDE-aware forms and never-weaken protection ([7549351](https://github.com/rvben/upd/commit/754935132e1628f8ce87e743002fe7948bc02493))
+- **fix**: write uv constraint-dependencies floors with never-weaken protection ([8c25195](https://github.com/rvben/upd/commit/8c25195a846317c6464e94fbeef2c985dd7940f0))
+- **fix**: route vulnerable pairs into explicit manifest-edit and floor targets ([b6877b9](https://github.com/rvben/upd/commit/b6877b946e5c7b13fd58b80da439eb9a437b6a24))
+- **lockscan**: classify positional provenance of locked packages per (name, version) pair ([2024883](https://github.com/rvben/upd/commit/2024883760d1f7d834b72beadb93859363c03b24))
+- **lockscan**: associate workspace member manifests with their nearest scannable lock ([416d95e](https://github.com/rvben/upd/commit/416d95e9b47d628f77e7c0810f815c0ec21c5198))
+- **lockscan**: record npm entry locators and parse direct-dep declarations for provenance ([4a4b754](https://github.com/rvben/upd/commit/4a4b7546ef65e95ce79a8be751a41aaf68841e2f))
+- **audit**: scan lockfiles so lock-only transitive dependencies are audited ([d3237da](https://github.com/rvben/upd/commit/d3237da8aa0cbd967ceddef060c01b5c4d99999a))
+- **lockscan**: discover scannable lockfiles with workspace and coverage guards ([06b8757](https://github.com/rvben/upd/commit/06b875792188fe47a520f5b734ebf06ee71740ce))
+- **lockfile**: treat npm-shrinkwrap.json as authoritative and add --ignore-scripts to npm relock ([0e11f31](https://github.com/rvben/upd/commit/0e11f31ec1ed14c78577ed2d0a9d3f68ddf76395))
+- **lockscan**: add package-lock.json reader with alias, scope, and legacy-version handling ([4fd2c0a](https://github.com/rvben/upd/commit/4fd2c0a642679332523d8c0f1703e76ecfcdbfa1))
+- **lockscan**: add poetry.lock and Cargo.lock readers ([5f66fca](https://github.com/rvben/upd/commit/5f66fca7d05afc19be95360f4d6b6fee92357d2a))
+- **lockscan**: add parse-only lockfile scanning module with uv.lock reader ([d7e9254](https://github.com/rvben/upd/commit/d7e925485087724739142e43579835b42fcc4011))
+- **audit**: add coverage warnings channel and go.mod pre-1.17 warning ([597cba7](https://github.com/rvben/upd/commit/597cba7fc02662a1858f16e69cecaadf4e639f0f))
+- **audit**: show CVE aliases and advisory source in text, JSON, and schema docs ([725f0ee](https://github.com/rvben/upd/commit/725f0ee8fcd6d81f52dc375c57eca4c46906cb22))
+- **audit**: version the audit cache and normalize PyPI cache keys per PEP 503 ([119bc04](https://github.com/rvben/upd/commit/119bc04ac3f347b6548c971a389ee752e5879eb1))
+- **audit**: carry advisory aliases and source database on findings ([5eaddf2](https://github.com/rvben/upd/commit/5eaddf2cec6802817ee4a98953db09af8fc9b5c6))
+- **audit**: add PEP 503 package-name normalization helper ([9ff5488](https://github.com/rvben/upd/commit/9ff5488553b2638bd8d5c60a29655fcd8cd2a119))
+
+### Fixed
+
+- **fix**: skip cargo-precise floors under --no-lock in dry-run previews too ([e89d3df](https://github.com/rvben/upd/commit/e89d3df39d4c0609721c7744a9135f149412cb2b))
+- **update**: count only planned and applied floors in the update summary ([2a2080b](https://github.com/rvben/upd/commit/2a2080b88a23ea51fde4f0b552ab16af7877a7eb))
+- **audit**: report apply-time unfixable floors in text mode and correct no-lock edit wording ([bee76a1](https://github.com/rvben/upd/commit/bee76a1ca2a0fb90a4b8d3885c9ee82d2d86d899))
+- **fix**: attribute manifest edits per owner and merge all edits in one line-aware pool ([653ff4e](https://github.com/rvben/upd/commit/653ff4e661aca18c2a8a84e330372bc7cd8891e9))
+- **lockscan**: keep per-lockfile provenance entries so independent projects never shadow each other ([2e66da0](https://github.com/rvben/upd/commit/2e66da0be6492495fc0fa3af9f07113026815689))
+- **audit**: distinguish unbumpable manifest pins from lock-only packages in fix-audit diagnostics ([edf183f](https://github.com/rvben/upd/commit/edf183fd2ba3074d5b1ba4c0794c33b32557e510))
+- **audit**: report lock-only packages that --fix-audit cannot edit ([5df74ac](https://github.com/rvben/upd/commit/5df74ac9c44916394d63b1dcc13d9292c428da61))
+- **lockscan**: do not follow symlinks in workspace membership walk ([0d10b6c](https://github.com/rvben/upd/commit/0d10b6ceb5d71bbbaf5fb3f646aea549ea879121))
+- **audit**: parse renamed Cargo dependencies under their real package name ([5ce219d](https://github.com/rvben/upd/commit/5ce219d8662fdf74556c1e604a3dc7fc2b50c5db))
+- **lockscan**: anchor entry lines to keys at line start, not references ([2d49a1e](https://github.com/rvben/upd/commit/2d49a1ee85f6193151c69d087aca9847041205ee))
+- **audit**: scope fixed-version extraction to the queried package and version branch ([c0fcf10](https://github.com/rvben/upd/commit/c0fcf107a834168b1f7683d4f8892fbe0ab7ab21))
+
+### Performance
+
+- **lockscan**: index lockfile entry lines in a single pass ([845bda5](https://github.com/rvben/upd/commit/845bda548ac32fbd9f752fd6f9a629b8e068c3cd))
+
 ## [0.2.4](https://github.com/rvben/upd/compare/v0.2.3...v0.2.4) - 2026-07-09
 
 ### Added
