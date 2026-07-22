@@ -193,6 +193,23 @@ pub trait Registry: Send + Sync {
         Ok(Vec::new())
     }
 
+    /// List the ref names a consumer can actually pin to, for registries where
+    /// refs are distinct from released versions.
+    ///
+    /// GitHub Actions are pinned to a git ref, and a repo publishing `v4.1.2`
+    /// does not necessarily publish a floating `v4` ref to go with it. Writing
+    /// a truncated `v4` in that case produces a workflow that fails to resolve,
+    /// so the Actions updater consults this before shortening a version.
+    ///
+    /// The default is empty, meaning "this registry has no ref concept". Callers
+    /// MUST treat empty as *unknown* rather than as "the ref does not exist", so
+    /// a registry without ref data keeps its existing behaviour instead of
+    /// silently losing precision-matching.
+    async fn list_ref_names(&self, package: &str) -> Result<Vec<String>> {
+        let _ = package;
+        Ok(Vec::new())
+    }
+
     /// Registry name for display
     fn name(&self) -> &'static str;
 }

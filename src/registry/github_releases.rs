@@ -202,6 +202,14 @@ impl Registry for GitHubReleasesRegistry {
             .ok_or_else(|| anyhow!("Repository '{}/{}' has no tags available.", owner, repo))
     }
 
+    /// Tags are the refs an action can be pinned to, so the tag list is exactly
+    /// what decides whether a floating major like `v4` is writable. A repo can
+    /// publish `v4.1.2` while its newest floating major is still `v3`.
+    async fn list_ref_names(&self, package: &str) -> Result<Vec<String>> {
+        let (owner, repo) = Self::extract_owner_repo(package)?;
+        self.fetch_tags(owner, repo).await
+    }
+
     async fn list_versions(&self, package: &str) -> Result<Vec<VersionMeta>> {
         let (owner, repo) = Self::extract_owner_repo(package)?;
         let url = format!("{}/repos/{}/{}/releases", self.api_url, owner, repo);

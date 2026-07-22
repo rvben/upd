@@ -14,6 +14,8 @@ pub struct MockRegistry {
     constrained_versions: HashMap<(String, String), String>,
     /// Map of package name to full version metadata entries
     version_metas: HashMap<String, Vec<VersionMeta>>,
+    /// Map of package name to the ref names a consumer could pin to
+    ref_names: HashMap<String, Vec<String>>,
     /// Registry name
     name: &'static str,
 }
@@ -25,6 +27,7 @@ impl MockRegistry {
             versions: HashMap::new(),
             constrained_versions: HashMap::new(),
             version_metas: HashMap::new(),
+            ref_names: HashMap::new(),
             name,
         }
     }
@@ -33,6 +36,16 @@ impl MockRegistry {
     pub fn with_version(mut self, package: &str, version: &str) -> Self {
         self.versions
             .insert(package.to_string(), (version.to_string(), None));
+        self
+    }
+
+    /// Declare the ref names a package publishes, as `list_ref_names` reports
+    /// them. Used to model a repo that ships `v4.1.2` without a floating `v4`.
+    pub fn with_ref_names(mut self, package: &str, refs: &[&str]) -> Self {
+        self.ref_names.insert(
+            package.to_string(),
+            refs.iter().map(|r| r.to_string()).collect(),
+        );
         self
     }
 
@@ -111,6 +124,10 @@ impl Registry for MockRegistry {
 
     async fn list_versions(&self, package: &str) -> Result<Vec<VersionMeta>> {
         Ok(self.version_metas.get(package).cloned().unwrap_or_default())
+    }
+
+    async fn list_ref_names(&self, package: &str) -> Result<Vec<String>> {
+        Ok(self.ref_names.get(package).cloned().unwrap_or_default())
     }
 
     fn name(&self) -> &'static str {

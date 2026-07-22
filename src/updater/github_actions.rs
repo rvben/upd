@@ -99,6 +99,40 @@ impl GithubActionsUpdater {
         }
     }
 
+    /// Resolve a precision-matched version against the refs a repo actually
+    /// publishes.
+    ///
+    /// An action is pinned to a git ref, not to a released version, so
+    /// shortening `v4.1.2` to `v4` is only valid when the repo publishes a
+    /// floating `v4`. Most do; some ship only concrete tags (sigstore's
+    /// cosign-installer has `v2` and `v3` but no `v4`), and writing the short
+    /// form there produces a workflow that cannot resolve the action.
+    ///
+    /// `refs` empty means the ref list is unknown - a registry that does not
+    /// expose refs, or a lookup that failed - and must leave the candidate
+    /// alone rather than expanding every action to full precision.
+    fn resolve_against_refs(candidate: String, latest: &str, refs: &[String]) -> String {
+        if refs.is_empty() {
+            return candidate;
+        }
+        let same =
+            |a: &str, b: &str| a.strip_prefix('v').unwrap_or(a) == b.strip_prefix('v').unwrap_or(b);
+        // No truncation happened, so there is nothing to verify.
+        if same(&candidate, latest) {
+            return candidate;
+        }
+        if refs.iter().any(|r| same(r, &candidate)) {
+            return candidate;
+        }
+        // Fall back to the concrete version, keeping the candidate's v-prefix style.
+        let bare = latest.strip_prefix('v').unwrap_or(latest);
+        if candidate.starts_with('v') {
+            format!("v{bare}")
+        } else {
+            bare.to_string()
+        }
+    }
+
     /// Extract `owner/repo` from an action reference like `owner/repo/path`
     fn extract_owner_repo(action: &str) -> &str {
         let parts: Vec<&str> = action.splitn(3, '/').collect();
@@ -293,6 +327,42 @@ impl Updater for GithubActionsUpdater {
             .map(|(repo, result)| (repo, result.map_err(|e| e.to_string())))
             .collect();
 
+        // Pass 2b: an action pinned to a shortened ref (`v3` against a latest of
+        // `v4.1.2`) can only be moved to another shortened ref the repo actually
+        // publishes. Fetch the ref list for exactly those repos - shortening is
+        // the only case that needs verifying, so a workflow pinned at full
+        // precision costs no extra requests. Failures are swallowed into an
+        // empty list, which resolve_against_refs treats as "unknown" and leaves
+        // the existing behaviour intact.
+        let repos_needing_refs: Vec<String> = {
+            let mut seen = std::collections::HashSet::new();
+            actions_to_check
+                .iter()
+                .filter(|(_, owner_repo, version)| {
+                    repo_versions
+                        .get(owner_repo)
+                        .and_then(|r| r.as_ref().ok())
+                        .is_some_and(|latest| {
+                            let bare = |s: &str| s.strip_prefix('v').unwrap_or(s).to_string();
+                            bare(version).split('.').count() < bare(latest).split('.').count()
+                        })
+                })
+                .filter(|(_, owner_repo, _)| seen.insert(owner_repo.clone()))
+                .map(|(_, owner_repo, _)| owner_repo.clone())
+                .collect()
+        };
+        let ref_results = join_all(
+            repos_needing_refs
+                .iter()
+                .map(|owner_repo| async { registry.list_ref_names(owner_repo).await }),
+        )
+        .await;
+        let repo_refs: HashMap<String, Vec<String>> = repos_needing_refs
+            .into_iter()
+            .zip(ref_results)
+            .map(|(repo, result)| (repo, result.unwrap_or_default()))
+            .collect();
+
         // Build version map per line index, cloning results from the deduplicated map
         let mut version_map: HashMap<usize, Result<String, anyhow::Error>> = HashMap::new();
         for (line_idx, owner_repo, _) in &actions_to_check {
@@ -397,6 +467,12 @@ impl Updater for GithubActionsUpdater {
                             current_version,
                             &latest_version,
                             options.full_precision,
+                        );
+                        // A shortened ref is only writable if the repo publishes it.
+                        let new_version = Self::resolve_against_refs(
+                            new_version,
+                            &latest_version,
+                            repo_refs.get(owner_repo).map_or(&[][..], |v| v.as_slice()),
                         );
 
                         if new_version != *current_version {
@@ -1134,5 +1210,131 @@ jobs:
         assert_eq!(result.pinned[0].0, "actions/setup-node");
         assert_eq!(result.updated.len(), 1);
         assert_eq!(result.updated[0].0, "jdx/mise-action");
+    }
+}
+
+#[cfg(test)]
+mod floating_ref_tests {
+    use super::*;
+    use crate::registry::MockRegistry;
+    use std::fs;
+    use std::io::Write;
+    use tempfile::NamedTempFile;
+
+    /// An action pinned to a floating major must only be moved to another
+    /// floating major the repo actually publishes. sigstore/cosign-installer
+    /// ships v4.x tags but no `v4` ref, so shortening v4.1.2 to `v4` yields a
+    /// workflow that cannot resolve the action - and because that action only
+    /// runs in a release job, the breakage surfaces at release time.
+    #[tokio::test]
+    async fn truncation_requires_the_floating_ref_to_exist() {
+        let mut file = NamedTempFile::new().unwrap();
+        write!(
+            file,
+            r#"name: CI
+on: push
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: sigstore/cosign-installer@v3
+"#
+        )
+        .unwrap();
+
+        let registry = MockRegistry::new("github-releases")
+            .with_version("sigstore/cosign-installer", "v4.1.2")
+            .with_ref_names(
+                "sigstore/cosign-installer",
+                &["v4.1.2", "v4.1.1", "v4.0.0", "v3.10.1", "v3", "v2"],
+            );
+
+        let updater = GithubActionsUpdater::new();
+        let result = updater
+            .update(file.path(), &registry, UpdateOptions::new(false, false))
+            .await
+            .unwrap();
+
+        let content = fs::read_to_string(file.path()).unwrap();
+        assert!(
+            content.contains("sigstore/cosign-installer@v4.1.2"),
+            "must fall back to the concrete version when no floating v4 exists, got: {content}"
+        );
+        assert!(
+            !content.contains("cosign-installer@v4\n"),
+            "must not write a floating ref the repo does not publish, got: {content}"
+        );
+        assert_eq!(result.updated.len(), 1, "{:?}", result.updated);
+    }
+
+    /// The common case must keep working: a repo that does publish the floating
+    /// major keeps the short, readable pin instead of being expanded.
+    #[tokio::test]
+    async fn truncation_is_kept_when_the_floating_ref_exists() {
+        let mut file = NamedTempFile::new().unwrap();
+        write!(
+            file,
+            r#"name: CI
+on: push
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+"#
+        )
+        .unwrap();
+
+        let registry = MockRegistry::new("github-releases")
+            .with_version("actions/checkout", "v4.2.0")
+            .with_ref_names("actions/checkout", &["v4.2.0", "v4", "v3", "v2"]);
+
+        let updater = GithubActionsUpdater::new();
+        updater
+            .update(file.path(), &registry, UpdateOptions::new(false, false))
+            .await
+            .unwrap();
+
+        let content = fs::read_to_string(file.path()).unwrap();
+        assert!(
+            content.contains("actions/checkout@v4\n"),
+            "a published floating major must stay short, got: {content}"
+        );
+    }
+
+    /// A registry with no ref information must not change behaviour: empty means
+    /// unknown, not "the ref is missing". Otherwise every action would suddenly
+    /// expand to full precision the moment ref lookup failed or was unsupported.
+    #[tokio::test]
+    async fn unknown_refs_preserve_existing_truncation() {
+        let mut file = NamedTempFile::new().unwrap();
+        write!(
+            file,
+            r#"name: CI
+on: push
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+"#
+        )
+        .unwrap();
+
+        // No with_ref_names: list_ref_names returns empty.
+        let registry =
+            MockRegistry::new("github-releases").with_version("actions/checkout", "v4.2.0");
+
+        let updater = GithubActionsUpdater::new();
+        updater
+            .update(file.path(), &registry, UpdateOptions::new(false, false))
+            .await
+            .unwrap();
+
+        let content = fs::read_to_string(file.path()).unwrap();
+        assert!(
+            content.contains("actions/checkout@v4\n"),
+            "unknown ref data must leave precision-matching alone, got: {content}"
+        );
     }
 }

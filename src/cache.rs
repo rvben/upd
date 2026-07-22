@@ -275,6 +275,15 @@ impl<R: Registry> Registry for CachedRegistry<R> {
         self.inner.list_versions(package).await
     }
 
+    /// Forwarded, not cached: the version cache stores a single version string
+    /// per key, and the callers already deduplicate ref lookups per repo within
+    /// a run. Forwarding is not optional - a method left to the trait default
+    /// here silently answers "no refs" for every wrapped registry, which reads
+    /// as a definitive answer rather than a missing implementation.
+    async fn list_ref_names(&self, package: &str) -> Result<Vec<String>> {
+        self.inner.list_ref_names(package).await
+    }
+
     fn name(&self) -> &'static str {
         self.inner.name()
     }
@@ -663,5 +672,31 @@ mod tests {
         let cached = CachedRegistry::new(mock, cache, true);
 
         assert_eq!(cached.name(), "npm");
+    }
+}
+
+#[cfg(test)]
+mod ref_forwarding_tests {
+    use super::*;
+    use crate::registry::MockRegistry;
+
+    /// CachedRegistry decorates another registry, so every Registry method has
+    /// to be forwarded explicitly. A method left to the trait default answers
+    /// with the default's "no data" value, which downstream code cannot
+    /// distinguish from a real answer - this shipped once as a floating-ref
+    /// check that silently never ran because the wrapper swallowed it.
+    #[tokio::test]
+    async fn cached_registry_forwards_ref_names() {
+        let inner = MockRegistry::new("github-releases")
+            .with_version("actions/checkout", "v4.2.0")
+            .with_ref_names("actions/checkout", &["v4.2.0", "v4", "v3"]);
+        let cached = CachedRegistry::new(inner, Cache::new_shared(), false);
+
+        let refs = cached.list_ref_names("actions/checkout").await.unwrap();
+        assert_eq!(
+            refs,
+            vec!["v4.2.0", "v4", "v3"],
+            "CachedRegistry must forward list_ref_names to the inner registry"
+        );
     }
 }
