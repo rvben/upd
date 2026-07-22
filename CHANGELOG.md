@@ -26,6 +26,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 
 
+
+## [0.3.1](https://github.com/rvben/upd/compare/v0.3.0...v0.3.1) - 2026-07-22
+
+### Fixed
+
+- **actions**: only shorten a version to a ref the repo actually publishes ([3321fbe](https://github.com/rvben/upd/commit/3321fbe3f5997bcbd51b2c58cce80edf7d620a79))
+
 ## [0.3.0](https://github.com/rvben/upd/compare/v0.2.4...v0.3.0) - 2026-07-18
 
 ### Added
