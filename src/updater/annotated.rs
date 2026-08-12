@@ -8,8 +8,9 @@ use super::{
 };
 use crate::align::compare_versions;
 use crate::annotation::{
-    AnnotationSource, ParseOutcome, distinct_values, is_prerelease_token, is_version_token,
-    parse_line, reapply_v_prefix, rewrite_spans, version_spans,
+    AnnotationSource, ParseOutcome, UNSUPPORTED_SOURCE_PREFIX, distinct_values,
+    is_prerelease_token, is_version_token, parse_line, reapply_v_prefix, rewrite_spans,
+    version_spans,
 };
 use crate::cache::CachedRegistry;
 use crate::registry::{
@@ -161,11 +162,19 @@ fn choose_write_value(current: &str, resolved: &str, full_precision: bool) -> St
 fn scan_annotated(content: &str) -> AnnotatedScan {
     let mut lines: Vec<AnnotatedLine> = Vec::new();
     let mut refusals: Vec<String> = Vec::new();
+    let mut unsupported_sources: HashSet<String> = HashSet::new();
 
     for (line_idx, raw) in content.lines().enumerate() {
         let annotation = match parse_line(raw) {
             ParseOutcome::None => continue,
             ParseOutcome::Malformed(reason) => {
+                if let Some(source) = reason
+                    .strip_prefix(UNSUPPORTED_SOURCE_PREFIX)
+                    .and_then(|rest| rest.split_once('\'').map(|(source, _)| source))
+                    && !unsupported_sources.insert(source.to_string())
+                {
+                    continue;
+                }
                 refusals.push(format!("line {}: {}", line_idx + 1, reason));
                 continue;
             }
@@ -523,14 +532,17 @@ impl Updater for AnnotatedUpdater {
         }
 
         if modified && !options.dry_run {
-            let line_ending = if content.contains("\r\n") {
-                "\r\n"
-            } else {
-                "\n"
-            };
-            let mut new_content = new_lines.join(line_ending);
-            if content.ends_with('\n') {
-                new_content.push_str(line_ending);
+            let mut new_content = String::with_capacity(content.len());
+            for (line_idx, segment) in content.split_inclusive('\n').enumerate() {
+                let terminator = if segment.ends_with("\r\n") {
+                    "\r\n"
+                } else if segment.ends_with('\n') {
+                    "\n"
+                } else {
+                    ""
+                };
+                new_content.push_str(&new_lines[line_idx]);
+                new_content.push_str(terminator);
             }
             // A write failure must not discard what this run already learned.
             // Append the error, keep the warnings, and return Ok so the file's
@@ -790,6 +802,22 @@ mod tests {
     }
 
     #[test]
+    fn unsupported_sources_are_deduplicated_after_normalization() {
+        let scan = scan_annotated(
+            "A ?= 1.0.0  # upd: Cargo first\nB ?= 2.0.0  # upd: cargo second\nC ?= 3.0.0  # upd: Helm third\n",
+        );
+
+        assert!(scan.lines.is_empty());
+        assert_eq!(
+            scan.refusals,
+            vec![
+                "line 1: unsupported source 'cargo'".to_string(),
+                "line 3: unsupported source 'helm'".to_string(),
+            ]
+        );
+    }
+
+    #[test]
     fn two_lines_under_one_source_are_not_a_conflict() {
         let scan =
             scan_annotated("A ?= 1.0.0  # upd: pypi widget\nB ?= 1.0.0  # upd: pypi widget\n");
@@ -873,6 +901,22 @@ mod tests {
         assert_eq!(
             result.entry_ecosystem.get("openbao-cli"),
             Some(&AnnotationSource::PyPi)
+        );
+    }
+
+    #[tokio::test]
+    async fn preserves_mixed_line_endings_and_the_missing_final_newline() {
+        let set = set_with(
+            AnnotationSource::PyPi,
+            MockRegistry::new("pypi").with_version("openbao-cli", "2.7.0"),
+        );
+        let original = "FIRST := unchanged\r\nBAO_VERSION ?= 2.6.1  # upd: pypi openbao-cli\nLAST := unchanged";
+        let (result, written) = run(original, set, UpdateOptions::new(false, false)).await;
+
+        assert_eq!(result.updated.len(), 1, "{result:?}");
+        assert_eq!(
+            written,
+            "FIRST := unchanged\r\nBAO_VERSION ?= 2.7.0  # upd: pypi openbao-cli\nLAST := unchanged"
         );
     }
 

@@ -83,15 +83,22 @@ fn apply_original_encoding(original: Option<&[u8]>, content: &str) -> Vec<u8> {
     };
 
     let had_bom = original.starts_with(&UTF8_BOM_BYTES);
-    let uses_crlf = original.windows(2).any(|w| w == b"\r\n");
+    let original_body = original.strip_prefix(&UTF8_BOM_BYTES).unwrap_or(original);
+    let uses_crlf = original_body.windows(2).any(|w| w == b"\r\n");
 
-    // Canonicalize to LF first so re-applying CRLF is idempotent regardless of
-    // what the updater emitted.
-    let normalized = content.replace("\r\n", "\n");
-    let body = if uses_crlf {
-        normalized.replace('\n', "\r\n")
+    // An updater that retained the original terminator sequence has already
+    // done the more precise job, including for mixed LF/CRLF files.
+    let body = if line_ending_sequence(original_body) == line_ending_sequence(content.as_bytes()) {
+        content.to_string()
     } else {
-        normalized
+        // Other updaters work on logical lines. Keep their established
+        // behavior of re-applying the original file's line-ending style.
+        let normalized = content.replace("\r\n", "\n");
+        if uses_crlf {
+            normalized.replace('\n', "\r\n")
+        } else {
+            normalized
+        }
     };
 
     let mut out = Vec::with_capacity(body.len() + 3);
@@ -100,6 +107,14 @@ fn apply_original_encoding(original: Option<&[u8]>, content: &str) -> Vec<u8> {
     }
     out.extend_from_slice(body.as_bytes());
     out
+}
+
+fn line_ending_sequence(bytes: &[u8]) -> Vec<bool> {
+    bytes
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, byte)| (*byte == b'\n').then_some(idx > 0 && bytes[idx - 1] == b'\r'))
+        .collect()
 }
 
 /// Write a file atomically (write to temp file, then rename)

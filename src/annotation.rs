@@ -211,6 +211,9 @@ fn parse_renovate_body(body: &str, comment_start: usize) -> ParseOutcome {
     }
 
     match (datasource, dep_name) {
+        (Some(""), _) | (_, Some("")) => ParseOutcome::Malformed(
+            "malformed annotation: datasource= and depName= values must be non-empty".to_string(),
+        ),
         (Some(source), Some(package)) => resolve(source, package, comment_start),
         _ => ParseOutcome::Malformed(
             "malformed annotation: a renovate comment needs both datasource= and depName="
@@ -468,6 +471,28 @@ mod tests {
     fn a_renovate_comment_missing_a_key_is_malformed() {
         let reason = malformed("X = 1.0 # renovate: datasource=pypi");
         assert!(reason.contains("datasource= and depName="), "{reason}");
+    }
+
+    #[test]
+    fn empty_renovate_values_are_malformed() {
+        for line in [
+            "X = 1.0 # renovate: datasource= depName=ruff",
+            "X = 1.0 # renovate: datasource=pypi depName=",
+            "X = 1.0 # renovate: datasource=pypi datasource= depName=ruff",
+            "X = 1.0 # renovate: depName=ruff depName= datasource=pypi",
+        ] {
+            let reason = malformed(line);
+            assert!(reason.starts_with("malformed annotation:"), "{reason}");
+            assert!(reason.contains("must be non-empty"), "{reason}");
+        }
+    }
+
+    #[test]
+    fn a_nonempty_final_renovate_value_still_wins() {
+        let annotation =
+            found("X = 1.0 # renovate: datasource= datasource=pypi depName= depName=ruff");
+        assert_eq!(annotation.source, AnnotationSource::PyPi);
+        assert_eq!(annotation.package, "ruff");
     }
 
     #[test]

@@ -20,23 +20,40 @@ fn upd_bin() -> &'static str {
 }
 
 fn run(args: &[&str], cwd: &Path) -> (String, String, i32) {
-    let output = Command::new(upd_bin())
+    let home = cwd.join("test-home");
+    let xdg_config = cwd.join("test-xdg-config");
+    std::fs::create_dir_all(&home).expect("fixture HOME created");
+    std::fs::create_dir_all(&xdg_config).expect("fixture XDG config created");
+
+    let mut command = Command::new(upd_bin());
+    // Align is network-free and these fixtures need no external tools. A
+    // minimal child environment excludes host credentials, TLS settings, and
+    // Git configuration while retaining deterministic fixture-local homes.
+    command
+        .env_clear()
         .args(args)
         .current_dir(cwd)
-        .env("UPD_CACHE_DIR", cwd.join("upd-cache"))
-        // Align is network-free. Do not let inherited TLS-bundle overrides make
-        // registry construction fail before the alignment code can run.
-        .env_remove("UPD_CA_BUNDLE")
-        .env_remove("REQUESTS_CA_BUNDLE")
-        .env_remove("CURL_CA_BUNDLE")
-        .env_remove("SSL_CERT_FILE")
-        .output()
-        .expect("failed to run upd");
+        .env("HOME", home)
+        .env("XDG_CONFIG_HOME", xdg_config)
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", null_device())
+        .env("UPD_CACHE_DIR", cwd.join("upd-cache"));
+    let output = command.output().expect("failed to run upd");
     (
         String::from_utf8_lossy(&output.stdout).into_owned(),
         String::from_utf8_lossy(&output.stderr).into_owned(),
         output.status.code().unwrap_or(-1),
     )
+}
+
+#[cfg(unix)]
+fn null_device() -> &'static str {
+    "/dev/null"
+}
+
+#[cfg(windows)]
+fn null_device() -> &'static str {
+    "NUL"
 }
 
 /// The misaligned package names `align --format json` reports, in the order the

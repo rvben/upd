@@ -1,7 +1,7 @@
 //! Shared utilities for registry authentication
 
 use std::io::BufRead;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// Maximum size for credential files (10 MB) to prevent DoS
 const MAX_CREDENTIAL_FILE_SIZE: u64 = 10 * 1024 * 1024;
@@ -181,6 +181,11 @@ pub fn get_pip_config_paths() -> Vec<PathBuf> {
 
     // 1. PIP_CONFIG_FILE environment variable (highest precedence)
     if let Ok(path) = std::env::var("PIP_CONFIG_FILE") {
+        // Match pip's documented opt-out: naming the platform null device
+        // disables every config file, including the system-wide fallback.
+        if is_null_device(Path::new(&path)) {
+            return paths;
+        }
         paths.push(PathBuf::from(path));
     }
 
@@ -217,6 +222,16 @@ pub fn get_pip_config_paths() -> Vec<PathBuf> {
     }
 
     paths
+}
+
+#[cfg(unix)]
+fn is_null_device(path: &Path) -> bool {
+    path == Path::new("/dev/null")
+}
+
+#[cfg(windows)]
+fn is_null_device(path: &Path) -> bool {
+    path.as_os_str().eq_ignore_ascii_case("NUL")
 }
 
 /// Read pip configuration from pip.conf/pip.ini files
@@ -300,6 +315,7 @@ pub fn read_pip_config_from_path(path: &PathBuf) -> Option<PipConfig> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serial_test::serial;
     use std::io::Write;
     use tempfile::NamedTempFile;
 
@@ -460,5 +476,35 @@ mod tests {
         let config = read_pip_config_from_path(&path);
 
         assert!(config.is_none());
+    }
+
+    #[test]
+    #[serial]
+    fn null_pip_config_file_suppresses_every_config_location() {
+        let previous = std::env::var_os("PIP_CONFIG_FILE");
+        // SAFETY: This test is serialized with the other environment-mutating tests.
+        unsafe {
+            std::env::set_var("PIP_CONFIG_FILE", pip_config_null_device());
+        }
+
+        assert!(get_pip_config_paths().is_empty());
+
+        // SAFETY: Restore the process environment before releasing the serial test lock.
+        unsafe {
+            match previous {
+                Some(value) => std::env::set_var("PIP_CONFIG_FILE", value),
+                None => std::env::remove_var("PIP_CONFIG_FILE"),
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    fn pip_config_null_device() -> &'static str {
+        "/dev/null"
+    }
+
+    #[cfg(windows)]
+    fn pip_config_null_device() -> &'static str {
+        "NUL"
     }
 }

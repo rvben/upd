@@ -3625,44 +3625,35 @@ impl AppliedVersionUpdates {
 #[derive(Debug)]
 struct TextDocument {
     lines: Vec<String>,
-    line_ending: &'static str,
-    has_trailing_newline: bool,
+    line_endings: Vec<&'static str>,
 }
 
 impl TextDocument {
     fn from_content(content: &str) -> Self {
-        let line_ending = if content.contains("\r\n") {
-            "\r\n"
-        } else {
-            "\n"
-        };
-        let has_trailing_newline = content.ends_with('\n');
-        let body = if has_trailing_newline {
-            content
-                .strip_suffix("\r\n")
-                .or_else(|| content.strip_suffix('\n'))
-                .unwrap_or(content)
-        } else {
-            content
-        };
-
-        let lines = if body.is_empty() {
-            Vec::new()
-        } else {
-            body.split(line_ending).map(str::to_string).collect()
-        };
-
+        let mut lines = Vec::new();
+        let mut line_endings = Vec::new();
+        for segment in content.split_inclusive('\n') {
+            let (line, ending) = if let Some(line) = segment.strip_suffix("\r\n") {
+                (line, "\r\n")
+            } else if let Some(line) = segment.strip_suffix('\n') {
+                (line, "\n")
+            } else {
+                (segment, "")
+            };
+            lines.push(line.to_string());
+            line_endings.push(ending);
+        }
         Self {
             lines,
-            line_ending,
-            has_trailing_newline,
+            line_endings,
         }
     }
 
     fn into_content(self) -> String {
-        let mut content = self.lines.join(self.line_ending);
-        if self.has_trailing_newline {
-            content.push_str(self.line_ending);
+        let mut content = String::new();
+        for (line, ending) in self.lines.into_iter().zip(self.line_endings) {
+            content.push_str(&line);
+            content.push_str(ending);
         }
         content
     }
@@ -6017,6 +6008,28 @@ mod output_tests {
     }
 
     #[test]
+    fn annotated_apply_preserves_mixed_line_endings_and_physical_line_numbers() {
+        let content =
+            "FIRST := unchanged\r\nWIDGET ?= 1.0.0  # upd: pypi widget\nLAST := unchanged";
+        let edits = [annotated_edit(
+            "widget",
+            "1.0.0",
+            "2.0.0",
+            2,
+            Some(AnnotationSource::PyPi),
+        )];
+
+        let result =
+            apply_version_updates(content, &edits, FileType::Annotated, false).expect("apply");
+
+        assert_eq!(
+            result.content,
+            "FIRST := unchanged\r\nWIDGET ?= 2.0.0  # upd: pypi widget\nLAST := unchanged"
+        );
+        assert_eq!(result.applied_count(), 1);
+    }
+
+    #[test]
     fn annotated_apply_matches_the_package_name_byte_for_byte() {
         // The scan recorded `Azure.Core`; a recased edit must not write the line.
         let content = "PKG ?= 1.0.0  # upd: nuget Azure.Core\n";
@@ -6113,7 +6126,8 @@ mod output_tests {
                 .await;
         }
 
-        let original = "ALPHA ?= v1.2.0  # upd: pypi alpha\nBETA ?= 1.2  # upd: pypi beta\n";
+        let original =
+            "ALPHA ?= v1.2.0  # upd: pypi alpha\r\nUNCHANGED := yes\nBETA ?= 1.2  # upd: pypi beta";
 
         let dir = tempfile::tempdir().unwrap();
         let file = dir.path().join("Makefile");
@@ -6203,8 +6217,9 @@ mod output_tests {
             "the interactive writer and the updater disagree about the same rewrite"
         );
         assert_eq!(
-            path_a, "ALPHA ?= v2.0.0  # upd: pypi alpha\nBETA ?= 2.0  # upd: pypi beta\n",
-            "and both must preserve the v prefix and the line's precision"
+            path_a,
+            "ALPHA ?= v2.0.0  # upd: pypi alpha\r\nUNCHANGED := yes\nBETA ?= 2.0  # upd: pypi beta",
+            "both must preserve exact line endings, final-newline state, v prefix, and precision"
         );
     }
 }

@@ -85,13 +85,13 @@ async fn mount_npm(mock: &MockServer, package: &str, latest: &str, versions: &[&
 }
 
 /// Run the binary in `dir` with an isolated cache and a controlled environment.
-/// The baseline contains only fixture-local `HOME`, `XDG_CONFIG_HOME`, and
-/// `UPD_CACHE_DIR`; registry URLs are added explicitly by each test. Clearing
-/// the inherited environment keeps host proxy, credential, CA, registry, and
-/// package-manager configuration out of both registry construction and exact
-/// request counts. No covered path spawns an external tool, so `PATH` is not
-/// restored. Every variable is child-only, which lets these tests run in
-/// parallel with no `#[serial]`.
+/// The baseline contains fixture-local config/cache directories and disables
+/// pip config discovery; registry URLs are added explicitly by each test.
+/// Clearing the inherited environment keeps host proxy, credential, CA,
+/// registry, and package-manager configuration out of both registry
+/// construction and exact request counts. No covered path spawns an external
+/// tool, so `PATH` is not restored. Every variable is child-only, which lets
+/// these tests run in parallel with no `#[serial]`.
 fn run_env(dir: &TempDir, envs: &[(&str, &str)], args: &[&str]) -> std::process::Output {
     let home = dir.path().join("home");
     let xdg_config = dir.path().join("xdg-config");
@@ -104,12 +104,23 @@ fn run_env(dir: &TempDir, envs: &[(&str, &str)], args: &[&str]) -> std::process:
         .args(args)
         .env("HOME", home)
         .env("XDG_CONFIG_HOME", xdg_config)
+        .env("PIP_CONFIG_FILE", pip_config_null_device())
         .env("UPD_CACHE_DIR", dir.path().join("cache"))
         .current_dir(dir.path());
     for (key, value) in envs {
         command.env(key, value);
     }
     command.output().expect("upd ran")
+}
+
+#[cfg(unix)]
+fn pip_config_null_device() -> &'static str {
+    "/dev/null"
+}
+
+#[cfg(windows)]
+fn pip_config_null_device() -> &'static str {
+    "NUL"
 }
 
 /// Run the binary against a mock PyPI, the common case.
@@ -632,6 +643,42 @@ async fn update_reports_the_annotation_warning_in_json_and_not_on_stderr() {
         count_occurrences(&stderr, UNSUPPORTED_SOURCE_PREFIX),
         0,
         "the report owns the warning in JSON mode:\n{stderr}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn repeated_unsupported_sources_are_reported_once_per_normalized_source() {
+    let mock = MockServer::start().await;
+    let dir = TempDir::new().unwrap();
+    std::fs::write(
+        dir.path().join("Makefile"),
+        "A ?= 1.0.0  # upd: Cargo first\nB ?= 2.0.0  # upd: cargo second\nC ?= 3.0.0  # upd: Helm third\n",
+    )
+    .unwrap();
+
+    let output = run(&dir, &mock.uri(), &["update", "--output", "json", "."]);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let report = json_of(&output);
+    let warnings = file_named(&report, "Makefile")["warnings"]
+        .as_array()
+        .unwrap();
+    assert_eq!(warnings.len(), 2, "{report}");
+    assert!(warnings[0].as_str().unwrap().starts_with("line 1:"));
+    assert!(warnings[0].as_str().unwrap().contains("'cargo'"));
+    assert!(warnings[1].as_str().unwrap().starts_with("line 3:"));
+    assert!(warnings[1].as_str().unwrap().contains("'helm'"));
+    assert_eq!(
+        count_occurrences(
+            &String::from_utf8_lossy(&output.stderr),
+            UNSUPPORTED_SOURCE_PREFIX
+        ),
+        0,
+        "the JSON report remains the warning owner"
     );
 }
 
