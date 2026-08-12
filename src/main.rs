@@ -1419,7 +1419,7 @@ async fn run_update(cli: &Cli) -> Result<()> {
         }
     }
 
-    // Version-floor branch (rules 1-9 of the --package lock-only design):
+    // Version-floor branch for --package lock-only dependencies:
     // lockfiles are parsed only when --package narrows to specific names. A
     // requested name with no manifest occurrence but a hit in a scanned
     // lockfile is floored to the registry latest (or a config pin) through
@@ -5190,8 +5190,8 @@ mod tests {
         assert!(has_interactive_changes(&[], &scanned_results));
     }
 
-    /// Section 5.7 step 1: a file that produced only diagnostics is not "up to
-    /// date". Without this, `upd update --interactive` over a repository whose
+    /// A file that produced only diagnostics is not "up to date". Without this,
+    /// `upd update --interactive` over a repository whose
     /// every lookup failed prints `✓ Scanned 1 file(s), all dependencies up to
     /// date` and returns Ok(()). The fixtures are `requirements.txt` results,
     /// not annotated ones: an annotated fixture passes against an
@@ -5251,8 +5251,8 @@ mod tests {
         );
     }
 
-    /// Section 6 invocation 4: the interactive diagnostic is produced by a
-    /// helper so it can be asserted without a terminal, following the
+    /// The interactive diagnostic is produced by a helper so the fourth CLI
+    /// invocation can assert it without a terminal, following the
     /// `interactive_lock_only_package_gets_note` precedent. Errors render the
     /// way the non-interactive renderer does (`src/main.rs:4385`), warnings the
     /// way `print_file_result` does (`:4395`), errors first.

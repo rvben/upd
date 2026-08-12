@@ -282,9 +282,9 @@ fn is_field_byte(b: u8) -> bool {
     b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.' | b'+' | b'-')
 }
 
-/// Whether `value` is a version by the Section 3.2 grammar, matched in its
-/// entirety. Used to validate a registry answer before it is written to a line
-/// that upd does not otherwise understand.
+/// Whether `value` matches the version-field grammar in its entirety. Used to
+/// validate a registry answer before it is written to a line that upd does not
+/// otherwise understand.
 pub fn is_version_token(value: &str) -> bool {
     VERSION_FIELD.is_match(value)
 }
@@ -331,7 +331,7 @@ pub fn reapply_v_prefix(original: &str, candidate: &str) -> String {
 }
 
 /// Positive dual of `align::is_stable_version`, for tokens that have already
-/// passed the Section 3.4 guards. Python is not the negation of it: both PEP 440
+/// passed the update guards. Python is not the negation of it: both PEP 440
 /// predicates report `false` for an unparseable string, which is why such a token
 /// is refused before it ever reaches this helper.
 ///

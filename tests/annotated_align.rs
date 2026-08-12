@@ -154,8 +154,8 @@ fn two_annotated_pins_of_the_same_source_are_still_not_aligned() {
     );
 }
 
-/// Section 2.3's stated v1 asymmetry: `upd align` reports no annotated
-/// occurrence under any `--lang`, including `--lang annotated`. The update half
+/// The v1 behavior is asymmetric: `upd align` reports no annotated occurrence
+/// under any `--lang`, including `--lang annotated`. The update half
 /// of the same asymmetry - `--lang python` DOES select an annotated PyPI pin -
 /// is `lang_python_selects_the_pypi_pin_and_skips_the_github_pin` in
 /// `tests/annotated_pins.rs`, which needs a registry mock and so cannot live
@@ -196,7 +196,7 @@ fn align_reports_no_annotated_occurrence_under_any_lang() {
         "{stdout}"
     );
 
-    // --lang python: the Makefiles are still admitted by discovery (Section 2.3),
+    // --lang python: the Makefiles are still admitted by discovery,
     // and scan_packages' langs filter drops their occurrences.
     let (stdout, stderr, code) = run(
         &["align", "--lang", "python", "--format", "json", "."],

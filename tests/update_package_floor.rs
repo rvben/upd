@@ -2,8 +2,7 @@
 //! a requested name that matches no manifest occurrence but resolves via a
 //! scanned lockfile is floored to the registry latest (or a config pin)
 //! through the lock's own mechanism, reusing the routing/apply machinery
-//! built for `audit --fix-audit`. See `.superpowers/sdd/task-9-brief.md`
-//! for the full rule set this file exercises.
+//! built for `audit --fix-audit`. This file exercises the full rule set.
 
 use std::fs;
 use std::process::Command;

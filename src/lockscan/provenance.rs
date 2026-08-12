@@ -2,7 +2,7 @@
 //! manifests, keyed by DEPENDENCY KEY. Provenance is positional, never
 //! inferred from range admission alone: the Manifest tag applies only to
 //! the lock entry that IS the direct resolved target of a manifest
-//! dependency (Task 3 consumes these inputs for classification).
+//! dependency; classification consumes these inputs directly.
 
 use anyhow::{Context, Result};
 use std::path::Path;

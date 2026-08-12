@@ -19,8 +19,7 @@ use std::path::{Path, PathBuf};
 /// Outcome of writing (or checking) a version floor through a
 /// package-manager-specific mechanism (uv constraint-dependencies, npm
 /// overrides, `cargo update --precise`). Shared across the floor writers so
-/// callers (Task 6's dispatcher, Task 7's transactional apply) handle all of
-/// them uniformly.
+/// dispatch and transactional application handle all of them uniformly.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FloorWriteOutcome {
     /// The floor entry was written (or would be written, in dry-run).
@@ -687,8 +686,8 @@ fn compare_versions(a: &str, b: &str) -> Ordering {
 
 /// Route every vulnerable (name, version) pair in `audit` into explicit
 /// manifest-edit and version-floor targets, or into `unfixable` with a
-/// human-readable reason. See the module's routing rules (spec Section
-/// 2-4): a pair with no fix at all is unfixable; a Manifest-covered pair
+/// human-readable reason. A pair with no fix at all is unfixable; a
+/// Manifest-covered pair
 /// gets one edit per occurrence when its manifest declares a single owner
 /// key, or one edit per owner (never a cross product) when it declares
 /// several (see [`route_manifest_covered`]); a LockOnly pair floors by lock

@@ -644,7 +644,7 @@ impl FileType {
     /// File names a directory walk opens looking for version annotations.
     /// Deliberately small, and in v1 the only set: no Markdown (it would
     /// rewrite this project's own README and every fixture in this repo), no
-    /// `Dockerfile*` (the approved Docker design claims those names), no YAML.
+    /// `Dockerfile*` (those names are reserved for Docker support), no YAML.
     const ANNOTATED_FILE_NAMES: &'static [&'static str] = &[
         "Makefile",
         "makefile",
@@ -1016,7 +1016,7 @@ mod tests {
         );
     }
 
-    /// Section 2.2: the built-in set, matched against the file name alone.
+    /// The built-in set, matched against the file name alone.
     /// Every pattern is a bare name with no `/`, which is why file-name
     /// matching is right here and a scan-root-relative path is not needed.
     #[test]
@@ -1040,9 +1040,9 @@ mod tests {
         }
     }
 
-    /// The negative control for the set above. `Dockerfile` is reserved for the
-    /// approved Docker design and Markdown would rewrite this project's own
-    /// README, so neither is in the set.
+    /// The negative control for the set above. `Dockerfile` is reserved for
+    /// Docker support and Markdown would rewrite this project's own README, so
+    /// neither is in the set.
     #[test]
     fn detect_with_annotated_leaves_unlisted_names_alone() {
         for name in [
@@ -1061,8 +1061,8 @@ mod tests {
         }
     }
 
-    /// Section 2.2 rule 1: an earlier rule always wins, which holds by
-    /// construction because `detect` runs first. `detect` is path-sensitive in
+    /// An earlier rule always wins, which holds by construction because
+    /// `detect` runs first. `detect` is path-sensitive in
     /// two places and still receives the real candidate path, so both survive.
     #[test]
     fn detect_with_annotated_never_overrides_an_earlier_rule() {
@@ -1083,8 +1083,8 @@ mod tests {
         );
     }
 
-    /// Section 2.4: an explicit file-path argument bypasses the pattern set,
-    /// which is what makes `upd README.md` work with no configuration. The
+    /// An explicit file-path argument bypasses the pattern set, which is what
+    /// makes `upd README.md` work with no configuration. The
     /// bypass still yields to an earlier rule.
     #[test]
     fn an_explicit_path_is_annotated_whatever_its_name() {
@@ -1100,7 +1100,7 @@ mod tests {
         );
     }
 
-    /// Section 2.3: `--lang` filters at discovery, before a line is read, so it
+    /// `--lang` filters at discovery, before a line is read, so it
     /// cannot know which ecosystems a file's annotations name. An annotated
     /// file is therefore admitted whatever the selection; without this,
     /// `--lang python` drops the Makefile and its PyPI pins are never seen.
@@ -1133,7 +1133,7 @@ mod tests {
         );
     }
 
-    /// Section 2.4: the built-in set is unconditional, not gated on an option
+    /// The built-in set is unconditional, not gated on an option
     /// that happens to default to empty. `discover_files` passes
     /// `DiscoverOptions::default()`, so this is the guard for that.
     #[test]

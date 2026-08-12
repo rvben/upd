@@ -329,8 +329,8 @@ async fn lang_python_selects_the_pypi_pin_and_skips_the_github_pin() {
     );
 }
 
-/// Section 6: a mixed-source file driven end to end. Task 9 proves the same
-/// routing in process including `github-releases`, which has no base-URL
+/// A mixed-source file driven end to end. In-process coverage proves the same
+/// routing including `github-releases`, which has no base-URL
 /// override and so cannot be mocked here. This is the CLI half, using the two
 /// sources that do have overrides.
 #[tokio::test(flavor = "multi_thread")]
@@ -385,9 +385,9 @@ async fn two_sources_in_one_file_each_reach_their_own_registry_through_the_cli()
     );
 }
 
-/// `--max-bump` is applied per line by `UpdateOptions::allows_bump`, which the
-/// annotated update path calls at step 7. One capped line and one allowed line
-/// in the same file give the negative and the positive control in one run.
+/// `--max-bump` is applied per line by `UpdateOptions::allows_bump` after the
+/// downgrade guard. One capped line and one allowed line in the same file give
+/// the negative and the positive control in one run.
 #[tokio::test(flavor = "multi_thread")]
 async fn max_bump_patch_caps_the_minor_line_and_allows_the_patch_line() {
     let mock = MockServer::start().await;
@@ -434,9 +434,9 @@ async fn max_bump_patch_caps_the_minor_line_and_allows_the_patch_line() {
     );
 }
 
-/// Section 3.4 step 5. `2.6` is two release segments and `2.6.1` is three, so
+/// `2.6` is two release segments and `2.6.1` is three, so
 /// `match_version_precision` (`src/version/mod.rs:26`) truncates the answer back
-/// to `2.6`, which equals the current token and takes the step 6 equality exit.
+/// to `2.6`, which equals the current token and takes the equality exit.
 /// `--full-precision` skips the truncation and the same registry answer becomes
 /// a real change. The exit codes are the discriminator: 0 and 1 from identical
 /// inputs.
@@ -494,7 +494,7 @@ async fn precision_is_matched_unless_full_precision_is_asked_for() {
     );
 }
 
-/// Section 3.4 steps 2 and 3. Both lines short-circuit before the lookup, so no
+/// Ignore and pin lines both short-circuit before the lookup, so no
 /// registry is mounted at all and `summary.errors == 0` is the proof that
 /// neither line was resolved: a lookup against an empty mock returns 404, which
 /// would surface as an error entry.
@@ -576,7 +576,7 @@ fn write_unsupported_source_fixture(dir: &TempDir) {
 }
 
 /// `upd align` scans with `ParseWarnings::Print`, so the warning is printed as
-/// it is discovered and never enters a report. Section 5.7: exactly one owner.
+/// it is discovered and never enters a report: exactly one owner.
 #[tokio::test(flavor = "multi_thread")]
 async fn align_prints_the_annotation_warning_on_stderr_and_not_in_its_report() {
     let mock = MockServer::start().await;
@@ -604,7 +604,7 @@ async fn align_prints_the_annotation_warning_on_stderr_and_not_in_its_report() {
 }
 
 /// `upd update --output json` collects the same warning into the file report.
-/// Printing it to stderr as well would be the second owner Section 5.7 forbids.
+/// Printing it to stderr as well would give it a second owner.
 #[tokio::test(flavor = "multi_thread")]
 async fn update_reports_the_annotation_warning_in_json_and_not_on_stderr() {
     let mock = MockServer::start().await;
@@ -664,12 +664,12 @@ async fn update_prints_the_annotation_warning_once_in_text_mode() {
 /// The fourth invocation, and the only one that can see a duplicate. `--package`
 /// is what sends `run_update` into the version-floor branch, where
 /// `scan_packages` opens every discovered file a second time
-/// (`src/main.rs:1391`). Task 6 step 11 gives that call site
-/// `ParseWarnings::Suppress`; a `Print` there prints the refusal the JSON report
-/// already owns, and no invocation without `--package` can tell.
+/// (`src/main.rs:1391`). That call site uses `ParseWarnings::Suppress`; a
+/// `Print` there prints the refusal the JSON report already owns, and no
+/// invocation without `--package` can tell.
 ///
 /// Naming a *different* package is the other half of the fixture's design. The
-/// refusal is recorded by `scan_annotated` at step 0, before the `--package`
+/// refusal is recorded by `scan_annotated` before the `--package`
 /// gate, so `warnings[]` holds it even though line 1 is filtered out. An
 /// implementation that recorded it after the filter reports zero here, and
 /// naming `thing` itself would hide that difference.
@@ -793,7 +793,7 @@ async fn a_scan_abort_reports_the_annotation_warning_exactly_once_in_both_modes(
     );
 }
 
-/// Section 5.7: a write failure keeps the warnings and drops the updates.
+/// A write failure keeps the warnings and drops the updates.
 /// `write_file_atomic` creates `.<name>.upd.tmp` beside the target
 /// (`src/updater/mod.rs:103-138`); a directory at that path makes `File::create`
 /// fail with EISDIR while everything before the write succeeds normally.
@@ -911,8 +911,7 @@ async fn a_lockfile_note_names_the_manifest_not_the_annotated_file() {
 
 /// Guards 1 and 3 together: with nothing but an annotated file changed,
 /// `updated_files` is empty and the whole `--lock` block is skipped. Removing
-/// guard 1 produces one note naming `Makefile` and fails this test, which is
-/// the mutation Task 11 records.
+/// guard 1 produces one note naming `Makefile` and fails this test.
 #[tokio::test(flavor = "multi_thread")]
 async fn the_lock_flag_is_silent_when_only_annotated_files_changed() {
     let mock = MockServer::start().await;
@@ -1016,8 +1015,8 @@ async fn a_held_back_entry_carries_the_annotated_lines_own_cooldown() {
 }
 
 /// The `skipped_by_cooldown` half, in text mode. Two things are under test that
-/// nothing else covers. The renderer's per-entry cooldown lookup: Task 4 step 9
-/// moved that hoist inside the loop, and a version left outside it compiles and
+/// nothing else covers. The renderer resolves cooldown per entry inside the
+/// loop; a version left outside it compiles and
 /// prints `cooldown disabled` for every annotated entry. And the exit code:
 /// `has_checkable_manifest_changes` deliberately excludes a cooldown-only skip
 /// (`src/main.rs:677-685`), so `--check` must exit 0 here or this is a CI
@@ -1065,8 +1064,8 @@ async fn a_cooldown_skip_renders_the_entrys_own_cooldown_in_text_mode() {
 /// Three runs, because two of them assert different things. Run two is the
 /// steady state after a successful write: no update entry, **no warning of any
 /// kind**, and a byte-identical file under `--apply`. The warning half is the
-/// load-bearing one. Reverse Section 3.4's gate order - downgrade check before
-/// the step 6 equality exit - and the second run still writes nothing while
+/// load-bearing one. Reverse the gate order - downgrade check before the
+/// equality exit - and the second run still writes nothing while
 /// emitting `downgrade_warning` on every invocation forever, so an assertion
 /// about bytes alone passes against exactly the defect this test exists to
 /// catch. Run three is `--check`, which is what a CI job runs.
@@ -1151,7 +1150,7 @@ async fn a_second_run_is_silent_and_reuses_the_cached_lookup() {
 
 /// The steady state after a hold-back, which is the one a CI job lives in.
 /// Current is now `1.3`; the walk-down still answers `1.3.0`, which
-/// precision-matches back to `1.3` and takes the step 6 equality exit before
+/// precision-matches back to `1.3` and takes the equality exit before
 /// `held_back` is ever pushed. An implementation that pushes `held_back` first
 /// makes `--check` exit 1 on every subsequent run, forever.
 ///
@@ -1160,8 +1159,8 @@ async fn a_second_run_is_silent_and_reuses_the_cached_lookup() {
 /// unconditionally would pass. Before the write it must exit **1**, because an
 /// `updated` and a `held_back` entry each count as pending work
 /// (`has_checkable_manifest_changes`, `src/main.rs:677-685`) - which is also
-/// where this differs from the cooldown *skip* in step 8, deliberately excluded
-/// from the same predicate.
+/// where this differs from the cooldown *skip*, deliberately excluded from the
+/// same predicate.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_second_run_after_a_cooldown_hold_back_is_quiet() {
     let mock = MockServer::start().await;
@@ -1243,10 +1242,10 @@ async fn a_second_run_after_a_cooldown_hold_back_is_quiet() {
     );
 }
 
-/// Section 3.4 step 7. `downgrade_warning` is the shared helper every updater
-/// uses (`src/updater/mod.rs:64-66`), so its exact wording is pinned in Task 9;
-/// this asserts the CLI consequences: a warning and not an error, no write, and
-/// exit 0 rather than 1 or 2.
+/// `downgrade_warning` is the shared helper every updater uses
+/// (`src/updater/mod.rs:64-66`), and its exact wording has unit coverage; this
+/// asserts the CLI consequences: a warning and not an error, no write, and exit
+/// 0 rather than 1 or 2.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_downgrade_is_refused_with_a_warning_through_the_cli() {
     let mock = MockServer::start().await;
@@ -1288,7 +1287,7 @@ async fn a_downgrade_is_refused_with_a_warning_through_the_cli() {
     );
 }
 
-/// Section 3.4: a failed lookup is per line, not per file. The failing
+/// A failed lookup is per line, not per file. The failing
 /// annotation is deliberately FIRST, because an implementation that abandons
 /// the file on the first error leaves the second line at 1.0.0 and fails on the
 /// written bytes.
@@ -1341,8 +1340,8 @@ async fn one_failing_lookup_does_not_stop_the_lines_below_it() {
     );
 }
 
-/// Section 4.1a: the Go pseudo-version guard sits at step 0, before the lookup.
-/// `GOPROXY` points at a mock with nothing mounted, so `received_requests()`
+/// The Go pseudo-version guard sits before the lookup. `GOPROXY` points at a
+/// mock with nothing mounted, so `received_requests()`
 /// being empty is direct evidence that no lookup was attempted; a guard placed
 /// after the lookup would leave an error entry behind instead of a warning.
 #[tokio::test(flavor = "multi_thread")]
@@ -1391,7 +1390,7 @@ async fn a_commit_pinned_go_line_is_refused_before_any_registry_call() {
     assert_eq!(std::fs::read_to_string(&makefile).unwrap(), original);
 }
 
-/// Section 3.4 step 4: the current token decides which registry method runs.
+/// The current token decides which registry method runs.
 /// One prerelease line and one stable line in the same file, each with an
 /// answer the other's rule would reject.
 #[tokio::test(flavor = "multi_thread")]
@@ -1427,7 +1426,7 @@ async fn a_prerelease_line_tracks_prereleases_and_a_stable_line_does_not() {
     assert_eq!(json_of(&output)["summary"]["updates_total"], 1);
 }
 
-/// Section 2.2: the built-in name set does not bypass `.gitignore`. The walker
+/// The built-in name set does not bypass `.gitignore`. The walker
 /// is built with `require_git(false)` (`src/updater/mod.rs:855-860`), so a
 /// `.gitignore` with no `.git` directory beside it is still honoured.
 #[tokio::test(flavor = "multi_thread")]
@@ -1475,7 +1474,7 @@ async fn a_gitignored_makefile_is_only_reached_with_no_ignore() {
     );
 }
 
-/// Task 1 added `Lang::Annotated` to `build_audit_packages`' skip chain
+/// `Lang::Annotated` is in `build_audit_packages`' skip chain
 /// (`src/main.rs:2615-2664`), which is an `if` chain the compiler does not
 /// force. Without it the annotated dependency falls through to the `Ecosystem`
 /// match below and hits `unreachable!("filtered above")`, so this test fails as

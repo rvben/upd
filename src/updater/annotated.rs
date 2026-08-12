@@ -138,15 +138,15 @@ struct AnnotatedScan {
     refusals: Vec<String>,
 }
 
-/// Section 2.3's per-line `--lang` rule. An empty selection means everything;
+/// Apply `--lang` per line. An empty selection means everything;
 /// `Lang::Annotated` selects every annotated line whatever its source; and a
 /// source's own lang selects its lines individually.
 fn lang_selected(langs: &[Lang], source: AnnotationSource) -> bool {
     langs.is_empty() || langs.contains(&Lang::Annotated) || langs.contains(&source.lang())
 }
 
-/// Section 3.4 step 6's write value: match the current token's precision unless
-/// the caller asked for full precision, then restore its `v` prefix.
+/// Match the current token's precision unless the caller asked for full
+/// precision, then restore its `v` prefix.
 fn choose_write_value(current: &str, resolved: &str, full_precision: bool) -> String {
     let matched = if full_precision {
         resolved.to_string()
@@ -202,9 +202,9 @@ fn scan_annotated(content: &str) -> AnnotatedScan {
         });
     }
 
-    // Section 5.3: one package name under two sources inside one file is a
-    // contradiction upd cannot resolve, so every line involved is dropped and
-    // the file reports exactly one warning naming all of them.
+    // One package name under two sources inside one file is a contradiction upd
+    // cannot resolve, so every line involved is dropped and the file reports
+    // exactly one warning naming all of them.
     let mut conflicts: Vec<(String, Vec<usize>)> = Vec::new();
     let mut examined: HashSet<&str> = HashSet::new();
     for line in &lines {
@@ -303,8 +303,8 @@ impl Updater for AnnotatedUpdater {
         let mut result = UpdateResult::default();
         let scan = scan_annotated(&content);
 
-        // Step 0: parse-time refusals are recorded unconditionally, ahead of
-        // every gate. `--package other` must not hide a malformed annotation.
+        // Parse-time refusals are recorded unconditionally, ahead of every gate.
+        // `--package other` must not hide a malformed annotation.
         result.warnings.extend(scan.refusals.iter().cloned());
 
         let lines: Vec<&str> = content.lines().collect();
@@ -320,8 +320,8 @@ impl Updater for AnnotatedUpdater {
                 .entry_ecosystem
                 .insert(line.package.clone(), line.source);
 
-            // Step 0, continued: a commit-pinned Go version names a commit, not
-            // a release. GoModUpdater refuses it before its own gates too.
+            // A commit-pinned Go version names a commit, not a release. Refuse
+            // it before the gates, as GoModUpdater does.
             if line.source == AnnotationSource::Go && GoModUpdater::is_pseudo_version(&line.version)
             {
                 result.warnings.push(format!(
@@ -330,13 +330,11 @@ impl Updater for AnnotatedUpdater {
                 continue;
             }
 
-            // Step 1
             if options.is_package_filtered_out(&line.package) {
                 result.unchanged += 1;
                 continue;
             }
 
-            // Step 2
             if options.should_ignore(&line.package) {
                 result
                     .ignored
@@ -348,13 +346,12 @@ impl Updater for AnnotatedUpdater {
                 continue;
             }
 
-            // Step 3: a pin short-circuits the registry entirely.
+            // A pin short-circuits the registry entirely.
             if let Some(pinned) = options.get_pinned_version(&line.package) {
                 version_map.insert(line.line_idx, PendingVersion::Pinned(pinned.to_string()));
                 continue;
             }
 
-            // Step 3a
             if line.source.lang() == Lang::Python && line.version.parse::<Pep440Version>().is_err()
             {
                 result.warnings.push(format!(
@@ -416,8 +413,8 @@ impl Updater for AnnotatedUpdater {
                     result.errors.push(format!("{}: {}", line.package, e));
                 }
                 PendingVersion::Registry(Ok(resolved)) => {
-                    // Step 4: upd is about to write this value into a line it
-                    // does not otherwise understand, so it must be a version.
+                    // upd is about to write this value into a line it does not
+                    // otherwise understand, so it must be a version.
                     if !is_version_token(&resolved) {
                         result.warnings.push(format!(
                             "line {line_num}: unusable version from {} for {}: {resolved}",
@@ -436,8 +433,8 @@ impl Updater for AnnotatedUpdater {
                         continue;
                     }
 
-                    // Step 5. An annotated line carries no constraint, so the
-                    // cooldown selector never has one to respect.
+                    // An annotated line carries no constraint, so the cooldown
+                    // selector never has one to respect.
                     let registry = match self.registries.for_source(line.source) {
                         Ok(registry) => registry,
                         Err(e) => {
@@ -479,7 +476,6 @@ impl Updater for AnnotatedUpdater {
                         }
                     };
 
-                    // Step 6
                     let target =
                         choose_write_value(&line.version, &resolved, options.full_precision);
                     if target == line.version {
@@ -487,9 +483,9 @@ impl Updater for AnnotatedUpdater {
                         continue;
                     }
 
-                    // Step 7. `compare_versions` strips a leading `v` from both
-                    // operands itself (see `align::compare_semver`), so the raw
-                    // tokens are passed straight through.
+                    // `compare_versions` strips a leading `v` from both operands
+                    // itself (see `align::compare_semver`), so the raw tokens are
+                    // passed straight through.
                     if compare_versions(&target, &line.version, lang) != Ordering::Greater {
                         result.warnings.push(downgrade_warning(
                             &line.package,
@@ -536,9 +532,9 @@ impl Updater for AnnotatedUpdater {
             if content.ends_with('\n') {
                 new_content.push_str(line_ending);
             }
-            // Section 5.7: a write failure must not discard what this run
-            // already learned. Append the error, keep the warnings, and return
-            // Ok so the file's diagnostics still reach the report.
+            // A write failure must not discard what this run already learned.
+            // Append the error, keep the warnings, and return Ok so the file's
+            // diagnostics still reach the report.
             if let Err(e) = write_file_atomic(path, &new_content) {
                 result.errors.push(e.to_string());
                 return Ok(UpdateResult {
@@ -769,10 +765,10 @@ mod tests {
 
     #[test]
     fn one_version_repeated_on_a_line_is_not_ambiguous() {
-        // `-` is a field byte (Section 3.2), so a hyphen-joined identifier like
+        // `-` is a field byte, so a hyphen-joined identifier like
         // `app-1.2.3` is not a candidate; delimit each occurrence with `/`
-        // instead, mirroring the spec's own `FOO := 1.2.3` plus
-        // `FOO_URL := .../1.2.3/...` example.
+        // instead, as in `FOO := 1.2.3` plus
+        // `FOO_URL := .../1.2.3/...`.
         let scan = scan_annotated("VERSION := 1.2.3 URL := .../1.2.3/tarball  # upd: pypi app\n");
         assert!(scan.refusals.is_empty(), "{:?}", scan.refusals);
         assert_eq!(scan.lines.len(), 1);
@@ -1044,8 +1040,8 @@ mod tests {
 
     #[tokio::test]
     async fn a_commit_pinned_go_line_is_refused_even_under_a_package_filter() {
-        // Step 0 runs before --package, so naming another package does not
-        // silence this refusal. GoModUpdater behaves the same way.
+        // The refusal runs before --package, so naming another package does not
+        // silence it. GoModUpdater behaves the same way.
         let set = set_with(
             AnnotationSource::Go,
             MockRegistry::new("go-proxy").with_version("golang.org/x/net", "v0.30.0"),
@@ -1082,10 +1078,10 @@ mod tests {
             AnnotationSource::PyPi,
             MockRegistry::new("pypi").with_version("thing", "2.7.0"),
         );
-        // `1.0++` matches the Section 3.2 grammar, so the scanner accepts it as
+        // `1.0++` matches the version-field grammar, so the scanner accepts it as
         // this line's version, but PEP 440 rejects an empty local segment.
         // A token that failed the grammar would be refused earlier, by the
-        // scanner, and would never reach step 3a.
+        // scanner, and would never reach the PEP 440 guard.
         let original = "THING ?= 1.0++  # upd: pypi thing\n";
         let (result, written) = run(original, set, UpdateOptions::new(false, false)).await;
         assert_eq!(
@@ -1104,7 +1100,7 @@ mod tests {
         }
     }
 
-    /// Two sources, two registries, one file. Section 6's mixed-source fixture.
+    /// Two sources, two registries, one mixed-source file.
     fn mixed_source_set() -> RegistrySet {
         set_of(vec![
             (
@@ -1169,8 +1165,8 @@ mod tests {
     /// Wraps a `MockRegistry` and counts how many times it was asked anything
     /// about a version.
     ///
-    /// `name()` is deliberately not counted, which narrows Section 6's "every
-    /// `Registry` method". `apply_cooldown` calls `name()` for every resolved
+    /// `name()` is deliberately not counted, which narrows "every `Registry`
+    /// method" to version queries. `apply_cooldown` calls `name()` for every resolved
     /// line before its no-policy early return (`src/updater/mod.rs:632-662`), so
     /// counting it would report 2 for a single lookup and the assertions below
     /// would stop meaning "the registry was asked for a version".
@@ -1247,10 +1243,10 @@ mod tests {
         })
     }
 
-    /// Section 5.7's counter rule for a refused line: the diagnostic lands in
-    /// `warnings` and nothing else moves.
+    /// For a refused line, the diagnostic lands in `warnings` and nothing else
+    /// moves.
     ///
-    /// `entry_ecosystem` is deliberately not checked. Task 6 records it before
+    /// `entry_ecosystem` is deliberately not checked. It is recorded before
     /// every gate precisely so a refused line can still be labelled with its
     /// source in the report, so it is expected to be non-empty here.
     fn assert_records_nothing(result: &UpdateResult) {
