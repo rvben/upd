@@ -1,3 +1,4 @@
+mod annotated;
 mod cargo_toml;
 mod csproj;
 mod gemfile;
@@ -11,6 +12,7 @@ mod pyproject;
 mod requirements;
 mod terraform;
 
+pub use annotated::{ParseWarnings, RegistrySet};
 pub use cargo_toml::CargoTomlUpdater;
 pub use csproj::CsprojUpdater;
 pub use gemfile::GemfileUpdater;
@@ -241,6 +243,14 @@ pub struct UpdateOptions {
     /// level, so updates are only skipped when `--only-bump` / `--max-bump`
     /// narrow it.
     pub bump_filter: BumpFilter,
+    /// Ecosystems selected by `--lang`. Empty means every ecosystem.
+    ///
+    /// Only `AnnotatedUpdater` reads this. Every other file type was already
+    /// filtered at discovery, where the same test was applied to the file's own
+    /// `FileType::lang()`; an annotated file is admitted by discovery
+    /// unconditionally because its ecosystems are not known until its lines are
+    /// read.
+    pub langs: Vec<Lang>,
 }
 
 impl UpdateOptions {
@@ -255,6 +265,7 @@ impl UpdateOptions {
             cooldown_now: None,
             cooldown_unavailable_notes: Arc::default(),
             bump_filter: BumpFilter::default(),
+            langs: Vec::new(),
         }
     }
 
@@ -280,6 +291,12 @@ impl UpdateOptions {
     /// Restrict processing to the named packages.
     pub fn with_packages(mut self, packages: Vec<String>) -> Self {
         self.packages = packages;
+        self
+    }
+
+    /// Restrict processing to the named ecosystems. Empty means every one.
+    pub fn with_langs(mut self, langs: Vec<Lang>) -> Self {
+        self.langs = langs;
         self
     }
 
@@ -965,6 +982,17 @@ mod tests {
             !filter.allows("1.0.0", ""),
             "an empty target version must never be writable"
         );
+    }
+
+    #[test]
+    fn with_langs_carries_the_selection_and_defaults_to_empty() {
+        let plain = UpdateOptions::new(true, false);
+        assert!(
+            plain.langs.is_empty(),
+            "an empty selection means every lang, so the default cannot filter"
+        );
+        let filtered = UpdateOptions::new(true, false).with_langs(vec![Lang::Python]);
+        assert_eq!(filtered.langs, vec![Lang::Python]);
     }
 
     #[test]

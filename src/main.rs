@@ -401,11 +401,13 @@ fn load_update_configs(
     Ok(file_configs)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_update_options(
     dry_run: bool,
     full_precision: bool,
     config: Option<Arc<UpdConfig>>,
     packages: &[String],
+    langs: &[Lang],
     cooldown_policy: Option<&CooldownPolicy>,
     cooldown_notes: Arc<Mutex<BTreeSet<String>>>,
     bump_filter: BumpFilter,
@@ -415,6 +417,7 @@ fn build_update_options(
         options = options.with_config(config);
     }
     options = options.with_packages(packages.to_vec());
+    options = options.with_langs(langs.to_vec());
     options = options.with_bump_filter(bump_filter);
     if let Some(policy) = cooldown_policy {
         options = options.with_cooldown_policy(policy.clone(), Utc::now());
@@ -1197,6 +1200,7 @@ async fn run_update(cli: &Cli) -> Result<()> {
                     cli.full_precision,
                     config,
                     &cli.packages,
+                    &cli.langs,
                     cooldown_policy,
                     Arc::clone(&cooldown_notes),
                     filter.to_bump_filter(),
@@ -1447,6 +1451,7 @@ async fn run_update(cli: &Cli) -> Result<()> {
                 cli.full_precision,
                 config,
                 &cli.packages,
+                &cli.langs,
                 cooldown_policy.as_ref(),
                 Arc::clone(&cooldown_notes),
                 filter.to_bump_filter(),
@@ -2048,6 +2053,7 @@ async fn run_interactive_update(
             cli.full_precision,
             file_configs.get(path).cloned().flatten(),
             &cli.packages,
+            &cli.langs,
             cooldown_policy,
             Arc::clone(&cooldown_notes),
             filter.to_bump_filter(),
