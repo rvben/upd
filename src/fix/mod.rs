@@ -1778,6 +1778,110 @@ mod tests {
         assert!(!u.no_fixed_version);
     }
 
+    /// FORWARD GUARD, vacuous in v1 by construction. `matching_occurrences`
+    /// (`src/fix/mod.rs:162-183`) only considers keys whose `Lang` equals
+    /// `ecosystem_lang(ecosystem)`, and `ecosystem_lang`'s image is
+    /// Python/Node/Rust/Go/Ruby/DotNet - never `Lang::Annotated`. So no audit
+    /// result can route an annotated occurrence today, and this test would pass
+    /// against an empty implementation of the rule.
+    ///
+    /// It is here for V2.1, which gives annotated dependencies their own
+    /// ecosystem `Lang` and makes this same fixture route a `ManifestEdit` into a
+    /// Makefile that `apply_fix` has no writer for. When it goes red, the router
+    /// needs an explicit `FileType::Annotated` exclusion - do not relax the
+    /// assertion.
+    ///
+    /// The `pyproject.toml` occurrence is the control: routing must still produce
+    /// its `ManifestEdit`, or this passes because nothing routed at all.
+    #[test]
+    fn annotated_occurrences_are_never_routed_to_a_fix_target() {
+        use crate::align::scan_packages;
+        use crate::updater::ParseWarnings;
+
+        let audit = audit_of(vec![vulnerable(
+            pkg("ruff", "0.1.0", Ecosystem::PyPI),
+            vec![vuln("GHSA-1", Some("0.2.0"))],
+        )]);
+        // No lockfile was scanned, so the pair has no provenance entry and
+        // routing takes `route_no_provenance` (rule 4) - the one path that walks
+        // the occurrence map directly, which is where an annotated occurrence
+        // would leak in.
+        let prov = prov_index(vec![], vec![]);
+        let mut packages = packages_map(vec![(
+            ("ruff", Lang::Python),
+            vec![occ(
+                "pyproject.toml",
+                FileType::PyProject,
+                "0.1.0",
+                Some(4),
+                "ruff",
+                true,
+            )],
+        )]);
+
+        // Scan the annotated half through production parsing and keying. This
+        // makes the forward guard sensitive to V2.1 changing the occurrence's
+        // Lang from Annotated to Python; a hand-built map could never see that
+        // transition and would stay vacuously green forever.
+        let tmp = tempfile::tempdir().unwrap();
+        let makefile = tmp.path().join("Makefile");
+        std::fs::write(&makefile, "RUFF ?= 0.1.0  # upd: pypi ruff\n").unwrap();
+        let scanned = scan_packages(
+            &[(makefile.clone(), FileType::Annotated)],
+            &[],
+            ParseWarnings::Suppress,
+        )
+        .unwrap();
+        let scanned_occurrences: Vec<_> = scanned.values().flatten().collect();
+        assert_eq!(
+            scanned_occurrences.len(),
+            1,
+            "precondition: the real scan must find exactly one annotated occurrence: {scanned:?}"
+        );
+        assert_eq!(
+            scanned_occurrences[0].file_path, makefile,
+            "precondition: the real scan must see the Makefile"
+        );
+        assert_eq!(
+            scanned_occurrences[0].file_type,
+            FileType::Annotated,
+            "precondition: the scanned occurrence must retain its file type"
+        );
+        let scanned_lang = scanned
+            .keys()
+            .find_map(|(name, lang)| (name == "ruff").then_some(*lang));
+        for (key, occurrences) in scanned {
+            packages.entry(key).or_default().extend(occurrences);
+        }
+
+        let routing = route_fix_targets(&audit, &prov, &packages);
+
+        assert_eq!(routing.targets.len(), 1, "{:?}", routing.targets);
+        assert_eq!(routing.targets[0].path, PathBuf::from("pyproject.toml"));
+        assert!(
+            routing
+                .targets
+                .iter()
+                .all(|t| t.path.as_path() != makefile.as_path()
+                    && t.file_type != Some(FileType::Annotated)),
+            "no fix target may name an annotated file: {:?}",
+            routing.targets
+        );
+        assert!(
+            routing
+                .unfixable
+                .iter()
+                .all(|u| u.path.as_deref() != Some(makefile.as_path())),
+            "an annotated occurrence must not even be reported as unfixable: {:?}",
+            routing.unfixable
+        );
+        assert_eq!(
+            scanned_lang,
+            Some(Lang::Annotated),
+            "v1 precondition: the real scan must key the Makefile occurrence as Lang::Annotated"
+        );
+    }
+
     mod resolve_floor_version_tests {
         use super::*;
         use crate::config::UpdConfig;

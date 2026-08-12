@@ -6078,4 +6078,133 @@ mod output_tests {
             "GH ?= v2.65.4  # upd: github-releases cli/cli\n"
         );
     }
+
+    /// The non-interactive writer (`AnnotatedUpdater::update`) and the
+    /// interactive/align writer (`apply_version_updates`' annotated arm) are two
+    /// implementations of one rewrite. Nothing forces them to agree, so this
+    /// runs both over one fixture and compares bytes.
+    ///
+    /// The fixture carries the two cases where they could plausibly diverge: a
+    /// `v`-prefixed pin, which only agrees if both call `reapply_v_prefix`, and a
+    /// two-segment pin, which only agrees if both call `match_version_precision`.
+    /// A three-segment plain pin would pass under either implementation and
+    /// prove nothing.
+    #[tokio::test]
+    async fn both_write_paths_produce_the_same_bytes_for_an_annotated_file() {
+        use std::sync::Mutex;
+        use upd::registry::{MultiPyPiRegistry, PyPiRegistry};
+        use upd::updater::{AnnotatedUpdater, RegistrySet, UpdateOptions, Updater};
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock = MockServer::start().await;
+        for (package, latest) in [("alpha", "2.0.0"), ("beta", "2.0.0")] {
+            Mock::given(method("GET"))
+                .and(path(format!("/pypi/{package}/json")))
+                .respond_with(ResponseTemplate::new(200).set_body_string(format!(
+                    r#"{{"releases":{{"{latest}":[{{"yanked":false,"upload_time_iso_8601":"2024-01-01T00:00:00Z"}}]}}}}"#
+                )))
+                .mount(&mock)
+                .await;
+            Mock::given(method("GET"))
+                .and(path(format!("/simple/{package}/")))
+                .respond_with(ResponseTemplate::new(404))
+                .mount(&mock)
+                .await;
+        }
+
+        let original = "ALPHA ?= v1.2.0  # upd: pypi alpha\nBETA ?= 1.2  # upd: pypi beta\n";
+
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("Makefile");
+        std::fs::write(&file, original).unwrap();
+
+        // `enabled: false` on every CachedRegistry, so no lookup is answered from
+        // a shared on-disk cache and the mock sees both requests.
+        let cache = Arc::new(Mutex::new(Cache::default()));
+        let pypi = Arc::new(CachedRegistry::new(
+            MultiPyPiRegistry::from_primary_and_extras(
+                PyPiRegistry::with_index_url(mock.uri()),
+                Vec::new(),
+            ),
+            Arc::clone(&cache),
+            false,
+        ));
+        let npm = Arc::new(CachedRegistry::new(
+            NpmRegistry::new(),
+            Arc::clone(&cache),
+            false,
+        ));
+        let crates_io = Arc::new(CachedRegistry::new(
+            CratesIoRegistry::new(),
+            Arc::clone(&cache),
+            false,
+        ));
+        let go_proxy = Arc::new(CachedRegistry::new(
+            GoProxyRegistry::new(),
+            Arc::clone(&cache),
+            false,
+        ));
+        let rubygems = Arc::new(CachedRegistry::new(
+            RubyGemsRegistry::new(),
+            Arc::clone(&cache),
+            false,
+        ));
+        let nuget = Arc::new(CachedRegistry::new(
+            NuGetRegistry::new(),
+            Arc::clone(&cache),
+            false,
+        ));
+        let github_releases = Arc::new(CachedRegistry::new(
+            GitHubReleasesRegistry::new(),
+            Arc::clone(&cache),
+            false,
+        ));
+
+        let updater = AnnotatedUpdater::new(RegistrySet::resolving(
+            &pypi,
+            &npm,
+            &crates_io,
+            &go_proxy,
+            &rubygems,
+            &nuget,
+            &github_releases,
+        ));
+        let result = updater
+            .update(&file, pypi.as_ref(), UpdateOptions::new(false, false))
+            .await
+            .expect("update");
+        let path_a = std::fs::read_to_string(&file).expect("read back");
+
+        assert_eq!(result.updated.len(), 2, "{result:?}");
+        assert_ne!(path_a, original, "the fixture must actually change");
+
+        // Rebuild the interactive path's edits from what the updater reported,
+        // exactly as `src/main.rs:2243-2248` does: the source comes from
+        // `entry_ecosystem`, keyed by package name.
+        let edits: Vec<VersionEdit<'_>> = result
+            .updated
+            .iter()
+            .map(|(package, old, new, line)| VersionEdit {
+                package: package.as_str(),
+                old_version: old.as_str(),
+                new_version: new.as_str(),
+                line_num: *line,
+                expected_source: result.entry_ecosystem.get(package).copied(),
+            })
+            .collect();
+
+        let applied = apply_version_updates(original, &edits, FileType::Annotated, false)
+            .expect("apply interactive-path edits");
+
+        assert_eq!(applied.applied_count(), 2, "both edits must apply");
+        assert_eq!(
+            applied.content, path_a,
+            "the interactive writer and the updater disagree about the same rewrite"
+        );
+        assert_eq!(
+            path_a, "ALPHA ?= v2.0.0  # upd: pypi alpha\nBETA ?= 2.0  # upd: pypi beta\n",
+            "and both must preserve the v prefix and the line's precision"
+        );
+    }
 }

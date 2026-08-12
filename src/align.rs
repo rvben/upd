@@ -605,4 +605,43 @@ mod tests {
         assert_eq!(result.packages[0].highest_version, "2.0.0");
         assert_eq!(result.misaligned_count, 1);
     }
+
+    /// Two annotated files pinning the same package name at different versions
+    /// form one `Lang::Annotated` group in the occurrence map, and that group
+    /// must never reach the alignment report. The map assertion is a
+    /// precondition, not decoration: a scan that produced no occurrences at all
+    /// also produces no alignment, and would pass the second half alone.
+    #[test]
+    fn a_real_scan_of_two_annotated_files_produces_one_group_and_no_alignment() {
+        use std::io::Write;
+        use tempfile::NamedTempFile;
+
+        let mut a = NamedTempFile::with_suffix(".mk").unwrap();
+        writeln!(a, "TOOL ?= 1.2.0  # upd: pypi widget").unwrap();
+        let mut b = NamedTempFile::with_suffix(".mk").unwrap();
+        writeln!(b, "TOOL ?= 3.4.0  # upd: pypi widget").unwrap();
+
+        let files = vec![
+            (a.path().to_path_buf(), FileType::Annotated),
+            (b.path().to_path_buf(), FileType::Annotated),
+        ];
+        let packages = scan_packages(&files, &[], ParseWarnings::Suppress).unwrap();
+
+        let key = ("widget".to_string(), Lang::Annotated);
+        assert_eq!(
+            packages.get(&key).map(Vec::len),
+            Some(2),
+            "expected one two-occurrence Annotated group, got keys {:?}",
+            packages.keys().collect::<Vec<_>>()
+        );
+
+        let result = find_alignments(packages);
+
+        assert!(
+            result.packages.is_empty(),
+            "annotated groups must never reach the alignment report: {:?}",
+            result.packages
+        );
+        assert_eq!(result.misaligned_count, 0);
+    }
 }

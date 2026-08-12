@@ -136,6 +136,7 @@ upd --lang ruby             # Update only Ruby gems
 upd --lang dot-net          # Update only .NET NuGet packages
 upd --lang terraform        # Update only Terraform providers/modules
 upd --lang mise             # Update only Mise/asdf tools
+upd --lang annotated        # Update only annotated version pins
 
 # Version precision
 upd --full-precision  # Output full versions (e.g., 3.1.5 instead of 3.1)
@@ -248,6 +249,32 @@ upd audit --format sarif > results.sarif
 - `.tool-versions` (space-delimited format)
 - Supports 24+ common dev tools: node, python, go, rust, zig, deno, bun, uv, ruff, terraform, kubectl, helm, and more
 - Skips `latest` versions and `cargo:*` tools
+
+### Annotated files
+
+A version pinned in a file `upd` does not otherwise understand can declare its
+own source with a trailing comment:
+
+```makefile
+BAO_VERSION ?= 2.6.1  # upd: pypi openbao-cli
+NODE_VERSION := 22.11.0  # upd: npm node
+```
+
+- Syntax: `upd: <source> <package>` in a trailing `#` or `//` comment
+- Sources: `pypi`, `npm`, `crates`, `go`, `rubygems`, `nuget`, `github-releases`
+- Scanned by name: `Makefile`, `makefile`, `GNUmakefile`, `*.mk`, `justfile`,
+  `Justfile`, `*.sh`, `*.bash`. Any other file works when passed explicitly:
+  `upd update path/to/versions.env`
+- The version on the line is found and rewritten in place, keeping a leading
+  `v` and the line's own precision (`v2.60` becomes `v2.65`, not `v2.65.4`)
+- One package name may not appear under two different sources in the same file
+- `ignore` and `pin` in `.updrc.toml` reach annotated packages by name. Package
+  matching is PEP 503-normalized, so `"Oven-SH/bun"` and `"oven-sh/bun"` are
+  one key, as are `"foo-bar"` and `"foo_bar"`
+- `exclude` filters discovered files with path globs; explicitly passed file
+  paths bypass it
+- `upd align` and `upd audit` ignore annotated lines: a package name is only
+  meaningful together with its source, so grouping them across files is not safe
 
 ## Example Output
 

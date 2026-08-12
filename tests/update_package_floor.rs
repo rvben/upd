@@ -208,6 +208,74 @@ async fn lock_only_package_floors_from_mocked_registry_dry_run() {
     assert_eq!(pyproject, PYPROJECT_BARE, "dry run must not write");
 }
 
+/// FORWARD GUARD, vacuous in v1. An annotated Makefile pinning the same
+/// lock-only name must not suppress the `constraint-dependencies` floor. Today
+/// it cannot: the occurrence is keyed `Lang::Annotated` and
+/// `matches_manifest_occurrence` (`src/main.rs:473-490`) never sees it. Under
+/// V2.1 the same occurrence arrives as `Lang::Python`, the name looks like a
+/// direct dependency, and the floor disappears with no diagnostic - which is
+/// exactly the failure a forward guard is for.
+///
+/// Two controls. `lock_only_package_floors_from_mocked_registry_dry_run` above
+/// is the same fixture WITHOUT the Makefile, so the annotation is the only
+/// variable between them. And the Makefile's own planned update is asserted
+/// here, which proves the annotated file was scanned at all - without it this
+/// test would pass on a build that never opened the Makefile.
+#[tokio::test]
+async fn an_annotated_pin_does_not_suppress_a_lock_only_floor() {
+    let server = wiremock::MockServer::start().await;
+    mount_pypi_latest(&server, "lockonly", "0.49.1").await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    fs::write(tmp.path().join("pyproject.toml"), PYPROJECT_BARE).unwrap();
+    fs::write(tmp.path().join("uv.lock"), uv_lock_at("lockonly", "0.40.0")).unwrap();
+    fs::write(
+        tmp.path().join("Makefile"),
+        "LOCKONLY ?= 0.40.0  # upd: pypi lockonly\n",
+    )
+    .unwrap();
+
+    let (stdout, stderr, code) = run_with_env(
+        &[
+            "update",
+            "--package",
+            "lockonly",
+            "--format",
+            "json",
+            "--no-cache",
+            ".",
+        ],
+        tmp.path(),
+        &[("UV_INDEX_URL", &server.uri())],
+    );
+
+    assert_eq!(code, 1, "stdout: {stdout}\nstderr: {stderr}");
+
+    let json: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    let files = json["files"].as_array().unwrap();
+
+    let floors = collect_for_path(files, "pyproject.toml", "updates");
+    assert!(
+        floors.iter().any(|u| u["package"] == "lockonly"
+            && u["current"] == "0.40.0"
+            && u["latest"] == "0.49.1"
+            && u["method"] == "uv-constraint"
+            && u["status"] == "planned"),
+        "the floor must survive the annotated pin: {floors:?}"
+    );
+
+    let annotated = collect_for_path(files, "Makefile", "updates");
+    assert!(
+        annotated
+            .iter()
+            .any(|u| u["package"] == "lockonly" && u["current"] == "0.40.0"),
+        "control: the Makefile must have been scanned and planned: {annotated:?}"
+    );
+
+    let pyproject = fs::read_to_string(tmp.path().join("pyproject.toml")).unwrap();
+    assert_eq!(pyproject, PYPROJECT_BARE, "dry run must not write");
+}
+
 /// (2) A candidate that exceeds `--max-bump` is silently skipped: no floor
 /// entry, exit 0.
 #[tokio::test]
