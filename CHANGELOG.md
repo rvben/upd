@@ -5,27 +5,21 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.0](https://github.com/rvben/upd/compare/v0.3.1...v0.4.0) - 2026-08-12
 
+### Added
 
+- **discovery**: find annotated version pins in Makefiles and shell scripts ([549ee2a](https://github.com/rvben/upd/commit/549ee2a54706264ac58bb36d87ad35b9d7577a2e))
+- **updater**: update dependencies declared by comment annotation ([d4736d0](https://github.com/rvben/upd/commit/d4736d044e0157bc137e3afa936a26705334a03b))
+- **updater**: add the annotated registry set and lang carrier ([12cd2f2](https://github.com/rvben/upd/commit/12cd2f29406462c13547a2f6d0f0a6f8fde4cda4))
+- **annotation**: locate, rewrite and classify version tokens ([a4ff1f3](https://github.com/rvben/upd/commit/a4ff1f383eb75127a76489c7723bd6fb6a932a17))
+- **annotation**: parse upd: and renovate: version annotations ([bd973f1](https://github.com/rvben/upd/commit/bd973f1311dbbd5d71f5cb3208f3790f31a00ef3))
+- **lang**: add github-releases and annotated ecosystems ([a0ff07d](https://github.com/rvben/upd/commit/a0ff07dc84f0b95ca374ab38ed74a1d851d4f688))
 
+### Fixed
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
+- **annotated**: preserve files and harden parsing ([993de3a](https://github.com/rvben/upd/commit/993de3a442d5611516a7901da1efff74e4a4c5ed))
+- **interactive**: surface per-file warnings and errors under --interactive ([97373d2](https://github.com/rvben/upd/commit/97373d291626a2c4f103b65697b147485e17fd25))
 
 ## [0.3.1](https://github.com/rvben/upd/compare/v0.3.0...v0.3.1) - 2026-07-22
 
