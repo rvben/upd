@@ -33,6 +33,7 @@ pub use registry::{
 };
 pub use updater::{
     DiscoverOptions, FileType, Lang, UpdateResult, Updater, discover_files, discover_files_with,
+    ecosystem_key,
 };
 
 /// Determine the process exit code given the outcome of a run.

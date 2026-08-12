@@ -24,13 +24,14 @@ pub use pyproject::PyProjectUpdater;
 pub use requirements::RequirementsUpdater;
 pub use terraform::TerraformUpdater;
 
+use crate::annotation::AnnotationSource;
 use crate::config::UpdConfig;
 use crate::cooldown::CooldownPolicy;
 use crate::registry::Registry;
 use anyhow::{Result, anyhow};
 use chrono::{DateTime, Utc};
 use ignore::WalkBuilder;
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
@@ -369,6 +370,9 @@ pub struct UpdateResult {
     /// we kept the current version. Tuple: (name, current_version,
     /// skipped_latest_version, skipped_latest_published_at).
     pub skipped_by_cooldown: Vec<(String, String, String, DateTime<Utc>)>,
+    /// Source of an entry that does not inherit its ecosystem from the file,
+    /// keyed by package name. Populated only by `AnnotatedUpdater`.
+    pub entry_ecosystem: HashMap<String, AnnotationSource>,
 }
 
 impl UpdateResult {
@@ -381,6 +385,7 @@ impl UpdateResult {
         self.pinned.extend(other.pinned);
         self.held_back.extend(other.held_back);
         self.skipped_by_cooldown.extend(other.skipped_by_cooldown);
+        self.entry_ecosystem.extend(other.entry_ecosystem);
     }
 }
 
@@ -480,6 +485,26 @@ impl FileType {
             FileType::TerraformTf => "terraform_tf",
         }
     }
+}
+
+/// Registry name for a file type's ecosystem, in the vocabulary
+/// `CooldownPolicy::effective_for` and the `[cooldown.ecosystem]` config keys
+/// use. `None` means the file has no single ecosystem: its entries carry their
+/// own (see `UpdateResult::entry_ecosystem`).
+pub fn ecosystem_key(file_type: FileType) -> Option<&'static str> {
+    Some(match file_type {
+        FileType::Requirements | FileType::PyProject => "pypi",
+        FileType::PackageJson => "npm",
+        FileType::CargoToml => "crates.io",
+        FileType::GoMod => "go-proxy",
+        FileType::Gemfile => "rubygems",
+        FileType::GithubActions
+        | FileType::PreCommitConfig
+        | FileType::MiseToml
+        | FileType::ToolVersions => "github-releases",
+        FileType::Csproj => "nuget",
+        FileType::TerraformTf => "terraform",
+    })
 }
 
 impl FileType {
@@ -1834,6 +1859,69 @@ mod tests {
                 "discover_files must not descend into .git/, found {path:?}"
             );
         }
+    }
+
+    /// Every `FileType`. The wildcard-free match below is a compile error when a
+    /// variant is added, which is the reminder to extend this list too.
+    const ALL_FILE_TYPES: &[FileType] = &[
+        FileType::Requirements,
+        FileType::PyProject,
+        FileType::PackageJson,
+        FileType::CargoToml,
+        FileType::GoMod,
+        FileType::Gemfile,
+        FileType::Csproj,
+        FileType::GithubActions,
+        FileType::PreCommitConfig,
+        FileType::MiseToml,
+        FileType::ToolVersions,
+        FileType::TerraformTf,
+    ];
+
+    #[test]
+    fn all_file_types_lists_every_variant() {
+        for file_type in ALL_FILE_TYPES {
+            match file_type {
+                FileType::Requirements
+                | FileType::PyProject
+                | FileType::PackageJson
+                | FileType::CargoToml
+                | FileType::GoMod
+                | FileType::Gemfile
+                | FileType::Csproj
+                | FileType::GithubActions
+                | FileType::PreCommitConfig
+                | FileType::MiseToml
+                | FileType::ToolVersions
+                | FileType::TerraformTf => {}
+            }
+        }
+    }
+
+    #[test]
+    fn every_file_type_has_an_ecosystem_key() {
+        for file_type in ALL_FILE_TYPES {
+            assert!(
+                ecosystem_key(*file_type).is_some(),
+                "{file_type:?} must map to a registry name"
+            );
+        }
+    }
+
+    #[test]
+    fn merge_carries_entry_ecosystems() {
+        use crate::annotation::AnnotationSource;
+        let mut a = UpdateResult::default();
+        a.entry_ecosystem
+            .insert("ruff".to_string(), AnnotationSource::PyPi);
+        let mut b = UpdateResult::default();
+        b.entry_ecosystem
+            .insert("serde".to_string(), AnnotationSource::Crates);
+
+        a.merge(b);
+
+        assert_eq!(a.entry_ecosystem.len(), 2);
+        assert_eq!(a.entry_ecosystem["serde"], AnnotationSource::Crates);
     }
 }
 

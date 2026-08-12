@@ -31,7 +31,7 @@ use upd::updater::{
     BumpFilter, CargoTomlUpdater, CsprojUpdater, DiscoverOptions, FileType, GemfileUpdater,
     GithubActionsUpdater, GoModUpdater, Lang, MiseUpdater, PackageJsonUpdater, PreCommitUpdater,
     PyProjectUpdater, RequirementsUpdater, TerraformUpdater, UpdateOptions, UpdateResult, Updater,
-    discover_files_with, read_file_safe, write_file_atomic,
+    discover_files_with, ecosystem_key, read_file_safe, write_file_atomic,
 };
 use upd::version::match_version_precision;
 
@@ -178,23 +178,6 @@ fn format_skipped_by_cooldown_line(
         humanize_age(age),
         humanize_cooldown(cooldown),
     )
-}
-
-/// Map a [`FileType`] to the registry ecosystem name used by cooldown policy keys.
-fn ecosystem_for_file_type(file_type: FileType) -> &'static str {
-    match file_type {
-        FileType::Requirements | FileType::PyProject => "pypi",
-        FileType::PackageJson => "npm",
-        FileType::CargoToml => "crates.io",
-        FileType::GoMod => "go-proxy",
-        FileType::Gemfile => "rubygems",
-        FileType::GithubActions
-        | FileType::PreCommitConfig
-        | FileType::MiseToml
-        | FileType::ToolVersions => "github-releases",
-        FileType::Csproj => "nuget",
-        FileType::TerraformTf => "terraform",
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1475,6 +1458,7 @@ async fn run_update(cli: &Cli) -> Result<()> {
                         package: locked.name.clone(),
                         current: locked.version.clone(),
                         line: None,
+                        source: None,
                     },
                 );
                 continue;
@@ -1609,6 +1593,7 @@ async fn run_update(cli: &Cli) -> Result<()> {
                 method: Some(target.kind.method()),
                 status: Some(outcome.status.as_str()),
                 error: outcome.error.clone(),
+                source: None,
             });
         }
 
@@ -1634,6 +1619,7 @@ async fn run_update(cli: &Cli) -> Result<()> {
                 method: u.method,
                 status: Some("unfixable"),
                 error: Some(u.reason.clone()),
+                source: None,
             });
         }
 
@@ -1905,19 +1891,12 @@ fn emit_update_json(input: UpdateReportInput<'_>, bounded: &BoundedOutputParams<
     let mut files: Vec<_> = scanned
         .iter()
         .map(|sf| {
-            let cooldown_seconds = file_cooldowns
-                .get(&sf.path)
-                .and_then(|p| p.as_ref())
-                .map(|p| {
-                    p.effective_for(ecosystem_for_file_type(sf.file_type))
-                        .num_seconds()
-                })
-                .unwrap_or(0);
+            let cooldown_policy = file_cooldowns.get(&sf.path).and_then(|p| p.as_ref());
             build_update_file_report(
                 &sf.path,
                 sf.file_type,
                 &sf.result,
-                cooldown_seconds,
+                cooldown_policy,
                 |old, new| match classify_update(old, new) {
                     UpdateType::Major => "major",
                     UpdateType::Minor => "minor",
@@ -4346,16 +4325,19 @@ fn print_file_result(
         );
     }
 
-    // Cooldown-related lines share a per-file location and ecosystem-derived
-    // cooldown duration; compute both once.
+    // Cooldown-related lines share a per-file location, but not a cooldown
+    // duration: an annotated file's entries each carry their own ecosystem.
     if !result.held_back.is_empty() || !result.skipped_by_cooldown.is_empty() {
         let file_location = format!("{}:", path);
-        let cooldown = cooldown_policy
-            .map(|p| p.effective_for(ecosystem_for_file_type(file_type)))
-            .unwrap_or_else(Duration::zero);
+        let file_ecosystem = ecosystem_key(file_type);
         let now = Utc::now();
 
         for (package, old, chosen, skipped_latest, skipped_pub_at) in &result.held_back {
+            let cooldown = upd::output::entry_cooldown(
+                cooldown_policy,
+                result.entry_ecosystem.get(package).copied(),
+                file_ecosystem,
+            );
             let line = format_held_back_line(
                 package,
                 old,
@@ -4369,6 +4351,11 @@ fn print_file_result(
         }
 
         for (package, _current, skipped_latest, skipped_pub_at) in &result.skipped_by_cooldown {
+            let cooldown = upd::output::entry_cooldown(
+                cooldown_policy,
+                result.entry_ecosystem.get(package).copied(),
+                file_ecosystem,
+            );
             let line = format_skipped_by_cooldown_line(
                 package,
                 skipped_latest,

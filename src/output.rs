@@ -6,8 +6,11 @@
 //! breaking.
 
 use crate::align::{PackageAlignment, PackageOccurrence};
+use crate::annotation::AnnotationSource;
 use crate::audit::{AuditResult, Vulnerability};
-use crate::updater::{FileType, UpdateResult};
+use crate::cooldown::CooldownPolicy;
+use crate::updater::{FileType, UpdateResult, ecosystem_key};
+use chrono::Duration;
 use serde::Serialize;
 use std::path::Path;
 
@@ -87,6 +90,10 @@ pub struct UpdateEntry {
     /// rolled-back floor. Absent for a plain manifest update.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    /// Annotation source token for an entry whose ecosystem is per-line rather
+    /// than per-file. Absent for every entry in a file `upd` has a parser for.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source: Option<&'static str>,
 }
 
 /// A package update held back by cooldown — the chosen version is older than
@@ -103,6 +110,10 @@ pub struct HeldBackEntry {
     pub skipped_published_at: String,
     /// Cooldown duration that caused the hold-back, in seconds.
     pub cooldown_seconds: i64,
+    /// Annotation source token for an entry whose ecosystem is per-line rather
+    /// than per-file. Absent for every entry in a file `upd` has a parser for.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source: Option<&'static str>,
 }
 
 /// A package skipped by cooldown entirely — every newer version is too new,
@@ -117,6 +128,10 @@ pub struct SkippedByCooldownEntry {
     pub skipped_published_at: String,
     /// Cooldown duration that caused the skip, in seconds.
     pub cooldown_seconds: i64,
+    /// Annotation source token for an entry whose ecosystem is per-line rather
+    /// than per-file. Absent for every entry in a file `upd` has a parser for.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source: Option<&'static str>,
 }
 
 #[derive(Debug, Serialize)]
@@ -126,6 +141,10 @@ pub struct PinnedEntry {
     pub pinned_to: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub line: Option<usize>,
+    /// Annotation source token for an entry whose ecosystem is per-line rather
+    /// than per-file. Absent for every entry in a file `upd` has a parser for.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source: Option<&'static str>,
 }
 
 #[derive(Debug, Serialize)]
@@ -134,6 +153,10 @@ pub struct IgnoredEntry {
     pub current: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub line: Option<usize>,
+    /// Annotation source token for an entry whose ecosystem is per-line rather
+    /// than per-file. Absent for every entry in a file `upd` has a parser for.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source: Option<&'static str>,
 }
 
 #[derive(Debug, Serialize)]
@@ -308,17 +331,43 @@ pub fn build_fix_entries(
     entries
 }
 
+/// Effective cooldown for one reported entry. `entry_source` comes from
+/// `UpdateResult::entry_ecosystem` and contributes its `registry_name()`;
+/// `file_ecosystem` is `ecosystem_key(file_type)`. Zero when neither names an
+/// ecosystem, which is what the per-file computation this replaced produced.
+pub fn entry_cooldown(
+    policy: Option<&CooldownPolicy>,
+    entry_source: Option<AnnotationSource>,
+    file_ecosystem: Option<&'static str>,
+) -> Duration {
+    let Some(policy) = policy else {
+        return Duration::zero();
+    };
+    match entry_source
+        .map(AnnotationSource::registry_name)
+        .or(file_ecosystem)
+    {
+        Some(ecosystem) => policy.effective_for(ecosystem),
+        None => Duration::zero(),
+    }
+}
+
 /// Build an [`UpdateFileReport`] from internal per-file data.
 ///
-/// `cooldown_seconds` is the effective cooldown for this file's ecosystem (0
-/// when cooldown is disabled or unknown).
+/// `cooldown_policy` is the policy in force for this file, or `None` when
+/// cooldown is disabled. Each entry resolves its own cooldown and source
+/// through `entry_cooldown`, so a file whose lines span several ecosystems
+/// reports each one correctly.
 pub fn build_update_file_report(
     path: &Path,
     file_type: FileType,
     result: &UpdateResult,
-    cooldown_seconds: i64,
+    cooldown_policy: Option<&CooldownPolicy>,
     classify: impl Fn(&str, &str) -> &'static str,
 ) -> UpdateFileReport {
+    let file_ecosystem = ecosystem_key(file_type);
+    let source_of = |package: &str| result.entry_ecosystem.get(package).copied();
+
     let updates = result
         .updated
         .iter()
@@ -331,6 +380,7 @@ pub fn build_update_file_report(
             method: None,
             status: None,
             error: None,
+            source: source_of(name).map(AnnotationSource::token),
         })
         .collect();
 
@@ -342,6 +392,7 @@ pub fn build_update_file_report(
             current: old.clone(),
             pinned_to: new.clone(),
             line: *line,
+            source: source_of(name).map(AnnotationSource::token),
         })
         .collect();
 
@@ -352,31 +403,42 @@ pub fn build_update_file_report(
             package: name.clone(),
             current: current.clone(),
             line: *line,
+            source: source_of(name).map(AnnotationSource::token),
         })
         .collect();
 
     let held_back = result
         .held_back
         .iter()
-        .map(|(name, old, chosen, skipped, pub_at)| HeldBackEntry {
-            package: name.clone(),
-            current: old.clone(),
-            chosen: chosen.clone(),
-            skipped_latest: skipped.clone(),
-            skipped_published_at: pub_at.to_rfc3339(),
-            cooldown_seconds,
+        .map(|(name, old, chosen, skipped, pub_at)| {
+            let source = source_of(name);
+            HeldBackEntry {
+                package: name.clone(),
+                current: old.clone(),
+                chosen: chosen.clone(),
+                skipped_latest: skipped.clone(),
+                skipped_published_at: pub_at.to_rfc3339(),
+                cooldown_seconds: entry_cooldown(cooldown_policy, source, file_ecosystem)
+                    .num_seconds(),
+                source: source.map(AnnotationSource::token),
+            }
         })
         .collect();
 
     let skipped_by_cooldown = result
         .skipped_by_cooldown
         .iter()
-        .map(|(name, current, skipped, pub_at)| SkippedByCooldownEntry {
-            package: name.clone(),
-            current: current.clone(),
-            skipped_latest: skipped.clone(),
-            skipped_published_at: pub_at.to_rfc3339(),
-            cooldown_seconds,
+        .map(|(name, current, skipped, pub_at)| {
+            let source = source_of(name);
+            SkippedByCooldownEntry {
+                package: name.clone(),
+                current: current.clone(),
+                skipped_latest: skipped.clone(),
+                skipped_published_at: pub_at.to_rfc3339(),
+                cooldown_seconds: entry_cooldown(cooldown_policy, source, file_ecosystem)
+                    .num_seconds(),
+                source: source.map(AnnotationSource::token),
+            }
         })
         .collect();
 
@@ -766,6 +828,42 @@ mod tests {
         }
     }
 
+    fn policy_of(default_seconds: i64, overrides: &[(&str, i64)]) -> CooldownPolicy {
+        CooldownPolicy {
+            default: Duration::seconds(default_seconds),
+            per_ecosystem: overrides
+                .iter()
+                .map(|(k, v)| ((*k).to_string(), Duration::seconds(*v)))
+                .collect(),
+            force_override: None,
+        }
+    }
+
+    #[test]
+    fn entry_cooldown_prefers_the_entry_source_over_the_file_ecosystem() {
+        let policy = policy_of(0, &[("pypi", 3), ("crates.io", 7)]);
+        assert_eq!(
+            entry_cooldown(Some(&policy), Some(AnnotationSource::Crates), Some("pypi")),
+            Duration::seconds(7)
+        );
+    }
+
+    #[test]
+    fn entry_cooldown_falls_back_to_the_file_ecosystem() {
+        let policy = policy_of(0, &[("pypi", 3)]);
+        assert_eq!(
+            entry_cooldown(Some(&policy), None, Some("pypi")),
+            Duration::seconds(3)
+        );
+    }
+
+    #[test]
+    fn entry_cooldown_is_zero_when_nothing_names_an_ecosystem() {
+        let policy = policy_of(9, &[]);
+        assert_eq!(entry_cooldown(Some(&policy), None, None), Duration::zero());
+        assert_eq!(entry_cooldown(None, None, Some("pypi")), Duration::zero());
+    }
+
     #[test]
     fn update_file_report_serializes_all_sections() {
         let result = UpdateResult {
@@ -783,7 +881,7 @@ mod tests {
             Path::new("package.json"),
             FileType::PackageJson,
             &result,
-            0,
+            None,
             |old, new| {
                 if old == "18.2.0" && new == "19.0.0" {
                     "major"
@@ -828,11 +926,12 @@ mod tests {
             skipped_by_cooldown: vec![("tokio".into(), "1.0.0".into(), "1.0.1".into(), published)],
             ..Default::default()
         };
+        let policy = policy_of(604_800, &[]);
         let report = build_update_file_report(
             Path::new("Cargo.toml"),
             FileType::CargoToml,
             &result,
-            604_800,
+            Some(&policy),
             stub_classify,
         );
         let json = serde_json::to_value(&report).unwrap();
@@ -863,7 +962,7 @@ mod tests {
             Path::new("Cargo.toml"),
             FileType::CargoToml,
             &result,
-            0,
+            None,
             stub_classify,
         );
         let json = serde_json::to_value(&report).unwrap();
@@ -887,13 +986,75 @@ mod tests {
             Path::new("requirements.txt"),
             FileType::Requirements,
             &result,
-            0,
+            None,
             stub_classify,
         );
         let json = serde_json::to_value(&report).unwrap();
         assert!(
             json["updates"][0].get("line").is_none(),
             "line should be omitted when None"
+        );
+    }
+
+    #[test]
+    fn per_entry_sources_reach_the_report_and_their_own_cooldowns() {
+        use chrono::Utc;
+        let mut result = UpdateResult::default();
+        result.updated.push((
+            "ruff".to_string(),
+            "0.1.0".to_string(),
+            "0.2.0".to_string(),
+            Some(3),
+        ));
+        result.held_back.push((
+            "serde".to_string(),
+            "1.0.0".to_string(),
+            "1.0.1".to_string(),
+            "1.0.2".to_string(),
+            Utc::now(),
+        ));
+        result
+            .entry_ecosystem
+            .insert("ruff".to_string(), AnnotationSource::PyPi);
+        result
+            .entry_ecosystem
+            .insert("serde".to_string(), AnnotationSource::Crates);
+
+        let policy = policy_of(0, &[("pypi", 3), ("crates.io", 7)]);
+        let report = build_update_file_report(
+            Path::new("Makefile"),
+            FileType::Requirements,
+            &result,
+            Some(&policy),
+            stub_classify,
+        );
+
+        assert_eq!(report.updates[0].source, Some("pypi"));
+        // `crates`, the annotation token, not `crates.io`, the registry name.
+        assert_eq!(report.held_back[0].source, Some("crates"));
+        assert_eq!(report.held_back[0].cooldown_seconds, 7);
+    }
+
+    #[test]
+    fn a_non_annotated_report_omits_source_entirely() {
+        let mut result = UpdateResult::default();
+        result.updated.push((
+            "ruff".to_string(),
+            "0.1.0".to_string(),
+            "0.2.0".to_string(),
+            Some(3),
+        ));
+        let report = build_update_file_report(
+            Path::new("requirements.txt"),
+            FileType::Requirements,
+            &result,
+            None,
+            stub_classify,
+        );
+        let json = serde_json::to_value(&report).unwrap();
+        assert!(
+            json["updates"][0].get("source").is_none(),
+            "source must not serialize for a non-annotated entry: {json}"
         );
     }
 
