@@ -511,6 +511,7 @@ unixdep = "0.3"
     use crate::lockscan::LockedPackage;
     use crate::lockscan::discover::{LockKind, ScannableLock};
     use crate::updater::FileType;
+    use crate::updater::ParseWarnings;
     use std::path::Path;
 
     fn lp(
@@ -717,7 +718,7 @@ unixdep = "0.3"
             lp("lockonly", "0.40.0", Ecosystem::PyPI, &lock, None),
         ];
         let files = vec![(py.clone(), FileType::PyProject)];
-        let occurrences = scan_packages(&files).unwrap();
+        let occurrences = scan_packages(&files, &[], ParseWarnings::Suppress).unwrap();
         let idx = classify(&locks, &lps, &occurrences);
         let entries = idx
             .map

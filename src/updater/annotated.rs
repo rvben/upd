@@ -2,14 +2,29 @@
 //! annotations. This module owns the registry dispatch and the warning mode;
 //! the grammar and the text surgery live in `crate::annotation`.
 
-use crate::annotation::AnnotationSource;
+use super::{
+    CooldownOutcome, FileType, ParsedDependency, PendingVersion, UpdateOptions, UpdateResult,
+    Updater, apply_cooldown, downgrade_warning, read_file_safe, write_file_atomic,
+};
+use crate::align::compare_versions;
+use crate::annotation::{
+    AnnotationSource, ParseOutcome, distinct_values, is_prerelease_token, is_version_token,
+    parse_line, reapply_v_prefix, rewrite_spans, version_spans,
+};
 use crate::cache::CachedRegistry;
 use crate::registry::{
     CratesIoRegistry, GitHubReleasesRegistry, GoProxyRegistry, MultiPyPiRegistry, NpmRegistry,
     NuGetRegistry, Registry, RubyGemsRegistry,
 };
+use crate::updater::{GoModUpdater, Lang};
+use crate::version::match_version_precision;
 use anyhow::{Result, anyhow};
-use std::collections::HashMap;
+use futures::future::join_all;
+use pep440_rs::Version as Pep440Version;
+use std::cmp::Ordering;
+use std::collections::{HashMap, HashSet};
+use std::ops::Range;
+use std::path::Path;
 use std::sync::Arc;
 
 /// One registry per annotation source.
@@ -102,6 +117,440 @@ impl RegistrySet {
 pub enum ParseWarnings {
     Print,
     Suppress,
+}
+
+/// One annotated line that survived parsing, with everything the update pass
+/// needs so no line is parsed twice.
+struct AnnotatedLine {
+    line_idx: usize,
+    source: AnnotationSource,
+    package: String,
+    /// The single distinct version value found in the code portion.
+    version: String,
+    /// Every candidate span, ascending. A repeated value has several.
+    spans: Vec<Range<usize>>,
+}
+
+/// The result of reading a file: the usable lines, and one refusal message per
+/// line upd understood the intent of but declined to act on.
+struct AnnotatedScan {
+    lines: Vec<AnnotatedLine>,
+    refusals: Vec<String>,
+}
+
+/// Section 2.3's per-line `--lang` rule. An empty selection means everything;
+/// `Lang::Annotated` selects every annotated line whatever its source; and a
+/// source's own lang selects its lines individually.
+fn lang_selected(langs: &[Lang], source: AnnotationSource) -> bool {
+    langs.is_empty() || langs.contains(&Lang::Annotated) || langs.contains(&source.lang())
+}
+
+/// Section 3.4 step 6's write value: match the current token's precision unless
+/// the caller asked for full precision, then restore its `v` prefix.
+fn choose_write_value(current: &str, resolved: &str, full_precision: bool) -> String {
+    let matched = if full_precision {
+        resolved.to_string()
+    } else {
+        match_version_precision(current, resolved)
+    };
+    reapply_v_prefix(current, &matched)
+}
+
+/// Read every annotated line in `content`. Refusals are collected rather than
+/// returned as an error: one bad line must not blind upd to the rest of a file.
+fn scan_annotated(content: &str) -> AnnotatedScan {
+    let mut lines: Vec<AnnotatedLine> = Vec::new();
+    let mut refusals: Vec<String> = Vec::new();
+
+    for (line_idx, raw) in content.lines().enumerate() {
+        let annotation = match parse_line(raw) {
+            ParseOutcome::None => continue,
+            ParseOutcome::Malformed(reason) => {
+                refusals.push(format!("line {}: {}", line_idx + 1, reason));
+                continue;
+            }
+            ParseOutcome::Found(annotation) => annotation,
+        };
+
+        let spans = version_spans(raw, annotation.comment_start);
+        let distinct = distinct_values(raw, &spans);
+        match distinct.len() {
+            0 => {
+                refusals.push(format!(
+                    "line {}: no version token found on annotated line",
+                    line_idx + 1
+                ));
+                continue;
+            }
+            1 => {}
+            _ => {
+                refusals.push(format!(
+                    "line {}: ambiguous version token on annotated line: {}",
+                    line_idx + 1,
+                    distinct.join(", ")
+                ));
+                continue;
+            }
+        }
+
+        lines.push(AnnotatedLine {
+            line_idx,
+            source: annotation.source,
+            version: distinct[0].to_string(),
+            package: annotation.package,
+            spans,
+        });
+    }
+
+    // Section 5.3: one package name under two sources inside one file is a
+    // contradiction upd cannot resolve, so every line involved is dropped and
+    // the file reports exactly one warning naming all of them.
+    let mut conflicts: Vec<(String, Vec<usize>)> = Vec::new();
+    let mut examined: HashSet<&str> = HashSet::new();
+    for line in &lines {
+        if !examined.insert(line.package.as_str()) {
+            continue;
+        }
+        let same: Vec<&AnnotatedLine> = lines
+            .iter()
+            .filter(|other| other.package == line.package)
+            .collect();
+        let sources: HashSet<AnnotationSource> = same.iter().map(|other| other.source).collect();
+        if sources.len() > 1 {
+            conflicts.push((
+                line.package.clone(),
+                same.iter().map(|other| other.line_idx).collect(),
+            ));
+        }
+    }
+    for (package, line_idxs) in &conflicts {
+        let numbers: Vec<String> = line_idxs.iter().map(|idx| (idx + 1).to_string()).collect();
+        refusals.push(format!(
+            "lines {}: conflicting sources for annotated package '{}'",
+            numbers.join(", "),
+            package
+        ));
+    }
+    let conflicted: HashSet<&str> = conflicts.iter().map(|(name, _)| name.as_str()).collect();
+    lines.retain(|line| !conflicted.contains(line.package.as_str()));
+
+    AnnotatedScan { lines, refusals }
+}
+
+/// Updates dependencies whose ecosystem is declared per line rather than by the
+/// file's name.
+pub struct AnnotatedUpdater {
+    registries: RegistrySet,
+    warnings: ParseWarnings,
+}
+
+impl AnnotatedUpdater {
+    /// The updating constructor. Parse refusals travel back through
+    /// `UpdateResult::warnings`, so this variant never prints them itself.
+    pub fn new(registries: RegistrySet) -> Self {
+        Self {
+            registries,
+            warnings: ParseWarnings::Suppress,
+        }
+    }
+
+    /// The scan-only constructor used by `align::get_updater`. It cannot look
+    /// anything up, and `warnings` decides whether its refusals reach stderr.
+    pub fn new_parse_only(warnings: ParseWarnings) -> Self {
+        Self {
+            registries: RegistrySet::parse_only(),
+            warnings,
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl Updater for AnnotatedUpdater {
+    fn handles(&self, file_type: FileType) -> bool {
+        file_type == FileType::Annotated
+    }
+
+    fn parse_dependencies(&self, path: &Path) -> Result<Vec<ParsedDependency>> {
+        let content = read_file_safe(path)?;
+        let scan = scan_annotated(&content);
+        if self.warnings == ParseWarnings::Print {
+            for refusal in &scan.refusals {
+                eprintln!("{}: Warning: {}", path.display(), refusal);
+            }
+        }
+        Ok(scan
+            .lines
+            .into_iter()
+            .map(|line| ParsedDependency {
+                line_number: Some(line.line_idx + 1),
+                // An annotated pin is a single value, never a range.
+                has_upper_bound: false,
+                is_bumpable: !(line.source == AnnotationSource::Go
+                    && GoModUpdater::is_pseudo_version(&line.version)),
+                name: line.package,
+                version: line.version,
+            })
+            .collect())
+    }
+
+    async fn update(
+        &self,
+        path: &Path,
+        _registry: &dyn Registry,
+        options: UpdateOptions,
+    ) -> Result<UpdateResult> {
+        let content = read_file_safe(path)?;
+        let mut result = UpdateResult::default();
+        let scan = scan_annotated(&content);
+
+        // Step 0: parse-time refusals are recorded unconditionally, ahead of
+        // every gate. `--package other` must not hide a malformed annotation.
+        result.warnings.extend(scan.refusals.iter().cloned());
+
+        let lines: Vec<&str> = content.lines().collect();
+        let mut fetch: Vec<&AnnotatedLine> = Vec::new();
+        let mut version_map: HashMap<usize, PendingVersion> = HashMap::new();
+
+        for line in &scan.lines {
+            let line_num = line.line_idx + 1;
+
+            // Every scanned line contributes its source, so the report can
+            // label entries upd declined to change as well as ones it wrote.
+            result
+                .entry_ecosystem
+                .insert(line.package.clone(), line.source);
+
+            // Step 0, continued: a commit-pinned Go version names a commit, not
+            // a release. GoModUpdater refuses it before its own gates too.
+            if line.source == AnnotationSource::Go && GoModUpdater::is_pseudo_version(&line.version)
+            {
+                result.warnings.push(format!(
+                    "line {line_num}: commit-pinned Go version, not updatable"
+                ));
+                continue;
+            }
+
+            // Step 1
+            if options.is_package_filtered_out(&line.package) {
+                result.unchanged += 1;
+                continue;
+            }
+
+            // Step 2
+            if options.should_ignore(&line.package) {
+                result
+                    .ignored
+                    .push((line.package.clone(), line.version.clone(), Some(line_num)));
+                continue;
+            }
+            if !lang_selected(&options.langs, line.source) {
+                result.unchanged += 1;
+                continue;
+            }
+
+            // Step 3: a pin short-circuits the registry entirely.
+            if let Some(pinned) = options.get_pinned_version(&line.package) {
+                version_map.insert(line.line_idx, PendingVersion::Pinned(pinned.to_string()));
+                continue;
+            }
+
+            // Step 3a
+            if line.source.lang() == Lang::Python && line.version.parse::<Pep440Version>().is_err()
+            {
+                result.warnings.push(format!(
+                    "line {line_num}: current version \"{}\" is not a valid PEP 440 version",
+                    line.version
+                ));
+                continue;
+            }
+
+            fetch.push(line);
+        }
+
+        // One lookup per line, all in flight together.
+        let lookups: Vec<_> = fetch
+            .iter()
+            .map(|line| async {
+                let registry = self.registries.for_source(line.source)?;
+                if is_prerelease_token(&line.version, line.source.lang()) {
+                    registry
+                        .get_latest_version_including_prereleases(&line.package)
+                        .await
+                } else {
+                    registry.get_latest_version(&line.package).await
+                }
+            })
+            .collect();
+        for (line, resolved) in fetch.iter().zip(join_all(lookups).await) {
+            version_map.insert(line.line_idx, PendingVersion::Registry(resolved));
+        }
+
+        let mut new_lines: Vec<String> = lines.iter().map(|line| line.to_string()).collect();
+        let mut modified = false;
+
+        for line in &scan.lines {
+            let Some(pending) = version_map.remove(&line.line_idx) else {
+                continue;
+            };
+            let line_num = line.line_idx + 1;
+            let lang = line.source.lang();
+
+            match pending {
+                PendingVersion::Pinned(pinned) => {
+                    let target = choose_write_value(&line.version, &pinned, options.full_precision);
+                    if target == line.version {
+                        result.unchanged += 1;
+                        continue;
+                    }
+                    result.pinned.push((
+                        line.package.clone(),
+                        line.version.clone(),
+                        target.clone(),
+                        Some(line_num),
+                    ));
+                    new_lines[line.line_idx] =
+                        rewrite_spans(lines[line.line_idx], &line.spans, &target);
+                    modified = true;
+                }
+                PendingVersion::Registry(Err(e)) => {
+                    result.errors.push(format!("{}: {}", line.package, e));
+                }
+                PendingVersion::Registry(Ok(resolved)) => {
+                    // Step 4: upd is about to write this value into a line it
+                    // does not otherwise understand, so it must be a version.
+                    if !is_version_token(&resolved) {
+                        result.warnings.push(format!(
+                            "line {line_num}: unusable version from {} for {}: {resolved}",
+                            line.source.token(),
+                            line.package
+                        ));
+                        result.unchanged += 1;
+                        continue;
+                    }
+                    let current_is_prerelease = is_prerelease_token(&line.version, lang);
+                    if current_is_prerelease && !is_prerelease_token(&resolved, lang) {
+                        // No newer prerelease exists. Promoting the user to a
+                        // stable release is not what they asked for, and it is
+                        // silent in RequirementsUpdater too.
+                        result.unchanged += 1;
+                        continue;
+                    }
+
+                    // Step 5. An annotated line carries no constraint, so the
+                    // cooldown selector never has one to respect.
+                    let registry = match self.registries.for_source(line.source) {
+                        Ok(registry) => registry,
+                        Err(e) => {
+                            result.errors.push(format!("{}: {}", line.package, e));
+                            continue;
+                        }
+                    };
+                    let (outcome, note) = apply_cooldown(
+                        registry,
+                        &line.package,
+                        &line.version,
+                        &resolved,
+                        None,
+                        current_is_prerelease,
+                        &options,
+                    )
+                    .await;
+                    if let Some(msg) = note {
+                        options.note_cooldown_unavailable(&msg);
+                    }
+                    let (resolved, held_back_record) = match outcome {
+                        CooldownOutcome::Unchanged(version) => (version, None),
+                        CooldownOutcome::HeldBack {
+                            chosen,
+                            skipped_version,
+                            skipped_published_at,
+                        } => (chosen, Some((skipped_version, skipped_published_at))),
+                        CooldownOutcome::Skipped {
+                            skipped_version,
+                            skipped_published_at,
+                        } => {
+                            result.skipped_by_cooldown.push((
+                                line.package.clone(),
+                                line.version.clone(),
+                                skipped_version,
+                                skipped_published_at,
+                            ));
+                            continue;
+                        }
+                    };
+
+                    // Step 6
+                    let target =
+                        choose_write_value(&line.version, &resolved, options.full_precision);
+                    if target == line.version {
+                        result.unchanged += 1;
+                        continue;
+                    }
+
+                    // Step 7. `compare_versions` strips a leading `v` from both
+                    // operands itself (see `align::compare_semver`), so the raw
+                    // tokens are passed straight through.
+                    if compare_versions(&target, &line.version, lang) != Ordering::Greater {
+                        result.warnings.push(downgrade_warning(
+                            &line.package,
+                            &target,
+                            &line.version,
+                        ));
+                        result.unchanged += 1;
+                        continue;
+                    }
+                    if !options.allows_bump(&line.version, &target) {
+                        result.unchanged += 1;
+                        continue;
+                    }
+
+                    result.updated.push((
+                        line.package.clone(),
+                        line.version.clone(),
+                        target.clone(),
+                        Some(line_num),
+                    ));
+                    if let Some((skipped_version, skipped_published_at)) = held_back_record {
+                        result.held_back.push((
+                            line.package.clone(),
+                            line.version.clone(),
+                            target.clone(),
+                            skipped_version,
+                            skipped_published_at,
+                        ));
+                    }
+                    new_lines[line.line_idx] =
+                        rewrite_spans(lines[line.line_idx], &line.spans, &target);
+                    modified = true;
+                }
+            }
+        }
+
+        if modified && !options.dry_run {
+            let line_ending = if content.contains("\r\n") {
+                "\r\n"
+            } else {
+                "\n"
+            };
+            let mut new_content = new_lines.join(line_ending);
+            if content.ends_with('\n') {
+                new_content.push_str(line_ending);
+            }
+            // Section 5.7: a write failure must not discard what this run
+            // already learned. Append the error, keep the warnings, and return
+            // Ok so the file's diagnostics still reach the report.
+            if let Err(e) = write_file_atomic(path, &new_content) {
+                result.errors.push(e.to_string());
+                return Ok(UpdateResult {
+                    errors: result.errors,
+                    warnings: result.warnings,
+                    ..Default::default()
+                });
+            }
+        }
+
+        Ok(result)
+    }
 }
 
 #[cfg(test)]
@@ -265,5 +714,450 @@ mod tests {
     fn a_resolving_set_holds_exactly_the_seven_v1_sources() {
         let set = real_resolving_set();
         assert_eq!(set.entries.len(), 7);
+    }
+
+    use std::io::Write;
+
+    fn write_temp(content: &str) -> tempfile::NamedTempFile {
+        let mut file = tempfile::NamedTempFile::new().expect("temp file");
+        file.write_all(content.as_bytes()).expect("write");
+        file.flush().expect("flush");
+        file
+    }
+
+    fn deps_of(content: &str) -> Vec<crate::updater::ParsedDependency> {
+        let file = write_temp(content);
+        AnnotatedUpdater::new_parse_only(ParseWarnings::Suppress)
+            .parse_dependencies(file.path())
+            .expect("parse")
+    }
+
+    #[test]
+    fn scans_one_annotated_line_and_ignores_everything_else() {
+        let scan = scan_annotated(
+            "# a comment\nBAO_VERSION ?= 2.6.1  # upd: pypi openbao-cli\nPLAIN = 1.0.0\n",
+        );
+        assert!(scan.refusals.is_empty(), "{:?}", scan.refusals);
+        assert_eq!(scan.lines.len(), 1);
+        assert_eq!(scan.lines[0].line_idx, 1);
+        assert_eq!(scan.lines[0].package, "openbao-cli");
+        assert_eq!(scan.lines[0].source, AnnotationSource::PyPi);
+        assert_eq!(scan.lines[0].version, "2.6.1");
+    }
+
+    #[test]
+    fn a_line_with_no_version_is_refused_by_line_number() {
+        let scan = scan_annotated("TOOL ?= latest  # upd: pypi ruff\n");
+        assert!(scan.lines.is_empty());
+        assert_eq!(
+            scan.refusals,
+            vec!["line 1: no version token found on annotated line".to_string()]
+        );
+    }
+
+    #[test]
+    fn a_line_with_two_distinct_versions_is_refused_with_both_values() {
+        // `:` is not a version-field byte, so the code portion splits into
+        // fields that yield two different version values.
+        let scan = scan_annotated("IMG ?= app:1.2.3 helper:2.0.0  # upd: pypi x\n");
+        assert!(scan.lines.is_empty());
+        assert_eq!(
+            scan.refusals,
+            vec!["line 1: ambiguous version token on annotated line: 1.2.3, 2.0.0".to_string()]
+        );
+    }
+
+    #[test]
+    fn one_version_repeated_on_a_line_is_not_ambiguous() {
+        // `-` is a field byte (Section 3.2), so a hyphen-joined identifier like
+        // `app-1.2.3` is not a candidate; delimit each occurrence with `/`
+        // instead, mirroring the spec's own `FOO := 1.2.3` plus
+        // `FOO_URL := .../1.2.3/...` example.
+        let scan = scan_annotated("VERSION := 1.2.3 URL := .../1.2.3/tarball  # upd: pypi app\n");
+        assert!(scan.refusals.is_empty(), "{:?}", scan.refusals);
+        assert_eq!(scan.lines.len(), 1);
+        assert_eq!(scan.lines[0].spans.len(), 2);
+        assert_eq!(scan.lines[0].version, "1.2.3");
+    }
+
+    #[test]
+    fn conflicting_sources_drop_both_lines_with_one_warning() {
+        let scan = scan_annotated(
+            "A ?= 1.0.0  # upd: pypi widget\nB ?= 2.0.0  # upd: npm widget\nC ?= 3.0.0  # upd: pypi other\n",
+        );
+        assert_eq!(
+            scan.refusals,
+            vec!["lines 1, 2: conflicting sources for annotated package 'widget'".to_string()]
+        );
+        let names: Vec<&str> = scan.lines.iter().map(|l| l.package.as_str()).collect();
+        assert_eq!(names, vec!["other"]);
+    }
+
+    #[test]
+    fn two_lines_under_one_source_are_not_a_conflict() {
+        let scan =
+            scan_annotated("A ?= 1.0.0  # upd: pypi widget\nB ?= 1.0.0  # upd: pypi widget\n");
+        assert!(scan.refusals.is_empty(), "{:?}", scan.refusals);
+        assert_eq!(scan.lines.len(), 2);
+    }
+
+    #[test]
+    fn parse_dependencies_reports_a_go_pseudo_version_as_unbumpable() {
+        let deps = deps_of(
+            "X ?= v0.0.0-20200115085410-6d4e4cb37c7d  # upd: go golang.org/x/net\nY ?= v1.2.3  # upd: go golang.org/x/text\n",
+        );
+        assert_eq!(deps.len(), 2);
+        assert_eq!(deps[0].name, "golang.org/x/net");
+        assert!(!deps[0].is_bumpable);
+        assert_eq!(deps[0].line_number, Some(1));
+        assert!(deps[1].is_bumpable);
+        // An annotated pin carries no constraint, so there is never a ceiling.
+        assert!(!deps[0].has_upper_bound);
+        assert!(!deps[1].has_upper_bound);
+    }
+
+    #[test]
+    fn parse_dependencies_keeps_the_package_name_byte_for_byte() {
+        let deps = deps_of("PKG ?= 1.0.0  # upd: nuget Azure.Core\n");
+        assert_eq!(deps[0].name, "Azure.Core");
+    }
+
+    use crate::registry::MockRegistry;
+
+    fn set_with(source: AnnotationSource, registry: MockRegistry) -> RegistrySet {
+        RegistrySet {
+            entries: HashMap::from([(source, Arc::new(registry) as Arc<dyn Registry>)]),
+        }
+    }
+
+    /// `AnnotatedUpdater` ignores the registry the trait hands it, so every test
+    /// needs some `&dyn Registry` to pass and none of them care which.
+    fn unused_registry() -> MockRegistry {
+        MockRegistry::new("unused")
+    }
+
+    async fn run(
+        content: &str,
+        set: RegistrySet,
+        options: UpdateOptions,
+    ) -> (UpdateResult, String) {
+        let file = write_temp(content);
+        let updater = AnnotatedUpdater::new(set);
+        let result = updater
+            .update(file.path(), &unused_registry(), options)
+            .await
+            .expect("update");
+        let written = std::fs::read_to_string(file.path()).expect("read back");
+        (result, written)
+    }
+
+    #[tokio::test]
+    async fn writes_the_resolved_version_in_place() {
+        let set = set_with(
+            AnnotationSource::PyPi,
+            MockRegistry::new("pypi").with_version("openbao-cli", "2.7.0"),
+        );
+        let (result, written) = run(
+            "BAO_VERSION ?= 2.6.1  # upd: pypi openbao-cli\n",
+            set,
+            UpdateOptions::new(false, false),
+        )
+        .await;
+
+        assert_eq!(
+            result.updated,
+            vec![(
+                "openbao-cli".to_string(),
+                "2.6.1".to_string(),
+                "2.7.0".to_string(),
+                Some(1)
+            )]
+        );
+        assert_eq!(written, "BAO_VERSION ?= 2.7.0  # upd: pypi openbao-cli\n");
+        assert_eq!(
+            result.entry_ecosystem.get("openbao-cli"),
+            Some(&AnnotationSource::PyPi)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_dry_run_reports_the_change_and_writes_nothing() {
+        let set = set_with(
+            AnnotationSource::PyPi,
+            MockRegistry::new("pypi").with_version("ruff", "0.9.0"),
+        );
+        let original = "RUFF ?= 0.8.0  # upd: pypi ruff\n";
+        let (result, written) = run(original, set, UpdateOptions::new(true, false)).await;
+
+        assert_eq!(result.updated.len(), 1);
+        assert_eq!(written, original);
+    }
+
+    #[tokio::test]
+    async fn the_v_prefix_and_the_precision_of_the_line_are_preserved() {
+        let set = set_with(
+            AnnotationSource::GitHubReleases,
+            MockRegistry::new("github-releases").with_version("cli/cli", "2.65.4"),
+        );
+        let (_, written) = run(
+            "GH ?= v2.60  # upd: github-releases cli/cli\n",
+            set,
+            UpdateOptions::new(false, false),
+        )
+        .await;
+        assert_eq!(written, "GH ?= v2.65  # upd: github-releases cli/cli\n");
+    }
+
+    #[tokio::test]
+    async fn every_occurrence_of_the_version_on_the_line_is_rewritten() {
+        // Same fixture shape as `one_version_repeated_on_a_line_is_not_ambiguous`:
+        // `-` is a field byte, so the two occurrences are delimited with `/`
+        // rather than joined onto an identifier with `-`.
+        let set = set_with(
+            AnnotationSource::PyPi,
+            MockRegistry::new("pypi").with_version("app", "2.0.0"),
+        );
+        let (_, written) = run(
+            "VERSION := 1.2.3 URL := .../1.2.3/tarball  # upd: pypi app\n",
+            set,
+            UpdateOptions::new(false, false),
+        )
+        .await;
+        assert_eq!(
+            written,
+            "VERSION := 2.0.0 URL := .../2.0.0/tarball  # upd: pypi app\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unusable_registry_answer_is_refused_and_counted_unchanged() {
+        let set = set_with(
+            AnnotationSource::PyPi,
+            MockRegistry::new("pypi").with_version("thing", "latest"),
+        );
+        let original = "THING ?= 1.0.0  # upd: pypi thing\n";
+        let (result, written) = run(original, set, UpdateOptions::new(false, false)).await;
+
+        assert_eq!(
+            result.warnings,
+            vec!["line 1: unusable version from pypi for thing: latest".to_string()]
+        );
+        assert_eq!(result.unchanged, 1);
+        assert!(result.updated.is_empty());
+        assert_eq!(written, original);
+    }
+
+    #[tokio::test]
+    async fn a_downgrade_is_refused_with_a_warning() {
+        let set = set_with(
+            AnnotationSource::PyPi,
+            MockRegistry::new("pypi").with_version("thing", "0.9.0"),
+        );
+        let original = "THING ?= 1.0.0  # upd: pypi thing\n";
+        let (result, written) = run(original, set, UpdateOptions::new(false, false)).await;
+
+        assert_eq!(result.warnings.len(), 1);
+        assert!(
+            result.warnings[0].contains("0.9.0"),
+            "{:?}",
+            result.warnings
+        );
+        assert_eq!(result.unchanged, 1);
+        assert_eq!(written, original);
+    }
+
+    #[tokio::test]
+    async fn a_v_prefixed_upgrade_across_a_digit_width_change_is_not_a_downgrade() {
+        // A lexical compare ranks "v10.0.0" below "v9.0.0" (`1` < `9`). The
+        // downgrade check goes through `compare_versions`, which strips a
+        // leading `v` before comparing, so this line must land as an upgrade.
+        let set = set_with(
+            AnnotationSource::Crates,
+            MockRegistry::new("crates.io").with_version("thing", "10.0.0"),
+        );
+        let original = "THING ?= v9.0.0  # upd: crates thing\n";
+        let (result, written) = run(original, set, UpdateOptions::new(false, false)).await;
+
+        assert!(result.warnings.is_empty(), "{:?}", result.warnings);
+        assert_eq!(
+            result.updated,
+            vec![(
+                "thing".to_string(),
+                "v9.0.0".to_string(),
+                "v10.0.0".to_string(),
+                Some(1)
+            )]
+        );
+        assert_eq!(written, "THING ?= v10.0.0  # upd: crates thing\n");
+    }
+
+    #[tokio::test]
+    async fn a_stable_answer_to_a_prerelease_question_is_silent() {
+        let set = set_with(
+            AnnotationSource::Npm,
+            MockRegistry::new("npm").with_prerelease("thing", "2.0.0", "2.0.0"),
+        );
+        let original = "THING ?= 2.0.0-rc.1  # upd: npm thing\n";
+        let (result, written) = run(original, set, UpdateOptions::new(false, false)).await;
+
+        assert!(result.warnings.is_empty(), "{:?}", result.warnings);
+        assert!(result.updated.is_empty());
+        assert_eq!(result.unchanged, 1);
+        assert_eq!(written, original);
+    }
+
+    #[tokio::test]
+    async fn a_registry_error_lands_in_errors_and_leaves_the_line_alone() {
+        let set = set_with(AnnotationSource::PyPi, MockRegistry::new("pypi"));
+        let original = "THING ?= 1.0.0  # upd: pypi thing\n";
+        let (result, written) = run(original, set, UpdateOptions::new(false, false)).await;
+
+        assert_eq!(result.errors.len(), 1);
+        assert!(
+            result.errors[0].starts_with("thing: "),
+            "{:?}",
+            result.errors
+        );
+        assert_eq!(written, original);
+    }
+
+    #[tokio::test]
+    async fn a_missing_registry_for_a_source_is_an_error_not_a_panic() {
+        // A parse-only set answers for nothing, which is the shape a wiring bug
+        // would produce in the real binary.
+        let original = "THING ?= 1.0.0  # upd: pypi thing\n";
+        let (result, written) = run(
+            original,
+            RegistrySet::parse_only(),
+            UpdateOptions::new(false, false),
+        )
+        .await;
+
+        assert_eq!(result.errors.len(), 1);
+        assert!(
+            result.errors[0].contains("parsing only"),
+            "{:?}",
+            result.errors
+        );
+        assert_eq!(written, original);
+    }
+
+    #[tokio::test]
+    async fn a_commit_pinned_go_line_is_refused_even_under_a_package_filter() {
+        // Step 0 runs before --package, so naming another package does not
+        // silence this refusal. GoModUpdater behaves the same way.
+        let set = set_with(
+            AnnotationSource::Go,
+            MockRegistry::new("go-proxy").with_version("golang.org/x/net", "v0.30.0"),
+        );
+        let original = "NET ?= v0.0.0-20200115085410-6d4e4cb37c7d  # upd: go golang.org/x/net\n";
+        let options = UpdateOptions::new(false, false).with_packages(vec!["other".to_string()]);
+        let (result, written) = run(original, set, options).await;
+
+        assert_eq!(
+            result.warnings,
+            vec!["line 1: commit-pinned Go version, not updatable".to_string()]
+        );
+        assert_eq!(written, original);
+    }
+
+    #[tokio::test]
+    async fn a_malformed_annotation_is_reported_even_under_a_package_filter() {
+        let original = "THING ?= 1.0.0  # upd: pypi\n";
+        let options = UpdateOptions::new(false, false).with_packages(vec!["other".to_string()]);
+        let (result, written) = run(original, RegistrySet::parse_only(), options).await;
+
+        assert_eq!(result.warnings.len(), 1);
+        assert!(
+            result.warnings[0].starts_with("line 1: malformed annotation:"),
+            "{:?}",
+            result.warnings
+        );
+        assert_eq!(written, original);
+    }
+
+    #[tokio::test]
+    async fn an_unparseable_python_token_is_refused() {
+        let set = set_with(
+            AnnotationSource::PyPi,
+            MockRegistry::new("pypi").with_version("thing", "2.7.0"),
+        );
+        // `1.0++` matches the Section 3.2 grammar, so the scanner accepts it as
+        // this line's version, but PEP 440 rejects an empty local segment.
+        // A token that failed the grammar would be refused earlier, by the
+        // scanner, and would never reach step 3a.
+        let original = "THING ?= 1.0++  # upd: pypi thing\n";
+        let (result, written) = run(original, set, UpdateOptions::new(false, false)).await;
+        assert_eq!(
+            result.warnings,
+            vec!["line 1: current version \"1.0++\" is not a valid PEP 440 version".to_string()]
+        );
+        assert_eq!(written, original);
+    }
+
+    fn set_of(entries: Vec<(AnnotationSource, MockRegistry)>) -> RegistrySet {
+        RegistrySet {
+            entries: entries
+                .into_iter()
+                .map(|(source, registry)| (source, Arc::new(registry) as Arc<dyn Registry>))
+                .collect(),
+        }
+    }
+
+    /// Two sources, two registries, one file. Section 6's mixed-source fixture.
+    fn mixed_source_set() -> RegistrySet {
+        set_of(vec![
+            (
+                AnnotationSource::PyPi,
+                MockRegistry::new("pypi").with_version("ruff", "0.9.0"),
+            ),
+            (
+                AnnotationSource::GitHubReleases,
+                MockRegistry::new("github-releases").with_version("oven-sh/bun", "v1.2.5"),
+            ),
+        ])
+    }
+
+    const MIXED_SOURCE_FILE: &str = "RUFF ?= 0.8.0  # upd: pypi ruff\n\
+                                     BUN ?= v1.1.0  # upd: github-releases oven-sh/bun\n";
+
+    #[tokio::test]
+    async fn two_sources_in_one_file_each_resolve_against_their_own_registry() {
+        let (result, written) = run(
+            MIXED_SOURCE_FILE,
+            mixed_source_set(),
+            UpdateOptions::new(false, false),
+        )
+        .await;
+
+        assert_eq!(result.updated.len(), 2, "{result:?}");
+        assert_eq!(
+            written,
+            "RUFF ?= 0.9.0  # upd: pypi ruff\n\
+             BUN ?= v1.2.5  # upd: github-releases oven-sh/bun\n",
+            "each line takes its own source's answer, not the other's"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_lang_selection_that_excludes_the_source_leaves_the_line_alone() {
+        let options = UpdateOptions::new(false, false).with_langs(vec![Lang::Node]);
+        let (result, written) = run(MIXED_SOURCE_FILE, mixed_source_set(), options).await;
+
+        assert!(result.updated.is_empty(), "{result:?}");
+        assert_eq!(result.unchanged, 2);
+        assert_eq!(written, MIXED_SOURCE_FILE);
+    }
+
+    #[tokio::test]
+    async fn selecting_the_annotated_lang_selects_every_source() {
+        let options = UpdateOptions::new(false, false).with_langs(vec![Lang::Annotated]);
+        let (result, _) = run(MIXED_SOURCE_FILE, mixed_source_set(), options).await;
+        assert_eq!(
+            result.updated.len(),
+            2,
+            "`Lang::Annotated` selects every source, not only the one whose own \
+             lang happens to be selected too: {result:?}"
+        );
     }
 }

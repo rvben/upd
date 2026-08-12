@@ -9,6 +9,7 @@ use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use upd::align::{PackageAlignment, PackageOccurrence, find_alignments, scan_packages};
+use upd::annotation::{self, AnnotationSource};
 use upd::audit::cache::AuditCache;
 use upd::audit::{
     AuditResult, Ecosystem, OsvClient, Package as AuditPackage, PackageAuditResult, Vulnerability,
@@ -28,10 +29,11 @@ use upd::registry::{
     NuGetRegistry, PyPiRegistry, RubyGemsRegistry, TerraformRegistry,
 };
 use upd::updater::{
-    BumpFilter, CargoTomlUpdater, CsprojUpdater, DiscoverOptions, FileType, GemfileUpdater,
-    GithubActionsUpdater, GoModUpdater, Lang, MiseUpdater, PackageJsonUpdater, PreCommitUpdater,
-    PyProjectUpdater, RequirementsUpdater, TerraformUpdater, UpdateOptions, UpdateResult, Updater,
-    discover_files_with, ecosystem_key, read_file_safe, write_file_atomic,
+    AnnotatedUpdater, BumpFilter, CargoTomlUpdater, CsprojUpdater, DiscoverOptions, FileType,
+    GemfileUpdater, GithubActionsUpdater, GoModUpdater, Lang, MiseUpdater, PackageJsonUpdater,
+    ParseWarnings, PreCommitUpdater, PyProjectUpdater, RegistrySet, RequirementsUpdater,
+    TerraformUpdater, UpdateOptions, UpdateResult, Updater, discover_files_with, ecosystem_key,
+    read_file_safe, write_file_atomic,
 };
 use upd::version::match_version_precision;
 
@@ -1141,6 +1143,18 @@ async fn run_update(cli: &Cli) -> Result<()> {
     let nuget = Arc::new(nuget);
     let github_releases = Arc::new(github_releases);
 
+    // Built last: it holds the cached registries, so it cannot exist before
+    // them. Terraform is absent because no v1 annotation source names it.
+    let annotated_updater = Arc::new(AnnotatedUpdater::new(RegistrySet::resolving(
+        &pypi,
+        &npm,
+        &crates_io,
+        &go_proxy,
+        &rubygems,
+        &nuget,
+        &github_releases,
+    )));
+
     // Interactive mode: first discover updates, then prompt, then apply approved ones
     if cli.interactive {
         return run_interactive_update(
@@ -1168,6 +1182,7 @@ async fn run_update(cli: &Cli) -> Result<()> {
             &mise_updater,
             &terraform_updater,
             &csproj_updater,
+            &annotated_updater,
             &cache,
             cache_enabled,
             &file_cooldowns,
@@ -1235,6 +1250,7 @@ async fn run_update(cli: &Cli) -> Result<()> {
             let mise_updater = Arc::clone(&mise_updater);
             let csproj_updater = Arc::clone(&csproj_updater);
             let terraform_updater = Arc::clone(&terraform_updater);
+            let annotated_updater = Arc::clone(&annotated_updater);
 
             async move {
                 let result = match file_type {
@@ -1293,6 +1309,11 @@ async fn run_update(cli: &Cli) -> Result<()> {
                             .update(&path, terraform.as_ref(), update_options.clone())
                             .await
                     }
+                    FileType::Annotated => {
+                        annotated_updater
+                            .update(&path, pypi.as_ref(), update_options.clone())
+                            .await
+                    }
                 };
                 (path, file_type, result.map_err(|e| e.to_string()))
             }
@@ -1314,7 +1335,10 @@ async fn run_update(cli: &Cli) -> Result<()> {
 
         match result {
             Ok(file_result) => {
-                if !dry_run && file_has_manifest_changes(&file_result) {
+                if !dry_run
+                    && file_type != FileType::Annotated
+                    && file_has_manifest_changes(&file_result)
+                {
                     updated_files.push(path.clone());
                 }
                 if text_mode && !cli.quiet {
@@ -1375,13 +1399,14 @@ async fn run_update(cli: &Cli) -> Result<()> {
             }
         }
 
-        let manifest_packages = match scan_packages(&discovered_files) {
-            Ok(p) => p,
-            Err(e) => {
-                eprintln!("{}", format!("Error scanning files: {}", e).red());
-                return Err(e);
-            }
-        };
+        let manifest_packages =
+            match scan_packages(&discovered_files, &cli.langs, ParseWarnings::Suppress) {
+                Ok(p) => p,
+                Err(e) => {
+                    eprintln!("{}", format!("Error scanning files: {}", e).red());
+                    return Err(e);
+                }
+            };
 
         let lock_kind_by_path: HashMap<PathBuf, lockscan::discover::LockKind> = lock_scan
             .locks
@@ -1654,6 +1679,9 @@ async fn run_update(cli: &Cli) -> Result<()> {
         // otherwise pin-only changes would silently degrade to a broad refresh.
         let mut changed_by_dir: HashMap<PathBuf, Vec<String>> = HashMap::new();
         for scanned_file in &scanned {
+            if scanned_file.file_type == FileType::Annotated {
+                continue;
+            }
             if scanned_file.result.updated.is_empty() && scanned_file.result.pinned.is_empty() {
                 continue;
             }
@@ -2004,6 +2032,7 @@ async fn run_interactive_update(
     mise_updater: &Arc<MiseUpdater>,
     terraform_updater: &Arc<TerraformUpdater>,
     csproj_updater: &Arc<CsprojUpdater>,
+    annotated_updater: &Arc<AnnotatedUpdater>,
     cache: &Arc<std::sync::Mutex<Cache>>,
     cache_enabled: bool,
     file_cooldowns: &HashMap<PathBuf, Option<CooldownPolicy>>,
@@ -2032,7 +2061,7 @@ async fn run_interactive_update(
     // scan is best-effort: unlike the non-interactive floor branch, a
     // failure here must not abort the interactive session.
     if !cli.packages.is_empty()
-        && let Ok(manifest_packages) = scan_packages(files)
+        && let Ok(manifest_packages) = scan_packages(files, &cli.langs, ParseWarnings::Suppress)
     {
         let lock_scan = lockscan::scan_locks(files, paths);
         for name in &cli.packages {
@@ -2117,6 +2146,11 @@ async fn run_interactive_update(
             FileType::TerraformTf => {
                 terraform_updater
                     .update(path, terraform.as_ref(), dry_run_options.clone())
+                    .await
+            }
+            FileType::Annotated => {
+                annotated_updater
+                    .update(path, pypi.as_ref(), dry_run_options.clone())
                     .await
             }
         };
@@ -2230,6 +2264,11 @@ async fn run_interactive_update(
                 old_version: change.old_version.as_str(),
                 new_version: change.new_version.as_str(),
                 line_num: change.line_num,
+                expected_source: scanned_file
+                    .result
+                    .entry_ecosystem
+                    .get(&change.package)
+                    .copied(),
             })
             .collect();
         let rewritten = apply_version_updates(
@@ -2245,7 +2284,9 @@ async fn run_interactive_update(
         }
 
         write_file_atomic(&scanned_file.path, &rewritten.content)?;
-        updated_files.push(scanned_file.path.clone());
+        if scanned_file.file_type != FileType::Annotated {
+            updated_files.push(scanned_file.path.clone());
+        }
 
         let file_str = scanned_file.path.display().to_string();
         for change in selected_changes {
@@ -2259,7 +2300,9 @@ async fn run_interactive_update(
             // updates and config pins both modify the manifest, so both must
             // contribute — otherwise a pin-only run would silently emit a
             // broad refresh (e.g. `cargo update --workspace`).
-            if let Some(dir) = scanned_file.path.parent() {
+            if scanned_file.file_type != FileType::Annotated
+                && let Some(dir) = scanned_file.path.parent()
+            {
                 let entry = changed_by_dir.entry(dir.to_path_buf()).or_default();
                 if !entry.iter().any(|n| n == &change.package) {
                     entry.push(change.package.clone());
@@ -2456,7 +2499,7 @@ async fn run_align(cli: &Cli) -> Result<()> {
     }
 
     // Scan all files for packages
-    let packages = match scan_packages(&files) {
+    let packages = match scan_packages(&files, &cli.langs, ParseWarnings::Print) {
         Ok(p) => p,
         Err(e) => {
             eprintln!("{}", format!("Error scanning files: {}", e).red());
@@ -2771,7 +2814,7 @@ async fn run_audit(cli: &Cli) -> Result<()> {
     }
 
     // Scan all files for packages
-    let packages = match scan_packages(&files) {
+    let packages = match scan_packages(&files, &cli.langs, ParseWarnings::Print) {
         Ok(p) => p,
         Err(e) => {
             eprintln!("{}", format!("Error scanning files: {}", e).red());
@@ -2975,6 +3018,7 @@ async fn run_audit(cli: &Cli) -> Result<()> {
                             old_version: t.from_version.as_str(),
                             new_version: t.to_version.as_str(),
                             line_num: t.line_number,
+                            expected_source: None,
                         })
                         .collect();
                     let applied =
@@ -3480,6 +3524,7 @@ fn apply_alignments(alignments: &[&PackageAlignment], full_precision: bool) -> R
                     old_version: &occurrence.version,
                     new_version: &alignment.highest_version,
                     line_num: occurrence.line_number,
+                    expected_source: None,
                 });
         }
     }
@@ -3506,6 +3551,10 @@ struct VersionEdit<'a> {
     old_version: &'a str,
     new_version: &'a str,
     line_num: Option<usize>,
+    /// The source the interactive scan recorded for this package, when the file
+    /// was an annotated one. `None` means the edit did not come from an
+    /// annotation, and `apply_annotated_version` skips its source check.
+    expected_source: Option<AnnotationSource>,
 }
 
 #[derive(Debug)]
@@ -3607,6 +3656,7 @@ fn apply_version_updates(
             FileType::TerraformTf => {
                 apply_terraform_version(&mut document, update, &target_version)
             }
+            FileType::Annotated => apply_annotated_version(&mut document, update, &target_version),
         };
     }
 
@@ -4179,6 +4229,46 @@ fn apply_terraform_version(
     apply_line_replacement(document, update.line_num, |line| {
         replace_first_match(line, &re, &replacement)
     })
+}
+
+/// Re-derive an annotated line's meaning from the file on disk before writing
+/// it. The interactive path scans, prompts, and only then writes, so the line
+/// can have changed in between; every check here answers "is this still the
+/// line the user approved?". Returning `false` makes the caller bail.
+fn apply_annotated_version(
+    document: &mut TextDocument,
+    update: &VersionEdit<'_>,
+    target_version: &str,
+) -> bool {
+    let Some(idx) = line_index(update.line_num) else {
+        return false;
+    };
+    let Some(line) = document.lines.get(idx).cloned() else {
+        return false;
+    };
+    let annotation::ParseOutcome::Found(annotation) = annotation::parse_line(&line) else {
+        return false;
+    };
+    // Byte for byte: the annotation names the registry's own spelling, and upd
+    // must not normalise a name a user wrote deliberately.
+    if annotation.package != update.package {
+        return false;
+    }
+    if let Some(expected) = update.expected_source
+        && annotation.source != expected
+    {
+        return false;
+    }
+
+    let spans = annotation::version_spans(&line, annotation.comment_start);
+    let distinct = annotation::distinct_values(&line, &spans);
+    if distinct.len() != 1 || distinct[0] != update.old_version {
+        return false;
+    }
+
+    let target = annotation::reapply_v_prefix(update.old_version, target_version);
+    document.lines[idx] = annotation::rewrite_spans(&line, &spans, &target);
+    true
 }
 
 /// Filter configuration for update types
@@ -5171,6 +5261,7 @@ mod tests {
             old_version: "3.2",
             new_version: "3.10.0",
             line_num: Some(2),
+            expected_source: None,
         }];
 
         let applied = apply_version_updates(content, &updates, FileType::PyProject, false).unwrap();
@@ -5190,6 +5281,7 @@ mod tests {
             old_version: "3.2",
             new_version: "3.10.0",
             line_num: Some(1),
+            expected_source: None,
         }];
 
         let applied = apply_version_updates(content, &updates, FileType::PyProject, false).unwrap();
@@ -5218,6 +5310,7 @@ dev = [
             old_version: "3.2",
             new_version: "3.10.0",
             line_num: Some(1),
+            expected_source: None,
         }];
 
         let error =
@@ -5244,6 +5337,7 @@ dev = [
             old_version: "1.0.0",
             new_version: "2.0.0",
             line_num: Some(6),
+            expected_source: None,
         }];
 
         let applied = apply_version_updates(content, &updates, FileType::Csproj, false).unwrap();
@@ -5275,6 +5369,7 @@ version = "1.0.0"
             old_version: "1.0.0",
             new_version: "1.2.3",
             line_num: Some(5),
+            expected_source: None,
         }];
 
         let applied = apply_version_updates(content, &updates, FileType::CargoToml, false).unwrap();
@@ -5304,12 +5399,14 @@ version = "1.0.0"
                 old_version: "18.2.0",
                 new_version: "19.0.0",
                 line_num: Some(3),
+                expected_source: None,
             },
             VersionEdit {
                 package: "react",
                 old_version: "18.1.0",
                 new_version: "19.0.0",
                 line_num: Some(3),
+                expected_source: None,
             },
         ];
 
@@ -5347,12 +5444,14 @@ serde = "1.0.1"
                 old_version: "1.0.0",
                 new_version: "1.0.2",
                 line_num: Some(6),
+                expected_source: None,
             },
             VersionEdit {
                 package: "serde",
                 old_version: "1.0.1",
                 new_version: "1.0.2",
                 line_num: Some(6),
+                expected_source: None,
             },
         ];
 
@@ -5720,6 +5819,104 @@ mod output_tests {
         assert!(
             !has_checkable_manifest_changes(&result, UpdateFilter::from_cli(&[], None)),
             "empty result must not count as pending"
+        );
+    }
+
+    fn annotated_edit<'a>(
+        package: &'a str,
+        old: &'a str,
+        new: &'a str,
+        line: usize,
+        source: Option<AnnotationSource>,
+    ) -> VersionEdit<'a> {
+        VersionEdit {
+            package,
+            old_version: old,
+            new_version: new,
+            line_num: Some(line),
+            expected_source: source,
+        }
+    }
+
+    #[test]
+    fn annotated_apply_rewrites_the_named_line() {
+        let content = "A ?= 1.0.0  # upd: pypi widget\nB ?= 1.0.0  # upd: pypi other\n";
+        let edits = [annotated_edit(
+            "widget",
+            "1.0.0",
+            "2.0.0",
+            1,
+            Some(AnnotationSource::PyPi),
+        )];
+        let result =
+            apply_version_updates(content, &edits, FileType::Annotated, false).expect("apply");
+        assert_eq!(
+            result.content,
+            "A ?= 2.0.0  # upd: pypi widget\nB ?= 1.0.0  # upd: pypi other\n"
+        );
+        assert_eq!(result.applied_count(), 1);
+    }
+
+    #[test]
+    fn annotated_apply_matches_the_package_name_byte_for_byte() {
+        // The scan recorded `Azure.Core`; a recased edit must not write the line.
+        let content = "PKG ?= 1.0.0  # upd: nuget Azure.Core\n";
+        let edits = [annotated_edit(
+            "azure.core",
+            "1.0.0",
+            "2.0.0",
+            1,
+            Some(AnnotationSource::NuGet),
+        )];
+        let err = apply_version_updates(content, &edits, FileType::Annotated, false)
+            .expect_err("recased name must not apply");
+        assert!(err.to_string().contains("azure.core"), "{err}");
+    }
+
+    #[test]
+    fn annotated_apply_refuses_when_the_line_changed_source_under_it() {
+        let content = "PKG ?= 1.0.0  # upd: npm widget\n";
+        let edits = [annotated_edit(
+            "widget",
+            "1.0.0",
+            "2.0.0",
+            1,
+            Some(AnnotationSource::PyPi),
+        )];
+        let err = apply_version_updates(content, &edits, FileType::Annotated, false)
+            .expect_err("source mismatch must not apply");
+        assert!(err.to_string().contains("widget"), "{err}");
+    }
+
+    #[test]
+    fn annotated_apply_refuses_when_the_version_changed_under_it() {
+        let content = "PKG ?= 1.5.0  # upd: pypi widget\n";
+        let edits = [annotated_edit(
+            "widget",
+            "1.0.0",
+            "2.0.0",
+            1,
+            Some(AnnotationSource::PyPi),
+        )];
+        apply_version_updates(content, &edits, FileType::Annotated, false)
+            .expect_err("stale old_version must not apply");
+    }
+
+    #[test]
+    fn annotated_apply_keeps_the_lines_v_prefix() {
+        let content = "GH ?= v2.60.0  # upd: github-releases cli/cli\n";
+        let edits = [annotated_edit(
+            "cli/cli",
+            "v2.60.0",
+            "2.65.4",
+            1,
+            Some(AnnotationSource::GitHubReleases),
+        )];
+        let result =
+            apply_version_updates(content, &edits, FileType::Annotated, false).expect("apply");
+        assert_eq!(
+            result.content,
+            "GH ?= v2.65.4  # upd: github-releases cli/cli\n"
         );
     }
 }

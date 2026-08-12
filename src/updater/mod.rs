@@ -12,7 +12,7 @@ mod pyproject;
 mod requirements;
 mod terraform;
 
-pub use annotated::{ParseWarnings, RegistrySet};
+pub use annotated::{AnnotatedUpdater, ParseWarnings, RegistrySet};
 pub use cargo_toml::CargoTomlUpdater;
 pub use csproj::CsprojUpdater;
 pub use gemfile::GemfileUpdater;
@@ -466,6 +466,10 @@ pub enum FileType {
     MiseToml,
     ToolVersions,
     TerraformTf,
+    /// A file whose dependencies declare their own ecosystem in a trailing
+    /// comment. Unlike every other variant, the file name does not decide the
+    /// registry; each annotated line does.
+    Annotated,
 }
 
 impl FileType {
@@ -482,6 +486,7 @@ impl FileType {
             FileType::PreCommitConfig => Lang::PreCommit,
             FileType::MiseToml | FileType::ToolVersions => Lang::Mise,
             FileType::TerraformTf => Lang::Terraform,
+            FileType::Annotated => Lang::Annotated,
         }
     }
 
@@ -500,6 +505,7 @@ impl FileType {
             FileType::MiseToml => "mise_toml",
             FileType::ToolVersions => "tool_versions",
             FileType::TerraformTf => "terraform_tf",
+            FileType::Annotated => "annotated",
         }
     }
 }
@@ -521,6 +527,9 @@ pub fn ecosystem_key(file_type: FileType) -> Option<&'static str> {
         | FileType::ToolVersions => "github-releases",
         FileType::Csproj => "nuget",
         FileType::TerraformTf => "terraform",
+        // An annotated file has no ecosystem of its own. Every entry carries
+        // its own, which is what `UpdateResult::entry_ecosystem` is for.
+        FileType::Annotated => return None,
     })
 }
 
@@ -1133,22 +1142,8 @@ mod tests {
 
     #[test]
     fn test_filetype_as_str_is_unique_and_stable() {
-        let variants = [
-            FileType::Requirements,
-            FileType::PyProject,
-            FileType::PackageJson,
-            FileType::CargoToml,
-            FileType::GoMod,
-            FileType::Gemfile,
-            FileType::Csproj,
-            FileType::GithubActions,
-            FileType::PreCommitConfig,
-            FileType::MiseToml,
-            FileType::ToolVersions,
-            FileType::TerraformTf,
-        ];
         let mut seen = std::collections::HashSet::new();
-        for ft in variants {
+        for ft in ALL_FILE_TYPES {
             let name = ft.as_str();
             assert!(
                 seen.insert(name),
@@ -1904,6 +1899,7 @@ mod tests {
         FileType::MiseToml,
         FileType::ToolVersions,
         FileType::TerraformTf,
+        FileType::Annotated,
     ];
 
     #[test]
@@ -1921,17 +1917,19 @@ mod tests {
                 | FileType::PreCommitConfig
                 | FileType::MiseToml
                 | FileType::ToolVersions
-                | FileType::TerraformTf => {}
+                | FileType::TerraformTf
+                | FileType::Annotated => {}
             }
         }
     }
 
     #[test]
-    fn every_file_type_has_an_ecosystem_key() {
+    fn only_the_annotated_file_type_lacks_an_ecosystem_key() {
         for file_type in ALL_FILE_TYPES {
-            assert!(
+            assert_eq!(
                 ecosystem_key(*file_type).is_some(),
-                "{file_type:?} must map to a registry name"
+                *file_type != FileType::Annotated,
+                "{file_type:?}: every file type but Annotated names one registry"
             );
         }
     }

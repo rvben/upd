@@ -4,9 +4,10 @@
 //! used across multiple dependency files and update all occurrences to that version.
 
 use crate::updater::{
-    CargoTomlUpdater, CsprojUpdater, FileType, GemfileUpdater, GithubActionsUpdater, GoModUpdater,
-    Lang, MiseUpdater, PackageJsonUpdater, ParsedDependency, PreCommitUpdater, PyProjectUpdater,
-    RequirementsUpdater, TerraformUpdater, Updater,
+    AnnotatedUpdater, CargoTomlUpdater, CsprojUpdater, FileType, GemfileUpdater,
+    GithubActionsUpdater, GoModUpdater, Lang, MiseUpdater, PackageJsonUpdater, ParseWarnings,
+    ParsedDependency, PreCommitUpdater, PyProjectUpdater, RequirementsUpdater, TerraformUpdater,
+    Updater,
 };
 use crate::version::{TagVersion, is_stable_pep440};
 use anyhow::Result;
@@ -83,7 +84,7 @@ pub struct AlignResult {
 }
 
 /// Get the appropriate updater for a file type
-fn get_updater(file_type: FileType) -> Box<dyn Updater> {
+fn get_updater(file_type: FileType, warnings: ParseWarnings) -> Box<dyn Updater> {
     match file_type {
         FileType::Requirements => Box::new(RequirementsUpdater::new()),
         FileType::PyProject => Box::new(PyProjectUpdater::new()),
@@ -96,6 +97,7 @@ fn get_updater(file_type: FileType) -> Box<dyn Updater> {
         FileType::PreCommitConfig => Box::new(PreCommitUpdater::new()),
         FileType::MiseToml | FileType::ToolVersions => Box::new(MiseUpdater::new()),
         FileType::TerraformTf => Box::new(TerraformUpdater::new()),
+        FileType::Annotated => Box::new(AnnotatedUpdater::new_parse_only(warnings)),
     }
 }
 
@@ -115,15 +117,20 @@ fn to_occurrence(dep: &ParsedDependency, path: &Path, file_type: FileType) -> Pa
 /// Scan all dependency files and collect package versions grouped by package name and language
 pub fn scan_packages(
     files: &[(PathBuf, FileType)],
+    langs: &[Lang],
+    warnings: ParseWarnings,
 ) -> Result<HashMap<(String, Lang), Vec<PackageOccurrence>>> {
     let mut packages: HashMap<(String, Lang), Vec<PackageOccurrence>> = HashMap::new();
 
     for (path, file_type) in files {
-        let updater = get_updater(*file_type);
+        let updater = get_updater(*file_type, warnings);
         let deps = updater.parse_dependencies(path)?;
         let lang = file_type.lang();
 
         for dep in deps {
+            if !langs.is_empty() && !langs.contains(&lang) {
+                continue;
+            }
             let key = (dep.name.to_lowercase(), lang);
             packages
                 .entry(key)
@@ -409,7 +416,7 @@ mod tests {
         let path = f.path().to_path_buf();
         let files = vec![(path, FileType::Csproj)];
 
-        let packages = scan_packages(&files).unwrap();
+        let packages = scan_packages(&files, &[], ParseWarnings::Suppress).unwrap();
 
         // The HashMap key must be lowercased for deduplication
         let key = ("newtonsoft.json".to_string(), Lang::DotNet);
@@ -454,7 +461,7 @@ mod tests {
             (file_a.path().to_path_buf(), FileType::GoMod),
             (file_b.path().to_path_buf(), FileType::GoMod),
         ];
-        let packages = scan_packages(&files).unwrap();
+        let packages = scan_packages(&files, &[], ParseWarnings::Suppress).unwrap();
         let result = find_alignments(packages);
 
         // There must be no misaligned occurrences — the pseudo-version is a pin, not
@@ -493,7 +500,7 @@ mod tests {
         .unwrap();
 
         let files = vec![(f.path().to_path_buf(), FileType::GoMod)];
-        let packages = scan_packages(&files).unwrap();
+        let packages = scan_packages(&files, &[], ParseWarnings::Suppress).unwrap();
 
         let key = ("golang.org/x/crypto".to_string(), Lang::Go);
         let occurrences = packages

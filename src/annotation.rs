@@ -282,6 +282,31 @@ fn is_field_byte(b: u8) -> bool {
     b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.' | b'+' | b'-')
 }
 
+/// Whether `value` is a version by the Section 3.2 grammar, matched in its
+/// entirety. Used to validate a registry answer before it is written to a line
+/// that upd does not otherwise understand.
+pub fn is_version_token(value: &str) -> bool {
+    VERSION_FIELD.is_match(value)
+}
+
+/// The distinct values named by `spans` on `text`, in first-seen order.
+///
+/// Both write paths need this: the non-interactive scan uses it to decide
+/// whether a line's version is unambiguous, and the interactive apply step
+/// uses it again, on the same line read fresh from disk, to check the line
+/// still matches what the user approved. A shared helper keeps that definition
+/// of "distinct" identical in both places rather than two copies drifting.
+pub fn distinct_values<'a>(text: &'a str, spans: &[Range<usize>]) -> Vec<&'a str> {
+    let mut distinct: Vec<&str> = Vec::new();
+    for span in spans {
+        let value = &text[span.clone()];
+        if !distinct.contains(&value) {
+            distinct.push(value);
+        }
+    }
+    distinct
+}
+
 /// Rewrite the given spans to `new_version`, right to left so earlier spans keep
 /// their offsets. Never a `String::replace`, which would also hit the comment.
 pub fn rewrite_spans(line: &str, spans: &[Range<usize>], new_version: &str) -> String {
@@ -592,6 +617,22 @@ mod tests {
     }
 
     #[test]
+    fn distinct_values_collapses_a_repeated_value_to_one() {
+        let line = "A := 1.2.3 B := 1.2.3 # upd: pypi x";
+        let comment_start = line.find('#').unwrap();
+        let spans = version_spans(line, comment_start);
+        assert_eq!(distinct_values(line, &spans), vec!["1.2.3"]);
+    }
+
+    #[test]
+    fn distinct_values_keeps_two_different_values_separate() {
+        let line = "IMG ?= app:1.2.3 helper:2.0.0 # upd: pypi x";
+        let comment_start = line.find('#').unwrap();
+        let spans = version_spans(line, comment_start);
+        assert_eq!(distinct_values(line, &spans), vec!["1.2.3", "2.0.0"]);
+    }
+
+    #[test]
     fn rewrite_spans_replaces_right_to_left() {
         let line = "A := 1.2.3 B := 1.2.3 # upd: pypi x";
         let comment_start = line.find('#').unwrap();
@@ -648,5 +689,21 @@ mod tests {
             );
         }
         assert!(!is_prerelease_token("8.0.0", Lang::Ruby));
+    }
+
+    #[test]
+    fn is_version_token_accepts_versions_and_rejects_registry_junk() {
+        assert!(is_version_token("1.2.3"));
+        assert!(is_version_token("v1.2.3"));
+        assert!(is_version_token("2.0.0-rc.1"));
+        assert!(is_version_token("v2"));
+        assert!(is_version_token("1.2.3+build.5"));
+        // A registry can answer with a tag, a branch, a digest or a range.
+        assert!(!is_version_token("latest"));
+        assert!(!is_version_token("main"));
+        assert!(!is_version_token("^1.2.3"));
+        assert!(!is_version_token("1.2.3 "));
+        assert!(!is_version_token("release-1.2.3"));
+        assert!(!is_version_token(""));
     }
 }
