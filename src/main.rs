@@ -590,6 +590,43 @@ fn lock_only_interactive_note(package: &str) -> String {
     )
 }
 
+/// Render one file's warning the way `print_file_result` does, so the
+/// interactive path and the aborted-scan flush cannot drift from the
+/// non-interactive renderer.
+fn format_warning_line(path: &Path, warning: &str) -> String {
+    let location = format!("{}:", path.display());
+    format!(
+        "{} {} {}",
+        location.blue().underline(),
+        "Warning:".yellow(),
+        warning
+    )
+}
+
+fn format_error_line(path: &Path, error: &str) -> String {
+    let location = format!("{}:", path.display());
+    format!(
+        "{} {} {}",
+        location.blue().underline(),
+        "Error:".red(),
+        error
+    )
+}
+
+/// Every diagnostic one scanned file produced, errors first, ready for stderr.
+/// The interactive path reads `updated` and `pinned` only, so without this the
+/// structured channel is discarded and a refusal is silent.
+fn format_scan_diagnostics(path: &Path, result: &UpdateResult) -> Vec<String> {
+    let mut lines = Vec::new();
+    for error in &result.errors {
+        lines.push(format_error_line(path, error));
+    }
+    for warning in &result.warnings {
+        lines.push(format_warning_line(path, warning));
+    }
+    lines
+}
+
 fn build_approved_change_counts(
     updates_with_decisions: &[PendingUpdate],
     planned_changes: &[PlannedChange],
@@ -677,9 +714,11 @@ fn has_interactive_changes(
     scanned_results: &[ScannedFileResult],
 ) -> bool {
     !pending_updates.is_empty()
-        || scanned_results
-            .iter()
-            .any(|scanned| !scanned.result.pinned.is_empty())
+        || scanned_results.iter().any(|scanned| {
+            !scanned.result.pinned.is_empty()
+                || !scanned.result.errors.is_empty()
+                || !scanned.result.warnings.is_empty()
+        })
 }
 
 fn audit_status(audit_result: &AuditResult) -> AuditStatus {
@@ -1403,6 +1442,16 @@ async fn run_update(cli: &Cli) -> Result<()> {
             match scan_packages(&discovered_files, &cli.langs, ParseWarnings::Suppress) {
                 Ok(p) => p,
                 Err(e) => {
+                    // The JSON report is emitted after this point, so returning here
+                    // would discard every warning the updater loop already merged.
+                    // Text mode already printed them per file inside that loop.
+                    if json_mode {
+                        for scanned_file in &scanned {
+                            for warning in &scanned_file.result.warnings {
+                                eprintln!("{}", format_warning_line(&scanned_file.path, warning));
+                            }
+                        }
+                    }
                     eprintln!("{}", format!("Error scanning files: {}", e).red());
                     return Err(e);
                 }
@@ -2157,6 +2206,10 @@ async fn run_interactive_update(
 
         match result {
             Ok(file_result) => {
+                for line in format_scan_diagnostics(path, &file_result) {
+                    eprintln!("{}", line);
+                }
+
                 for update in &file_result.updated {
                     let (package, old_version, new_version, line_num) = update;
                     let update_type = classify_update(old_version, new_version);
@@ -5135,6 +5188,112 @@ mod tests {
         }];
 
         assert!(has_interactive_changes(&[], &scanned_results));
+    }
+
+    /// Section 5.7 step 1: a file that produced only diagnostics is not "up to
+    /// date". Without this, `upd update --interactive` over a repository whose
+    /// every lookup failed prints `✓ Scanned 1 file(s), all dependencies up to
+    /// date` and returns Ok(()). The fixtures are `requirements.txt` results,
+    /// not annotated ones: an annotated fixture passes against an
+    /// implementation that special-cases `FileType::Annotated`.
+    #[test]
+    fn interactive_changes_covers_warnings_and_errors() {
+        let quiet = vec![ScannedFileResult {
+            path: PathBuf::from("requirements.txt"),
+            file_type: FileType::Requirements,
+            result: UpdateResult::default(),
+        }];
+
+        let warned = vec![ScannedFileResult {
+            path: PathBuf::from("requirements.txt"),
+            file_type: FileType::Requirements,
+            result: UpdateResult {
+                warnings: vec![
+                    "skipping foo: current version \"1.0++\" is not a valid PEP 440 version".into(),
+                ],
+                ..Default::default()
+            },
+        }];
+
+        let errored = vec![ScannedFileResult {
+            path: PathBuf::from("requirements.txt"),
+            file_type: FileType::Requirements,
+            result: UpdateResult {
+                errors: vec!["foo: registry request failed".into()],
+                ..Default::default()
+            },
+        }];
+
+        let pending = vec![PendingUpdate::new(
+            "requirements.txt".to_string(),
+            Some(1),
+            "foo".to_string(),
+            "1.0.0".to_string(),
+            "1.1.0".to_string(),
+            false,
+        )];
+
+        assert!(
+            has_interactive_changes(&[], &warned),
+            "a warnings-only result must not be reported as up to date"
+        );
+        assert!(
+            has_interactive_changes(&[], &errored),
+            "an errors-only result must not be reported as up to date"
+        );
+        assert!(
+            !has_interactive_changes(&[], &quiet),
+            "a result with nothing to report is the up-to-date case"
+        );
+        assert!(
+            has_interactive_changes(&pending, &quiet),
+            "a pending update is still a change"
+        );
+    }
+
+    /// Section 6 invocation 4: the interactive diagnostic is produced by a
+    /// helper so it can be asserted without a terminal, following the
+    /// `interactive_lock_only_package_gets_note` precedent. Errors render the
+    /// way the non-interactive renderer does (`src/main.rs:4385`), warnings the
+    /// way `print_file_result` does (`:4395`), errors first.
+    #[test]
+    fn scan_diagnostics_render_errors_then_warnings() {
+        let result = UpdateResult {
+            errors: vec!["foo: registry request failed".into()],
+            warnings: vec!["line 3: unsupported source 'cocoapods'".into()],
+            ..Default::default()
+        };
+
+        let lines = format_scan_diagnostics(Path::new("sub/Makefile"), &result);
+
+        assert_eq!(lines.len(), 2, "{lines:?}");
+        assert!(lines[0].contains("Error:"), "{}", lines[0]);
+        assert!(lines[0].contains("sub/Makefile"), "{}", lines[0]);
+        assert!(
+            lines[0].contains("foo: registry request failed"),
+            "{}",
+            lines[0]
+        );
+        assert!(lines[1].contains("Warning:"), "{}", lines[1]);
+        assert!(lines[1].contains("sub/Makefile"), "{}", lines[1]);
+        assert!(
+            lines[1].contains("line 3: unsupported source 'cocoapods'"),
+            "{}",
+            lines[1]
+        );
+    }
+
+    #[test]
+    fn scan_diagnostics_are_empty_for_a_clean_result() {
+        let clean = UpdateResult {
+            updated: vec![("foo".into(), "1.0.0".into(), "1.1.0".into(), Some(1))],
+            ..Default::default()
+        };
+
+        assert!(
+            format_scan_diagnostics(Path::new("requirements.txt"), &clean).is_empty(),
+            "an ordinary update is not a diagnostic"
+        );
     }
 
     #[test]
