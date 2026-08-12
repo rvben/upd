@@ -1160,4 +1160,614 @@ mod tests {
              lang happens to be selected too: {result:?}"
         );
     }
+
+    use crate::config::UpdConfig;
+    use crate::registry::VersionMeta;
+    use crate::updater::BumpFilter;
+    use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+
+    /// Wraps a `MockRegistry` and counts how many times it was asked anything
+    /// about a version.
+    ///
+    /// `name()` is deliberately not counted, which narrows Section 6's "every
+    /// `Registry` method". `apply_cooldown` calls `name()` for every resolved
+    /// line before its no-policy early return (`src/updater/mod.rs:632-662`), so
+    /// counting it would report 2 for a single lookup and the assertions below
+    /// would stop meaning "the registry was asked for a version".
+    struct CountingRegistry {
+        inner: MockRegistry,
+        calls: Arc<AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl Registry for CountingRegistry {
+        async fn get_latest_version(&self, package: &str) -> Result<String> {
+            self.calls.fetch_add(1, AtomicOrdering::SeqCst);
+            self.inner.get_latest_version(package).await
+        }
+
+        async fn get_latest_version_including_prereleases(&self, package: &str) -> Result<String> {
+            self.calls.fetch_add(1, AtomicOrdering::SeqCst);
+            self.inner
+                .get_latest_version_including_prereleases(package)
+                .await
+        }
+
+        async fn get_latest_version_matching(
+            &self,
+            package: &str,
+            constraints: &str,
+        ) -> Result<String> {
+            self.calls.fetch_add(1, AtomicOrdering::SeqCst);
+            self.inner
+                .get_latest_version_matching(package, constraints)
+                .await
+        }
+
+        async fn list_versions(&self, package: &str) -> Result<Vec<VersionMeta>> {
+            self.calls.fetch_add(1, AtomicOrdering::SeqCst);
+            self.inner.list_versions(package).await
+        }
+
+        async fn list_ref_names(&self, package: &str) -> Result<Vec<String>> {
+            self.calls.fetch_add(1, AtomicOrdering::SeqCst);
+            self.inner.list_ref_names(package).await
+        }
+
+        fn name(&self) -> &'static str {
+            self.inner.name()
+        }
+    }
+
+    fn counting_set(
+        source: AnnotationSource,
+        registry: MockRegistry,
+    ) -> (RegistrySet, Arc<AtomicUsize>) {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let counting = CountingRegistry {
+            inner: registry,
+            calls: Arc::clone(&calls),
+        };
+        (
+            RegistrySet {
+                entries: HashMap::from([(source, Arc::new(counting) as Arc<dyn Registry>)]),
+            },
+            calls,
+        )
+    }
+
+    fn config_of(ignore: &[&str], pin: &[(&str, &str)]) -> Arc<UpdConfig> {
+        Arc::new(UpdConfig {
+            ignore: ignore.iter().map(|s| s.to_string()).collect(),
+            pin: pin
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+            ..UpdConfig::default()
+        })
+    }
+
+    /// Section 5.7's counter rule for a refused line: the diagnostic lands in
+    /// `warnings` and nothing else moves.
+    ///
+    /// `entry_ecosystem` is deliberately not checked. Task 6 records it before
+    /// every gate precisely so a refused line can still be labelled with its
+    /// source in the report, so it is expected to be non-empty here.
+    fn assert_records_nothing(result: &UpdateResult) {
+        assert_eq!(
+            result.unchanged, 0,
+            "`unchanged` records that the registry was asked; a refusal never asked"
+        );
+        assert!(result.updated.is_empty(), "{:?}", result.updated);
+        assert!(result.pinned.is_empty(), "{:?}", result.pinned);
+        assert!(result.ignored.is_empty(), "{:?}", result.ignored);
+        assert!(result.errors.is_empty(), "{:?}", result.errors);
+        assert!(result.held_back.is_empty(), "{:?}", result.held_back);
+        assert!(
+            result.skipped_by_cooldown.is_empty(),
+            "{:?}",
+            result.skipped_by_cooldown
+        );
+    }
+
+    #[tokio::test]
+    async fn the_python_token_guard_refuses_before_any_lookup_and_counts_nothing() {
+        let (set, calls) = counting_set(
+            AnnotationSource::PyPi,
+            MockRegistry::new("pypi").with_version("thing", "2.7.0"),
+        );
+        let original = "THING ?= 1.0++  # upd: pypi thing\n";
+        let (result, written) = run(original, set, UpdateOptions::new(false, false)).await;
+
+        assert_eq!(written, original);
+        assert_eq!(
+            calls.load(AtomicOrdering::SeqCst),
+            0,
+            "step 3a refuses the line before its lookup is queued"
+        );
+        assert_eq!(
+            result.warnings,
+            vec!["line 1: current version \"1.0++\" is not a valid PEP 440 version".to_string()]
+        );
+        assert_records_nothing(&result);
+    }
+
+    #[tokio::test]
+    async fn a_package_filter_silences_the_python_token_guard() {
+        let (set, calls) = counting_set(
+            AnnotationSource::PyPi,
+            MockRegistry::new("pypi")
+                .with_version("thing", "2.7.0")
+                .with_version("other", "3.1.0"),
+        );
+        let options = UpdateOptions::new(false, false).with_packages(vec!["other".to_string()]);
+        let (result, written) = run(
+            "THING ?= 1.0++  # upd: pypi thing\nOTHER ?= 3.0.0  # upd: pypi other\n",
+            set,
+            options,
+        )
+        .await;
+
+        assert!(
+            result.warnings.is_empty(),
+            "step 1 runs before step 3a, so `--package other` hides the guard: {:?}",
+            result.warnings
+        );
+        assert_eq!(
+            calls.load(AtomicOrdering::SeqCst),
+            1,
+            "only the selected package is looked up"
+        );
+        assert_eq!(
+            result.unchanged, 1,
+            "the filtered-out line counts unchanged"
+        );
+        assert_eq!(
+            written,
+            "THING ?= 1.0++  # upd: pypi thing\nOTHER ?= 3.1.0  # upd: pypi other\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_configured_pin_repairs_an_unparseable_python_token_and_truncates_to_its_precision() {
+        let (set, calls) = counting_set(
+            AnnotationSource::PyPi,
+            MockRegistry::new("pypi").with_version("thing", "9.9.9"),
+        );
+        let options =
+            UpdateOptions::new(false, false).with_config(config_of(&[], &[("thing", "2.7.0")]));
+        let (result, written) = run("THING ?= 1.0++  # upd: pypi thing\n", set, options).await;
+
+        assert!(result.warnings.is_empty(), "{:?}", result.warnings);
+        assert_eq!(
+            calls.load(AtomicOrdering::SeqCst),
+            0,
+            "a pin short-circuits the registry"
+        );
+        assert_eq!(
+            result.pinned,
+            vec![(
+                "thing".to_string(),
+                "1.0++".to_string(),
+                "2.7".to_string(),
+                Some(1)
+            )]
+        );
+        assert_eq!(written, "THING ?= 2.7  # upd: pypi thing\n");
+    }
+
+    #[tokio::test]
+    async fn the_go_pseudo_version_guard_refuses_before_any_lookup_and_counts_nothing() {
+        let (set, calls) = counting_set(
+            AnnotationSource::Go,
+            MockRegistry::new("go").with_version("example.com/m", "v0.38.0"),
+        );
+        let original = "MOD ?= v0.0.0-20241217172646-ca3f786aa774  # upd: go example.com/m\n";
+        let (result, written) = run(original, set, UpdateOptions::new(false, false)).await;
+
+        assert_eq!(written, original);
+        assert_eq!(calls.load(AtomicOrdering::SeqCst), 0);
+        assert_eq!(
+            result.warnings,
+            vec!["line 1: commit-pinned Go version, not updatable".to_string()]
+        );
+        assert_records_nothing(&result);
+    }
+
+    #[tokio::test]
+    async fn a_package_filter_does_not_silence_the_go_pseudo_version_guard() {
+        let (set, calls) = counting_set(
+            AnnotationSource::Go,
+            MockRegistry::new("go")
+                .with_version("example.com/m", "v0.38.0")
+                .with_version("example.com/other", "v1.4.0"),
+        );
+        let options =
+            UpdateOptions::new(false, false).with_packages(vec!["example.com/other".to_string()]);
+        let original = "MOD ?= v0.0.0-20241217172646-ca3f786aa774  # upd: go example.com/m\nOTHER ?= v1.3.0  # upd: go example.com/other\n";
+        let (result, written) = run(original, set, options).await;
+
+        assert_eq!(
+            result.warnings,
+            vec!["line 1: commit-pinned Go version, not updatable".to_string()],
+            "step 0 runs before step 1, so `--package` cannot hide the guard"
+        );
+        assert_eq!(
+            calls.load(AtomicOrdering::SeqCst),
+            1,
+            "only the selected package is looked up"
+        );
+        assert_eq!(
+            result.unchanged, 0,
+            "the refused line counts nothing and the selected line was written"
+        );
+        assert_eq!(
+            written,
+            "MOD ?= v0.0.0-20241217172646-ca3f786aa774  # upd: go example.com/m\nOTHER ?= v1.4.0  # upd: go example.com/other\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_configured_pin_does_not_repair_a_commit_pinned_go_line() {
+        let (set, calls) = counting_set(
+            AnnotationSource::Go,
+            MockRegistry::new("go").with_version("example.com/m", "v0.38.0"),
+        );
+        let options = UpdateOptions::new(false, false)
+            .with_config(config_of(&[], &[("example.com/m", "v0.38.0")]));
+        let original = "MOD ?= v0.0.0-20241217172646-ca3f786aa774  # upd: go example.com/m\n";
+        let (result, written) = run(original, set, options).await;
+
+        assert_eq!(written, original, "step 0 is upstream of the pin branch");
+        assert_eq!(calls.load(AtomicOrdering::SeqCst), 0);
+        assert_eq!(
+            result.warnings,
+            vec!["line 1: commit-pinned Go version, not updatable".to_string()]
+        );
+        assert!(result.pinned.is_empty(), "{:?}", result.pinned);
+    }
+
+    #[tokio::test]
+    async fn a_prerelease_python_line_takes_the_prerelease_answer() {
+        let set = set_with(
+            AnnotationSource::PyPi,
+            MockRegistry::new("pypi").with_prerelease("thing", "1.1.0", "1.2.0rc2"),
+        );
+        let (result, written) = run(
+            "THING ?= 1.2.0rc1  # upd: pypi thing\n",
+            set,
+            UpdateOptions::new(false, false),
+        )
+        .await;
+
+        assert_eq!(result.updated.len(), 1, "{:?}", result);
+        assert_eq!(written, "THING ?= 1.2.0rc2  # upd: pypi thing\n");
+    }
+
+    #[tokio::test]
+    async fn a_stable_python_line_takes_the_stable_answer_even_when_a_newer_prerelease_exists() {
+        let set = set_with(
+            AnnotationSource::PyPi,
+            MockRegistry::new("pypi").with_prerelease("thing", "1.2.1", "1.3.0rc1"),
+        );
+        let (result, written) = run(
+            "THING ?= 1.2.0  # upd: pypi thing\n",
+            set,
+            UpdateOptions::new(false, false),
+        )
+        .await;
+
+        assert_eq!(result.updated.len(), 1, "{:?}", result);
+        assert_eq!(
+            written, "THING ?= 1.2.1  # upd: pypi thing\n",
+            "a stable current token must not be walked onto 1.3.0rc1"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_prerelease_github_releases_line_takes_the_prerelease_answer() {
+        let set = set_with(
+            AnnotationSource::GitHubReleases,
+            MockRegistry::new("github-releases").with_prerelease(
+                "oven-sh/bun",
+                "v1.3.0",
+                "v1.2.0-rc.2",
+            ),
+        );
+        let (result, written) = run(
+            "BUN ?= v1.2.0-rc.1  # upd: github-releases oven-sh/bun\n",
+            set,
+            UpdateOptions::new(false, false),
+        )
+        .await;
+
+        assert_eq!(result.updated.len(), 1, "{:?}", result);
+        assert_eq!(
+            written,
+            "BUN ?= v1.2.0-rc.2  # upd: github-releases oven-sh/bun\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_prerelease_ruby_line_takes_the_prerelease_answer() {
+        let set = set_with(
+            AnnotationSource::RubyGems,
+            MockRegistry::new("rubygems").with_prerelease("thing", "9.0.0", "8.0.0.dev2"),
+        );
+        let (result, written) = run(
+            "THING ?= 8.0.0.dev1  # upd: rubygems thing\n",
+            set,
+            UpdateOptions::new(false, false),
+        )
+        .await;
+
+        assert_eq!(result.updated.len(), 1, "{:?}", result);
+        assert_eq!(written, "THING ?= 8.0.0.dev2  # upd: rubygems thing\n");
+    }
+
+    #[tokio::test]
+    async fn a_tag_shaped_registry_answer_is_refused_and_counted_unchanged() {
+        let set = set_with(
+            AnnotationSource::GitHubReleases,
+            MockRegistry::new("github-releases").with_version("oven-sh/bun", "bun-v1.2.5"),
+        );
+        let original = "BUN ?= v1.1.0  # upd: github-releases oven-sh/bun\n";
+        let (result, written) = run(original, set, UpdateOptions::new(false, false)).await;
+
+        assert_eq!(written, original);
+        assert_eq!(
+            result.warnings,
+            vec![
+                "line 1: unusable version from github-releases for oven-sh/bun: bun-v1.2.5"
+                    .to_string()
+            ]
+        );
+        assert_eq!(
+            result.unchanged, 1,
+            "step 4 refuses after the lookup, so the registry was asked"
+        );
+        assert!(result.updated.is_empty(), "{:?}", result.updated);
+    }
+
+    #[tokio::test]
+    async fn the_same_source_answering_a_version_writes_it() {
+        let set = set_with(
+            AnnotationSource::GitHubReleases,
+            MockRegistry::new("github-releases").with_version("oven-sh/bun", "v1.2.5"),
+        );
+        let (result, written) = run(
+            "BUN ?= v1.1.0  # upd: github-releases oven-sh/bun\n",
+            set,
+            UpdateOptions::new(false, false),
+        )
+        .await;
+
+        assert!(result.warnings.is_empty(), "{:?}", result.warnings);
+        assert_eq!(result.unchanged, 0);
+        assert_eq!(
+            result.updated,
+            vec![(
+                "oven-sh/bun".to_string(),
+                "v1.1.0".to_string(),
+                "v1.2.5".to_string(),
+                Some(1)
+            )]
+        );
+        assert_eq!(
+            written,
+            "BUN ?= v1.2.5  # upd: github-releases oven-sh/bun\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_two_segment_line_keeps_its_precision_and_reports_nothing() {
+        let set = set_with(
+            AnnotationSource::PyPi,
+            MockRegistry::new("pypi").with_version("thing", "1.2.1"),
+        );
+        let original = "THING ?= 1.2  # upd: pypi thing\n";
+        let (result, written) = run(original, set, UpdateOptions::new(false, false)).await;
+
+        assert_eq!(written, original);
+        assert!(
+            result.updated.is_empty(),
+            "1.2.1 truncated to the line's precision is 1.2, which is not a change: {:?}",
+            result.updated
+        );
+        assert!(result.warnings.is_empty(), "{:?}", result.warnings);
+        assert_eq!(result.unchanged, 1);
+    }
+
+    #[tokio::test]
+    async fn full_precision_writes_the_registrys_own_value() {
+        let set = set_with(
+            AnnotationSource::PyPi,
+            MockRegistry::new("pypi").with_version("thing", "1.2.1"),
+        );
+        let (result, written) = run(
+            "THING ?= 1.2  # upd: pypi thing\n",
+            set,
+            UpdateOptions::new(false, true),
+        )
+        .await;
+
+        assert_eq!(result.updated.len(), 1, "{:?}", result);
+        assert_eq!(written, "THING ?= 1.2.1  # upd: pypi thing\n");
+    }
+
+    #[tokio::test]
+    async fn an_ignored_package_is_never_looked_up() {
+        let (set, calls) = counting_set(
+            AnnotationSource::PyPi,
+            MockRegistry::new("pypi").with_version("ruff", "0.14.2"),
+        );
+        let options = UpdateOptions::new(false, false).with_config(config_of(&["ruff"], &[]));
+        let original = "RUFF ?= 0.8.0  # upd: pypi ruff\n";
+        let (result, written) = run(original, set, options).await;
+
+        assert_eq!(written, original);
+        assert_eq!(calls.load(AtomicOrdering::SeqCst), 0);
+        assert_eq!(
+            result.ignored,
+            vec![("ruff".to_string(), "0.8.0".to_string(), Some(1))]
+        );
+        assert_eq!(
+            result.unchanged, 0,
+            "an ignored package was never asked about"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_configured_pin_that_is_a_downgrade_is_still_written() {
+        let set = set_with(
+            AnnotationSource::PyPi,
+            MockRegistry::new("pypi").with_version("ruff", "0.14.2"),
+        );
+        let options =
+            UpdateOptions::new(false, false).with_config(config_of(&[], &[("ruff", "0.13.0")]));
+        let (result, written) = run("RUFF ?= 0.14.2  # upd: pypi ruff\n", set, options).await;
+
+        assert!(result.warnings.is_empty(), "{:?}", result.warnings);
+        assert_eq!(
+            result.pinned,
+            vec![(
+                "ruff".to_string(),
+                "0.14.2".to_string(),
+                "0.13.0".to_string(),
+                Some(1)
+            )]
+        );
+        assert_eq!(written, "RUFF ?= 0.13.0  # upd: pypi ruff\n");
+    }
+
+    #[tokio::test]
+    async fn a_configured_pin_outside_the_bump_ceiling_is_still_written() {
+        let set = set_with(
+            AnnotationSource::PyPi,
+            MockRegistry::new("pypi").with_version("thing", "1.0.1"),
+        );
+        let options = UpdateOptions::new(false, false)
+            .with_config(config_of(&[], &[("thing", "2.0.0")]))
+            .with_bump_filter(BumpFilter {
+                major: false,
+                minor: false,
+                patch: true,
+            });
+        let (_, written) = run("THING ?= 1.0.0  # upd: pypi thing\n", set, options).await;
+
+        assert_eq!(written, "THING ?= 2.0.0  # upd: pypi thing\n");
+    }
+
+    #[tokio::test]
+    async fn the_bump_ceiling_caps_a_registry_answer_silently() {
+        let set = set_with(
+            AnnotationSource::PyPi,
+            MockRegistry::new("pypi").with_version("thing", "1.1.0"),
+        );
+        let options = UpdateOptions::new(false, false).with_bump_filter(BumpFilter {
+            major: false,
+            minor: false,
+            patch: true,
+        });
+        let original = "THING ?= 1.0.0  # upd: pypi thing\n";
+        let (result, written) = run(original, set, options).await;
+
+        assert_eq!(written, original);
+        assert!(result.updated.is_empty(), "{:?}", result.updated);
+        assert!(
+            result.warnings.is_empty(),
+            "a capped bump is silent, as it is in every other updater: {:?}",
+            result.warnings
+        );
+        assert_eq!(result.unchanged, 1);
+    }
+
+    #[tokio::test]
+    async fn a_dotted_python_suffix_is_replaced_whole() {
+        let set = set_with(
+            AnnotationSource::PyPi,
+            MockRegistry::new("pypi").with_version("thing", "2.0.0"),
+        );
+        let (result, written) = run(
+            "THING ?= 1.2.3.post1  # upd: pypi thing\n",
+            set,
+            UpdateOptions::new(false, false),
+        )
+        .await;
+
+        assert_eq!(result.updated.len(), 1, "{:?}", result);
+        assert_eq!(
+            written, "THING ?= 2.0.0  # upd: pypi thing\n",
+            "no `.post1` may survive the rewrite"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_dotted_ruby_suffix_is_replaced_whole() {
+        let set = set_with(
+            AnnotationSource::RubyGems,
+            MockRegistry::new("rubygems").with_prerelease("thing", "9.0.0", "9.0.0.beta2"),
+        );
+        let (result, written) = run(
+            "THING ?= 8.0.0.beta1  # upd: rubygems thing\n",
+            set,
+            UpdateOptions::new(false, false),
+        )
+        .await;
+
+        assert_eq!(result.updated.len(), 1, "{:?}", result);
+        assert_eq!(written, "THING ?= 9.0.0.beta2  # upd: rubygems thing\n");
+    }
+
+    #[tokio::test]
+    async fn a_parse_only_updater_parses_the_same_dependencies_as_a_resolving_one() {
+        let content = "THING ?= 1.2.3  # upd: pypi thing\n\
+                       BUN ?= v1.1.0  # upd: github-releases oven-sh/bun\n\
+                       BAD ?= 1.0.0  # upd: pypi\n";
+        let file = write_temp(content);
+
+        let parse_only = AnnotatedUpdater::new_parse_only(ParseWarnings::Suppress)
+            .parse_dependencies(file.path())
+            .expect("parse-only");
+        let resolving = AnnotatedUpdater::new(real_resolving_set())
+            .parse_dependencies(file.path())
+            .expect("resolving");
+
+        let shape =
+            |deps: &[ParsedDependency]| -> Vec<(String, String, Option<usize>, bool, bool)> {
+                deps.iter()
+                    .map(|d| {
+                        (
+                            d.name.clone(),
+                            d.version.clone(),
+                            d.line_number,
+                            d.is_bumpable,
+                            d.has_upper_bound,
+                        )
+                    })
+                    .collect()
+            };
+
+        assert_eq!(shape(&parse_only), shape(&resolving));
+        assert_eq!(
+            shape(&parse_only),
+            vec![
+                (
+                    "thing".to_string(),
+                    "1.2.3".to_string(),
+                    Some(1),
+                    true,
+                    false
+                ),
+                (
+                    "oven-sh/bun".to_string(),
+                    "v1.1.0".to_string(),
+                    Some(2),
+                    true,
+                    false
+                ),
+            ],
+            "the malformed third line is dropped from the dependency list by both"
+        );
+    }
 }
