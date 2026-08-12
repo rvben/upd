@@ -93,7 +93,7 @@ impl GoModUpdater {
     /// Pseudo-versions have the format: v0.0.0-YYYYMMDDHHMMSS-abcdefabcdef
     /// Or for pre-release: v1.2.4-0.YYYYMMDDHHMMSS-abcdefabcdef
     /// These modules have no semver tags (or point to commits), so updating them via registry fails.
-    fn is_pseudo_version(version: &str) -> bool {
+    pub(crate) fn is_pseudo_version(version: &str) -> bool {
         // Pseudo-version patterns:
         // 1. v0.0.0-20241217172646-ca3f786aa774 (base version is 0.0.0)
         // 2. v1.2.4-0.20220331215641-2d8c0ab7ef04 (pre-release pseudo after real version)

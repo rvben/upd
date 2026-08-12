@@ -191,7 +191,7 @@ fn find_highest_version(occurrences: &[PackageOccurrence], lang: Lang) -> Option
 }
 
 /// Check if a version is stable (not a pre-release)
-fn is_stable_version(version: &str, lang: Lang) -> bool {
+pub(crate) fn is_stable_version(version: &str, lang: Lang) -> bool {
     match lang {
         Lang::Python => is_stable_pep440(version),
         Lang::Node | Lang::Rust | Lang::Go | Lang::DotNet => {

@@ -82,7 +82,7 @@ impl GemfileUpdater {
     /// Check if a Ruby gem version string is a pre-release.
     /// RubyGems pre-releases include a letter component in the version segments,
     /// commonly expressed as `.pre`, `.rc`, `.beta`, `.alpha`, or similar suffixes.
-    fn is_prerelease_ruby(version: &str) -> bool {
+    pub(crate) fn is_prerelease_ruby(version: &str) -> bool {
         let v = version.to_lowercase();
         v.contains(".pre")
             || v.contains(".rc")

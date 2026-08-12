@@ -3,7 +3,12 @@
 //! Everything here is pure text work: no file type, no registry, no options.
 //! Both write paths (non-interactive and interactive) share this module.
 
-use crate::updater::Lang;
+use crate::align;
+use crate::updater::{GemfileUpdater, Lang};
+use crate::version::is_prerelease_pep440;
+use regex::Regex;
+use std::ops::Range;
+use std::sync::LazyLock;
 
 /// Every warning about a source `upd` does not support starts with this, so the
 /// updater can emit one warning per distinct source instead of one per line.
@@ -236,6 +241,87 @@ fn resolve(source: &str, package: &str, comment_start: usize) -> ParseOutcome {
     ))
 }
 
+/// A field is a version candidate only when this matches it in its entirety.
+/// Two alternatives: a dotted number with an optional suffix, or a `v`-prefixed
+/// bare major with an optional suffix. A bare `4` is neither.
+static VERSION_FIELD: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"^(?:v?\d+(?:\.\d+)+(?:[-+.][0-9A-Za-z.+-]*)?|v\d+(?:[-+.][0-9A-Za-z.+-]*)?)$")
+        .expect("the version field pattern is a compile-time constant")
+});
+
+/// Candidate version spans in the code portion of `line`, ascending.
+///
+/// Fields are maximal runs of `[A-Za-z0-9_.+-]`, so a version inside a file name
+/// (`bao_2.6.1_linux.tar.gz`) is part of one larger field and is not a candidate,
+/// while a version after a `:` or `/` (`bun:1.2.4`) is a field of its own.
+pub fn version_spans(line: &str, comment_start: usize) -> Vec<Range<usize>> {
+    let code = &line[..comment_start];
+    let bytes = code.as_bytes();
+    let mut spans = Vec::new();
+    let mut i = 0;
+
+    while i < bytes.len() {
+        if !is_field_byte(bytes[i]) {
+            i += 1;
+            continue;
+        }
+        let start = i;
+        while i < bytes.len() && is_field_byte(bytes[i]) {
+            i += 1;
+        }
+        // Every field byte is ASCII, so `start` and `i` are char boundaries.
+        if VERSION_FIELD.is_match(&code[start..i]) {
+            spans.push(start..i);
+        }
+    }
+
+    spans
+}
+
+fn is_field_byte(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.' | b'+' | b'-')
+}
+
+/// Rewrite the given spans to `new_version`, right to left so earlier spans keep
+/// their offsets. Never a `String::replace`, which would also hit the comment.
+pub fn rewrite_spans(line: &str, spans: &[Range<usize>], new_version: &str) -> String {
+    let mut out = line.to_string();
+    for span in spans.iter().rev() {
+        out.replace_range(span.clone(), new_version);
+    }
+    out
+}
+
+/// Give `candidate` the leading `v` of `original`, or take it away.
+///
+/// Strips exactly one `v`, never `trim_start_matches`, so a doubled prefix is
+/// not silently swallowed.
+pub fn reapply_v_prefix(original: &str, candidate: &str) -> String {
+    let bare = candidate.strip_prefix('v').unwrap_or(candidate);
+    if original.starts_with('v') {
+        format!("v{bare}")
+    } else {
+        bare.to_string()
+    }
+}
+
+/// Positive dual of `align::is_stable_version`, for tokens that have already
+/// passed the Section 3.4 guards. Python is not the negation of it: both PEP 440
+/// predicates report `false` for an unparseable string, which is why such a token
+/// is refused before it ever reaches this helper.
+///
+/// Ruby delegates to `GemfileUpdater`'s classifier, not to `align`'s: the align
+/// arm calls `8.0.0.dev1` stable, and asking for the latest stable release there
+/// would write it straight over a dev pin.
+pub fn is_prerelease_token(token: &str, lang: Lang) -> bool {
+    let v = token.strip_prefix('v').unwrap_or(token);
+    match lang {
+        Lang::Python => is_prerelease_pep440(v),
+        Lang::Ruby => GemfileUpdater::is_prerelease_ruby(v),
+        _ => !align::is_stable_version(v, lang),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -425,5 +511,142 @@ mod tests {
         ));
         let a = found("VERSIÓN = 1.0 # upd: pypi ruff");
         assert_eq!(a.package, "ruff");
+    }
+
+    fn spans_of(line: &str) -> Vec<String> {
+        let comment_start = line.find('#').unwrap_or(line.len());
+        version_spans(line, comment_start)
+            .into_iter()
+            .map(|s| line[s].to_string())
+            .collect()
+    }
+
+    #[test]
+    fn finds_a_plain_version_token() {
+        assert_eq!(
+            spans_of("BAO_VERSION     ?= 2.6.1      # upd: pypi openbao-cli"),
+            ["2.6.1"]
+        );
+    }
+
+    #[test]
+    fn finds_the_version_inside_an_image_reference() {
+        // `/` and `:` are not field bytes, so the fields are ghcr.io, oven-sh,
+        // bun and 1.2.4; only the last one matches in its entirety.
+        assert_eq!(
+            spans_of("IMAGE := ghcr.io/oven-sh/bun:1.2.4  # upd: github-releases oven-sh/bun"),
+            ["1.2.4"]
+        );
+    }
+
+    #[test]
+    fn accepts_a_v_prefixed_token_and_a_bare_v_major() {
+        assert_eq!(spans_of("A := v0.2.5 # upd: go example.com/m"), ["v0.2.5"]);
+        assert_eq!(spans_of("A := v4 # upd: github-releases o/r"), ["v4"]);
+    }
+
+    #[test]
+    fn a_bare_integer_is_not_a_version() {
+        assert!(spans_of("WORKERS := 4 # upd: pypi ruff").is_empty());
+    }
+
+    #[test]
+    fn a_date_is_not_a_version() {
+        assert!(spans_of("BUILT := 2026-08-11 # upd: pypi ruff").is_empty());
+    }
+
+    #[test]
+    fn a_version_embedded_in_a_file_name_is_not_a_candidate() {
+        // `_` is a field byte, so the whole file name is one field and it does
+        // not match in its entirety.
+        assert!(spans_of("TARBALL := bao_2.6.1_linux.tar.gz # upd: pypi openbao-cli").is_empty());
+    }
+
+    #[test]
+    fn a_dotted_suffix_belongs_to_the_same_span() {
+        assert_eq!(spans_of("A := 1.2.3.post1 # upd: pypi x"), ["1.2.3.post1"]);
+        assert_eq!(
+            spans_of("A := 8.0.0.beta1 # upd: rubygems x"),
+            ["8.0.0.beta1"]
+        );
+    }
+
+    #[test]
+    fn the_comment_portion_is_never_searched() {
+        let line = "A := 1.0.0 # upd: pypi ruff";
+        assert_eq!(spans_of(line), ["1.0.0"]);
+        let with_noise = "A := 1.0.0 # see 9.9.9 too";
+        let comment_start = with_noise.find('#').unwrap();
+        assert_eq!(version_spans(with_noise, comment_start).len(), 1);
+    }
+
+    #[test]
+    fn every_candidate_span_is_returned_in_ascending_order() {
+        let line = "A := 1.2.3 B := 1.2.3 # upd: pypi x";
+        let comment_start = line.find('#').unwrap();
+        let spans = version_spans(line, comment_start);
+        assert_eq!(spans.len(), 2);
+        assert!(spans[0].start < spans[1].start);
+        assert_eq!(&line[spans[0].clone()], "1.2.3");
+        assert_eq!(&line[spans[1].clone()], "1.2.3");
+    }
+
+    #[test]
+    fn rewrite_spans_replaces_right_to_left() {
+        let line = "A := 1.2.3 B := 1.2.3 # upd: pypi x";
+        let comment_start = line.find('#').unwrap();
+        let spans = version_spans(line, comment_start);
+        assert_eq!(
+            rewrite_spans(line, &spans, "10.0.0"),
+            "A := 10.0.0 B := 10.0.0 # upd: pypi x"
+        );
+    }
+
+    #[test]
+    fn rewrite_spans_leaves_the_comment_untouched() {
+        let line = "A := 1.2.3 # upd: pypi x";
+        let comment_start = line.find('#').unwrap();
+        let spans = version_spans(line, comment_start);
+        assert_eq!(
+            rewrite_spans(line, &spans, "2.0.0"),
+            "A := 2.0.0 # upd: pypi x"
+        );
+    }
+
+    #[test]
+    fn reapply_v_prefix_follows_the_original_token() {
+        assert_eq!(reapply_v_prefix("v1.2.3", "2.0.0"), "v2.0.0");
+        assert_eq!(reapply_v_prefix("v1.2.3", "v2.0.0"), "v2.0.0");
+        assert_eq!(reapply_v_prefix("1.2.3", "v2.0.0"), "2.0.0");
+        assert_eq!(reapply_v_prefix("1.2.3", "2.0.0"), "2.0.0");
+        // Exactly one `v` is stripped, so a doubled prefix is not eaten whole.
+        assert_eq!(reapply_v_prefix("1.2.3", "vv2.0.0"), "v2.0.0");
+    }
+
+    #[test]
+    fn classifies_prereleases_per_ecosystem() {
+        use crate::updater::Lang;
+        assert!(!is_prerelease_token("1.2.3", Lang::Python));
+        assert!(is_prerelease_token("1.2.3rc1", Lang::Python));
+        assert!(is_prerelease_token("v1.2.3rc1", Lang::Python));
+        assert!(!is_prerelease_token("1.0.0", Lang::Node));
+        assert!(is_prerelease_token("1.0.0-rc.1", Lang::Node));
+        assert!(!is_prerelease_token("v1.2.0", Lang::GithubReleases));
+        assert!(is_prerelease_token("v1.2.0-rc1", Lang::GithubReleases));
+    }
+
+    #[test]
+    fn ruby_uses_the_gemfile_classifier_not_the_align_one() {
+        use crate::updater::Lang;
+        // align::is_stable_version calls all of these stable; GemfileUpdater's
+        // classifier does not, and writing a stable release over any of them
+        // would promote a pin the user chose on purpose.
+        for token in ["8.0.0.dev1", "8.0.0.a1", "8.0.0.b2", "2.0.0.final"] {
+            assert!(
+                is_prerelease_token(token, Lang::Ruby),
+                "{token} must classify as a Ruby prerelease"
+            );
+        }
+        assert!(!is_prerelease_token("8.0.0", Lang::Ruby));
     }
 }
