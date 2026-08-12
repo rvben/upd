@@ -405,6 +405,8 @@ pub enum Lang {
     PreCommit,
     Mise,
     Terraform,
+    GithubReleases,
+    Annotated,
 }
 
 impl Lang {
@@ -421,6 +423,8 @@ impl Lang {
             Lang::PreCommit => "pre_commit",
             Lang::Mise => "mise",
             Lang::Terraform => "terraform",
+            Lang::GithubReleases => "github_releases",
+            Lang::Annotated => "annotated",
         }
     }
 }
@@ -901,6 +905,21 @@ mod tests {
     use super::*;
     use std::fs;
     use tempfile::tempdir;
+
+    #[test]
+    fn new_lang_wire_values_are_snake_case_and_not_the_clap_names() {
+        use clap::ValueEnum;
+        assert_eq!(Lang::GithubReleases.as_str(), "github_releases");
+        assert_eq!(Lang::Annotated.as_str(), "annotated");
+        assert_eq!(
+            Lang::GithubReleases.to_possible_value().unwrap().get_name(),
+            "github-releases"
+        );
+        assert_eq!(
+            Lang::Annotated.to_possible_value().unwrap().get_name(),
+            "annotated"
+        );
+    }
 
     #[test]
     fn bump_filter_rejects_empty_current_version() {

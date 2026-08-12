@@ -68,7 +68,7 @@ fn build_schema() -> Value {
                 "short": "l",
                 "description": "Filter by language/ecosystem (repeatable or comma-separated)",
                 "type": "string[]",
-                "enum": ["python", "node", "rust", "go", "ruby", "dotnet", "actions", "pre-commit", "mise", "terraform"]
+                "enum": ["python", "node", "rust", "go", "ruby", "dotnet", "actions", "pre-commit", "mise", "terraform", "github-releases", "annotated"]
             },
             {
                 "name": "limit",
@@ -481,31 +481,34 @@ mod tests {
 
     #[test]
     fn schema_lang_arg_enumerates_valid_ecosystems() {
+        use crate::updater::Lang;
+        use clap::ValueEnum;
+
         let s = build_schema();
         let arg = find_global_arg(&s, "lang");
-        let values: Vec<String> = arg["enum"]
+        let mut values: Vec<String> = arg["enum"]
             .as_array()
             .expect("--lang must have an enum of valid ecosystems")
             .iter()
             .filter_map(|v| v.as_str().map(str::to_string))
             .collect();
-        for eco in [
-            "python",
-            "node",
-            "rust",
-            "go",
-            "ruby",
-            "dotnet",
-            "actions",
-            "pre-commit",
-            "mise",
-            "terraform",
-        ] {
-            assert!(
-                values.iter().any(|v| v == eco),
-                "--lang enum must include '{eco}'; got {values:?}"
-            );
-        }
+        values.sort();
+
+        let mut expected: Vec<String> = Lang::value_variants()
+            .iter()
+            .map(|lang| {
+                lang.to_possible_value()
+                    .expect("every Lang variant must be selectable on the command line")
+                    .get_name()
+                    .to_string()
+            })
+            .collect();
+        expected.sort();
+
+        assert_eq!(
+            values, expected,
+            "the --lang enum in the schema must list exactly the Lang variants clap accepts"
+        );
     }
 
     #[test]

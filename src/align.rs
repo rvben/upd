@@ -140,6 +140,13 @@ pub fn find_alignments(packages: HashMap<(String, Lang), Vec<PackageOccurrence>>
     let mut result = AlignResult::default();
 
     for ((package_name, lang), occurrences) in packages {
+        // Annotated lines carry their own per-line source; two lines that share a
+        // package name may resolve against different registries, so aligning them
+        // would write one ecosystem's release into another's pin.
+        if lang == Lang::Annotated {
+            continue;
+        }
+
         // Skip packages that only appear once (already "aligned")
         if occurrences.len() <= 1 {
             continue;
@@ -198,7 +205,12 @@ fn is_stable_version(version: &str, lang: Lang) -> bool {
                 && !v.contains(".beta")
                 && !v.contains(".alpha")
         }
-        Lang::Actions | Lang::PreCommit | Lang::Mise | Lang::Terraform => {
+        Lang::Actions
+        | Lang::PreCommit
+        | Lang::Mise
+        | Lang::Terraform
+        | Lang::GithubReleases
+        | Lang::Annotated => {
             let v = version.strip_prefix('v').unwrap_or(version);
             !v.contains('-')
         }
@@ -215,7 +227,12 @@ pub(crate) fn compare_versions(a: &str, b: &str, lang: Lang) -> std::cmp::Orderi
         Lang::Python => compare_pep440(a, b),
         Lang::Node | Lang::Rust | Lang::Ruby | Lang::DotNet => compare_semver(a, b),
         Lang::Go => compare_go_version(a, b),
-        Lang::Actions | Lang::PreCommit | Lang::Mise | Lang::Terraform => {
+        Lang::Actions
+        | Lang::PreCommit
+        | Lang::Mise
+        | Lang::Terraform
+        | Lang::GithubReleases
+        | Lang::Annotated => {
             let clean_a = a.trim_start_matches('v');
             let clean_b = b.trim_start_matches('v');
             compare_semver(clean_a, clean_b)
@@ -535,5 +552,50 @@ mod tests {
             Ordering::Less
         );
         assert_eq!(compare_semver("1.0.0-beta", "1.0.0"), Ordering::Less);
+    }
+
+    fn occ_for_test(version: &str) -> PackageOccurrence {
+        PackageOccurrence {
+            file_path: PathBuf::from("Makefile"),
+            file_type: FileType::Requirements,
+            version: version.to_string(),
+            line_number: Some(1),
+            has_upper_bound: false,
+            original_name: "foo".to_string(),
+            is_bumpable: true,
+        }
+    }
+
+    #[test]
+    fn find_alignments_skips_annotated_groups() {
+        let mut packages: HashMap<(String, Lang), Vec<PackageOccurrence>> = HashMap::new();
+        packages.insert(
+            ("foo".to_string(), Lang::Annotated),
+            vec![occ_for_test("1.0.0"), occ_for_test("2.0.0")],
+        );
+
+        let result = find_alignments(packages);
+
+        assert!(
+            result.packages.is_empty(),
+            "annotated groups must never produce an alignment: {:?}",
+            result.packages
+        );
+        assert_eq!(result.misaligned_count, 0);
+    }
+
+    #[test]
+    fn find_alignments_reports_non_annotated_groups() {
+        let mut packages: HashMap<(String, Lang), Vec<PackageOccurrence>> = HashMap::new();
+        packages.insert(
+            ("foo".to_string(), Lang::Python),
+            vec![occ_for_test("1.0.0"), occ_for_test("2.0.0")],
+        );
+
+        let result = find_alignments(packages);
+
+        assert_eq!(result.packages.len(), 1);
+        assert_eq!(result.packages[0].highest_version, "2.0.0");
+        assert_eq!(result.misaligned_count, 1);
     }
 }

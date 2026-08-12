@@ -2644,11 +2644,14 @@ pub(crate) fn build_audit_packages(
         .collect();
 
     for ((name, lang), occurrences) in packages {
-        // OSV doesn't cover GitHub Actions, pre-commit hooks, mise tools, or Terraform; skip
+        // OSV doesn't cover GitHub Actions, pre-commit hooks, mise tools, Terraform,
+        // GitHub releases, or annotated pins; skip
         if *lang == Lang::Actions
             || *lang == Lang::PreCommit
             || *lang == Lang::Mise
             || *lang == Lang::Terraform
+            || *lang == Lang::GithubReleases
+            || *lang == Lang::Annotated
         {
             continue;
         }
@@ -2660,7 +2663,12 @@ pub(crate) fn build_audit_packages(
             Lang::Go => Ecosystem::Go,
             Lang::Ruby => Ecosystem::RubyGems,
             Lang::DotNet => Ecosystem::NuGet,
-            Lang::Actions | Lang::PreCommit | Lang::Mise | Lang::Terraform => {
+            Lang::Actions
+            | Lang::PreCommit
+            | Lang::Mise
+            | Lang::Terraform
+            | Lang::GithubReleases
+            | Lang::Annotated => {
                 unreachable!("filtered above")
             }
         };
@@ -3261,6 +3269,8 @@ fn build_sarif_occurrences(
             || *lang == Lang::PreCommit
             || *lang == Lang::Mise
             || *lang == Lang::Terraform
+            || *lang == Lang::GithubReleases
+            || *lang == Lang::Annotated
         {
             continue;
         }
@@ -3272,7 +3282,12 @@ fn build_sarif_occurrences(
             Lang::Go => Ecosystem::Go,
             Lang::Ruby => Ecosystem::RubyGems,
             Lang::DotNet => Ecosystem::NuGet,
-            Lang::Actions | Lang::PreCommit | Lang::Mise | Lang::Terraform => {
+            Lang::Actions
+            | Lang::PreCommit
+            | Lang::Mise
+            | Lang::Terraform
+            | Lang::GithubReleases
+            | Lang::Annotated => {
                 unreachable!("filtered above")
             }
         };
@@ -3414,6 +3429,8 @@ fn print_alignment(alignment: &PackageAlignment, _dry_run: bool) {
         Lang::PreCommit => " (pre-commit)",
         Lang::Mise => " (mise)",
         Lang::Terraform => " (terraform)",
+        Lang::GithubReleases => " (github-releases)",
+        Lang::Annotated => " (annotated)",
     };
 
     println!(
