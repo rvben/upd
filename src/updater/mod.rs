@@ -640,6 +640,46 @@ impl FileType {
 
         None
     }
+
+    /// File names a directory walk opens looking for version annotations.
+    /// Deliberately small, and in v1 the only set: no Markdown (it would
+    /// rewrite this project's own README and every fixture in this repo), no
+    /// `Dockerfile*` (the approved Docker design claims those names), no YAML.
+    const ANNOTATED_FILE_NAMES: &'static [&'static str] = &[
+        "Makefile",
+        "makefile",
+        "GNUmakefile",
+        "justfile",
+        "Justfile",
+    ];
+
+    /// Extensions a directory walk opens, matched against the file name.
+    const ANNOTATED_FILE_EXTENSIONS: &'static [&'static str] = &[".mk", ".sh", ".bash"];
+
+    /// `detect`, extended with the annotated set. Every earlier rule wins by
+    /// construction. `explicit` is true for a file named directly on the
+    /// command line, which bypasses the set entirely: `upd README.md` works
+    /// with no configuration while a walk never touches Markdown.
+    pub(crate) fn detect_with_annotated(path: &Path, explicit: bool) -> Option<Self> {
+        if let Some(file_type) = Self::detect(path) {
+            return Some(file_type);
+        }
+
+        if explicit {
+            return Some(FileType::Annotated);
+        }
+
+        let file_name = path.file_name()?.to_str()?;
+        if Self::ANNOTATED_FILE_NAMES.contains(&file_name)
+            || Self::ANNOTATED_FILE_EXTENSIONS
+                .iter()
+                .any(|ext| file_name.ends_with(ext))
+        {
+            return Some(FileType::Annotated);
+        }
+
+        None
+    }
 }
 
 /// Trait for file updaters
@@ -895,8 +935,10 @@ fn walk_dependency_files(
 
     for path in paths {
         if path.is_file() {
-            if let Some(file_type) = FileType::detect(path)
-                && (langs.is_empty() || langs.contains(&file_type.lang()))
+            if let Some(file_type) = FileType::detect_with_annotated(path, true)
+                && (langs.is_empty()
+                    || langs.contains(&file_type.lang())
+                    || file_type == FileType::Annotated)
             {
                 files.push((path.clone(), file_type));
             }
@@ -940,8 +982,10 @@ fn walk_dependency_files(
             if !entry_path.is_file() {
                 continue;
             }
-            if let Some(file_type) = FileType::detect(entry_path)
-                && (langs.is_empty() || langs.contains(&file_type.lang()))
+            if let Some(file_type) = FileType::detect_with_annotated(entry_path, false)
+                && (langs.is_empty()
+                    || langs.contains(&file_type.lang())
+                    || file_type == FileType::Annotated)
             {
                 files.push((entry_path.to_path_buf(), file_type));
             }
@@ -969,6 +1013,156 @@ mod tests {
         assert_eq!(
             Lang::Annotated.to_possible_value().unwrap().get_name(),
             "annotated"
+        );
+    }
+
+    /// Section 2.2: the built-in set, matched against the file name alone.
+    /// Every pattern is a bare name with no `/`, which is why file-name
+    /// matching is right here and a scan-root-relative path is not needed.
+    #[test]
+    fn detect_with_annotated_claims_the_built_in_names() {
+        for name in [
+            "Makefile",
+            "makefile",
+            "GNUmakefile",
+            "common.mk",
+            "justfile",
+            "Justfile",
+            "release.sh",
+            "release.bash",
+        ] {
+            let path = PathBuf::from("/repo/sub").join(name);
+            assert_eq!(
+                FileType::detect_with_annotated(&path, false),
+                Some(FileType::Annotated),
+                "{name} must be claimed by a walk"
+            );
+        }
+    }
+
+    /// The negative control for the set above. `Dockerfile` is reserved for the
+    /// approved Docker design and Markdown would rewrite this project's own
+    /// README, so neither is in the set.
+    #[test]
+    fn detect_with_annotated_leaves_unlisted_names_alone() {
+        for name in [
+            "README.md",
+            "Dockerfile",
+            "Dockerfile.ci",
+            "notes.txt",
+            "build.zsh",
+        ] {
+            let path = PathBuf::from("/repo").join(name);
+            assert_eq!(
+                FileType::detect_with_annotated(&path, false),
+                None,
+                "{name} must not be claimed by a walk"
+            );
+        }
+    }
+
+    /// Section 2.2 rule 1: an earlier rule always wins, which holds by
+    /// construction because `detect` runs first. `detect` is path-sensitive in
+    /// two places and still receives the real candidate path, so both survive.
+    #[test]
+    fn detect_with_annotated_never_overrides_an_earlier_rule() {
+        assert_eq!(
+            FileType::detect_with_annotated(Path::new("/repo/Cargo.toml"), false),
+            Some(FileType::CargoToml)
+        );
+        assert_eq!(
+            FileType::detect_with_annotated(Path::new("/repo/.github/workflows/ci.yml"), false),
+            Some(FileType::GithubActions)
+        );
+        let cached = Path::new("/repo/.terraform/modules/main.tf");
+        assert_eq!(FileType::detect(cached), None);
+        assert_eq!(
+            FileType::detect_with_annotated(cached, false),
+            None,
+            "a .tf under .terraform/ is excluded by detect and is not in the annotated set either"
+        );
+    }
+
+    /// Section 2.4: an explicit file-path argument bypasses the pattern set,
+    /// which is what makes `upd README.md` work with no configuration. The
+    /// bypass still yields to an earlier rule.
+    #[test]
+    fn an_explicit_path_is_annotated_whatever_its_name() {
+        let notes = Path::new("/repo/some-notes.txt");
+        assert_eq!(FileType::detect_with_annotated(notes, false), None);
+        assert_eq!(
+            FileType::detect_with_annotated(notes, true),
+            Some(FileType::Annotated)
+        );
+        assert_eq!(
+            FileType::detect_with_annotated(Path::new("/repo/go.mod"), true),
+            Some(FileType::GoMod)
+        );
+    }
+
+    /// Section 2.3: `--lang` filters at discovery, before a line is read, so it
+    /// cannot know which ecosystems a file's annotations name. An annotated
+    /// file is therefore admitted whatever the selection; without this,
+    /// `--lang python` drops the Makefile and its PyPI pins are never seen.
+    #[test]
+    fn a_lang_filter_never_drops_an_annotated_file() {
+        let dir = tempdir().unwrap();
+        fs::write(
+            dir.path().join("Makefile"),
+            "BAO_VERSION ?= 2.6.1  # upd: pypi openbao-cli\n",
+        )
+        .unwrap();
+        fs::write(dir.path().join("Cargo.toml"), "[package]\nname = \"x\"\n").unwrap();
+
+        let found = walk_dependency_files(&[dir.path().to_path_buf()], &[Lang::Python], true);
+
+        assert!(
+            found.iter().any(|(_, ft)| *ft == FileType::Annotated),
+            "--lang python must still admit the Makefile: {found:?}"
+        );
+        assert!(
+            !found.iter().any(|(_, ft)| *ft == FileType::CargoToml),
+            "--lang python must still drop Cargo.toml: {found:?}"
+        );
+
+        let explicit = walk_dependency_files(&[dir.path().join("Makefile")], &[Lang::Rust], true);
+        assert_eq!(
+            explicit.len(),
+            1,
+            "an explicitly named annotated file survives --lang rust too: {explicit:?}"
+        );
+    }
+
+    /// Section 2.4: the built-in set is unconditional, not gated on an option
+    /// that happens to default to empty. `discover_files` passes
+    /// `DiscoverOptions::default()`, so this is the guard for that.
+    #[test]
+    fn discover_files_finds_a_makefile_by_default() {
+        let dir = tempdir().unwrap();
+        fs::write(
+            dir.path().join("Makefile"),
+            "BAO_VERSION ?= 2.6.1  # upd: pypi openbao-cli\n",
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join("Dockerfile"),
+            "ARG BAO_VERSION=2.6.1  # upd: pypi openbao-cli\n",
+        )
+        .unwrap();
+
+        let found = discover_files(&[dir.path().to_path_buf()], &[]);
+
+        assert!(
+            found
+                .iter()
+                .any(|(p, ft)| p.file_name().unwrap() == "Makefile" && *ft == FileType::Annotated),
+            "{found:?}"
+        );
+        assert!(
+            !found
+                .iter()
+                .any(|(p, _)| p.file_name().unwrap() == "Dockerfile"),
+            "Dockerfile is reserved for the Docker design: {found:?}"
         );
     }
 
