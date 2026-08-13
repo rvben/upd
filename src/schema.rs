@@ -11,10 +11,11 @@ pub fn build_schema_value() -> Value {
 
 fn build_schema() -> Value {
     json!({
-        "clispec": "0.2",
+        "clispec": "0.3",
         "name": "upd",
         "version": env!("CARGO_PKG_VERSION"),
         "description": "A fast dependency updater for Python, Node.js, Rust, Go, Ruby, .NET, Terraform, GitHub Actions, pre-commit, and Mise/asdf projects",
+        "output": {"tty": "text", "piped": "json"},
         "global_args": [
             {
                 "name": "paths",
@@ -24,7 +25,7 @@ fn build_schema() -> Value {
             },
             {
                 "name": "output",
-                "short": "o",
+                "short": "-o",
                 "description": "Output format. auto emits JSON when stdout is not a TTY, explicit value always wins",
                 "type": "string",
                 "enum": ["auto", "text", "json"],
@@ -42,7 +43,7 @@ fn build_schema() -> Value {
             },
             {
                 "name": "dry-run",
-                "short": "n",
+                "short": "-n",
                 "description": "Show what would change without writing any files",
                 "type": "boolean"
             },
@@ -65,7 +66,7 @@ fn build_schema() -> Value {
             },
             {
                 "name": "lang",
-                "short": "l",
+                "short": "-l",
                 "description": "Filter by language/ecosystem (repeatable or comma-separated)",
                 "type": "string[]",
                 "enum": ["python", "node", "rust", "go", "ruby", "dotnet", "actions", "pre-commit", "mise", "terraform", "github-releases", "annotated"]
@@ -104,7 +105,7 @@ fn build_schema() -> Value {
             },
             {
                 "name": "interactive",
-                "short": "i",
+                "short": "-i",
                 "description": "Prompt before applying each update",
                 "type": "boolean"
             },
@@ -135,13 +136,13 @@ fn build_schema() -> Value {
             },
             {
                 "name": "verbose",
-                "short": "v",
+                "short": "-v",
                 "description": "Verbose output",
                 "type": "boolean"
             },
             {
                 "name": "quiet",
-                "short": "q",
+                "short": "-q",
                 "description": "Suppress all output except errors and warnings",
                 "type": "boolean"
             },
@@ -152,7 +153,7 @@ fn build_schema() -> Value {
             },
             {
                 "name": "config",
-                "short": "c",
+                "short": "-c",
                 "description": "Path to config file (default: auto-discover .updrc.toml, upd.toml, or .updrc)",
                 "type": "path"
             },
@@ -171,7 +172,11 @@ fn build_schema() -> Value {
             {
                 "name": "update",
                 "description": "Update dependencies (default when no subcommand is given). Dry-run by default; pass --apply to write",
+                "effects": "non_idempotent",
                 "mutating": true,
+                "cardinality": "unbounded",
+                "pagination": {"style": "offset", "limit_arg": "limit", "offset_arg": "offset"},
+                "fields_arg": "fields",
                 "args": [
                     {
                         "name": "paths",
@@ -183,15 +188,19 @@ fn build_schema() -> Value {
                 "output_fields": [
                     {"name": "command", "type": "string", "description": "Always \"update\""},
                     {"name": "mode", "type": "string", "description": "\"dry-run\" or \"applied\""},
-                    {"name": "files", "type": "array", "description": "Per-file update reports. Each entry in a file's updates[] may carry method (manifest|uv-constraint|npm-override|cargo-precise) and status (planned|applied|pending_relock|skipped|unfixable|already_satisfied|failed|rolled_back), present only for version floors created when --package targets a lock-only package; error carries guidance for an unfixable floor, or resolver/tool stderr for a failed or rolled-back floor"},
+                    {"name": "files", "type": "array", "items": {"type": "object"}, "description": "Per-file update reports. Each entry in a file's updates[] may carry method (manifest|uv-constraint|npm-override|cargo-precise) and status (planned|applied|pending_relock|skipped|unfixable|already_satisfied|failed|rolled_back), present only for version floors created when --package targets a lock-only package; error carries guidance for an unfixable floor, or resolver/tool stderr for a failed or rolled-back floor"},
                     {"name": "summary", "type": "object", "description": "Aggregate counts (files_scanned, updates_total, etc.)"},
-                    {"name": "warnings", "type": "array", "description": "Lockfile-discovery warnings (e.g. an ancestor lock outside the scanned paths), populated only when --package triggers lockfile scanning for version floors; signals incomplete coverage without failing the command"}
+                    {"name": "warnings", "type": "array", "items": {"type": "object"}, "description": "Lockfile-discovery warnings (e.g. an ancestor lock outside the scanned paths), populated only when --package triggers lockfile scanning for version floors; signals incomplete coverage without failing the command"}
                 ]
             },
             {
                 "name": "align",
                 "description": "Align all packages to the highest version found in the repository. Dry-run by default; pass --apply to write",
+                "effects": "non_idempotent",
                 "mutating": true,
+                "cardinality": "unbounded",
+                "pagination": {"style": "offset", "limit_arg": "limit", "offset_arg": "offset"},
+                "fields_arg": "fields",
                 "args": [
                     {
                         "name": "paths",
@@ -202,14 +211,19 @@ fn build_schema() -> Value {
                 ],
                 "output_fields": [
                     {"name": "command", "type": "string", "description": "Always \"align\""},
-                    {"name": "packages", "type": "array", "description": "Per-package alignment records (name, highest_version, occurrences with file/line/is_misaligned)"},
+                    {"name": "packages", "type": "array", "items": {"type": "object"}, "description": "Per-package alignment records (name, highest_version, occurrences with file/line/is_misaligned)"},
                     {"name": "summary", "type": "object", "description": "Aggregate counts (files_scanned, misaligned_packages, misaligned_occurrences, packages)"}
-                ]
+                ],
+                "example": {"args": ["align", "--dry-run", "Cargo.toml"]}
             },
             {
                 "name": "audit",
                 "description": "Check dependencies for known security vulnerabilities",
-                "mutating": false,
+                "effects": "non_idempotent",
+                "mutating": true,
+                "cardinality": "unbounded",
+                "pagination": {"style": "offset", "limit_arg": "limit", "offset_arg": "offset"},
+                "fields_arg": "fields",
                 "args": [
                     {
                         "name": "paths",
@@ -236,35 +250,52 @@ fn build_schema() -> Value {
                 "output_fields": [
                     {"name": "command", "type": "string", "description": "Always \"audit\""},
                     {"name": "status", "type": "string", "description": "\"complete\" or \"incomplete\" (an offline cache miss or coverage warning)"},
-                    {"name": "vulnerabilities", "type": "array", "description": "Vulnerable packages, each with package, ecosystem, version, id, severity, fixed_version, url, aliases (alternate ids such as CVEs, omitted when empty), and source (advisory database prefix of id, e.g. GHSA/PYSEC/GO)"},
+                    {"name": "vulnerabilities", "type": "array", "items": {"type": "object"}, "description": "Vulnerable packages, each with package, ecosystem, version, id, severity, fixed_version, url, aliases (alternate ids such as CVEs, omitted when empty), and source (advisory database prefix of id, e.g. GHSA/PYSEC/GO)"},
                     {"name": "summary", "type": "object", "description": "Aggregate counts (packages_checked, vulnerabilities, vulnerable_packages, errors)"},
-                    {"name": "errors", "type": "array", "description": "Per-package audit errors (e.g. unreachable registry, offline cache miss)"},
-                    {"name": "warnings", "type": "array", "description": "Coverage warnings (e.g. go.mod predating go 1.17): the audit ran but could not fully cover these inputs; status becomes \"incomplete\" without a nonzero exit"},
-                    {"name": "fixes", "type": "array", "description": "Fix outcomes for each vulnerable pair targeted by --fix-audit, present only under --fix-audit. Each entry: package, dependency_key? (composite key disambiguating aliased or multi-section declarations), from_version, to_version? (absent when unfixable), method? (manifest|uv-constraint|npm-override|cargo-precise), path?, status (planned|applied|pending_relock|skipped|unfixable|already_satisfied|failed|rolled_back), error? (guidance for an unfixable floor, or resolver/tool stderr for a failed or rolled-back floor)"}
+                    {"name": "errors", "type": "array", "items": {"type": "object"}, "description": "Per-package audit errors (e.g. unreachable registry, offline cache miss)"},
+                    {"name": "warnings", "type": "array", "items": {"type": "object"}, "description": "Coverage warnings (e.g. go.mod predating go 1.17): the audit ran but could not fully cover these inputs; status becomes \"incomplete\" without a nonzero exit"},
+                    {"name": "fixes", "type": "array", "items": {"type": "object"}, "description": "Fix outcomes for each vulnerable pair targeted by --fix-audit, present only under --fix-audit. Each entry: package, dependency_key? (composite key disambiguating aliased or multi-section declarations), from_version, to_version? (absent when unfixable), method? (manifest|uv-constraint|npm-override|cargo-precise), path?, status (planned|applied|pending_relock|skipped|unfixable|already_satisfied|failed|rolled_back), error? (guidance for an unfixable floor, or resolver/tool stderr for a failed or rolled-back floor)"}
                 ]
             },
             {
                 "name": "clean-cache",
                 "description": "Clear the version cache",
-                "mutating": true
+                "effects": "non_idempotent",
+                "mutating": true,
+                "cardinality": "single",
+                "stdout_schema": {}
             },
             {
                 "name": "self-update",
                 "description": "Update upd itself to the latest release",
-                "mutating": true
+                "effects": "non_idempotent",
+                "mutating": true,
+                "cardinality": "single",
+                "stdout_schema": {}
+            },
+            {
+                "name": "capabilities",
+                "description": "Describe offline-safe CLI capabilities",
+                "effects": "read_only",
+                "mutating": false,
+                "cardinality": "single",
+                "args": [],
+                "example": {"args": ["capabilities"]},
+                "output_fields": [
+                    {"name": "name", "type": "string"},
+                    {"name": "version", "type": "string"},
+                    {"name": "clispec", "type": "string"},
+                    {"name": "output", "type": "array", "items": {"type": "string"}},
+                    {"name": "features", "type": "array", "items": {"type": "string"}}
+                ]
             },
             {
                 "name": "schema",
-                "description": "Print machine-readable schema (clispec v0.2 JSON). Works offline with no config required",
+                "description": "Print machine-readable schema (clispec v0.3 JSON). Works offline with no config required",
+                "effects": "read_only",
                 "mutating": false,
-                "output_fields": [
-                    {"name": "clispec", "type": "string", "description": "Spec version"},
-                    {"name": "name", "type": "string", "description": "Tool name"},
-                    {"name": "version", "type": "string", "description": "Tool version"},
-                    {"name": "commands", "type": "array", "description": "Available commands"},
-                    {"name": "global_args", "type": "array", "description": "Global flags accepted by every command"},
-                    {"name": "errors", "type": "array", "description": "Error kinds with exit codes"}
-                ]
+                "cardinality": "single",
+                "stdout_schema": {"$ref": "https://clispec.dev/schema/v0.3.json"}
             }
         ],
         "outcomes": [
@@ -312,13 +343,13 @@ fn build_schema() -> Value {
 mod tests {
     use super::*;
 
-    // The clispec v0.2 JSON Schema, vendored from clispec.dev/schema/v0.2.json.
-    const CLISPEC_V0_2_SCHEMA: &str = include_str!("../fixtures/clispec-v0.2.json");
+    // The clispec v0.3 JSON Schema, vendored from clispec.dev/schema/v0.3.json.
+    const CLISPEC_V0_3_SCHEMA: &str = include_str!("../fixtures/clispec-v0.3.json");
 
     #[test]
-    fn schema_output_validates_against_clispec_v0_2() {
+    fn schema_output_validates_against_clispec_v0_3() {
         let meta_schema: Value =
-            serde_json::from_str(CLISPEC_V0_2_SCHEMA).expect("vendored schema must be valid JSON");
+            serde_json::from_str(CLISPEC_V0_3_SCHEMA).expect("vendored schema must be valid JSON");
         let validator = jsonschema::draft202012::new(&meta_schema)
             .expect("vendored schema must be a valid Draft 2020-12 schema");
 
@@ -326,7 +357,7 @@ mod tests {
         let errors: Vec<_> = validator.iter_errors(&instance).collect();
         assert!(
             errors.is_empty(),
-            "schema output must validate against clispec v0.2: {:?}",
+            "schema output must validate against clispec v0.3: {:?}",
             errors
                 .iter()
                 .map(|e| format!("{}: {}", e.instance_path(), e))
@@ -337,7 +368,7 @@ mod tests {
     #[test]
     fn schema_has_required_top_level_fields() {
         let s = build_schema();
-        assert_eq!(s["clispec"], "0.2");
+        assert_eq!(s["clispec"], "0.3");
         assert_eq!(s["name"], "upd");
         assert!(s["version"].is_string());
         assert!(s["commands"].is_array());
@@ -346,7 +377,7 @@ mod tests {
     }
 
     #[test]
-    fn schema_all_commands_have_mutating_marker() {
+    fn schema_all_commands_have_effects_and_cardinality() {
         let s = build_schema();
         let commands = s["commands"].as_array().expect("commands must be an array");
         for cmd in commands {
@@ -354,6 +385,16 @@ mod tests {
             assert!(
                 cmd.get("mutating").is_some_and(|m| m.is_boolean()),
                 "command '{}' must have an explicit mutating marker",
+                name
+            );
+            assert!(
+                cmd.get("effects").is_some_and(|e| e.is_string()),
+                "command '{}' must declare effects",
+                name
+            );
+            assert!(
+                cmd.get("cardinality").is_some_and(|c| c.is_string()),
+                "command '{}' must declare cardinality",
                 name
             );
         }

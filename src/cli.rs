@@ -52,7 +52,7 @@ pub enum OutputFormat {
     author,
     version,
     about = "A fast dependency updater for Python, Node.js, Rust, Go, Ruby, .NET, Terraform, GitHub Actions, pre-commit, and Mise/asdf projects",
-    after_help = "Run 'upd schema' for machine-readable interface description (clispec v0.2).\n\nTip: changes are applied in-place \u{2014} use git to revert."
+    after_help = "Run 'upd schema' for machine-readable interface description (clispec v0.3).\n\nTip: changes are applied in-place \u{2014} use git to revert."
 )]
 pub struct Cli {
     #[command(subcommand)]
@@ -316,12 +316,15 @@ pub enum Command {
     /// Update upd itself
     SelfUpdate,
 
-    /// Print machine-readable schema (clispec v0.2 JSON).
+    /// Print machine-readable schema (clispec v0.3 JSON).
     ///
     /// Works offline with no authentication or configuration required.
     /// Consumers can use this to discover commands, arguments, output fields,
     /// and error kinds without parsing --help text.
     Schema,
+
+    /// Describe offline-safe CLI capabilities
+    Capabilities,
 }
 
 impl Cli {

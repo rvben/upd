@@ -879,6 +879,24 @@ async fn run() -> Result<()> {
         upd::schema::print_schema();
         return Ok(());
     }
+    if matches!(cli.command, Some(Command::Capabilities)) {
+        let capabilities = serde_json::json!({
+            "name": "upd",
+            "version": env!("CARGO_PKG_VERSION"),
+            "clispec": "0.3",
+            "output": ["text", "json", "sarif"],
+            "features": ["schema", "dry-run", "dependency updates", "security audit"]
+        });
+        if effective_json_mode(&cli) {
+            println!("{}", serde_json::to_string_pretty(&capabilities)?);
+        } else {
+            println!(
+                "upd {} - clispec 0.3; text/json output, dry-run, dependency audit",
+                env!("CARGO_PKG_VERSION")
+            );
+        }
+        return Ok(());
+    }
 
     // --show-config: print the canonical config schema and exit
     if cli.show_config {
@@ -930,6 +948,9 @@ async fn run() -> Result<()> {
         Some(Command::Schema) => {
             // Already handled above before show_config check.
             unreachable!("Schema handled earlier");
+        }
+        Some(Command::Capabilities) => {
+            unreachable!("Capabilities handled earlier");
         }
         Some(Command::Update { .. }) | None => {
             run_update(&cli).await?;
