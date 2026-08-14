@@ -464,10 +464,15 @@ on:
     - cron: "17 6 * * 2"
   workflow_dispatch:
 
+permissions:
+  contents: write
+  pull-requests: write
+
 jobs:
   actions:
-    uses: rvben/upd/.github/workflows/dependency-health.yml@<full-commit-sha>
+    uses: rvben/upd/.github/workflows/dependency-health.yml@bdc55ece90b7333f177027ad208705b815b6caab # v0.5.2
     with:
+      upd-version: v0.5.2
       min-age: 7d
       max-bump: minor
       validation-command: make test
@@ -483,6 +488,13 @@ Use a narrowly scoped GitHub App token or fine-grained PAT for
 falls back to `GITHUB_TOKEN`; GitHub suppresses subsequent workflow runs caused
 by that token. Set `fail-on-blocked: true` when every SHA pin is expected to
 carry a verified version annotation.
+
+For an existing fleet, keep GitHub Actions updates enabled in Dependabot for
+four successful weekly `upd` cycles. During that proving period, review the
+workflow summaries, resolve intentionally blocked legacy pins, and configure
+`UPD_PR_TOKEN` before relying on PR-triggered CI. After four green cycles,
+remove only the overlapping `github-actions` Dependabot updates; keep its other
+package ecosystems enabled.
 
 ## Version Constraints
 
