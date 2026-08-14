@@ -407,6 +407,7 @@ fn load_update_configs(
 fn build_update_options(
     dry_run: bool,
     full_precision: bool,
+    update_action_shas: bool,
     config: Option<Arc<UpdConfig>>,
     packages: &[String],
     langs: &[Lang],
@@ -415,6 +416,7 @@ fn build_update_options(
     bump_filter: BumpFilter,
 ) -> UpdateOptions {
     let mut options = UpdateOptions::new(dry_run, full_precision);
+    options = options.with_action_sha_updates(update_action_shas);
     if let Some(config) = config {
         options = options.with_config(config);
     }
@@ -551,6 +553,7 @@ fn empty_floor_report(path: &Path) -> upd::output::UpdateFileReport {
         ignored: Vec::new(),
         held_back: Vec::new(),
         skipped_by_cooldown: Vec::new(),
+        skipped: Vec::new(),
         errors: Vec::new(),
         warnings: Vec::new(),
     }
@@ -885,7 +888,7 @@ async fn run() -> Result<()> {
             "version": env!("CARGO_PKG_VERSION"),
             "clispec": "0.3",
             "output": ["text", "json", "sarif"],
-            "features": ["schema", "dry-run", "dependency updates", "security audit"]
+            "features": ["schema", "dry-run", "dependency updates", "security audit", "verified action SHA updates"]
         });
         if effective_json_mode(&cli) {
             println!("{}", serde_json::to_string_pretty(&capabilities)?);
@@ -1273,6 +1276,7 @@ async fn run_update(cli: &Cli) -> Result<()> {
                 build_update_options(
                     dry_run,
                     cli.full_precision,
+                    cli.update_action_shas,
                     config,
                     &cli.packages,
                     &cli.langs,
@@ -1544,6 +1548,7 @@ async fn run_update(cli: &Cli) -> Result<()> {
             let options = build_update_options(
                 dry_run,
                 cli.full_precision,
+                cli.update_action_shas,
                 config,
                 &cli.packages,
                 &cli.langs,
@@ -1694,6 +1699,9 @@ async fn run_update(cli: &Cli) -> Result<()> {
                 status: Some(outcome.status.as_str()),
                 error: outcome.error.clone(),
                 source: None,
+                reference_kind: None,
+                current_commit: None,
+                latest_commit: None,
             });
         }
 
@@ -1720,6 +1728,9 @@ async fn run_update(cli: &Cli) -> Result<()> {
                 status: Some("unfixable"),
                 error: Some(u.reason.clone()),
                 source: None,
+                reference_kind: None,
+                current_commit: None,
+                latest_commit: None,
             });
         }
 
@@ -2057,6 +2068,7 @@ fn emit_update_json(input: UpdateReportInput<'_>, bounded: &BoundedOutputParams<
         warnings: total_result.warnings.len() + lockscan_warnings.len(),
         held_back: total_result.held_back.len(),
         skipped_by_cooldown: total_result.skipped_by_cooldown.len(),
+        skipped: total_result.skipped.len(),
     };
 
     files.extend(floor_reports);
@@ -2150,6 +2162,7 @@ async fn run_interactive_update(
         let dry_run_options = build_update_options(
             true,
             cli.full_precision,
+            cli.update_action_shas,
             file_configs.get(path).cloned().flatten(),
             &cli.packages,
             &cli.langs,
@@ -4430,6 +4443,7 @@ fn print_file_result(
         && result.warnings.is_empty()
         && result.held_back.is_empty()
         && result.skipped_by_cooldown.is_empty()
+        && result.skipped.is_empty()
     {
         return;
     }
@@ -4547,6 +4561,21 @@ fn print_file_result(
         }
     }
 
+    for skipped in &result.skipped {
+        let location = match skipped.line_number {
+            Some(n) => format!("{}:{}:", path, n),
+            None => format!("{}:", path),
+        };
+        println!(
+            "{} {} {} {} ({})",
+            location.blue().underline(),
+            "Blocked".yellow(),
+            skipped.package.bold(),
+            skipped.message,
+            skipped.reason.dimmed()
+        );
+    }
+
     for error in &result.errors {
         let location = format!("{}:", path);
         eprintln!(
@@ -4584,11 +4613,13 @@ fn print_summary(
     let ignored_count = result.ignored.len();
     let held_back_count = result.held_back.len();
     let skipped_cooldown_count = result.skipped_by_cooldown.len();
+    let skipped_count = result.skipped.len();
 
     if filtered_total == 0
         && pinned_count == 0
         && held_back_count == 0
         && skipped_cooldown_count == 0
+        && skipped_count == 0
     {
         println!(
             "{} Scanned {} file(s), all dependencies up to date",
@@ -4653,6 +4684,14 @@ fn print_summary(
                 "{} {} package(s) skipped (cooldown)",
                 "Skipped".dimmed(),
                 skipped_cooldown_count.to_string().dimmed()
+            );
+        }
+
+        if skipped_count > 0 {
+            println!(
+                "{} {} package(s) blocked by safety checks",
+                "Blocked".yellow(),
+                skipped_count.to_string().yellow().bold()
             );
         }
     }

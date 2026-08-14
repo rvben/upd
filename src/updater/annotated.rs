@@ -1254,6 +1254,11 @@ mod tests {
             self.inner.list_ref_names(package).await
         }
 
+        async fn resolve_ref_to_commit(&self, package: &str, reference: &str) -> Result<String> {
+            self.calls.fetch_add(1, AtomicOrdering::SeqCst);
+            self.inner.resolve_ref_to_commit(package, reference).await
+        }
+
         fn name(&self) -> &'static str {
             self.inner.name()
         }

@@ -52,6 +52,29 @@ impl ErrorEntry {
     }
 }
 
+fn classify_update_error(message: &str) -> &'static str {
+    let lower = message.to_ascii_lowercase();
+    if lower.contains("error sending request")
+        || lower.contains("timed out")
+        || lower.contains("connection")
+    {
+        "network"
+    } else if lower.contains("http ")
+        || lower.contains("registry")
+        || lower.contains("failed to resolve target sha")
+        || lower.contains("failed to verify current sha pin")
+        || lower.contains("ref not found")
+    {
+        "registry"
+    } else if lower.contains("parse") || lower.contains("invalid version") {
+        "parse"
+    } else if lower.contains("permission denied") || lower.contains("failed to read") {
+        "io"
+    } else {
+        "other"
+    }
+}
+
 /// Wire-level representation of a dependency file and what `upd update`
 /// would or did do to it.
 #[derive(Debug, Serialize)]
@@ -66,6 +89,8 @@ pub struct UpdateFileReport {
     pub held_back: Vec<HeldBackEntry>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub skipped_by_cooldown: Vec<SkippedByCooldownEntry>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub skipped: Vec<SkippedEntry>,
     pub errors: Vec<ErrorEntry>,
     pub warnings: Vec<String>,
 }
@@ -94,6 +119,28 @@ pub struct UpdateEntry {
     /// than per-file. Absent for every entry in a file `upd` has a parser for.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub source: Option<&'static str>,
+    /// Reference style for ecosystem-specific immutable updates. Present as
+    /// `"sha"` for verified GitHub Actions SHA-pin updates.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reference_kind: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub current_commit: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub latest_commit: Option<String>,
+}
+
+/// A dependency deliberately left untouched because a safety prerequisite was
+/// not satisfied. `status` is stable and always `"blocked"`; `reason` is the
+/// machine-readable condition callers should branch on.
+#[derive(Debug, Serialize)]
+pub struct SkippedEntry {
+    pub package: String,
+    pub current: String,
+    pub status: &'static str,
+    pub reason: &'static str,
+    pub message: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub line: Option<usize>,
 }
 
 /// A package update held back by cooldown — the chosen version is older than
@@ -175,6 +222,8 @@ pub struct UpdateSummary {
     pub held_back: usize,
     #[serde(default, skip_serializing_if = "is_zero")]
     pub skipped_by_cooldown: usize,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub skipped: usize,
 }
 
 fn is_zero(n: &usize) -> bool {
@@ -371,16 +420,27 @@ pub fn build_update_file_report(
     let updates = result
         .updated
         .iter()
-        .map(|(name, old, new, line)| UpdateEntry {
-            package: name.clone(),
-            current: old.clone(),
-            latest: new.clone(),
-            bump: classify(old, new),
-            line: *line,
-            method: None,
-            status: None,
-            error: None,
-            source: source_of(name).map(AnnotationSource::token),
+        .map(|(name, old, new, line)| {
+            let sha = result.action_sha_updates.iter().find(|change| {
+                change.package == *name
+                    && change.current_version == *old
+                    && change.new_version == *new
+                    && change.line_number == *line
+            });
+            UpdateEntry {
+                package: name.clone(),
+                current: old.clone(),
+                latest: new.clone(),
+                bump: classify(old, new),
+                line: *line,
+                method: None,
+                status: None,
+                error: None,
+                source: source_of(name).map(AnnotationSource::token),
+                reference_kind: sha.map(|_| "sha"),
+                current_commit: sha.map(|change| change.current_commit.clone()),
+                latest_commit: sha.map(|change| change.new_commit.clone()),
+            }
         })
         .collect();
 
@@ -442,11 +502,24 @@ pub fn build_update_file_report(
         })
         .collect();
 
+    let skipped = result
+        .skipped
+        .iter()
+        .map(|entry| SkippedEntry {
+            package: entry.package.clone(),
+            current: entry.current.clone(),
+            status: "blocked",
+            reason: entry.reason,
+            message: entry.message.clone(),
+            line: entry.line_number,
+        })
+        .collect();
+
     let path_str = path.display().to_string();
     let errors = result
         .errors
         .iter()
-        .map(|msg| ErrorEntry::with_file(path_str.clone(), "other", msg.clone()))
+        .map(|msg| ErrorEntry::with_file(path_str.clone(), classify_update_error(msg), msg.clone()))
         .collect();
 
     UpdateFileReport {
@@ -458,6 +531,7 @@ pub fn build_update_file_report(
         ignored,
         held_back,
         skipped_by_cooldown,
+        skipped,
         errors,
         warnings: result.warnings.clone(),
     }
@@ -909,6 +983,76 @@ mod tests {
             json["warnings"][0],
             "skipping bar: current version \"%version%\" is not a valid PEP 440 version"
         );
+    }
+
+    #[test]
+    fn update_file_report_identifies_sha_updates_and_blocked_pins() {
+        use crate::updater::{ActionShaUpdate, SkippedUpdate};
+
+        let old_sha = "1111111111111111111111111111111111111111";
+        let new_sha = "2222222222222222222222222222222222222222";
+        let result = UpdateResult {
+            updated: vec![(
+                "actions/checkout".into(),
+                "v4.2.2".into(),
+                "v5.0.0".into(),
+                Some(4),
+            )],
+            action_sha_updates: vec![ActionShaUpdate {
+                package: "actions/checkout".into(),
+                current_version: "v4.2.2".into(),
+                new_version: "v5.0.0".into(),
+                current_commit: old_sha.into(),
+                new_commit: new_sha.into(),
+                line_number: Some(4),
+            }],
+            skipped: vec![SkippedUpdate {
+                package: "rvben/clispec".into(),
+                current: old_sha.into(),
+                reason: "missing-version-comment",
+                message: "add a concrete version comment".into(),
+                line_number: Some(9),
+            }],
+            ..Default::default()
+        };
+
+        let report = build_update_file_report(
+            Path::new(".github/workflows/ci.yml"),
+            FileType::GithubActions,
+            &result,
+            None,
+            stub_classify,
+        );
+        let json = serde_json::to_value(report).unwrap();
+
+        assert_eq!(json["updates"][0]["reference_kind"], "sha");
+        assert_eq!(json["updates"][0]["current_commit"], old_sha);
+        assert_eq!(json["updates"][0]["latest_commit"], new_sha);
+        assert_eq!(json["skipped"][0]["status"], "blocked");
+        assert_eq!(json["skipped"][0]["reason"], "missing-version-comment");
+    }
+
+    #[test]
+    fn update_file_report_classifies_sha_resolution_failures() {
+        let result = UpdateResult {
+            errors: vec![
+                "actions/checkout@v4.2.2: failed to verify current SHA pin: HTTP 404".into(),
+                "actions/setup-node@v6.0.0: failed to resolve target SHA: error sending request"
+                    .into(),
+            ],
+            ..Default::default()
+        };
+        let report = build_update_file_report(
+            Path::new(".github/workflows/ci.yml"),
+            FileType::GithubActions,
+            &result,
+            None,
+            stub_classify,
+        );
+        let json = serde_json::to_value(report).unwrap();
+
+        assert_eq!(json["errors"][0]["kind"], "registry");
+        assert_eq!(json["errors"][1]["kind"], "network");
     }
 
     #[test]

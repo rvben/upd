@@ -210,6 +210,21 @@ pub trait Registry: Send + Sync {
         Ok(Vec::new())
     }
 
+    /// Resolve a Git ref to the immutable commit SHA it currently identifies.
+    ///
+    /// Registries that do not expose Git refs return an error by default. The
+    /// GitHub Actions updater uses this only for its opt-in SHA-pin mode, where
+    /// silently falling back to a mutable tag would weaken the caller's supply-
+    /// chain protection.
+    async fn resolve_ref_to_commit(&self, package: &str, reference: &str) -> Result<String> {
+        anyhow::bail!(
+            "registry '{}' cannot resolve Git ref '{}' for '{}'",
+            self.name(),
+            reference,
+            package
+        )
+    }
+
     /// Registry name for display
     fn name(&self) -> &'static str;
 }

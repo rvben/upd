@@ -24,6 +24,11 @@ struct TagResponse {
 }
 
 #[derive(Debug, Deserialize)]
+struct CommitResponse {
+    sha: String,
+}
+
+#[derive(Debug, Deserialize)]
 struct ReleaseListEntry {
     tag_name: String,
     #[serde(default)]
@@ -208,6 +213,42 @@ impl Registry for GitHubReleasesRegistry {
     async fn list_ref_names(&self, package: &str) -> Result<Vec<String>> {
         let (owner, repo) = Self::extract_owner_repo(package)?;
         self.fetch_tags(owner, repo).await
+    }
+
+    async fn resolve_ref_to_commit(&self, package: &str, reference: &str) -> Result<String> {
+        let (owner, repo) = Self::extract_owner_repo(package)?;
+        let mut url = reqwest::Url::parse(&self.api_url)?;
+        {
+            let mut segments = url
+                .path_segments_mut()
+                .map_err(|_| anyhow!("invalid GitHub API base URL"))?;
+            segments
+                .pop_if_empty()
+                .extend(["repos", owner, repo, "commits", reference]);
+        }
+
+        let response = get_with_retry(&self.client, url.as_str()).await?;
+        if !response.status().is_success() {
+            let status = response.status();
+            let hint = match status.as_u16() {
+                403 | 429 => Some("Set GITHUB_TOKEN to increase the API rate limit."),
+                _ => None,
+            };
+            return Err(anyhow!(http_error_message(
+                status,
+                "Git ref",
+                &format!("{owner}/{repo}@{reference}"),
+                hint,
+            )));
+        }
+
+        let commit: CommitResponse = response.json().await?;
+        if commit.sha.len() != 40 || !commit.sha.chars().all(|c| c.is_ascii_hexdigit()) {
+            return Err(anyhow!(
+                "GitHub returned an invalid commit SHA for '{owner}/{repo}@{reference}'"
+            ));
+        }
+        Ok(commit.sha.to_ascii_lowercase())
     }
 
     async fn list_versions(&self, package: &str) -> Result<Vec<VersionMeta>> {
@@ -625,5 +666,26 @@ mod tests {
             Some(expected),
             "published_at should parse from RFC3339 and convert to UTC"
         );
+    }
+
+    #[tokio::test]
+    async fn test_resolve_ref_to_commit_uses_commit_endpoint() {
+        let server = MockServer::start().await;
+        let sha = "1234567890abcdef1234567890abcdef12345678";
+
+        Mock::given(method("GET"))
+            .and(path("/repos/actions/checkout/commits/v4.2.2"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_string(format!(r#"{{"sha":"{sha}"}}"#)),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let resolved = registry(&server)
+            .resolve_ref_to_commit("actions/checkout", "v4.2.2")
+            .await
+            .unwrap();
+        assert_eq!(resolved, sha);
     }
 }

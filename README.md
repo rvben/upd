@@ -234,8 +234,45 @@ upd audit --format sarif > results.sarif
 
 - `.github/workflows/*.yml` and `.github/workflows/*.yaml`
 - Updates `uses:` version references (e.g., `actions/checkout@v3` → `actions/checkout@v4`)
-- Skips SHA-pinned actions, branch refs, local actions, and Docker references
+- Supports actions and reusable workflows
+- Skips SHA-pinned actions by default; `--update-action-shas` safely updates
+  annotated full-SHA pins without converting them to mutable tags
+- Skips branch refs, local actions, and Docker references
 - Authenticates via `GITHUB_TOKEN` or `GH_TOKEN` for higher API rate limits
+
+#### Immutable SHA pins
+
+SHA updates are deliberately opt-in and require a concrete version annotation:
+
+```yaml
+- uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+jobs:
+  conformance:
+    uses: rvben/clispec/.github/workflows/conformance.yml@<full-commit-sha> # v0.3.0
+```
+
+```bash
+upd update . \
+  --apply \
+  --lang actions \
+  --update-action-shas \
+  --min-age 7d \
+  --max-bump minor
+```
+
+Before writing, `upd` verifies that the annotated current tag resolves to the
+pinned commit. It then applies cooldown and bump policy to release versions,
+resolves the selected tag to its full commit SHA, and updates both the SHA and
+comment. A short SHA, missing or floating comment (`# v4`), moved tag, or stale
+comment is never rewritten. Structured output reports these under
+`files[].skipped[]` with `status: "blocked"` and a machine-readable `reason`.
+
+Configuration pins and `--package` filters use the action's `owner/repo` name.
+For example, `--package actions/checkout` selects every checkout reference,
+including subdirectory actions and reusable workflow paths from that repository.
+Configured targets for immutable pins must also be concrete SemVer tags; a
+floating value such as `v5` is reported as blocked.
 
 ### Pre-commit
 
@@ -412,6 +449,40 @@ Summary: 2 vulnerable package(s), 3 total vulnerability/ies
   with:
     sarif_file: results.sarif
 ```
+
+### Automated GitHub Actions pull requests
+
+This repository publishes a reusable workflow that installs a checksum-verified
+`upd` release, applies only policy-approved Actions updates, validates every
+workflow with `actionlint`, and opens one Conventional Commits pull request:
+
+```yaml
+name: Weekly dependency health
+
+on:
+  schedule:
+    - cron: "17 6 * * 2"
+  workflow_dispatch:
+
+jobs:
+  actions:
+    uses: rvben/upd/.github/workflows/dependency-health.yml@<full-commit-sha>
+    with:
+      min-age: 7d
+      max-bump: minor
+      validation-command: make test
+    secrets:
+      pull-request-token: ${{ secrets.UPD_PR_TOKEN }}
+```
+
+Select an `upd-version` that advertises `--update-action-shas`; the workflow
+checks this capability explicitly and fails with upgrade guidance otherwise.
+
+Use a narrowly scoped GitHub App token or fine-grained PAT for
+`UPD_PR_TOKEN` when the generated PR must trigger CI. Without it, the workflow
+falls back to `GITHUB_TOKEN`; GitHub suppresses subsequent workflow runs caused
+by that token. Set `fail-on-blocked: true` when every SHA pin is expected to
+carry a verified version annotation.
 
 ## Version Constraints
 

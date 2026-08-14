@@ -266,6 +266,9 @@ pub struct UpdateOptions {
     /// unconditionally because its ecosystems are not known until its lines are
     /// read.
     pub langs: Vec<Lang>,
+    /// Update fully SHA-pinned GitHub Actions when they carry a verified,
+    /// concrete version comment (for example `# v4.2.2`). Off by default.
+    pub update_action_shas: bool,
 }
 
 impl UpdateOptions {
@@ -281,6 +284,7 @@ impl UpdateOptions {
             cooldown_unavailable_notes: Arc::default(),
             bump_filter: BumpFilter::default(),
             langs: Vec::new(),
+            update_action_shas: false,
         }
     }
 
@@ -312,6 +316,12 @@ impl UpdateOptions {
     /// Restrict processing to the named ecosystems. Empty means every one.
     pub fn with_langs(mut self, langs: Vec<Lang>) -> Self {
         self.langs = langs;
+        self
+    }
+
+    /// Opt in to verified GitHub Actions SHA-pin updates.
+    pub fn with_action_sha_updates(mut self, enabled: bool) -> Self {
+        self.update_action_shas = enabled;
         self
     }
 
@@ -405,6 +415,35 @@ pub struct UpdateResult {
     /// Source of an entry that does not inherit its ecosystem from the file,
     /// keyed by package name. Populated only by `AnnotatedUpdater`.
     pub entry_ecosystem: HashMap<String, AnnotationSource>,
+    /// Extra immutable-ref details for GitHub Actions updates. The matching
+    /// entry also appears in `updated`, using semantic versions for bump
+    /// classification and human-readable reporting.
+    pub action_sha_updates: Vec<ActionShaUpdate>,
+    /// Dependencies deliberately not changed because a safety prerequisite was
+    /// not met. This is distinct from `ignored` (user policy) and `errors`
+    /// (operation failure), allowing automation to identify blocked updates.
+    pub skipped: Vec<SkippedUpdate>,
+}
+
+/// A verified GitHub Actions SHA-pin update.
+#[derive(Debug, Clone)]
+pub struct ActionShaUpdate {
+    pub package: String,
+    pub current_version: String,
+    pub new_version: String,
+    pub current_commit: String,
+    pub new_commit: String,
+    pub line_number: Option<usize>,
+}
+
+/// A dependency update blocked by a documented safety condition.
+#[derive(Debug, Clone)]
+pub struct SkippedUpdate {
+    pub package: String,
+    pub current: String,
+    pub reason: &'static str,
+    pub message: String,
+    pub line_number: Option<usize>,
 }
 
 impl UpdateResult {
@@ -418,6 +457,8 @@ impl UpdateResult {
         self.held_back.extend(other.held_back);
         self.skipped_by_cooldown.extend(other.skipped_by_cooldown);
         self.entry_ecosystem.extend(other.entry_ecosystem);
+        self.action_sha_updates.extend(other.action_sha_updates);
+        self.skipped.extend(other.skipped);
     }
 }
 

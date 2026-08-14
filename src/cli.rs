@@ -126,6 +126,15 @@ pub struct Cli {
     #[arg(long, global = true)]
     pub full_precision: bool,
 
+    /// Update immutable GitHub Actions SHA pins with verified version comments.
+    ///
+    /// Accepts `uses: owner/repo@<40-char-sha> # v1.2.3`. The current tag is
+    /// verified against the pin before policy is evaluated, and the result stays
+    /// pinned to the new tag's full commit SHA. Unsafe pins are reported and
+    /// left unchanged.
+    #[arg(long, global = true, conflicts_with = "interactive")]
+    pub update_action_shas: bool,
+
     /// Limit to one or more ecosystems (repeatable, or comma-separated).
     ///
     /// Examples: --lang python  |  --lang python,rust  |  -l go -l node
@@ -382,6 +391,7 @@ mod tests {
         assert!(cli.only_bump.is_empty());
         assert!(cli.max_bump.is_none());
         assert!(!cli.full_precision);
+        assert!(!cli.update_action_shas);
         assert!(!cli.check);
         assert!(!cli.lock);
         assert!(!cli.apply);
@@ -389,6 +399,23 @@ mod tests {
         assert!(cli.command.is_none());
         assert!(cli.min_age.is_none());
         assert!(!cli.insecure);
+    }
+
+    #[test]
+    fn test_cli_parses_action_sha_opt_in() {
+        let cli =
+            Cli::try_parse_from(["upd", "--update-action-shas", "--lang", "actions"]).unwrap();
+        assert!(cli.update_action_shas);
+        assert_eq!(cli.langs, vec![Lang::Actions]);
+    }
+
+    #[test]
+    fn test_action_sha_updates_conflict_with_interactive_mode() {
+        let result = Cli::try_parse_from(["upd", "--update-action-shas", "--interactive"]);
+        let error = result
+            .err()
+            .expect("SHA updates must not enter the tag-based interactive rewrite path");
+        assert_eq!(error.kind(), clap::error::ErrorKind::ArgumentConflict);
     }
 
     #[test]

@@ -14,18 +14,42 @@ use std::path::Path;
 
 pub struct GithubActionsUpdater {
     uses_re: Regex,
+    version_comment_re: Regex,
+}
+
+#[derive(Debug, Clone)]
+struct ShaAction {
+    line_idx: usize,
+    owner_repo: String,
+    current_sha: String,
+    current_version: String,
+    pinned_version: Option<String>,
 }
 
 impl GithubActionsUpdater {
     pub fn new() -> Self {
         let uses_re =
-            Regex::new(r#"uses:\s*"?([^@\s"]+)@([^"'\s#]+)"#).expect("Invalid uses regex");
-        Self { uses_re }
+            Regex::new(r#"uses:\s*["']?([^@\s"']+)@([^"'\s#]+)"#).expect("Invalid uses regex");
+        // A concrete SemVer annotation is deliberately required. Floating
+        // comments such as `# v4` cannot prove which release the old SHA was
+        // intended to represent and therefore cannot be updated safely.
+        let version_comment_re = Regex::new(
+            r#"^\s*["']?\s*#\s*(v?\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?)(?:\s|$)"#,
+        )
+        .expect("Invalid SHA version comment regex");
+        Self {
+            uses_re,
+            version_comment_re,
+        }
     }
 
     /// Returns true if the ref looks like a commit SHA (7+ hex characters)
     fn is_sha_ref(ref_str: &str) -> bool {
         ref_str.len() >= 7 && ref_str.chars().all(|c| c.is_ascii_hexdigit())
+    }
+
+    fn is_full_sha_ref(ref_str: &str) -> bool {
+        ref_str.len() == 40 && ref_str.chars().all(|c| c.is_ascii_hexdigit())
     }
 
     /// Returns true if the ref looks like a branch name (e.g., main, develop)
@@ -53,11 +77,42 @@ impl GithubActionsUpdater {
         if action.starts_with("./") || action.starts_with("docker://") {
             return true;
         }
-        if action.contains(".yml") || action.contains(".yaml") {
-            return true;
-        }
         let segments: Vec<&str> = action.split('/').collect();
         segments.len() < 2
+    }
+
+    fn version_comment(&self, line: &str, uses_end: usize) -> Option<String> {
+        self.version_comment_re
+            .captures(&line[uses_end..])
+            .and_then(|caps| caps.get(1))
+            .map(|m| m.as_str().to_string())
+            .filter(|version| Self::is_concrete_version(version))
+    }
+
+    fn is_concrete_version(version: &str) -> bool {
+        semver::Version::parse(version.strip_prefix('v').unwrap_or(version)).is_ok()
+    }
+
+    fn replace_sha_pin(
+        &self,
+        line: &str,
+        current_sha: &str,
+        current_version: &str,
+        new_sha: &str,
+        new_version: &str,
+    ) -> Option<String> {
+        let mut updated = line.replacen(current_sha, new_sha, 1);
+        let uses_end = self.uses_re.captures(&updated)?.get(0)?.end();
+        let suffix = &updated[uses_end..];
+        let caps = self.version_comment_re.captures(suffix)?;
+        let version = caps.get(1)?;
+        if version.as_str() != current_version {
+            return None;
+        }
+        let start = uses_end + version.start();
+        let end = uses_end + version.end();
+        updated.replace_range(start..end, new_version);
+        Some(updated)
     }
 
     /// Returns true if the line starts a YAML block scalar (e.g., `run: |`)
@@ -228,6 +283,7 @@ impl Updater for GithubActionsUpdater {
         let mut ignored_actions: Vec<(usize, String, String)> = Vec::new();
         let mut pinned_actions: Vec<(usize, String, String, String)> = Vec::new();
         let mut actions_to_check: Vec<(usize, String, String)> = Vec::new();
+        let mut sha_actions: Vec<ShaAction> = Vec::new();
 
         let mut in_block_scalar = false;
         let mut block_parent_indent: usize = 0;
@@ -260,7 +316,7 @@ impl Updater for GithubActionsUpdater {
                 let action = caps.get(1).unwrap().as_str();
                 let version_ref = caps.get(2).unwrap().as_str();
 
-                if Self::should_skip_action(action) || Self::should_skip_ref(version_ref) {
+                if Self::should_skip_action(action) {
                     continue;
                 }
 
@@ -274,6 +330,48 @@ impl Updater for GithubActionsUpdater {
                 // Check config for ignore/pin
                 if options.should_ignore(&owner_repo) {
                     ignored_actions.push((line_idx, owner_repo, version_ref.to_string()));
+                    continue;
+                }
+
+                if Self::is_sha_ref(version_ref) {
+                    if !options.update_action_shas {
+                        continue;
+                    }
+                    if !Self::is_full_sha_ref(version_ref) {
+                        result.skipped.push(super::SkippedUpdate {
+                            package: owner_repo,
+                            current: version_ref.to_string(),
+                            reason: "short-sha",
+                            message: "a full 40-character commit SHA is required".to_string(),
+                            line_number: Some(line_idx + 1),
+                        });
+                        continue;
+                    }
+                    let Some(current_version) =
+                        self.version_comment(line, caps.get(0).unwrap().end())
+                    else {
+                        result.skipped.push(super::SkippedUpdate {
+                            package: owner_repo,
+                            current: version_ref.to_string(),
+                            reason: "missing-version-comment",
+                            message: "add a concrete version comment such as `# v4.2.2` to make this SHA pin safely updateable".to_string(),
+                            line_number: Some(line_idx + 1),
+                        });
+                        continue;
+                    };
+                    let pinned_version =
+                        options.get_pinned_version(&owner_repo).map(str::to_string);
+                    sha_actions.push(ShaAction {
+                        line_idx,
+                        owner_repo,
+                        current_sha: version_ref.to_ascii_lowercase(),
+                        current_version,
+                        pinned_version,
+                    });
+                    continue;
+                }
+
+                if Self::is_branch_ref(version_ref) {
                     continue;
                 }
 
@@ -301,16 +399,18 @@ impl Updater for GithubActionsUpdater {
         // Pass 2: Fetch versions in parallel (deduplicated by owner_repo)
         let unique_repos: Vec<String> = {
             let mut seen = std::collections::HashSet::new();
-            actions_to_check
-                .iter()
-                .filter_map(|(_, owner_repo, _)| {
-                    if seen.insert(owner_repo.clone()) {
-                        Some(owner_repo.clone())
-                    } else {
-                        None
-                    }
-                })
-                .collect()
+            let mut repos = Vec::new();
+            for (_, owner_repo, _) in &actions_to_check {
+                if seen.insert(owner_repo.clone()) {
+                    repos.push(owner_repo.clone());
+                }
+            }
+            for action in &sha_actions {
+                if action.pinned_version.is_none() && seen.insert(action.owner_repo.clone()) {
+                    repos.push(action.owner_repo.clone());
+                }
+            }
+            repos
         };
 
         let version_futures: Vec<_> = unique_repos
@@ -393,6 +493,11 @@ impl Updater for GithubActionsUpdater {
             action_info.insert(line_idx, (owner_repo, current_version, true));
         }
 
+        let sha_action_info: HashMap<usize, ShaAction> = sha_actions
+            .into_iter()
+            .map(|action| (action.line_idx, action))
+            .collect();
+
         // Pass 3: Apply updates
         let mut new_lines: Vec<String> = Vec::new();
         in_block_scalar = false;
@@ -412,6 +517,219 @@ impl Updater for GithubActionsUpdater {
             if !in_block_scalar && Self::is_block_scalar_start(line) {
                 in_block_scalar = true;
                 block_parent_indent = line.len() - line.trim_start().len();
+            }
+
+            if let Some(action) = sha_action_info.get(&line_idx) {
+                let expected_current = match registry
+                    .resolve_ref_to_commit(&action.owner_repo, &action.current_version)
+                    .await
+                {
+                    Ok(commit) => commit.to_ascii_lowercase(),
+                    Err(error) => {
+                        result.errors.push(format!(
+                            "{}@{}: failed to verify current SHA pin: {}",
+                            action.owner_repo, action.current_version, error
+                        ));
+                        new_lines.push(line.to_string());
+                        continue;
+                    }
+                };
+
+                if expected_current != action.current_sha {
+                    result.skipped.push(super::SkippedUpdate {
+                        package: action.owner_repo.clone(),
+                        current: action.current_sha.clone(),
+                        reason: "version-comment-mismatch",
+                        message: format!(
+                            "comment {} resolves to {}, not the pinned commit",
+                            action.current_version, expected_current
+                        ),
+                        line_number: Some(line_num),
+                    });
+                    new_lines.push(line.to_string());
+                    continue;
+                }
+
+                let is_config_pinned = action.pinned_version.is_some();
+                let target_result = match &action.pinned_version {
+                    Some(version) => Ok(version.clone()),
+                    None => repo_versions
+                        .get(&action.owner_repo)
+                        .cloned()
+                        .unwrap_or_else(|| Err("no release result returned".to_string())),
+                };
+                let target_version = match target_result {
+                    Ok(version) => version,
+                    Err(error) => {
+                        result
+                            .errors
+                            .push(format!("{}: {}", action.owner_repo, error));
+                        new_lines.push(line.to_string());
+                        continue;
+                    }
+                };
+                if !Self::is_concrete_version(&target_version) {
+                    result.skipped.push(super::SkippedUpdate {
+                        package: action.owner_repo.clone(),
+                        current: action.current_version.clone(),
+                        reason: "non-concrete-target",
+                        message: format!(
+                            "target {} is not a concrete semantic version",
+                            target_version
+                        ),
+                        line_number: Some(line_num),
+                    });
+                    new_lines.push(line.to_string());
+                    continue;
+                }
+
+                let (target_version, held_back_record) = if is_config_pinned {
+                    (target_version, None)
+                } else {
+                    let (outcome, note) = crate::updater::apply_cooldown(
+                        registry,
+                        &action.owner_repo,
+                        &action.current_version,
+                        &target_version,
+                        None,
+                        false,
+                        &options,
+                    )
+                    .await;
+                    if let Some(msg) = note {
+                        options.note_cooldown_unavailable(&msg);
+                    }
+                    match outcome {
+                        crate::updater::CooldownOutcome::Unchanged(version) => (version, None),
+                        crate::updater::CooldownOutcome::HeldBack {
+                            chosen,
+                            skipped_version,
+                            skipped_published_at,
+                        } => (chosen, Some((skipped_version, skipped_published_at))),
+                        crate::updater::CooldownOutcome::Skipped {
+                            skipped_version,
+                            skipped_published_at,
+                        } => {
+                            result.skipped_by_cooldown.push((
+                                action.owner_repo.clone(),
+                                action.current_version.clone(),
+                                skipped_version,
+                                skipped_published_at,
+                            ));
+                            new_lines.push(line.to_string());
+                            continue;
+                        }
+                    }
+                };
+
+                if target_version == action.current_version {
+                    result.unchanged += 1;
+                    new_lines.push(line.to_string());
+                    continue;
+                }
+                if !is_config_pinned
+                    && compare_versions(&target_version, &action.current_version, Lang::Actions)
+                        != std::cmp::Ordering::Greater
+                {
+                    result.warnings.push(downgrade_warning(
+                        &action.owner_repo,
+                        &target_version,
+                        &action.current_version,
+                    ));
+                    result.unchanged += 1;
+                    new_lines.push(line.to_string());
+                    continue;
+                }
+                if !is_config_pinned
+                    && !options.allows_bump(&action.current_version, &target_version)
+                {
+                    result.skipped.push(super::SkippedUpdate {
+                        package: action.owner_repo.clone(),
+                        current: action.current_version.clone(),
+                        reason: "bump-policy",
+                        message: format!(
+                            "{} is outside the configured bump ceiling",
+                            target_version
+                        ),
+                        line_number: Some(line_num),
+                    });
+                    new_lines.push(line.to_string());
+                    continue;
+                }
+
+                let new_sha = match registry
+                    .resolve_ref_to_commit(&action.owner_repo, &target_version)
+                    .await
+                {
+                    Ok(commit) => commit.to_ascii_lowercase(),
+                    Err(error) => {
+                        result.errors.push(format!(
+                            "{}@{}: failed to resolve target SHA: {}",
+                            action.owner_repo, target_version, error
+                        ));
+                        new_lines.push(line.to_string());
+                        continue;
+                    }
+                };
+                if !Self::is_full_sha_ref(&new_sha) {
+                    result.errors.push(format!(
+                        "{}@{}: registry returned an invalid commit SHA",
+                        action.owner_repo, target_version
+                    ));
+                    new_lines.push(line.to_string());
+                    continue;
+                }
+
+                let Some(new_line) = self.replace_sha_pin(
+                    line,
+                    &action.current_sha,
+                    &action.current_version,
+                    &new_sha,
+                    &target_version,
+                ) else {
+                    result.errors.push(format!(
+                        "{}: could not safely rewrite SHA pin at line {}",
+                        action.owner_repo, line_num
+                    ));
+                    new_lines.push(line.to_string());
+                    continue;
+                };
+                new_lines.push(new_line);
+
+                let change = super::ActionShaUpdate {
+                    package: action.owner_repo.clone(),
+                    current_version: action.current_version.clone(),
+                    new_version: target_version.clone(),
+                    current_commit: action.current_sha.clone(),
+                    new_commit: new_sha,
+                    line_number: Some(line_num),
+                };
+                result.action_sha_updates.push(change);
+                if is_config_pinned {
+                    result.pinned.push((
+                        action.owner_repo.clone(),
+                        action.current_version.clone(),
+                        target_version,
+                        Some(line_num),
+                    ));
+                } else {
+                    result.updated.push((
+                        action.owner_repo.clone(),
+                        action.current_version.clone(),
+                        target_version.clone(),
+                        Some(line_num),
+                    ));
+                    if let Some((skipped_version, skipped_published_at)) = held_back_record {
+                        result.held_back.push((
+                            action.owner_repo.clone(),
+                            action.current_version.clone(),
+                            target_version,
+                            skipped_version,
+                            skipped_published_at,
+                        ));
+                    }
+                }
+                continue;
             }
 
             if let Some(version_result) = version_map.remove(&line_idx) {
@@ -667,11 +985,11 @@ mod tests {
         assert!(GithubActionsUpdater::should_skip_action(
             "docker://alpine:3.8"
         ));
-        // Reusable workflow
-        assert!(GithubActionsUpdater::should_skip_action(
+        // Reusable workflows are valid remote refs and share the owner/repo's tags.
+        assert!(!GithubActionsUpdater::should_skip_action(
             "org/repo/.github/workflows/ci.yml"
         ));
-        assert!(GithubActionsUpdater::should_skip_action(
+        assert!(!GithubActionsUpdater::should_skip_action(
             "org/repo/.github/workflows/ci.yaml"
         ));
         // Malformed (single segment)
@@ -849,6 +1167,206 @@ jobs:
 
         let content = fs::read_to_string(file.path()).unwrap();
         assert!(content.contains("a5ac7e51b28d7f9f3091645916e8170a8b5cbc47"));
+    }
+
+    #[tokio::test]
+    async fn test_updates_verified_sha_pin_without_weakening_it() {
+        const OLD_SHA: &str = "1111111111111111111111111111111111111111";
+        const NEW_SHA: &str = "2222222222222222222222222222222222222222";
+        let mut file = NamedTempFile::new().unwrap();
+        write!(
+            file,
+            "jobs:\n  build:\n    steps:\n      - uses: actions/checkout@{OLD_SHA} # v4.2.2\n"
+        )
+        .unwrap();
+
+        let registry = MockRegistry::new("github-releases")
+            .with_version("actions/checkout", "v5.0.0")
+            .with_resolved_ref("actions/checkout", "v4.2.2", OLD_SHA)
+            .with_resolved_ref("actions/checkout", "v5.0.0", NEW_SHA);
+        let options = UpdateOptions::new(false, false).with_action_sha_updates(true);
+
+        let result = GithubActionsUpdater::new()
+            .update(file.path(), &registry, options)
+            .await
+            .unwrap();
+
+        assert_eq!(result.updated.len(), 1);
+        assert_eq!(result.updated[0].1, "v4.2.2");
+        assert_eq!(result.updated[0].2, "v5.0.0");
+        assert_eq!(result.action_sha_updates.len(), 1);
+        assert_eq!(result.action_sha_updates[0].current_commit, OLD_SHA);
+        assert_eq!(result.action_sha_updates[0].new_commit, NEW_SHA);
+        let content = fs::read_to_string(file.path()).unwrap();
+        assert!(content.contains(&format!("actions/checkout@{NEW_SHA} # v5.0.0")));
+        assert!(!content.contains("actions/checkout@v5.0.0"));
+    }
+
+    #[tokio::test]
+    async fn test_updates_quoted_reusable_workflow_sha_pin() {
+        const OLD_SHA: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        const NEW_SHA: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        let mut file = NamedTempFile::new().unwrap();
+        write!(
+            file,
+            "jobs:\n  call:\n    uses: \"rvben/clispec/.github/workflows/conformance.yml@{OLD_SHA}\" # v0.3.0\n"
+        )
+        .unwrap();
+
+        let registry = MockRegistry::new("github-releases")
+            .with_version("rvben/clispec", "v0.3.1")
+            .with_resolved_ref("rvben/clispec", "v0.3.0", OLD_SHA)
+            .with_resolved_ref("rvben/clispec", "v0.3.1", NEW_SHA);
+        let options = UpdateOptions::new(false, false).with_action_sha_updates(true);
+
+        let result = GithubActionsUpdater::new()
+            .update(file.path(), &registry, options)
+            .await
+            .unwrap();
+
+        assert_eq!(result.updated.len(), 1);
+        let content = fs::read_to_string(file.path()).unwrap();
+        assert!(content.contains(&format!(
+            "uses: \"rvben/clispec/.github/workflows/conformance.yml@{NEW_SHA}\" # v0.3.1"
+        )));
+    }
+
+    #[tokio::test]
+    async fn test_sha_pin_requires_opt_in_and_concrete_comment() {
+        const SHA: &str = "1111111111111111111111111111111111111111";
+        let updater = GithubActionsUpdater::new();
+
+        let mut opt_out = NamedTempFile::new().unwrap();
+        write!(
+            opt_out,
+            "steps:\n  - uses: actions/checkout@{SHA} # v4.2.2\n"
+        )
+        .unwrap();
+        let registry = MockRegistry::new("github-releases");
+        let result = updater
+            .update(opt_out.path(), &registry, UpdateOptions::new(false, false))
+            .await
+            .unwrap();
+        assert!(result.updated.is_empty());
+        assert!(result.skipped.is_empty());
+
+        let mut unsafe_pin = NamedTempFile::new().unwrap();
+        write!(
+            unsafe_pin,
+            "steps:\n  - uses: actions/checkout@{SHA} # v4\n"
+        )
+        .unwrap();
+        let result = updater
+            .update(
+                unsafe_pin.path(),
+                &registry,
+                UpdateOptions::new(false, false).with_action_sha_updates(true),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result.skipped.len(), 1);
+        assert_eq!(result.skipped[0].reason, "missing-version-comment");
+    }
+
+    #[tokio::test]
+    async fn test_sha_pin_refuses_stale_or_forged_version_comment() {
+        const PINNED_SHA: &str = "1111111111111111111111111111111111111111";
+        const TAG_SHA: &str = "3333333333333333333333333333333333333333";
+        let mut file = NamedTempFile::new().unwrap();
+        write!(
+            file,
+            "steps:\n  - uses: actions/checkout@{PINNED_SHA} # v4.2.2\n"
+        )
+        .unwrap();
+        let registry = MockRegistry::new("github-releases")
+            .with_version("actions/checkout", "v5.0.0")
+            .with_resolved_ref("actions/checkout", "v4.2.2", TAG_SHA);
+
+        let result = GithubActionsUpdater::new()
+            .update(
+                file.path(),
+                &registry,
+                UpdateOptions::new(false, false).with_action_sha_updates(true),
+            )
+            .await
+            .unwrap();
+
+        assert!(result.updated.is_empty());
+        assert_eq!(result.skipped.len(), 1);
+        assert_eq!(result.skipped[0].reason, "version-comment-mismatch");
+        assert!(
+            fs::read_to_string(file.path())
+                .unwrap()
+                .contains(PINNED_SHA)
+        );
+    }
+
+    #[tokio::test]
+    async fn test_sha_pin_honors_bump_ceiling_before_resolving_target() {
+        use crate::updater::BumpFilter;
+
+        const OLD_SHA: &str = "1111111111111111111111111111111111111111";
+        let mut file = NamedTempFile::new().unwrap();
+        write!(
+            file,
+            "steps:\n  - uses: actions/checkout@{OLD_SHA} # v4.2.2\n"
+        )
+        .unwrap();
+        let registry = MockRegistry::new("github-releases")
+            .with_version("actions/checkout", "v5.0.0")
+            .with_resolved_ref("actions/checkout", "v4.2.2", OLD_SHA);
+        let options = UpdateOptions::new(false, false)
+            .with_action_sha_updates(true)
+            .with_bump_filter(BumpFilter {
+                major: false,
+                minor: true,
+                patch: true,
+            });
+
+        let result = GithubActionsUpdater::new()
+            .update(file.path(), &registry, options)
+            .await
+            .unwrap();
+
+        assert!(result.updated.is_empty());
+        assert_eq!(result.skipped.len(), 1);
+        assert_eq!(result.skipped[0].reason, "bump-policy");
+        assert!(result.errors.is_empty());
+        assert!(fs::read_to_string(file.path()).unwrap().contains(OLD_SHA));
+    }
+
+    #[tokio::test]
+    async fn test_sha_pin_refuses_floating_config_target() {
+        use crate::config::UpdConfig;
+        use std::sync::Arc;
+
+        const OLD_SHA: &str = "1111111111111111111111111111111111111111";
+        let mut file = NamedTempFile::new().unwrap();
+        write!(
+            file,
+            "steps:\n  - uses: actions/checkout@{OLD_SHA} # v4.2.2\n"
+        )
+        .unwrap();
+        let registry = MockRegistry::new("github-releases").with_resolved_ref(
+            "actions/checkout",
+            "v4.2.2",
+            OLD_SHA,
+        );
+        let mut config = UpdConfig::default();
+        config.pin.insert("actions/checkout".into(), "v5".into());
+        let options = UpdateOptions::new(false, false)
+            .with_action_sha_updates(true)
+            .with_config(Arc::new(config));
+
+        let result = GithubActionsUpdater::new()
+            .update(file.path(), &registry, options)
+            .await
+            .unwrap();
+
+        assert!(result.updated.is_empty());
+        assert!(result.pinned.is_empty());
+        assert_eq!(result.skipped[0].reason, "non-concrete-target");
+        assert!(fs::read_to_string(file.path()).unwrap().contains(OLD_SHA));
     }
 
     #[tokio::test]

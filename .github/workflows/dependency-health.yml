@@ -1,0 +1,189 @@
+name: Dependency health with upd
+
+on:
+  workflow_call:
+    inputs:
+      upd-version:
+        description: Released upd version to install, or "latest"
+        type: string
+        default: latest
+      min-age:
+        description: Minimum age of an eligible release
+        type: string
+        default: 7d
+      max-bump:
+        description: Highest automatically applied bump (patch, minor, or major)
+        type: string
+        default: minor
+      validation-command:
+        description: Additional repository-specific validation command
+        type: string
+        default: ""
+      fail-on-blocked:
+        description: Fail when a SHA pin cannot pass safety verification
+        type: boolean
+        default: false
+    secrets:
+      pull-request-token:
+        description: GitHub App or PAT token; recommended so the PR triggers CI
+        required: false
+    outputs:
+      changed:
+        description: Whether upd produced a repository change
+        value: ${{ jobs.update.outputs.changed }}
+      pull-request-url:
+        description: Created or updated pull request URL
+        value: ${{ jobs.update.outputs.pull-request-url }}
+  workflow_dispatch:
+    inputs:
+      upd-version:
+        description: Released upd version to install, or "latest"
+        type: string
+        default: latest
+      min-age:
+        description: Minimum age of an eligible release
+        type: string
+        default: 7d
+      max-bump:
+        description: Highest automatically applied bump
+        type: choice
+        options: [patch, minor, major]
+        default: minor
+      validation-command:
+        description: Additional repository-specific validation command
+        type: string
+        default: ""
+      fail-on-blocked:
+        description: Fail when a SHA pin cannot pass safety verification
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: upd-actions-${{ github.repository }}
+  cancel-in-progress: false
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    outputs:
+      changed: ${{ steps.changes.outputs.changed }}
+      pull-request-url: ${{ steps.pull-request.outputs.url }}
+    env:
+      GH_TOKEN: ${{ secrets.pull-request-token || github.token }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.pull-request-token || github.token }}
+
+      - name: Install verified upd release
+        env:
+          REQUESTED_VERSION: ${{ inputs.upd-version }}
+        run: |
+          set -euo pipefail
+          version="$REQUESTED_VERSION"
+          if [[ -z "$version" || "$version" == "latest" ]]; then
+            version="$(gh api repos/rvben/upd/releases/latest --jq .tag_name)"
+          fi
+          [[ "$version" == v* ]] || version="v${version}"
+
+          install_dir="$RUNNER_TEMP/upd-bin"
+          mkdir -p "$install_dir"
+          asset="upd-${version}-x86_64-unknown-linux-gnu.tar.gz"
+          gh release download "$version" --repo rvben/upd --dir "$install_dir" --pattern "$asset"
+          gh release download "$version" --repo rvben/upd --dir "$install_dir" --pattern "${asset}.sha256"
+          (cd "$install_dir" && sha256sum --check "${asset}.sha256")
+          tar -xzf "$install_dir/$asset" -C "$install_dir"
+          if ! "$install_dir/upd" --help | grep -q -- "--update-action-shas"; then
+            echo "upd $version does not support verified action SHA updates; select a newer release" >&2
+            exit 2
+          fi
+          echo "$install_dir" >> "$GITHUB_PATH"
+
+      - name: Apply policy-approved GitHub Actions updates
+        env:
+          MIN_AGE: ${{ inputs.min-age }}
+          MAX_BUMP: ${{ inputs.max-bump }}
+        run: |
+          set -euo pipefail
+          upd update . \
+            --apply \
+            --lang actions \
+            --update-action-shas \
+            --min-age "$MIN_AGE" \
+            --max-bump "$MAX_BUMP" \
+            --output json > "$RUNNER_TEMP/upd-report.json"
+
+      - name: Validate workflow syntax
+        run: go run github.com/rhysd/actionlint/cmd/actionlint@v1.7.7
+
+      - name: Run repository validation
+        if: inputs.validation-command != ''
+        env:
+          VALIDATION_COMMAND: ${{ inputs.validation-command }}
+        run: bash -euo pipefail -c "$VALIDATION_COMMAND"
+
+      - name: Publish dependency summary
+        env:
+          FAIL_ON_BLOCKED: ${{ inputs.fail-on-blocked }}
+        run: |
+          set -euo pipefail
+          report="$RUNNER_TEMP/upd-report.json"
+          {
+            echo "## upd dependency health"
+            echo
+            jq -r '"- Updates: \(.summary.updates_total)\n- Files changed: \(.summary.files_with_changes)\n- Held back: \(.summary.held_back // 0)\n- Blocked: \(.summary.skipped // 0)\n- Errors: \(.summary.errors)"' "$report"
+            echo
+            jq -r '.files[] | .skipped[]? | "- Blocked `\(.package)`: \(.message) (`\(.reason)`)"' "$report"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          blocked="$(jq -r '.summary.skipped // 0' "$report")"
+          if [[ "$FAIL_ON_BLOCKED" == "true" && "$blocked" -gt 0 ]]; then
+            echo "Blocked SHA pins require attention" >&2
+            exit 1
+          fi
+
+      - name: Detect changes
+        id: changes
+        run: |
+          if git diff --quiet -- .github/workflows; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Commit dependency updates
+        if: steps.changes.outputs.changed == 'true'
+        env:
+          BRANCH: automation/upd-github-actions
+        run: |
+          set -euo pipefail
+          git config user.name "upd automation"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git fetch origin "$BRANCH:refs/remotes/origin/$BRANCH" || true
+          git switch -C "$BRANCH"
+          git add .github/workflows
+          git commit -m "ci(deps): update GitHub Actions with upd"
+          git push --force-with-lease origin "HEAD:$BRANCH"
+
+      - name: Create or update pull request
+        id: pull-request
+        if: steps.changes.outputs.changed == 'true'
+        env:
+          BRANCH: automation/upd-github-actions
+        run: |
+          set -euo pipefail
+          url="$(gh pr list --head "$BRANCH" --state open --json url --jq '.[0].url // empty')"
+          if [[ -z "$url" ]]; then
+            url="$(gh pr create \
+              --head "$BRANCH" \
+              --title "ci(deps): update GitHub Actions with upd" \
+              --body "Automated, policy-constrained GitHub Actions updates generated by [upd](https://github.com/rvben/upd). Full SHA pins remain immutable and are updated only after their version annotations are verified.")"
+          fi
+          echo "url=$url" >> "$GITHUB_OUTPUT"
+          echo "Pull request: $url" >> "$GITHUB_STEP_SUMMARY"

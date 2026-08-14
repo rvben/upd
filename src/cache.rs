@@ -284,6 +284,13 @@ impl<R: Registry> Registry for CachedRegistry<R> {
         self.inner.list_ref_names(package).await
     }
 
+    /// Forwarded without caching. Ref resolution is security-sensitive and a
+    /// tag may be moved between runs; the SHA-pin updater must observe GitHub's
+    /// current answer before it writes anything.
+    async fn resolve_ref_to_commit(&self, package: &str, reference: &str) -> Result<String> {
+        self.inner.resolve_ref_to_commit(package, reference).await
+    }
+
     fn name(&self) -> &'static str {
         self.inner.name()
     }
@@ -697,6 +704,25 @@ mod ref_forwarding_tests {
             refs,
             vec!["v4.2.0", "v4", "v3"],
             "CachedRegistry must forward list_ref_names to the inner registry"
+        );
+    }
+
+    #[tokio::test]
+    async fn cached_registry_forwards_ref_resolution() {
+        let sha = "1234567890abcdef1234567890abcdef12345678";
+        let inner = MockRegistry::new("github-releases").with_resolved_ref(
+            "actions/checkout",
+            "v4.2.2",
+            sha,
+        );
+        let cached = CachedRegistry::new(inner, Cache::new_shared(), true);
+
+        assert_eq!(
+            cached
+                .resolve_ref_to_commit("actions/checkout", "v4.2.2")
+                .await
+                .unwrap(),
+            sha
         );
     }
 }

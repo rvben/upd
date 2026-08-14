@@ -104,6 +104,12 @@ fn build_schema() -> Value {
                 "type": "boolean"
             },
             {
+                "name": "update-action-shas",
+                "description": "Update full GitHub Actions SHA pins with verified concrete version comments while preserving immutable refs",
+                "type": "boolean",
+                "default": false
+            },
+            {
                 "name": "interactive",
                 "short": "-i",
                 "description": "Prompt before applying each update",
@@ -188,7 +194,7 @@ fn build_schema() -> Value {
                 "output_fields": [
                     {"name": "command", "type": "string", "description": "Always \"update\""},
                     {"name": "mode", "type": "string", "description": "\"dry-run\" or \"applied\""},
-                    {"name": "files", "type": "array", "items": {"type": "object"}, "description": "Per-file update reports. Each entry in a file's updates[] may carry method (manifest|uv-constraint|npm-override|cargo-precise) and status (planned|applied|pending_relock|skipped|unfixable|already_satisfied|failed|rolled_back), present only for version floors created when --package targets a lock-only package; error carries guidance for an unfixable floor, or resolver/tool stderr for a failed or rolled-back floor"},
+                    {"name": "files", "type": "array", "items": {"type": "object"}, "description": "Per-file update reports. Verified GitHub Actions SHA updates include reference_kind, current_commit, and latest_commit; safety-blocked pins appear in skipped[] with status and reason. Each entry in updates[] may also carry method and status for lock-only version floors"},
                     {"name": "summary", "type": "object", "description": "Aggregate counts (files_scanned, updates_total, etc.)"},
                     {"name": "warnings", "type": "array", "items": {"type": "object"}, "description": "Lockfile-discovery warnings (e.g. an ancestor lock outside the scanned paths), populated only when --package triggers lockfile scanning for version floors; signals incomplete coverage without failing the command"}
                 ]

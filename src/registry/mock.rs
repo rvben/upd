@@ -16,6 +16,8 @@ pub struct MockRegistry {
     version_metas: HashMap<String, Vec<VersionMeta>>,
     /// Map of package name to the ref names a consumer could pin to
     ref_names: HashMap<String, Vec<String>>,
+    /// Map of package name + ref to its immutable commit SHA
+    resolved_refs: HashMap<(String, String), String>,
     /// Registry name
     name: &'static str,
 }
@@ -28,6 +30,7 @@ impl MockRegistry {
             constrained_versions: HashMap::new(),
             version_metas: HashMap::new(),
             ref_names: HashMap::new(),
+            resolved_refs: HashMap::new(),
             name,
         }
     }
@@ -45,6 +48,15 @@ impl MockRegistry {
         self.ref_names.insert(
             package.to_string(),
             refs.iter().map(|r| r.to_string()).collect(),
+        );
+        self
+    }
+
+    /// Declare the commit SHA a Git ref resolves to.
+    pub fn with_resolved_ref(mut self, package: &str, reference: &str, commit_sha: &str) -> Self {
+        self.resolved_refs.insert(
+            (package.to_string(), reference.to_string()),
+            commit_sha.to_string(),
         );
         self
     }
@@ -128,6 +140,13 @@ impl Registry for MockRegistry {
 
     async fn list_ref_names(&self, package: &str) -> Result<Vec<String>> {
         Ok(self.ref_names.get(package).cloned().unwrap_or_default())
+    }
+
+    async fn resolve_ref_to_commit(&self, package: &str, reference: &str) -> Result<String> {
+        self.resolved_refs
+            .get(&(package.to_string(), reference.to_string()))
+            .cloned()
+            .ok_or_else(|| anyhow!("Ref not found: {package}@{reference}"))
     }
 
     fn name(&self) -> &'static str {
