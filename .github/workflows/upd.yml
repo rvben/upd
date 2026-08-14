@@ -1,0 +1,20 @@
+name: upd dependency health
+
+on:
+  schedule:
+    - cron: "58 6 * * 2"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  update:
+    uses: rvben/upd/.github/workflows/dependency-health.yml@9bcf516a6ef7c6c964c09f6a9f30e0d38a6f9210 # v0.5.0
+    with:
+      upd-version: v0.5.0
+      min-age: 7d
+      max-bump: minor
+      validation-command: make check
+      fail-on-blocked: false
