@@ -513,6 +513,31 @@ mod tests {
     }
 
     #[test]
+    fn test_select_accepts_version_exactly_at_cooldown_boundary() {
+        let versions = vec![meta("2.0.0", 7, false, false)];
+        let decision = select(
+            &versions,
+            "1.0.0",
+            "2.0.0",
+            None,
+            false,
+            Duration::days(7),
+            fixed_now(),
+        );
+
+        match decision {
+            CooldownDecision::Use {
+                version,
+                held_back_from,
+            } => {
+                assert_eq!(version, "2.0.0");
+                assert!(held_back_from.is_none());
+            }
+            other => panic!("version at the exact boundary must be eligible, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn test_select_held_back_to_second_newest() {
         let versions = vec![
             meta("2.0.0", 2, false, false),  // too new
