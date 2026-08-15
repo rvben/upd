@@ -797,6 +797,15 @@ pub async fn apply_cooldown(
     if cooldown <= chrono::Duration::zero() {
         return (CooldownOutcome::Unchanged(latest.to_string()), None);
     }
+
+    // Cooldown only applies to an actual forward update. Callers resolve every
+    // dependency before checking whether its version changed, so an up-to-date
+    // package can legitimately arrive here with `latest == current`. Passing
+    // that pair to `select` leaves no newer candidates and produces a bogus
+    // cooldown skip anchored to arbitrary registry metadata (often a prerelease).
+    if crate::version::compare::compare_versions(latest, current) != std::cmp::Ordering::Greater {
+        return (CooldownOutcome::Unchanged(latest.to_string()), None);
+    }
     let now = options.cooldown_now.unwrap_or_else(Utc::now);
 
     let versions = match registry.list_versions(package).await {
@@ -2458,5 +2467,59 @@ mod cooldown_integration_tests {
         assert_eq!(old, "4.17.20");
         assert_eq!(new, "4.17.21");
         assert_eq!(skipped, "4.17.22");
+    }
+
+    #[tokio::test]
+    async fn test_package_json_current_latest_is_not_a_cooldown_skip() {
+        let now = Utc.with_ymd_and_hms(2026, 8, 15, 12, 0, 0).unwrap();
+
+        let mut file = NamedTempFile::with_suffix(".json").unwrap();
+        writeln!(
+            file,
+            r#"{{"name":"demo","version":"0.0.0","dependencies":{{"astro":"7.2.2"}}}}"#
+        )
+        .unwrap();
+        file.flush().unwrap();
+
+        let registry = MockRegistry::new("npm")
+            .with_version("astro", "7.2.2")
+            .with_version_meta(
+                "astro",
+                "0.0.0-data-astro-transition-20240111220209",
+                Some(now - Duration::days(900)),
+                false,
+                true,
+            )
+            .with_version_meta(
+                "astro",
+                "7.2.2",
+                Some(now - Duration::days(30)),
+                false,
+                false,
+            );
+
+        let policy = CooldownPolicy {
+            default: Duration::days(7),
+            per_ecosystem: HashMap::new(),
+            force_override: None,
+        };
+
+        let updater = PackageJsonUpdater::new();
+        let options = UpdateOptions::new(true, false).with_cooldown_policy(policy, now);
+        let result = updater
+            .update(file.path(), &registry, options)
+            .await
+            .unwrap();
+
+        assert!(
+            result.updated.is_empty(),
+            "an up-to-date package must stay unchanged"
+        );
+        assert!(result.held_back.is_empty(), "no update exists to hold back");
+        assert!(
+            result.skipped_by_cooldown.is_empty(),
+            "unrelated prerelease metadata must not become a cooldown skip"
+        );
+        assert_eq!(result.unchanged, 1);
     }
 }
