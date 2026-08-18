@@ -1053,7 +1053,7 @@ mod tests {
                 current: "1111111111111111111111111111111111111111".into(),
                 status: SkipStatus::NotExamined,
                 reason: "action-sha-updates-off",
-                message: "SHA-pinned actions are only checked with --update-action-shas".into(),
+                message: "SHA pin updates are turned off by --no-update-action-shas".into(),
                 line_number: Some(17),
             }],
             ..Default::default()

@@ -19,8 +19,8 @@
 //!     "**/vendored/requirements.txt",
 //! ]
 //!
-//! # Update SHA-pinned GitHub Actions that carry a version comment
-//! update_action_shas = true
+//! # Leave SHA-pinned GitHub Actions alone; updating them is the default
+//! update_action_shas = false
 //!
 //! # Pin packages to specific versions or constraints - top-level table
 //! [pin]

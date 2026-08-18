@@ -105,13 +105,13 @@ fn build_schema() -> Value {
             },
             {
                 "name": "update-action-shas",
-                "description": "Update full GitHub Actions SHA pins with verified concrete version comments while preserving immutable refs. Overrides update_action_shas in .updrc.toml.",
+                "description": "Update full GitHub Actions SHA pins with verified concrete version comments while preserving immutable refs. On by default; pass this only to override update_action_shas = false in .updrc.toml.",
                 "type": "boolean",
-                "default": false
+                "default": true
             },
             {
                 "name": "no-update-action-shas",
-                "description": "Leave GitHub Actions SHA pins alone, overriding update_action_shas in .updrc.toml. The pins are still reported in skipped[] with status \"not-examined\". Conflicts with --update-action-shas.",
+                "description": "Leave GitHub Actions SHA pins alone, overriding update_action_shas in .updrc.toml and the default. The pins are still reported in skipped[] with status \"not-examined\". Conflicts with --update-action-shas.",
                 "type": "boolean"
             },
             {

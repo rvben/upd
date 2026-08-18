@@ -1,19 +1,33 @@
-//! End-to-end tests for how a run reports GitHub Actions pinned to a commit
-//! SHA while SHA-pin updating is off, driven through the built binary.
+//! End-to-end tests for how a run treats GitHub Actions pinned to a commit SHA,
+//! driven through the built binary.
 //!
-//! The defect these guard: such a pin used to be dropped without a trace, so a
-//! workflow whose every action is SHA-pinned closed with a green "all
-//! dependencies up to date" even though not one of them had been looked at.
-//! A pin nobody examined is not an up-to-date dependency.
+//! Two defects these guard. A pin left unchecked used to be dropped without a
+//! trace, so a workflow whose every action is SHA-pinned closed with a green
+//! "all dependencies up to date" even though not one of them had been looked
+//! at; a pin nobody examined is not an up-to-date dependency. And checking them
+//! used to be off by default, which left the repositories that took GitHub's
+//! own pinning advice on stale action code.
+//!
+//! `--no-update-action-shas` is therefore explicit wherever these tests want the
+//! unchecked state, rather than relied on as the default.
 
 use std::process::Command;
 
 use serde_json::Value;
 use tempfile::TempDir;
 
+/// Arguments for a run that must not consult the network: opting out stops at
+/// the pin before any lookup.
+const OFFLINE_OPT_OUT: &[&str] = &[
+    "--dry-run",
+    "--no-cache",
+    "--no-update-action-shas",
+    "--output",
+    "text",
+];
+
 /// A real, full-length commit SHA carrying the concrete version comment that
-/// makes the pin updateable. Nothing here reaches the network: the run stops at
-/// the pin before any lookup, which is the whole point of the feature being off.
+/// makes the pin updateable.
 const PINNED_WORKFLOW: &str = "\
 name: CI
 on: push
@@ -95,7 +109,7 @@ fn json_of(output: &std::process::Output) -> Value {
 #[test]
 fn text_summary_does_not_claim_up_to_date_for_an_unchecked_sha_pin() {
     let dir = fixture(PINNED_WORKFLOW);
-    let output = run(&dir, &["--dry-run", "--no-cache", "--output", "text"]);
+    let output = run(&dir, OFFLINE_OPT_OUT);
     let stdout = stdout_of(&output);
 
     assert!(
@@ -103,7 +117,7 @@ fn text_summary_does_not_claim_up_to_date_for_an_unchecked_sha_pin() {
         "the only action was never looked at:\n{stdout}"
     );
     assert!(
-        stdout.contains("1 SHA-pinned action(s), not checked without --update-action-shas"),
+        stdout.contains("1 SHA-pinned action(s), not checked while SHA updates are off"),
         "the summary must account for the unchecked pin:\n{stdout}"
     );
     assert_eq!(
@@ -118,7 +132,7 @@ fn text_summary_does_not_claim_up_to_date_for_an_unchecked_sha_pin() {
 #[test]
 fn text_summary_keeps_the_tick_when_there_is_nothing_to_check() {
     let dir = fixture(EMPTY_WORKFLOW);
-    let output = run(&dir, &["--dry-run", "--no-cache", "--output", "text"]);
+    let output = run(&dir, OFFLINE_OPT_OUT);
     let stdout = stdout_of(&output);
 
     assert!(
@@ -133,16 +147,15 @@ fn text_summary_keeps_the_tick_when_there_is_nothing_to_check() {
 fn verbose_names_the_unchecked_pin() {
     let dir = fixture(PINNED_WORKFLOW);
 
-    let quiet = stdout_of(&run(&dir, &["--dry-run", "--no-cache", "--output", "text"]));
+    let quiet = stdout_of(&run(&dir, OFFLINE_OPT_OUT));
     assert!(
         !quiet.contains("actions/checkout"),
-        "the default run reports the count, not the names:\n{quiet}"
+        "the summary reports the count, not the names:\n{quiet}"
     );
 
-    let verbose = stdout_of(&run(
-        &dir,
-        &["--dry-run", "--no-cache", "--output", "text", "--verbose"],
-    ));
+    let mut verbose_args = OFFLINE_OPT_OUT.to_vec();
+    verbose_args.push("--verbose");
+    let verbose = stdout_of(&run(&dir, &verbose_args));
     assert!(
         verbose.contains("actions/checkout"),
         "--verbose must name the pin so it can be found:\n{verbose}"
@@ -158,7 +171,16 @@ fn verbose_names_the_unchecked_pin() {
 #[test]
 fn json_report_separates_unchecked_pins_from_up_to_date_dependencies() {
     let dir = fixture(PINNED_WORKFLOW);
-    let report = json_of(&run(&dir, &["--dry-run", "--no-cache", "--output", "json"]));
+    let report = json_of(&run(
+        &dir,
+        &[
+            "--dry-run",
+            "--no-cache",
+            "--no-update-action-shas",
+            "--output",
+            "json",
+        ],
+    ));
 
     let summary = &report["summary"];
     assert_eq!(summary["not_examined"], 1, "report: {report:#}");
@@ -188,25 +210,40 @@ fn only_skipped(report: &Value) -> &Value {
     &entries[0]
 }
 
-/// `update_action_shas` in `.updrc.toml` sets the default for the repository,
-/// and the opt-out flag still wins over it. Both directions are visible without
-/// a network lookup: the short SHA is only reached once the pin is examined.
+/// Checking SHA pins is the default, so a plain run examines one. Visible
+/// without a network lookup: the short SHA is only reached once the pin is
+/// examined, and reporting it as not-examined would mean the default was off.
 #[test]
-fn config_key_turns_sha_checking_on_and_the_flag_turns_it_back_off() {
+fn sha_pins_are_checked_by_default() {
+    let dir = fixture(SHORT_SHA_WORKFLOW);
+    let report = json_of(&run(&dir, &["--dry-run", "--no-cache", "--output", "json"]));
+
+    let entry = only_skipped(&report);
+    assert_eq!(entry["status"], "blocked", "report: {report:#}");
+    assert_eq!(entry["reason"], "short-sha", "report: {report:#}");
+}
+
+/// `update_action_shas = false` in `.updrc.toml` turns the default off for the
+/// repository, and the opt-in flag still wins over it.
+#[test]
+fn config_key_turns_sha_checking_off_and_the_flag_turns_it_back_on() {
     let dir = fixture(SHORT_SHA_WORKFLOW);
     std::fs::write(
         dir.path().join(".updrc.toml"),
-        "update_action_shas = true\n",
+        "update_action_shas = false\n",
     )
     .expect("config written");
 
     let from_config = json_of(&run(&dir, &["--dry-run", "--no-cache", "--output", "json"]));
     let entry = only_skipped(&from_config);
     assert_eq!(
-        entry["status"], "blocked",
+        entry["status"], "not-examined",
         "the config key must reach the updater: {from_config:#}"
     );
-    assert_eq!(entry["reason"], "short-sha", "report: {from_config:#}");
+    assert_eq!(
+        entry["reason"], "action-sha-updates-off",
+        "report: {from_config:#}"
+    );
 
     let overridden = json_of(&run(
         &dir,
@@ -215,16 +252,13 @@ fn config_key_turns_sha_checking_on_and_the_flag_turns_it_back_off() {
             "--no-cache",
             "--output",
             "json",
-            "--no-update-action-shas",
+            "--update-action-shas",
         ],
     ));
     let entry = only_skipped(&overridden);
     assert_eq!(
-        entry["status"], "not-examined",
+        entry["status"], "blocked",
         "the flag must override the config key: {overridden:#}"
     );
-    assert_eq!(
-        entry["reason"], "action-sha-updates-off",
-        "report: {overridden:#}"
-    );
+    assert_eq!(entry["reason"], "short-sha", "report: {overridden:#}");
 }

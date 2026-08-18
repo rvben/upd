@@ -235,16 +235,17 @@ upd audit --format sarif > results.sarif
 - `.github/workflows/*.yml` and `.github/workflows/*.yaml`
 - Updates `uses:` version references (e.g., `actions/checkout@v3` → `actions/checkout@v4`)
 - Supports actions and reusable workflows
-- Leaves SHA-pinned actions unchecked by default and reports them as such, so
-  they are never counted as up to date; `--update-action-shas` (or
-  `update_action_shas = true` in `.updrc.toml`) safely updates annotated
-  full-SHA pins without converting them to mutable tags
+- Checks SHA-pinned actions by default, updating annotated full-SHA pins
+  without ever converting them to mutable tags; a pin it declines to rewrite is
+  reported rather than counted as up to date. `--no-update-action-shas` (or
+  `update_action_shas = false` in `.updrc.toml`) leaves the pins untouched
 - Skips branch refs, local actions, and Docker references
 - Authenticates via `GITHUB_TOKEN` or `GH_TOKEN` for higher API rate limits
 
 #### Immutable SHA pins
 
-SHA updates are deliberately opt-in and require a concrete version annotation:
+Commit pins are checked by default, and rewriting one requires a concrete
+version annotation:
 
 ```yaml
 - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
@@ -258,7 +259,6 @@ jobs:
 upd update . \
   --apply \
   --lang actions \
-  --update-action-shas \
   --min-age 7d \
   --max-bump minor
 ```
@@ -270,7 +270,9 @@ comment. A short SHA, missing or floating comment (`# v4`), moved tag, or stale
 comment is never rewritten. Structured output reports these under
 `files[].skipped[]` with `status: "blocked"` and a machine-readable `reason`.
 
-With SHA updates off, the pins still appear in `files[].skipped[]`, under
+With SHA updates turned off (`--no-update-action-shas`, or
+`update_action_shas = false` in `.updrc.toml`), the pins still appear in
+`files[].skipped[]`, under
 `status: "not-examined"` with `reason: "action-sha-updates-off"`, and are
 counted in `summary.not_examined`. The two statuses answer different questions:
 `blocked` means the pin was examined and a safety condition refused the change,
@@ -546,9 +548,9 @@ ignore = [
     "pre-commit/pre-commit-hooks",  # Pre-commit hooks too
 ]
 
-# Check SHA-pinned GitHub Actions for this repository without passing
-# --update-action-shas on every run. The flag still wins when given.
-update_action_shas = true
+# Leave SHA-pinned GitHub Actions unchecked for this repository. Checking them
+# is the default; --update-action-shas still wins when given.
+update_action_shas = false
 
 # Pin packages to specific versions (bypasses registry lookup)
 [pin]
@@ -564,7 +566,7 @@ django = "4.2.0"
 |--------|------|-------------|
 | `ignore` | `string[]` | List of package names to skip during updates |
 | `pin` | `table` | Map of package names to pinned versions |
-| `update_action_shas` | `bool` | Default for `--update-action-shas`. Omit it to keep the built-in default; `--no-update-action-shas` overrides it |
+| `update_action_shas` | `bool` | Whether SHA-pinned GitHub Actions are checked and updated. Defaults to `true`; `--update-action-shas` and `--no-update-action-shas` override it |
 
 ### Verbose Output
 

@@ -133,14 +133,16 @@ pub struct Cli {
     /// pinned to the new tag's full commit SHA. Unsafe pins are reported and
     /// left unchanged.
     ///
-    /// Overrides `update_action_shas` in the config file.
+    /// On by default. Pass --no-update-action-shas to leave pins alone, or set
+    /// `update_action_shas` in the config file; this flag overrides both.
     #[arg(long, global = true)]
     pub update_action_shas: bool,
 
     /// Leave GitHub Actions SHA pins alone.
     ///
-    /// Overrides `update_action_shas = true` in the config file. The pins are
-    /// still reported as unchecked rather than counted as up to date.
+    /// Overrides `update_action_shas` in the config file and the built-in
+    /// default. The pins are still reported as unchecked rather than counted as
+    /// up to date.
     #[arg(
         long = "no-update-action-shas",
         global = true,

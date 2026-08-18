@@ -4808,7 +4808,7 @@ fn print_summary(
 
         if not_examined_count > 0 {
             println!(
-                "{} {} SHA-pinned action(s), not checked without --update-action-shas",
+                "{} {} SHA-pinned action(s), not checked while SHA updates are off",
                 "Skipped".dimmed(),
                 not_examined_count.to_string().dimmed()
             );

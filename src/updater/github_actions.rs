@@ -358,7 +358,7 @@ impl Updater for GithubActionsUpdater {
                             current: version_ref.to_string(),
                             status: SkipStatus::NotExamined,
                             reason: "action-sha-updates-off",
-                            message: "SHA-pinned actions are only checked with --update-action-shas, or `update_action_shas = true` in .updrc.toml".to_string(),
+                            message: "SHA pin updates are turned off by --no-update-action-shas, or `update_action_shas = false` in .updrc.toml".to_string(),
                             line_number: Some(line_idx + 1),
                         });
                         continue;
@@ -1263,7 +1263,7 @@ jobs:
     }
 
     #[tokio::test]
-    async fn test_sha_pin_requires_opt_in_and_concrete_comment() {
+    async fn test_sha_pin_opt_out_and_concrete_comment() {
         const SHA: &str = "1111111111111111111111111111111111111111";
         let updater = GithubActionsUpdater::new();
 
@@ -1275,7 +1275,11 @@ jobs:
         .unwrap();
         let registry = MockRegistry::new("github-releases");
         let result = updater
-            .update(opt_out.path(), &registry, UpdateOptions::new(false, false))
+            .update(
+                opt_out.path(),
+                &registry,
+                UpdateOptions::new(false, false).with_action_sha_updates(false),
+            )
             .await
             .unwrap();
         assert!(result.updated.is_empty());

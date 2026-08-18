@@ -275,7 +275,15 @@ pub struct UpdateOptions {
 /// Whether GitHub Actions SHA pins are updated when neither the command line
 /// nor the config file says. A SHA pin that is not updated is still reported,
 /// so this decides the default behaviour but never whether the pin is visible.
-pub const DEFAULT_UPDATE_ACTION_SHAS: bool = false;
+///
+/// On, because pinning an action to a commit is the hardening GitHub itself
+/// recommends, and a default that declines to update those pins leaves the
+/// hardened repository on stale action code while the unhardened one gets
+/// patched. Every rewrite is gated on a full 40-character SHA, a concrete
+/// version comment, and that comment resolving to the pinned commit, so the
+/// pins this default touches are exactly the ones whose provenance is
+/// verifiable; anything ambiguous is reported and left alone.
+pub const DEFAULT_UPDATE_ACTION_SHAS: bool = true;
 
 impl UpdateOptions {
     /// Create new options with the given dry_run and full_precision settings
