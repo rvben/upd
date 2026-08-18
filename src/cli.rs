@@ -134,7 +134,7 @@ pub struct Cli {
     /// left unchanged.
     ///
     /// Overrides `update_action_shas` in the config file.
-    #[arg(long, global = true, conflicts_with = "interactive")]
+    #[arg(long, global = true)]
     pub update_action_shas: bool,
 
     /// Leave GitHub Actions SHA pins alone.
@@ -433,17 +433,18 @@ mod tests {
         assert_eq!(cli.langs, vec![Lang::Actions]);
     }
 
+    /// SHA pins were once barred from interactive mode because the approved
+    /// edit was rewritten tag-shaped and could not be applied to a commit pin.
+    /// The interactive path now carries the resolved commit transition, so the
+    /// combination is accepted rather than rejected at parse time.
     #[test]
-    fn test_action_sha_updates_conflict_with_interactive_mode() {
-        let result = Cli::try_parse_from(["upd", "--update-action-shas", "--interactive"]);
-        let error = result
-            .err()
-            .expect("SHA updates must not enter the tag-based interactive rewrite path");
-        assert_eq!(error.kind(), clap::error::ErrorKind::ArgumentConflict);
+    fn test_action_sha_updates_are_allowed_with_interactive_mode() {
+        let cli = Cli::try_parse_from(["upd", "--update-action-shas", "--interactive"])
+            .expect("interactive mode applies SHA pins through the commit-aware rewrite");
+        assert_eq!(cli.action_sha_override(), Some(true));
+        assert!(cli.interactive);
     }
 
-    /// Opting out is compatible with interactive mode: it removes the SHA-pin
-    /// rewrites that cannot be prompted for, rather than adding them.
     #[test]
     fn test_action_sha_opt_out_is_allowed_with_interactive_mode() {
         let cli = Cli::try_parse_from(["upd", "--no-update-action-shas", "--interactive"]).unwrap();

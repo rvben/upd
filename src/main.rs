@@ -29,11 +29,12 @@ use upd::registry::{
     NuGetRegistry, PyPiRegistry, RubyGemsRegistry, TerraformRegistry,
 };
 use upd::updater::{
-    AnnotatedUpdater, BumpFilter, CargoTomlUpdater, CsprojUpdater, DEFAULT_UPDATE_ACTION_SHAS,
-    DiscoverOptions, FileType, GemfileUpdater, GithubActionsUpdater, GoModUpdater, Lang,
-    MiseUpdater, PackageJsonUpdater, ParseWarnings, PreCommitUpdater, PyProjectUpdater,
-    RegistrySet, RequirementsUpdater, SkipStatus, TerraformUpdater, UpdateOptions, UpdateResult,
-    Updater, discover_files_with, ecosystem_key, read_file_safe, write_file_atomic,
+    ActionShaUpdate, AnnotatedUpdater, BumpFilter, CargoTomlUpdater, CsprojUpdater,
+    DEFAULT_UPDATE_ACTION_SHAS, DiscoverOptions, FileType, GemfileUpdater, GithubActionsUpdater,
+    GoModUpdater, Lang, MiseUpdater, PackageJsonUpdater, ParseWarnings, PreCommitUpdater,
+    PyProjectUpdater, RegistrySet, RequirementsUpdater, SkipStatus, TerraformUpdater,
+    UpdateOptions, UpdateResult, Updater, discover_files_with, ecosystem_key, read_file_safe,
+    write_file_atomic,
 };
 use upd::version::match_version_precision;
 
@@ -2374,6 +2375,13 @@ async fn run_interactive_update(
                     .entry_ecosystem
                     .get(&change.package)
                     .copied(),
+                // A workflow scan records the resolved commit transition beside
+                // the version one.
+                sha_pin: sha_pin_for(
+                    &scanned_file.result.action_sha_updates,
+                    &change.package,
+                    change.line_num,
+                ),
             })
             .collect();
         let rewritten = apply_version_updates(
@@ -3124,6 +3132,9 @@ async fn run_audit(cli: &Cli) -> Result<()> {
                             new_version: t.to_version.as_str(),
                             line_num: t.line_number,
                             expected_source: None,
+                            // Fix targets name a vulnerable version in a
+                            // manifest, never an action's commit pin.
+                            sha_pin: None,
                         })
                         .collect();
                     let applied =
@@ -3630,6 +3641,9 @@ fn apply_alignments(alignments: &[&PackageAlignment], full_precision: bool) -> R
                     new_version: &alignment.highest_version,
                     line_num: occurrence.line_number,
                     expected_source: None,
+                    // Alignment equalises declared version strings across
+                    // manifests; it never touches a workflow's commit pin.
+                    sha_pin: None,
                 });
         }
     }
@@ -3660,6 +3674,30 @@ struct VersionEdit<'a> {
     /// was an annotated one. `None` means the edit did not come from an
     /// annotation, and `apply_annotated_version` skips its source check.
     expected_source: Option<AnnotationSource>,
+    /// The commit transition the scan resolved for this line, when the action is
+    /// pinned to a SHA rather than a tag. `None` means the line carries a tag and
+    /// is rewritten as one. Without this the tag-shaped rewrite would be applied
+    /// to a commit pin, which is why SHA updates were once barred from the
+    /// interactive path entirely.
+    sha_pin: Option<&'a ActionShaUpdate>,
+}
+
+/// Find the commit transition a workflow scan resolved for `package` on
+/// `line_num`.
+///
+/// Both sides must name a line. A workflow referencing the same action from two
+/// jobs is ordinary, and matching on name alone would hand one line's commit to
+/// the other, so a pin whose line is unknown matches nothing rather than the
+/// first reference that happens to share its name. An edit left without its pin
+/// fails to apply and is reported; it is never rewritten as a tag.
+fn sha_pin_for<'a>(
+    pins: &'a [ActionShaUpdate],
+    package: &str,
+    line_num: Option<usize>,
+) -> Option<&'a ActionShaUpdate> {
+    let line_num = line_num?;
+    pins.iter()
+        .find(|pin| pin.package == package && pin.line_number == Some(line_num))
 }
 
 #[derive(Debug)]
@@ -4247,6 +4285,23 @@ fn apply_github_actions_version(
     update: &VersionEdit<'_>,
     target_version: &str,
 ) -> bool {
+    // A commit pin is rewritten through the updater's own routine so both the
+    // SHA and its version comment move together. `target_version` is deliberately
+    // unused here: it has been through precision matching, while the pin's
+    // new_version is the exact tag that was resolved to new_commit, and writing
+    // any other string would leave the comment describing a different commit.
+    if let Some(pin) = update.sha_pin {
+        return apply_line_replacement(document, update.line_num, |line| {
+            GithubActionsUpdater::new().replace_sha_pin(
+                line,
+                &pin.current_commit,
+                &pin.current_version,
+                &pin.new_commit,
+                &pin.new_version,
+            )
+        });
+    }
+
     let pattern = format!(
         r#"({}@){}(\s|$|#|")"#,
         regex::escape(update.package),
@@ -5536,6 +5591,7 @@ mod tests {
             new_version: "3.10.0",
             line_num: Some(2),
             expected_source: None,
+            sha_pin: None,
         }];
 
         let applied = apply_version_updates(content, &updates, FileType::PyProject, false).unwrap();
@@ -5556,6 +5612,7 @@ mod tests {
             new_version: "3.10.0",
             line_num: Some(1),
             expected_source: None,
+            sha_pin: None,
         }];
 
         let applied = apply_version_updates(content, &updates, FileType::PyProject, false).unwrap();
@@ -5565,6 +5622,136 @@ mod tests {
             applied.content,
             "[project]\ndependencies = [\"django>=3.10,<4\"]\n"
         );
+    }
+
+    /// A SHA pin approved interactively must move the commit and its comment
+    /// together. The tag-shaped rewrite cannot do this: it looks for
+    /// `actions/checkout@v4.2.2`, which a commit-pinned line does not contain.
+    #[test]
+    fn test_apply_version_updates_rewrites_an_approved_sha_pin() {
+        const OLD_SHA: &str = "11bd71901bbe5b1630ceea73d27597364c9af683";
+        const NEW_SHA: &str = "08c6903cd8c0fde910a37f88322edcfb5dd907a8";
+        let content = format!(
+            "jobs:\n  build:\n    steps:\n      - uses: actions/checkout@{OLD_SHA} # v4.2.2\n"
+        );
+        let pin = ActionShaUpdate {
+            package: "actions/checkout".to_string(),
+            current_version: "v4.2.2".to_string(),
+            new_version: "v4.3.0".to_string(),
+            current_commit: OLD_SHA.to_string(),
+            new_commit: NEW_SHA.to_string(),
+            line_number: Some(4),
+        };
+        let updates = [VersionEdit {
+            package: "actions/checkout",
+            old_version: "v4.2.2",
+            new_version: "v4.3.0",
+            line_num: Some(4),
+            expected_source: None,
+            sha_pin: Some(&pin),
+        }];
+
+        let applied =
+            apply_version_updates(&content, &updates, FileType::GithubActions, false).unwrap();
+
+        assert_eq!(applied.applied_count(), 1);
+        assert!(
+            applied
+                .content
+                .contains(&format!("actions/checkout@{NEW_SHA} # v4.3.0")),
+            "commit and comment must move together:\n{}",
+            applied.content
+        );
+        assert!(
+            !applied.content.contains(OLD_SHA),
+            "the old commit must not survive:\n{}",
+            applied.content
+        );
+        assert!(
+            !applied.content.contains("actions/checkout@v4.3.0"),
+            "the pin must stay a commit pin, not become a mutable tag:\n{}",
+            applied.content
+        );
+    }
+
+    /// The pin is only rewritten from the state the scan verified. A line that
+    /// changed underneath leaves the SHA alone rather than being rewritten from
+    /// stale input.
+    #[test]
+    fn test_apply_version_updates_refuses_a_sha_pin_that_moved_since_the_scan() {
+        const SCANNED_SHA: &str = "11bd71901bbe5b1630ceea73d27597364c9af683";
+        const ON_DISK_SHA: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let content = format!(
+            "jobs:\n  build:\n    steps:\n      - uses: actions/checkout@{ON_DISK_SHA} # v4.2.2\n"
+        );
+        let pin = ActionShaUpdate {
+            package: "actions/checkout".to_string(),
+            current_version: "v4.2.2".to_string(),
+            new_version: "v4.3.0".to_string(),
+            current_commit: SCANNED_SHA.to_string(),
+            new_commit: "08c6903cd8c0fde910a37f88322edcfb5dd907a8".to_string(),
+            line_number: Some(4),
+        };
+        let updates = [VersionEdit {
+            package: "actions/checkout",
+            old_version: "v4.2.2",
+            new_version: "v4.3.0",
+            line_num: Some(4),
+            expected_source: None,
+            sha_pin: Some(&pin),
+        }];
+
+        let error = apply_version_updates(&content, &updates, FileType::GithubActions, false)
+            .unwrap_err()
+            .to_string();
+
+        assert!(
+            error.contains("Failed to apply 1 version edit"),
+            "a drifted pin must fail loudly, not be rewritten: {error}"
+        );
+    }
+
+    /// Build a pin for `package` on `line`, with commits distinguishable by the
+    /// line they came from.
+    fn pin_on_line(package: &str, line: Option<usize>) -> ActionShaUpdate {
+        let n = line.unwrap_or(0);
+        ActionShaUpdate {
+            package: package.to_string(),
+            current_version: "v4.2.2".to_string(),
+            new_version: "v4.3.0".to_string(),
+            current_commit: format!("old{n}"),
+            new_commit: format!("new{n}"),
+            line_number: line,
+        }
+    }
+
+    /// A workflow may use one action from two jobs, and each reference resolves
+    /// its own commit. Matching on name alone would rewrite one line with the
+    /// other's commit.
+    #[test]
+    fn test_sha_pin_for_keeps_two_references_to_one_action_apart() {
+        let pins = [
+            pin_on_line("actions/checkout", Some(4)),
+            pin_on_line("actions/checkout", Some(11)),
+        ];
+
+        let found = sha_pin_for(&pins, "actions/checkout", Some(11)).expect("pin on line 11");
+        assert_eq!(found.new_commit, "new11");
+        assert!(sha_pin_for(&pins, "actions/checkout", Some(7)).is_none());
+        assert!(sha_pin_for(&pins, "actions/setup-node", Some(4)).is_none());
+    }
+
+    /// An edit or a pin without a line cannot be shown to be the same reference,
+    /// so it matches nothing. The edit then fails to apply and is reported,
+    /// which is what a wrong commit would not be.
+    #[test]
+    fn test_sha_pin_for_will_not_match_without_a_line_on_both_sides() {
+        let unlocated = [pin_on_line("actions/checkout", None)];
+        assert!(sha_pin_for(&unlocated, "actions/checkout", Some(4)).is_none());
+        assert!(sha_pin_for(&unlocated, "actions/checkout", None).is_none());
+
+        let located = [pin_on_line("actions/checkout", Some(4))];
+        assert!(sha_pin_for(&located, "actions/checkout", None).is_none());
     }
 
     #[test]
@@ -5585,6 +5772,7 @@ dev = [
             new_version: "3.10.0",
             line_num: Some(1),
             expected_source: None,
+            sha_pin: None,
         }];
 
         let error =
@@ -5612,6 +5800,7 @@ dev = [
             new_version: "2.0.0",
             line_num: Some(6),
             expected_source: None,
+            sha_pin: None,
         }];
 
         let applied = apply_version_updates(content, &updates, FileType::Csproj, false).unwrap();
@@ -5644,6 +5833,7 @@ version = "1.0.0"
             new_version: "1.2.3",
             line_num: Some(5),
             expected_source: None,
+            sha_pin: None,
         }];
 
         let applied = apply_version_updates(content, &updates, FileType::CargoToml, false).unwrap();
@@ -5674,6 +5864,7 @@ version = "1.0.0"
                 new_version: "19.0.0",
                 line_num: Some(3),
                 expected_source: None,
+                sha_pin: None,
             },
             VersionEdit {
                 package: "react",
@@ -5681,6 +5872,7 @@ version = "1.0.0"
                 new_version: "19.0.0",
                 line_num: Some(3),
                 expected_source: None,
+                sha_pin: None,
             },
         ];
 
@@ -5719,6 +5911,7 @@ serde = "1.0.1"
                 new_version: "1.0.2",
                 line_num: Some(6),
                 expected_source: None,
+                sha_pin: None,
             },
             VersionEdit {
                 package: "serde",
@@ -5726,6 +5919,7 @@ serde = "1.0.1"
                 new_version: "1.0.2",
                 line_num: Some(6),
                 expected_source: None,
+                sha_pin: None,
             },
         ];
 
@@ -6173,6 +6367,7 @@ mod output_tests {
             new_version: new,
             line_num: Some(line),
             expected_source: source,
+            sha_pin: None,
         }
     }
 
@@ -6393,6 +6588,7 @@ mod output_tests {
                 new_version: new.as_str(),
                 line_num: *line,
                 expected_source: result.entry_ecosystem.get(package).copied(),
+                sha_pin: None,
             })
             .collect();
 

@@ -93,7 +93,16 @@ impl GithubActionsUpdater {
         semver::Version::parse(version.strip_prefix('v').unwrap_or(version)).is_ok()
     }
 
-    fn replace_sha_pin(
+    /// Rewrite one `uses:` line from one verified SHA pin to another, moving the
+    /// commit and its version comment together.
+    ///
+    /// Returns `None` unless the line still carries `current_sha` annotated with
+    /// exactly `current_version`, which keeps the pin immutable: a line that
+    /// drifted since the scan is left alone rather than rewritten from stale
+    /// input. Every path that edits a SHA pin goes through here, so an
+    /// interactively approved update cannot rewrite the line differently from
+    /// the same update applied in one pass.
+    pub fn replace_sha_pin(
         &self,
         line: &str,
         current_sha: &str,
@@ -101,6 +110,12 @@ impl GithubActionsUpdater {
         new_sha: &str,
         new_version: &str,
     ) -> Option<String> {
+        // `replacen` leaves the line untouched when the commit is absent, so
+        // without this the comment would still be rewritten and the pin would
+        // end up advertising a version its commit does not correspond to.
+        if !line.contains(current_sha) {
+            return None;
+        }
         let mut updated = line.replacen(current_sha, new_sha, 1);
         let uses_end = self.uses_re.captures(&updated)?.get(0)?.end();
         let suffix = &updated[uses_end..];
