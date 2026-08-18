@@ -5,6 +5,15 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.4](https://github.com/rvben/upd/compare/v0.5.3...v0.5.4) - 2026-08-18
+
+### Fixed
+
+- **actions**: report SHA-pinned actions left unchecked instead of dropping them ([31fbf34](https://github.com/rvben/upd/commit/31fbf342651eb5dab40aff73a6d6301e7a47f9d3))
+- **requirements**: keep the default index when only --extra-index-url is set ([26388b2](https://github.com/rvben/upd/commit/26388b28f11674ae00a6b8d9ac8acbde8edca3da))
+- **output**: do not report "up to date" when lookups failed ([ca555f8](https://github.com/rvben/upd/commit/ca555f8ab4f018da363f0ae53f98999d33a69812))
+- **pyproject**: consult declared indexes alongside the default index ([edd7922](https://github.com/rvben/upd/commit/edd7922cae34e5f70bce4b5848e7b58aaa01579c))
+
 ## [0.5.3](https://github.com/rvben/upd/compare/v0.5.2...v0.5.3) - 2026-08-15
 
 ### Fixed
