@@ -2285,6 +2285,9 @@ async fn run_interactive_update(
 
     if !has_interactive_changes(&pending_updates, &scanned_results) {
         if !cli.quiet {
+            // Failed lookups count as interactive changes (see
+            // has_interactive_changes), so this branch is only reached when
+            // every lookup succeeded and the tick is accurate.
             println!(
                 "{} Scanned {} file(s), all dependencies up to date",
                 "✓".green(),
@@ -4597,6 +4600,30 @@ fn print_file_result(
     }
 }
 
+/// The closing line for a run that found nothing to update.
+///
+/// "All dependencies up to date" is a claim that every dependency was checked,
+/// so it is only printed when every lookup succeeded. When lookups failed the
+/// line says how many could not be checked instead of showing a green tick
+/// next to a run that may have checked nothing at all.
+fn print_nothing_to_update_line(file_count: usize, up_to_date: usize, failed_lookups: usize) {
+    if failed_lookups == 0 {
+        println!(
+            "{} Scanned {} file(s), all dependencies up to date",
+            "✓".green(),
+            file_count
+        );
+    } else {
+        println!(
+            "{} Scanned {} file(s), {} dependency(ies) up to date, {} could not be checked",
+            "⚠".yellow().bold(),
+            file_count,
+            up_to_date,
+            failed_lookups.to_string().red().bold()
+        );
+    }
+}
+
 fn print_summary(
     result: &UpdateResult,
     file_count: usize,
@@ -4621,11 +4648,7 @@ fn print_summary(
         && skipped_cooldown_count == 0
         && skipped_count == 0
     {
-        println!(
-            "{} Scanned {} file(s), all dependencies up to date",
-            "✓".green(),
-            file_count
-        );
+        print_nothing_to_update_line(file_count, result.unchanged, result.errors.len());
     } else {
         // Build breakdown string for updates
         let mut parts = Vec::new();

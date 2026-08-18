@@ -290,3 +290,97 @@ torch = {{ index = "pytorch" }}
         ]
     );
 }
+
+/// The text summary must not claim "all dependencies up to date" for a run in
+/// which nothing could be checked. The failure count already exits 2; this is
+/// about the human-readable line next to it.
+#[tokio::test(flavor = "multi_thread")]
+async fn text_summary_does_not_claim_up_to_date_when_every_lookup_failed() {
+    let default = MockServer::start().await;
+
+    let private = MockServer::start().await;
+    missing(&private, "requests").await;
+    missing(&private, "loguru").await;
+
+    let dir = TempDir::new().unwrap();
+    write_pyproject(
+        &dir,
+        &format!(
+            r#"[project]
+name = "demo"
+dependencies = [
+    "requests>=2.28.0",
+    "loguru>=0.6.0",
+]
+
+[[tool.uv.index]]
+name = "nexus"
+url = "{}/simple/"
+default = true
+"#,
+            private.uri()
+        ),
+    );
+
+    let output = run(
+        &dir,
+        &default.uri(),
+        &["--dry-run", "--no-cache", "--output", "text"],
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert_eq!(output.status.code(), Some(2), "stderr: {stderr}");
+    assert!(
+        !stdout.contains("all dependencies up to date"),
+        "a run that checked nothing must not claim it is up to date:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("2 could not be checked"),
+        "the summary must count the failed lookups:\n{stdout}"
+    );
+    assert!(
+        stderr.contains("2 error(s) occurred"),
+        "the error count still closes the run:\n{stderr}"
+    );
+}
+
+/// The green tick is still the closing line when every lookup succeeded and
+/// nothing needs updating.
+#[tokio::test(flavor = "multi_thread")]
+async fn text_summary_keeps_the_tick_when_everything_was_checked() {
+    let default = MockServer::start().await;
+    serve(&default, "requests", &["2.32.0"]).await;
+
+    let private = MockServer::start().await;
+    missing(&private, "requests").await;
+
+    let dir = TempDir::new().unwrap();
+    write_pyproject(
+        &dir,
+        &format!(
+            r#"[project]
+name = "demo"
+dependencies = ["requests>=2.32.0"]
+
+[[tool.uv.index]]
+name = "nexus"
+url = "{}/simple/"
+"#,
+            private.uri()
+        ),
+    );
+
+    let output = run(
+        &dir,
+        &default.uri(),
+        &["--dry-run", "--no-cache", "--output", "text"],
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    assert_eq!(output.status.code(), Some(0));
+    assert!(
+        stdout.contains("Scanned 1 file(s), all dependencies up to date"),
+        "stdout:\n{stdout}"
+    );
+}
