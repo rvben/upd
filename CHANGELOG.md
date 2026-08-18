@@ -5,6 +5,13 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.6.0](https://github.com/rvben/upd/compare/v0.5.4...v0.6.0) - 2026-08-18
+
+### Added
+
+- check GitHub Actions SHA pins by default ([f9da91e](https://github.com/rvben/upd/commit/f9da91eefd7d33457ccbaba8605a8be7822e14b8))
+- apply GitHub Actions SHA pin updates in interactive mode ([a8836dd](https://github.com/rvben/upd/commit/a8836dda20805fe36654af52d76d32e46c62742f))
+
 ## [0.5.4](https://github.com/rvben/upd/compare/v0.5.3...v0.5.4) - 2026-08-18
 
 ### Fixed
