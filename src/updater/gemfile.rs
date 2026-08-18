@@ -604,6 +604,7 @@ mod tests {
             ignore: vec!["rails".to_string()],
             pin: pins,
             cooldown: None,
+            ..Default::default()
         };
 
         let updater = GemfileUpdater::new();

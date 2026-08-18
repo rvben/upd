@@ -1209,6 +1209,7 @@ hda-common>=1.0.908
             ignore: vec!["flask".to_string()],
             pin: HashMap::new(),
             cooldown: None,
+            ..Default::default()
         };
 
         let updater = RequirementsUpdater::new();
@@ -1253,6 +1254,7 @@ hda-common>=1.0.908
             ignore: vec![],
             pin,
             cooldown: None,
+            ..Default::default()
         };
 
         let updater = RequirementsUpdater::new();
@@ -1300,6 +1302,7 @@ hda-common>=1.0.908
             ignore: vec!["flask".to_string()],
             pin,
             cooldown: None,
+            ..Default::default()
         };
 
         let updater = RequirementsUpdater::new();

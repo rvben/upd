@@ -29,11 +29,11 @@ use upd::registry::{
     NuGetRegistry, PyPiRegistry, RubyGemsRegistry, TerraformRegistry,
 };
 use upd::updater::{
-    AnnotatedUpdater, BumpFilter, CargoTomlUpdater, CsprojUpdater, DiscoverOptions, FileType,
-    GemfileUpdater, GithubActionsUpdater, GoModUpdater, Lang, MiseUpdater, PackageJsonUpdater,
-    ParseWarnings, PreCommitUpdater, PyProjectUpdater, RegistrySet, RequirementsUpdater,
-    TerraformUpdater, UpdateOptions, UpdateResult, Updater, discover_files_with, ecosystem_key,
-    read_file_safe, write_file_atomic,
+    AnnotatedUpdater, BumpFilter, CargoTomlUpdater, CsprojUpdater, DEFAULT_UPDATE_ACTION_SHAS,
+    DiscoverOptions, FileType, GemfileUpdater, GithubActionsUpdater, GoModUpdater, Lang,
+    MiseUpdater, PackageJsonUpdater, ParseWarnings, PreCommitUpdater, PyProjectUpdater,
+    RegistrySet, RequirementsUpdater, SkipStatus, TerraformUpdater, UpdateOptions, UpdateResult,
+    Updater, discover_files_with, ecosystem_key, read_file_safe, write_file_atomic,
 };
 use upd::version::match_version_precision;
 
@@ -407,7 +407,7 @@ fn load_update_configs(
 fn build_update_options(
     dry_run: bool,
     full_precision: bool,
-    update_action_shas: bool,
+    update_action_shas: Option<bool>,
     config: Option<Arc<UpdConfig>>,
     packages: &[String],
     langs: &[Lang],
@@ -415,8 +415,14 @@ fn build_update_options(
     cooldown_notes: Arc<Mutex<BTreeSet<String>>>,
     bump_filter: BumpFilter,
 ) -> UpdateOptions {
+    // Command line first, then the config file nearest this file, then the
+    // built-in default.
+    let action_shas = update_action_shas
+        .or_else(|| config.as_ref().and_then(|c| c.update_action_shas))
+        .unwrap_or(DEFAULT_UPDATE_ACTION_SHAS);
+
     let mut options = UpdateOptions::new(dry_run, full_precision);
-    options = options.with_action_sha_updates(update_action_shas);
+    options = options.with_action_sha_updates(action_shas);
     if let Some(config) = config {
         options = options.with_config(config);
     }
@@ -1276,7 +1282,7 @@ async fn run_update(cli: &Cli) -> Result<()> {
                 build_update_options(
                     dry_run,
                     cli.full_precision,
-                    cli.update_action_shas,
+                    cli.action_sha_override(),
                     config,
                     &cli.packages,
                     &cli.langs,
@@ -1548,7 +1554,7 @@ async fn run_update(cli: &Cli) -> Result<()> {
             let options = build_update_options(
                 dry_run,
                 cli.full_precision,
-                cli.update_action_shas,
+                cli.action_sha_override(),
                 config,
                 &cli.packages,
                 &cli.langs,
@@ -2068,7 +2074,16 @@ fn emit_update_json(input: UpdateReportInput<'_>, bounded: &BoundedOutputParams<
         warnings: total_result.warnings.len() + lockscan_warnings.len(),
         held_back: total_result.held_back.len(),
         skipped_by_cooldown: total_result.skipped_by_cooldown.len(),
-        skipped: total_result.skipped.len(),
+        skipped: total_result
+            .skipped
+            .iter()
+            .filter(|s| s.status == SkipStatus::Blocked)
+            .count(),
+        not_examined: total_result
+            .skipped
+            .iter()
+            .filter(|s| s.status == SkipStatus::NotExamined)
+            .count(),
     };
 
     files.extend(floor_reports);
@@ -2162,7 +2177,7 @@ async fn run_interactive_update(
         let dry_run_options = build_update_options(
             true,
             cli.full_precision,
-            cli.update_action_shas,
+            cli.action_sha_override(),
             file_configs.get(path).cloned().flatten(),
             &cli.packages,
             &cli.langs,
@@ -4564,15 +4579,27 @@ fn print_file_result(
         }
     }
 
+    // A blocked pin needs attention on the line it is on, so it always prints.
+    // A not-examined pin is the steady state for anyone who leaves SHA-pin
+    // updates off, and a repo that pins every action would otherwise emit a
+    // line per action on every run; the summary always reports the count, and
+    // --verbose names them.
     for skipped in &result.skipped {
+        if skipped.status == SkipStatus::NotExamined && !verbose {
+            continue;
+        }
         let location = match skipped.line_number {
             Some(n) => format!("{}:{}:", path, n),
             None => format!("{}:", path),
         };
+        let label = match skipped.status {
+            SkipStatus::Blocked => skipped.status.label().yellow(),
+            SkipStatus::NotExamined => skipped.status.label().dimmed(),
+        };
         println!(
             "{} {} {} {} ({})",
             location.blue().underline(),
-            "Blocked".yellow(),
+            label,
             skipped.package.bold(),
             skipped.message,
             skipped.reason.dimmed()
@@ -4640,13 +4667,19 @@ fn print_summary(
     let ignored_count = result.ignored.len();
     let held_back_count = result.held_back.len();
     let skipped_cooldown_count = result.skipped_by_cooldown.len();
-    let skipped_count = result.skipped.len();
+    let blocked_count = result
+        .skipped
+        .iter()
+        .filter(|s| s.status == SkipStatus::Blocked)
+        .count();
+    let not_examined_count = result.skipped.len() - blocked_count;
 
     if filtered_total == 0
         && pinned_count == 0
         && held_back_count == 0
         && skipped_cooldown_count == 0
-        && skipped_count == 0
+        && blocked_count == 0
+        && not_examined_count == 0
     {
         print_nothing_to_update_line(file_count, result.unchanged, result.errors.len());
     } else {
@@ -4710,11 +4743,19 @@ fn print_summary(
             );
         }
 
-        if skipped_count > 0 {
+        if blocked_count > 0 {
             println!(
                 "{} {} package(s) blocked by safety checks",
                 "Blocked".yellow(),
-                skipped_count.to_string().yellow().bold()
+                blocked_count.to_string().yellow().bold()
+            );
+        }
+
+        if not_examined_count > 0 {
+            println!(
+                "{} {} SHA-pinned action(s), not checked without --update-action-shas",
+                "Skipped".dimmed(),
+                not_examined_count.to_string().dimmed()
             );
         }
     }
@@ -6043,6 +6084,70 @@ mod output_tests {
         assert!(
             !has_checkable_manifest_changes(&result, UpdateFilter::from_cli(&[], None)),
             "skipped_by_cooldown entries are steady state and must not count as pending changes"
+        );
+    }
+
+    /// An unchecked SHA pin is not pending work either: nobody knows whether an
+    /// update exists, and failing `--check` on it would break every CI job in a
+    /// repo that pins its actions and leaves the feature off.
+    #[test]
+    fn test_has_checkable_manifest_changes_not_examined_is_not_pending() {
+        let result = UpdateResult {
+            skipped: vec![upd::updater::SkippedUpdate {
+                package: "rvben/clispec".to_string(),
+                current: "1111111111111111111111111111111111111111".to_string(),
+                status: SkipStatus::NotExamined,
+                reason: "action-sha-updates-off",
+                message: "off".to_string(),
+                line_number: Some(17),
+            }],
+            ..Default::default()
+        };
+        assert!(
+            !has_checkable_manifest_changes(&result, UpdateFilter::from_cli(&[], None)),
+            "an unchecked pin is an unknown, not a pending change"
+        );
+    }
+
+    fn options_for(cli_flag: Option<bool>, config_key: Option<bool>) -> UpdateOptions {
+        build_update_options(
+            true,
+            false,
+            cli_flag,
+            Some(Arc::new(UpdConfig {
+                update_action_shas: config_key,
+                ..Default::default()
+            })),
+            &[],
+            &[],
+            None,
+            Arc::default(),
+            BumpFilter::default(),
+        )
+    }
+
+    #[test]
+    fn test_action_sha_resolution_prefers_flag_then_config_then_default() {
+        assert_eq!(
+            options_for(None, None).update_action_shas,
+            DEFAULT_UPDATE_ACTION_SHAS,
+            "silence everywhere leaves the built-in default"
+        );
+        assert!(
+            options_for(None, Some(true)).update_action_shas,
+            "the config file decides when no flag was passed"
+        );
+        assert!(
+            !options_for(None, Some(false)).update_action_shas,
+            "the config file can turn it off as well as on"
+        );
+        assert!(
+            options_for(Some(true), Some(false)).update_action_shas,
+            "--update-action-shas overrides the config file"
+        );
+        assert!(
+            !options_for(Some(false), Some(true)).update_action_shas,
+            "--no-update-action-shas overrides the config file"
         );
     }
 

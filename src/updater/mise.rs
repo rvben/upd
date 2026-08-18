@@ -814,6 +814,7 @@ uv = "latest"
             ignore: vec!["node".to_string()],
             pin: pins,
             cooldown: None,
+            ..Default::default()
         };
 
         let updater = MiseUpdater::new();

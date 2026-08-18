@@ -718,6 +718,7 @@ mod tests {
             ignore: vec!["Newtonsoft.Json".to_string()],
             pin: pins,
             cooldown: None,
+            ..Default::default()
         };
 
         let updater = CsprojUpdater::new();
@@ -759,6 +760,7 @@ mod tests {
             ignore: vec![],
             pin: pins,
             cooldown: None,
+            ..Default::default()
         };
 
         let updater = CsprojUpdater::new();

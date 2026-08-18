@@ -132,8 +132,21 @@ pub struct Cli {
     /// verified against the pin before policy is evaluated, and the result stays
     /// pinned to the new tag's full commit SHA. Unsafe pins are reported and
     /// left unchanged.
+    ///
+    /// Overrides `update_action_shas` in the config file.
     #[arg(long, global = true, conflicts_with = "interactive")]
     pub update_action_shas: bool,
+
+    /// Leave GitHub Actions SHA pins alone.
+    ///
+    /// Overrides `update_action_shas = true` in the config file. The pins are
+    /// still reported as unchecked rather than counted as up to date.
+    #[arg(
+        long = "no-update-action-shas",
+        global = true,
+        conflicts_with = "update_action_shas"
+    )]
+    pub no_update_action_shas: bool,
 
     /// Limit to one or more ecosystems (repeatable, or comma-separated).
     ///
@@ -345,6 +358,17 @@ impl Cli {
         self.check || self.dry_run || (!self.apply && !self.yes && !self.interactive)
     }
 
+    /// The command line's answer on updating GitHub Actions SHA pins, or `None`
+    /// when neither flag was passed and the decision belongs to the config file
+    /// and then the built-in default.
+    pub fn action_sha_override(&self) -> Option<bool> {
+        match (self.update_action_shas, self.no_update_action_shas) {
+            (true, _) => Some(true),
+            (_, true) => Some(false),
+            _ => None,
+        }
+    }
+
     /// Returns true when JSON output should be emitted to stdout.
     ///
     /// Respects the three-valued --output flag: auto selects JSON when stdout
@@ -416,6 +440,47 @@ mod tests {
             .err()
             .expect("SHA updates must not enter the tag-based interactive rewrite path");
         assert_eq!(error.kind(), clap::error::ErrorKind::ArgumentConflict);
+    }
+
+    /// Opting out is compatible with interactive mode: it removes the SHA-pin
+    /// rewrites that cannot be prompted for, rather than adding them.
+    #[test]
+    fn test_action_sha_opt_out_is_allowed_with_interactive_mode() {
+        let cli = Cli::try_parse_from(["upd", "--no-update-action-shas", "--interactive"]).unwrap();
+        assert_eq!(cli.action_sha_override(), Some(false));
+    }
+
+    #[test]
+    fn test_action_sha_override_reports_the_flag_that_was_passed() {
+        let neither = Cli::try_parse_from(["upd"]).unwrap();
+        assert_eq!(
+            neither.action_sha_override(),
+            None,
+            "with no flag the decision belongs to the config file and the built-in default"
+        );
+
+        let opt_in = Cli::try_parse_from(["upd", "--update-action-shas"]).unwrap();
+        assert_eq!(opt_in.action_sha_override(), Some(true));
+
+        let opt_out = Cli::try_parse_from(["upd", "--no-update-action-shas"]).unwrap();
+        assert_eq!(opt_out.action_sha_override(), Some(false));
+    }
+
+    #[test]
+    fn test_action_sha_flags_conflict_with_each_other() {
+        let result =
+            Cli::try_parse_from(["upd", "--update-action-shas", "--no-update-action-shas"]);
+        let error = result
+            .err()
+            .expect("asking to both update and not update SHA pins has no sensible answer");
+        assert_eq!(error.kind(), clap::error::ErrorKind::ArgumentConflict);
+    }
+
+    #[test]
+    fn test_action_sha_opt_out_is_global_across_subcommands() {
+        let cli = Cli::try_parse_from(["upd", "update", "--no-update-action-shas"]).unwrap();
+        assert_eq!(cli.action_sha_override(), Some(false));
+        assert!(matches!(cli.command, Some(Command::Update { .. })));
     }
 
     #[test]

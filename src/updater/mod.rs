@@ -267,9 +267,15 @@ pub struct UpdateOptions {
     /// read.
     pub langs: Vec<Lang>,
     /// Update fully SHA-pinned GitHub Actions when they carry a verified,
-    /// concrete version comment (for example `# v4.2.2`). Off by default.
+    /// concrete version comment (for example `# v4.2.2`). Resolved from the
+    /// command line, then the config file, then `DEFAULT_UPDATE_ACTION_SHAS`.
     pub update_action_shas: bool,
 }
+
+/// Whether GitHub Actions SHA pins are updated when neither the command line
+/// nor the config file says. A SHA pin that is not updated is still reported,
+/// so this decides the default behaviour but never whether the pin is visible.
+pub const DEFAULT_UPDATE_ACTION_SHAS: bool = false;
 
 impl UpdateOptions {
     /// Create new options with the given dry_run and full_precision settings
@@ -284,7 +290,7 @@ impl UpdateOptions {
             cooldown_unavailable_notes: Arc::default(),
             bump_filter: BumpFilter::default(),
             langs: Vec::new(),
-            update_action_shas: false,
+            update_action_shas: DEFAULT_UPDATE_ACTION_SHAS,
         }
     }
 
@@ -419,9 +425,9 @@ pub struct UpdateResult {
     /// entry also appears in `updated`, using semantic versions for bump
     /// classification and human-readable reporting.
     pub action_sha_updates: Vec<ActionShaUpdate>,
-    /// Dependencies deliberately not changed because a safety prerequisite was
-    /// not met. This is distinct from `ignored` (user policy) and `errors`
-    /// (operation failure), allowing automation to identify blocked updates.
+    /// Dependencies deliberately left alone, each carrying the reason why. This
+    /// is distinct from `ignored` (user policy) and `errors` (operation
+    /// failure), allowing automation to identify blocked and unchecked pins.
     pub skipped: Vec<SkippedUpdate>,
 }
 
@@ -436,14 +442,47 @@ pub struct ActionShaUpdate {
     pub line_number: Option<usize>,
 }
 
-/// A dependency update blocked by a documented safety condition.
+/// A dependency left at its current version, with the reason why.
 #[derive(Debug, Clone)]
 pub struct SkippedUpdate {
     pub package: String,
     pub current: String,
+    pub status: SkipStatus,
     pub reason: &'static str,
     pub message: String,
     pub line_number: Option<usize>,
+}
+
+/// Why a `SkippedUpdate` exists, which decides how it is reported.
+///
+/// Both statuses leave the line untouched, but they answer different questions.
+/// `Blocked` means the dependency was examined and a safety condition refused
+/// the change. `NotExamined` means it was never looked at, because the feature
+/// that reads that kind of pin is off. Reporting the second as the first would
+/// describe a configuration choice as a safety problem, and reporting either as
+/// up to date would claim a check that never happened.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SkipStatus {
+    Blocked,
+    NotExamined,
+}
+
+impl SkipStatus {
+    /// Stable token for machine-readable output.
+    pub fn token(self) -> &'static str {
+        match self {
+            Self::Blocked => "blocked",
+            Self::NotExamined => "not-examined",
+        }
+    }
+
+    /// The word a human-readable line opens with.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Blocked => "Blocked",
+            Self::NotExamined => "Not checked",
+        }
+    }
 }
 
 impl UpdateResult {

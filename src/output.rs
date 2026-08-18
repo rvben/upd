@@ -129,9 +129,11 @@ pub struct UpdateEntry {
     pub latest_commit: Option<String>,
 }
 
-/// A dependency deliberately left untouched because a safety prerequisite was
-/// not satisfied. `status` is stable and always `"blocked"`; `reason` is the
-/// machine-readable condition callers should branch on.
+/// A dependency deliberately left untouched. `status` says which kind of
+/// decision that was: `"blocked"` when a safety prerequisite was not satisfied,
+/// `"not-examined"` when the dependency was never checked because the feature
+/// that reads its kind of pin is off. `reason` is the machine-readable
+/// condition callers should branch on within a status.
 #[derive(Debug, Serialize)]
 pub struct SkippedEntry {
     pub package: String,
@@ -222,8 +224,14 @@ pub struct UpdateSummary {
     pub held_back: usize,
     #[serde(default, skip_serializing_if = "is_zero")]
     pub skipped_by_cooldown: usize,
+    /// Dependencies examined and left alone by a safety condition.
     #[serde(default, skip_serializing_if = "is_zero")]
     pub skipped: usize,
+    /// Dependencies never examined, because the feature that reads their kind
+    /// of pin is off. Disjoint from `skipped`; both appear in `files[].skipped`
+    /// and are told apart there by `status`.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub not_examined: usize,
 }
 
 fn is_zero(n: &usize) -> bool {
@@ -508,7 +516,7 @@ pub fn build_update_file_report(
         .map(|entry| SkippedEntry {
             package: entry.package.clone(),
             current: entry.current.clone(),
-            status: "blocked",
+            status: entry.status.token(),
             reason: entry.reason,
             message: entry.message.clone(),
             line: entry.line_number,
@@ -987,7 +995,7 @@ mod tests {
 
     #[test]
     fn update_file_report_identifies_sha_updates_and_blocked_pins() {
-        use crate::updater::{ActionShaUpdate, SkippedUpdate};
+        use crate::updater::{ActionShaUpdate, SkipStatus, SkippedUpdate};
 
         let old_sha = "1111111111111111111111111111111111111111";
         let new_sha = "2222222222222222222222222222222222222222";
@@ -1009,6 +1017,7 @@ mod tests {
             skipped: vec![SkippedUpdate {
                 package: "rvben/clispec".into(),
                 current: old_sha.into(),
+                status: SkipStatus::Blocked,
                 reason: "missing-version-comment",
                 message: "add a concrete version comment".into(),
                 line_number: Some(9),
@@ -1030,6 +1039,38 @@ mod tests {
         assert_eq!(json["updates"][0]["latest_commit"], new_sha);
         assert_eq!(json["skipped"][0]["status"], "blocked");
         assert_eq!(json["skipped"][0]["reason"], "missing-version-comment");
+    }
+
+    /// A pin nobody looked at carries its own status, so a consumer branching on
+    /// `"blocked"` is not told a safety check failed when none ran.
+    #[test]
+    fn update_file_report_marks_unchecked_sha_pins_not_examined() {
+        use crate::updater::{SkipStatus, SkippedUpdate};
+
+        let result = UpdateResult {
+            skipped: vec![SkippedUpdate {
+                package: "rvben/clispec".into(),
+                current: "1111111111111111111111111111111111111111".into(),
+                status: SkipStatus::NotExamined,
+                reason: "action-sha-updates-off",
+                message: "SHA-pinned actions are only checked with --update-action-shas".into(),
+                line_number: Some(17),
+            }],
+            ..Default::default()
+        };
+
+        let report = build_update_file_report(
+            Path::new(".github/workflows/ci.yml"),
+            FileType::GithubActions,
+            &result,
+            None,
+            stub_classify,
+        );
+        let json = serde_json::to_value(report).unwrap();
+
+        assert_eq!(json["skipped"][0]["status"], "not-examined");
+        assert_eq!(json["skipped"][0]["reason"], "action-sha-updates-off");
+        assert_eq!(json["skipped"][0]["line"], 17);
     }
 
     #[test]

@@ -1331,6 +1331,7 @@ anyhow = "1.0.0"
             ignore: vec!["tokio".to_string()],
             pin: std::collections::HashMap::new(),
             cooldown: None,
+            ..Default::default()
         };
 
         let updater = CargoTomlUpdater::new();
@@ -1384,6 +1385,7 @@ tokio = "1.0.0"
             ignore: Vec::new(),
             pin,
             cooldown: None,
+            ..Default::default()
         };
 
         let updater = CargoTomlUpdater::new();
@@ -1435,6 +1437,7 @@ serde = "1.0.1"
             ignore: Vec::new(),
             pin,
             cooldown: None,
+            ..Default::default()
         };
 
         let updater = CargoTomlUpdater::new();
@@ -1489,6 +1492,7 @@ anyhow = "1.0.0"
             ignore: vec!["tokio".to_string()],
             pin,
             cooldown: None,
+            ..Default::default()
         };
 
         let updater = CargoTomlUpdater::new();
@@ -1542,6 +1546,7 @@ tempfile = "3.0.0"
             ignore: vec!["tempfile".to_string()],
             pin: std::collections::HashMap::new(),
             cooldown: None,
+            ..Default::default()
         };
 
         let updater = CargoTomlUpdater::new();
@@ -1597,6 +1602,7 @@ anyhow = "=1.0.0"
             ignore: Vec::new(),
             pin,
             cooldown: None,
+            ..Default::default()
         };
 
         let updater = CargoTomlUpdater::new();
@@ -1644,6 +1650,7 @@ tokio = {{ version = "1.0.0", features = ["full"] }}
             ignore: vec!["serde".to_string()],
             pin: std::collections::HashMap::new(),
             cooldown: None,
+            ..Default::default()
         };
 
         let updater = CargoTomlUpdater::new();

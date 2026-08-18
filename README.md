@@ -235,8 +235,10 @@ upd audit --format sarif > results.sarif
 - `.github/workflows/*.yml` and `.github/workflows/*.yaml`
 - Updates `uses:` version references (e.g., `actions/checkout@v3` → `actions/checkout@v4`)
 - Supports actions and reusable workflows
-- Skips SHA-pinned actions by default; `--update-action-shas` safely updates
-  annotated full-SHA pins without converting them to mutable tags
+- Leaves SHA-pinned actions unchecked by default and reports them as such, so
+  they are never counted as up to date; `--update-action-shas` (or
+  `update_action_shas = true` in `.updrc.toml`) safely updates annotated
+  full-SHA pins without converting them to mutable tags
 - Skips branch refs, local actions, and Docker references
 - Authenticates via `GITHUB_TOKEN` or `GH_TOKEN` for higher API rate limits
 
@@ -267,6 +269,14 @@ resolves the selected tag to its full commit SHA, and updates both the SHA and
 comment. A short SHA, missing or floating comment (`# v4`), moved tag, or stale
 comment is never rewritten. Structured output reports these under
 `files[].skipped[]` with `status: "blocked"` and a machine-readable `reason`.
+
+With SHA updates off, the pins still appear in `files[].skipped[]`, under
+`status: "not-examined"` with `reason: "action-sha-updates-off"`, and are
+counted in `summary.not_examined`. The two statuses answer different questions:
+`blocked` means the pin was examined and a safety condition refused the change,
+`not-examined` means it was never looked at. Neither is `summary.unchanged`,
+which counts dependencies that were checked and found current. In text output
+the count appears in the summary and `--verbose` names each pin.
 
 Configuration pins and `--package` filters use the action's `owner/repo` name.
 For example, `--package actions/checkout` selects every checkout reference,
@@ -536,6 +546,10 @@ ignore = [
     "pre-commit/pre-commit-hooks",  # Pre-commit hooks too
 ]
 
+# Check SHA-pinned GitHub Actions for this repository without passing
+# --update-action-shas on every run. The flag still wins when given.
+update_action_shas = true
+
 # Pin packages to specific versions (bypasses registry lookup)
 [pin]
 flask = "2.3.0"
@@ -550,6 +564,7 @@ django = "4.2.0"
 |--------|------|-------------|
 | `ignore` | `string[]` | List of package names to skip during updates |
 | `pin` | `table` | Map of package names to pinned versions |
+| `update_action_shas` | `bool` | Default for `--update-action-shas`. Omit it to keep the built-in default; `--no-update-action-shas` overrides it |
 
 ### Verbose Output
 

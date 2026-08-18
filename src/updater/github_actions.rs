@@ -1,6 +1,6 @@
 use super::{
-    FileType, ParsedDependency, UpdateOptions, UpdateResult, Updater, downgrade_warning,
-    read_file_safe, write_file_atomic,
+    FileType, ParsedDependency, SkipStatus, UpdateOptions, UpdateResult, Updater,
+    downgrade_warning, read_file_safe, write_file_atomic,
 };
 use crate::align::compare_versions;
 use crate::registry::Registry;
@@ -334,13 +334,25 @@ impl Updater for GithubActionsUpdater {
                 }
 
                 if Self::is_sha_ref(version_ref) {
+                    // A SHA pin left alone is recorded either way. Dropping it
+                    // silently would let the run report every dependency as up
+                    // to date while this one was never looked at.
                     if !options.update_action_shas {
+                        result.skipped.push(super::SkippedUpdate {
+                            package: owner_repo,
+                            current: version_ref.to_string(),
+                            status: SkipStatus::NotExamined,
+                            reason: "action-sha-updates-off",
+                            message: "SHA-pinned actions are only checked with --update-action-shas, or `update_action_shas = true` in .updrc.toml".to_string(),
+                            line_number: Some(line_idx + 1),
+                        });
                         continue;
                     }
                     if !Self::is_full_sha_ref(version_ref) {
                         result.skipped.push(super::SkippedUpdate {
                             package: owner_repo,
                             current: version_ref.to_string(),
+                            status: SkipStatus::Blocked,
                             reason: "short-sha",
                             message: "a full 40-character commit SHA is required".to_string(),
                             line_number: Some(line_idx + 1),
@@ -353,6 +365,7 @@ impl Updater for GithubActionsUpdater {
                         result.skipped.push(super::SkippedUpdate {
                             package: owner_repo,
                             current: version_ref.to_string(),
+                            status: SkipStatus::Blocked,
                             reason: "missing-version-comment",
                             message: "add a concrete version comment such as `# v4.2.2` to make this SHA pin safely updateable".to_string(),
                             line_number: Some(line_idx + 1),
@@ -539,6 +552,7 @@ impl Updater for GithubActionsUpdater {
                     result.skipped.push(super::SkippedUpdate {
                         package: action.owner_repo.clone(),
                         current: action.current_sha.clone(),
+                        status: SkipStatus::Blocked,
                         reason: "version-comment-mismatch",
                         message: format!(
                             "comment {} resolves to {}, not the pinned commit",
@@ -572,6 +586,7 @@ impl Updater for GithubActionsUpdater {
                     result.skipped.push(super::SkippedUpdate {
                         package: action.owner_repo.clone(),
                         current: action.current_version.clone(),
+                        status: SkipStatus::Blocked,
                         reason: "non-concrete-target",
                         message: format!(
                             "target {} is not a concrete semantic version",
@@ -646,6 +661,7 @@ impl Updater for GithubActionsUpdater {
                     result.skipped.push(super::SkippedUpdate {
                         package: action.owner_repo.clone(),
                         current: action.current_version.clone(),
+                        status: SkipStatus::Blocked,
                         reason: "bump-policy",
                         message: format!(
                             "{} is outside the configured bump ceiling",
@@ -1248,7 +1264,16 @@ jobs:
             .await
             .unwrap();
         assert!(result.updated.is_empty());
-        assert!(result.skipped.is_empty());
+        // Opting out leaves the pin alone but must still report it. Counting it
+        // as unchanged would let the run claim every dependency was checked.
+        assert_eq!(result.skipped.len(), 1);
+        assert_eq!(result.skipped[0].status, SkipStatus::NotExamined);
+        assert_eq!(result.skipped[0].reason, "action-sha-updates-off");
+        assert_eq!(result.skipped[0].line_number, Some(2));
+        assert_eq!(
+            result.unchanged, 0,
+            "a pin that was never examined is not an up-to-date dependency"
+        );
 
         let mut unsafe_pin = NamedTempFile::new().unwrap();
         write!(
@@ -1713,6 +1738,7 @@ jobs:
             ignore: vec!["actions/checkout".to_string()],
             pin: pins,
             cooldown: None,
+            ..Default::default()
         };
 
         let updater = GithubActionsUpdater::new();

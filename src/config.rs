@@ -19,6 +19,9 @@
 //!     "**/vendored/requirements.txt",
 //! ]
 //!
+//! # Update SHA-pinned GitHub Actions that carry a version comment
+//! update_action_shas = true
+//!
 //! # Pin packages to specific versions or constraints - top-level table
 //! [pin]
 //! requests = "2.28.0"  # Pin to exact version
@@ -27,6 +30,9 @@
 //!
 //! Unknown top-level keys produce a warning on stderr but do not stop execution.
 //! A common mistake is writing `[ignore]` (table) instead of `ignore = [...]` (array).
+//!
+//! Keys that mirror a command-line flag, such as `update_action_shas`, set the
+//! default for the repository; the flag still wins when it is passed.
 //!
 //! # Minimum release age (cooldown)
 //!
@@ -53,7 +59,7 @@ use std::path::{Path, PathBuf};
 const MAX_CONFIG_FILE_SIZE: u64 = 1024 * 1024;
 
 /// All valid top-level keys in the config schema.
-const KNOWN_KEYS: &[&str] = &["ignore", "exclude", "pin", "cooldown"];
+const KNOWN_KEYS: &[&str] = &["ignore", "exclude", "pin", "cooldown", "update_action_shas"];
 
 /// Raw cooldown config as written in the TOML file. Parsed into a
 /// `crate::cooldown::CooldownPolicy` at runtime via `UpdConfig::to_cooldown_policy`.
@@ -90,6 +96,15 @@ pub struct UpdConfig {
     /// Optional cooldown (minimum release age) policy.
     #[serde(default)]
     pub cooldown: Option<CooldownConfig>,
+
+    /// Whether to update fully SHA-pinned GitHub Actions that carry a verified
+    /// version comment (for example `# v4.2.2`).
+    ///
+    /// `None` means the file does not say, leaving the built-in default in
+    /// place. `--update-action-shas` and `--no-update-action-shas` override
+    /// whatever is written here.
+    #[serde(default)]
+    pub update_action_shas: Option<bool>,
 }
 
 impl UpdConfig {
@@ -404,6 +419,10 @@ exclude = [
         if other.cooldown.is_some() {
             self.cooldown = other.cooldown;
         }
+        // Child SHA-pin choice overrides parent only when the child states one
+        if other.update_action_shas.is_some() {
+            self.update_action_shas = other.update_action_shas;
+        }
     }
 }
 
@@ -507,6 +526,7 @@ django = ">=3.2,<4"
             ignore: vec!["pkg-a".to_string(), "pkg-b".to_string()],
             pin: HashMap::new(),
             cooldown: None,
+            ..Default::default()
         };
 
         assert!(config.should_ignore("pkg-a"));
@@ -626,6 +646,7 @@ exclude = ["**/archive/**", "**/vendored/requirements.txt"]
             ignore: vec![],
             pin,
             cooldown: None,
+            ..Default::default()
         };
 
         assert_eq!(config.get_pinned_version("requests"), Some("2.28.0"));
@@ -724,6 +745,7 @@ ignore = ["parent-pkg"]
             ignore: vec!["pkg".to_string()],
             pin: HashMap::new(),
             cooldown: None,
+            ..Default::default()
         };
         assert!(with_ignore.has_config());
 
@@ -734,6 +756,7 @@ ignore = ["parent-pkg"]
             ignore: vec![],
             pin,
             cooldown: None,
+            ..Default::default()
         };
         assert!(with_pin.has_config());
     }
@@ -749,6 +772,7 @@ ignore = ["parent-pkg"]
                 m
             },
             cooldown: None,
+            ..Default::default()
         };
 
         let other = UpdConfig {
@@ -761,6 +785,7 @@ ignore = ["parent-pkg"]
                 m
             },
             cooldown: None,
+            ..Default::default()
         };
 
         base.merge(other);
@@ -911,6 +936,7 @@ parent-pkg = "1.0.0"
                 m
             },
             cooldown: None,
+            ..Default::default()
         };
 
         // Create mock registry
@@ -973,6 +999,7 @@ parent-pkg = "1.0.0"
                 m
             },
             cooldown: None,
+            ..Default::default()
         });
 
         // Test Requirements
@@ -1093,6 +1120,51 @@ django = ">=3.2,<4"
         );
         assert_eq!(config.ignore.len(), 2);
         assert_eq!(config.pin.len(), 2);
+    }
+
+    #[test]
+    fn test_update_action_shas_key_parses_without_warning() {
+        let content = r#"
+update_action_shas = true
+"#;
+        let (config, warnings) = UpdConfig::parse_with_warnings(content, "test.toml").unwrap();
+        assert!(
+            warnings.is_empty(),
+            "update_action_shas is a known key; got: {warnings:?}"
+        );
+        assert_eq!(config.update_action_shas, Some(true));
+    }
+
+    /// Absent and `false` are different answers: absent leaves the built-in
+    /// default in place, `false` overrides a parent config that turned it on.
+    #[test]
+    fn test_update_action_shas_absent_is_not_false() {
+        let (absent, _) = UpdConfig::parse_with_warnings("ignore = []", "test.toml").unwrap();
+        assert_eq!(absent.update_action_shas, None);
+
+        let (explicit, _) =
+            UpdConfig::parse_with_warnings("update_action_shas = false", "test.toml").unwrap();
+        assert_eq!(explicit.update_action_shas, Some(false));
+    }
+
+    #[test]
+    fn test_merge_update_action_shas_only_when_child_states_one() {
+        let mut base = UpdConfig {
+            update_action_shas: Some(true),
+            ..Default::default()
+        };
+        base.merge(UpdConfig::default());
+        assert_eq!(
+            base.update_action_shas,
+            Some(true),
+            "a child that says nothing must not silently disable the parent's choice"
+        );
+
+        base.merge(UpdConfig {
+            update_action_shas: Some(false),
+            ..Default::default()
+        });
+        assert_eq!(base.update_action_shas, Some(false));
     }
 
     #[test]

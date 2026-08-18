@@ -105,9 +105,14 @@ fn build_schema() -> Value {
             },
             {
                 "name": "update-action-shas",
-                "description": "Update full GitHub Actions SHA pins with verified concrete version comments while preserving immutable refs",
+                "description": "Update full GitHub Actions SHA pins with verified concrete version comments while preserving immutable refs. Overrides update_action_shas in .updrc.toml.",
                 "type": "boolean",
                 "default": false
+            },
+            {
+                "name": "no-update-action-shas",
+                "description": "Leave GitHub Actions SHA pins alone, overriding update_action_shas in .updrc.toml. The pins are still reported in skipped[] with status \"not-examined\". Conflicts with --update-action-shas.",
+                "type": "boolean"
             },
             {
                 "name": "interactive",
@@ -194,7 +199,7 @@ fn build_schema() -> Value {
                 "output_fields": [
                     {"name": "command", "type": "string", "description": "Always \"update\""},
                     {"name": "mode", "type": "string", "description": "\"dry-run\" or \"applied\""},
-                    {"name": "files", "type": "array", "items": {"type": "object"}, "description": "Per-file update reports. Verified GitHub Actions SHA updates include reference_kind, current_commit, and latest_commit; safety-blocked pins appear in skipped[] with status and reason. Each entry in updates[] may also carry method and status for lock-only version floors"},
+                    {"name": "files", "type": "array", "items": {"type": "object"}, "description": "Per-file update reports. Verified GitHub Actions SHA updates include reference_kind, current_commit, and latest_commit; pins left alone appear in skipped[] with status (\"blocked\" for a failed safety condition, \"not-examined\" when SHA-pin updates are off) and reason. Each entry in updates[] may also carry method and status for lock-only version floors"},
                     {"name": "summary", "type": "object", "description": "Aggregate counts (files_scanned, updates_total, etc.)"},
                     {"name": "warnings", "type": "array", "items": {"type": "object"}, "description": "Lockfile-discovery warnings (e.g. an ancestor lock outside the scanned paths), populated only when --package triggers lockfile scanning for version floors; signals incomplete coverage without failing the command"}
                 ]

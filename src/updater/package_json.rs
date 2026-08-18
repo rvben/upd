@@ -1111,6 +1111,7 @@ mod tests {
             ignore: Vec::new(),
             pin,
             cooldown: None,
+            ..Default::default()
         };
 
         let updater = PackageJsonUpdater::new();
@@ -1162,6 +1163,7 @@ mod tests {
             ignore: Vec::new(),
             pin,
             cooldown: None,
+            ..Default::default()
         };
 
         let updater = PackageJsonUpdater::new();
@@ -1245,6 +1247,7 @@ mod tests {
             ignore: vec!["lodash".to_string()],
             pin: std::collections::HashMap::new(),
             cooldown: None,
+            ..Default::default()
         };
 
         let updater = PackageJsonUpdater::new();
@@ -1298,6 +1301,7 @@ mod tests {
             ignore: Vec::new(),
             pin,
             cooldown: None,
+            ..Default::default()
         };
 
         let updater = PackageJsonUpdater::new();
@@ -1354,6 +1358,7 @@ mod tests {
             ignore: vec!["lodash".to_string()],
             pin,
             cooldown: None,
+            ..Default::default()
         };
 
         let updater = PackageJsonUpdater::new();
@@ -1406,6 +1411,7 @@ mod tests {
             ignore: vec!["typescript".to_string()],
             pin: std::collections::HashMap::new(),
             cooldown: None,
+            ..Default::default()
         };
 
         let updater = PackageJsonUpdater::new();
@@ -1460,6 +1466,7 @@ mod tests {
             ignore: Vec::new(),
             pin,
             cooldown: None,
+            ..Default::default()
         };
 
         let updater = PackageJsonUpdater::new();
@@ -1860,6 +1867,7 @@ mod tests {
             ignore: vec!["ranged".to_string()],
             pin: std::collections::HashMap::new(),
             cooldown: None,
+            ..Default::default()
         };
         let options = UpdateOptions::new(false, false).with_config(Arc::new(config));
 
@@ -1972,6 +1980,7 @@ mod tests {
             ignore: Vec::new(),
             pin,
             cooldown: None,
+            ..Default::default()
         };
         let options = UpdateOptions::new(false, false).with_config(Arc::new(config));
 
