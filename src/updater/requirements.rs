@@ -3,15 +3,15 @@ use super::{
     downgrade_warning, read_file_safe, write_file_atomic,
 };
 use crate::align::compare_versions;
-use crate::registry::{MultiPyPiRegistry, PyPiRegistry, Registry};
+use crate::registry::{DeclaredIndex, IndexChain, Registry};
 use crate::updater::Lang;
 use crate::version::{is_prerelease_pep440, match_version_precision};
 use anyhow::Result;
 use futures::future::join_all;
 use pep440_rs::Version as Pep440Version;
 use regex::Regex;
+use std::collections::HashMap;
 use std::path::Path;
-use std::sync::Arc;
 
 pub struct RequirementsUpdater {
     // Regex to match package specifications
@@ -116,6 +116,27 @@ impl RequirementsUpdater {
         }
 
         (primary_index, extra_indexes)
+    }
+
+    /// The indexes a requirements file declares for itself, in lookup order,
+    /// following pip: `--index-url` replaces the default index and is consulted
+    /// first, `--extra-index-url` entries are added after it. A file that only
+    /// adds extra indexes keeps the default index as its last resort; without
+    /// that, every public dependency in such a file would go unresolved.
+    /// Empty when the file declares nothing, so the process default applies.
+    fn declared_indexes(content: &str) -> Vec<DeclaredIndex> {
+        let (primary_index, extra_indexes) = Self::extract_index_urls(content);
+        let replaces_default = primary_index.is_some();
+
+        let mut chain: Vec<DeclaredIndex> = primary_index
+            .iter()
+            .chain(extra_indexes.iter())
+            .map(|url| DeclaredIndex::url(None, url))
+            .collect();
+        if !chain.is_empty() && !replaces_default {
+            chain.push(DeclaredIndex::default_registry());
+        }
+        chain
     }
 
     fn parse_line(&self, line: &str) -> Option<ParsedDep> {
@@ -223,28 +244,12 @@ impl Updater for RequirementsUpdater {
         let content = read_file_safe(path)?;
         let mut result = UpdateResult::default();
 
-        // Check for inline index URLs in the requirements file
-        let (inline_index, extra_indexes) = Self::extract_index_urls(&content);
-
-        // Build effective registry based on inline index configuration
-        // If file has --index-url, use that (with any --extra-index-url) instead of env vars
-        let inline_registry: Option<Arc<dyn Registry + Send + Sync>> =
-            if let Some(primary_url) = inline_index {
-                let primary = PyPiRegistry::from_url(&primary_url);
-                if extra_indexes.is_empty() {
-                    Some(Arc::new(primary))
-                } else {
-                    Some(Arc::new(MultiPyPiRegistry::from_primary_and_extras(
-                        primary,
-                        extra_indexes,
-                    )))
-                }
-            } else {
-                None
-            };
-
-        let effective_registry: &dyn Registry = match &inline_registry {
-            Some(r) => r.as_ref(),
+        // Indexes declared inline take over from the process default only as
+        // far as pip would let them: `--index-url` replaces it, an
+        // `--extra-index-url` on its own is layered in front of it.
+        let chain = IndexChain::new(Self::declared_indexes(&content), &HashMap::new(), registry);
+        let effective_registry: &dyn Registry = match &chain {
+            Some(chain) => chain,
             None => registry,
         };
 
@@ -552,6 +557,7 @@ mod tests {
     use super::*;
     use crate::registry::MockRegistry;
     use std::io::Write;
+    use std::sync::Arc;
     use tempfile::NamedTempFile;
 
     #[test]
@@ -674,6 +680,110 @@ flask>=2.0.0
         let (primary, extra) = RequirementsUpdater::extract_index_urls(content);
         assert!(primary.is_none());
         assert!(extra.is_empty());
+    }
+
+    fn url(u: &str) -> DeclaredIndex {
+        DeclaredIndex::url(None, u)
+    }
+
+    #[test]
+    fn declared_indexes_are_empty_when_the_file_declares_none() {
+        assert!(RequirementsUpdater::declared_indexes("requests==2.28.0\nflask>=2.0.0").is_empty());
+    }
+
+    #[test]
+    fn index_url_replaces_the_default_and_leads_the_extras() {
+        let chain = RequirementsUpdater::declared_indexes(
+            r#"
+--extra-index-url https://extra1.example.com/simple
+--index-url https://pypi.example.com/simple
+--extra-index-url https://extra2.example.com/simple
+requests==2.28.0
+"#,
+        );
+        assert_eq!(
+            chain,
+            vec![
+                url("https://pypi.example.com/simple"),
+                url("https://extra1.example.com/simple"),
+                url("https://extra2.example.com/simple"),
+            ]
+        );
+    }
+
+    #[test]
+    fn extra_index_url_alone_keeps_the_default_index_last() {
+        let chain = RequirementsUpdater::declared_indexes(
+            r#"
+--extra-index-url https://nexus.example.com/repository/private/simple
+requests==2.28.0
+hda-common>=1.0.908
+"#,
+        );
+        assert_eq!(
+            chain,
+            vec![
+                url("https://nexus.example.com/repository/private/simple"),
+                DeclaredIndex::default_registry(),
+            ]
+        );
+    }
+
+    /// A file that only adds an `--extra-index-url` still resolves public
+    /// packages from the default registry; the private index answers for the
+    /// packages it carries.
+    #[tokio::test]
+    async fn update_layers_extra_index_url_over_the_default_registry() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let private = MockServer::start().await;
+        for p in [
+            "/simple/requests/",
+            "/pypi/requests/json",
+            "/simple/hda-common/",
+        ] {
+            Mock::given(method("GET"))
+                .and(path(p))
+                .respond_with(ResponseTemplate::new(404))
+                .mount(&private)
+                .await;
+        }
+        Mock::given(method("GET"))
+            .and(path("/pypi/hda-common/json"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string(r#"{"releases": {"1.0.909": [{"yanked": false}]}}"#),
+            )
+            .mount(&private)
+            .await;
+
+        let mut file = NamedTempFile::with_suffix(".txt").unwrap();
+        write!(
+            file,
+            "--extra-index-url {}/simple/\nrequests==2.28.0\nhda-common==1.0.908\n",
+            private.uri()
+        )
+        .unwrap();
+
+        let default = MockRegistry::new("pypi").with_version("requests", "2.32.0");
+        let updater = RequirementsUpdater::new();
+        let result = updater
+            .update(file.path(), &default, UpdateOptions::new(true, false))
+            .await
+            .unwrap();
+
+        assert!(result.errors.is_empty(), "errors: {:?}", result.errors);
+        let mut updated: Vec<(&str, &str)> = result
+            .updated
+            .iter()
+            .map(|(p, _, new, _)| (p.as_str(), new.as_str()))
+            .collect();
+        updated.sort();
+        assert_eq!(
+            updated,
+            vec![("hda-common", "1.0.909"), ("requests", "2.32.0")]
+        );
     }
 
     #[test]

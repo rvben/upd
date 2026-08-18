@@ -664,8 +664,10 @@ extra-index-url = https://pypi.org/simple
 5. `/etc/pip.conf` (system-wide)
 
 **Inline index URLs**: When a `requirements.txt` file contains `--index-url` or `-i`,
-`upd` automatically uses that index instead of the default PyPI. Credentials can be
-embedded in the URL (`https://user:pass@host/simple`) or looked up from `~/.netrc`.
+`upd` automatically uses that index instead of the default PyPI. An `--extra-index-url`
+on its own is added in front of the default index, which is still consulted for
+anything the extra index does not carry. Credentials can be embedded in the URL
+(`https://user:pass@host/simple`) or looked up from `~/.netrc`.
 
 **Indexes declared in pyproject.toml**: `[[tool.uv.index]]`, `[[tool.poetry.source]]`
 and `[[tool.pdm.source]]` entries are honoured with each tool's own semantics.
