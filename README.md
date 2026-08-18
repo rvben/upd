@@ -4,6 +4,11 @@
 
 # upd
 
+[![crates.io](https://img.shields.io/crates/v/upd.svg)](https://crates.io/crates/upd)
+[![PyPI](https://img.shields.io/pypi/v/upd-cli.svg)](https://pypi.org/project/upd-cli/)
+[![CI](https://github.com/rvben/upd/actions/workflows/ci.yml/badge.svg)](https://github.com/rvben/upd/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](https://github.com/rvben/upd/blob/main/LICENSE)
+
 A fast dependency updater for Python, Node.js, Rust, Go, Ruby, .NET, Terraform, GitHub Actions, pre-commit, and Mise projects, written in Rust.
 
 ## Quick Start
@@ -22,27 +27,19 @@ pipx run --spec upd-cli upd --apply
 ## Features
 
 - **Multi-ecosystem**: Python, Node.js, Rust, Go, Ruby, .NET, Terraform, GitHub Actions, pre-commit, Mise/asdf
-- **Fast**: Parallel registry requests for all dependencies
-- **Constraint-aware**: Respects `>=2.0,<3` (Python), `~> 7.1` (Ruby), and `^2.0.0` / `~2.0.0` (npm, Cargo).
-  For npm, comparator ranges such as `">=1.0.0 <2.0.0"` are rewritten with a **bump strategy**: the lower
-  bound moves to the highest version satisfying the constraint, preserving the upper bound. Hyphen
-  (`"1 - 2"`) and OR (`"^1 || ^2"`) ranges are reported as warnings and left untouched.
-- **Smart caching**: 24-hour version cache for faster subsequent runs
-- **Update filters**: Filter by bump level with `--only-bump <major|minor|patch>` (repeatable) or cap with `--max-bump`
-- **Interactive mode**: Approve updates individually with `-i`
-- **Check mode**: Exit with code 1 if updates available (for CI/pre-commit)
-- **Major warnings**: Highlights breaking changes with `(MAJOR)`
-- **Format-preserving**: Keeps formatting, comments, and structure
-- **Pre-release aware**: Updates pre-releases to newer pre-releases
-- **Gitignore-aware**: Honors `.gitignore`, `.git/info/exclude`, and the global
-  gitignore — even outside a git repo. Hidden directories are pruned by default;
-  `upd` only opens the dotfiles it actually updates (`.github/workflows`,
-  `.pre-commit-config.yaml`, `.mise.toml`, `.tool-versions`). Use `--no-ignore`
-  to walk every file regardless.
-- **Version alignment**: Align package versions across multiple files
-- **Security auditing**: Check dependencies for known vulnerabilities via OSV
-- **Config file support**: Ignore or pin packages via `.updrc.toml`
-- **Private registries**: Authentication for PyPI, npm, Cargo, Go, and GitHub
+- **Dry-run by default**: nothing is written without `--apply`
+- **Fast**: parallel registry requests, with a 24-hour version cache
+- **Constraint-aware**: respects `>=2.0,<3` (Python), `~> 7.1` (Ruby), and `^2.0.0` / `~2.0.0` (npm, Cargo)
+- **Format-preserving**: keeps formatting, comments, and structure
+- **Update filters**: `--only-bump`, `--max-bump`, `--package`, `--lang`, or approve one by one with `-i`
+- **Major warnings**: breaking changes are flagged with `(MAJOR)`
+- **Pre-release aware**: updates pre-releases to newer pre-releases
+- **Cooldown**: hold back releases younger than N days, against supply-chain attacks
+- **Security auditing**: OSV vulnerability scanning with auto-fix and SARIF output
+- **Check mode**: exit 1 if updates are available (for CI and pre-commit)
+- **Gitignore-aware**: honors `.gitignore` and prunes hidden directories, without missing the dotfiles it updates
+- **Private registries**: authentication for PyPI, npm, Cargo, Go, and GitHub
+- **Config file**: ignore or pin packages via `.updrc.toml`
 
 ## Installation
 
@@ -80,78 +77,38 @@ upd
 # Apply updates to files
 upd --apply
 
-# Update specific files or directories (still dry-run without --apply)
-upd requirements.txt pyproject.toml
-
-# Apply updates to specific files
+# Limit to specific files or directories
 upd --apply requirements.txt pyproject.toml
 
-# Dry-run mode (explicit; same as omitting --apply)
-upd -n
-upd --dry-run
+# Approve updates one by one
+upd -i
 
-# Verbose output
-upd -v
-upd --verbose
-
-# Suppress decorative output (errors still shown)
-upd --quiet
-upd -q
-
-# Disable colored output
-upd --no-color
-
-# Disable caching (force fresh lookups)
-upd --no-cache
-
-# Filter to only the named packages
-upd --package requests
-upd --package requests --package flask
+# Only the packages you name
 upd --package requests,flask
 
-# Filter by bump level (only exact levels)
-upd --only-bump major      # Show only major (breaking) updates
-upd --only-bump minor      # Show only minor updates
-upd --only-bump patch      # Show only patch updates
+# Cap the bump level (allow patch + minor, skip major)
+upd --max-bump minor
 
-# Combine filters (repeat --only-bump or comma-separate)
-upd --only-bump major --only-bump minor
-upd --only-bump major,minor
+# Restrict to exactly one level (repeatable, comma-separated)
+upd --only-bump major
 
-# Cap by bump level (include up to and including this level)
-upd --max-bump minor       # Allow patch + minor, skip major
-upd --max-bump patch       # Allow patch only
+# One ecosystem at a time: python, node, rust, go, ruby, dot-net,
+# terraform, actions, pre-commit, mise, annotated
+upd --lang python
 
-# Interactive mode - approve updates one by one
-upd -i
-upd --interactive
-
-# Filter by language/ecosystem
-upd --lang python           # Update only Python dependencies
-upd -l rust                 # Short form
-upd --lang python --lang go # Update Python and Go only
-upd --lang actions          # Update only GitHub Actions
-upd --lang pre-commit       # Update only pre-commit hooks
-upd --lang ruby             # Update only Ruby gems
-upd --lang dot-net          # Update only .NET NuGet packages
-upd --lang terraform        # Update only Terraform providers/modules
-upd --lang mise             # Update only Mise/asdf tools
-upd --lang annotated        # Update only annotated version pins
-
-# Version precision
-upd --full-precision  # Output full versions (e.g., 3.1.5 instead of 3.1)
-
-# Check mode - exit with code 1 if updates available (for CI/pre-commit)
+# Exit 1 if anything is outdated (for CI and pre-commit)
 upd --check
-upd --check --lang python  # Check only Python dependencies
 
-# Print effective configuration and exit
+# Regenerate lockfiles after writing
+upd --apply --lock
+
+# Print the effective configuration and exit
 upd --show-config
-
-# Use a specific config file
-upd --config /path/to/config.toml
-upd -c .updrc.toml         # Short form
 ```
+
+`upd --help` lists every flag; [Stability](https://github.com/rvben/upd/blob/main/docs/stability.md)
+documents the ones that are contractual, and `upd schema` emits the whole
+interface as JSON.
 
 > **Dry-run by default**: `upd` without `--apply` only previews changes. Pass `--apply` to
 > write updates. `--check`, `--dry-run`, and `--interactive` do not require `--apply`.
@@ -163,167 +120,13 @@ upd -c .updrc.toml         # Short form
 ### Commands
 
 ```bash
-# Show version
-upd --version
-
-# Check for upd updates
-upd self-update
-
-# Clear version cache
-upd clean-cache
-
-# Align versions across files (use highest version found)
-upd align
-upd align --check  # Exit 1 if misalignments found (for CI)
-
-# Check for security vulnerabilities
-upd audit          # Exit 6 if vulnerabilities are found (for CI)
-
-# Auto-fix vulnerable packages to minimum safe version, then write changes
-upd audit --fix-audit --apply
-
-# Run audit using only the local cache (no network; cache misses are errors)
-upd audit --offline
-
-# Emit SARIF 2.1.0 for GitHub Code Scanning upload
-upd audit --format sarif > results.sarif
+upd --version      # Print version
+upd self-update    # Check for upd updates
+upd clean-cache    # Clear the version cache
+upd align          # Align versions across files (--check exits 1 on misalignment)
+upd audit          # Scan for known vulnerabilities (exit 6 if found)
+upd schema         # Machine-readable interface description
 ```
-
-## Supported Files
-
-### Python
-
-- `requirements.txt`, `requirements-dev.txt`, `requirements-*.txt`
-- `requirements.in`, `requirements-dev.in`, `requirements-*.in`
-- `dev-requirements.txt`, `*-requirements.txt`, `*_requirements.txt`
-- `pyproject.toml` (PEP 621 and Poetry formats)
-
-### Node.js
-
-- `package.json` (`dependencies` and `devDependencies`)
-
-### Rust
-
-- `Cargo.toml` (`[dependencies]`, `[dev-dependencies]`, `[build-dependencies]`)
-
-### Go
-
-- `go.mod` (`require` blocks)
-
-### Ruby
-
-- `Gemfile` (gem declarations with version constraints)
-
-### .NET / NuGet
-
-- `.csproj` files (`PackageReference` elements)
-- `Directory.Packages.props` and `Directory.Build.props` (`PackageVersion` elements)
-- Supports both inline `Version` attributes and child `<Version>` elements
-- Queries the NuGet v3 API (`api.nuget.org`)
-- Skips range version constraints (`[1.0, 2.0)`)
-
-### Terraform / OpenTofu
-
-- `.tf` files (HCL format)
-- Updates `required_providers` version constraints and `module` version declarations
-- Queries the Terraform Registry API (`registry.terraform.io`)
-- Skips local modules (`./`, `../`) and git sources
-- Supports pessimistic constraints (`~> 5.0`)
-
-### GitHub Actions
-
-- `.github/workflows/*.yml` and `.github/workflows/*.yaml`
-- Updates `uses:` version references (e.g., `actions/checkout@v3` → `actions/checkout@v4`)
-- Supports actions and reusable workflows
-- Checks SHA-pinned actions by default, updating annotated full-SHA pins
-  without ever converting them to mutable tags; a pin it declines to rewrite is
-  reported rather than counted as up to date. `--no-update-action-shas` (or
-  `update_action_shas = false` in `.updrc.toml`) leaves the pins untouched
-- Skips branch refs, local actions, and Docker references
-- Authenticates via `GITHUB_TOKEN` or `GH_TOKEN` for higher API rate limits
-
-#### Immutable SHA pins
-
-Commit pins are checked by default, and rewriting one requires a concrete
-version annotation:
-
-```yaml
-- uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
-
-jobs:
-  conformance:
-    uses: rvben/clispec/.github/workflows/conformance.yml@<full-commit-sha> # v0.3.0
-```
-
-```bash
-upd update . \
-  --apply \
-  --lang actions \
-  --min-age 7d \
-  --max-bump minor
-```
-
-Before writing, `upd` verifies that the annotated current tag resolves to the
-pinned commit. It then applies cooldown and bump policy to release versions,
-resolves the selected tag to its full commit SHA, and updates both the SHA and
-comment. A short SHA, missing or floating comment (`# v4`), moved tag, or stale
-comment is never rewritten. Structured output reports these under
-`files[].skipped[]` with `status: "blocked"` and a machine-readable `reason`.
-
-With SHA updates turned off (`--no-update-action-shas`, or
-`update_action_shas = false` in `.updrc.toml`), the pins still appear in
-`files[].skipped[]`, under
-`status: "not-examined"` with `reason: "action-sha-updates-off"`, and are
-counted in `summary.not_examined`. The two statuses answer different questions:
-`blocked` means the pin was examined and a safety condition refused the change,
-`not-examined` means it was never looked at. Neither is `summary.unchanged`,
-which counts dependencies that were checked and found current. In text output
-the count appears in the summary and `--verbose` names each pin.
-
-Configuration pins and `--package` filters use the action's `owner/repo` name.
-For example, `--package actions/checkout` selects every checkout reference,
-including subdirectory actions and reusable workflow paths from that repository.
-Configured targets for immutable pins must also be concrete SemVer tags; a
-floating value such as `v5` is reported as blocked.
-
-### Pre-commit
-
-- `.pre-commit-config.yaml`
-- Updates `rev:` fields for GitHub-hosted hook repositories
-- Skips local hooks, meta hooks, and non-GitHub repositories
-
-### Mise / asdf
-
-- `.mise.toml` (`[tools]` section)
-- `.tool-versions` (space-delimited format)
-- Supports 24+ common dev tools: node, python, go, rust, zig, deno, bun, uv, ruff, terraform, kubectl, helm, and more
-- Skips `latest` versions and `cargo:*` tools
-
-### Annotated files
-
-A version pinned in a file `upd` does not otherwise understand can declare its
-own source with a trailing comment:
-
-```makefile
-BAO_VERSION ?= 2.6.1  # upd: pypi openbao-cli
-NODE_VERSION := 22.11.0  # upd: npm node
-```
-
-- Syntax: `upd: <source> <package>` in a trailing `#` or `//` comment
-- Sources: `pypi`, `npm`, `crates`, `go`, `rubygems`, `nuget`, `github-releases`
-- Scanned by name: `Makefile`, `makefile`, `GNUmakefile`, `*.mk`, `justfile`,
-  `Justfile`, `*.sh`, `*.bash`. Any other file works when passed explicitly:
-  `upd update path/to/versions.env`
-- The version on the line is found and rewritten in place, keeping a leading
-  `v` and the line's own precision (`v2.60` becomes `v2.65`, not `v2.65.4`)
-- One package name may not appear under two different sources in the same file
-- `ignore` and `pin` in `.updrc.toml` reach annotated packages by name. Package
-  matching is PEP 503-normalized, so `"Oven-SH/bun"` and `"oven-sh/bun"` are
-  one key, as are `"foo-bar"` and `"foo_bar"`
-- `exclude` filters discovered files with path globs; explicitly passed file
-  paths bypass it
-- `upd align` and `upd audit` ignore annotated lines: a package name is only
-  meaningful together with its source, so grouping them across files is not safe
 
 ## Example Output
 
@@ -339,6 +142,25 @@ Would update 6 package(s) (2 major, 3 minor, 1 patch) in 4 file(s), 8 up to date
 ```
 
 Output includes clickable `file:line:` locations (recognized by VS Code, iTerm2, and modern terminals).
+
+## Version Constraints
+
+`upd` respects version constraints in your dependency files:
+
+| Constraint | Behavior |
+|------------|----------|
+| `>=2.0,<3` | Updates within 2.x range only |
+| `^2.0.0` | Updates within 2.x range (npm/Cargo); never crosses the major bound |
+| `~2.0.0` | Updates within 2.0.x range (npm); `~2.0.0` (Cargo) stays within 2.0.x |
+| `~> 7.1` | Updates within 7.x range (Ruby pessimistic) |
+| `>=2.0` | Updates to any version >= 2.0 |
+| `==2.0.0` | Updates the exact pin to the latest version (e.g. `==2.0.0` → `==3.1.5`). To freeze a package, use `[pin]` or `ignore` in `.updrc.toml`. |
+
+For npm, comparator ranges such as `">=1.0.0 <2.0.0"` are rewritten with a
+**bump strategy**: the lower bound moves to the highest version satisfying the
+constraint, preserving the upper bound. Hyphen (`"1 - 2"`) and OR
+(`"^1 || ^2"`) ranges are reported as warnings and left untouched rather than
+rewritten wrongly.
 
 ## Version Precision
 
@@ -367,7 +189,8 @@ requests>=2.0.0   →  requests>=2.32.5
 
 ## Version Alignment
 
-In monorepos or projects with multiple dependency files, the same package might have different versions:
+In monorepos or projects with multiple dependency files, the same package might
+have different versions:
 
 ```text
 # requirements.txt
@@ -380,7 +203,7 @@ requests==2.31.0
 requests==2.25.0
 ```
 
-Use `upd align` to update all occurrences to the highest version found:
+`upd align` updates every occurrence to the highest version found:
 
 ```bash
 upd align              # Align all packages to highest version
@@ -389,435 +212,9 @@ upd align --check      # Exit 1 if misalignments (for CI)
 upd align --lang python # Align only Python packages
 ```
 
-**Behavior:**
-
-- Only aligns packages within the same ecosystem (Python with Python, etc.)
-- Skips packages with upper bound constraints (e.g., `>=2.0,<3.0`) to avoid breaking them
-- Ignores pre-release versions when finding the highest version
-
-## Security Auditing
-
-Check your dependencies for known security vulnerabilities using the [OSV (Open Source Vulnerabilities)](https://osv.dev/) database:
-
-```bash
-upd audit              # Scan all dependency files (exit 6 if vulnerabilities found)
-upd audit --dry-run    # Same as audit (read-only operation)
-upd audit --no-fail    # Report vulnerabilities but exit 0
-upd audit --lang python # Audit only Python packages
-upd audit ./services   # Audit specific directory
-
-# Auto-fix: bump each vulnerable package to the minimum safe version
-# (max of fixed_version across all its vulnerabilities). Packages with
-# no fixed_version are reported but left untouched.
-upd audit --fix-audit --apply
-
-# Auto-fix and refresh the affected lockfiles (e.g. go.sum, Cargo.lock)
-upd audit --fix-audit --apply --lock
-
-# Offline mode: use only cached OSV responses; cache misses are errors
-upd audit --offline
-
-# SARIF 2.1.0 output for GitHub Code Scanning
-upd audit --format sarif > results.sarif
-```
-
-**Example output:**
-
-```text
-Checking 42 unique package(s) for vulnerabilities...
-
-⚠ Found 3 vulnerability/ies in 2 package(s):
-
-  ● requests@2.19.0 (PyPI)
-    ├── GHSA-j8r2-6x86-q33q [CVSS:3.1/AV:N/AC:H/PR:N/UI:R/S:C/C:H/I:N/A:N] Unintended leak of Proxy-Authorization header
-    │   Fixed in: 2.31.0
-    │   https://github.com/psf/requests/security/advisories/GHSA-j8r2-6x86-q33q
-
-  ● flask@0.12.2 (PyPI)
-    ├── GHSA-562c-5r94-xh97 [CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:N/I:N/A:H] Denial of Service vulnerability
-    │   Fixed in: 0.12.3
-    │   https://nvd.nist.gov/vuln/detail/CVE-2018-1000656
-    ├── GHSA-m2qf-hxjv-5gpq [CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:N/A:N] Session cookie disclosure
-    │   Fixed in: 2.3.2
-    │   https://github.com/pallets/flask/security/advisories/GHSA-m2qf-hxjv-5gpq
-
-Summary: 2 vulnerable package(s), 3 total vulnerability/ies
-```
-
-**Supported ecosystems for auditing:** PyPI, npm, crates.io, Go, RubyGems, NuGet
-
-**CI/CD Integration:**
-
-```yaml
-# GitHub Actions example — fail the build on vulnerabilities
-- name: Check for vulnerabilities
-  run: upd audit   # non-zero exit (6) fails the build when vulnerabilities are found
-
-# Upload SARIF results to GitHub Code Scanning
-- name: Audit dependencies (SARIF)
-  run: upd audit --format sarif > results.sarif
-- name: Upload to Code Scanning
-  uses: github/codeql-action/upload-sarif@v3
-  with:
-    sarif_file: results.sarif
-```
-
-### Automated GitHub Actions pull requests
-
-This repository publishes a reusable workflow that installs a checksum-verified
-`upd` release, applies only policy-approved Actions updates, validates every
-workflow with `actionlint`, and opens one Conventional Commits pull request:
-
-```yaml
-name: Weekly dependency health
-
-on:
-  schedule:
-    - cron: "17 6 * * 2"
-  workflow_dispatch:
-
-permissions:
-  contents: write
-  pull-requests: write
-
-jobs:
-  actions:
-    uses: rvben/upd/.github/workflows/dependency-health.yml@bdc55ece90b7333f177027ad208705b815b6caab # v0.5.2
-    with:
-      upd-version: v0.5.2
-      min-age: 7d
-      max-bump: minor
-      validation-command: make test
-    secrets:
-      pull-request-token: ${{ secrets.UPD_PR_TOKEN }}
-```
-
-Select an `upd-version` that advertises `--update-action-shas`; the workflow
-checks this capability explicitly and fails with upgrade guidance otherwise.
-
-Use a narrowly scoped GitHub App token or fine-grained PAT for
-`UPD_PR_TOKEN` when the generated PR must trigger CI. Without it, the workflow
-falls back to `GITHUB_TOKEN`; GitHub suppresses subsequent workflow runs caused
-by that token. Set `fail-on-blocked: true` when every SHA pin is expected to
-carry a verified version annotation.
-
-For an existing fleet, keep GitHub Actions updates enabled in Dependabot for
-four successful weekly `upd` cycles. During that proving period, review the
-workflow summaries, resolve intentionally blocked legacy pins, and configure
-`UPD_PR_TOKEN` before relying on PR-triggered CI. After four green cycles,
-remove only the overlapping `github-actions` Dependabot updates; keep its other
-package ecosystems enabled.
-
-## Version Constraints
-
-`upd` respects version constraints in your dependency files:
-
-| Constraint | Behavior |
-|------------|----------|
-| `>=2.0,<3` | Updates within 2.x range only |
-| `^2.0.0` | Updates within 2.x range (npm/Cargo); never crosses the major bound |
-| `~2.0.0` | Updates within 2.0.x range (npm); `~2.0.0` (Cargo) stays within 2.0.x |
-| `~> 7.1` | Updates within 7.x range (Ruby pessimistic) |
-| `>=2.0` | Updates to any version >= 2.0 |
-| `==2.0.0` | Updates the exact pin to the latest version (e.g. `==2.0.0` → `==3.1.5`). To freeze a package, use `[pin]` or `ignore` in `.updrc.toml`. |
-
-## Configuration File
-
-`upd` supports configuration files to customize update behavior on a per-project basis.
-
-### File Discovery
-
-`upd` searches for configuration files in the following order (first found wins):
-
-1. `.updrc.toml` - Recommended, explicit config file
-2. `upd.toml` - Alternative name
-3. `.updrc` - Minimal name (TOML format)
-
-The search starts from the target directory and walks up to parent directories, allowing you to place a config file at the repository root.
-
-### Configuration Options
-
-```toml
-# .updrc.toml
-
-# Packages to ignore during updates (never updated)
-ignore = [
-    "legacy-package",
-    "internal-tool",
-    "actions/checkout",        # GitHub Actions use owner/repo
-    "pre-commit/pre-commit-hooks",  # Pre-commit hooks too
-]
-
-# Leave SHA-pinned GitHub Actions unchecked for this repository. Checking them
-# is the default; --update-action-shas still wins when given.
-update_action_shas = false
-
-# Pin packages to specific versions (bypasses registry lookup)
-[pin]
-flask = "2.3.0"
-django = "4.2.0"
-"actions/setup-node" = "v4"   # Pin GitHub Actions
-"psf/black" = "24.0.0"        # Pin pre-commit hooks
-```
-
-### Options
-
-| Option | Type | Description |
-|--------|------|-------------|
-| `ignore` | `string[]` | List of package names to skip during updates |
-| `pin` | `table` | Map of package names to pinned versions |
-| `update_action_shas` | `bool` | Whether SHA-pinned GitHub Actions are checked and updated. Defaults to `true`; `--update-action-shas` and `--no-update-action-shas` override it |
-
-### Verbose Output
-
-Use `--verbose` to see which packages are ignored or pinned:
-
-```bash
-upd --verbose
-# Output:
-# Using config from: .updrc.toml
-#   Ignoring 2 package(s)
-#   Pinning 3 package(s)
-# pyproject.toml:12: Pinned flask 2.2.0 → 3.0.0 (pinned)
-# pyproject.toml:13: Skipped internal-utils 1.0.0 (ignored)
-```
-
-## Cooldown (minimum release age)
-
-Hold back updates to versions that have been public for less than N days.
-Reduces exposure to supply-chain attacks that rely on freshly published
-malicious versions being installed before detection. Modelled after
-Renovate's `minimumReleaseAge` / Dependabot's `cooldown`.
-
-Enable in `.updrc.toml`:
-
-```toml
-[cooldown]
-default = "7d"           # applies to every ecosystem unless overridden
-
-[cooldown.ecosystem]
-npm = "14d"              # stricter for npm
-pypi = "14d"
-"crates.io" = "3d"
-```
-
-Duration syntax: `<integer><unit>` where unit is `s`, `m`, `h`, `d`, `w`.
-A bare `0` disables cooldown.
-
-Override from the CLI for one-off runs:
-
-```text
-upd --min-age 14d         # use 14 days regardless of config
-upd --min-age 0           # disable cooldown entirely for this run
-```
-
-**How it works:** when the latest version is still inside the cooldown
-window, `upd` updates to the newest version that *is* old enough. If nothing
-newer is old enough yet, the package is held back. Output marks these
-packages explicitly:
-
-```text
-requirements.txt: Updated requests 2.28.0 → 2.31.0
-package.json: Held back lodash 4.17.20 → 4.17.21 (4.17.22 released 2d ago, cooldown 7d)
-package.json: Skipped express (only newer version 4.19.0 released 1d ago, cooldown 7d)
-```
-
-**Supported ecosystems:** PyPI, npm, crates.io, Go modules, RubyGems,
-GitHub releases (covers GitHub Actions, pre-commit, Mise). NuGet and
-Terraform Registry do not expose per-version publish dates we can
-consume today; cooldown is reported as unavailable for those files.
-
-## Caching
-
-Version lookups are cached for 24 hours in:
-
-- macOS: `~/Library/Caches/upd/versions.json`
-- Linux: `~/.cache/upd/versions.json`
-- Windows: `%LOCALAPPDATA%\upd\versions.json`
-
-Use `upd clean-cache` to clear the cache, or `upd --no-cache` to bypass it.
-
-## Private Repositories
-
-`upd` supports private package registries for all ecosystems. Credentials are automatically detected from environment variables and configuration files.
-
-### PyPI / Private Python Index
-
-```bash
-# Option 1: Environment variables
-export UV_INDEX_URL=https://my-private-pypi.com/simple
-export UV_INDEX_USERNAME=myuser
-export UV_INDEX_PASSWORD=mypassword
-
-# Option 2: PIP-style environment variables
-export PIP_INDEX_URL=https://my-private-pypi.com/simple
-export PIP_INDEX_USERNAME=myuser
-export PIP_INDEX_PASSWORD=mypassword
-
-# Option 3: ~/.netrc file
-# machine my-private-pypi.com
-# login myuser
-# password mypassword
-
-# Option 4: pip.conf / pip.ini
-# ~/.config/pip/pip.conf (Linux/macOS)
-# %APPDATA%\pip\pip.ini (Windows)
-[global]
-index-url = https://my-private-pypi.com/simple
-extra-index-url = https://pypi.org/simple
-
-# Option 5: Inline in requirements.txt (with credentials)
-# --index-url https://user:pass@my-private-pypi.com/simple
-# or just the URL (credentials from netrc):
-# --index-url https://my-private-pypi.com/simple
-```
-
-**pip.conf locations** (searched in order):
-
-1. `$PIP_CONFIG_FILE` environment variable
-2. `$VIRTUAL_ENV/pip.conf` (if in a virtual environment)
-3. `$XDG_CONFIG_HOME/pip/pip.conf` or `~/.config/pip/pip.conf`
-4. `~/.pip/pip.conf`
-5. `/etc/pip.conf` (system-wide)
-
-**Inline index URLs**: When a `requirements.txt` file contains `--index-url` or `-i`,
-`upd` automatically uses that index instead of the default PyPI. An `--extra-index-url`
-on its own is added in front of the default index, which is still consulted for
-anything the extra index does not carry. Credentials can be embedded in the URL
-(`https://user:pass@host/simple`) or looked up from `~/.netrc`.
-
-**Indexes declared in pyproject.toml**: `[[tool.uv.index]]`, `[[tool.poetry.source]]`
-and `[[tool.pdm.source]]` entries are honoured with each tool's own semantics.
-Declared indexes are consulted in the tool's own order (uv and Poetry: declared
-sources before the default index; PDM: the default index first) and only replace the
-default where the tool would (uv `default = true`, a Poetry primary source, a PDM
-source named `pypi`).
-uv `explicit = true` indexes are only used for packages pinned to them in
-`[tool.uv.sources]`. PDM `include_packages` / `exclude_packages` globs scope a source
-to the packages it names. Poetry `priority = "explicit"` sources are not consulted.
-The first index in the order that knows the package answers, as with uv's default
-`first-index` strategy: a package that lives on your private index is never bumped to
-a version that only exists on a public one, even if that version number is higher.
-
-### npm / Private Registry
-
-```bash
-# Option 1: Environment variables
-export NPM_REGISTRY=https://npm.mycompany.com
-export NPM_TOKEN=your-auth-token
-
-# Option 2: NODE_AUTH_TOKEN (GitHub Actions)
-export NODE_AUTH_TOKEN=your-auth-token
-
-# Option 3: ~/.npmrc file (global registry)
-registry=https://npm.mycompany.com
-//npm.mycompany.com/:_authToken=your-auth-token
-# Or for environment variable reference:
-//npm.mycompany.com/:_authToken=${NPM_TOKEN}
-
-# Option 4: ~/.npmrc file (scoped registries)
-@mycompany:registry=https://npm.mycompany.com
-//npm.mycompany.com/:_authToken=your-auth-token
-@another-scope:registry=https://another.registry.com
-```
-
-**Scoped registries**: Packages with scopes (e.g., `@mycompany/package`) will use the
-registry configured for that scope in `.npmrc`. This allows mixing public and private
-packages in the same project.
-
-### Cargo / Private Registry
-
-```bash
-# Option 1: Environment variables
-export CARGO_REGISTRY_TOKEN=your-token  # For crates.io default
-export CARGO_REGISTRIES_MY_REGISTRY_TOKEN=your-token  # For named registry
-
-# Option 2: ~/.cargo/credentials.toml
-[registry]
-token = "your-crates-io-token"
-
-[registries.my-private-registry]
-token = "your-private-token"
-
-# Option 3: ~/.cargo/config.toml (registry URLs)
-[registries.my-private-registry]
-index = "https://my-registry.com/git/index"
-# or sparse registry:
-index = "sparse+https://my-registry.com/index/"
-```
-
-**Custom registries**: `upd` reads `~/.cargo/config.toml` to discover custom registry
-URLs. Combine with `credentials.toml` for authenticated access.
-
-### Go / Private Module Proxy
-
-```bash
-# Option 1: Environment variables
-export GOPROXY=https://proxy.mycompany.com
-export GOPROXY_USERNAME=myuser
-export GOPROXY_PASSWORD=mypassword
-
-# Option 2: Private module patterns
-export GOPRIVATE=github.com/mycompany/*,gitlab.mycompany.com/*
-export GONOPROXY=github.com/mycompany/*
-export GONOSUMDB=github.com/mycompany/*
-
-# Option 3: ~/.netrc file (commonly used with go modules)
-# machine github.com
-# login myuser
-# password mytoken
-```
-
-**Private modules**: Set `GOPRIVATE` to specify module patterns that should bypass
-the public proxy. `upd` respects these patterns and will attempt direct access
-for matching modules.
-
-### GitHub (Actions & Pre-commit)
-
-```bash
-# Option 1: GITHUB_TOKEN (automatically available in GitHub Actions)
-export GITHUB_TOKEN=ghp_your-token-here
-
-# Option 2: GH_TOKEN (used by the gh CLI)
-export GH_TOKEN=ghp_your-token-here
-```
-
-Without a token, the GitHub API rate limit is 60 requests/hour. With a token, it's 5,000 requests/hour.
-
-Use `--verbose` to see when authenticated access is being used:
-
-```bash
-upd --verbose
-# Output: Using authenticated PyPI access
-# Output: Using authenticated npm access
-# Output: Using authenticated GitHub access
-```
-
-## Environment Variables
-
-| Variable | Description |
-|----------|-------------|
-| `UV_INDEX_URL` | Custom PyPI index URL |
-| `PIP_INDEX_URL` | Custom PyPI index URL (fallback) |
-| `PIP_CONFIG_FILE` | Path to pip configuration file |
-| `UV_INDEX_USERNAME` | PyPI username (with UV_INDEX_URL) |
-| `UV_INDEX_PASSWORD` | PyPI password (with UV_INDEX_URL) |
-| `PIP_INDEX_USERNAME` | PyPI username (with PIP_INDEX_URL) |
-| `PIP_INDEX_PASSWORD` | PyPI password (with PIP_INDEX_URL) |
-| `NPM_REGISTRY` | Custom npm registry URL |
-| `NPM_TOKEN` | npm authentication token |
-| `NODE_AUTH_TOKEN` | npm token (GitHub Actions compatible) |
-| `CARGO_REGISTRY_TOKEN` | crates.io authentication token |
-| `CARGO_REGISTRIES_<NAME>_TOKEN` | Named registry token |
-| `GOPROXY` | Custom Go module proxy URL |
-| `GOPROXY_USERNAME` | Go proxy username |
-| `GOPROXY_PASSWORD` | Go proxy password |
-| `GOPRIVATE` | Comma-separated private module patterns |
-| `GONOPROXY` | Modules to exclude from proxy |
-| `GONOSUMDB` | Modules to exclude from checksum DB |
-| `GITHUB_TOKEN` | GitHub API token (for Actions and pre-commit) |
-| `GH_TOKEN` | GitHub API token (gh CLI compatible) |
-| `UPD_CACHE_DIR` | Custom cache directory |
+It only aligns within one ecosystem, skips packages with upper bound
+constraints (e.g. `>=2.0,<3.0`) to avoid breaking them, and ignores
+pre-release versions when finding the highest version.
 
 ## Pre-commit Integration
 
@@ -840,7 +237,60 @@ Available hooks:
 | `upd-check` | Fail if any dependencies are outdated |
 | `upd-check-major` | Fail only on major (breaking) updates |
 
-Both hooks run on `pre-push` by default. Uses `language: python` which installs `upd-cli` from PyPI automatically — no manual installation needed.
+Both hooks run on `pre-push` by default. Uses `language: python` which installs `upd-cli` from PyPI automatically, so no manual installation is needed.
+
+## Documentation
+
+Everything you look up rather than read lives in
+[docs/](https://github.com/rvben/upd/tree/main/docs).
+
+### Supported files
+
+Every file `upd` discovers, per ecosystem, plus annotated version pins in files
+it does not otherwise understand.
+→ [docs/ecosystems.md](https://github.com/rvben/upd/blob/main/docs/ecosystems.md)
+
+### Security auditing
+
+OSV vulnerability scanning, `--fix-audit`, SARIF output, and CI integration.
+→ [docs/audit.md](https://github.com/rvben/upd/blob/main/docs/audit.md)
+
+### Configuration file
+
+`.updrc.toml` discovery order and every key it accepts.
+→ [docs/configuration.md](https://github.com/rvben/upd/blob/main/docs/configuration.md)
+
+### Cooldown (minimum release age)
+
+Hold back versions published less than N days ago, per ecosystem.
+→ [docs/configuration.md#cooldown-minimum-release-age](https://github.com/rvben/upd/blob/main/docs/configuration.md#cooldown-minimum-release-age)
+
+### Caching
+
+Where the 24-hour version cache lives and how to clear or bypass it.
+→ [docs/configuration.md#caching](https://github.com/rvben/upd/blob/main/docs/configuration.md#caching)
+
+### Environment variables
+
+Every variable `upd` reads, in one table.
+→ [docs/configuration.md#environment-variables](https://github.com/rvben/upd/blob/main/docs/configuration.md#environment-variables)
+
+### Private repositories
+
+Credential detection for PyPI, npm, Cargo, Go, and GitHub, including private
+indexes declared in `pyproject.toml`.
+→ [docs/private-registries.md](https://github.com/rvben/upd/blob/main/docs/private-registries.md)
+
+### GitHub Actions
+
+SHA-pin safety rules, `blocked` vs `not-examined` reporting, and the reusable
+workflow that opens dependency pull requests.
+→ [docs/github-actions.md](https://github.com/rvben/upd/blob/main/docs/github-actions.md)
+
+### Stability
+
+The stable CLI surface, exit codes, `--lock` commands, and output guarantees.
+→ [docs/stability.md](https://github.com/rvben/upd/blob/main/docs/stability.md)
 
 ## Development
 
@@ -860,110 +310,6 @@ make fmt
 # All checks
 make check
 ```
-
-## Stability
-
-Starting with `0.1.0`, `upd` commits to the following public surfaces.
-Anything listed here will not change in a backwards-incompatible way
-without a major-version bump.
-
-### Stable CLI
-
-Global flags (accepted on every subcommand):
-
-| Flag | Short | Purpose |
-|------|-------|---------|
-| `--apply` | | Write changes to files (omit for dry-run preview) |
-| `--dry-run` | `-n` | Preview changes without writing (explicit form) |
-| `--verbose` | `-v` | Verbose output |
-| `--quiet` | `-q` | Suppress decorative output (errors still shown) |
-| `--interactive` | `-i` | Approve each update individually |
-| `--check` | | Make `align` exit 1 if misalignments are found (`update` and `audit` already exit non-zero; see exit codes) |
-| `--only-bump <major\|minor\|patch>` | | Restrict to exactly these bump levels (repeatable, comma-separated) |
-| `--max-bump <major\|minor\|patch>` | | Include updates up to and including this level |
-| `--package <NAME>` | | Restrict to named packages (repeatable, comma-separated) |
-| `--lang <LANG>` | `-l` | Filter by ecosystem (repeatable) |
-| `--full-precision` | | Output full versions |
-| `--no-cache` | | Disable version cache |
-| `--no-color` | | Disable colored output |
-| `--no-ignore` | | Disable `.gitignore` filtering during discovery |
-| `--lock` | | Regenerate lockfiles after updates or security fixes |
-| `--config <FILE>` | `-c` | Use a specific config file |
-| `--show-config` | | Print effective configuration and exit |
-| `--format <text\|json\|sarif>` | | Output format (`sarif` applies to `audit`) |
-| `--version` | `-V` | Print version (built-in clap flag) |
-| `--help` | `-h` | Print help (built-in clap flag) |
-
-Subcommands: `update` (default), `align`, `audit`, `clean-cache`, `self-update`.
-
-#### Commands run by `--lock`
-
-`upd --lock` runs the narrowest per-ecosystem refresh command that
-updates only the packages `upd` just rewrote. Targeted forms are used
-wherever the package manager supports them; targeting falls back to
-`--lockfile-only` flags where no per-package form exists; otherwise
-the manifest-wide refresh command is used. The flag is honored by
-`update` (including `--interactive`) and by `audit --fix-audit --apply`.
-
-| Ecosystem | Lockfile                 | Command                                        |
-|-----------|--------------------------|------------------------------------------------|
-| Python    | `poetry.lock`            | `poetry lock --no-update`                      |
-| Python    | `uv.lock`                | `uv lock`                                      |
-| Node      | `package-lock.json`      | `npm install --package-lock-only`              |
-| Node      | `yarn.lock`              | `yarn install --mode update-lockfile` (Yarn 2+)|
-| Node      | `pnpm-lock.yaml`         | `pnpm install --lockfile-only`                 |
-| Node      | `bun.lockb`              | `bun install`                                  |
-| Rust      | `Cargo.lock`             | `cargo update -p <changed> -p <changed> …`     |
-| Go        | `go.sum`                 | `go mod tidy` (no targeted form)               |
-| Ruby      | `Gemfile.lock`           | `bundle lock --update <changed> …`             |
-| .NET      | `packages.lock.json`     | `dotnet restore` (no targeted form)            |
-| Terraform | `.terraform.lock.hcl`    | `terraform providers lock` (no targeted form)  |
-
-Manifests whose `upd` pass produced zero changes have their lockfile
-refresh skipped entirely. A directory where only config pins were
-applied is still refreshed, and the changed-package list includes
-those pinned packages so `cargo update -p <pkg>` / `bundle lock --update <pkg>` stay scoped.
-
-Stable `audit`-specific flags:
-
-| Flag | Purpose |
-|------|---------|
-| `--fix-audit` | Bump each vulnerable package to minimum safe version |
-| `--offline` | Use only cached OSV responses; cache misses are errors |
-| `--format sarif` | Emit SARIF 2.1.0 for GitHub Code Scanning |
-
-### Stable exit codes
-
-| Code | Meaning |
-|------|---------|
-| `0` | Success — no action required, or updates applied cleanly |
-| `1` | Pending updates or misalignments found (dry-run / `--check`). Not an error. |
-| `2` | I/O error — a file could not be read/written, or a required path does not exist |
-| `3` | Network error — a registry was unreachable or timed out |
-| `4` | Invalid CLI arguments or an unparseable dependency file / configuration |
-| `6` | Vulnerabilities found (`upd audit`). Pass `--no-fail` to force exit 0. |
-
-> The authoritative exit-code contract is emitted by `upd schema` (`outcomes` and
-> `errors`). A bare `upd` / `upd audit` already signals these codes; `--check` does
-> not change `update`/`audit` exit codes (it gates `align`, which otherwise exits 0).
-
-### Stable output
-
-- **Text output** is designed for humans. Exact wording, colour, and spacing may change between minor versions — do not parse it.
-- **JSON output** (`--format json`) follows an additive schema. New
-  fields may appear in minor releases; existing fields will not change
-  type, be renamed, or be removed before `1.0`.
-
-### Stable configuration
-
-- `.updrc.toml` / `upd.toml` / `.updrc` discovery order and the `ignore` array + `[pin]` table are stable.
-- New top-level keys may be added in minor releases, but will always default to the pre-existing behaviour.
-
-### Not covered by stability guarantees
-
-- Error message wording and verbose/debug log lines.
-- Cache file layout on disk (`$UPD_CACHE_DIR/versions.json`).
-- The `upd` Rust library crate — internal types may change between any releases. Depend on the CLI, not the crate.
 
 ## License
 

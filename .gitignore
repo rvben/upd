@@ -1,3 +1,7 @@
 /target
 .env
 .worktrees/
+
+# Design and planning notes. docs/ otherwise holds published documentation.
+docs/superpowers/
+.superpowers/
