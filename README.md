@@ -667,6 +667,19 @@ extra-index-url = https://pypi.org/simple
 `upd` automatically uses that index instead of the default PyPI. Credentials can be
 embedded in the URL (`https://user:pass@host/simple`) or looked up from `~/.netrc`.
 
+**Indexes declared in pyproject.toml**: `[[tool.uv.index]]`, `[[tool.poetry.source]]`
+and `[[tool.pdm.source]]` entries are honoured with each tool's own semantics.
+Declared indexes are consulted in the tool's own order (uv and Poetry: declared
+sources before the default index; PDM: the default index first) and only replace the
+default where the tool would (uv `default = true`, a Poetry primary source, a PDM
+source named `pypi`).
+uv `explicit = true` indexes are only used for packages pinned to them in
+`[tool.uv.sources]`. PDM `include_packages` / `exclude_packages` globs scope a source
+to the packages it names. Poetry `priority = "explicit"` sources are not consulted.
+The first index in the order that knows the package answers, as with uv's default
+`first-index` strategy: a package that lives on your private index is never bumped to
+a version that only exists on a public one, even if that version number is higher.
+
 ### npm / Private Registry
 
 ```bash

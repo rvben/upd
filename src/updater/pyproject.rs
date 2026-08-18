@@ -3,7 +3,7 @@ use super::{
     read_file_safe, write_file_atomic,
 };
 use crate::align::compare_versions;
-use crate::registry::{MultiPyPiRegistry, PyPiRegistry, Registry};
+use crate::registry::{DeclaredIndex, IndexChain, Registry};
 use crate::updater::Lang;
 use crate::version::{is_prerelease_pep440, is_stable_pep440, match_version_precision};
 use anyhow::{Result, anyhow};
@@ -11,8 +11,39 @@ use futures::future::join_all;
 use regex::Regex;
 use std::collections::HashMap;
 use std::path::Path;
-use std::sync::Arc;
 use toml_edit::{DocumentMut, Formatted, Item, Value};
+
+/// Package indexes declared by a manifest: the query chain and the packages
+/// pinned to a named index (package name -> declared index name).
+#[derive(Debug, Default, PartialEq, Eq)]
+struct DeclaredIndexes {
+    chain: Vec<DeclaredIndex>,
+    pins: HashMap<String, String>,
+}
+
+fn table_str<'t>(table: &'t toml_edit::Table, key: &str) -> Option<&'t str> {
+    match table.get(key) {
+        Some(Item::Value(Value::String(s))) if !s.value().is_empty() => Some(s.value()),
+        _ => None,
+    }
+}
+
+fn table_bool(table: &toml_edit::Table, key: &str) -> bool {
+    matches!(table.get(key), Some(Item::Value(Value::Boolean(b))) if *b.value())
+}
+
+/// The string entries of an array value; a missing key or a non-array is empty.
+fn table_str_array(table: &toml_edit::Table, key: &str) -> Vec<String> {
+    match table.get(key) {
+        Some(Item::Value(Value::Array(items))) => items
+            .iter()
+            .filter_map(Value::as_str)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .collect(),
+        _ => Vec::new(),
+    }
+}
 
 pub struct PyProjectUpdater {
     // Regex to extract version from dependency string
@@ -136,82 +167,236 @@ impl PyProjectUpdater {
         ))
     }
 
-    /// Extract index URLs from pyproject.toml for Poetry and PDM configurations
-    /// Poetry uses [[tool.poetry.source]] with url field
-    /// PDM uses [[tool.pdm.source]] with url field
-    /// Returns (primary_url, extra_urls) where primary is the first found or default PyPI
-    fn extract_index_urls(doc: &DocumentMut) -> (Option<String>, Vec<String>) {
-        let mut urls: Vec<String> = Vec::new();
+    /// The package indexes a pyproject.toml declares, in query order, plus the
+    /// packages it pins to a named index.
+    ///
+    /// Each tool has its own rules for how a declared index relates to the
+    /// default one, and the manifest that resolves is the one whose tool table
+    /// is consulted: uv, then Poetry, then PDM. A project that keeps a stale
+    /// `[tool.poetry]` around after moving to uv is resolved by uv.
+    fn declared_indexes(doc: &DocumentMut) -> DeclaredIndexes {
+        let tool = match doc.get("tool") {
+            Some(Item::Table(tool)) => tool,
+            _ => return DeclaredIndexes::default(),
+        };
 
-        // Check [[tool.poetry.source]]
-        if let Some(Item::Table(tool)) = doc.get("tool")
-            && let Some(Item::Table(poetry)) = tool.get("poetry")
-            && let Some(Item::ArrayOfTables(sources)) = poetry.get("source")
-        {
-            for source in sources.iter() {
-                if let Some(Item::Value(Value::String(url))) = source.get("url") {
-                    let url_str = url.value().to_string();
-                    if !url_str.is_empty() {
-                        urls.push(url_str);
-                    }
-                }
+        if let Some(Item::Table(uv)) = tool.get("uv") {
+            let declared = Self::uv_indexes(uv);
+            if !declared.chain.is_empty() {
+                return declared;
             }
         }
-
-        // Check [[tool.pdm.source]]
-        if let Some(Item::Table(tool)) = doc.get("tool")
-            && let Some(Item::Table(pdm)) = tool.get("pdm")
-            && let Some(Item::ArrayOfTables(sources)) = pdm.get("source")
-        {
-            for source in sources.iter() {
-                if let Some(Item::Value(Value::String(url))) = source.get("url") {
-                    let url_str = url.value().to_string();
-                    if !url_str.is_empty() && !urls.contains(&url_str) {
-                        urls.push(url_str);
-                    }
-                }
+        if let Some(Item::Table(poetry)) = tool.get("poetry") {
+            let declared = Self::poetry_indexes(poetry);
+            if !declared.chain.is_empty() {
+                return declared;
             }
         }
+        if let Some(Item::Table(pdm)) = tool.get("pdm") {
+            let declared = Self::pdm_indexes(pdm);
+            if !declared.chain.is_empty() {
+                return declared;
+            }
+        }
+        DeclaredIndexes::default()
+    }
 
-        // Also check for uv's [[tool.uv.index]] format
-        if let Some(Item::Table(tool)) = doc.get("tool")
-            && let Some(Item::Table(uv)) = tool.get("uv")
-            && let Some(Item::ArrayOfTables(indexes)) = uv.get("index")
-        {
+    /// uv: every `[[tool.uv.index]]` entry is consulted before the default index
+    /// in declaration order. Only `default = true` replaces PyPI; `explicit =
+    /// true` restricts an index to packages pinned to it through
+    /// `[tool.uv.sources]`. The legacy `[tool.uv] index-url` and
+    /// `extra-index-url` keys are the unnamed forms of the same two roles.
+    fn uv_indexes(uv: &toml_edit::Table) -> DeclaredIndexes {
+        let mut before_default: Vec<DeclaredIndex> = Vec::new();
+        let mut explicit: Vec<DeclaredIndex> = Vec::new();
+        let mut default_index: Option<DeclaredIndex> = None;
+        let mut default_replaced = false;
+
+        if let Some(Item::ArrayOfTables(indexes)) = uv.get("index") {
             for index in indexes.iter() {
-                if let Some(Item::Value(Value::String(url))) = index.get("url") {
-                    let url_str = url.value().to_string();
-                    if !url_str.is_empty() && !urls.contains(&url_str) {
-                        urls.push(url_str);
-                    }
+                let Some(url) = table_str(index, "url") else {
+                    continue;
+                };
+                let name = table_str(index, "name");
+                let is_default = table_bool(index, "default");
+                let is_explicit = table_bool(index, "explicit");
+                let declared = DeclaredIndex::url(name, url);
+
+                if is_explicit {
+                    // A default+explicit index removes PyPI as the default and
+                    // is still only reachable through pins.
+                    default_replaced |= is_default;
+                    explicit.push(declared.explicit());
+                } else if is_default && default_index.is_none() {
+                    default_index = Some(declared);
+                } else {
+                    before_default.push(declared);
                 }
             }
         }
 
-        if urls.is_empty() {
-            (None, Vec::new())
-        } else {
-            let primary = urls.remove(0);
-            (Some(primary), urls)
+        if let Some(Item::Value(Value::Array(urls))) = uv.get("extra-index-url") {
+            for url in urls.iter().filter_map(|u| u.as_str()) {
+                if !url.is_empty() {
+                    before_default.push(DeclaredIndex::url(None, url));
+                }
+            }
+        }
+        if let Some(Item::Value(Value::String(url))) = uv.get("index-url")
+            && !url.value().is_empty()
+            && default_index.is_none()
+            && !default_replaced
+        {
+            default_index = Some(DeclaredIndex::url(None, url.value()));
+        }
+
+        if before_default.is_empty()
+            && explicit.is_empty()
+            && default_index.is_none()
+            && !default_replaced
+        {
+            return DeclaredIndexes::default();
+        }
+
+        let mut chain = before_default;
+        match default_index {
+            Some(index) => chain.push(index),
+            None if !default_replaced => chain.push(DeclaredIndex::default_registry()),
+            None => {}
+        }
+        chain.extend(explicit);
+
+        DeclaredIndexes {
+            chain,
+            pins: Self::uv_source_pins(uv),
         }
     }
 
-    /// Create a registry from the pyproject.toml index configuration
-    /// If no index URLs are found, returns None to use the default registry
-    fn create_registry_from_config(doc: &DocumentMut) -> Option<Arc<dyn Registry + Send + Sync>> {
-        let (primary_url, extra_urls) = Self::extract_index_urls(doc);
-
-        if let Some(url) = primary_url {
-            let primary = PyPiRegistry::from_url(&url);
-            if extra_urls.is_empty() {
-                Some(Arc::new(primary))
-            } else {
-                Some(Arc::new(MultiPyPiRegistry::from_primary_and_extras(
-                    primary, extra_urls,
-                )))
+    /// `[tool.uv.sources]` entries of the form `pkg = { index = "name" }`, or a
+    /// list of such tables (the first `index` entry wins; markers are not
+    /// evaluated). Git, path and URL sources are not index pins.
+    fn uv_source_pins(uv: &toml_edit::Table) -> HashMap<String, String> {
+        let mut pins = HashMap::new();
+        let Some(sources) = uv.get("sources").and_then(|s| s.as_table_like()) else {
+            return pins;
+        };
+        for (package, source) in sources.iter() {
+            let index = match source {
+                Item::Value(Value::InlineTable(table)) => table
+                    .get("index")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string),
+                Item::Table(table) => table_str(table, "index").map(str::to_string),
+                Item::Value(Value::Array(alternatives)) => alternatives.iter().find_map(|alt| {
+                    alt.as_inline_table()
+                        .and_then(|t| t.get("index"))
+                        .and_then(|v| v.as_str())
+                        .map(str::to_string)
+                }),
+                _ => None,
+            };
+            if let Some(index) = index {
+                pins.insert(package.to_string(), index);
             }
-        } else {
-            None
+        }
+        pins
+    }
+
+    /// Poetry: `[[tool.poetry.source]]` entries are searched by priority.
+    /// Primary sources (`priority = "primary"`, the default when omitted, or the
+    /// legacy `default = true`) come first and disable the implicit PyPI, unless
+    /// PyPI itself is listed as a primary source (by name, without a URL).
+    /// Supplemental sources (`priority = "supplemental"` or the legacy
+    /// `secondary = true`) follow PyPI. Explicit sources are only used for
+    /// dependencies that name them, which the updater does not model, so they
+    /// stay out of the chain.
+    fn poetry_indexes(poetry: &toml_edit::Table) -> DeclaredIndexes {
+        let Some(Item::ArrayOfTables(sources)) = poetry.get("source") else {
+            return DeclaredIndexes::default();
+        };
+
+        let mut primary: Vec<DeclaredIndex> = Vec::new();
+        let mut supplemental: Vec<DeclaredIndex> = Vec::new();
+        let mut explicit: Vec<DeclaredIndex> = Vec::new();
+
+        for source in sources.iter() {
+            let name = table_str(source, "name");
+            let declared = match table_str(source, "url") {
+                Some(url) => DeclaredIndex::url(name, url),
+                None if name.is_some_and(|n| n.eq_ignore_ascii_case("pypi")) => DeclaredIndex {
+                    name: name.map(str::to_string),
+                    ..DeclaredIndex::default_registry()
+                },
+                None => continue,
+            };
+
+            let priority = table_str(source, "priority").map(str::to_ascii_lowercase);
+            let priority = match priority.as_deref() {
+                Some(p) => p.to_string(),
+                None if table_bool(source, "secondary") => "supplemental".to_string(),
+                None => "primary".to_string(),
+            };
+            match priority.as_str() {
+                "supplemental" | "secondary" => supplemental.push(declared),
+                "explicit" => explicit.push(declared.explicit()),
+                _ => primary.push(declared),
+            }
+        }
+
+        if primary.is_empty() && supplemental.is_empty() && explicit.is_empty() {
+            return DeclaredIndexes::default();
+        }
+
+        let mut chain = primary;
+        if chain.is_empty() {
+            chain.push(DeclaredIndex::default_registry());
+        }
+        chain.extend(supplemental);
+        chain.extend(explicit);
+        DeclaredIndexes {
+            chain,
+            pins: HashMap::new(),
+        }
+    }
+
+    /// PDM: the default PyPI comes first, then every `[[tool.pdm.source]]` of
+    /// type `index` in declaration order. A source named `pypi` replaces the
+    /// default and takes its declared position; `find_links` sources are not
+    /// indexes.
+    fn pdm_indexes(pdm: &toml_edit::Table) -> DeclaredIndexes {
+        let Some(Item::ArrayOfTables(sources)) = pdm.get("source") else {
+            return DeclaredIndexes::default();
+        };
+
+        let mut declared: Vec<DeclaredIndex> = Vec::new();
+        let mut replaces_default = false;
+        for source in sources.iter() {
+            if table_str(source, "type").is_some_and(|t| t == "find_links") {
+                continue;
+            }
+            let Some(url) = table_str(source, "url") else {
+                continue;
+            };
+            let name = table_str(source, "name");
+            replaces_default |= name.is_some_and(|n| n.eq_ignore_ascii_case("pypi"));
+            declared.push(DeclaredIndex::url(name, url).with_package_filters(
+                table_str_array(source, "include_packages"),
+                table_str_array(source, "exclude_packages"),
+            ));
+        }
+
+        if declared.is_empty() {
+            return DeclaredIndexes::default();
+        }
+
+        let mut chain = Vec::new();
+        if !replaces_default {
+            chain.push(DeclaredIndex::default_registry());
+        }
+        chain.extend(declared);
+        DeclaredIndexes {
+            chain,
+            pins: HashMap::new(),
         }
     }
 
@@ -876,13 +1061,14 @@ impl Updater for PyProjectUpdater {
         let mut result = UpdateResult::default();
         let line_index = PyProjectLineIndex::from_content(&content, self);
 
-        // Check for inline index configuration (Poetry/PDM/uv)
-        // If found, use that registry instead of the default
-        let inline_registry = Self::create_registry_from_config(&doc);
-        let effective_registry: &dyn Registry = if let Some(ref inline) = inline_registry {
-            inline.as_ref()
-        } else {
-            registry
+        // Indexes the manifest declares (uv/Poetry/PDM) are layered over the
+        // registry we were handed; only the tool's own replace-the-default rule
+        // takes PyPI out of the chain.
+        let declared = Self::declared_indexes(&doc);
+        let chain = IndexChain::new(declared.chain, &declared.pins, registry);
+        let effective_registry: &dyn Registry = match &chain {
+            Some(chain) => chain,
+            None => registry,
         };
 
         // Update [project.dependencies]
@@ -1081,6 +1267,7 @@ mod tests {
     use super::*;
     use crate::registry::MockRegistry;
     use std::io::Write;
+    use std::sync::Arc;
     use tempfile::NamedTempFile;
 
     #[test]
@@ -1565,11 +1752,173 @@ version = "1.0.0"
         assert!(result.errors.is_empty());
     }
 
-    // Tests for index URL extraction
+    // Tests for declared package indexes. Each tool's rules for how a declared
+    // index relates to the default index are asserted here in isolation; the
+    // end-to-end behaviour against two live mock indexes lives in
+    // tests/pyproject_indexes.rs.
+
+    fn declared(content: &str) -> DeclaredIndexes {
+        let doc: DocumentMut = content.parse().unwrap();
+        PyProjectUpdater::declared_indexes(&doc)
+    }
+
+    fn url(name: &str, url: &str) -> DeclaredIndex {
+        DeclaredIndex::url(Some(name), url)
+    }
 
     #[test]
-    fn test_extract_poetry_source_urls() {
-        let content = r#"
+    fn uv_index_without_default_is_added_ahead_of_pypi() {
+        // The reported case: a private-only index declared without
+        // `default = true` must not replace PyPI, or every public dependency
+        // in the file 404s.
+        let d = declared(
+            r#"
+[[tool.uv.index]]
+name = "nexus"
+url = "https://nexus.example.com/repository/private/simple/"
+publish-url = "https://nexus.example.com/repository/private/"
+"#,
+        );
+        assert_eq!(
+            d.chain,
+            vec![
+                url(
+                    "nexus",
+                    "https://nexus.example.com/repository/private/simple/"
+                ),
+                DeclaredIndex::default_registry(),
+            ]
+        );
+        assert!(d.pins.is_empty());
+    }
+
+    #[test]
+    fn uv_indexes_keep_declaration_order_with_default_last() {
+        let d = declared(
+            r#"
+[tool.uv]
+
+[[tool.uv.index]]
+name = "pytorch"
+url = "https://download.pytorch.org/whl/cpu"
+
+[[tool.uv.index]]
+name = "private"
+url = "https://private.pypi.com/simple"
+"#,
+        );
+        assert_eq!(
+            d.chain,
+            vec![
+                url("pytorch", "https://download.pytorch.org/whl/cpu"),
+                url("private", "https://private.pypi.com/simple"),
+                DeclaredIndex::default_registry(),
+            ]
+        );
+    }
+
+    #[test]
+    fn uv_default_true_replaces_pypi_and_stays_last() {
+        let d = declared(
+            r#"
+[[tool.uv.index]]
+name = "mirror"
+url = "https://mirror.example.com/simple"
+default = true
+
+[[tool.uv.index]]
+name = "private"
+url = "https://private.pypi.com/simple"
+"#,
+        );
+        assert_eq!(
+            d.chain,
+            vec![
+                url("private", "https://private.pypi.com/simple"),
+                url("mirror", "https://mirror.example.com/simple"),
+            ]
+        );
+    }
+
+    #[test]
+    fn uv_explicit_index_is_only_reachable_through_sources_pins() {
+        let d = declared(
+            r#"
+[[tool.uv.index]]
+name = "pytorch"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
+
+[tool.uv.sources]
+torch = { index = "pytorch" }
+torchvision = [{ index = "pytorch", marker = "sys_platform == 'linux'" }]
+mylib = { git = "https://github.com/example/mylib" }
+"#,
+        );
+        assert_eq!(
+            d.chain,
+            vec![
+                DeclaredIndex::default_registry(),
+                url("pytorch", "https://download.pytorch.org/whl/cpu").explicit(),
+            ]
+        );
+        assert_eq!(d.pins.len(), 2);
+        assert_eq!(d.pins["torch"], "pytorch");
+        assert_eq!(d.pins["torchvision"], "pytorch");
+    }
+
+    #[test]
+    fn uv_default_and_explicit_index_removes_pypi_without_joining_the_chain() {
+        let d = declared(
+            r#"
+[[tool.uv.index]]
+name = "locked"
+url = "https://locked.example.com/simple"
+default = true
+explicit = true
+"#,
+        );
+        assert_eq!(
+            d.chain,
+            vec![url("locked", "https://locked.example.com/simple").explicit()]
+        );
+    }
+
+    #[test]
+    fn uv_legacy_index_keys_map_to_default_and_extra_roles() {
+        let d = declared(
+            r#"
+[tool.uv]
+index-url = "https://mirror.example.com/simple"
+extra-index-url = ["https://extra.example.com/simple"]
+"#,
+        );
+        assert_eq!(
+            d.chain,
+            vec![
+                DeclaredIndex::url(None, "https://extra.example.com/simple"),
+                DeclaredIndex::url(None, "https://mirror.example.com/simple"),
+            ]
+        );
+    }
+
+    #[test]
+    fn uv_index_without_url_is_ignored() {
+        let d = declared(
+            r#"
+[[tool.uv.index]]
+name = "broken"
+"#,
+        );
+        assert!(d.chain.is_empty());
+    }
+
+    #[test]
+    fn poetry_primary_sources_replace_pypi() {
+        // Sources without a priority are primary, and a primary source
+        // disables the implicit PyPI.
+        let d = declared(
+            r#"
 [tool.poetry]
 name = "myproject"
 
@@ -1580,74 +1929,178 @@ url = "https://private.pypi.com/simple"
 [[tool.poetry.source]]
 name = "extra"
 url = "https://extra.pypi.com/simple"
-"#;
-        let doc: DocumentMut = content.parse().unwrap();
-        let (primary, extras) = PyProjectUpdater::extract_index_urls(&doc);
-
-        assert_eq!(primary, Some("https://private.pypi.com/simple".to_string()));
-        assert_eq!(extras.len(), 1);
-        assert_eq!(extras[0], "https://extra.pypi.com/simple");
+priority = "primary"
+"#,
+        );
+        assert_eq!(
+            d.chain,
+            vec![
+                url("private", "https://private.pypi.com/simple"),
+                url("extra", "https://extra.pypi.com/simple"),
+            ]
+        );
     }
 
     #[test]
-    fn test_extract_pdm_source_urls() {
-        let content = r#"
+    fn poetry_supplemental_source_follows_pypi() {
+        let d = declared(
+            r#"
+[[tool.poetry.source]]
+name = "private"
+url = "https://private.pypi.com/simple"
+priority = "supplemental"
+"#,
+        );
+        assert_eq!(
+            d.chain,
+            vec![
+                DeclaredIndex::default_registry(),
+                url("private", "https://private.pypi.com/simple"),
+            ]
+        );
+    }
+
+    #[test]
+    fn poetry_named_pypi_source_keeps_the_default_in_its_position() {
+        let d = declared(
+            r#"
+[[tool.poetry.source]]
+name = "private"
+url = "https://private.pypi.com/simple"
+priority = "primary"
+
+[[tool.poetry.source]]
+name = "PyPI"
+priority = "primary"
+
+[[tool.poetry.source]]
+name = "explicit-only"
+url = "https://explicit.pypi.com/simple"
+priority = "explicit"
+"#,
+        );
+        assert_eq!(
+            d.chain,
+            vec![
+                url("private", "https://private.pypi.com/simple"),
+                DeclaredIndex {
+                    name: Some("PyPI".to_string()),
+                    ..DeclaredIndex::default_registry()
+                },
+                url("explicit-only", "https://explicit.pypi.com/simple").explicit(),
+            ]
+        );
+    }
+
+    #[test]
+    fn poetry_legacy_secondary_flag_is_supplemental() {
+        let d = declared(
+            r#"
+[[tool.poetry.source]]
+name = "private"
+url = "https://private.pypi.com/simple"
+secondary = true
+"#,
+        );
+        assert_eq!(
+            d.chain,
+            vec![
+                DeclaredIndex::default_registry(),
+                url("private", "https://private.pypi.com/simple"),
+            ]
+        );
+    }
+
+    #[test]
+    fn pdm_sources_follow_pypi_unless_one_is_named_pypi() {
+        let d = declared(
+            r#"
 [tool.pdm]
 name = "myproject"
 
 [[tool.pdm.source]]
 name = "private"
 url = "https://private.pypi.com/simple"
-"#;
-        let doc: DocumentMut = content.parse().unwrap();
-        let (primary, extras) = PyProjectUpdater::extract_index_urls(&doc);
 
-        assert_eq!(primary, Some("https://private.pypi.com/simple".to_string()));
-        assert!(extras.is_empty());
-    }
+[[tool.pdm.source]]
+name = "wheels"
+url = "https://wheels.example.com/"
+type = "find_links"
+"#,
+        );
+        assert_eq!(
+            d.chain,
+            vec![
+                DeclaredIndex::default_registry(),
+                url("private", "https://private.pypi.com/simple"),
+            ]
+        );
 
-    #[test]
-    fn test_extract_uv_index_urls() {
-        let content = r#"
-[tool.uv]
-
-[[tool.uv.index]]
-name = "pytorch"
-url = "https://download.pytorch.org/whl/cpu"
-
-[[tool.uv.index]]
+        let d = declared(
+            r#"
+[[tool.pdm.source]]
 name = "private"
 url = "https://private.pypi.com/simple"
-"#;
-        let doc: DocumentMut = content.parse().unwrap();
-        let (primary, extras) = PyProjectUpdater::extract_index_urls(&doc);
 
-        assert_eq!(
-            primary,
-            Some("https://download.pytorch.org/whl/cpu".to_string())
+[[tool.pdm.source]]
+name = "pypi"
+url = "https://mirror.example.com/simple"
+"#,
         );
-        assert_eq!(extras.len(), 1);
-        assert_eq!(extras[0], "https://private.pypi.com/simple");
+        assert_eq!(
+            d.chain,
+            vec![
+                url("private", "https://private.pypi.com/simple"),
+                url("pypi", "https://mirror.example.com/simple"),
+            ]
+        );
     }
 
     #[test]
-    fn test_extract_no_sources() {
-        let content = r#"
+    fn pdm_source_package_filters_are_carried_onto_the_index() {
+        let d = declared(
+            r#"
+[[tool.pdm.source]]
+name = "private"
+url = "https://private.pypi.com/simple"
+include_packages = ["foo", "foo-*"]
+exclude_packages = ["bar"]
+"#,
+        );
+        assert_eq!(
+            d.chain,
+            vec![
+                DeclaredIndex::default_registry(),
+                url("private", "https://private.pypi.com/simple").with_package_filters(
+                    vec!["foo".to_string(), "foo-*".to_string()],
+                    vec!["bar".to_string()],
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn no_declared_indexes_means_no_chain() {
+        let d = declared(
+            r#"
 [project]
 name = "myproject"
 dependencies = ["requests>=2.0.0"]
-"#;
-        let doc: DocumentMut = content.parse().unwrap();
-        let (primary, extras) = PyProjectUpdater::extract_index_urls(&doc);
-
-        assert!(primary.is_none());
-        assert!(extras.is_empty());
+"#,
+        );
+        assert!(d.chain.is_empty());
+        assert!(d.pins.is_empty());
     }
 
     #[test]
-    fn test_extract_combined_sources() {
-        // Poetry and PDM sources in the same file (unlikely but should handle)
-        let content = r#"
+    fn the_first_tool_that_declares_indexes_wins() {
+        // uv resolves a project that still carries a Poetry table.
+        let d = declared(
+            r#"
+[[tool.uv.index]]
+name = "uv-private"
+url = "https://uv.pypi.com/simple"
+
 [[tool.poetry.source]]
 name = "poetry-private"
 url = "https://poetry.pypi.com/simple"
@@ -1655,32 +2108,83 @@ url = "https://poetry.pypi.com/simple"
 [[tool.pdm.source]]
 name = "pdm-private"
 url = "https://pdm.pypi.com/simple"
-"#;
-        let doc: DocumentMut = content.parse().unwrap();
-        let (primary, extras) = PyProjectUpdater::extract_index_urls(&doc);
-
-        assert_eq!(primary, Some("https://poetry.pypi.com/simple".to_string()));
-        assert_eq!(extras.len(), 1);
-        assert_eq!(extras[0], "https://pdm.pypi.com/simple");
+"#,
+        );
+        assert_eq!(
+            d.chain,
+            vec![
+                url("uv-private", "https://uv.pypi.com/simple"),
+                DeclaredIndex::default_registry(),
+            ]
+        );
     }
 
-    #[test]
-    fn test_extract_skips_duplicate_urls() {
-        let content = r#"
-[[tool.poetry.source]]
-name = "private1"
-url = "https://private.pypi.com/simple"
+    /// The updater resolves through the declared chain: a package the private
+    /// index does not carry is answered by the default registry instead of
+    /// failing, and a package the private index does carry comes from there.
+    #[tokio::test]
+    async fn update_layers_declared_uv_index_over_the_default_registry() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
 
-[[tool.pdm.source]]
-name = "private2"
-url = "https://private.pypi.com/simple"
-"#;
-        let doc: DocumentMut = content.parse().unwrap();
-        let (primary, extras) = PyProjectUpdater::extract_index_urls(&doc);
+        let private = MockServer::start().await;
+        for p in ["/simple/requests/", "/pypi/requests/json"] {
+            Mock::given(method("GET"))
+                .and(path(p))
+                .respond_with(ResponseTemplate::new(404))
+                .mount(&private)
+                .await;
+        }
+        Mock::given(method("GET"))
+            .and(path("/simple/hda-common/"))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&private)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/pypi/hda-common/json"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string(r#"{"releases": {"1.0.909": [{"yanked": false}]}}"#),
+            )
+            .mount(&private)
+            .await;
 
-        // Should only have one unique URL
-        assert_eq!(primary, Some("https://private.pypi.com/simple".to_string()));
-        assert!(extras.is_empty());
+        let mut file = NamedTempFile::with_suffix(".toml").unwrap();
+        write!(
+            file,
+            r#"[project]
+name = "demo"
+dependencies = [
+    "requests>=2.28.0",
+    "hda-common>=1.0.908",
+]
+
+[[tool.uv.index]]
+name = "nexus"
+url = "{}/simple/"
+"#,
+            private.uri()
+        )
+        .unwrap();
+
+        let default = MockRegistry::new("pypi").with_version("requests", "2.32.0");
+        let updater = PyProjectUpdater::new();
+        let result = updater
+            .update(file.path(), &default, UpdateOptions::new(true, false))
+            .await
+            .unwrap();
+
+        assert!(result.errors.is_empty(), "errors: {:?}", result.errors);
+        let mut updated: Vec<(&str, &str)> = result
+            .updated
+            .iter()
+            .map(|(p, _, new, _)| (p.as_str(), new.as_str()))
+            .collect();
+        updated.sort();
+        assert_eq!(
+            updated,
+            vec![("hda-common", "1.0.909"), ("requests", "2.32.0")]
+        );
     }
 
     // Tests for config-based ignore/pin functionality

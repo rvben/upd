@@ -1,6 +1,7 @@
 mod crates_io;
 mod github_releases;
 mod go_proxy;
+mod index_chain;
 #[cfg(test)]
 pub mod mock;
 mod npm;
@@ -13,6 +14,7 @@ mod utils;
 pub use crates_io::{CargoConfig, CargoCredentials, CratesIoRegistry, read_cargo_config};
 pub use github_releases::GitHubReleasesRegistry;
 pub use go_proxy::{GoCredentials, GoPrivateConfig, GoProxyRegistry, read_go_private_config};
+pub use index_chain::{DeclaredIndex, IndexChain, IndexSource};
 #[cfg(test)]
 pub use mock::MockRegistry;
 pub use npm::{NpmCredentials, NpmRegistry, NpmrcConfig, read_npmrc_config};
