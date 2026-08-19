@@ -434,12 +434,25 @@ impl Registry for GoProxyRegistry {
             .map(str::to_string)
             .collect();
 
-        // `/@v/list` is unordered per protocol; cap the fan-out to the last 50 entries.
+        // `/@v/list` is unordered per protocol, so the newest release can sit
+        // anywhere in the response. Order by version before capping the
+        // fan-out: taking the tail of the raw body windows an arbitrary subset
+        // and can leave out the very version the caller is asking about.
         const MAX: usize = 50;
-        let tail: Vec<String> = versions.iter().rev().take(MAX).cloned().collect();
+        let mut newest = versions;
+        newest.sort_by(|a, b| crate::version::compare::compare_versions(b, a));
+        newest.truncate(MAX);
 
-        let fetches = tail.iter().map(|v| {
-            let url = format!("{}/{}/@v/{}.info", self.proxy_url, encoded, v);
+        let fetches = newest.iter().map(|v| {
+            // The version is escaped the same way as the module path. Without
+            // this, every version carrying an uppercase letter (`v1.0.0-RC1`)
+            // answers 404 and disappears from the list without a trace.
+            let url = format!(
+                "{}/{}/@v/{}.info",
+                self.proxy_url,
+                encoded,
+                Self::escape_module_path(v)
+            );
             async move {
                 let resp = self.get_with_retry(&url).await.ok()?;
                 if !resp.status().is_success() {
@@ -799,6 +812,103 @@ mod tests {
                 .iter()
                 .any(|v| v.version == "v1.10.0" && v.published_at.is_some())
         );
+    }
+
+    /// `/@v/list` is unordered, so the newest release can sit anywhere in the
+    /// body. Capping the fan-out by list position drops real releases; capping
+    /// it by version does not.
+    #[tokio::test]
+    async fn test_go_proxy_list_versions_windows_by_version_not_position() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+
+        // 60 versions, above the 50-entry cap. The newest sits at the head of
+        // the body, which is exactly where a tail-based window cannot see it.
+        let mut all = vec!["v2.0.0".to_string()];
+        for minor in 0..59 {
+            all.push(format!("v1.{minor}.0"));
+        }
+
+        Mock::given(method("GET"))
+            .and(path("/example.com/mod/@v/list"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(all.join("\n")))
+            .mount(&mock_server)
+            .await;
+
+        // Each version answers with its own identity. A blanket mock would make
+        // this assert what the mock was seeded with rather than which versions
+        // were actually requested.
+        for v in &all {
+            Mock::given(method("GET"))
+                .and(path(format!("/example.com/mod/@v/{v}.info")))
+                .respond_with(ResponseTemplate::new(200).set_body_string(format!(
+                    r#"{{"Version": "{v}", "Time": "2024-01-15T10:00:00Z"}}"#
+                )))
+                .mount(&mock_server)
+                .await;
+        }
+
+        let registry = GoProxyRegistry::with_proxy_url(mock_server.uri());
+        let versions = registry.list_versions("example.com/mod").await.unwrap();
+
+        assert_eq!(
+            versions.len(),
+            50,
+            "the fan-out cap must still apply; got {}",
+            versions.len()
+        );
+        assert!(
+            versions.iter().any(|v| v.version == "v2.0.0"),
+            "the newest version must survive the fan-out cap; got {:?}",
+            versions.iter().map(|v| &v.version).collect::<Vec<_>>()
+        );
+        // The cap has to drop the oldest, not the newest.
+        assert!(
+            !versions.iter().any(|v| v.version == "v1.0.0"),
+            "the cap must drop the oldest versions"
+        );
+    }
+
+    /// Uppercase letters in a version need the same `!lowercase` escaping as
+    /// the module path. Unescaped, the Go proxy answers 404 and the version
+    /// vanishes from the list with no error anywhere.
+    #[tokio::test]
+    async fn test_go_proxy_list_versions_escapes_uppercase_in_version() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/example.com/mod/@v/list"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("v1.0.0-RC1\n"))
+            .mount(&mock_server)
+            .await;
+
+        // Only the escaped path is served. An unescaped request 404s, which is
+        // what the real proxy does.
+        Mock::given(method("GET"))
+            .and(path("/example.com/mod/@v/v1.0.0-!r!c1.info"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_string(
+                    r#"{"Version": "v1.0.0-RC1", "Time": "2021-06-18T15:22:16Z"}"#,
+                ),
+            )
+            .mount(&mock_server)
+            .await;
+
+        let registry = GoProxyRegistry::with_proxy_url(mock_server.uri());
+        let versions = registry.list_versions("example.com/mod").await.unwrap();
+
+        assert_eq!(
+            versions.len(),
+            1,
+            "a version with uppercase letters must be fetched, not silently dropped"
+        );
+        assert_eq!(versions[0].version, "v1.0.0-RC1");
+        assert!(versions[0].published_at.is_some());
     }
 
     #[test]

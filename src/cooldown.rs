@@ -148,9 +148,24 @@ pub fn select(
     // the constraint-unparseable path or reject every candidate.
     let constraints = constraints.and_then(strip_exact_pin);
 
-    // First entry in the raw input list (including potentially yanked versions),
-    // used as the diagnostic anchor in Skip when no non-yanked candidates remain.
-    let raw_top = versions.first().cloned();
+    // Diagnostic anchor for Skip, drawn from the raw input list so it can name
+    // a yanked or off-track version when nothing else survives filtering.
+    //
+    // `latest` comes first because it is the version the caller resolved and
+    // the one the user is being told about. Highest-by-version is the fallback,
+    // never list position: registries are under no obligation to return the
+    // list sorted (the Go proxy explicitly does not), so an anchor picked
+    // positionally names an arbitrary old release and the resulting "only newer
+    // version X" line is simply false.
+    let raw_top = versions
+        .iter()
+        .find(|v| v.version == latest)
+        .or_else(|| {
+            versions
+                .iter()
+                .max_by(|a, b| compare_versions(&a.version, &b.version))
+        })
+        .cloned();
 
     // When the constraint is provided but cannot be evaluated with semver
     // syntax (PyPI `~=1.4`, Ruby `~> 7.1`, etc.), we cannot prove any older
@@ -480,6 +495,67 @@ mod tests {
     fn fixed_now() -> chrono::DateTime<chrono::Utc> {
         use chrono::{TimeZone, Utc};
         Utc.with_ymd_and_hms(2026, 4, 22, 12, 0, 0).unwrap()
+    }
+
+    /// When nothing survives filtering, the version named in `Skip` is the one
+    /// the caller resolved, not whichever entry happened to come first. An
+    /// unordered registry list (the Go proxy returns one) otherwise produces a
+    /// "only newer version 0.16.0" line for a package sitting on 1.x.
+    #[test]
+    fn test_select_skip_anchor_is_the_resolved_latest_not_the_first_entry() {
+        // Unordered, and every entry is off-track so the candidate list empties.
+        let versions = vec![
+            meta("0.16.0", 2000, false, true),
+            meta("1.45.0", 1, false, true),
+            meta("0.2.0", 2200, false, true),
+        ];
+        let decision = select(
+            &versions,
+            "1.44.0",
+            "1.45.0",
+            None,
+            false,
+            Duration::days(7),
+            fixed_now(),
+        );
+        match decision {
+            CooldownDecision::Skip { latest_too_new } => {
+                assert_eq!(
+                    latest_too_new.version, "1.45.0",
+                    "Skip must name the resolved latest, got {latest_too_new:?}"
+                );
+            }
+            other => panic!("expected Skip, got {other:?}"),
+        }
+    }
+
+    /// With the resolved latest absent from the registry list, the anchor falls
+    /// back to the highest version present rather than to list position.
+    #[test]
+    fn test_select_skip_anchor_falls_back_to_highest_not_first() {
+        let versions = vec![
+            meta("0.16.0", 2000, false, true),
+            meta("1.44.0", 3, false, true),
+            meta("0.2.0", 2200, false, true),
+        ];
+        let decision = select(
+            &versions,
+            "1.43.0",
+            "1.45.0",
+            None,
+            false,
+            Duration::days(7),
+            fixed_now(),
+        );
+        match decision {
+            CooldownDecision::Skip { latest_too_new } => {
+                assert_eq!(
+                    latest_too_new.version, "1.44.0",
+                    "Skip must name the highest known version, got {latest_too_new:?}"
+                );
+            }
+            other => panic!("expected Skip, got {other:?}"),
+        }
     }
 
     #[test]
