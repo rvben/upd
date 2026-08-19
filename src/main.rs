@@ -908,19 +908,51 @@ async fn run() -> Result<()> {
         return Ok(());
     }
 
-    // --show-config: print the canonical config schema and exit
+    // --show-config: print the settings this run resolved to, and exit.
     if cli.show_config {
-        print!("{}", upd::config::UpdConfig::schema_toml());
+        // A named --config that cannot be read is an error rather than a
+        // silent fall back to discovery: the whole point of the flag is to ask
+        // what THAT file resolves to.
+        let (loaded_config, source, explicit) = match &cli.config {
+            Some(path) => (
+                upd::config::UpdConfig::load_from_path_with_error(path)
+                    .map_err(anyhow::Error::msg)?,
+                Some(path.clone()),
+                true,
+            ),
+            None => {
+                let cwd = std::env::current_dir()?;
+                match upd::config::UpdConfig::discover(&cwd).map_err(anyhow::Error::msg)? {
+                    Some((config, path)) => (config, Some(path), false),
+                    None => (upd::config::UpdConfig::default(), None, false),
+                }
+            }
+        };
 
-        // Also render the active cooldown policy (if any).
-        let cwd = std::env::current_dir()?;
-        let (loaded_config, _) = upd::config::UpdConfig::discover(&cwd)
-            .ok()
-            .flatten()
-            .unwrap_or_else(|| (upd::config::UpdConfig::default(), cwd.clone()));
         let policy = loaded_config.to_cooldown_policy(cli.min_age.as_deref())?;
-        println!();
-        print!("{}", upd::config::render_cooldown_for_show_config(&policy));
+        let effective = upd::config::EffectiveConfig {
+            source: source.as_deref(),
+            explicit,
+            config: &loaded_config,
+            cooldown: &policy,
+            update_action_shas: cli
+                .action_sha_override()
+                .or(loaded_config.update_action_shas)
+                .unwrap_or(upd::updater::DEFAULT_UPDATE_ACTION_SHAS),
+        };
+
+        if effective_json_mode(&cli) {
+            println!("{}", serde_json::to_string_pretty(&effective.to_json())?);
+        } else {
+            print!("{}", effective.render_text());
+            // The schema follows the resolved values because a config-parse
+            // warning points here to see the accepted keys, and because the
+            // reader needs the answer to "what did this run use" before the
+            // answer to "what could I write".
+            println!();
+            println!("# --- accepted configuration schema ---");
+            print!("{}", upd::config::UpdConfig::schema_toml());
+        }
 
         return Ok(());
     }

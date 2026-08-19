@@ -489,21 +489,202 @@ fn audit_with_osv_unreachable_exits_two() {
 
 // ── --show-config tests ───────────────────────────────────────────────────────
 
-/// Exit 0: `--show-config` prints the schema and exits cleanly.
+/// A config file exercising every setting `--show-config` claims to report.
+const SHOW_CONFIG_FIXTURE: &str = r#"
+ignore = ["left-pad"]
+exclude = ["**/vendor/**"]
+
+[pin]
+"sigstore/cosign-installer" = "v4.1.2"
+
+[cooldown]
+default = "14d"
+
+[cooldown.ecosystem]
+npm = "3d"
+"#;
+
+/// Exit 0: `--show-config` reports the settings the run resolved to.
+///
+/// The values below come from the fixture rather than from the schema
+/// template, which is the distinction the command exists to make: a template
+/// showing `ignore = []` is indistinguishable from a resolved empty list.
 #[test]
-fn show_config_exits_zero() {
+fn show_config_reports_resolved_settings() {
     let tmp = tempfile::tempdir().unwrap();
-    let (stdout, _stderr, code) = run(&["--show-config"], tmp.path());
+    fs::write(tmp.path().join(".updrc.toml"), SHOW_CONFIG_FIXTURE).unwrap();
+
+    let (stdout, _stderr, code) = run(&["--show-config", "-o", "text"], tmp.path());
     assert_eq!(code, 0, "--show-config must exit 0; got {code}");
-    // The schema output must contain the documented top-level keys so users
-    // know what the config file should look like.
+
+    for needle in [
+        ".updrc.toml",
+        "left-pad",
+        "**/vendor/**",
+        "sigstore/cosign-installer",
+        "14d",
+        "3d",
+    ] {
+        assert!(
+            stdout.contains(needle),
+            "--show-config must report {needle:?}; got:\n{stdout}"
+        );
+    }
+}
+
+/// `--show-config` distinguishes "no config file" from "a config file setting
+/// nothing", rather than rendering an empty template for both.
+#[test]
+fn show_config_without_a_config_file_says_so() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (stdout, _stderr, code) = run(&["--show-config", "-o", "text"], tmp.path());
+    assert_eq!(code, 0, "--show-config must exit 0; got {code}");
     assert!(
-        stdout.contains("ignore"),
-        "--show-config stdout must contain 'ignore'; got:\n{stdout}"
+        stdout.contains("(none found"),
+        "--show-config must say no config file was found; got:\n{stdout}"
     );
     assert!(
+        stdout.contains("ignore: (none)"),
+        "--show-config must render an empty ignore list explicitly; got:\n{stdout}"
+    );
+}
+
+/// `-c` selects the file `--show-config` reports on. Without this the flag is
+/// accepted and silently ignored, and the output describes a different file
+/// than the one named.
+#[test]
+fn show_config_honors_explicit_config_path() {
+    let tmp = tempfile::tempdir().unwrap();
+    let named = tmp.path().join("named.toml");
+    fs::write(&named, SHOW_CONFIG_FIXTURE).unwrap();
+
+    // A different config in the working directory, so discovery and the
+    // explicit path cannot both be satisfied by the same output.
+    let other = tempfile::tempdir().unwrap();
+    fs::write(
+        other.path().join(".updrc.toml"),
+        "ignore = [\"right-pad\"]\n",
+    )
+    .unwrap();
+
+    let (stdout, _stderr, code) = run(
+        &["--show-config", "-o", "text", "-c", named.to_str().unwrap()],
+        other.path(),
+    );
+    assert_eq!(code, 0, "--show-config must exit 0; got {code}");
+    assert!(
+        stdout.contains("left-pad"),
+        "--show-config -c must read the named file; got:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains("right-pad"),
+        "--show-config -c must not fall back to discovery; got:\n{stdout}"
+    );
+}
+
+/// Exit 2: a `-c` path that cannot be read is an error, not a silent fall back
+/// to discovery. Reporting some other file's settings under the name the user
+/// asked about is worse than reporting nothing.
+#[test]
+fn show_config_with_missing_config_path_exits_two() {
+    let tmp = tempfile::tempdir().unwrap();
+    let missing = tmp.path().join("nope.toml");
+    let (_stdout, stderr, code) = run(
+        &["--show-config", "-c", missing.to_str().unwrap()],
+        tmp.path(),
+    );
+    assert_eq!(
+        code, 2,
+        "missing --config must exit 2; got {code}\n{stderr}"
+    );
+    assert!(
+        stderr.contains("nope.toml"),
+        "error must name the file; got:\n{stderr}"
+    );
+}
+
+/// JSON mode emits the resolved settings as JSON, not the TOML template.
+#[test]
+fn show_config_json_reports_resolved_settings() {
+    let tmp = tempfile::tempdir().unwrap();
+    fs::write(tmp.path().join(".updrc.toml"), SHOW_CONFIG_FIXTURE).unwrap();
+
+    let (stdout, _stderr, code) = run(&["--show-config", "-o", "json"], tmp.path());
+    assert_eq!(code, 0, "--show-config must exit 0; got {code}");
+
+    let json = parse_json(&stdout);
+    assert_eq!(json["ignore"][0], "left-pad");
+    assert_eq!(json["exclude"][0], "**/vendor/**");
+    assert_eq!(json["pin"]["sigstore/cosign-installer"], "v4.1.2");
+    assert_eq!(json["cooldown"]["default_seconds"], 14 * 86_400);
+    assert_eq!(json["cooldown"]["ecosystem_seconds"]["npm"], 3 * 86_400);
+    assert_eq!(json["update_action_shas"], true);
+    assert!(
+        json["config_file"]
+            .as_str()
+            .expect("config_file must be a string when a file was loaded")
+            .ends_with(".updrc.toml"),
+        "config_file must name the loaded file; got {}",
+        json["config_file"]
+    );
+}
+
+/// `config_file` is null rather than an empty string when no file was found, so
+/// a consumer can tell "defaults" from "a file at path ''".
+#[test]
+fn show_config_json_reports_null_when_no_config_file() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (stdout, _stderr, code) = run(&["--show-config", "-o", "json"], tmp.path());
+    assert_eq!(code, 0, "--show-config must exit 0; got {code}");
+    let json = parse_json(&stdout);
+    assert!(
+        json["config_file"].is_null(),
+        "config_file must be null with no config file; got {}",
+        json["config_file"]
+    );
+}
+
+/// The reported settings fold in the command line, not just the file: this is
+/// what the run will use, so `--min-age` and the action-SHA flags show through.
+#[test]
+fn show_config_folds_in_command_line_overrides() {
+    let tmp = tempfile::tempdir().unwrap();
+    fs::write(tmp.path().join(".updrc.toml"), SHOW_CONFIG_FIXTURE).unwrap();
+
+    let (stdout, _stderr, code) = run(
+        &[
+            "--show-config",
+            "-o",
+            "json",
+            "--min-age",
+            "30d",
+            "--no-update-action-shas",
+        ],
+        tmp.path(),
+    );
+    assert_eq!(code, 0, "--show-config must exit 0; got {code}");
+    let json = parse_json(&stdout);
+    assert_eq!(
+        json["cooldown"]["min_age_override_seconds"],
+        30 * 86_400,
+        "--min-age must show as the active override"
+    );
+    assert_eq!(
+        json["update_action_shas"], false,
+        "--no-update-action-shas must show through"
+    );
+}
+
+/// Text mode still carries the schema, because a config-parse warning points
+/// here to find the accepted keys.
+#[test]
+fn show_config_text_still_documents_the_schema() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (stdout, _stderr, code) = run(&["--show-config", "-o", "text"], tmp.path());
+    assert_eq!(code, 0, "--show-config must exit 0; got {code}");
+    assert!(
         stdout.contains("[pin]"),
-        "--show-config stdout must contain '[pin]'; got:\n{stdout}"
+        "--show-config text must document the schema; got:\n{stdout}"
     );
 }
 

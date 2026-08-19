@@ -488,6 +488,120 @@ pub fn render_cooldown_for_show_config(policy: &crate::cooldown::CooldownPolicy)
     out
 }
 
+/// The settings a run will actually use, resolved from the config file plus the
+/// command line.
+///
+/// `--show-config` answers "what will upd do here", so it reports resolved
+/// values rather than the file's raw contents: `update_action_shas` folds in the
+/// command line and the built-in default, and the cooldown policy folds in
+/// `--min-age`.
+pub struct EffectiveConfig<'a> {
+    /// The config file that was loaded, or `None` when no file was found and
+    /// built-in defaults are in force.
+    pub source: Option<&'a Path>,
+    /// True when the source came from `--config` rather than from discovery.
+    pub explicit: bool,
+    pub config: &'a UpdConfig,
+    pub cooldown: &'a crate::cooldown::CooldownPolicy,
+    /// Resolved value of `update_action_shas` after command line, config file
+    /// and built-in default.
+    pub update_action_shas: bool,
+}
+
+impl EffectiveConfig<'_> {
+    /// Render the resolved settings for human display.
+    ///
+    /// Every list is shown even when empty: "ignore: (none)" tells the reader
+    /// that nothing is ignored, whereas an omitted section leaves them unable to
+    /// distinguish "nothing configured" from "this tool does not report it",
+    /// which is the confusion this command exists to remove.
+    pub fn render_text(&self) -> String {
+        let mut out = String::new();
+
+        match self.source {
+            Some(path) => {
+                let origin = if self.explicit {
+                    " (from --config)"
+                } else {
+                    " (discovered)"
+                };
+                out.push_str(&format!("config file: {}{}\n", path.display(), origin));
+            }
+            None => out.push_str("config file: (none found; built-in defaults)\n"),
+        }
+
+        out.push_str(&render_list("ignore", &self.config.ignore));
+        out.push_str(&render_list("exclude", &self.config.exclude));
+
+        if self.config.pin.is_empty() {
+            out.push_str("pin: (none)\n");
+        } else {
+            out.push_str("pin:\n");
+            let mut entries: Vec<_> = self.config.pin.iter().collect();
+            entries.sort_by(|a, b| a.0.cmp(b.0));
+            for (name, version) in entries {
+                out.push_str(&format!("  {name} = {version}\n"));
+            }
+        }
+
+        out.push_str(&format!(
+            "update_action_shas: {}\n",
+            self.update_action_shas
+        ));
+        out.push_str(&render_cooldown_for_show_config(self.cooldown));
+
+        out
+    }
+
+    /// Render the resolved settings as JSON for machine consumers.
+    pub fn to_json(&self) -> serde_json::Value {
+        let mut pin = serde_json::Map::new();
+        let mut entries: Vec<_> = self.config.pin.iter().collect();
+        entries.sort_by(|a, b| a.0.cmp(b.0));
+        for (name, version) in entries {
+            pin.insert(name.clone(), serde_json::Value::String(version.clone()));
+        }
+
+        let mut ecosystem = serde_json::Map::new();
+        let mut cooldown_entries: Vec<_> = self.cooldown.per_ecosystem.iter().collect();
+        cooldown_entries.sort_by(|a, b| a.0.cmp(b.0));
+        for (name, duration) in cooldown_entries {
+            ecosystem.insert(
+                name.clone(),
+                serde_json::Value::from(duration.num_seconds()),
+            );
+        }
+
+        serde_json::json!({
+            "config_file": self.source.map(|p| p.display().to_string()),
+            "config_file_explicit": self.explicit,
+            "ignore": self.config.ignore,
+            "exclude": self.config.exclude,
+            "pin": pin,
+            "update_action_shas": self.update_action_shas,
+            "cooldown": {
+                "default_seconds": self.cooldown.default.num_seconds(),
+                "min_age_override_seconds": self.cooldown
+                    .force_override
+                    .map(|d| d.num_seconds()),
+                "ecosystem_seconds": ecosystem,
+            },
+        })
+    }
+}
+
+/// Render one named list, naming emptiness explicitly rather than omitting it.
+fn render_list(label: &str, values: &[String]) -> String {
+    if values.is_empty() {
+        return format!("{label}: (none)\n");
+    }
+    let mut out = format!("{label}:\n");
+    for value in values {
+        out.push_str(&format!("  {value}\n"));
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
