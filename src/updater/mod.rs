@@ -424,8 +424,9 @@ pub struct UpdateResult {
     pub held_back: Vec<(String, String, String, String, DateTime<Utc>)>,
     /// Packages where every newer version sits inside the cooldown window and
     /// we kept the current version. Tuple: (name, current_version,
-    /// skipped_latest_version, skipped_latest_published_at).
-    pub skipped_by_cooldown: Vec<(String, String, String, DateTime<Utc>)>,
+    /// skipped_latest_version, skipped_latest_published_at). The publish date
+    /// is `None` when the registry does not report one for the skipped version.
+    pub skipped_by_cooldown: Vec<(String, String, String, Option<DateTime<Utc>>)>,
     /// Source of an entry that does not inherit its ecosystem from the file,
     /// keyed by package name. Populated only by `AnnotatedUpdater`.
     pub entry_ecosystem: HashMap<String, AnnotationSource>,
@@ -820,7 +821,11 @@ pub enum CooldownOutcome {
     /// records the skip.
     Skipped {
         skipped_version: String,
-        skipped_published_at: DateTime<Utc>,
+        /// When the registry published `skipped_version`, or `None` when it
+        /// does not say. This anchor can be a version filtered out of the
+        /// candidate list (a yanked or off-track release), which is the one
+        /// case where the date is genuinely unknown.
+        skipped_published_at: Option<DateTime<Utc>>,
     },
 }
 
@@ -893,7 +898,11 @@ pub async fn apply_cooldown(
         CooldownDecision::Skip { latest_too_new } => (
             CooldownOutcome::Skipped {
                 skipped_version: latest_too_new.version,
-                skipped_published_at: latest_too_new.published_at.unwrap_or_else(Utc::now),
+                // Carried through as-is. Substituting the current time here
+                // dates the release to the instant of the run, which reads as
+                // "released 0s ago": false, and maximally fresh, so it agrees
+                // with the cooldown that skipped it and never looks wrong.
+                skipped_published_at: latest_too_new.published_at,
             },
             None,
         ),
@@ -2348,6 +2357,52 @@ mod cooldown_integration_tests {
         assert_eq!(result.skipped_by_cooldown.len(), 1);
         assert!(result.updated.is_empty());
         assert!(result.held_back.is_empty());
+    }
+
+    /// A skip anchored to a version the registry gave no publish date for must
+    /// report the date as unknown. Substituting "now" dates it to the instant of
+    /// the run, which renders as "released 0s ago" - both false and maximally
+    /// fresh, so it is exactly consistent with being held by cooldown and
+    /// nothing downstream can flag it.
+    #[tokio::test]
+    async fn test_skip_without_publish_date_reports_it_as_unknown() {
+        let now = Utc.with_ymd_and_hms(2026, 4, 22, 12, 0, 0).unwrap();
+
+        let mut file = NamedTempFile::new().unwrap();
+        writeln!(file, "requests==2.28.0").unwrap();
+        file.flush().unwrap();
+
+        // The one newer release is yanked, so it is filtered out of the
+        // candidate list and the decision falls back to the raw anchor, which
+        // is the path that can carry a missing publish date.
+        let registry = MockRegistry::new("pypi")
+            .with_version("requests", "2.31.0")
+            .with_version_meta("requests", "2.31.0", None, true, false);
+
+        let policy = CooldownPolicy {
+            default: Duration::days(7),
+            per_ecosystem: HashMap::new(),
+            force_override: None,
+        };
+
+        let updater = RequirementsUpdater::new();
+        let options = UpdateOptions::new(true, false).with_cooldown_policy(policy, now);
+        let result = updater
+            .update(file.path(), &registry, options)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            result.skipped_by_cooldown.len(),
+            1,
+            "the yanked-only case must still record a skip, got {:?}",
+            result.skipped_by_cooldown
+        );
+        let (_, _, _, published_at) = &result.skipped_by_cooldown[0];
+        assert!(
+            published_at.is_none(),
+            "a missing publish date must stay missing, not become the current time; got {published_at:?}"
+        );
     }
 
     #[tokio::test]

@@ -173,8 +173,10 @@ pub struct SkippedByCooldownEntry {
     pub current: String,
     /// The latest version that was skipped because it is too new.
     pub skipped_latest: String,
-    /// RFC 3339 timestamp of when `skipped_latest` was published.
-    pub skipped_published_at: String,
+    /// RFC 3339 timestamp of when `skipped_latest` was published, or null when
+    /// the registry does not report one. Serialized even when absent so a
+    /// consumer can tell "date unknown" from "field not produced".
+    pub skipped_published_at: Option<String>,
     /// Cooldown duration that caused the skip, in seconds.
     pub cooldown_seconds: i64,
     /// Annotation source token for an entry whose ecosystem is per-line rather
@@ -502,7 +504,7 @@ pub fn build_update_file_report(
                 package: name.clone(),
                 current: current.clone(),
                 skipped_latest: skipped.clone(),
-                skipped_published_at: pub_at.to_rfc3339(),
+                skipped_published_at: pub_at.map(|t| t.to_rfc3339()),
                 cooldown_seconds: entry_cooldown(cooldown_policy, source, file_ecosystem)
                     .num_seconds(),
                 source: source.map(AnnotationSource::token),
@@ -1108,7 +1110,12 @@ mod tests {
                 "1.0.2".into(),
                 published,
             )],
-            skipped_by_cooldown: vec![("tokio".into(), "1.0.0".into(), "1.0.1".into(), published)],
+            skipped_by_cooldown: vec![(
+                "tokio".into(),
+                "1.0.0".into(),
+                "1.0.1".into(),
+                Some(published),
+            )],
             ..Default::default()
         };
         let policy = policy_of(604_800, &[]);
@@ -1138,6 +1145,46 @@ mod tests {
         assert_eq!(json["skipped_by_cooldown"][0]["current"], "1.0.0");
         assert_eq!(json["skipped_by_cooldown"][0]["skipped_latest"], "1.0.1");
         assert_eq!(json["skipped_by_cooldown"][0]["cooldown_seconds"], 604_800);
+        assert!(
+            json["skipped_by_cooldown"][0]["skipped_published_at"]
+                .as_str()
+                .unwrap()
+                .starts_with("2026-01-01"),
+            "a known publish date must serialize as its RFC 3339 timestamp"
+        );
+    }
+
+    /// A skipped version the registry gave no publish date for serializes as an
+    /// explicit null. Omitting the key would leave a consumer unable to tell an
+    /// unknown date from a field this version of `upd` does not emit, and any
+    /// stand-in timestamp would be a fabricated fact.
+    #[test]
+    fn update_file_report_reports_a_missing_publish_date_as_null() {
+        let result = UpdateResult {
+            skipped_by_cooldown: vec![("tokio".into(), "1.0.0".into(), "1.0.1".into(), None)],
+            ..Default::default()
+        };
+        let policy = policy_of(604_800, &[]);
+        let report = build_update_file_report(
+            Path::new("Cargo.toml"),
+            FileType::CargoToml,
+            &result,
+            Some(&policy),
+            stub_classify,
+        );
+        let json = serde_json::to_value(&report).unwrap();
+
+        let entry = &json["skipped_by_cooldown"][0];
+        assert_eq!(entry["skipped_latest"], "1.0.1");
+        assert!(
+            entry.get("skipped_published_at").is_some(),
+            "the key must be present so its absence is not confused with an older upd"
+        );
+        assert!(
+            entry["skipped_published_at"].is_null(),
+            "an unknown publish date must serialize as null, got {}",
+            entry["skipped_published_at"]
+        );
     }
 
     #[test]

@@ -171,14 +171,19 @@ fn format_held_back_line(
 fn format_skipped_by_cooldown_line(
     name: &str,
     skipped_latest: &str,
-    skipped_published_at: DateTime<Utc>,
+    skipped_published_at: Option<DateTime<Utc>>,
     cooldown: Duration,
     now: DateTime<Utc>,
 ) -> String {
-    let age = now - skipped_published_at;
+    // No publish date means no age to state. Saying so keeps the line honest;
+    // any stand-in date would render as a concrete, checkable-looking claim
+    // about when the release happened.
+    let released = match skipped_published_at {
+        Some(published_at) => format!("released {}", humanize_age(now - published_at)),
+        None => "release date unknown".to_string(),
+    };
     format!(
-        "Skipped {name} (only newer version {skipped_latest} released {}, cooldown {})",
-        humanize_age(age),
+        "Skipped {name} (only newer version {skipped_latest} {released}, cooldown {})",
         humanize_cooldown(cooldown),
     )
 }
@@ -6199,14 +6204,44 @@ mod output_tests {
         let line = format_skipped_by_cooldown_line(
             "express",
             "4.19.0",
-            pub_at,
+            Some(pub_at),
             Duration::days(7),
             fixed_now(),
         );
         assert!(line.contains("Skipped"), "line: {line}");
         assert!(line.contains("express"), "line: {line}");
         assert!(line.contains("4.19.0"), "line: {line}");
-        assert!(line.contains("6h ago"), "line: {line}");
+        assert!(line.contains("released 6h ago"), "line: {line}");
+        assert!(line.contains("cooldown 7d"), "line: {line}");
+    }
+
+    /// Without a publish date the line says so. The failure this guards against
+    /// is not a missing word but a plausible one: substituting the run time
+    /// renders "released 0s ago", which looks like a real, very recent release
+    /// and is consistent with the cooldown that skipped it.
+    #[test]
+    fn test_format_skipped_by_cooldown_line_without_a_publish_date() {
+        let line = format_skipped_by_cooldown_line(
+            "express",
+            "4.19.0",
+            None,
+            Duration::days(7),
+            fixed_now(),
+        );
+        assert!(line.contains("Skipped"), "line: {line}");
+        assert!(line.contains("4.19.0"), "line: {line}");
+        assert!(
+            line.contains("release date unknown"),
+            "an unknown date must be stated, line: {line}"
+        );
+        assert!(
+            !line.contains("released"),
+            "no age may be claimed without a date, line: {line}"
+        );
+        assert!(
+            !line.contains("0s ago"),
+            "the run time must not stand in for the publish date, line: {line}"
+        );
         assert!(line.contains("cooldown 7d"), "line: {line}");
     }
 
@@ -6303,7 +6338,7 @@ mod output_tests {
                 "pkg".to_string(),
                 "1.0.0".to_string(),
                 "1.0.1".to_string(),
-                Utc::now(),
+                Some(Utc::now()),
             )],
             ..Default::default()
         };
