@@ -4325,8 +4325,8 @@ fn apply_github_actions_version(
     // A commit pin is rewritten through the updater's own routine so both the
     // SHA and its version comment move together. `target_version` is deliberately
     // unused here: it has been through precision matching, while the pin's
-    // new_version is the exact tag that was resolved to new_commit, and writing
-    // any other string would leave the comment describing a different commit.
+    // new_version names the release that resolved to new_commit, and writing any
+    // other string would leave the comment describing a different commit.
     if let Some(pin) = update.sha_pin {
         return apply_line_replacement(document, update.line_num, |line| {
             GithubActionsUpdater::new().replace_sha_pin(

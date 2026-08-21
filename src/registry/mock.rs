@@ -1,10 +1,10 @@
 //! Mock registry for testing updaters without network calls.
 
-use super::{Registry, VersionMeta};
+use super::{RefNotFound, Registry, VersionMeta};
 use anyhow::{Result, anyhow};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 /// A mock registry that returns pre-configured versions for testing.
 pub struct MockRegistry {
@@ -18,6 +18,8 @@ pub struct MockRegistry {
     ref_names: HashMap<String, Vec<String>>,
     /// Map of package name + ref to its immutable commit SHA
     resolved_refs: HashMap<(String, String), String>,
+    /// Refs whose lookup fails without answering whether they exist
+    unavailable_refs: HashSet<(String, String)>,
     /// Registry name
     name: &'static str,
 }
@@ -31,6 +33,7 @@ impl MockRegistry {
             version_metas: HashMap::new(),
             ref_names: HashMap::new(),
             resolved_refs: HashMap::new(),
+            unavailable_refs: HashSet::new(),
             name,
         }
     }
@@ -58,6 +61,15 @@ impl MockRegistry {
             (package.to_string(), reference.to_string()),
             commit_sha.to_string(),
         );
+        self
+    }
+
+    /// Declare a ref whose lookup fails without saying whether it exists, as a
+    /// rate limit or an outage does. An undeclared ref is reported missing
+    /// instead, which is the registry answering the question.
+    pub fn with_unavailable_ref(mut self, package: &str, reference: &str) -> Self {
+        self.unavailable_refs
+            .insert((package.to_string(), reference.to_string()));
         self
     }
 
@@ -143,10 +155,15 @@ impl Registry for MockRegistry {
     }
 
     async fn resolve_ref_to_commit(&self, package: &str, reference: &str) -> Result<String> {
-        self.resolved_refs
-            .get(&(package.to_string(), reference.to_string()))
-            .cloned()
-            .ok_or_else(|| anyhow!("Ref not found: {package}@{reference}"))
+        let key = (package.to_string(), reference.to_string());
+        if self.unavailable_refs.contains(&key) {
+            return Err(anyhow!("Ref lookup failed: {package}@{reference}"));
+        }
+        self.resolved_refs.get(&key).cloned().ok_or_else(|| {
+            anyhow!(RefNotFound::new(format!(
+                "Ref not found: {package}@{reference}"
+            )))
+        })
     }
 
     fn name(&self) -> &'static str {

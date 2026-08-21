@@ -3,7 +3,7 @@ use super::{
     downgrade_warning, read_file_safe, write_file_atomic,
 };
 use crate::align::compare_versions;
-use crate::registry::Registry;
+use crate::registry::{Registry, is_ref_not_found};
 use crate::updater::Lang;
 use crate::version::match_version_precision;
 use anyhow::Result;
@@ -24,6 +24,43 @@ struct ShaAction {
     current_sha: String,
     current_version: String,
     pinned_version: Option<String>,
+}
+
+/// Resolve a hand-written version string to the commit it names.
+///
+/// A version comment and a configured pin are both authored by hand, so their
+/// `v` prefix records local style rather than the repo's tag naming: a repo that
+/// tags `v7.0.1` is routinely annotated `# 7.0.1`, and a repo that tags `1.3.0`
+/// is routinely annotated `# v1.3.0`. Either spelling names one release, so both
+/// are accepted.
+///
+/// The literal spelling is tried first, which decides the rare repo publishing
+/// `1.2.3` and `v1.2.3` at different commits by what the file actually says. The
+/// other spelling is only reached once the repo has said the literal one does
+/// not exist, so a version comment that resolves to the wrong commit is still a
+/// mismatch rather than something the second lookup can rescue. A lookup that
+/// merely failed is propagated instead: a rate limit against `v1.2.3` is not
+/// evidence that the author meant `1.2.3`. The first error is the one reported,
+/// because it names the ref the author wrote.
+async fn resolve_version_ref(
+    registry: &dyn Registry,
+    owner_repo: &str,
+    version: &str,
+) -> Result<String> {
+    match registry.resolve_ref_to_commit(owner_repo, version).await {
+        Ok(commit) => Ok(commit),
+        Err(literal_error) if is_ref_not_found(&literal_error) => {
+            let variant = match version.strip_prefix('v') {
+                Some(bare) => bare.to_string(),
+                None => format!("v{version}"),
+            };
+            registry
+                .resolve_ref_to_commit(owner_repo, &variant)
+                .await
+                .map_err(|_| literal_error)
+        }
+        Err(error) => Err(error),
+    }
 }
 
 impl GithubActionsUpdater {
@@ -548,9 +585,12 @@ impl Updater for GithubActionsUpdater {
             }
 
             if let Some(action) = sha_action_info.get(&line_idx) {
-                let expected_current = match registry
-                    .resolve_ref_to_commit(&action.owner_repo, &action.current_version)
-                    .await
+                let expected_current = match resolve_version_ref(
+                    registry,
+                    &action.owner_repo,
+                    &action.current_version,
+                )
+                .await
                 {
                     Ok(commit) => commit.to_ascii_lowercase(),
                     Err(error) => {
@@ -652,15 +692,32 @@ impl Updater for GithubActionsUpdater {
                     }
                 };
 
-                if target_version == action.current_version {
-                    result.unchanged += 1;
-                    new_lines.push(line.to_string());
-                    continue;
+                // `5.0.0` and `v5.0.0` name one release, so the version
+                // comparison decides whether there is anything to do here.
+                // String equality would send an up-to-date pin whose comment
+                // spells the tag differently into the downgrade branch below.
+                let ordering =
+                    compare_versions(&target_version, &action.current_version, Lang::Actions);
+                if ordering == std::cmp::Ordering::Equal {
+                    // A configured pin is an instruction, so a repo publishing
+                    // `1.2.3` and `v1.2.3` at different commits makes the pinned
+                    // spelling a target of its own rather than a restyling of the
+                    // comment, and skipping it would drop the instruction without
+                    // a word. Only a differing spelling is resolved, and only for
+                    // a pin: doing it for the latest version would cost a request
+                    // for every action already up to date.
+                    let satisfied = !is_config_pinned
+                        || target_version == action.current_version
+                        || resolve_version_ref(registry, &action.owner_repo, &target_version)
+                            .await
+                            .is_ok_and(|commit| commit.to_ascii_lowercase() == action.current_sha);
+                    if satisfied {
+                        result.unchanged += 1;
+                        new_lines.push(line.to_string());
+                        continue;
+                    }
                 }
-                if !is_config_pinned
-                    && compare_versions(&target_version, &action.current_version, Lang::Actions)
-                        != std::cmp::Ordering::Greater
-                {
+                if !is_config_pinned && ordering != std::cmp::Ordering::Greater {
                     result.warnings.push(downgrade_warning(
                         &action.owner_repo,
                         &target_version,
@@ -688,9 +745,12 @@ impl Updater for GithubActionsUpdater {
                     continue;
                 }
 
-                let new_sha = match registry
-                    .resolve_ref_to_commit(&action.owner_repo, &target_version)
-                    .await
+                let new_sha = match resolve_version_ref(
+                    registry,
+                    &action.owner_repo,
+                    &target_version,
+                )
+                .await
                 {
                     Ok(commit) => commit.to_ascii_lowercase(),
                     Err(error) => {
@@ -711,12 +771,41 @@ impl Updater for GithubActionsUpdater {
                     continue;
                 }
 
+                // The tag resolves the commit; the comment keeps the prefix style
+                // the file already used, the same way the non-pinned path does.
+                let styled_version =
+                    Self::compute_updated_version(&action.current_version, &target_version, true);
+
+                // A comment has to name the commit written beside it, or the next
+                // run reads the line as a forged pin and refuses it. Restyling is
+                // safe only while both spellings name one release, which a repo
+                // publishing `1.3.0` and `v1.3.0` at different commits breaks. The
+                // restyled spelling is looked up literally, without the fallback,
+                // so the target tag is resolved exactly once: a spelling the repo
+                // does not publish is one the next run reaches through that
+                // fallback, and one that resolves elsewhere is a different
+                // release. While the answer is unknown the resolved tag's own
+                // spelling is written, since style is worth less than a comment
+                // that describes the commit beside it.
+                let comment_version = if styled_version == target_version {
+                    styled_version
+                } else {
+                    match registry
+                        .resolve_ref_to_commit(&action.owner_repo, &styled_version)
+                        .await
+                    {
+                        Ok(commit) if commit.to_ascii_lowercase() == new_sha => styled_version,
+                        Err(error) if is_ref_not_found(&error) => styled_version,
+                        _ => target_version.clone(),
+                    }
+                };
+
                 let Some(new_line) = self.replace_sha_pin(
                     line,
                     &action.current_sha,
                     &action.current_version,
                     &new_sha,
-                    &target_version,
+                    &comment_version,
                 ) else {
                     result.errors.push(format!(
                         "{}: could not safely rewrite SHA pin at line {}",
@@ -730,7 +819,7 @@ impl Updater for GithubActionsUpdater {
                 let change = super::ActionShaUpdate {
                     package: action.owner_repo.clone(),
                     current_version: action.current_version.clone(),
-                    new_version: target_version.clone(),
+                    new_version: comment_version.clone(),
                     current_commit: action.current_sha.clone(),
                     new_commit: new_sha,
                     line_number: Some(line_num),
@@ -740,21 +829,21 @@ impl Updater for GithubActionsUpdater {
                     result.pinned.push((
                         action.owner_repo.clone(),
                         action.current_version.clone(),
-                        target_version,
+                        comment_version,
                         Some(line_num),
                     ));
                 } else {
                     result.updated.push((
                         action.owner_repo.clone(),
                         action.current_version.clone(),
-                        target_version.clone(),
+                        comment_version.clone(),
                         Some(line_num),
                     ));
                     if let Some((skipped_version, skipped_published_at)) = held_back_record {
                         result.held_back.push((
                             action.owner_repo.clone(),
                             action.current_version.clone(),
-                            target_version,
+                            comment_version,
                             skipped_version,
                             skipped_published_at,
                         ));
@@ -1342,6 +1431,395 @@ jobs:
             fs::read_to_string(file.path())
                 .unwrap()
                 .contains(PINNED_SHA)
+        );
+    }
+
+    #[tokio::test]
+    async fn test_sha_pin_accepts_bare_version_comment() {
+        const OLD_SHA: &str = "1111111111111111111111111111111111111111";
+        const NEW_SHA: &str = "2222222222222222222222222222222222222222";
+        let mut file = NamedTempFile::new().unwrap();
+        write!(
+            file,
+            "steps:\n  - uses: actions/checkout@{OLD_SHA} # 4.2.2\n"
+        )
+        .unwrap();
+
+        // The repo publishes `v`-prefixed tags only, as actions/checkout does.
+        let registry = MockRegistry::new("github-releases")
+            .with_version("actions/checkout", "v5.0.0")
+            .with_resolved_ref("actions/checkout", "v4.2.2", OLD_SHA)
+            .with_resolved_ref("actions/checkout", "v5.0.0", NEW_SHA);
+        let options = UpdateOptions::new(false, false).with_action_sha_updates(true);
+
+        let result = GithubActionsUpdater::new()
+            .update(file.path(), &registry, options)
+            .await
+            .unwrap();
+
+        assert!(result.errors.is_empty(), "errors: {:?}", result.errors);
+        assert_eq!(result.updated.len(), 1);
+        assert_eq!(result.updated[0].1, "4.2.2");
+        assert_eq!(result.updated[0].2, "5.0.0");
+        // The comment keeps the prefix style the file already used, matching how
+        // the non-pinned path treats a bare version.
+        let content = fs::read_to_string(file.path()).unwrap();
+        assert!(
+            content.contains(&format!("actions/checkout@{NEW_SHA} # 5.0.0")),
+            "content: {content}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_bare_version_comment_at_latest_reports_unchanged() {
+        const SHA: &str = "1111111111111111111111111111111111111111";
+        let mut file = NamedTempFile::new().unwrap();
+        write!(file, "steps:\n  - uses: actions/checkout@{SHA} # 5.0.0\n").unwrap();
+
+        let registry = MockRegistry::new("github-releases")
+            .with_version("actions/checkout", "v5.0.0")
+            .with_resolved_ref("actions/checkout", "v5.0.0", SHA);
+        let options = UpdateOptions::new(false, false).with_action_sha_updates(true);
+
+        let result = GithubActionsUpdater::new()
+            .update(file.path(), &registry, options)
+            .await
+            .unwrap();
+
+        assert!(result.updated.is_empty());
+        assert!(result.errors.is_empty(), "errors: {:?}", result.errors);
+        // `5.0.0` and `v5.0.0` are the same release, so nothing was skipped over
+        // and there is no downgrade to warn about.
+        assert!(
+            result.warnings.is_empty(),
+            "warnings: {:?}",
+            result.warnings
+        );
+        assert_eq!(result.unchanged, 1);
+    }
+
+    #[tokio::test]
+    async fn test_sha_pin_accepts_v_prefixed_comment_against_bare_tags() {
+        const OLD_SHA: &str = "1111111111111111111111111111111111111111";
+        const NEW_SHA: &str = "2222222222222222222222222222222222222222";
+        let mut file = NamedTempFile::new().unwrap();
+        write!(file, "steps:\n  - uses: acme/action@{OLD_SHA} # v1.2.3\n").unwrap();
+
+        // The mirror image: a repo that tags without the `v` prefix.
+        let registry = MockRegistry::new("github-releases")
+            .with_version("acme/action", "1.3.0")
+            .with_resolved_ref("acme/action", "1.2.3", OLD_SHA)
+            .with_resolved_ref("acme/action", "1.3.0", NEW_SHA);
+        let options = UpdateOptions::new(false, false).with_action_sha_updates(true);
+
+        let result = GithubActionsUpdater::new()
+            .update(file.path(), &registry, options)
+            .await
+            .unwrap();
+
+        assert!(result.errors.is_empty(), "errors: {:?}", result.errors);
+        assert_eq!(result.updated.len(), 1);
+        let content = fs::read_to_string(file.path()).unwrap();
+        assert!(
+            content.contains(&format!("acme/action@{NEW_SHA} # v1.3.0")),
+            "content: {content}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_bare_version_comment_still_refuses_forged_pin() {
+        const PINNED_SHA: &str = "1111111111111111111111111111111111111111";
+        const TAG_SHA: &str = "3333333333333333333333333333333333333333";
+        let mut file = NamedTempFile::new().unwrap();
+        write!(
+            file,
+            "steps:\n  - uses: actions/checkout@{PINNED_SHA} # 4.2.2\n"
+        )
+        .unwrap();
+        let registry = MockRegistry::new("github-releases")
+            .with_version("actions/checkout", "v5.0.0")
+            .with_resolved_ref("actions/checkout", "v4.2.2", TAG_SHA);
+
+        let result = GithubActionsUpdater::new()
+            .update(
+                file.path(),
+                &registry,
+                UpdateOptions::new(false, false).with_action_sha_updates(true),
+            )
+            .await
+            .unwrap();
+
+        // Accepting the other prefix spelling must not weaken the check that the
+        // comment actually describes the pinned commit.
+        assert!(result.updated.is_empty());
+        assert_eq!(result.skipped.len(), 1);
+        assert_eq!(result.skipped[0].reason, "version-comment-mismatch");
+        assert!(
+            fs::read_to_string(file.path())
+                .unwrap()
+                .contains(PINNED_SHA)
+        );
+    }
+
+    #[tokio::test]
+    async fn test_sha_pin_prefers_literal_comment_over_prefix_variant() {
+        const LITERAL_SHA: &str = "1111111111111111111111111111111111111111";
+        const VARIANT_SHA: &str = "3333333333333333333333333333333333333333";
+        let mut file = NamedTempFile::new().unwrap();
+        write!(
+            file,
+            "steps:\n  - uses: acme/action@{VARIANT_SHA} # 1.2.3\n"
+        )
+        .unwrap();
+        // A repo carrying both `1.2.3` and `v1.2.3` at different commits. The
+        // comment says `1.2.3`, so that tag decides, and the pin does not match it.
+        let registry = MockRegistry::new("github-releases")
+            .with_version("acme/action", "1.3.0")
+            .with_resolved_ref("acme/action", "1.2.3", LITERAL_SHA)
+            .with_resolved_ref("acme/action", "v1.2.3", VARIANT_SHA);
+
+        let result = GithubActionsUpdater::new()
+            .update(
+                file.path(),
+                &registry,
+                UpdateOptions::new(false, false).with_action_sha_updates(true),
+            )
+            .await
+            .unwrap();
+
+        assert!(result.updated.is_empty());
+        assert_eq!(result.skipped.len(), 1);
+        assert_eq!(result.skipped[0].reason, "version-comment-mismatch");
+    }
+
+    #[tokio::test]
+    async fn test_config_pin_is_satisfied_by_a_differently_spelled_comment() {
+        use crate::config::UpdConfig;
+        use std::sync::Arc;
+
+        const SHA: &str = "1111111111111111111111111111111111111111";
+        let mut file = NamedTempFile::new().unwrap();
+        write!(file, "steps:\n  - uses: actions/checkout@{SHA} # v5.0.0\n").unwrap();
+
+        // The pin names a release, not a spelling, and the file already sits on
+        // that release. Resolving the pin literally would ask a repo tagging
+        // `v5.0.0` for a `5.0.0` it never published.
+        let registry = MockRegistry::new("github-releases")
+            .with_version("actions/checkout", "5.0.0")
+            .with_resolved_ref("actions/checkout", "v5.0.0", SHA);
+        let mut config = UpdConfig::default();
+        config.pin.insert("actions/checkout".into(), "5.0.0".into());
+        let options = UpdateOptions::new(false, false)
+            .with_action_sha_updates(true)
+            .with_config(Arc::new(config));
+
+        let result = GithubActionsUpdater::new()
+            .update(file.path(), &registry, options)
+            .await
+            .unwrap();
+
+        assert!(result.errors.is_empty(), "errors: {:?}", result.errors);
+        assert!(result.skipped.is_empty(), "skipped: {:?}", result.skipped);
+        assert_eq!(result.unchanged, 1);
+        assert!(result.updated.is_empty());
+        let content = fs::read_to_string(file.path()).unwrap();
+        assert!(
+            content.contains(&format!("checkout@{SHA} # v5.0.0")),
+            "content: {content}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_unavailable_literal_ref_does_not_verify_against_the_other_spelling() {
+        const PREFIXED_SHA: &str = "1111111111111111111111111111111111111111";
+        const BARE_SHA: &str = "2222222222222222222222222222222222222222";
+        let mut file = NamedTempFile::new().unwrap();
+        write!(
+            file,
+            "steps:\n  - uses: actions/checkout@{BARE_SHA} # v1.2.3\n"
+        )
+        .unwrap();
+
+        // `v1.2.3` is the ref the author wrote and it exists, so a rate limit
+        // against it is not evidence that `1.2.3` is what they meant. Reading
+        // the outage as absence would bless a comment naming another commit.
+        let registry = MockRegistry::new("github-releases")
+            .with_version("actions/checkout", "1.2.3")
+            .with_unavailable_ref("actions/checkout", "v1.2.3")
+            .with_resolved_ref("actions/checkout", "1.2.3", BARE_SHA);
+
+        let result = GithubActionsUpdater::new()
+            .update(
+                file.path(),
+                &registry,
+                UpdateOptions::new(false, false).with_action_sha_updates(true),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(result.errors.len(), 1, "errors: {:?}", result.errors);
+        assert!(
+            result.errors[0].contains("failed to verify current SHA pin"),
+            "errors: {:?}",
+            result.errors
+        );
+        let content = fs::read_to_string(file.path()).unwrap();
+        assert!(content.contains(PREFIXED_SHA) || content.contains(BARE_SHA));
+    }
+
+    #[tokio::test]
+    async fn test_unavailable_styled_ref_falls_back_to_the_resolved_spelling() {
+        const OLD_SHA: &str = "1111111111111111111111111111111111111111";
+        const NEW_SHA: &str = "2222222222222222222222222222222222222222";
+        let mut file = NamedTempFile::new().unwrap();
+        write!(file, "steps:\n  - uses: acme/action@{OLD_SHA} # v1.2.3\n").unwrap();
+
+        // Whether `v1.3.0` names NEW_SHA is unknown while the lookup is failing,
+        // so the comment takes the spelling already known to name it. Style is
+        // worth less than a comment that describes the commit beside it.
+        let registry = MockRegistry::new("github-releases")
+            .with_version("acme/action", "1.3.0")
+            .with_resolved_ref("acme/action", "v1.2.3", OLD_SHA)
+            .with_resolved_ref("acme/action", "1.3.0", NEW_SHA)
+            .with_unavailable_ref("acme/action", "v1.3.0");
+
+        let result = GithubActionsUpdater::new()
+            .update(
+                file.path(),
+                &registry,
+                UpdateOptions::new(false, false).with_action_sha_updates(true),
+            )
+            .await
+            .unwrap();
+
+        assert!(result.errors.is_empty(), "errors: {:?}", result.errors);
+        let content = fs::read_to_string(file.path()).unwrap();
+        assert!(
+            content.contains(&format!("acme/action@{NEW_SHA} # 1.3.0")),
+            "content: {content}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_config_pin_is_applied_when_its_spelling_names_another_commit() {
+        use crate::config::UpdConfig;
+        use std::sync::Arc;
+
+        const PREFIXED_SHA: &str = "1111111111111111111111111111111111111111";
+        const BARE_SHA: &str = "2222222222222222222222222222222222222222";
+        let mut file = NamedTempFile::new().unwrap();
+        write!(
+            file,
+            "steps:\n  - uses: actions/checkout@{PREFIXED_SHA} # v1.2.3\n"
+        )
+        .unwrap();
+
+        // Both spellings exist at different commits, so the pinned one is a
+        // release of its own rather than a restyling of the current comment.
+        let registry = MockRegistry::new("github-releases")
+            .with_resolved_ref("actions/checkout", "v1.2.3", PREFIXED_SHA)
+            .with_resolved_ref("actions/checkout", "1.2.3", BARE_SHA);
+        let mut config = UpdConfig::default();
+        config.pin.insert("actions/checkout".into(), "1.2.3".into());
+        let options = UpdateOptions::new(false, false)
+            .with_action_sha_updates(true)
+            .with_config(Arc::new(config));
+
+        let result = GithubActionsUpdater::new()
+            .update(file.path(), &registry, options)
+            .await
+            .unwrap();
+
+        assert!(result.errors.is_empty(), "errors: {:?}", result.errors);
+        assert_eq!(result.unchanged, 0, "the pin was silently skipped");
+        let content = fs::read_to_string(file.path()).unwrap();
+        assert!(
+            content.contains(&format!("checkout@{BARE_SHA} # 1.2.3")),
+            "content: {content}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_rewritten_comment_describes_the_commit_it_was_written_with() {
+        const OLD_SHA: &str = "1111111111111111111111111111111111111111";
+        const NEW_SHA: &str = "2222222222222222222222222222222222222222";
+        const OTHER_SHA: &str = "3333333333333333333333333333333333333333";
+        let mut file = NamedTempFile::new().unwrap();
+        write!(file, "steps:\n  - uses: acme/action@{OLD_SHA} # v1.2.3\n").unwrap();
+
+        // A repo publishing both spellings of its latest release at different
+        // commits. Keeping the comment's `v` style here would annotate the
+        // commit `1.3.0` names with the tag `v1.3.0`, which names another.
+        let registry = MockRegistry::new("github-releases")
+            .with_version("acme/action", "1.3.0")
+            .with_resolved_ref("acme/action", "v1.2.3", OLD_SHA)
+            .with_resolved_ref("acme/action", "1.3.0", NEW_SHA)
+            .with_resolved_ref("acme/action", "v1.3.0", OTHER_SHA);
+        let options = UpdateOptions::new(false, false).with_action_sha_updates(true);
+
+        let updater = GithubActionsUpdater::new();
+        let result = updater
+            .update(file.path(), &registry, options.clone())
+            .await
+            .unwrap();
+
+        assert!(result.errors.is_empty(), "errors: {:?}", result.errors);
+        assert_eq!(result.updated.len(), 1);
+        let content = fs::read_to_string(file.path()).unwrap();
+        assert!(
+            content.contains(&format!("acme/action@{NEW_SHA} # 1.3.0")),
+            "content: {content}"
+        );
+
+        // The property that matters: upd must not reject the line it just wrote.
+        let second = updater
+            .update(file.path(), &registry, options)
+            .await
+            .unwrap();
+        assert!(second.errors.is_empty(), "errors: {:?}", second.errors);
+        assert!(
+            second.skipped.is_empty(),
+            "upd rejected its own output: {:?}",
+            second.skipped
+        );
+        assert_eq!(second.unchanged, 1);
+    }
+
+    #[tokio::test]
+    async fn test_config_pinned_bare_version_resolves_against_prefixed_tag() {
+        use crate::config::UpdConfig;
+        use std::sync::Arc;
+
+        const OLD_SHA: &str = "1111111111111111111111111111111111111111";
+        const NEW_SHA: &str = "2222222222222222222222222222222222222222";
+        let mut file = NamedTempFile::new().unwrap();
+        write!(
+            file,
+            "steps:\n  - uses: actions/checkout@{OLD_SHA} # v4.2.2\n"
+        )
+        .unwrap();
+        let registry = MockRegistry::new("github-releases")
+            .with_resolved_ref("actions/checkout", "v4.2.2", OLD_SHA)
+            .with_resolved_ref("actions/checkout", "v5.0.0", NEW_SHA);
+        let mut config = UpdConfig::default();
+        // `.updrc.toml` is hand-written too, so a bare pin must resolve the same
+        // way a bare comment does.
+        config.pin.insert("actions/checkout".into(), "5.0.0".into());
+        let options = UpdateOptions::new(false, false)
+            .with_action_sha_updates(true)
+            .with_config(Arc::new(config));
+
+        let result = GithubActionsUpdater::new()
+            .update(file.path(), &registry, options)
+            .await
+            .unwrap();
+
+        assert!(result.errors.is_empty(), "errors: {:?}", result.errors);
+        assert_eq!(result.pinned.len(), 1);
+        let content = fs::read_to_string(file.path()).unwrap();
+        assert!(
+            content.contains(&format!("actions/checkout@{NEW_SHA} # v5.0.0")),
+            "content: {content}"
         );
     }
 

@@ -71,6 +71,39 @@ pub async fn get_with_retry(client: &Client, url: &str) -> anyhow::Result<Respon
     Err(crate::http::wrap_send_err(last_error.unwrap(), url))
 }
 
+/// A registry's definitive answer that a Git ref names no commit in a
+/// repository, as opposed to a lookup that could not be completed.
+///
+/// The distinction decides whether another spelling of the same version may be
+/// tried: a repository that does not publish `1.2.3` says so, while a rate limit
+/// or an outage says nothing at all about which refs exist. Treating the second
+/// as the first would let a transient failure pick a different commit.
+#[derive(Debug)]
+pub struct RefNotFound {
+    message: String,
+}
+
+impl RefNotFound {
+    pub fn new(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+        }
+    }
+}
+
+impl std::fmt::Display for RefNotFound {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for RefNotFound {}
+
+/// Whether a failed ref lookup means the ref does not exist.
+pub fn is_ref_not_found(error: &anyhow::Error) -> bool {
+    error.downcast_ref::<RefNotFound>().is_some()
+}
+
 /// Create a descriptive error message for HTTP failures
 /// Helps users understand why a request failed and what to do
 ///

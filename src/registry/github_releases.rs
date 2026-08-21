@@ -1,4 +1,4 @@
-use super::{Registry, VersionMeta, get_with_retry, http_error_message};
+use super::{RefNotFound, Registry, VersionMeta, get_with_retry, http_error_message};
 use crate::version::TagVersion;
 use anyhow::{Result, anyhow};
 use async_trait::async_trait;
@@ -234,12 +234,26 @@ impl Registry for GitHubReleasesRegistry {
                 403 | 429 => Some("Set GITHUB_TOKEN to increase the API rate limit."),
                 _ => None,
             };
-            return Err(anyhow!(http_error_message(
+            let message = http_error_message(
                 status,
                 "Git ref",
                 &format!("{owner}/{repo}@{reference}"),
                 hint,
-            )));
+            );
+            // This endpoint answers a ref that names no commit with 422 and the
+            // body "No commit found for SHA", for a tag the repo never published
+            // and for a string that is not a ref at all alike; 404 is how it
+            // reports a repository it cannot see. Both are statements about what
+            // was asked for, while every other status is about the request, so
+            // narrowing this to 404 would stop the version-comment fallback from
+            // ever running. Throttling does not reach here disguised as an
+            // absent ref: an exhausted quota on this endpoint answers 403, which
+            // falls through to the error below and is reported rather than
+            // licensing the other spelling.
+            return Err(match status.as_u16() {
+                404 | 422 => anyhow!(RefNotFound::new(message)),
+                _ => anyhow!(message),
+            });
         }
 
         let commit: CommitResponse = response.json().await?;
@@ -300,6 +314,7 @@ impl Registry for GitHubReleasesRegistry {
 
 #[cfg(test)]
 mod tests {
+    use super::super::is_ref_not_found;
     use super::*;
     use chrono::TimeZone;
     use wiremock::matchers::{method, path, query_param};
@@ -307,6 +322,42 @@ mod tests {
 
     fn registry(server: &MockServer) -> GitHubReleasesRegistry {
         GitHubReleasesRegistry::with_api_url(server.uri())
+    }
+
+    /// The SHA-pin updater tries the other spelling of a version only when the
+    /// repo has said the written one does not exist, so which statuses carry
+    /// that meaning is wiring the mock registry cannot check.
+    ///
+    /// 422 is load-bearing: `GET /repos/actions/checkout/commits/7.0.1` answers
+    /// 422 for a repo that tags `v7.0.1`, so a classification narrowed to 404
+    /// leaves every bare version comment unresolvable.
+    #[tokio::test]
+    async fn test_only_a_ref_answer_is_reported_as_a_missing_ref() {
+        for (status, missing) in [
+            (404, true),
+            (422, true),
+            (403, false),
+            (429, false),
+            (500, false),
+        ] {
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path("/repos/acme/action/commits/1.2.3"))
+                .respond_with(ResponseTemplate::new(status))
+                .mount(&server)
+                .await;
+
+            let error = registry(&server)
+                .resolve_ref_to_commit("acme/action", "1.2.3")
+                .await
+                .expect_err("HTTP {status} should not resolve");
+
+            assert_eq!(
+                is_ref_not_found(&error),
+                missing,
+                "HTTP {status} was classified wrongly: {error}"
+            );
+        }
     }
 
     #[tokio::test]

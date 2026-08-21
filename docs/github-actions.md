@@ -39,6 +39,15 @@ floating comment (`# v4`), moved tag, or stale comment is never rewritten.
 Structured output reports these under `files[].skipped[]` with
 `status: "blocked"` and a machine-readable `reason`.
 
+The comment may write the version with or without the `v` prefix, whichever the
+repo's own tags use: `# 7.0.1` and `# v7.0.1` both verify against a repo tagging
+`v7.0.1`. The prefix style of each comment is preserved when it is rewritten, so
+`# 5.0.0` becomes `# 7.0.1` and `# v5.0.0` becomes `# v7.0.1`. The exception is a
+repository that publishes both spellings of one release at different commits:
+there the comment takes the spelling of the tag that was actually resolved, since
+the other one names a different commit. A comment that resolves to some commit
+other than the pinned one is still refused, whichever spelling it uses.
+
 ### Turning SHA updates off
 
 With SHA updates turned off (`--no-update-action-shas`, or
