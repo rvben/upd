@@ -16,6 +16,8 @@ pub struct MockRegistry {
     version_metas: HashMap<String, Vec<VersionMeta>>,
     /// Map of package name to the ref names a consumer could pin to
     ref_names: HashMap<String, Vec<String>>,
+    /// Packages whose ref-name listing fails rather than answering
+    unavailable_ref_names: HashSet<String>,
     /// Map of package name + ref to its immutable commit SHA
     resolved_refs: HashMap<(String, String), String>,
     /// Refs whose lookup fails without answering whether they exist
@@ -32,6 +34,7 @@ impl MockRegistry {
             constrained_versions: HashMap::new(),
             version_metas: HashMap::new(),
             ref_names: HashMap::new(),
+            unavailable_ref_names: HashSet::new(),
             resolved_refs: HashMap::new(),
             unavailable_refs: HashSet::new(),
             name,
@@ -52,6 +55,15 @@ impl MockRegistry {
             package.to_string(),
             refs.iter().map(|r| r.to_string()).collect(),
         );
+        self
+    }
+
+    /// Declare a package whose ref-name listing fails without answering whether
+    /// the repo publishes any refs, as a rate limit or an outage does. A package
+    /// with no declared ref names answers with an empty list instead, which is
+    /// the registry saying it has no ref concept.
+    pub fn with_unavailable_ref_names(mut self, package: &str) -> Self {
+        self.unavailable_ref_names.insert(package.to_string());
         self
     }
 
@@ -151,6 +163,9 @@ impl Registry for MockRegistry {
     }
 
     async fn list_ref_names(&self, package: &str) -> Result<Vec<String>> {
+        if self.unavailable_ref_names.contains(package) {
+            return Err(anyhow!("Ref listing failed: {package}"));
+        }
         Ok(self.ref_names.get(package).cloned().unwrap_or_default())
     }
 

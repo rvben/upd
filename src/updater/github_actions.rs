@@ -217,7 +217,9 @@ impl GithubActionsUpdater {
     ///
     /// `refs` empty means the ref list is unknown - a registry that does not
     /// expose refs, or a lookup that failed - and must leave the candidate
-    /// alone rather than expanding every action to full precision.
+    /// alone rather than expanding every action to full precision. The caller
+    /// reports the failed-lookup case, since a shortened ref then goes out
+    /// unverified.
     fn resolve_against_refs(candidate: String, latest: &str, refs: &[String]) -> String {
         if refs.is_empty() {
             return candidate;
@@ -496,9 +498,15 @@ impl Updater for GithubActionsUpdater {
         // `v4.1.2`) can only be moved to another shortened ref the repo actually
         // publishes. Fetch the ref list for exactly those repos - shortening is
         // the only case that needs verifying, so a workflow pinned at full
-        // precision costs no extra requests. Failures are swallowed into an
-        // empty list, which resolve_against_refs treats as "unknown" and leaves
-        // the existing behaviour intact.
+        // precision costs no extra requests.
+        //
+        // A registry with no ref concept and a lookup that did not complete both
+        // leave the shortened candidate alone: expanding to full precision
+        // because a request failed would make the file depend on network
+        // weather. They differ in what the user is told. The second is reported,
+        // but only for a repo whose shortened ref this run actually writes -
+        // pass 3 decides that, so the failures are recorded here and warned
+        // about there.
         let repos_needing_refs: Vec<String> = {
             let mut seen = std::collections::HashSet::new();
             actions_to_check
@@ -522,11 +530,21 @@ impl Updater for GithubActionsUpdater {
                 .map(|owner_repo| async { registry.list_ref_names(owner_repo).await }),
         )
         .await;
-        let repo_refs: HashMap<String, Vec<String>> = repos_needing_refs
-            .into_iter()
-            .zip(ref_results)
-            .map(|(repo, result)| (repo, result.unwrap_or_default()))
-            .collect();
+        let mut repo_refs: HashMap<String, Vec<String>> = HashMap::new();
+        let mut failed_ref_lookups: HashMap<String, String> = HashMap::new();
+        for (repo, ref_result) in repos_needing_refs.into_iter().zip(ref_results) {
+            let refs = match ref_result {
+                Ok(refs) => refs,
+                Err(error) => {
+                    failed_ref_lookups.insert(repo.clone(), error.to_string());
+                    Vec::new()
+                }
+            };
+            repo_refs.insert(repo, refs);
+        }
+        // Repos whose shortened ref this run wrote without a ref list to check
+        // it against, in first-written order so the report is deterministic.
+        let mut unverified_shortenings: Vec<String> = Vec::new();
 
         // Build version map per line index, cloning results from the deduplicated map
         let mut version_map: HashMap<usize, Result<String, anyhow::Error>> = HashMap::new();
@@ -937,6 +955,19 @@ impl Updater for GithubActionsUpdater {
                                 let new_line = line.replacen(current_version, &new_version, 1);
                                 new_lines.push(new_line);
 
+                                // The written ref is shorter than the version it
+                                // stands for, and the list that would confirm
+                                // the repo publishes it never arrived.
+                                fn bare(s: &str) -> &str {
+                                    s.strip_prefix('v').unwrap_or(s)
+                                }
+                                if bare(&new_version) != bare(&latest_version)
+                                    && failed_ref_lookups.contains_key(owner_repo)
+                                    && !unverified_shortenings.contains(owner_repo)
+                                {
+                                    unverified_shortenings.push(owner_repo.clone());
+                                }
+
                                 if *is_pinned {
                                     result.pinned.push((
                                         owner_repo.clone(),
@@ -976,6 +1007,22 @@ impl Updater for GithubActionsUpdater {
                 }
             } else {
                 new_lines.push(line.to_string());
+            }
+        }
+
+        // A dry run - `--check`, `--dry-run`, and the scan interactive mode runs
+        // before prompting - reaches here having written nothing, so the warning
+        // describes the shortening it proposes rather than one that went out.
+        let written = if options.dry_run {
+            "would be written"
+        } else {
+            "was written"
+        };
+        for repo in unverified_shortenings {
+            if let Some(error) = failed_ref_lookups.get(&repo) {
+                result.warnings.push(format!(
+                    "Could not list the refs {repo} publishes ({error}); its shortened version {written} without verifying the repo publishes that ref"
+                ));
             }
         }
 
@@ -2367,7 +2414,7 @@ jobs:
             MockRegistry::new("github-releases").with_version("actions/checkout", "v4.2.0");
 
         let updater = GithubActionsUpdater::new();
-        updater
+        let result = updater
             .update(file.path(), &registry, UpdateOptions::new(false, false))
             .await
             .unwrap();
@@ -2376,6 +2423,201 @@ jobs:
         assert!(
             content.contains("actions/checkout@v4\n"),
             "unknown ref data must leave precision-matching alone, got: {content}"
+        );
+        assert!(
+            result.warnings.is_empty(),
+            "a registry that simply has no ref concept is not a failure, got: {:?}",
+            result.warnings
+        );
+    }
+
+    /// A ref lookup that fails is not the same as a repo with no refs. The
+    /// shortened ref still gets written, because expanding to full precision
+    /// based on network weather would make the output depend on whether a
+    /// request happened to succeed. But the run must say the check did not
+    /// happen, or a workflow pinned to a ref the repo does not publish is
+    /// written in silence.
+    #[tokio::test]
+    async fn a_failed_ref_lookup_is_reported_rather_than_read_as_no_refs() {
+        let mut file = NamedTempFile::new().unwrap();
+        write!(
+            file,
+            r#"name: CI
+on: push
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+"#
+        )
+        .unwrap();
+
+        let registry = MockRegistry::new("github-releases")
+            .with_version("actions/checkout", "v4.2.0")
+            .with_unavailable_ref_names("actions/checkout");
+
+        let updater = GithubActionsUpdater::new();
+        let result = updater
+            .update(file.path(), &registry, UpdateOptions::new(false, false))
+            .await
+            .unwrap();
+
+        let content = fs::read_to_string(file.path()).unwrap();
+        assert!(
+            content.contains("actions/checkout@v4\n"),
+            "a failed lookup must not change which ref is written, got: {content}"
+        );
+        assert!(
+            result
+                .warnings
+                .iter()
+                .any(|w| w.contains("actions/checkout")),
+            "the unverified shortening must be reported, got: {:?}",
+            result.warnings
+        );
+    }
+
+    /// The warning says a shortened ref went out unverified, so it may only
+    /// appear when one did. Under `--full-precision` the concrete version is
+    /// written and no ref is ever shortened, which makes the ref list irrelevant
+    /// and the warning false.
+    #[tokio::test]
+    async fn a_failed_ref_lookup_is_not_reported_when_nothing_was_shortened() {
+        let mut file = NamedTempFile::new().unwrap();
+        write!(
+            file,
+            r#"name: CI
+on: push
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+"#
+        )
+        .unwrap();
+
+        let registry = MockRegistry::new("github-releases")
+            .with_version("actions/checkout", "v4.2.0")
+            .with_unavailable_ref_names("actions/checkout");
+
+        let updater = GithubActionsUpdater::new();
+        let result = updater
+            .update(file.path(), &registry, UpdateOptions::new(false, true))
+            .await
+            .unwrap();
+
+        let content = fs::read_to_string(file.path()).unwrap();
+        assert!(
+            content.contains("actions/checkout@v4.2.0\n"),
+            "full precision writes the concrete version, got: {content}"
+        );
+        assert!(
+            result.warnings.is_empty(),
+            "nothing was shortened, so there is no unverified shortening to report, got: {:?}",
+            result.warnings
+        );
+    }
+
+    /// A shortening the bump ceiling rejects is never written, so there is
+    /// nothing unverified to report either.
+    #[tokio::test]
+    async fn a_failed_ref_lookup_is_not_reported_when_the_update_is_capped() {
+        let mut file = NamedTempFile::new().unwrap();
+        write!(
+            file,
+            r#"name: CI
+on: push
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+"#
+        )
+        .unwrap();
+
+        let registry = MockRegistry::new("github-releases")
+            .with_version("actions/checkout", "v4.2.0")
+            .with_unavailable_ref_names("actions/checkout");
+
+        let options =
+            UpdateOptions::new(false, false).with_bump_filter(crate::updater::BumpFilter {
+                major: false,
+                minor: true,
+                patch: true,
+            });
+
+        let updater = GithubActionsUpdater::new();
+        let result = updater
+            .update(file.path(), &registry, options)
+            .await
+            .unwrap();
+
+        let content = fs::read_to_string(file.path()).unwrap();
+        assert!(
+            content.contains("actions/checkout@v3\n"),
+            "a major bump above the ceiling is not written, got: {content}"
+        );
+        assert!(
+            result.warnings.is_empty(),
+            "no shortened ref was written, so nothing is unverified, got: {:?}",
+            result.warnings
+        );
+    }
+
+    /// `--check`, `--dry-run` and the scan interactive mode runs before it
+    /// prompts all write nothing, so the warning has to describe the shortening
+    /// it proposes rather than a write that did not happen.
+    #[tokio::test]
+    async fn a_dry_run_reports_the_unverified_shortening_as_a_proposal() {
+        let mut file = NamedTempFile::new().unwrap();
+        write!(
+            file,
+            r#"name: CI
+on: push
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+"#
+        )
+        .unwrap();
+
+        let registry = MockRegistry::new("github-releases")
+            .with_version("actions/checkout", "v4.2.0")
+            .with_unavailable_ref_names("actions/checkout");
+
+        let updater = GithubActionsUpdater::new();
+        let result = updater
+            .update(file.path(), &registry, UpdateOptions::new(true, false))
+            .await
+            .unwrap();
+
+        let content = fs::read_to_string(file.path()).unwrap();
+        assert!(
+            content.contains("actions/checkout@v3\n"),
+            "a dry run writes nothing, got: {content}"
+        );
+        let warning = result
+            .warnings
+            .iter()
+            .find(|w| w.contains("actions/checkout"))
+            .unwrap_or_else(|| {
+                panic!(
+                    "the proposed shortening is still unverified and must be reported, got: {:?}",
+                    result.warnings
+                )
+            });
+        assert!(
+            warning.contains("would be written"),
+            "a dry run proposes the shortening, got: {warning}"
+        );
+        assert!(
+            !warning.contains("was written"),
+            "nothing was written, so the warning must not claim it was, got: {warning}"
         );
     }
 }
