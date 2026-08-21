@@ -1,4 +1,4 @@
-.PHONY: build release test lint fmt check clean run install release-patch release-minor release-major
+.PHONY: build release test test-verbose lint fmt fmt-check check ci clean run run-release install release-patch release-minor release-major
 
 # Build debug binary
 build:
@@ -28,8 +28,12 @@ fmt:
 fmt-check:
 	cargo fmt -- --check
 
-# Run all checks (format, lint, test)
-check: fmt-check lint test
+# Everything CI's test job runs, in the order it runs them. CI invokes this
+# target rather than repeating the list, so the two cannot drift apart.
+ci: fmt-check lint test
+
+# Alias for `ci`
+check: ci
 
 # Clean build artifacts
 clean:

@@ -35,14 +35,8 @@ jobs:
             target
           key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
 
-      - name: Check formatting
-        run: make fmt-check
-
-      - name: Run clippy
-        run: make lint
-
-      - name: Run tests
-        run: make test
+      - name: Run checks
+        run: make ci
 
   build:
     runs-on: ${{ matrix.os }}
