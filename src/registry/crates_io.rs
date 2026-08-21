@@ -548,6 +548,20 @@ impl Registry for CratesIoRegistry {
             .collect())
     }
 
+    /// Crates are not pinned to Git refs.
+    async fn list_ref_names(&self, _package: &str) -> Result<Vec<String>> {
+        super::no_ref_names()
+    }
+
+    /// Crates are not pinned to Git refs.
+    async fn resolve_ref_to_commit(&self, package: &str, reference: &str) -> Result<String> {
+        Err(super::ref_resolution_unsupported(
+            self.name(),
+            package,
+            reference,
+        ))
+    }
+
     fn name(&self) -> &'static str {
         "crates.io"
     }

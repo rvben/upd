@@ -317,6 +317,47 @@ impl Registry for IndexChain<'_> {
         Ok(Vec::new())
     }
 
+    /// First non-empty answer in chain order. A chain can be built over any
+    /// registry (`Link::Default` holds an arbitrary `&dyn Registry`), so this
+    /// forwards rather than assuming the Python indexes it usually wraps.
+    ///
+    /// A link that fails is not a link that answered "no refs". Unlike
+    /// `list_versions`, whose empty result the cooldown layer already reads as
+    /// "unavailable", an empty ref list tells the caller the refs were checked,
+    /// so a failure anywhere in the chain is reported rather than flattened.
+    async fn list_ref_names(&self, package: &str) -> Result<Vec<String>> {
+        let mut last_error = None;
+        for link in self.links_for(package) {
+            match link.registry().list_ref_names(package).await {
+                Ok(refs) if !refs.is_empty() => return Ok(refs),
+                Ok(_) => {}
+                Err(error) => last_error = Some(error),
+            }
+        }
+        match last_error {
+            Some(error) => Err(error),
+            None => Ok(Vec::new()),
+        }
+    }
+
+    /// First link that resolves the ref wins; otherwise the last error, so the
+    /// caller sees why the chain could not answer.
+    async fn resolve_ref_to_commit(&self, package: &str, reference: &str) -> Result<String> {
+        let mut last_error = None;
+        for link in self.links_for(package) {
+            match link
+                .registry()
+                .resolve_ref_to_commit(package, reference)
+                .await
+            {
+                Ok(commit) => return Ok(commit),
+                Err(e) => last_error = Some(e),
+            }
+        }
+        Err(last_error
+            .unwrap_or_else(|| super::ref_resolution_unsupported(self.name(), package, reference)))
+    }
+
     fn name(&self) -> &'static str {
         "pypi"
     }
@@ -618,5 +659,81 @@ mod tests {
         assert!(chain.is_empty());
         let err = chain.get_latest_version("requests").await.unwrap_err();
         assert!(err.to_string().contains("No package index is configured"));
+    }
+
+    /// A chain is a decorator: `Link::Default` holds an arbitrary registry, so
+    /// ref lookups have to travel to it. Answering from the chain itself would
+    /// report "no refs" for a registry that publishes them, which the caller
+    /// cannot tell from a real answer.
+    #[tokio::test]
+    async fn chain_forwards_ref_lookups_to_the_link_that_can_answer() {
+        let sha = "1234567890abcdef1234567890abcdef12345678";
+        let default = MockRegistry::new("github-releases")
+            .with_ref_names("actions/checkout", &["v4.2.2", "v4"])
+            .with_resolved_ref("actions/checkout", "v4", sha);
+
+        let chain = IndexChain::new(
+            vec![DeclaredIndex::default_registry()],
+            &no_pins(),
+            &default,
+        )
+        .unwrap();
+
+        assert_eq!(
+            chain.list_ref_names("actions/checkout").await.unwrap(),
+            strings(&["v4.2.2", "v4"]),
+            "the chain must return the link's refs, not its own empty answer"
+        );
+        assert_eq!(
+            chain
+                .resolve_ref_to_commit("actions/checkout", "v4")
+                .await
+                .unwrap(),
+            sha
+        );
+    }
+
+    /// A lookup that could not complete is not the same fact as a repository
+    /// with no refs, and the chain is the last place that distinction can be
+    /// lost: an empty list here tells the caller the refs were checked.
+    #[tokio::test]
+    async fn a_failed_ref_listing_stays_an_error_through_the_chain() {
+        let default =
+            MockRegistry::new("github-releases").with_unavailable_ref_names("actions/checkout");
+
+        let chain = IndexChain::new(
+            vec![DeclaredIndex::default_registry()],
+            &no_pins(),
+            &default,
+        )
+        .unwrap();
+
+        let error = chain
+            .list_ref_names("actions/checkout")
+            .await
+            .expect_err("a failed listing must not be reported as an empty ref list");
+        assert!(
+            error.to_string().contains("actions/checkout"),
+            "the link's error must survive, got: {error}"
+        );
+    }
+
+    /// A link that answers "no refs here" is a real answer, so the chain keeps
+    /// reporting it as one.
+    #[tokio::test]
+    async fn a_link_with_no_ref_concept_is_still_an_empty_answer() {
+        let default = MockRegistry::new("pypi");
+
+        let chain = IndexChain::new(
+            vec![DeclaredIndex::default_registry()],
+            &no_pins(),
+            &default,
+        )
+        .unwrap();
+
+        assert!(
+            chain.list_ref_names("requests").await.unwrap().is_empty(),
+            "a registry without ref data answers empty, not an error"
+        );
     }
 }

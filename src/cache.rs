@@ -685,7 +685,10 @@ mod tests {
 #[cfg(test)]
 mod ref_forwarding_tests {
     use super::*;
+    use crate::registry::GitHubReleasesRegistry;
     use crate::registry::MockRegistry;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
 
     /// CachedRegistry decorates another registry, so every Registry method has
     /// to be forwarded explicitly. A method left to the trait default answers
@@ -720,6 +723,56 @@ mod ref_forwarding_tests {
         assert_eq!(
             cached
                 .resolve_ref_to_commit("actions/checkout", "v4.2.2")
+                .await
+                .unwrap(),
+            sha
+        );
+    }
+
+    /// The two tests above inject a `MockRegistry`, which cannot see a wiring
+    /// bug: it answers whether or not a request was ever made. This one wraps
+    /// the production registry over a mock HTTP server, so passing requires the
+    /// call to travel through the decorator and out onto the wire. `expect(1)`,
+    /// verified when the server drops, is what makes a silent no-op fail: a
+    /// method left to a trait default never reaches either endpoint.
+    #[tokio::test]
+    async fn cached_registry_ref_lookups_reach_the_http_layer() {
+        let sha = "1234567890abcdef1234567890abcdef12345678";
+        let server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/repos/actions/checkout/tags"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string(r#"[{"name": "v4.2.2"}, {"name": "v4"}]"#),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path("/repos/actions/checkout/commits/v4"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_string(format!(r#"{{"sha": "{sha}"}}"#)),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let cached = CachedRegistry::new(
+            GitHubReleasesRegistry::with_api_url(server.uri()),
+            Cache::new_shared(),
+            true,
+        );
+
+        assert_eq!(
+            cached.list_ref_names("actions/checkout").await.unwrap(),
+            vec!["v4.2.2", "v4"],
+            "the decorator must return what the HTTP layer served"
+        );
+        assert_eq!(
+            cached
+                .resolve_ref_to_commit("actions/checkout", "v4")
                 .await
                 .unwrap(),
             sha

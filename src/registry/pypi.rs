@@ -844,6 +844,23 @@ impl Registry for MultiPyPiRegistry {
         Ok(Vec::new())
     }
 
+    /// Every index here is a `PyPiRegistry`, so the answer is a single index's:
+    /// Python distributions are not pinned to Git refs. Declared rather than
+    /// forwarded because the element type is concrete - a loop over the indexes
+    /// could not return anything else.
+    async fn list_ref_names(&self, _package: &str) -> Result<Vec<String>> {
+        super::no_ref_names()
+    }
+
+    /// See `list_ref_names`: every index here is a `PyPiRegistry`.
+    async fn resolve_ref_to_commit(&self, package: &str, reference: &str) -> Result<String> {
+        Err(super::ref_resolution_unsupported(
+            self.name(),
+            package,
+            reference,
+        ))
+    }
+
     fn name(&self) -> &'static str {
         "pypi"
     }
@@ -948,6 +965,20 @@ impl Registry for PyPiRegistry {
             });
         }
         Ok(out)
+    }
+
+    /// Python distributions are not pinned to Git refs.
+    async fn list_ref_names(&self, _package: &str) -> Result<Vec<String>> {
+        super::no_ref_names()
+    }
+
+    /// Python distributions are not pinned to Git refs.
+    async fn resolve_ref_to_commit(&self, package: &str, reference: &str) -> Result<String> {
+        Err(super::ref_resolution_unsupported(
+            self.name(),
+            package,
+            reference,
+        ))
     }
 
     fn name(&self) -> &'static str {

@@ -574,6 +574,20 @@ impl Registry for NpmRegistry {
         Ok(out)
     }
 
+    /// npm packages are not pinned to Git refs.
+    async fn list_ref_names(&self, _package: &str) -> Result<Vec<String>> {
+        super::no_ref_names()
+    }
+
+    /// npm packages are not pinned to Git refs.
+    async fn resolve_ref_to_commit(&self, package: &str, reference: &str) -> Result<String> {
+        Err(super::ref_resolution_unsupported(
+            self.name(),
+            package,
+            reference,
+        ))
+    }
+
     fn name(&self) -> &'static str {
         "npm"
     }

@@ -1,4 +1,4 @@
-use super::{Registry, get_with_retry, http_error_message};
+use super::{Registry, VersionMeta, get_with_retry, http_error_message};
 use anyhow::{Result, anyhow};
 use async_trait::async_trait;
 use reqwest::Client;
@@ -212,6 +212,25 @@ impl Registry for TerraformRegistry {
                     constraints
                 )
             })
+    }
+
+    /// The registry API returns no publish dates, so cooldown cannot apply here.
+    async fn list_versions(&self, _package: &str) -> Result<Vec<VersionMeta>> {
+        super::no_version_metadata()
+    }
+
+    /// Modules are addressed by registry version, not by Git ref.
+    async fn list_ref_names(&self, _package: &str) -> Result<Vec<String>> {
+        super::no_ref_names()
+    }
+
+    /// Modules are addressed by registry version, not by Git ref.
+    async fn resolve_ref_to_commit(&self, package: &str, reference: &str) -> Result<String> {
+        Err(super::ref_resolution_unsupported(
+            self.name(),
+            package,
+            reference,
+        ))
     }
 
     fn name(&self) -> &'static str {

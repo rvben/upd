@@ -1,14 +1,14 @@
-use super::{Registry, get_with_retry, http_error_message};
+use super::{Registry, VersionMeta, get_with_retry, http_error_message};
 use anyhow::{Result, anyhow};
 use async_trait::async_trait;
 use reqwest::Client;
 use serde::Deserialize;
 use std::time::Duration;
 
-// NuGet intentionally does not override `list_versions`: the v3-flatcontainer
-// endpoint we query here returns only version strings, not publish dates, so
-// cooldown reports NuGet as unsupported. Resolving `RegistrationsBaseUrl` from
-// the service index would let us fetch catalog entries with publish dates.
+// NuGet declares no publish dates: the v3-flatcontainer endpoint we query here
+// returns only version strings, so cooldown reports NuGet as unsupported.
+// Resolving `RegistrationsBaseUrl` from the service index would let us fetch
+// catalog entries with publish dates.
 pub struct NuGetRegistry {
     client: Client,
     api_url: String,
@@ -111,6 +111,26 @@ impl Registry for NuGetRegistry {
             .map(|(v, _)| v.clone());
 
         latest.ok_or_else(|| anyhow!("NuGet package '{}' has no versions", package))
+    }
+
+    /// The flat container index carries no publish dates, so cooldown cannot
+    /// apply here.
+    async fn list_versions(&self, _package: &str) -> Result<Vec<VersionMeta>> {
+        super::no_version_metadata()
+    }
+
+    /// NuGet packages are not pinned to Git refs.
+    async fn list_ref_names(&self, _package: &str) -> Result<Vec<String>> {
+        super::no_ref_names()
+    }
+
+    /// NuGet packages are not pinned to Git refs.
+    async fn resolve_ref_to_commit(&self, package: &str, reference: &str) -> Result<String> {
+        Err(super::ref_resolution_unsupported(
+            self.name(),
+            package,
+            reference,
+        ))
     }
 
     fn name(&self) -> &'static str {

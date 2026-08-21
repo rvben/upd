@@ -23,7 +23,7 @@ pub use pypi::{MultiPyPiRegistry, PyPiCredentials, PyPiRegistry};
 pub use rubygems::RubyGemsRegistry;
 pub use terraform::TerraformRegistry;
 
-use anyhow::Result;
+use anyhow::{Result, anyhow};
 use async_trait::async_trait;
 use reqwest::{Client, Response};
 use std::time::Duration;
@@ -196,6 +196,48 @@ pub struct VersionMeta {
     pub prerelease: bool,
 }
 
+/// The answer from a registry that has no Git-ref concept at all.
+///
+/// Distinct from an `Err`, which says the question could not be answered.
+pub fn no_ref_names() -> Result<Vec<String>> {
+    Ok(Vec::new())
+}
+
+/// The answer from a registry that publishes no per-version metadata.
+///
+/// Distinct from an `Err`, which says the question could not be answered.
+pub fn no_version_metadata() -> Result<Vec<VersionMeta>> {
+    Ok(Vec::new())
+}
+
+/// The error for a registry that cannot resolve Git refs at all.
+///
+/// Deliberately not a [`RefNotFound`]: the ref was never looked up, so nothing
+/// was learned about whether it exists, and no caller may treat this as the
+/// repository saying the ref is absent.
+pub fn ref_resolution_unsupported(registry: &str, package: &str, reference: &str) -> anyhow::Error {
+    anyhow!("registry '{registry}' cannot resolve Git ref '{reference}' for '{package}'")
+}
+
+/// A package registry.
+///
+/// **The capability methods - `list_versions`, `list_ref_names` and
+/// `resolve_ref_to_commit` - have no default body, and a new method describing
+/// what a registry can do must not have one either.** `Registry` is wrapped by
+/// decorators ([`crate::cache::CachedRegistry`], [`IndexChain`],
+/// [`MultiPyPiRegistry`]), and a default body is silently inherited by every one
+/// of them: the wrapped registry is never consulted and the caller receives the
+/// default's answer, which is indistinguishable from a real one. That has
+/// shipped from this trait before. Requiring these forces every decorator to
+/// state whether it forwards, and makes forgetting one a compile error rather
+/// than a silent wrong answer. A registry that genuinely lacks a capability says
+/// so explicitly with [`no_ref_names`], [`no_version_metadata`], or
+/// [`ref_resolution_unsupported`].
+///
+/// The two lookup methods below keep a default because theirs degrades to a real
+/// answer from the same registry - the stable version, the latest version -
+/// rather than manufacturing an absence. Every decorator overrides both anyway;
+/// a new one that does not silently loses prerelease and constraint handling.
 #[async_trait]
 pub trait Registry: Send + Sync {
     /// Get the latest stable version of a package
@@ -220,13 +262,11 @@ pub trait Registry: Send + Sync {
         self.get_latest_version(package).await
     }
 
-    /// List recent versions with metadata. Default returns empty, which the
-    /// cooldown layer treats as "publish dates unavailable for this registry".
-    /// Implementations should return the most recent ~50 versions in any order.
-    async fn list_versions(&self, package: &str) -> Result<Vec<VersionMeta>> {
-        let _ = package;
-        Ok(Vec::new())
-    }
+    /// List recent versions with metadata, most recent ~50 in any order.
+    ///
+    /// A registry that publishes no dates answers `no_version_metadata()`, which
+    /// the cooldown layer reads as "publish dates unavailable here".
+    async fn list_versions(&self, package: &str) -> Result<Vec<VersionMeta>>;
 
     /// List the ref names a consumer can actually pin to, for registries where
     /// refs are distinct from released versions.
@@ -236,29 +276,23 @@ pub trait Registry: Send + Sync {
     /// a truncated `v4` in that case produces a workflow that fails to resolve,
     /// so the Actions updater consults this before shortening a version.
     ///
-    /// The default is empty, meaning "this registry has no ref concept". Callers
-    /// MUST treat empty as *unknown* rather than as "the ref does not exist", so
-    /// a registry without ref data keeps its existing behaviour instead of
-    /// silently losing precision-matching.
-    async fn list_ref_names(&self, package: &str) -> Result<Vec<String>> {
-        let _ = package;
-        Ok(Vec::new())
-    }
+    /// A registry with no ref concept answers `no_ref_names()`. Callers MUST
+    /// read an empty list as *unknown* rather than as "the ref does not exist",
+    /// so a registry without ref data keeps its existing behaviour instead of
+    /// silently losing precision-matching. A lookup that could not complete is
+    /// an `Err`, which is a different fact and must stay distinguishable.
+    async fn list_ref_names(&self, package: &str) -> Result<Vec<String>>;
 
     /// Resolve a Git ref to the immutable commit SHA it currently identifies.
     ///
-    /// Registries that do not expose Git refs return an error by default. The
-    /// GitHub Actions updater uses this only for its opt-in SHA-pin mode, where
-    /// silently falling back to a mutable tag would weaken the caller's supply-
-    /// chain protection.
-    async fn resolve_ref_to_commit(&self, package: &str, reference: &str) -> Result<String> {
-        anyhow::bail!(
-            "registry '{}' cannot resolve Git ref '{}' for '{}'",
-            self.name(),
-            reference,
-            package
-        )
-    }
+    /// A registry that does not expose Git refs answers
+    /// `ref_resolution_unsupported()`. The GitHub Actions updater uses this only
+    /// for its opt-in SHA-pin mode, where silently falling back to a mutable tag
+    /// would weaken the caller's supply-chain protection.
+    ///
+    /// An `Err` carrying [`RefNotFound`] means the repository answered that the
+    /// ref does not exist. Any other `Err` means the question went unanswered.
+    async fn resolve_ref_to_commit(&self, package: &str, reference: &str) -> Result<String>;
 
     /// Registry name for display
     fn name(&self) -> &'static str;
@@ -402,11 +436,24 @@ mod tests {
             Ok(self.version.clone())
         }
 
+        async fn list_versions(&self, _package: &str) -> Result<Vec<VersionMeta>> {
+            no_version_metadata()
+        }
+
+        async fn list_ref_names(&self, _package: &str) -> Result<Vec<String>> {
+            no_ref_names()
+        }
+
+        async fn resolve_ref_to_commit(&self, package: &str, reference: &str) -> Result<String> {
+            Err(ref_resolution_unsupported(self.name(), package, reference))
+        }
+
         fn name(&self) -> &'static str {
             "Minimal"
         }
-        // Note: we intentionally DON'T override the default methods
-        // to test that the default implementations work
+        // The prerelease and constraint methods are intentionally left to their
+        // defaults, which the tests below exercise. The capability methods have
+        // no defaults to inherit, so they are declared here like any leaf.
     }
 
     #[tokio::test]
