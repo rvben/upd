@@ -302,19 +302,27 @@ impl Registry for IndexChain<'_> {
             .await
     }
 
-    /// First non-empty answer in chain order. Errors are swallowed for the
-    /// same reason as in `MultiPyPiRegistry`: cooldown callers treat an empty
-    /// result as "publish dates unavailable" and fall back to the regular
-    /// update path, so one failing index must not become a hard failure here.
+    /// First non-empty answer in chain order.
+    ///
+    /// A link that fails is not a link that answered "no publish dates". The
+    /// cooldown layer distinguishes the two and tells the user which happened,
+    /// so a failure anywhere in the chain is reported rather than flattened. It
+    /// still never becomes a hard failure: that call degrades to the regular
+    /// update path, which is the caller's decision to make and not this
+    /// layer's to pre-empt by discarding the reason.
     async fn list_versions(&self, package: &str) -> Result<Vec<VersionMeta>> {
+        let mut last_error = None;
         for link in self.links_for(package) {
-            if let Ok(versions) = link.registry().list_versions(package).await
-                && !versions.is_empty()
-            {
-                return Ok(versions);
+            match link.registry().list_versions(package).await {
+                Ok(versions) if !versions.is_empty() => return Ok(versions),
+                Ok(_) => {}
+                Err(error) => last_error = Some(error),
             }
         }
-        Ok(Vec::new())
+        match last_error {
+            Some(error) => Err(error),
+            None => Ok(Vec::new()),
+        }
     }
 
     /// First non-empty answer in chain order. A chain can be built over any
@@ -734,6 +742,77 @@ mod tests {
         assert!(
             chain.list_ref_names("requests").await.unwrap().is_empty(),
             "a registry without ref data answers empty, not an error"
+        );
+    }
+
+    /// The cooldown layer reads an empty version list as "this registry holds
+    /// no publish dates" and says so to the user. Flattening a failed lookup
+    /// into that answer here reports a transient outage as a permanent
+    /// registry limitation.
+    #[tokio::test]
+    async fn a_failed_version_listing_stays_an_error_through_the_chain() {
+        let default = MockRegistry::new("pypi").with_unavailable_versions("requests");
+
+        let chain = IndexChain::new(
+            vec![DeclaredIndex::default_registry()],
+            &no_pins(),
+            &default,
+        )
+        .unwrap();
+
+        let error = chain
+            .list_versions("requests")
+            .await
+            .expect_err("a failed listing must not be reported as an empty version list");
+        assert!(
+            error.to_string().contains("requests"),
+            "the link's error must survive, got: {error}"
+        );
+    }
+
+    /// A link answers empty when it does not hold the package at all, which says
+    /// nothing about publish dates. Letting that suppress a later link's failure
+    /// would report an outage on the link that does hold the package as a
+    /// registry unable to support cooldown, which is the confusion this chain
+    /// exists to avoid.
+    #[tokio::test]
+    async fn a_link_without_the_package_does_not_mask_a_later_failure() {
+        let private = MockServer::start().await;
+        missing(&private, "requests").await;
+        let default = MockRegistry::new("pypi").with_unavailable_versions("requests");
+
+        let chain = IndexChain::new(
+            vec![
+                DeclaredIndex::url(Some("private"), &private.uri()),
+                DeclaredIndex::default_registry(),
+            ],
+            &no_pins(),
+            &default,
+        )
+        .unwrap();
+
+        chain
+            .list_versions("requests")
+            .await
+            .expect_err("an earlier link's 404 is not an answer about publish dates");
+    }
+
+    /// A registry that answers "I hold no publish dates" is answering, so the
+    /// chain keeps reporting that as the empty list it is.
+    #[tokio::test]
+    async fn a_link_without_publish_dates_is_still_an_empty_answer() {
+        let default = MockRegistry::new("nuget").with_version("requests", "2.31.0");
+
+        let chain = IndexChain::new(
+            vec![DeclaredIndex::default_registry()],
+            &no_pins(),
+            &default,
+        )
+        .unwrap();
+
+        assert!(
+            chain.list_versions("requests").await.unwrap().is_empty(),
+            "a registry without publish dates answers empty, not an error"
         );
     }
 }

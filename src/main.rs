@@ -4,7 +4,7 @@ use clap::Parser;
 use colored::Colorize;
 use futures::stream::{self, StreamExt};
 
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -418,7 +418,7 @@ fn build_update_options(
     packages: &[String],
     langs: &[Lang],
     cooldown_policy: Option<&CooldownPolicy>,
-    cooldown_notes: Arc<Mutex<BTreeSet<String>>>,
+    cooldown_notes: Arc<Mutex<BTreeMap<String, String>>>,
     bump_filter: BumpFilter,
 ) -> UpdateOptions {
     // Command line first, then the config file nearest this file, then the
@@ -1127,7 +1127,8 @@ async fn run_update(cli: &Cli) -> Result<()> {
             Ok::<_, anyhow::Error>((path.clone(), if is_noop { None } else { Some(raw) }))
         })
         .collect::<Result<HashMap<_, _>>>()?;
-    let cooldown_notes: Arc<Mutex<BTreeSet<String>>> = Arc::new(Mutex::new(BTreeSet::new()));
+    let cooldown_notes: Arc<Mutex<BTreeMap<String, String>>> =
+        Arc::new(Mutex::new(BTreeMap::new()));
 
     if cli.verbose {
         eprintln!(
@@ -1885,9 +1886,9 @@ async fn run_update(cli: &Cli) -> Result<()> {
         let _ = Cache::save_shared(&cache);
     }
 
-    // Emit cooldown unavailability notes (deduplicated across all files).
+    // Emit cooldown unavailability notes, one per condition across all files.
     if let Ok(notes) = cooldown_notes.lock() {
-        for note in notes.iter() {
+        for note in notes.values() {
             eprintln!("note: {}", note);
         }
     }
@@ -1912,7 +1913,7 @@ async fn run_update(cli: &Cli) -> Result<()> {
     } else {
         let notes_vec: Vec<String> = cooldown_notes
             .lock()
-            .map(|g| g.iter().cloned().collect())
+            .map(|g| g.values().cloned().collect())
             .unwrap_or_default();
         emit_update_json(
             UpdateReportInput {
@@ -2171,7 +2172,7 @@ async fn run_interactive_update(
     cache: &Arc<std::sync::Mutex<Cache>>,
     cache_enabled: bool,
     file_cooldowns: &HashMap<PathBuf, Option<CooldownPolicy>>,
-    cooldown_notes: Arc<Mutex<BTreeSet<String>>>,
+    cooldown_notes: Arc<Mutex<BTreeMap<String, String>>>,
 ) -> Result<()> {
     if !std::io::stdin().is_terminal() {
         eprintln!(

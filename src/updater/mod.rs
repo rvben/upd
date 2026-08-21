@@ -33,7 +33,7 @@ use crate::registry::Registry;
 use anyhow::{Result, anyhow};
 use chrono::{DateTime, Utc};
 use ignore::WalkBuilder;
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
@@ -251,9 +251,10 @@ pub struct UpdateOptions {
     /// Wall-clock used for cooldown decisions. None => `Utc::now()` at call time.
     /// Injected by tests for deterministic behaviour.
     pub cooldown_now: Option<DateTime<Utc>>,
-    /// Notes emitted when a registry cannot supply publish dates. Shared across
-    /// updaters so a single file processing run reports each note once.
-    pub cooldown_unavailable_notes: Arc<Mutex<BTreeSet<String>>>,
+    /// Notes emitted when a registry cannot supply publish dates, keyed by the
+    /// condition they describe. Shared across updaters so a single run reports
+    /// each condition once however many packages ran into it.
+    pub cooldown_unavailable_notes: Arc<Mutex<BTreeMap<String, String>>>,
     /// Bump-level ceiling enforced at write time. Defaults to permitting every
     /// level, so updates are only skipped when `--only-bump` / `--max-bump`
     /// narrow it.
@@ -376,9 +377,22 @@ impl UpdateOptions {
     }
 
     /// Record a note that cooldown metadata was unavailable for an ecosystem.
-    pub fn note_cooldown_unavailable(&self, note: &str) {
+    /// One condition is one note however many packages meet it, so the packages
+    /// after the first add nothing the user does not already know.
+    ///
+    /// Which of them arrives first is not fixed, since packages resolve
+    /// concurrently. The lowest-ordered message wins rather than the earliest,
+    /// so the same repository state reports the same cause every run.
+    pub fn note_cooldown_unavailable(&self, note: &CooldownNote) {
         if let Ok(mut guard) = self.cooldown_unavailable_notes.lock() {
-            guard.insert(note.to_string());
+            guard
+                .entry(note.key.clone())
+                .and_modify(|reported| {
+                    if note.message < *reported {
+                        reported.clone_from(&note.message);
+                    }
+                })
+                .or_insert_with(|| note.message.clone());
         }
     }
 }
@@ -829,6 +843,17 @@ pub enum CooldownOutcome {
     },
 }
 
+/// A diagnostic about a condition rather than about a package. Every package
+/// resolved against the same registry meets the same condition, so `key`
+/// says what counts as one occurrence and `message` is what the user reads.
+/// Keeping them apart is what lets the message name a concrete cause without
+/// one note per dependency.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CooldownNote {
+    pub key: String,
+    pub message: String,
+}
+
 /// Apply the active cooldown policy to a resolved `(current -> latest)` pair.
 /// Returns the outcome plus an optional diagnostic note the caller should
 /// stash on `UpdateOptions::note_cooldown_unavailable` for later reporting.
@@ -840,7 +865,7 @@ pub async fn apply_cooldown(
     constraints: Option<&str>,
     current_is_prerelease: bool,
     options: &UpdateOptions,
-) -> (CooldownOutcome, Option<String>) {
+) -> (CooldownOutcome, Option<CooldownNote>) {
     let ecosystem = registry.name();
     let Some(policy) = options.cooldown_policy.as_ref() else {
         return (CooldownOutcome::Unchanged(latest.to_string()), None);
@@ -860,12 +885,30 @@ pub async fn apply_cooldown(
     }
     let now = options.cooldown_now.unwrap_or_else(Utc::now);
 
+    // Three outcomes, two meanings. An empty list is the registry answering
+    // that it holds no publish dates, which no retry changes. An error is the
+    // question going unanswered, which a retry may well change, so it is
+    // reported as the failure it is rather than as a registry limitation.
     let versions = match registry.list_versions(package).await {
         Ok(v) if !v.is_empty() => v,
-        _ => {
+        Ok(_) => {
             return (
                 CooldownOutcome::Unchanged(latest.to_string()),
-                Some(format!("cooldown unavailable for {ecosystem}")),
+                Some(no_publish_dates_note(ecosystem)),
+            );
+        }
+        Err(error) => {
+            return (
+                CooldownOutcome::Unchanged(latest.to_string()),
+                Some(CooldownNote {
+                    key: format!("{ecosystem}:lookup-failed"),
+                    // The cause names the package it happened to, so the wording
+                    // says this is one occurrence: every other package on the
+                    // ecosystem meets the same condition and reports no note.
+                    message: format!(
+                        "cooldown not applied for {ecosystem}: a publish date lookup failed ({error})"
+                    ),
+                }),
             );
         }
     };
@@ -908,8 +951,18 @@ pub async fn apply_cooldown(
         ),
         CooldownDecision::Unsupported => (
             CooldownOutcome::Unchanged(latest.to_string()),
-            Some(format!("cooldown unavailable for {ecosystem}")),
+            Some(no_publish_dates_note(ecosystem)),
         ),
+    }
+}
+
+/// The registry answered and holds no publish dates, whether by returning no
+/// versions at all or versions carrying no dates. Both are the same fact to a
+/// user and no retry changes either, so they read and deduplicate as one.
+fn no_publish_dates_note(ecosystem: &str) -> CooldownNote {
+    CooldownNote {
+        key: format!("{ecosystem}:no-publish-dates"),
+        message: format!("cooldown unavailable for {ecosystem}"),
     }
 }
 
@@ -2623,5 +2676,140 @@ mod cooldown_integration_tests {
             "unrelated prerelease metadata must not become a cooldown skip"
         );
         assert_eq!(result.unchanged, 1);
+    }
+
+    /// Run one update under an active cooldown policy and return the notes it
+    /// stashed, so a test can assert on what the run told the user.
+    async fn cooldown_notes_for(registry: &MockRegistry, now: DateTime<Utc>) -> Vec<String> {
+        let mut file = NamedTempFile::new().unwrap();
+        writeln!(file, "requests==2.28.0").unwrap();
+        file.flush().unwrap();
+
+        let policy = CooldownPolicy {
+            default: Duration::days(7),
+            per_ecosystem: HashMap::new(),
+            force_override: None,
+        };
+        let options = UpdateOptions::new(true, false).with_cooldown_policy(policy, now);
+        let notes = std::sync::Arc::clone(&options.cooldown_unavailable_notes);
+
+        RequirementsUpdater::new()
+            .update(file.path(), registry, options)
+            .await
+            .unwrap();
+
+        let notes = notes.lock().unwrap();
+        notes.values().cloned().collect()
+    }
+
+    /// The note describes an ecosystem-wide condition, not a package. An
+    /// outage that every package in the file runs into is one fact, and
+    /// repeating it per dependency buries the rest of the output.
+    #[tokio::test]
+    async fn one_outage_is_reported_once_however_many_packages_hit_it() {
+        let now = Utc.with_ymd_and_hms(2026, 4, 22, 12, 0, 0).unwrap();
+
+        let mut file = NamedTempFile::new().unwrap();
+        writeln!(file, "requests==2.28.0").unwrap();
+        writeln!(file, "urllib3==1.26.0").unwrap();
+        file.flush().unwrap();
+
+        let registry = MockRegistry::new("pypi")
+            .with_version("requests", "2.31.0")
+            .with_version("urllib3", "2.2.0")
+            .with_unavailable_versions("requests")
+            .with_unavailable_versions("urllib3");
+
+        let policy = CooldownPolicy {
+            default: Duration::days(7),
+            per_ecosystem: HashMap::new(),
+            force_override: None,
+        };
+        let options = UpdateOptions::new(true, false).with_cooldown_policy(policy, now);
+        let notes = std::sync::Arc::clone(&options.cooldown_unavailable_notes);
+
+        RequirementsUpdater::new()
+            .update(file.path(), &registry, options)
+            .await
+            .unwrap();
+
+        let notes: Vec<String> = notes.lock().unwrap().values().cloned().collect();
+        assert_eq!(
+            notes.len(),
+            1,
+            "one outage on one ecosystem is one note, got: {notes:?}"
+        );
+    }
+
+    /// A registry that answers the publish-date question with "I hold no dates"
+    /// is permanently unable to support cooldown, and saying so is correct.
+    #[tokio::test]
+    async fn a_registry_without_publish_dates_reports_cooldown_as_unavailable() {
+        let now = Utc.with_ymd_and_hms(2026, 4, 22, 12, 0, 0).unwrap();
+        let registry = MockRegistry::new("nuget").with_version("requests", "2.31.0");
+
+        let notes = cooldown_notes_for(&registry, now).await;
+
+        assert_eq!(
+            notes,
+            vec!["cooldown unavailable for nuget".to_string()],
+            "a registry holding no publish dates cannot support cooldown"
+        );
+    }
+
+    /// A lookup that failed never answered the question, so reporting it with
+    /// the wording above tells the user their registry does not support
+    /// cooldown when in fact a retry would work. The two must read differently
+    /// and the failure must name its cause.
+    #[tokio::test]
+    async fn a_failed_publish_date_lookup_is_not_reported_as_an_unsupported_registry() {
+        let now = Utc.with_ymd_and_hms(2026, 4, 22, 12, 0, 0).unwrap();
+        let registry = MockRegistry::new("pypi")
+            .with_version("requests", "2.31.0")
+            .with_unavailable_versions("requests");
+
+        let notes = cooldown_notes_for(&registry, now).await;
+
+        assert_eq!(notes.len(), 1, "one failure, one note, got: {notes:?}");
+        let note = &notes[0];
+        assert_ne!(
+            note, "cooldown unavailable for pypi",
+            "a failed lookup must not read as a registry that cannot support cooldown"
+        );
+        assert!(
+            note.contains("pypi") && note.contains("Version listing failed"),
+            "the note must name the ecosystem and why the lookup failed, got: {note}"
+        );
+    }
+
+    /// Packages resolve concurrently, so which of them reaches a shared outage
+    /// first is not fixed. Reporting whichever arrived first would make the same
+    /// repository state print a different cause from run to run, so the
+    /// representative is chosen by ordering instead of by arrival.
+    #[test]
+    fn the_reported_cause_does_not_depend_on_which_package_hit_it_first() {
+        let options = UpdateOptions::new(true, false);
+
+        options.note_cooldown_unavailable(&CooldownNote {
+            key: "pypi:lookup-failed".to_string(),
+            message: "zzz arrived first".to_string(),
+        });
+        options.note_cooldown_unavailable(&CooldownNote {
+            key: "pypi:lookup-failed".to_string(),
+            message: "aaa arrived second".to_string(),
+        });
+
+        let notes: Vec<String> = options
+            .cooldown_unavailable_notes
+            .lock()
+            .unwrap()
+            .values()
+            .cloned()
+            .collect();
+        assert_eq!(
+            notes,
+            vec!["aaa arrived second".to_string()],
+            "the condition is still one note, and arrival order must not pick it"
+        );
     }
 }

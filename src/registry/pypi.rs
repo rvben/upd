@@ -826,22 +826,27 @@ impl Registry for MultiPyPiRegistry {
         }))
     }
 
+    /// Query indexes in order and return the first non-empty result, so that
+    /// cooldown decisions are based on the same source used for resolution.
+    ///
+    /// An index that fails is not an index that answered "no publish dates".
+    /// The cooldown layer distinguishes the two and tells the user which
+    /// happened, so a failure on every index is reported rather than flattened
+    /// into an empty answer. It still never becomes a hard failure: that call
+    /// degrades to the regular update path.
     async fn list_versions(&self, package: &str) -> Result<Vec<VersionMeta>> {
-        // Query registries in order; return the first non-empty result so that
-        // cooldown decisions are based on the same source used for resolution.
-        // Errors from individual registries are swallowed: cooldown callers
-        // treat an empty result as "metadata unavailable" and fall back to the
-        // regular update path, so a transient failure on one mirror never
-        // turns into a hard failure here.
+        let mut last_error = None;
         for registry in &self.registries {
-            let result = registry.list_versions(package).await;
-            if let Ok(versions) = result
-                && !versions.is_empty()
-            {
-                return Ok(versions);
+            match registry.list_versions(package).await {
+                Ok(versions) if !versions.is_empty() => return Ok(versions),
+                Ok(_) => {}
+                Err(error) => last_error = Some(error),
             }
         }
-        Ok(Vec::new())
+        match last_error {
+            Some(error) => Err(error),
+            None => Ok(Vec::new()),
+        }
     }
 
     /// Every index here is a `PyPiRegistry`, so the answer is a single index's:
@@ -2052,6 +2057,107 @@ mod tests {
                 .unwrap();
 
             assert_eq!(version, "1.5.0");
+        }
+
+        /// The cooldown layer reads an empty version list as "this index holds
+        /// no publish dates" and says so to the user. A later index answering
+        /// empty must not erase the earlier failure, or a rate-limited PyPI
+        /// behind a private index reports as a registry that cannot do cooldown.
+        #[tokio::test]
+        async fn a_failed_index_is_reported_even_when_a_later_index_answers_empty() {
+            let failing = MockServer::start().await;
+            let empty = MockServer::start().await;
+
+            Mock::given(method("GET"))
+                .and(path("/pypi/testpkg/json"))
+                .respond_with(ResponseTemplate::new(403))
+                .expect(1)
+                .mount(&failing)
+                .await;
+
+            Mock::given(method("GET"))
+                .and(path("/pypi/testpkg/json"))
+                .respond_with(ResponseTemplate::new(404))
+                .expect(1)
+                .mount(&empty)
+                .await;
+
+            let multi = MultiPyPiRegistry::from_primary_and_extras(
+                PyPiRegistry::with_index_url(failing.uri()),
+                vec![empty.uri()],
+            );
+
+            let error = multi
+                .list_versions("testpkg")
+                .await
+                .expect_err("a failed index must not be reported as an empty version list");
+            assert!(
+                error.to_string().contains("testpkg"),
+                "the index's error must survive, got: {error}"
+            );
+        }
+
+        /// An index answers empty only for a 404, which is "this package is not
+        /// here" and says nothing about publish dates: an index that has the
+        /// package but no upload timestamps answers with those versions and no
+        /// dates on them. So an earlier empty must not suppress a later index's
+        /// failure - no index that holds the package ever answered, which is the
+        /// failure this reports rather than a registry that cannot do cooldown.
+        #[tokio::test]
+        async fn an_index_without_the_package_does_not_mask_a_later_failure() {
+            let absent = MockServer::start().await;
+            let failing = MockServer::start().await;
+
+            Mock::given(method("GET"))
+                .and(path("/pypi/testpkg/json"))
+                .respond_with(ResponseTemplate::new(404))
+                .expect(1)
+                .mount(&absent)
+                .await;
+
+            Mock::given(method("GET"))
+                .and(path("/pypi/testpkg/json"))
+                .respond_with(ResponseTemplate::new(403))
+                .expect(1)
+                .mount(&failing)
+                .await;
+
+            let multi = MultiPyPiRegistry::from_primary_and_extras(
+                PyPiRegistry::with_index_url(absent.uri()),
+                vec![failing.uri()],
+            );
+
+            multi
+                .list_versions("testpkg")
+                .await
+                .expect_err("an earlier 404 is not an answer about publish dates");
+        }
+
+        /// Every index answering "no dates for this package" is an answer, so
+        /// the set of them is still the empty list and not an error.
+        #[tokio::test]
+        async fn every_index_answering_empty_is_an_empty_answer() {
+            let first = MockServer::start().await;
+            let second = MockServer::start().await;
+
+            for server in [&first, &second] {
+                Mock::given(method("GET"))
+                    .and(path("/pypi/testpkg/json"))
+                    .respond_with(ResponseTemplate::new(404))
+                    .expect(1)
+                    .mount(server)
+                    .await;
+            }
+
+            let multi = MultiPyPiRegistry::from_primary_and_extras(
+                PyPiRegistry::with_index_url(first.uri()),
+                vec![second.uri()],
+            );
+
+            assert!(
+                multi.list_versions("testpkg").await.unwrap().is_empty(),
+                "indexes that answer empty produce an empty answer, not an error"
+            );
         }
 
         #[tokio::test]

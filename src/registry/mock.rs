@@ -18,6 +18,8 @@ pub struct MockRegistry {
     ref_names: HashMap<String, Vec<String>>,
     /// Packages whose ref-name listing fails rather than answering
     unavailable_ref_names: HashSet<String>,
+    /// Packages whose version listing fails rather than answering
+    unavailable_versions: HashSet<String>,
     /// Map of package name + ref to its immutable commit SHA
     resolved_refs: HashMap<(String, String), String>,
     /// Refs whose lookup fails without answering whether they exist
@@ -35,6 +37,7 @@ impl MockRegistry {
             version_metas: HashMap::new(),
             ref_names: HashMap::new(),
             unavailable_ref_names: HashSet::new(),
+            unavailable_versions: HashSet::new(),
             resolved_refs: HashMap::new(),
             unavailable_refs: HashSet::new(),
             name,
@@ -64,6 +67,15 @@ impl MockRegistry {
     /// the registry saying it has no ref concept.
     pub fn with_unavailable_ref_names(mut self, package: &str) -> Self {
         self.unavailable_ref_names.insert(package.to_string());
+        self
+    }
+
+    /// Declare a package whose version listing fails without answering which
+    /// versions exist or when they were published, as a rate limit or an outage
+    /// does. A package with no declared metadata answers with an empty list
+    /// instead, which is the registry saying it publishes no dates.
+    pub fn with_unavailable_versions(mut self, package: &str) -> Self {
+        self.unavailable_versions.insert(package.to_string());
         self
     }
 
@@ -159,6 +171,9 @@ impl Registry for MockRegistry {
     }
 
     async fn list_versions(&self, package: &str) -> Result<Vec<VersionMeta>> {
+        if self.unavailable_versions.contains(package) {
+            return Err(anyhow!("Version listing failed: {package}"));
+        }
         Ok(self.version_metas.get(package).cloned().unwrap_or_default())
     }
 

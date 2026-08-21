@@ -682,8 +682,13 @@ mod tests {
     }
 }
 
+/// Every capability method `CachedRegistry` forwards rather than caches. A
+/// forward that answers on its own behalf returns a plausible "nothing here"
+/// that no caller can distinguish from the real registry's answer, so each one
+/// is pinned by a test that fails when the call stops reaching the inner
+/// registry.
 #[cfg(test)]
-mod ref_forwarding_tests {
+mod forwarding_tests {
     use super::*;
     use crate::registry::GitHubReleasesRegistry;
     use crate::registry::MockRegistry;
@@ -734,11 +739,25 @@ mod ref_forwarding_tests {
     /// the production registry over a mock HTTP server, so passing requires the
     /// call to travel through the decorator and out onto the wire. `expect(1)`,
     /// verified when the server drops, is what makes a silent no-op fail: a
-    /// method left to a trait default never reaches either endpoint.
+    /// method that never asks the inner registry reaches no endpoint.
+    ///
+    /// `list_versions` is here because it is forwarded uncached and the
+    /// cooldown layer reads its empty answer as "this registry publishes no
+    /// dates". A forward that returned an empty list of its own would disable
+    /// cooldown everywhere and report it as a registry limitation.
     #[tokio::test]
-    async fn cached_registry_ref_lookups_reach_the_http_layer() {
+    async fn cached_registry_lookups_reach_the_http_layer() {
         let sha = "1234567890abcdef1234567890abcdef12345678";
         let server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/repos/actions/checkout/releases"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                r#"[{"tag_name": "v4.2.2", "published_at": "2026-01-02T03:04:05Z", "draft": false, "prerelease": false}]"#,
+            ))
+            .expect(1)
+            .mount(&server)
+            .await;
 
         Mock::given(method("GET"))
             .and(path("/repos/actions/checkout/tags"))
@@ -776,6 +795,20 @@ mod ref_forwarding_tests {
                 .await
                 .unwrap(),
             sha
+        );
+
+        let versions = cached.list_versions("actions/checkout").await.unwrap();
+        assert_eq!(
+            versions
+                .iter()
+                .map(|v| v.version.as_str())
+                .collect::<Vec<_>>(),
+            vec!["v4.2.2"],
+            "the decorator must return what the HTTP layer served"
+        );
+        assert!(
+            versions[0].published_at.is_some(),
+            "the publish date cooldown depends on must survive the decorator"
         );
     }
 }

@@ -513,4 +513,37 @@ uMhJbUlN9AYtL2pAGNPK
             "apply(builder).build() must succeed: {client:?}"
         );
     }
+
+    /// An index URL may carry credentials (`UV_INDEX_URL=https://user:token@host`,
+    /// and the 401 hint tells people to configure exactly that), and this error
+    /// reaches the terminal and the JSON report through update errors and
+    /// cooldown notes. Neither may render the userinfo. reqwest omits it from
+    /// its own rendering and `tls_hint` reads only the host, so this guards a
+    /// property two layers already have rather than one this function adds.
+    #[tokio::test]
+    async fn a_send_error_never_renders_the_credentials_in_the_url() {
+        // Nothing listens on port 1, so the request fails without leaving the host.
+        let url = "https://alice:s3cr3t@127.0.0.1:1/simple/requests/";
+        let error = reqwest::Client::new()
+            .get(url)
+            .send()
+            .await
+            .expect_err("nothing listens on port 1");
+
+        let wrapped = wrap_send_err(error, url);
+        for rendered in [
+            format!("{wrapped}"),
+            format!("{wrapped:#}"),
+            format!("{wrapped:?}"),
+        ] {
+            assert!(
+                !rendered.contains("s3cr3t"),
+                "the password must never be rendered, got: {rendered}"
+            );
+            assert!(
+                !rendered.contains("alice"),
+                "the username must never be rendered, got: {rendered}"
+            );
+        }
+    }
 }
