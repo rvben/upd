@@ -29,12 +29,12 @@ use upd::registry::{
     NuGetRegistry, PyPiRegistry, RubyGemsRegistry, TerraformRegistry,
 };
 use upd::updater::{
-    ActionShaUpdate, AnnotatedUpdater, BumpFilter, CargoTomlUpdater, CsprojUpdater,
+    ActionShaUpdate, AnnotatedUpdater, BumpFilter, BumpKind, CargoTomlUpdater, CsprojUpdater,
     DEFAULT_UPDATE_ACTION_SHAS, DiscoverOptions, FileType, GemfileUpdater, GithubActionsUpdater,
     GoModUpdater, Lang, MiseUpdater, PackageJsonUpdater, ParseWarnings, PreCommitUpdater,
     PyProjectUpdater, RegistrySet, RequirementsUpdater, SkipStatus, TerraformUpdater,
-    UpdateOptions, UpdateResult, Updater, discover_files_with, ecosystem_key, read_file_safe,
-    write_file_atomic,
+    UpdateOptions, UpdateResult, Updater, classify_bump, discover_files_with, ecosystem_key,
+    read_file_safe, write_file_atomic,
 };
 use upd::version::match_version_precision;
 
@@ -79,30 +79,15 @@ Pass an explicit path, or run from inside a git repo."
     }
 }
 
-/// Parse version components
-fn parse_version(v: &str) -> Option<(u64, u64, u64)> {
-    let v = v.trim_start_matches('v');
-    let parts: Vec<&str> = v.split('.').collect();
-    let major = parts.first()?.parse().ok()?;
-    let minor = parts.get(1).and_then(|s| s.parse().ok()).unwrap_or(0);
-    let patch = parts.get(2).and_then(|s| s.parse().ok()).unwrap_or(0);
-    Some((major, minor, patch))
-}
-
-/// Classify an update as major, minor, or patch
+/// Classify an update as major, minor, or patch.
+///
+/// Delegates to the library classifier that the write-time `--max-bump` gate
+/// uses, so a change can never be labelled one thing and gated as another.
 fn classify_update(old: &str, new: &str) -> UpdateType {
-    if let (Some((old_major, old_minor, _)), Some((new_major, new_minor, _))) =
-        (parse_version(old), parse_version(new))
-    {
-        if new_major > old_major {
-            return UpdateType::Major;
-        }
-        if new_minor > old_minor {
-            return UpdateType::Minor;
-        }
-        UpdateType::Patch
-    } else {
-        UpdateType::Patch
+    match classify_bump(old, new) {
+        BumpKind::Major => UpdateType::Major,
+        BumpKind::Minor => UpdateType::Minor,
+        BumpKind::Patch => UpdateType::Patch,
     }
 }
 
@@ -4982,22 +4967,6 @@ mod tests {
     use tempfile::tempdir;
     use upd::align::PackageOccurrence;
 
-    #[test]
-    fn test_parse_version() {
-        assert_eq!(parse_version("1.2.3"), Some((1, 2, 3)));
-        assert_eq!(parse_version("v1.2.3"), Some((1, 2, 3)));
-        assert_eq!(parse_version("1.2"), Some((1, 2, 0)));
-        assert_eq!(parse_version("1"), Some((1, 0, 0)));
-        assert_eq!(parse_version("10.20.30"), Some((10, 20, 30)));
-    }
-
-    #[test]
-    fn test_parse_version_invalid() {
-        assert_eq!(parse_version(""), None);
-        assert_eq!(parse_version("abc"), None);
-        assert_eq!(parse_version("a.b.c"), None);
-    }
-
     /// A name with no manifest occurrence but a hit in a scanned lockfile is
     /// lock-only (rule 2); a name occurring in the manifest is not, even
     /// when the same name also appears in the lockfile.
@@ -5056,6 +5025,14 @@ mod tests {
         assert_eq!(classify_update("0.9.0", "1.0.0"), UpdateType::Major);
     }
 
+    /// The reported label has to agree with the ceiling that gates the write,
+    /// so a breaking zero-major step reads as major here too.
+    #[test]
+    fn test_classify_update_zero_major_minor_step_is_major() {
+        assert_eq!(classify_update("0.12", "0.13"), UpdateType::Major);
+        assert_eq!(classify_update("0.12.1", "0.13.0"), UpdateType::Major);
+    }
+
     #[test]
     fn test_classify_update_minor() {
         assert_eq!(classify_update("1.0.0", "1.1.0"), UpdateType::Minor);
@@ -5068,6 +5045,8 @@ mod tests {
         assert_eq!(classify_update("1.0.0", "1.0.1"), UpdateType::Patch);
         assert_eq!(classify_update("1.5.3", "1.5.4"), UpdateType::Patch);
         assert_eq!(classify_update("2.0.0", "2.0.10"), UpdateType::Patch);
+        // Still inside `^0.12`, so still compatible.
+        assert_eq!(classify_update("0.12.1", "0.12.4"), UpdateType::Patch);
     }
 
     #[test]

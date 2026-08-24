@@ -69,6 +69,33 @@ refresh skipped entirely. A directory where only config pins were
 applied is still refreshed, and the changed-package list includes
 those pinned packages so `cargo update -p <pkg>` / `bundle lock --update <pkg>` stay scoped.
 
+## Bump levels
+
+`--only-bump` and `--max-bump` classify a change by comparing the two version
+numbers:
+
+| Change | Level |
+|--------|-------|
+| `1.2.3` -> `2.0.0` | major |
+| `1.2.3` -> `1.3.0` | minor |
+| `1.2.3` -> `1.2.4` | patch |
+| `0.12.1` -> `0.13.0` | **major** |
+| `0.0.3` -> `0.0.4` | **major** |
+| `0.12.1` -> `0.12.4` | patch |
+
+Below `1.0.0` the compatible range is narrower than the version numbers suggest.
+SemVer leaves a zero major version unstable, and Cargo and npm both read `^0.12`
+as `>=0.12, <0.13`, so moving from `0.12` to `0.13` breaks callers exactly the
+way `1.0` to `2.0` does. `upd` therefore classifies such a step as major, which
+holds it behind a `--max-bump minor` ceiling instead of applying it unattended.
+The same reasoning goes one digit further down, where `^0.0.3` means
+`>=0.0.3, <0.0.4` and every release is breaking.
+
+An update above the ceiling is reported as held back, in `files[].capped` and
+`summary.capped`. It is never counted as up to date, and it does not change the
+exit code: the ceiling exists to keep such a change out of the gate, so a run
+can exit `0` with work waiting in `capped`.
+
 ## Stable exit codes
 
 | Code | Meaning |

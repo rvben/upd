@@ -156,9 +156,10 @@ pub fn write_file_atomic(path: &Path, content: &str) -> Result<()> {
 }
 
 /// Coarse bump classification of a version change, used to honor the
-/// `--only-bump` / `--max-bump` ceiling at write time.
+/// `--only-bump` / `--max-bump` ceiling at write time and to label the change
+/// in reports.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum BumpKind {
+pub enum BumpKind {
     Major,
     Minor,
     Patch,
@@ -166,11 +167,22 @@ enum BumpKind {
 
 /// Classify a version change as major / minor / patch.
 ///
-/// This mirrors the reporting classifier in the binary so the write-time gate
-/// and the printed counts always agree: parse the leading `major.minor.patch`
-/// (tolerating a leading `v` and missing segments), and fall back to `Patch`
-/// for anything unparseable or non-increasing.
-fn classify_bump(old: &str, new: &str) -> BumpKind {
+/// Parses the leading `major.minor.patch`, tolerating a leading `v` and
+/// missing segments, and falls back to `Patch` for anything unparseable or
+/// non-increasing.
+///
+/// Below `1.0.0` the compatible range is narrower than the version numbers
+/// suggest. SemVer leaves a zero major version unstable, and Cargo and npm
+/// both read `^0.12` as `>=0.12, <0.13`, so moving a dependency from `0.12` to
+/// `0.13` breaks callers exactly the way `1.0` to `2.0` does. Such a step is
+/// therefore `Major`, which is what holds it behind a `--max-bump minor`
+/// ceiling instead of applying it unattended. The same reasoning goes one
+/// digit further down, where `^0.0.3` means `>=0.0.3, <0.0.4` and every
+/// release is breaking.
+///
+/// This is the single classifier behind both the write-time gate and the
+/// printed labels, so the two cannot disagree about what a change is.
+pub fn classify_bump(old: &str, new: &str) -> BumpKind {
     fn parse(v: &str) -> Option<(u64, u64, u64)> {
         let v = v.trim_start_matches('v');
         let parts: Vec<&str> = v.split('.').collect();
@@ -179,18 +191,22 @@ fn classify_bump(old: &str, new: &str) -> BumpKind {
         let patch = parts.get(2).and_then(|s| s.parse().ok()).unwrap_or(0);
         Some((major, minor, patch))
     }
-    match (parse(old), parse(new)) {
-        (Some((om, oi, _)), Some((nm, ni, _))) => {
-            if nm > om {
-                BumpKind::Major
-            } else if ni > oi {
-                BumpKind::Minor
-            } else {
-                BumpKind::Patch
-            }
-        }
-        _ => BumpKind::Patch,
+    let (Some((om, oi, op)), Some((nm, ni, np))) = (parse(old), parse(new)) else {
+        return BumpKind::Patch;
+    };
+    if nm > om {
+        return BumpKind::Major;
     }
+    if om == 0 {
+        if ni > oi || (oi == 0 && np > op) {
+            return BumpKind::Major;
+        }
+        return BumpKind::Patch;
+    }
+    if ni > oi {
+        return BumpKind::Minor;
+    }
+    BumpKind::Patch
 }
 
 /// Which bump levels are permitted to be written.
@@ -1212,6 +1228,69 @@ mod tests {
     use super::*;
     use std::fs;
     use tempfile::tempdir;
+
+    #[test]
+    fn classify_bump_reads_the_usual_semver_steps() {
+        assert_eq!(classify_bump("1.0.0", "2.0.0"), BumpKind::Major);
+        assert_eq!(classify_bump("1.5.3", "1.6.0"), BumpKind::Minor);
+        assert_eq!(classify_bump("1.5.3", "1.5.4"), BumpKind::Patch);
+        assert_eq!(classify_bump("0.9.0", "1.0.0"), BumpKind::Major);
+    }
+
+    #[test]
+    fn classify_bump_tolerates_a_v_prefix_and_missing_segments() {
+        assert_eq!(classify_bump("v1.2.3", "v2.0.0"), BumpKind::Major);
+        assert_eq!(classify_bump("1", "2"), BumpKind::Major);
+        assert_eq!(classify_bump("1.2", "1.3"), BumpKind::Minor);
+    }
+
+    #[test]
+    fn classify_bump_falls_back_to_patch_for_unparseable_versions() {
+        assert_eq!(classify_bump("abc", "1.0.0"), BumpKind::Patch);
+        assert_eq!(classify_bump("1.0.0", "abc"), BumpKind::Patch);
+        assert_eq!(classify_bump("", "1.0.0"), BumpKind::Patch);
+    }
+
+    /// `^0.12` resolves to `>=0.12, <0.13` under both Cargo and npm, so moving
+    /// to 0.13 is a breaking change wearing a minor version number. Reading it
+    /// as minor is what let `--max-bump minor` apply `reqwest 0.12 -> 0.13`
+    /// unattended and break every caller of a renamed feature.
+    #[test]
+    fn a_zero_major_minor_step_is_breaking() {
+        assert_eq!(classify_bump("0.12", "0.13"), BumpKind::Major);
+        assert_eq!(classify_bump("0.12.1", "0.13.0"), BumpKind::Major);
+        assert_eq!(classify_bump("0.1.0", "0.2.0"), BumpKind::Major);
+
+        let minor_ceiling = BumpFilter {
+            major: false,
+            minor: true,
+            patch: true,
+        };
+        assert!(!minor_ceiling.allows("0.12", "0.13"));
+    }
+
+    /// One digit further down the same rule applies: `^0.0.3` means
+    /// `>=0.0.3, <0.0.4`, so there is no compatible newer release at all.
+    #[test]
+    fn a_zero_zero_patch_step_is_breaking() {
+        assert_eq!(classify_bump("0.0.3", "0.0.4"), BumpKind::Major);
+        assert_eq!(classify_bump("0.0.3", "0.1.0"), BumpKind::Major);
+    }
+
+    /// The narrowing stops at the patch segment of a non-zero minor, which is
+    /// what `^0.12.1` genuinely permits. Without this the whole zero-major
+    /// range would freeze under a minor ceiling.
+    #[test]
+    fn a_zero_major_patch_step_stays_compatible() {
+        assert_eq!(classify_bump("0.12.1", "0.12.4"), BumpKind::Patch);
+
+        let minor_ceiling = BumpFilter {
+            major: false,
+            minor: true,
+            patch: true,
+        };
+        assert!(minor_ceiling.allows("0.12.1", "0.12.4"));
+    }
 
     #[test]
     fn new_lang_wire_values_are_snake_case_and_not_the_clap_names() {
