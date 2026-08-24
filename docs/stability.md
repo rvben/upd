@@ -130,6 +130,12 @@ package locked at several versions produces one `capped` entry per manifest,
 carrying the highest locked version, and produces none at all when a copy within
 the ceiling is already floored to a version that covers the rest.
 
+Sibling projects that lock the same package each answer for themselves. A floor
+is written to a project only if that project's own `.updrc` admits the package,
+so an `ignore` entry keeps the floor out of that manifest (reported in its
+`ignored[]`) without withholding it from a sibling whose config says nothing
+about the package.
+
 ## Stable exit codes
 
 | Code | Meaning |

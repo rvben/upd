@@ -1490,6 +1490,97 @@ async fn ignored_lock_only_package_gets_no_floor() {
     );
 }
 
+/// (7b) Two sibling projects lock the same package at the same version, and
+/// only one of them ignores it. Ignoring is that project's own decision, so
+/// the ignoring project must receive no floor and the other must receive its
+/// own, whichever of the two the triple happens to be deduplicated onto.
+///
+/// Both directions run, and they are each other's control: the run is
+/// otherwise identical, so a verdict taken from one project and applied to
+/// both cannot satisfy both directions. Both ceilings run too, since the
+/// candidate is written under `major` and only reported under `minor`, and the
+/// ignoring project must be left out of either answer.
+#[tokio::test]
+async fn a_sibling_that_ignores_the_package_neither_receives_the_floor_nor_suppresses_it() {
+    let server = wiremock::MockServer::start().await;
+    mount_pypi_latest(&server, "dupdep", "1.2.0").await;
+
+    for (ignoring, wanting) in [("a_proj", "z_proj"), ("z_proj", "a_proj")] {
+        for max_bump in ["major", "minor"] {
+            let tmp = tempfile::tempdir().unwrap();
+            for proj in [ignoring, wanting] {
+                let dir = tmp.path().join(proj);
+                fs::create_dir_all(&dir).unwrap();
+                fs::write(dir.join("pyproject.toml"), PYPROJECT_BARE).unwrap();
+                fs::write(dir.join("uv.lock"), uv_lock_at("dupdep", "0.9.0")).unwrap();
+            }
+            fs::write(
+                tmp.path().join(ignoring).join(".updrc.toml"),
+                "ignore = [\"dupdep\"]\n",
+            )
+            .unwrap();
+
+            let label = format!("ignoring={ignoring} max_bump={max_bump}");
+            let (stdout, stderr, code) = run_with_env(
+                &[
+                    "update",
+                    "--package",
+                    "dupdep",
+                    "--max-bump",
+                    max_bump,
+                    "--format",
+                    "json",
+                    "--no-cache",
+                    ".",
+                ],
+                tmp.path(),
+                &[("UV_INDEX_URL", &server.uri())],
+            );
+
+            // 1 above the ceiling is held back (exit 0), in cap it is a
+            // pending update (exit 1).
+            let expected_code = if max_bump == "major" { 1 } else { 0 };
+            assert_eq!(code, expected_code, "{label}\n{stdout}\nstderr: {stderr}");
+
+            let json: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+            let files = json["files"].as_array().unwrap();
+            let manifest_of = |proj: &str| format!("{proj}/pyproject.toml");
+
+            let ignored = collect_for_path(files, &manifest_of(ignoring), "ignored");
+            assert_eq!(ignored.len(), 1, "{label}: {ignored:?}");
+            assert_eq!(ignored[0]["package"], "dupdep", "{label}");
+            assert_eq!(
+                json["summary"]["ignored"], 1,
+                "{label}: {}",
+                json["summary"]
+            );
+
+            for field in ["updates", "capped"] {
+                let entries = collect_for_path(files, &manifest_of(ignoring), field);
+                assert!(
+                    entries.is_empty(),
+                    "{label}: the project ignoring dupdep must get no {field} entry: {entries:?}"
+                );
+            }
+
+            let updates = collect_for_path(files, &manifest_of(wanting), "updates");
+            let capped = collect_for_path(files, &manifest_of(wanting), "capped");
+            if max_bump == "major" {
+                assert_eq!(updates.len(), 1, "{label}: {updates:?}");
+                assert_eq!(updates[0]["package"], "dupdep", "{label}");
+                assert_eq!(updates[0]["latest"], "1.2.0", "{label}");
+                assert_eq!(updates[0]["status"], "planned", "{label}");
+                assert!(capped.is_empty(), "{label}: {capped:?}");
+            } else {
+                assert_eq!(capped.len(), 1, "{label}: {capped:?}");
+                assert_eq!(capped[0]["package"], "dupdep", "{label}");
+                assert_eq!(capped[0]["available"], "1.2.0", "{label}");
+                assert!(updates.is_empty(), "{label}: {updates:?}");
+            }
+        }
+    }
+}
+
 /// (8) `--no-lock` under `update --package` writes the constraint but never
 /// relocks, reporting `pending_relock`. A `pending_relock` entry is still a
 /// would-be change: it must count in `updates_total`/`files_with_changes`

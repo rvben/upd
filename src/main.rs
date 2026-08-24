@@ -1536,6 +1536,16 @@ async fn run_update(cli: &Cli) -> Result<()> {
             .map(|l| (l.path.clone(), l.kind))
             .collect();
 
+        // A lockfile belongs to exactly one ecosystem, which is what makes
+        // `(lockfile, package)` an unambiguous key for a per-project verdict:
+        // the name alone is shared across ecosystems, and a fix target carries
+        // no ecosystem of its own.
+        let lock_ecosystem_by_path: HashMap<PathBuf, Ecosystem> = lock_scan
+            .packages
+            .iter()
+            .map(|p| (p.lockfile_path.clone(), p.ecosystem))
+            .collect();
+
         // Rule 2: a requested name is lock-only when it matches no manifest
         // occurrence but resolves via at least one scanned lockfile.
         let mut lock_only: Vec<&upd::lockscan::LockedPackage> = Vec::new();
@@ -1576,51 +1586,86 @@ async fn run_update(cli: &Cli) -> Result<()> {
         let mut floor_errors: HashMap<PathBuf, Vec<upd::output::ErrorEntry>> = HashMap::new();
         let mut floor_capped: HashMap<PathBuf, Vec<upd::output::CappedEntry>> = HashMap::new();
 
+        // Lockfiles whose own config ignores the package, so the fan-out below
+        // can be trimmed back to the projects that actually want the floor.
+        let mut ignoring_locks: HashSet<(PathBuf, String)> = HashSet::new();
+
         for locked in &distinct {
-            let Some(kind) = lock_kind_by_path.get(&locked.lockfile_path).copied() else {
-                continue;
-            };
-            let report_path = floor_report_path(&locked.lockfile_path, kind);
-            let lookup_path = floor_config_lookup_path(&locked.lockfile_path, kind);
-            let config = resolve_floor_config(cli, &file_configs, &lookup_path)?;
-            let lang = ecosystem_to_lang(locked.ecosystem);
+            // Sibling projects can hold one triple under different `.updrc`
+            // files, and ignoring is that project's own decision: a project
+            // that ignores the package must not receive the floor, and must not
+            // suppress it for a sibling that does not ignore it. Every holder is
+            // therefore asked, not just the one the triple was deduplicated
+            // onto. The candidate is still resolved once, from the first holder
+            // that does not ignore the package, so a pin or a cooldown
+            // configured against a lock-only name follows that holder rather
+            // than each project's own config.
+            let mut holders = Vec::new();
+            for lp in &lock_only {
+                if lp.name != locked.name
+                    || lp.version != locked.version
+                    || lp.ecosystem != locked.ecosystem
+                {
+                    continue;
+                }
+                let Some(kind) = lock_kind_by_path.get(&lp.lockfile_path).copied() else {
+                    continue;
+                };
+                let report_path = floor_report_path(&lp.lockfile_path, kind);
+                let lookup_path = floor_config_lookup_path(&lp.lockfile_path, kind);
+                let config = resolve_floor_config(cli, &file_configs, &lookup_path)?;
 
-            let raw_policy = match config.as_ref() {
-                Some(cfg) => cfg.to_cooldown_policy(cli.min_age.as_deref())?,
-                None => UpdConfig::default().to_cooldown_policy(cli.min_age.as_deref())?,
-            };
-            let is_noop_cooldown = raw_policy.force_override.is_none()
-                && raw_policy.default <= Duration::zero()
-                && raw_policy.per_ecosystem.is_empty();
-            let cooldown_policy = if is_noop_cooldown {
-                None
-            } else {
-                Some(raw_policy)
-            };
+                let raw_policy = match config.as_ref() {
+                    Some(cfg) => cfg.to_cooldown_policy(cli.min_age.as_deref())?,
+                    None => UpdConfig::default().to_cooldown_policy(cli.min_age.as_deref())?,
+                };
+                let is_noop_cooldown = raw_policy.force_override.is_none()
+                    && raw_policy.default <= Duration::zero()
+                    && raw_policy.per_ecosystem.is_empty();
+                let cooldown_policy = if is_noop_cooldown {
+                    None
+                } else {
+                    Some(raw_policy)
+                };
 
-            let options = build_update_options(
-                dry_run,
-                cli.full_precision,
-                cli.action_sha_override(),
-                config,
-                &cli.packages,
-                &cli.langs,
-                cooldown_policy.as_ref(),
-                Arc::clone(&cooldown_notes),
-                filter.to_bump_filter(),
-            );
+                let options = build_update_options(
+                    dry_run,
+                    cli.full_precision,
+                    cli.action_sha_override(),
+                    config,
+                    &cli.packages,
+                    &cli.langs,
+                    cooldown_policy.as_ref(),
+                    Arc::clone(&cooldown_notes),
+                    filter.to_bump_filter(),
+                );
 
-            if options.should_ignore(&locked.name) {
+                let ignored = options.should_ignore(&lp.name);
+                holders.push((*lp, report_path, options, ignored));
+            }
+
+            for (lp, report_path, _, ignored) in &holders {
+                if !ignored {
+                    continue;
+                }
                 floor_ignored.entry(report_path.clone()).or_default().push(
                     upd::output::IgnoredEntry {
-                        package: locked.name.clone(),
-                        current: locked.version.clone(),
+                        package: lp.name.clone(),
+                        current: lp.version.clone(),
                         line: None,
                         source: None,
                     },
                 );
-                continue;
+                ignoring_locks.insert((
+                    lp.lockfile_path.clone(),
+                    normalized_package_name(&lp.name, lp.ecosystem),
+                ));
             }
+
+            let Some((locked, report_path, options, _)) = holders.iter().find(|h| !h.3) else {
+                continue;
+            };
+            let lang = ecosystem_to_lang(locked.ecosystem);
 
             let registry: &dyn upd::registry::Registry = match locked.ecosystem {
                 Ecosystem::PyPI => pypi.as_ref(),
@@ -1629,7 +1674,7 @@ async fn run_update(cli: &Cli) -> Result<()> {
                 Ecosystem::Go | Ecosystem::RubyGems | Ecosystem::NuGet => continue,
             };
 
-            match resolve_floor_version(registry, &locked.name, &locked.version, lang, &options)
+            match resolve_floor_version(registry, &locked.name, &locked.version, lang, options)
                 .await
             {
                 Ok(FloorResolution::Capped(candidate)) => {
@@ -1638,7 +1683,7 @@ async fn run_update(cli: &Cli) -> Result<()> {
                     // router has been asked whether a floor could be written
                     // here at all, since "held back by the ceiling" promises
                     // that raising the ceiling releases the update.
-                    capped_pending.push((locked, candidate));
+                    capped_pending.push((*locked, candidate));
                 }
                 Ok(FloorResolution::Floor(candidate)) => {
                     synthetic_vulnerable.push(PackageAuditResult {
@@ -1677,6 +1722,24 @@ async fn run_update(cli: &Cli) -> Result<()> {
             }
         }
 
+        // Routing fans one triple out to every lockfile that resolves it,
+        // including the ones whose own project ignores the package. Those
+        // projects have already been reported as `ignored` and must not be
+        // written to, so their targets are dropped before anything reaches a
+        // writer or a capped report.
+        let target_is_ignored = |target: &FixTarget| -> bool {
+            let Some(lockfile) = target.lockfile.as_ref() else {
+                return false;
+            };
+            let Some(ecosystem) = lock_ecosystem_by_path.get(lockfile).copied() else {
+                return false;
+            };
+            ignoring_locks.contains(&(
+                lockfile.clone(),
+                normalized_package_name(&target.package, ecosystem),
+            ))
+        };
+
         // Shared by the real routing pass and the capped classification pass
         // below, both of which ask the same question of the same locks.
         let prov = if synthetic_vulnerable.is_empty() && capped_pending.is_empty() {
@@ -1702,11 +1765,12 @@ async fn run_update(cli: &Cli) -> Result<()> {
                 errors: Vec::new(),
                 warnings: Vec::new(),
             };
-            let routing = route_fix_targets(
+            let mut routing = route_fix_targets(
                 &synthetic_audit,
                 prov.as_ref().expect("prov built for a non-empty floor set"),
                 &manifest_packages,
             );
+            routing.targets.retain(|target| !target_is_ignored(target));
 
             let opts = FixApplyOptions {
                 dry_run,
@@ -1778,6 +1842,12 @@ async fn run_update(cli: &Cli) -> Result<()> {
             // representative's own manifest, leaving every other project
             // holding the same package looking up to date.
             for target in &routing.targets {
+                // A project whose own config ignores the package is not waiting
+                // on the ceiling, and has been reported as `ignored` already.
+                if target_is_ignored(target) {
+                    continue;
+                }
+
                 // Routing places a target without reading the manifest or the
                 // apply options, so a target alone does not mean the floor can
                 // be written: an existing uv constraint upd will not rewrite,
