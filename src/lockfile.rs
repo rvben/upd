@@ -390,11 +390,21 @@ fn cargo_compat_key(version: &str) -> Option<(usize, u64)> {
     Some((2, 0))
 }
 
-/// The versions `Cargo.lock` holds, keyed by package name.
+/// What `Cargo.lock` records about the packages sharing one name.
+#[derive(Default)]
+struct LockedCrate {
+    /// Every locked version, in the order the lockfile lists them.
+    versions: Vec<String>,
+    /// The versions a workspace member depends on, which are the edges the
+    /// rewritten manifests own.
+    direct: Vec<String>,
+}
+
+/// What `Cargo.lock` holds, keyed by package name.
 ///
 /// An unreadable or unparseable lockfile answers empty, which leaves every
 /// spec bare and hands the diagnosis to cargo.
-fn locked_versions(lock_path: &Path) -> HashMap<String, Vec<String>> {
+fn locked_versions(lock_path: &Path) -> HashMap<String, LockedCrate> {
     #[derive(serde::Deserialize)]
     struct Lock {
         #[serde(default)]
@@ -404,6 +414,9 @@ fn locked_versions(lock_path: &Path) -> HashMap<String, Vec<String>> {
     struct LockPackage {
         name: String,
         version: String,
+        source: Option<String>,
+        #[serde(default)]
+        dependencies: Vec<String>,
     }
 
     let Ok(text) = std::fs::read_to_string(lock_path) else {
@@ -413,14 +426,34 @@ fn locked_versions(lock_path: &Path) -> HashMap<String, Vec<String>> {
         return HashMap::new();
     };
 
-    let mut versions: HashMap<String, Vec<String>> = HashMap::new();
-    for package in lock.package {
-        versions
-            .entry(package.name)
+    let mut crates: HashMap<String, LockedCrate> = HashMap::new();
+    for package in &lock.package {
+        crates
+            .entry(package.name.clone())
             .or_default()
-            .push(package.version);
+            .versions
+            .push(package.version.clone());
     }
-    versions
+
+    // A workspace member carries no source, so its dependency list is the set of
+    // edges the manifests declare. Cargo writes an edge as a bare name and adds
+    // the version only where the name alone would be ambiguous, which is exactly
+    // the case a spec has to resolve.
+    for package in &lock.package {
+        if package.source.is_some() {
+            continue;
+        }
+        for edge in &package.dependencies {
+            let mut parts = edge.split_whitespace();
+            let (Some(name), Some(version)) = (parts.next(), parts.next()) else {
+                continue;
+            };
+            if let Some(entry) = crates.get_mut(name) {
+                entry.direct.push(version.to_string());
+            }
+        }
+    }
+    crates
 }
 
 /// Every version `name` is required at by a parsed `Cargo.toml`, across the
@@ -474,16 +507,28 @@ fn manifest_requirements(manifest: &toml::Table, name: &str) -> Vec<String> {
 /// `upd` just rewrote; a declaration the lockfile still satisfies is left
 /// alone. A declaration whose key the lockfile does not carry at all has just
 /// crossed a compatibility boundary, and is anchored on the entry it left
-/// behind. Falls back to every entry a declaration claims, and to nothing at all
-/// when even that is unclear, so the caller can hand the ambiguity back to cargo
-/// rather than guess.
-fn locked_entries_to_update<'a>(requirements: &[String], locked: &'a [String]) -> Vec<&'a str> {
-    fn is_below<'a>(locked: &'a [String], floor: &str) -> impl Iterator<Item = &'a str> {
+/// behind, which the lockfile's own dependency edges name. Falls back to every
+/// entry a declaration claims, and to nothing at all when even that is unclear,
+/// so the caller can hand the ambiguity back to cargo rather than guess.
+fn locked_entries_to_update<'a>(requirements: &[String], locked: &'a LockedCrate) -> Vec<&'a str> {
+    let below = |floor: &str| -> Vec<&'a str> {
         let floor = floor.to_string();
-        locked.iter().map(String::as_str).filter(move |version| {
-            crate::version::compare::compare_versions(version, &floor) == std::cmp::Ordering::Less
-        })
-    }
+        locked
+            .versions
+            .iter()
+            .map(String::as_str)
+            .filter(|version| {
+                crate::version::compare::compare_versions(version, &floor)
+                    == std::cmp::Ordering::Less
+            })
+            .collect()
+    };
+    let highest = |versions: Vec<&'a str>| -> Option<&'a str> {
+        versions
+            .into_iter()
+            .max_by(|a, b| crate::version::compare::compare_versions(a, b))
+    };
+    let is_direct = |version: &&str| locked.direct.iter().any(|edge| edge == version);
 
     let mut matched: Vec<&str> = Vec::new();
     let mut stale: Vec<&str> = Vec::new();
@@ -497,13 +542,25 @@ fn locked_entries_to_update<'a>(requirements: &[String], locked: &'a [String]) -
         let Some(key) = cargo_compat_key(floor) else {
             continue;
         };
-        let entry = locked
+        let candidates: Vec<&str> = locked
+            .versions
             .iter()
             .map(String::as_str)
-            .find(|version| cargo_compat_key(version) == Some(key));
-        let Some(version) = entry else {
-            unsatisfied.push(floor);
-            continue;
+            .filter(|version| cargo_compat_key(version) == Some(key))
+            .collect();
+        // More than one candidate means same-key entries from different sources,
+        // which only a dependency edge can tell apart. Without one the choice
+        // would be a guess, so the whole name goes back to cargo.
+        let version = match candidates.as_slice() {
+            [] => {
+                unsatisfied.push(floor);
+                continue;
+            }
+            [only] => *only,
+            many => match many.iter().copied().filter(is_direct).collect::<Vec<_>>()[..] {
+                [only] => only,
+                _ => return Vec::new(),
+            },
         };
         if !matched.contains(&version) {
             matched.push(version);
@@ -517,17 +574,18 @@ fn locked_entries_to_update<'a>(requirements: &[String], locked: &'a [String]) -
 
     // Cargo has to add a version no locked entry can satisfy whatever it is
     // told, so the spec only has to name an entry unambiguously enough for cargo
-    // to re-resolve from. The version nearest below the floor is the one the
-    // rewritten declaration moved off, and one no other declaration still claims
-    // is preferred, so an unchanged sibling declaration keeps its own entry.
+    // to re-resolve from. The entry the rewritten declaration moved off is the
+    // one the lockfile still records as a direct edge; failing that, the version
+    // nearest below the floor, preferring one no other declaration still claims
+    // so an unchanged sibling declaration keeps its own entry.
     for floor in unsatisfied {
-        let anchor = is_below(locked, floor)
+        let unclaimed: Vec<&str> = below(floor)
+            .into_iter()
             .filter(|version| !matched.contains(version))
-            .max_by(|a, b| crate::version::compare::compare_versions(a, b))
-            .or_else(|| {
-                is_below(locked, floor)
-                    .max_by(|a, b| crate::version::compare::compare_versions(a, b))
-            });
+            .collect();
+        let anchor = highest(unclaimed.iter().copied().filter(is_direct).collect())
+            .or_else(|| highest(unclaimed))
+            .or_else(|| highest(below(floor)));
         if let Some(anchor) = anchor
             && !stale.contains(&anchor)
         {
@@ -551,14 +609,9 @@ fn locked_entries_to_update<'a>(requirements: &[String], locked: &'a [String]) -
 /// refuses the entire command rather than guess which one is meant. Those names
 /// are qualified with the locked version the manifest asks for, or, when a
 /// cross-major bump has left the manifest asking for a version the lockfile
-/// does not carry at all, with the entry nearest below it. Every other name
-/// stays bare, and so does one whose entry cannot be singled out, leaving cargo
-/// to report the ambiguity itself.
-///
-/// Known limitation: two same-name entries that are semver-compatible but come
-/// from different sources (a path or git checkout beside the registry) share a
-/// compatibility key, so `name@version` does not separate them either. Those
-/// stay bare and cargo still reports them.
+/// does not carry at all, with the entry the lockfile still records as a direct
+/// edge. Every other name stays bare, and so does one whose entry cannot be
+/// singled out, leaving cargo to report the ambiguity itself.
 fn cargo_update_specs(manifest_path: &Path, changed: &[String]) -> Vec<String> {
     let dir = manifest_path.parent().unwrap_or(Path::new("."));
     let locked = locked_versions(&dir.join("Cargo.lock"));
@@ -569,10 +622,10 @@ fn cargo_update_specs(manifest_path: &Path, changed: &[String]) -> Vec<String> {
     changed
         .iter()
         .flat_map(|name| {
-            let Some(versions) = locked.get(name) else {
+            let Some(entry) = locked.get(name) else {
                 return vec![name.clone()];
             };
-            if versions.len() < 2 {
+            if entry.versions.len() < 2 {
                 return vec![name.clone()];
             }
             let requirements = manifest
@@ -580,7 +633,7 @@ fn cargo_update_specs(manifest_path: &Path, changed: &[String]) -> Vec<String> {
                 .map(|doc| manifest_requirements(doc, name))
                 .unwrap_or_default();
 
-            match locked_entries_to_update(&requirements, versions).as_slice() {
+            match locked_entries_to_update(&requirements, entry).as_slice() {
                 [] => vec![name.clone()],
                 entries => entries
                     .iter()
@@ -732,11 +785,8 @@ mod tests {
     /// Write a Cargo project whose lockfile holds two majors of `thiserror`
     /// and one `serde`, and answer the `-p` specs for updating both.
     fn specs_for(manifest_body: &str) -> Vec<String> {
-        let dir = tempdir().unwrap();
-        let manifest = dir.path().join("Cargo.toml");
-        fs::write(&manifest, manifest_body).unwrap();
-        fs::write(
-            dir.path().join("Cargo.lock"),
+        specs_for_lock(
+            manifest_body,
             r#"version = 4
 
 [[package]]
@@ -752,7 +802,14 @@ name = "thiserror"
 version = "2.0.18"
 "#,
         )
-        .unwrap();
+    }
+
+    /// As [`specs_for`], with a lockfile the test writes itself.
+    fn specs_for_lock(manifest_body: &str, lock_body: &str) -> Vec<String> {
+        let dir = tempdir().unwrap();
+        let manifest = dir.path().join("Cargo.toml");
+        fs::write(&manifest, manifest_body).unwrap();
+        fs::write(dir.path().join("Cargo.lock"), lock_body).unwrap();
         cargo_update_specs(&manifest, &["serde".to_string(), "thiserror".to_string()])
     }
 
@@ -820,6 +877,112 @@ version = "2.0.18"
             "[build-dependencies]\nthiserror = \"3.0.1\"\n",
         ));
         assert_eq!(specs, vec!["serde", "thiserror@1.0.69"]);
+    }
+
+    /// A lockfile whose workspace member depends on `thiserror` at the version
+    /// `edge` names, beside a transitive copy of the other major.
+    fn lock_with_direct_edge(edge: &str) -> String {
+        format!(
+            r#"version = 4
+
+[[package]]
+name = "fixture"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "thiserror {edge}",
+]
+
+[[package]]
+name = "serde"
+version = "1.0.228"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+dependencies = [
+ "thiserror 2.0.18",
+]
+
+[[package]]
+name = "thiserror"
+version = "1.0.69"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+
+[[package]]
+name = "thiserror"
+version = "2.0.18"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+"#
+        )
+    }
+
+    #[test]
+    fn a_major_jump_anchors_on_the_entry_the_lockfile_calls_direct() {
+        let specs = specs_for_lock(
+            "[dependencies]\nserde = \"1.0.228\"\nthiserror = \"3.0.1\"\n",
+            &lock_with_direct_edge("1.0.69"),
+        );
+        // 2.0.18 sits nearer below 3.0.1, but 1.0.69 is the copy the manifest
+        // declared before the jump, so the transitive 2.x is left alone.
+        assert_eq!(specs, vec!["serde", "thiserror@1.0.69"]);
+    }
+
+    #[test]
+    fn same_key_entries_are_told_apart_by_the_direct_edge() {
+        let lock = r#"version = 4
+
+[[package]]
+name = "fixture"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "thiserror 1.1.0",
+]
+
+[[package]]
+name = "serde"
+version = "1.0.228"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+
+[[package]]
+name = "thiserror"
+version = "1.0.69"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+
+[[package]]
+name = "thiserror"
+version = "1.1.0"
+source = "git+https://example.invalid/thiserror#0c0ffee"
+"#;
+        let specs = specs_for_lock(
+            "[dependencies]\nserde = \"1.0.228\"\nthiserror = \"1.2.0\"\n",
+            lock,
+        );
+        assert_eq!(specs, vec!["serde", "thiserror@1.1.0"]);
+    }
+
+    #[test]
+    fn same_key_entries_no_edge_tells_apart_stay_bare() {
+        let lock = r#"version = 4
+
+[[package]]
+name = "serde"
+version = "1.0.228"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+
+[[package]]
+name = "thiserror"
+version = "1.0.69"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+
+[[package]]
+name = "thiserror"
+version = "1.1.0"
+source = "git+https://example.invalid/thiserror#0c0ffee"
+"#;
+        let specs = specs_for_lock(
+            "[dependencies]\nserde = \"1.0.228\"\nthiserror = \"1.2.0\"\n",
+            lock,
+        );
+        assert_eq!(specs, vec!["serde", "thiserror"]);
     }
 
     #[test]
