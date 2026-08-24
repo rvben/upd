@@ -158,15 +158,14 @@ jobs:
       - name: Install base build tools
         run: mise install rust python
 
-      - name: Install cargo tool bootstrap
-        run: mise install cargo-binstall
-
-      - name: Install Rust build tool
-        run: mise install cargo:maturin
+      - name: Install attested maturin binary
+        run: mise install github:PyO3/maturin
 
       - name: Install Linux cross-compilation tools
         if: matrix.os == 'ubuntu-latest'
-        run: mise install zig cargo:cargo-zigbuild
+        run: |
+          mise install cargo-binstall
+          mise install zig cargo:cargo-zigbuild
 
       - name: Verify zig installation
         if: matrix.os == 'ubuntu-latest'
@@ -254,10 +253,8 @@ jobs:
           install: false
       - name: Install base source-distribution tools
         run: mise install rust python
-      - name: Install cargo tool bootstrap
-        run: mise install cargo-binstall
-      - name: Install maturin
-        run: mise install cargo:maturin
+      - name: Install attested maturin binary
+        run: mise install github:PyO3/maturin
       - name: Build source distribution
         run: mise exec -- maturin sdist
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1

@@ -160,12 +160,13 @@ fn ci_and_release_jobs_install_only_the_tools_they_use() {
         );
     }
     assert_eq!(CI_WORKFLOW.matches("run: mise install rust").count(), 2);
-    assert!(RELEASE_WORKFLOW.contains("run: mise install cargo-binstall"));
+    assert!(RELEASE_WORKFLOW.contains("mise install cargo-binstall"));
     assert!(!RELEASE_WORKFLOW.contains("mise install cargo:cargo-binstall"));
-    assert!(RELEASE_WORKFLOW.contains("run: mise install cargo:maturin"));
+    assert!(RELEASE_WORKFLOW.contains("run: mise install github:PyO3/maturin"));
+    assert!(!RELEASE_WORKFLOW.contains("mise install cargo:maturin"));
     assert!(!RELEASE_WORKFLOW.contains("mise install rust python zig"));
     assert!(RELEASE_WORKFLOW.contains(
-        "if: matrix.os == 'ubuntu-latest'\n        run: mise install zig cargo:cargo-zigbuild"
+        "if: matrix.os == 'ubuntu-latest'\n        run: |\n          mise install cargo-binstall\n          mise install zig cargo:cargo-zigbuild"
     ));
 
     let mise: toml::Value =
@@ -180,6 +181,14 @@ fn ci_and_release_jobs_install_only_the_tools_they_use() {
         mise["tools"].get("cargo:cargo-binstall").is_none(),
         "cargo-binstall must not bootstrap itself from source",
     );
+    assert_eq!(mise["min_version"].as_str(), Some("2026.4.19"));
+    assert!(
+        mise["tools"]["github:PyO3/maturin"]
+            .as_str()
+            .is_some_and(|version| !version.is_empty()),
+        "maturin must use mise's attestation-verifying GitHub backend",
+    );
+    assert!(mise["tools"].get("cargo:maturin").is_none());
     assert_eq!(
         mise["settings"]["cargo"]["binstall"].as_bool(),
         Some(true),
@@ -193,6 +202,7 @@ fn ci_and_release_jobs_install_only_the_tools_they_use() {
         .as_str()
         .expect("setup task should be a script");
     assert!(!setup.lines().any(|line| line.trim() == "mise install"));
+    assert!(setup.contains("mise install github:PyO3/maturin"));
     assert!(setup.contains("mise install cargo-binstall"));
 }
 

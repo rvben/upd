@@ -1,4 +1,5 @@
 # mise configuration for upd development environment
+min_version = "2026.4.19"
 
 [env]
 RUST_BACKTRACE = "1"
@@ -20,8 +21,10 @@ actionlint = "1.7.12"
 # Binary installer bootstrapped from its attested GitHub release via mise's registry
 cargo-binstall = "1.22.0"
 
+# Release tooling installed from attested GitHub artifacts
+"github:PyO3/maturin" = "1.14.1"
+
 # Development tools installed via cargo-binstall
-"cargo:maturin" = "1.14.1"
 "cargo:cargo-zigbuild" = "0.23.0"
 
 # Zig for cross-compilation
@@ -37,8 +40,9 @@ description = "Set up the development environment"
 run = """
 echo "Setting up upd development environment..."
 mise install rust python uv actionlint zig
+mise install github:PyO3/maturin
 mise install cargo-binstall
-mise install cargo:maturin cargo:cargo-zigbuild
+mise install cargo:cargo-zigbuild
 uv tool install twine
 echo "Setup complete!"
 mise list
