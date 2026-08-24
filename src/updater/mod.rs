@@ -183,12 +183,24 @@ pub enum BumpKind {
 /// This is the single classifier behind both the write-time gate and the
 /// printed labels, so the two cannot disagree about what a change is.
 pub fn classify_bump(old: &str, new: &str) -> BumpKind {
+    /// Read the version numbers out of a version or a range spec. A spec
+    /// (`^1.2.3`, `>=1.0`, `~=1.4`, `>=1.0.0 <2.0.0`) reaches here verbatim
+    /// wherever an updater records the string it found in the manifest, and
+    /// the numbers that decide its bump level are the lower bound's - the
+    /// same anchor the ceiling compares. Leading operators are dropped and
+    /// everything from the first character that is neither a digit nor a dot
+    /// is ignored, which also trims a prerelease or build suffix.
     fn parse(v: &str) -> Option<(u64, u64, u64)> {
-        let v = v.trim_start_matches('v');
-        let parts: Vec<&str> = v.split('.').collect();
-        let major = parts.first()?.parse().ok()?;
-        let minor = parts.get(1).and_then(|s| s.parse().ok()).unwrap_or(0);
-        let patch = parts.get(2).and_then(|s| s.parse().ok()).unwrap_or(0);
+        let v = v.trim_start_matches(|c: char| {
+            matches!(c, '^' | '~' | '>' | '<' | '=' | '!' | 'v' | 'V') || c.is_whitespace()
+        });
+        let end = v
+            .find(|c: char| !c.is_ascii_digit() && c != '.')
+            .unwrap_or(v.len());
+        let mut parts = v[..end].split('.');
+        let major = parts.next()?.parse().ok()?;
+        let minor = parts.next().and_then(|s| s.parse().ok()).unwrap_or(0);
+        let patch = parts.next().and_then(|s| s.parse().ok()).unwrap_or(0);
         Some((major, minor, patch))
     }
     let (Some((om, oi, op)), Some((nm, ni, np))) = (parse(old), parse(new)) else {
@@ -1242,6 +1254,23 @@ mod tests {
         assert_eq!(classify_bump("v1.2.3", "v2.0.0"), BumpKind::Major);
         assert_eq!(classify_bump("1", "2"), BumpKind::Major);
         assert_eq!(classify_bump("1.2", "1.3"), BumpKind::Minor);
+    }
+
+    /// Range specs reach the classifier verbatim: npm comparator ranges from
+    /// the package.json updater, and caret/tilde specs anywhere a raw spec is
+    /// recorded. The ceiling gates on the range's lower bound, so the level
+    /// reported for one has to be the level the ceiling gated on. Reading the
+    /// whole range string instead falls through to `patch`, which tells the
+    /// reader a patch ceiling would let the change through when it would not.
+    #[test]
+    fn classify_bump_reads_the_lower_bound_of_a_range_spec() {
+        assert_eq!(
+            classify_bump(">=1.0.0 <2.0.0", ">=1.5.0 <2.0.0"),
+            BumpKind::Minor
+        );
+        assert_eq!(classify_bump("^1.2.3", "^2.0.0"), BumpKind::Major);
+        assert_eq!(classify_bump(">=1.0,<2.0", ">=1.0.1,<2.0"), BumpKind::Patch);
+        assert_eq!(classify_bump("~=1.4", "~=1.5"), BumpKind::Minor);
     }
 
     #[test]

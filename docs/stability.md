@@ -91,6 +91,11 @@ holds it behind a `--max-bump minor` ceiling instead of applying it unattended.
 The same reasoning goes one digit further down, where `^0.0.3` means
 `>=0.0.3, <0.0.4` and every release is breaking.
 
+Where a manifest pins a range rather than an exact version (`^1.2.3`, `>=1.0`,
+`~=1.4`), the level is read from the range's lower bound, which is the same
+anchor the ceiling compares. A spec and a bare version therefore always report
+the level that decided whether the change was let through.
+
 An update above the ceiling is reported as held back, in `files[].capped` and
 `summary.capped`. It is never counted as up to date, and it does not change the
 exit code: the ceiling exists to keep such a change out of the gate, so a run

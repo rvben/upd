@@ -473,6 +473,65 @@ async fn a_capped_update_is_reported_in_json() {
     );
 }
 
+/// A comparator spec whose anchor is not full semver (`>=1.0`) goes through
+/// the range module, which records the spec verbatim, operator and all. The
+/// report classifier therefore sees `>=1.0`, not a bare version. The ceiling
+/// gated on the spec's lower bound; the level reported has to be that same
+/// level, or the reader is told a patch ceiling would let this through when
+/// raising it to minor is what it takes.
+#[tokio::test]
+async fn a_capped_comparator_range_reports_the_level_the_ceiling_gated_on() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/examplepkg"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "name": "examplepkg",
+            "dist-tags": { "latest": "1.5.0" },
+            "versions": {
+                "1.0.0": { "name": "examplepkg", "version": "1.0.0" },
+                "1.5.0": { "name": "examplepkg", "version": "1.5.0" }
+            }
+        })))
+        .mount(&server)
+        .await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    fs::write(
+        tmp.path().join("package.json"),
+        r#"{"name": "t", "version": "1.0.0", "dependencies": {"examplepkg": ">=1.0"}}"#,
+    )
+    .unwrap();
+    let path_str = tmp.path().to_str().unwrap().to_string();
+
+    let (stdout, stderr, _code) = run_with_env(
+        &[
+            "--check",
+            "--no-cache",
+            "--max-bump",
+            "patch",
+            "-o",
+            "json",
+            &path_str,
+        ],
+        tmp.path(),
+        &[("NPM_REGISTRY", &server.uri())],
+    );
+
+    let report: serde_json::Value = serde_json::from_str(&stdout)
+        .unwrap_or_else(|e| panic!("stdout is not JSON ({e}): {stdout}; stderr: {stderr}"));
+
+    let capped = &report["files"][0]["capped"];
+    assert_eq!(capped[0]["package"], "examplepkg", "report: {report}");
+    assert_eq!(
+        capped[0]["bump"], "minor",
+        "the ceiling compared 1.0.0 with 1.5.0, so the report must say minor; report: {report}"
+    );
+}
+
 /// `--max-bump patch` must skip both a minor and a major update.
 #[tokio::test]
 async fn max_bump_patch_skips_minor_and_major_updates() {
