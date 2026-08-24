@@ -425,8 +425,14 @@ impl CargoTomlUpdater {
                             result.unchanged += 1;
                         } else if !options.allows_bump(&current_version, &matched_version) {
                             // Bump level exceeds the --only-bump/--max-bump ceiling:
-                            // leave the dependency untouched.
-                            result.unchanged += 1;
+                            // leave the dependency untouched, and record that a
+                            // newer release is waiting on a human.
+                            result.record_capped(
+                                &key,
+                                &current_version,
+                                &matched_version,
+                                line_num,
+                            );
                         } else {
                             let new_version_req = format!("{}{}", prefix, matched_version);
                             if let Some(item) = table.get_mut(&key) {

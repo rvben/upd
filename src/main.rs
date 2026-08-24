@@ -195,6 +195,18 @@ enum UpdateType {
     Patch,
 }
 
+impl UpdateType {
+    /// The wire token for this bump level, shared by the JSON `bump` field and
+    /// the text report so the two always agree.
+    fn as_str(self) -> &'static str {
+        match self {
+            UpdateType::Major => "major",
+            UpdateType::Minor => "minor",
+            UpdateType::Patch => "patch",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum ChangeKind {
     RegistryUpdate,
@@ -566,6 +578,7 @@ fn empty_floor_report(path: &Path) -> upd::output::UpdateFileReport {
         held_back: Vec::new(),
         skipped_by_cooldown: Vec::new(),
         skipped: Vec::new(),
+        capped: Vec::new(),
         errors: Vec::new(),
         warnings: Vec::new(),
     }
@@ -1734,11 +1747,7 @@ async fn run_update(cli: &Cli) -> Result<()> {
                 package: target.package.clone(),
                 current: target.from_version.clone(),
                 latest: target.to_version.clone(),
-                bump: match classify_update(&target.from_version, &target.to_version) {
-                    UpdateType::Major => "major",
-                    UpdateType::Minor => "minor",
-                    UpdateType::Patch => "patch",
-                },
+                bump: classify_update(&target.from_version, &target.to_version).as_str(),
                 line: None,
                 method: Some(target.kind.method()),
                 status: Some(outcome.status.as_str()),
@@ -1763,11 +1772,7 @@ async fn run_update(cli: &Cli) -> Result<()> {
                 package: u.package.clone(),
                 current: current.clone(),
                 latest: latest.clone(),
-                bump: match classify_update(&current, &latest) {
-                    UpdateType::Major => "major",
-                    UpdateType::Minor => "minor",
-                    UpdateType::Patch => "patch",
-                },
+                bump: classify_update(&current, &latest).as_str(),
                 line: None,
                 method: u.method,
                 status: Some("unfixable"),
@@ -2056,11 +2061,7 @@ fn emit_update_json(input: UpdateReportInput<'_>, bounded: &BoundedOutputParams<
                 sf.file_type,
                 &sf.result,
                 cooldown_policy,
-                |old, new| match classify_update(old, new) {
-                    UpdateType::Major => "major",
-                    UpdateType::Minor => "minor",
-                    UpdateType::Patch => "patch",
-                },
+                |old, new| classify_update(old, new).as_str(),
             )
         })
         .collect();
@@ -2123,6 +2124,7 @@ fn emit_update_json(input: UpdateReportInput<'_>, bounded: &BoundedOutputParams<
             .iter()
             .filter(|s| s.status == SkipStatus::NotExamined)
             .count(),
+        capped: total_result.capped.len(),
     };
 
     files.extend(floor_reports);
@@ -2339,14 +2341,30 @@ async fn run_interactive_update(
 
     if !has_interactive_changes(&pending_updates, &scanned_results) {
         if !cli.quiet {
-            // Failed lookups count as interactive changes (see
-            // has_interactive_changes), so this branch is only reached when
-            // every lookup succeeded and the tick is accurate.
-            println!(
-                "{} Scanned {} file(s), all dependencies up to date",
-                "✓".green(),
-                files.len()
-            );
+            // A capped update has nothing to prompt for, since the ceiling
+            // already decided it. It still means something is waiting, so it
+            // must not be reported as up to date.
+            let capped: usize = scanned_results
+                .iter()
+                .map(|scanned| scanned.result.capped.len())
+                .sum();
+            if capped > 0 {
+                println!(
+                    "{} Scanned {} file(s), {} update(s) held back by the bump ceiling (--max-bump/--only-bump)",
+                    "!".yellow().bold(),
+                    files.len(),
+                    capped.to_string().yellow().bold()
+                );
+            } else {
+                // Failed lookups count as interactive changes (see
+                // has_interactive_changes), so this branch is only reached when
+                // every lookup succeeded and the tick is accurate.
+                println!(
+                    "{} Scanned {} file(s), all dependencies up to date",
+                    "✓".green(),
+                    files.len()
+                );
+            }
         }
         return Ok(());
     }
@@ -4555,6 +4573,7 @@ fn print_file_result(
         && result.held_back.is_empty()
         && result.skipped_by_cooldown.is_empty()
         && result.skipped.is_empty()
+        && result.capped.is_empty()
     {
         return;
     }
@@ -4672,6 +4691,27 @@ fn print_file_result(
         }
     }
 
+    // An update the ceiling held back always prints, whatever the --filter:
+    // filters narrow which updates get written, and this one was not written.
+    // Naming the bump that exceeded the ceiling says what raising it would let
+    // through.
+    for capped in &result.capped {
+        let location = match capped.line_number {
+            Some(n) => format!("{}:{}:", path, n),
+            None => format!("{}:", path),
+        };
+        println!(
+            "{} {} {} {} {} {} ({} bump)",
+            location.blue().underline(),
+            "Held back".yellow(),
+            capped.package.bold(),
+            capped.current.dimmed(),
+            "→".dimmed(),
+            capped.available.cyan(),
+            classify_update(&capped.current, &capped.available).as_str()
+        );
+    }
+
     // A blocked pin needs attention on the line it is on, so it always prints.
     // A not-examined pin is the steady state for anyone who leaves SHA-pin
     // updates off, and a repo that pins every action would otherwise emit a
@@ -4766,6 +4806,7 @@ fn print_summary(
         .filter(|s| s.status == SkipStatus::Blocked)
         .count();
     let not_examined_count = result.skipped.len() - blocked_count;
+    let capped_count = result.capped.len();
 
     if filtered_total == 0
         && pinned_count == 0
@@ -4773,6 +4814,7 @@ fn print_summary(
         && skipped_cooldown_count == 0
         && blocked_count == 0
         && not_examined_count == 0
+        && capped_count == 0
     {
         print_nothing_to_update_line(file_count, result.unchanged, result.errors.len());
     } else {
@@ -4815,6 +4857,17 @@ fn print_summary(
                 "{} {} package(s) to configured versions",
                 pinned_action,
                 pinned_count.to_string().cyan().bold()
+            );
+        }
+
+        // Show capped count. These are real waiting updates, so the line has to
+        // appear even when nothing was written, or the run reads as "all up to
+        // date" while a major release sits there.
+        if capped_count > 0 {
+            println!(
+                "{} {} package(s) held back by the bump ceiling (--max-bump/--only-bump)",
+                "Held back".yellow(),
+                capped_count.to_string().yellow().bold()
             );
         }
 

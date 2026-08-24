@@ -585,7 +585,12 @@ impl PyProjectUpdater {
                             result.unchanged += 1;
                         } else if !options.allows_bump(&current_version, &matched_version) {
                             // Bump level exceeds the --only-bump/--max-bump ceiling.
-                            result.unchanged += 1;
+                            result.record_capped(
+                                &package,
+                                &current_version,
+                                &matched_version,
+                                line_num,
+                            );
                         } else {
                             let updated = self.update_dependency(&dep_str, &matched_version);
                             result.updated.push((
@@ -809,7 +814,7 @@ impl PyProjectUpdater {
                             result.unchanged += 1;
                         } else if !options.allows_bump(&version, &matched_version) {
                             // Bump level exceeds the --only-bump/--max-bump ceiling.
-                            result.unchanged += 1;
+                            result.record_capped(&key, &version, &matched_version, line_num);
                         } else {
                             let new_val = format!("{}{}", prefix, matched_version);
                             result.updated.push((

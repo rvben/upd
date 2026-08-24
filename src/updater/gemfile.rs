@@ -347,7 +347,12 @@ impl Updater for GemfileUpdater {
                                     new_lines.push(line.to_string());
                                 } else if !options.allows_bump(&parsed.version, &matched_version) {
                                     // Bump level exceeds the --only-bump/--max-bump ceiling.
-                                    result.unchanged += 1;
+                                    result.record_capped(
+                                        &parsed.name,
+                                        &parsed.version,
+                                        &matched_version,
+                                        Some(line_num),
+                                    );
                                     new_lines.push(line.to_string());
                                 } else {
                                     result.updated.push((

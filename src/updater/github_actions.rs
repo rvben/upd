@@ -748,17 +748,16 @@ impl Updater for GithubActionsUpdater {
                 if !is_config_pinned
                     && !options.allows_bump(&action.current_version, &target_version)
                 {
-                    result.skipped.push(super::SkippedUpdate {
-                        package: action.owner_repo.clone(),
-                        current: action.current_version.clone(),
-                        status: SkipStatus::Blocked,
-                        reason: "bump-policy",
-                        message: format!(
-                            "{} is outside the configured bump ceiling",
-                            target_version
-                        ),
-                        line_number: Some(line_num),
-                    });
+                    // The update is known and writable; only the ceiling holds it
+                    // back, which is `capped` rather than a `Blocked` skip. The
+                    // other blocked reasons mean the line cannot be updated at
+                    // all, and a reader needs to tell those two apart.
+                    result.record_capped(
+                        &action.owner_repo,
+                        &action.current_version,
+                        &target_version,
+                        Some(line_num),
+                    );
                     new_lines.push(line.to_string());
                     continue;
                 }
@@ -949,7 +948,12 @@ impl Updater for GithubActionsUpdater {
                             {
                                 // Bump level exceeds the --only-bump/--max-bump ceiling.
                                 // Configured pins are intentional and bypass the ceiling.
-                                result.unchanged += 1;
+                                result.record_capped(
+                                    owner_repo,
+                                    current_version,
+                                    &new_version,
+                                    Some(line_num),
+                                );
                                 new_lines.push(line.to_string());
                             } else {
                                 let new_line = line.replacen(current_version, &new_version, 1);
@@ -1898,8 +1902,15 @@ jobs:
             .unwrap();
 
         assert!(result.updated.is_empty());
-        assert_eq!(result.skipped.len(), 1);
-        assert_eq!(result.skipped[0].reason, "bump-policy");
+        // The ceiling refused a known, writable update, so it is reported as
+        // capped rather than as an unchanged dependency or a blocked skip.
+        assert!(result.skipped.is_empty(), "skipped: {:?}", result.skipped);
+        assert_eq!(result.capped.len(), 1, "capped: {:?}", result.capped);
+        assert_eq!(result.capped[0].package, "actions/checkout");
+        assert_eq!(result.capped[0].current, "v4.2.2");
+        assert_eq!(result.capped[0].available, "v5.0.0");
+        // The registry can only resolve `v4.2.2`, so a lookup of the capped
+        // target would surface here: the ceiling is honored before resolving.
         assert!(result.errors.is_empty());
         assert!(fs::read_to_string(file.path()).unwrap().contains(OLD_SHA));
     }

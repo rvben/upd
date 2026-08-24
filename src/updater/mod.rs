@@ -452,6 +452,23 @@ pub struct UpdateResult {
     /// is distinct from `ignored` (user policy) and `errors` (operation
     /// failure), allowing automation to identify blocked and unchecked pins.
     pub skipped: Vec<SkippedUpdate>,
+    /// Updates that exist but were not written because the bump exceeds the
+    /// `--only-bump` / `--max-bump` ceiling.
+    pub capped: Vec<CappedUpdate>,
+}
+
+/// An available update held back by the bump ceiling.
+///
+/// Distinct from `unchanged`, which counts dependencies that are genuinely
+/// current. A capped dependency has a newer release waiting and needs a human
+/// to decide on it, so reporting the two together would answer "is anything
+/// waiting for me?" with a confident no.
+#[derive(Debug, Clone)]
+pub struct CappedUpdate {
+    pub package: String,
+    pub current: String,
+    pub available: String,
+    pub line_number: Option<usize>,
 }
 
 /// A verified GitHub Actions SHA-pin update.
@@ -521,6 +538,27 @@ impl UpdateResult {
         self.entry_ecosystem.extend(other.entry_ecosystem);
         self.action_sha_updates.extend(other.action_sha_updates);
         self.skipped.extend(other.skipped);
+        self.capped.extend(other.capped);
+    }
+
+    /// Record an update that the bump ceiling refused to write.
+    ///
+    /// Every updater routes its ceiling rejection through here so the reason a
+    /// dependency stayed put is recorded once, in one shape, rather than being
+    /// added to the up-to-date tally at thirteen separate call sites.
+    pub fn record_capped(
+        &mut self,
+        package: &str,
+        current: &str,
+        available: &str,
+        line_number: Option<usize>,
+    ) {
+        self.capped.push(CappedUpdate {
+            package: package.to_string(),
+            current: current.to_string(),
+            available: available.to_string(),
+            line_number,
+        });
     }
 }
 

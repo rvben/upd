@@ -505,7 +505,7 @@ impl Updater for AnnotatedUpdater {
                         continue;
                     }
                     if !options.allows_bump(&line.version, &target) {
-                        result.unchanged += 1;
+                        result.record_capped(&line.package, &line.version, &target, Some(line_num));
                         continue;
                     }
 
@@ -1704,7 +1704,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn the_bump_ceiling_caps_a_registry_answer_silently() {
+    async fn the_bump_ceiling_reports_a_capped_registry_answer() {
         let set = set_with(
             AnnotationSource::PyPi,
             MockRegistry::new("pypi").with_version("thing", "1.1.0"),
@@ -1719,12 +1719,21 @@ mod tests {
 
         assert_eq!(written, original);
         assert!(result.updated.is_empty(), "{:?}", result.updated);
+        // A capped bump is not a diagnostic, so it stays out of `warnings`, but
+        // it is also not an up-to-date dependency: 1.1.0 is waiting.
         assert!(
             result.warnings.is_empty(),
-            "a capped bump is silent, as it is in every other updater: {:?}",
+            "a capped bump is not a warning: {:?}",
             result.warnings
         );
-        assert_eq!(result.unchanged, 1);
+        assert_eq!(
+            result.unchanged, 0,
+            "a dependency with a newer release is not up to date"
+        );
+        assert_eq!(result.capped.len(), 1, "capped: {:?}", result.capped);
+        assert_eq!(result.capped[0].package, "thing");
+        assert_eq!(result.capped[0].current, "1.0.0");
+        assert_eq!(result.capped[0].available, "1.1.0");
     }
 
     #[tokio::test]

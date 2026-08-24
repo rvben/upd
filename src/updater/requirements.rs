@@ -465,7 +465,12 @@ impl Updater for RequirementsUpdater {
                                 {
                                     // Bump level exceeds the --only-bump/--max-bump
                                     // ceiling: leave the line untouched.
-                                    result.unchanged += 1;
+                                    result.record_capped(
+                                        &parsed.package,
+                                        &parsed.first_version,
+                                        &matched_version,
+                                        Some(line_num),
+                                    );
                                     new_lines.push(line.to_string());
                                 } else {
                                     result.updated.push((

@@ -321,7 +321,12 @@ impl Updater for PreCommitUpdater {
                             {
                                 // Bump level exceeds the --only-bump/--max-bump ceiling.
                                 // Configured pins are intentional and bypass the ceiling.
-                                result.unchanged += 1;
+                                result.record_capped(
+                                    owner_repo,
+                                    current_version,
+                                    &new_version,
+                                    Some(line_num),
+                                );
                                 new_lines.push(line.to_string());
                             } else {
                                 let new_line = line.replacen(current_version, &new_version, 1);

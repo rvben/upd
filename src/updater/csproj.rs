@@ -403,7 +403,12 @@ impl Updater for CsprojUpdater {
                                     new_lines.push(line.to_string());
                                 } else if !options.allows_bump(&pkg.version, &matched_version) {
                                     // Bump level exceeds the --only-bump/--max-bump ceiling.
-                                    result.unchanged += 1;
+                                    result.record_capped(
+                                        &pkg.name,
+                                        &pkg.version,
+                                        &matched_version,
+                                        Some(line_num),
+                                    );
                                     new_lines.push(line.to_string());
                                 } else {
                                     if !pinned_lines.contains(&line_idx) {

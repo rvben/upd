@@ -376,7 +376,12 @@ impl Updater for GoModUpdater {
                             {
                                 // Bump level exceeds the --only-bump/--max-bump ceiling.
                                 // Configured pins are intentional and bypass the ceiling.
-                                result.unchanged += 1;
+                                result.record_capped(
+                                    module,
+                                    current_version,
+                                    &matched_version,
+                                    Some(line_num),
+                                );
                                 new_lines.push(line.to_string());
                             } else {
                                 // Replace version in the line, preserving everything else

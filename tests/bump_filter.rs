@@ -301,6 +301,178 @@ async fn apply_max_bump_minor_writes_minor() {
     );
 }
 
+/// A capped update must not be reported as an up-to-date dependency.
+///
+/// The ceiling decides what gets WRITTEN. Folding a capped update into the
+/// up-to-date tally answers "is anything waiting for me?" with a confident no,
+/// which is how an action four majors behind can sit in a repository whose
+/// weekly check has printed a green tick every time.
+///
+/// The exit code deliberately stays 0: `--max-bump minor` in CI means "fail on
+/// what I would take", and a major is not that. Only the text changes.
+#[tokio::test]
+async fn a_capped_update_is_not_reported_as_up_to_date() {
+    use wiremock::matchers::{method, path_regex};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+
+    // Advertise version 2.0.0, a major bump from 1.0.0.
+    let html = r#"<!DOCTYPE html><html><body>
+<a href="requests-2.0.0.tar.gz">requests-2.0.0.tar.gz</a>
+</body></html>"#;
+
+    Mock::given(method("GET"))
+        .and(path_regex(r"^/simple/requests/?$"))
+        .respond_with(ResponseTemplate::new(200).set_body_raw(html.as_bytes(), "text/html"))
+        .mount(&server)
+        .await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    fs::write(tmp.path().join("requirements.txt"), "requests==1.0.0\n").unwrap();
+    let path_str = tmp.path().to_str().unwrap().to_string();
+
+    let (stdout, stderr, code) = run_with_env(
+        &[
+            "--check",
+            "--no-cache",
+            "--max-bump",
+            "minor",
+            "-o",
+            "text",
+            &path_str,
+        ],
+        tmp.path(),
+        &[("UV_INDEX_URL", &server.uri())],
+    );
+
+    assert!(
+        !stdout.contains("all dependencies up to date"),
+        "a dependency with a 2.0.0 release waiting is not up to date; stdout: {stdout}"
+    );
+    assert!(
+        stdout.contains("held back by the bump ceiling"),
+        "the run must say why 2.0.0 was not taken; stdout: {stdout}"
+    );
+    assert!(
+        stdout.contains("requests") && stdout.contains("2.0.0"),
+        "the held-back update must be named with the version waiting; stdout: {stdout}"
+    );
+    assert_eq!(
+        code, 0,
+        "a capped update must not fail the gate the ceiling exists to relax; stderr: {stderr}"
+    );
+}
+
+/// The negative control for the test above: with nothing above the ceiling, the
+/// up-to-date tick is still printed and no held-back line appears. Without this,
+/// an implementation that never says "up to date" would pass.
+#[tokio::test]
+async fn a_genuinely_current_dependency_still_reports_up_to_date() {
+    use wiremock::matchers::{method, path_regex};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+
+    // Advertise exactly the pinned version: nothing is waiting.
+    let html = r#"<!DOCTYPE html><html><body>
+<a href="requests-1.0.0.tar.gz">requests-1.0.0.tar.gz</a>
+</body></html>"#;
+
+    Mock::given(method("GET"))
+        .and(path_regex(r"^/simple/requests/?$"))
+        .respond_with(ResponseTemplate::new(200).set_body_raw(html.as_bytes(), "text/html"))
+        .mount(&server)
+        .await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    fs::write(tmp.path().join("requirements.txt"), "requests==1.0.0\n").unwrap();
+    let path_str = tmp.path().to_str().unwrap().to_string();
+
+    let (stdout, stderr, code) = run_with_env(
+        &[
+            "--check",
+            "--no-cache",
+            "--max-bump",
+            "minor",
+            "-o",
+            "text",
+            &path_str,
+        ],
+        tmp.path(),
+        &[("UV_INDEX_URL", &server.uri())],
+    );
+
+    assert!(
+        stdout.contains("all dependencies up to date"),
+        "nothing is waiting, so the tick belongs here; stdout: {stdout}"
+    );
+    assert!(
+        !stdout.contains("held back"),
+        "nothing was held back; stdout: {stdout}"
+    );
+    assert_eq!(code, 0, "stderr: {stderr}");
+}
+
+/// A capped update is its own field in the JSON report, disjoint from `skipped`
+/// and absent from the up-to-date accounting, so a machine reader can act on it.
+#[tokio::test]
+async fn a_capped_update_is_reported_in_json() {
+    use wiremock::matchers::{method, path_regex};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+
+    let html = r#"<!DOCTYPE html><html><body>
+<a href="requests-2.0.0.tar.gz">requests-2.0.0.tar.gz</a>
+</body></html>"#;
+
+    Mock::given(method("GET"))
+        .and(path_regex(r"^/simple/requests/?$"))
+        .respond_with(ResponseTemplate::new(200).set_body_raw(html.as_bytes(), "text/html"))
+        .mount(&server)
+        .await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    fs::write(tmp.path().join("requirements.txt"), "requests==1.0.0\n").unwrap();
+    let path_str = tmp.path().to_str().unwrap().to_string();
+
+    let (stdout, stderr, _code) = run_with_env(
+        &[
+            "--check",
+            "--no-cache",
+            "--max-bump",
+            "minor",
+            "-o",
+            "json",
+            &path_str,
+        ],
+        tmp.path(),
+        &[("UV_INDEX_URL", &server.uri())],
+    );
+
+    let report: serde_json::Value = serde_json::from_str(&stdout)
+        .unwrap_or_else(|e| panic!("stdout is not JSON ({e}): {stdout}; stderr: {stderr}"));
+
+    assert_eq!(
+        report["summary"]["capped"], 1,
+        "summary must count the capped update; report: {report}"
+    );
+    assert_eq!(
+        report["summary"]["updates_total"], 0,
+        "a capped update was not written, so it is not an update; report: {report}"
+    );
+
+    let capped = &report["files"][0]["capped"];
+    assert_eq!(capped[0]["package"], "requests", "report: {report}");
+    assert_eq!(capped[0]["current"], "1.0.0", "report: {report}");
+    assert_eq!(capped[0]["available"], "2.0.0", "report: {report}");
+    assert_eq!(
+        capped[0]["bump"], "major",
+        "naming the bump says what raising the ceiling would let through; report: {report}"
+    );
+}
+
 /// `--max-bump patch` must skip both a minor and a major update.
 #[tokio::test]
 async fn max_bump_patch_skips_minor_and_major_updates() {

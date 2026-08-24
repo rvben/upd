@@ -402,7 +402,12 @@ impl Updater for PackageJsonUpdater {
                                                         // Bump level exceeds the
                                                         // --only-bump/--max-bump ceiling: leave the
                                                         // dependency spec untouched.
-                                                        result.unchanged += 1;
+                                                        result.record_capped(
+                                                            package,
+                                                            version_str,
+                                                            &new_spec,
+                                                            line_index.line_for(section, package),
+                                                        );
                                                     } else if new_spec != version_str {
                                                         let line_num =
                                                             line_index.line_for(section, package);
@@ -604,7 +609,12 @@ impl Updater for PackageJsonUpdater {
                             result.unchanged += 1;
                         } else if !options.allows_bump(&current_version, &matched_version) {
                             // Bump level exceeds the --only-bump/--max-bump ceiling.
-                            result.unchanged += 1;
+                            result.record_capped(
+                                &package,
+                                &current_version,
+                                &matched_version,
+                                line_index.line_for(&section, &package),
+                            );
                         } else {
                             let line_num = line_index.line_for(&section, &package);
                             result.updated.push((

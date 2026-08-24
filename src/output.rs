@@ -91,8 +91,30 @@ pub struct UpdateFileReport {
     pub skipped_by_cooldown: Vec<SkippedByCooldownEntry>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub skipped: Vec<SkippedEntry>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub capped: Vec<CappedEntry>,
     pub errors: Vec<ErrorEntry>,
     pub warnings: Vec<String>,
+}
+
+/// An available update the bump ceiling refused to write.
+///
+/// Separate from `skipped`, whose entries could not be updated at all, and from
+/// the up-to-date tally, which counts dependencies with nothing waiting. `bump`
+/// names the step that exceeded the ceiling, so a reader can see what raising
+/// `--max-bump` would let through.
+#[derive(Debug, Serialize)]
+pub struct CappedEntry {
+    pub package: String,
+    pub current: String,
+    pub available: String,
+    pub bump: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub line: Option<usize>,
+    /// Annotation source token for an entry whose ecosystem is per-line rather
+    /// than per-file. Absent for every entry in a file `upd` has a parser for.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source: Option<&'static str>,
 }
 
 #[derive(Debug, Serialize)]
@@ -234,6 +256,11 @@ pub struct UpdateSummary {
     /// and are told apart there by `status`.
     #[serde(default, skip_serializing_if = "is_zero")]
     pub not_examined: usize,
+    /// Available updates held back by the `--only-bump` / `--max-bump` ceiling.
+    /// Disjoint from every other count here, and never folded into the
+    /// up-to-date tally: something is waiting for each one.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub capped: usize,
 }
 
 fn is_zero(n: &usize) -> bool {
@@ -525,6 +552,19 @@ pub fn build_update_file_report(
         })
         .collect();
 
+    let capped = result
+        .capped
+        .iter()
+        .map(|entry| CappedEntry {
+            package: entry.package.clone(),
+            current: entry.current.clone(),
+            available: entry.available.clone(),
+            bump: classify(&entry.current, &entry.available),
+            line: entry.line_number,
+            source: source_of(&entry.package).map(AnnotationSource::token),
+        })
+        .collect();
+
     let path_str = path.display().to_string();
     let errors = result
         .errors
@@ -542,6 +582,7 @@ pub fn build_update_file_report(
         held_back,
         skipped_by_cooldown,
         skipped,
+        capped,
         errors,
         warnings: result.warnings.clone(),
     }

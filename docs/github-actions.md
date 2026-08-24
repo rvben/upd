@@ -39,6 +39,13 @@ floating comment (`# v4`), moved tag, or stale comment is never rewritten.
 Structured output reports these under `files[].skipped[]` with
 `status: "blocked"` and a machine-readable `reason`.
 
+`--max-bump minor` is a strict ceiling, and most actions are pinned to a bare
+major tag (`@v4`), so nearly every action release is a major step and is held
+back by it. Held-back updates are reported under `files[].capped[]` and
+`summary.capped` rather than counted as up to date, and they do not change the
+exit code. Read `summary.capped` if the job is meant to notice them; use
+`--max-bump major` if it is meant to take them.
+
 The comment may write the version with or without the `v` prefix, whichever the
 repo's own tags use: `# 7.0.1` and `# v7.0.1` both verify against a repo tagging
 `v7.0.1`. The prefix style of each comment is preserved when it is rewritten, so

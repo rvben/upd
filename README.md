@@ -86,7 +86,9 @@ upd -i
 # Only the packages you name
 upd --package requests,flask
 
-# Cap the bump level (allow patch + minor, skip major)
+# Cap the bump level (allow patch + minor, skip major). Updates above the
+# ceiling are reported as held back, never as up to date, and do not
+# change the exit code.
 upd --max-bump minor
 
 # Restrict to exactly one level (repeatable, comma-separated)
