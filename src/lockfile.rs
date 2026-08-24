@@ -3,11 +3,14 @@
 //! After updating manifest files, this module can regenerate lockfiles
 //! by invoking the appropriate package manager.
 
+use std::collections::HashMap;
 use std::io;
 use std::path::Path;
 use std::process::Command;
 
 use colored::Colorize;
+
+use crate::updater::specifier_floor_range;
 
 /// The outcome of attempting to regenerate a single lockfile.
 #[derive(Debug)]
@@ -315,7 +318,13 @@ pub(crate) fn regenerate_lockfile(
     verbose: bool,
 ) -> RegenOutcome {
     let dir = manifest_path.parent().unwrap_or(Path::new("."));
-    let (cmd, args) = lockfile_type.command(changed);
+    let (cmd, args) = match lockfile_type {
+        LockfileType::CargoLock => {
+            let specs = cargo_update_specs(manifest_path, changed);
+            lockfile_type.command(&specs)
+        }
+        _ => lockfile_type.command(changed),
+    };
 
     if !tool_available(cmd) {
         return RegenOutcome::ToolMissing {
@@ -362,6 +371,224 @@ pub(crate) fn regenerate_lockfile(
             ),
         }
     }
+}
+
+/// Cargo's semver-compatibility key: the position of the leading non-zero
+/// component and its value, so `1.2.3` answers `(0, 1)` and `0.39.6` `(1, 39)`.
+///
+/// Two versions of one crate can only sit in the same lockfile when their keys
+/// differ, which is what makes the key enough to tell locked entries apart.
+/// Answers `None` for a version whose leading components are not numeric.
+fn cargo_compat_key(version: &str) -> Option<(usize, u64)> {
+    let core = version.split(['-', '+']).next().unwrap_or(version);
+    for (index, component) in core.split('.').take(3).enumerate() {
+        let value: u64 = component.trim().parse().ok()?;
+        if value != 0 {
+            return Some((index, value));
+        }
+    }
+    Some((2, 0))
+}
+
+/// The versions `Cargo.lock` holds, keyed by package name.
+///
+/// An unreadable or unparseable lockfile answers empty, which leaves every
+/// spec bare and hands the diagnosis to cargo.
+fn locked_versions(lock_path: &Path) -> HashMap<String, Vec<String>> {
+    #[derive(serde::Deserialize)]
+    struct Lock {
+        #[serde(default)]
+        package: Vec<LockPackage>,
+    }
+    #[derive(serde::Deserialize)]
+    struct LockPackage {
+        name: String,
+        version: String,
+    }
+
+    let Ok(text) = std::fs::read_to_string(lock_path) else {
+        return HashMap::new();
+    };
+    let Ok(lock) = toml::from_str::<Lock>(&text) else {
+        return HashMap::new();
+    };
+
+    let mut versions: HashMap<String, Vec<String>> = HashMap::new();
+    for package in lock.package {
+        versions
+            .entry(package.name)
+            .or_default()
+            .push(package.version);
+    }
+    versions
+}
+
+/// Every version `name` is required at by a parsed `Cargo.toml`, across the
+/// normal, dev, build, target-specific and workspace dependency tables.
+///
+/// One crate can appear in several tables at incompatible majors, so the
+/// answers are collected rather than stopping at the first.
+fn manifest_requirements(manifest: &toml::Table, name: &str) -> Vec<String> {
+    const TABLES: [&str; 3] = ["dependencies", "dev-dependencies", "build-dependencies"];
+
+    fn requirement_of(table: &toml::Value, name: &str) -> Option<String> {
+        match table.get(name)? {
+            toml::Value::String(version) => Some(version.clone()),
+            entry => entry.get("version")?.as_str().map(str::to_string),
+        }
+    }
+
+    let mut scopes: Vec<&toml::Value> = vec![manifest.get("workspace")]
+        .into_iter()
+        .flatten()
+        .collect();
+    if let Some(toml::Value::Table(targets)) = manifest.get("target") {
+        scopes.extend(targets.values());
+    }
+
+    let mut requirements = Vec::new();
+    for table in TABLES {
+        if let Some(deps) = manifest.get(table)
+            && let Some(requirement) = requirement_of(deps, name)
+        {
+            requirements.push(requirement);
+        }
+    }
+    for scope in scopes {
+        for table in TABLES {
+            if let Some(deps) = scope.get(table)
+                && let Some(requirement) = requirement_of(deps, name)
+            {
+                requirements.push(requirement);
+            }
+        }
+    }
+    requirements
+}
+
+/// The locked versions `cargo update -p` should be pointed at for one crate.
+///
+/// A requirement identifies a locked entry by its compatibility key. When the
+/// manifest declares the crate at several keys, the entries to move are the
+/// ones their own requirement has outgrown, since those are the declarations
+/// `upd` just rewrote; a declaration the lockfile still satisfies is left
+/// alone. A declaration whose key the lockfile does not carry at all has just
+/// crossed a compatibility boundary, and is anchored on the entry it left
+/// behind. Falls back to every entry a declaration claims, and to nothing at all
+/// when even that is unclear, so the caller can hand the ambiguity back to cargo
+/// rather than guess.
+fn locked_entries_to_update<'a>(requirements: &[String], locked: &'a [String]) -> Vec<&'a str> {
+    fn is_below<'a>(locked: &'a [String], floor: &str) -> impl Iterator<Item = &'a str> {
+        let floor = floor.to_string();
+        locked.iter().map(String::as_str).filter(move |version| {
+            crate::version::compare::compare_versions(version, &floor) == std::cmp::Ordering::Less
+        })
+    }
+
+    let mut matched: Vec<&str> = Vec::new();
+    let mut stale: Vec<&str> = Vec::new();
+    let mut unsatisfied: Vec<&str> = Vec::new();
+
+    for requirement in requirements {
+        let Some(range) = specifier_floor_range(requirement, 0) else {
+            continue;
+        };
+        let floor = &requirement[range];
+        let Some(key) = cargo_compat_key(floor) else {
+            continue;
+        };
+        let entry = locked
+            .iter()
+            .map(String::as_str)
+            .find(|version| cargo_compat_key(version) == Some(key));
+        let Some(version) = entry else {
+            unsatisfied.push(floor);
+            continue;
+        };
+        if !matched.contains(&version) {
+            matched.push(version);
+        }
+        if crate::version::compare::compare_versions(version, floor) == std::cmp::Ordering::Less
+            && !stale.contains(&version)
+        {
+            stale.push(version);
+        }
+    }
+
+    // Cargo has to add a version no locked entry can satisfy whatever it is
+    // told, so the spec only has to name an entry unambiguously enough for cargo
+    // to re-resolve from. The version nearest below the floor is the one the
+    // rewritten declaration moved off, and one no other declaration still claims
+    // is preferred, so an unchanged sibling declaration keeps its own entry.
+    for floor in unsatisfied {
+        let anchor = is_below(locked, floor)
+            .filter(|version| !matched.contains(version))
+            .max_by(|a, b| crate::version::compare::compare_versions(a, b))
+            .or_else(|| {
+                is_below(locked, floor)
+                    .max_by(|a, b| crate::version::compare::compare_versions(a, b))
+            });
+        if let Some(anchor) = anchor
+            && !stale.contains(&anchor)
+        {
+            stale.push(anchor);
+        }
+    }
+
+    if !stale.is_empty() {
+        return stale;
+    }
+    // Nothing moved, so every entry a declaration claims is named anyway: the
+    // spec is unambiguous and cargo treats it as a no-op, where the bare name
+    // would be refused outright.
+    matched
+}
+
+/// Build the `-p` specs for `cargo update` from the names `upd` just rewrote.
+///
+/// A bare name is ambiguous when the lockfile carries two semver-incompatible
+/// versions of one crate, a direct `2.x` beside a transitive `1.x`, and cargo
+/// refuses the entire command rather than guess which one is meant. Those names
+/// are qualified with the locked version the manifest asks for, or, when a
+/// cross-major bump has left the manifest asking for a version the lockfile
+/// does not carry at all, with the entry nearest below it. Every other name
+/// stays bare, and so does one whose entry cannot be singled out, leaving cargo
+/// to report the ambiguity itself.
+///
+/// Known limitation: two same-name entries that are semver-compatible but come
+/// from different sources (a path or git checkout beside the registry) share a
+/// compatibility key, so `name@version` does not separate them either. Those
+/// stay bare and cargo still reports them.
+fn cargo_update_specs(manifest_path: &Path, changed: &[String]) -> Vec<String> {
+    let dir = manifest_path.parent().unwrap_or(Path::new("."));
+    let locked = locked_versions(&dir.join("Cargo.lock"));
+    let manifest = std::fs::read_to_string(manifest_path)
+        .ok()
+        .and_then(|text| text.parse::<toml::Table>().ok());
+
+    changed
+        .iter()
+        .flat_map(|name| {
+            let Some(versions) = locked.get(name) else {
+                return vec![name.clone()];
+            };
+            if versions.len() < 2 {
+                return vec![name.clone()];
+            }
+            let requirements = manifest
+                .as_ref()
+                .map(|doc| manifest_requirements(doc, name))
+                .unwrap_or_default();
+
+            match locked_entries_to_update(&requirements, versions).as_slice() {
+                [] => vec![name.clone()],
+                entries => entries
+                    .iter()
+                    .map(|version| format!("{name}@{version}"))
+                    .collect(),
+            }
+        })
+        .collect()
 }
 
 /// Build the `cargo update -p {package}@{locked} --precise {precise}` args.
@@ -501,6 +728,139 @@ mod tests {
     use super::*;
     use std::fs;
     use tempfile::tempdir;
+
+    /// Write a Cargo project whose lockfile holds two majors of `thiserror`
+    /// and one `serde`, and answer the `-p` specs for updating both.
+    fn specs_for(manifest_body: &str) -> Vec<String> {
+        let dir = tempdir().unwrap();
+        let manifest = dir.path().join("Cargo.toml");
+        fs::write(&manifest, manifest_body).unwrap();
+        fs::write(
+            dir.path().join("Cargo.lock"),
+            r#"version = 4
+
+[[package]]
+name = "serde"
+version = "1.0.228"
+
+[[package]]
+name = "thiserror"
+version = "1.0.69"
+
+[[package]]
+name = "thiserror"
+version = "2.0.18"
+"#,
+        )
+        .unwrap();
+        cargo_update_specs(&manifest, &["serde".to_string(), "thiserror".to_string()])
+    }
+
+    #[test]
+    fn a_crate_locked_at_two_majors_is_qualified_by_the_one_its_manifest_admits() {
+        let specs = specs_for("[dependencies]\nserde = \"1.0.229\"\nthiserror = \"2.0.20\"\n");
+        // serde sits in the lockfile once, so the bare name is unambiguous.
+        assert_eq!(specs, vec!["serde", "thiserror@2.0.18"]);
+    }
+
+    #[test]
+    fn a_manifest_holding_the_older_major_qualifies_with_the_older_locked_entry() {
+        // Guards against reading "ambiguous" as "take the newest": a manifest
+        // deliberately on 1.x must move the 1.x entry, not the transitive 2.x.
+        let specs = specs_for("[dependencies]\nserde = \"1.0.229\"\nthiserror = \"1.0.70\"\n");
+        assert_eq!(specs, vec!["serde", "thiserror@1.0.69"]);
+    }
+
+    #[test]
+    fn a_range_requirement_is_qualified_from_its_lower_bound() {
+        let specs =
+            specs_for("[dev-dependencies]\nserde = \"1.0.229\"\nthiserror = \">=1.0.70, <2.0\"\n");
+        assert_eq!(specs, vec!["serde", "thiserror@1.0.69"]);
+    }
+
+    #[test]
+    fn an_ambiguous_crate_absent_from_every_dependency_table_stays_bare() {
+        let specs = specs_for("[dependencies]\nserde = \"1.0.229\"\n");
+        assert_eq!(specs, vec!["serde", "thiserror"]);
+    }
+
+    #[test]
+    fn a_crate_declared_at_two_majors_moves_only_the_declaration_the_lockfile_outgrew() {
+        // `^1` is still satisfied by the locked 1.0.69, so the build-dependency
+        // is the one that just moved and the only entry cargo should be given.
+        let specs = specs_for(concat!(
+            "[dependencies]\nserde = \"1.0.229\"\nthiserror = \"^1\"\n",
+            "[build-dependencies]\nthiserror = \"2.0.20\"\n",
+        ));
+        assert_eq!(specs, vec!["serde", "thiserror@2.0.18"]);
+    }
+
+    #[test]
+    fn a_crate_whose_every_declaration_moved_names_each_locked_entry() {
+        let specs = specs_for(concat!(
+            "[dependencies]\nserde = \"1.0.229\"\nthiserror = \"1.0.70\"\n",
+            "[target.'cfg(unix)'.dependencies]\nthiserror = \"2.0.20\"\n",
+        ));
+        assert_eq!(specs, vec!["serde", "thiserror@1.0.69", "thiserror@2.0.18"]);
+    }
+
+    #[test]
+    fn a_crate_whose_declarations_the_lockfile_already_satisfies_still_names_each_entry() {
+        let specs = specs_for(concat!(
+            "[dependencies]\nserde = \"1.0.228\"\nthiserror = \"1.0.69\"\n",
+            "[build-dependencies]\nthiserror = \"2.0.18\"\n",
+        ));
+        assert_eq!(specs, vec!["serde", "thiserror@1.0.69", "thiserror@2.0.18"]);
+    }
+
+    #[test]
+    fn an_unchanged_declaration_keeps_its_entry_when_a_sibling_crosses_a_major() {
+        let specs = specs_for(concat!(
+            "[dependencies]\nserde = \"1.0.228\"\nthiserror = \"2.0.18\"\n",
+            "[build-dependencies]\nthiserror = \"3.0.1\"\n",
+        ));
+        assert_eq!(specs, vec!["serde", "thiserror@1.0.69"]);
+    }
+
+    #[test]
+    fn cargo_compat_key_separates_versions_that_can_share_a_lockfile() {
+        assert_eq!(cargo_compat_key("1.0.69"), Some((0, 1)));
+        assert_eq!(cargo_compat_key("2.0.18"), Some((0, 2)));
+        assert_eq!(cargo_compat_key("0.39.6"), Some((1, 39)));
+        assert_eq!(cargo_compat_key("0.38.1"), Some((1, 38)));
+        assert_eq!(cargo_compat_key("0.0.5"), Some((2, 5)));
+        assert_eq!(cargo_compat_key("2.0"), Some((0, 2)));
+        assert_eq!(cargo_compat_key("1.0.0-rc.1"), Some((0, 1)));
+        assert_eq!(cargo_compat_key("x.y.z"), None);
+    }
+
+    #[test]
+    fn a_requirement_no_locked_major_satisfies_anchors_on_the_nearest_lower_entry() {
+        let specs = specs_for(
+            r#"[package]
+name = "fixture"
+
+[dependencies]
+serde = "1.0.228"
+thiserror = "3.0.1"
+"#,
+        );
+        assert_eq!(specs, vec!["serde", "thiserror@2.0.18"]);
+    }
+
+    #[test]
+    fn a_requirement_below_every_locked_entry_stays_bare() {
+        let specs = specs_for(
+            r#"[package]
+name = "fixture"
+
+[dependencies]
+serde = "1.0.228"
+thiserror = "0.9.1"
+"#,
+        );
+        assert_eq!(specs, vec!["serde", "thiserror"]);
+    }
 
     #[test]
     fn test_lockfile_type_filename() {
