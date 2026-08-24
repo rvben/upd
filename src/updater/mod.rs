@@ -68,6 +68,62 @@ pub(crate) fn downgrade_warning(pkg: &str, latest: &str, current: &str) -> Strin
     format!("skipping {pkg}: latest \"{latest}\" is not greater than current \"{current}\"")
 }
 
+/// Where a version specifier's floor is written, as the byte range of that
+/// version within the string `constraint` was taken from. `base` is
+/// `constraint`'s own offset there.
+///
+/// A specifier is a set of clauses and carries no order: `botocore<1.35.0,>=1.34.0`
+/// is what setuptools and pip write, and it means exactly what
+/// `botocore>=1.34.0,<1.35.0` means. The clause that says which release is
+/// installed today, and the one an update rewrites, is the lower bound wherever
+/// the author put it. Reading the first clause instead makes one requirement
+/// answer two ways depending on how it was typed: against an upper bound the
+/// latest release compares as a downgrade, so the package is passed over as
+/// already ahead of the registry and never updated.
+///
+/// A specifier with no lower bound at all answers with its first clause, which
+/// leaves a ceiling-only spec (`<6`) reading as it always has. Callers refuse to
+/// rewrite those on their own account. A clause whose version does not start
+/// with a digit is passed over entirely, so a wildcard or otherwise unreadable
+/// requirement answers `None` and the caller keeps whatever handling it had.
+pub(crate) fn specifier_floor_range(
+    constraint: &str,
+    base: usize,
+) -> Option<std::ops::Range<usize>> {
+    let mut first: Option<std::ops::Range<usize>> = None;
+    let mut offset = 0usize;
+
+    for clause in constraint.split(',') {
+        let clause_at = offset;
+        offset += clause.len() + 1;
+
+        let after_space = clause.trim_start();
+        let op_at = clause_at + (clause.len() - after_space.len());
+        let op_len = after_space
+            .bytes()
+            .take_while(|b| matches!(b, b'=' | b'<' | b'>' | b'!' | b'~' | b'^'))
+            .count();
+        let (op, rest) = after_space.split_at(op_len);
+
+        let version = rest.trim_start();
+        let version_at = op_at + op_len + (rest.len() - version.len());
+        let version = version.trim_end();
+        if !version.starts_with(|c: char| c.is_ascii_digit()) {
+            continue;
+        }
+
+        let range = base + version_at..base + version_at + version.len();
+        if first.is_none() {
+            first = Some(range.clone());
+        }
+        if matches!(op, ">=" | ">" | "==" | "===" | "=" | "~=" | "~" | "^") {
+            return Some(range);
+        }
+    }
+
+    first
+}
+
 /// UTF-8 byte-order mark, as bytes.
 const UTF8_BOM_BYTES: [u8; 3] = [0xEF, 0xBB, 0xBF];
 
@@ -1240,6 +1296,44 @@ mod tests {
     use super::*;
     use std::fs;
     use tempfile::tempdir;
+
+    /// The clause `specifier_floor_range` picks, as the text it points at.
+    fn floor_of(constraint: &str) -> Option<&str> {
+        specifier_floor_range(constraint, 0).map(|range| &constraint[range])
+    }
+
+    #[test]
+    fn a_specifier_floor_is_its_lower_bound_wherever_it_is_written() {
+        assert_eq!(floor_of(">=1.0,<2.0"), Some("1.0"));
+        assert_eq!(floor_of("<2.0,>=1.0"), Some("1.0"));
+        assert_eq!(floor_of("!=1.2,>=1.0,<2.0"), Some("1.0"));
+        assert_eq!(floor_of(">1.0,<2.0"), Some("1.0"));
+        assert_eq!(floor_of("~=1.4"), Some("1.4"));
+        assert_eq!(floor_of("==1.0.0"), Some("1.0.0"));
+        assert_eq!(floor_of("===1.0.0"), Some("1.0.0"));
+        assert_eq!(floor_of(">= 1.0 , < 2.0"), Some("1.0"));
+    }
+
+    /// A specifier with no lower bound has no floor to move, so it answers with
+    /// its first clause and callers refuse it on their own account. Answering
+    /// `None` instead would make a ceiling-only entry unparseable rather than
+    /// merely unmovable.
+    #[test]
+    fn a_specifier_without_a_lower_bound_answers_with_its_first_clause() {
+        assert_eq!(floor_of("<6"), Some("6"));
+        assert_eq!(floor_of("<6,!=5.0"), Some("6"));
+        assert_eq!(floor_of(""), None);
+    }
+
+    /// The range is a byte offset into the caller's own string, not into the
+    /// constraint, so a rewrite lands on the right clause of the whole line.
+    #[test]
+    fn a_specifier_floor_range_is_offset_by_its_base() {
+        let line = "botocore<1.35.0,>=1.34.0";
+        let base = "botocore".len();
+        let range = specifier_floor_range(&line[base..], base).unwrap();
+        assert_eq!(&line[range], "1.34.0");
+    }
 
     #[test]
     fn classify_bump_reads_the_usual_semver_steps() {

@@ -1,6 +1,6 @@
 use super::{
     FileType, ParsedDependency, UpdateOptions, UpdateResult, Updater, downgrade_warning,
-    read_file_safe, write_file_atomic,
+    read_file_safe, specifier_floor_range, write_file_atomic,
 };
 use crate::align::compare_versions;
 use crate::registry::{CratesIoRegistry, Registry};
@@ -20,8 +20,58 @@ struct CargoTomlLineIndex {
     lines_by_section: HashMap<String, HashMap<String, usize>>,
 }
 
-/// (package, prefix, current_version, optional registry name, source line).
-type DependencyLookup = (String, String, String, Option<String>, Option<usize>);
+/// (package, requirement, current_version, optional registry name, source line).
+type DependencyLookup = (String, ReqSpec, String, Option<String>, Option<usize>);
+
+/// A Cargo version requirement, with the position of the version its floor
+/// sits at.
+///
+/// A requirement can carry more than one comma-separated clause, and the floor
+/// is the lower bound wherever the author wrote it. Rewriting through the
+/// recorded position rather than rebuilding from a prefix is what keeps the
+/// clauses an update did not touch: `>=1.0, <2.0` becomes `>=1.5.0, <2.0` and
+/// not `>=1.5.0`, which would drop a ceiling the author put there on purpose.
+#[derive(Clone, Debug)]
+struct ReqSpec {
+    text: String,
+    floor: std::ops::Range<usize>,
+}
+
+impl ReqSpec {
+    /// Handles `1.0`, `^1.0`, `~1.0`, `>=1.0`, `=1.0`, `>=1.0, <2.0` and
+    /// `<2.0, >=1.0`. A requirement with no readable version, such as `*`,
+    /// records an empty floor at the first digit, which leaves the whole
+    /// requirement standing as the prefix a rewrite appends to.
+    fn parse(version_req: &str) -> Self {
+        let text = version_req.trim().to_string();
+        let floor = specifier_floor_range(&text, 0).unwrap_or_else(|| {
+            let start = text
+                .find(|c: char| c.is_ascii_digit())
+                .unwrap_or(text.len());
+            start..text.len()
+        });
+        Self { text, floor }
+    }
+
+    /// The version this requirement floors the package at.
+    fn version(&self) -> &str {
+        &self.text[self.floor.clone()]
+    }
+
+    /// This requirement with its floor moved to `version`.
+    fn with_version(&self, version: &str) -> String {
+        let mut out = self.text.clone();
+        out.replace_range(self.floor.clone(), version);
+        out
+    }
+
+    /// Whether this requirement bounds the versions above, so a lookup has to
+    /// respect it rather than take the registry's newest release. `^3.0.0`
+    /// stays below 4, and `>=1.0, <2.0` stays below 2.
+    fn bounds_above(&self) -> bool {
+        self.text.contains('<') || self.text.starts_with(['^', '~'])
+    }
+}
 
 impl CargoTomlUpdater {
     pub fn new() -> Self {
@@ -163,22 +213,6 @@ impl CargoTomlUpdater {
         }
     }
 
-    /// Parse version requirement to extract the actual version number
-    /// Handles: "1.0", "^1.0", "~1.0", ">=1.0", "=1.0", etc.
-    fn parse_version_req(version_req: &str) -> (String, String) {
-        let trimmed = version_req.trim();
-
-        // Find where the version number starts
-        let version_start = trimmed
-            .find(|c: char| c.is_ascii_digit())
-            .unwrap_or(trimmed.len());
-
-        let prefix = &trimmed[..version_start];
-        let version = &trimmed[version_start..];
-
-        (prefix.to_string(), version.to_string())
-    }
-
     fn normalize_section_path(section: &str) -> String {
         section
             .split('.')
@@ -226,7 +260,7 @@ impl CargoTomlUpdater {
     ) {
         // First pass: collect dependencies and separate by config status
         let mut ignored_deps: Vec<(String, String, Option<usize>)> = Vec::new();
-        let mut pinned_deps: Vec<(String, String, String, String, Option<usize>)> = Vec::new();
+        let mut pinned_deps: Vec<(String, ReqSpec, String, String, Option<usize>)> = Vec::new();
         let mut deps_to_check: Vec<DependencyLookup> = Vec::new();
 
         for (key, item) in table.iter() {
@@ -247,7 +281,8 @@ impl CargoTomlUpdater {
             };
 
             let registry_name = Self::get_registry_name(item);
-            let (prefix, current_version) = Self::parse_version_req(&version_req);
+            let req = ReqSpec::parse(&version_req);
+            let current_version = req.version().to_string();
             let package = key.to_string();
             let line_num = line_index.line_for(section_path, &package);
 
@@ -266,7 +301,7 @@ impl CargoTomlUpdater {
             if let Some(pinned_version) = options.get_pinned_version(&package) {
                 pinned_deps.push((
                     package,
-                    prefix,
+                    req,
                     current_version,
                     pinned_version.to_string(),
                     line_num,
@@ -274,7 +309,7 @@ impl CargoTomlUpdater {
                 continue;
             }
 
-            deps_to_check.push((package, prefix, current_version, registry_name, line_num));
+            deps_to_check.push((package, req, current_version, registry_name, line_num));
         }
 
         // Record ignored packages
@@ -283,7 +318,7 @@ impl CargoTomlUpdater {
         }
 
         // Process pinned packages (no registry fetch needed)
-        for (key, prefix, current_version, pinned_version, line_num) in pinned_deps {
+        for (key, req, current_version, pinned_version, line_num) in pinned_deps {
             let matched_version = if options.full_precision {
                 pinned_version.clone()
             } else {
@@ -291,7 +326,7 @@ impl CargoTomlUpdater {
             };
 
             if matched_version != current_version {
-                let new_version_req = format!("{}{}", prefix, matched_version);
+                let new_version_req = req.with_version(&matched_version);
                 if let Some(item) = table.get_mut(&key) {
                     Self::set_version(item, &new_version_req);
                 }
@@ -316,7 +351,7 @@ impl CargoTomlUpdater {
         // Fetch all versions in parallel for non-ignored, non-pinned packages
         let version_futures: Vec<_> = deps_to_check
             .iter()
-            .map(|(key, prefix, current_version, registry_name, _)| {
+            .map(|(key, req, current_version, registry_name, _)| {
                 let effective_registry: &dyn Registry = if let Some(name) = registry_name {
                     registry_cache
                         .get(name)
@@ -331,13 +366,12 @@ impl CargoTomlUpdater {
                         effective_registry
                             .get_latest_version_including_prereleases(key)
                             .await
-                    } else if matches!(prefix.as_str(), "^" | "~") {
-                        // Honor explicit caret/tilde bounds: select the highest
-                        // version satisfying the original requirement, never
-                        // crossing the implied range (`^3.0.0` stays <4).
-                        let req = format!("{prefix}{current_version}");
+                    } else if req.bounds_above() {
+                        // Honor an explicit ceiling: select the highest version
+                        // satisfying the original requirement, never crossing
+                        // the range the author asked for.
                         effective_registry
-                            .get_latest_version_matching(key, &req)
+                            .get_latest_version_matching(key, &req.text)
                             .await
                     } else {
                         effective_registry.get_latest_version(key).await
@@ -349,7 +383,7 @@ impl CargoTomlUpdater {
         let version_results = join_all(version_futures).await;
 
         // Process results
-        for ((key, prefix, current_version, registry_name, line_num), version_result) in
+        for ((key, req, current_version, registry_name, line_num), version_result) in
             deps_to_check.into_iter().zip(version_results)
         {
             let effective_registry: &dyn Registry = if let Some(ref name) = registry_name {
@@ -434,7 +468,7 @@ impl CargoTomlUpdater {
                                 line_num,
                             );
                         } else {
-                            let new_version_req = format!("{}{}", prefix, matched_version);
+                            let new_version_req = req.with_version(&matched_version);
                             if let Some(item) = table.get_mut(&key) {
                                 Self::set_version(item, &new_version_req);
                             }
@@ -739,7 +773,7 @@ impl Updater for CargoTomlUpdater {
                     }
 
                     if let Some(version_req) = Self::get_version(item) {
-                        let (_, version) = Self::parse_version_req(&version_req);
+                        let version = ReqSpec::parse(&version_req).version().to_string();
                         let line_num = line_index.line_for(section_path, key);
                         let name = Self::get_package_name(item).unwrap_or_else(|| key.to_string());
                         deps.push(ParsedDependency {
@@ -809,27 +843,61 @@ mod tests {
     use toml_edit::InlineTable;
 
     #[test]
-    fn test_parse_version_req() {
-        assert_eq!(
-            CargoTomlUpdater::parse_version_req("1.0.0"),
-            ("".to_string(), "1.0.0".to_string())
-        );
-        assert_eq!(
-            CargoTomlUpdater::parse_version_req("^1.0.0"),
-            ("^".to_string(), "1.0.0".to_string())
-        );
-        assert_eq!(
-            CargoTomlUpdater::parse_version_req("~1.0.0"),
-            ("~".to_string(), "1.0.0".to_string())
-        );
-        assert_eq!(
-            CargoTomlUpdater::parse_version_req(">=1.0.0"),
-            (">=".to_string(), "1.0.0".to_string())
-        );
-        assert_eq!(
-            CargoTomlUpdater::parse_version_req("=1.0.0"),
-            ("=".to_string(), "1.0.0".to_string())
-        );
+    fn a_requirement_reports_the_version_it_floors_at() {
+        for (req, floor) in [
+            ("1.0.0", "1.0.0"),
+            ("^1.0.0", "1.0.0"),
+            ("~1.0.0", "1.0.0"),
+            (">=1.0.0", "1.0.0"),
+            ("=1.0.0", "1.0.0"),
+            (">=1.0, <2.0", "1.0"),
+            ("<2.0, >=1.0", "1.0"),
+        ] {
+            assert_eq!(ReqSpec::parse(req).version(), floor, "{req}");
+        }
+    }
+
+    /// A rewrite moves the floor and leaves every other clause standing. The
+    /// ceiling in a two-clause requirement is the author's, not the updater's,
+    /// and rebuilding the requirement from its leading operator would drop it.
+    #[test]
+    fn a_rewritten_requirement_keeps_the_clauses_it_did_not_move() {
+        for (req, rewritten) in [
+            ("1.0.0", "1.5.0"),
+            ("^1.0.0", "^1.5.0"),
+            (">=1.0, <2.0", ">=1.5.0, <2.0"),
+            ("<2.0, >=1.0", "<2.0, >=1.5.0"),
+            (">=1.0,!=1.2,<2.0", ">=1.5.0,!=1.2,<2.0"),
+        ] {
+            assert_eq!(
+                ReqSpec::parse(req).with_version("1.5.0"),
+                rewritten,
+                "{req}"
+            );
+        }
+    }
+
+    /// A requirement naming no version keeps the shape it always had: the whole
+    /// text stands as a prefix and the new version is appended.
+    #[test]
+    fn a_requirement_without_a_version_is_left_as_a_prefix() {
+        let req = ReqSpec::parse("*");
+        assert_eq!(req.version(), "");
+        assert_eq!(req.with_version("1.5.0"), "*1.5.0");
+    }
+
+    #[test]
+    fn a_requirement_knows_whether_it_bounds_above() {
+        for (req, bounds) in [
+            ("1.0.0", false),
+            (">=1.0.0", false),
+            ("^1.0.0", true),
+            ("~1.0.0", true),
+            (">=1.0, <2.0", true),
+            ("<2.0, >=1.0", true),
+        ] {
+            assert_eq!(ReqSpec::parse(req).bounds_above(), bounds, "{req}");
+        }
     }
 
     #[test]

@@ -94,7 +94,15 @@ The same reasoning goes one digit further down, where `^0.0.3` means
 Where a manifest pins a range rather than an exact version (`^1.2.3`, `>=1.0`,
 `~=1.4`), the level is read from the range's lower bound, which is the same
 anchor the ceiling compares. A spec and a bare version therefore always report
-the level that decided whether the change was let through.
+the level that decided whether the change was let through. A range with several
+clauses is a set, not a sequence, so the lower bound is found wherever it was
+written: `botocore<1.35.0,>=1.34.0` and `botocore>=1.34.0,<1.35.0` are one
+requirement and answer alike.
+
+An update moves that lower bound and leaves every other clause exactly as the
+author wrote it, so `>=1.0, <2.0` becomes `>=1.5.0, <2.0`. An upper bound is
+also honored when picking the new version: the release chosen is the newest one
+the requirement already admits, never one above the cap.
 
 An update above the ceiling is reported as held back, in `files[].capped` and
 `summary.capped`. It is never counted as up to date, and it does not change the

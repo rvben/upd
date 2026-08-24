@@ -567,3 +567,217 @@ async fn max_bump_patch_skips_minor_and_major_updates() {
         "--max-bump patch must skip a minor bump; --check should exit 0; stderr: {stderr}"
     );
 }
+
+/// A PEP 440 specifier is a set of clauses with no order, and setuptools and
+/// pip write the ceiling first: `botocore<1.35.0,>=1.34.0` says what
+/// `botocore>=1.34.0,<1.35.0` says. The clause naming the release installed
+/// today, and the one an update rewrites, is the lower bound wherever the
+/// author put it, so both orderings of one requirement must answer identically.
+///
+/// Reading the first clause instead compares the latest release against the
+/// ceiling, where it reads as a downgrade: the package is warned about as
+/// already ahead of the registry and never updated, so a repo pinned that way
+/// never moves and its own output agrees. The forward ordering is the control that
+/// proves the rig can see the update at all, and the ceiling left in place
+/// afterwards proves the rewrite landed on the floor rather than the cap.
+#[tokio::test]
+async fn a_specifier_reads_its_floor_from_the_lower_bound() {
+    use wiremock::matchers::{method, path_regex};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    for (file, ceiling_first, forward) in [
+        ("requirements.txt", "<2.0,>=1.0", ">=1.0,<2.0"),
+        ("pyproject.toml", "<2.0,>=1.0", ">=1.0,<2.0"),
+    ] {
+        for spec in [ceiling_first, forward] {
+            let server = MockServer::start().await;
+            let html = r#"<!DOCTYPE html><html><body>
+<a href="examplepkg-1.5.0.tar.gz">examplepkg-1.5.0.tar.gz</a>
+</body></html>"#;
+            Mock::given(method("GET"))
+                .and(path_regex(r"^/simple/examplepkg/?$"))
+                .respond_with(ResponseTemplate::new(200).set_body_raw(html.as_bytes(), "text/html"))
+                .mount(&server)
+                .await;
+
+            let tmp = tempfile::tempdir().unwrap();
+            let body = if file == "pyproject.toml" {
+                format!(
+                    "[project]\nname = \"t\"\nversion = \"1.0.0\"\ndependencies = [\"examplepkg{spec}\"]\n"
+                )
+            } else {
+                format!("examplepkg{spec}\n")
+            };
+            fs::write(tmp.path().join(file), body).unwrap();
+
+            let (stdout, stderr, code) = run_with_env(
+                &["update", "--apply", "--format", "json", "--no-cache", "."],
+                tmp.path(),
+                &[("UV_INDEX_URL", &server.uri())],
+            );
+
+            let who = format!("{file} {spec:?}");
+            assert_eq!(code, 0, "{who}: stdout: {stdout}\nstderr: {stderr}");
+
+            let json: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+            let entry = json["files"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .flat_map(|f| f["updates"].as_array().cloned().unwrap_or_default())
+                .find(|u| u["package"] == "examplepkg")
+                .unwrap_or_else(|| panic!("{who}: no update in {json}"));
+            assert_eq!(entry["current"], "1.0", "{who}: {entry}");
+            assert_eq!(entry["latest"], "1.5", "{who}: {entry}");
+            assert_eq!(entry["bump"], "minor", "{who}: {entry}");
+
+            let after = fs::read_to_string(tmp.path().join(file)).unwrap();
+            let line = after
+                .lines()
+                .find(|l| l.contains("examplepkg"))
+                .unwrap_or_else(|| panic!("{who}: package gone from {after}"));
+            assert!(
+                line.contains(">=1.5"),
+                "{who}: the floor is what moves: {line}"
+            );
+            assert!(
+                line.contains("<2.0"),
+                "{who}: the ceiling is not the update's business: {line}"
+            );
+        }
+    }
+}
+
+/// Everything a requirement line carries besides its floor stays put: the
+/// clauses the update did not move, an extras group, an environment marker and
+/// a trailing comment. Splicing the new version over the floor's own span is
+/// what keeps them; rebuilding the line from the package name and the new
+/// version would take the marker and the comment with it, and rebuilding the
+/// specifier from its leading operator would take the other clauses.
+#[tokio::test]
+async fn a_rewritten_requirement_line_keeps_everything_but_its_floor() {
+    use wiremock::matchers::{method, path_regex};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    for name in ["markerpkg", "extraspkg", "excludepkg"] {
+        let html = format!(
+            "<!DOCTYPE html><html><body>\n<a href=\"{name}-1.5.0.tar.gz\">{name}-1.5.0.tar.gz</a>\n</body></html>"
+        );
+        Mock::given(method("GET"))
+            .and(path_regex(format!(r"^/simple/{name}/?$")))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(html.into_bytes(), "text/html"))
+            .mount(&server)
+            .await;
+    }
+
+    let tmp = tempfile::tempdir().unwrap();
+    fs::write(
+        tmp.path().join("requirements.txt"),
+        "markerpkg<2.0,>=1.0 ; python_version >= \"3.8\"\n\
+         extraspkg[extra]<2.0,>=1.0\n\
+         excludepkg !=1.2,>=1.0,<2.0  # keep me\n",
+    )
+    .unwrap();
+
+    let (stdout, stderr, code) = run_with_env(
+        &["update", "--apply", "--format", "json", "--no-cache", "."],
+        tmp.path(),
+        &[("UV_INDEX_URL", &server.uri())],
+    );
+    assert_eq!(code, 0, "stdout: {stdout}\nstderr: {stderr}");
+
+    let after = fs::read_to_string(tmp.path().join("requirements.txt")).unwrap();
+    assert_eq!(
+        after,
+        "markerpkg<2.0,>=1.5 ; python_version >= \"3.8\"\n\
+         extraspkg[extra]<2.0,>=1.5\n\
+         excludepkg !=1.2,>=1.5,<2.0  # keep me\n",
+        "only the floor may move"
+    );
+}
+
+/// A Cargo requirement carries the same clause set, and the same floor rule:
+/// `dupcrate = ">=1.0, <2.0"` is floored at `1.0` and capped below `2.0`
+/// whichever clause was typed first. An update moves the floor and leaves every
+/// other clause where the author wrote it, so the ceiling still stands
+/// afterwards. Rebuilding the requirement from its leading operator instead
+/// writes the new version out as the whole requirement, which drops the ceiling
+/// silently: `--apply` exits 0 and nothing in the output says a bound was lost.
+///
+/// The registry offers a release above the ceiling as well, so the version that
+/// lands is also the proof the ceiling was read: `1.9.0` is the newest release
+/// the requirement admits, and `2.5.0` is the one it does not.
+#[tokio::test]
+async fn a_cargo_requirement_keeps_the_ceiling_its_floor_moves_under() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    for spec in [">=1.0, <2.0", "<2.0, >=1.0"] {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/v1/crates/dupcrate"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "crate": {"max_stable_version": "2.5.0", "max_version": "2.5.0"},
+                "versions": [
+                    {"num": "2.5.0", "yanked": false, "created_at": "2024-01-01T00:00:00Z"},
+                    {"num": "1.9.0", "yanked": false, "created_at": "2024-01-01T00:00:00Z"},
+                    {"num": "1.0.0", "yanked": false, "created_at": "2024-01-01T00:00:00Z"},
+                ]
+            })))
+            .mount(&server)
+            .await;
+
+        let tmp = tempfile::tempdir().unwrap();
+        fs::write(
+            tmp.path().join("Cargo.toml"),
+            format!(
+                "[package]\nname = \"t\"\nversion = \"0.1.0\"\n\n[dependencies]\ndupcrate = \"{spec}\"\n"
+            ),
+        )
+        .unwrap();
+
+        let (stdout, stderr, code) = run_with_env(
+            &[
+                "update",
+                "--apply",
+                "--no-lock",
+                "--format",
+                "json",
+                "--no-cache",
+                ".",
+            ],
+            tmp.path(),
+            &[("CARGO_REGISTRIES_CRATES_IO_INDEX", &server.uri())],
+        );
+
+        let who = format!("Cargo.toml {spec:?}");
+        assert_eq!(code, 0, "{who}: stdout: {stdout}\nstderr: {stderr}");
+
+        let json: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+        let entry = json["files"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .flat_map(|f| f["updates"].as_array().cloned().unwrap_or_default())
+            .find(|u| u["package"] == "dupcrate")
+            .unwrap_or_else(|| panic!("{who}: no update in {json}"));
+        assert_eq!(entry["current"], "1.0", "{who}: {entry}");
+        assert_eq!(entry["latest"], "1.9", "{who}: {entry}");
+        assert_eq!(entry["bump"], "minor", "{who}: {entry}");
+
+        let after = fs::read_to_string(tmp.path().join("Cargo.toml")).unwrap();
+        let line = after
+            .lines()
+            .find(|l| l.starts_with("dupcrate"))
+            .unwrap_or_else(|| panic!("{who}: package gone from {after}"));
+        assert!(
+            line.contains(">=1.9"),
+            "{who}: the floor is what moves: {line}"
+        );
+        assert!(
+            line.contains("<2.0"),
+            "{who}: the ceiling the author wrote must survive the rewrite: {line}"
+        );
+    }
+}

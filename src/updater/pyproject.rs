@@ -1,6 +1,6 @@
 use super::{
     FileType, ParsedDependency, UpdateOptions, UpdateResult, Updater, downgrade_warning,
-    read_file_safe, write_file_atomic,
+    read_file_safe, specifier_floor_range, write_file_atomic,
 };
 use crate::align::compare_versions;
 use crate::registry::{DeclaredIndex, IndexChain, Registry};
@@ -91,7 +91,23 @@ impl PyProjectUpdater {
         }
     }
 
-    /// Parse dependency string and return (package, first_version, full_constraint)
+    /// Where this dependency's floor version sits, as a byte range within `dep`.
+    ///
+    /// Falls back to the first clause's version for anything
+    /// [`specifier_floor_range`] cannot place, which keeps a dependency with no
+    /// recognizable constraint reading as it always has.
+    fn floor_range(&self, dep: &str) -> Option<std::ops::Range<usize>> {
+        let constraint = self.constraint_re.captures(dep).and_then(|c| c.get(3));
+        constraint
+            .and_then(|m| specifier_floor_range(m.as_str(), m.start()))
+            .or_else(|| {
+                self.version_re
+                    .captures(dep)
+                    .map(|caps| caps.get(4).unwrap().range())
+            })
+    }
+
+    /// Parse dependency string and return (package, floor_version, full_constraint)
     fn parse_dependency(&self, dep: &str) -> Option<(String, String, String)> {
         // First get the full constraint
         let full_constraint = self
@@ -101,9 +117,13 @@ impl PyProjectUpdater {
             .map(|m| m.as_str().to_string())
             .unwrap_or_default();
 
+        let floor = self.floor_range(dep);
         self.version_re.captures(dep).map(|caps| {
             let package = caps.get(1).unwrap().as_str().to_string();
-            let version = caps.get(4).unwrap().as_str().to_string();
+            let version = floor.map_or_else(
+                || caps.get(4).unwrap().as_str().to_string(),
+                |range| dep[range].to_string(),
+            );
             (package, version, full_constraint)
         })
     }
@@ -141,13 +161,11 @@ impl PyProjectUpdater {
     }
 
     fn update_dependency(&self, dep: &str, new_version: &str) -> String {
-        if let Some(caps) = self.version_re.captures(dep) {
-            // Only replace the version number itself, preserving everything else
-            // (package name, extras, operator, AND any additional constraints like ,<6)
-            let version_match = caps.get(4).unwrap();
-
+        if let Some(range) = self.floor_range(dep) {
+            // Only replace the floor version itself, preserving everything else
+            // (package name, extras, operator, AND any other constraints like ,<6)
             let mut result = dep.to_string();
-            result.replace_range(version_match.range(), new_version);
+            result.replace_range(range, new_version);
             result
         } else {
             dep.to_string()

@@ -1,6 +1,6 @@
 use super::{
     FileType, ParsedDependency, PendingVersion, UpdateOptions, UpdateResult, Updater,
-    downgrade_warning, read_file_safe, write_file_atomic,
+    downgrade_warning, read_file_safe, specifier_floor_range, write_file_atomic,
 };
 use crate::align::compare_versions;
 use crate::registry::{DeclaredIndex, IndexChain, Registry};
@@ -28,7 +28,7 @@ struct ParsedDep {
     /// Extras like [standard] - currently stored for future use in constraint reconstruction
     #[cfg_attr(not(test), allow(dead_code))]
     extras: String,
-    /// The first version number found (for display purposes)
+    /// The version the specifier floors the package at (for display purposes)
     first_version: String,
     /// The full constraint string (e.g., ">=2.8.0,<9")
     full_constraint: String,
@@ -155,12 +155,10 @@ impl RequirementsUpdater {
             let extras = caps.get(2).map_or("", |m| m.as_str()).to_string();
             let full_constraint = caps.get(3).unwrap().as_str().to_string();
 
-            // Extract the first version for display
+            // Extract the floor version for display
             let first_version = self
-                .package_re
-                .captures(code_part)
-                .and_then(|c| c.get(4))
-                .map(|m| m.as_str().to_string())
+                .floor_range(code_part)
+                .map(|range| code_part[range].to_string())
                 .unwrap_or_default();
 
             return Some(ParsedDep {
@@ -209,17 +207,35 @@ impl RequirementsUpdater {
         (trimmed.starts_with('<') || trimmed.starts_with("<=")) && !trimmed.contains(',') // No other constraints (like >=x,<y)
     }
 
+    /// Where this line's floor version sits, as a byte range within `line`.
+    ///
+    /// Falls back to the first clause's version for anything
+    /// [`specifier_floor_range`] cannot place, which keeps a line with no
+    /// recognizable constraint reading as it always has.
+    fn floor_range(&self, line: &str) -> Option<std::ops::Range<usize>> {
+        let code_part = line.split('#').next().unwrap_or(line);
+        let constraint = self
+            .constraint_re
+            .captures(code_part)
+            .and_then(|c| c.get(3));
+        constraint
+            .and_then(|m| specifier_floor_range(m.as_str(), m.start()))
+            .or_else(|| {
+                self.package_re
+                    .captures(code_part)
+                    .map(|caps| caps.get(4).unwrap().range())
+            })
+    }
+
     fn update_line(&self, line: &str, new_version: &str) -> String {
-        if let Some(caps) = self.package_re.captures(line) {
-            // Only replace the version number itself, preserving everything else
-            // (package name, extras, operator, AND any additional constraints like ,<6).
+        if let Some(range) = self.floor_range(line) {
+            // Only replace the floor version itself, preserving everything else
+            // (package name, extras, operator, AND any other constraints like ,<6).
             // Known limitation: if the new version string is a different length than the
             // old one, any trailing inline `# comment` will shift left or right by that
             // difference. Column-aligned comment blocks are not preserved.
-            let version_match = caps.get(4).unwrap();
-
             let mut result = line.to_string();
-            result.replace_range(version_match.range(), new_version);
+            result.replace_range(range, new_version);
             result
         } else {
             line.to_string()
