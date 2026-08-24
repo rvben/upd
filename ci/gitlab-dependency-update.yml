@@ -1,0 +1,403 @@
+# Reusable GitLab CI template for one rolling dependency merge request.
+# Include this file from a pinned upd commit, configure its typed inputs, then
+# extend `.upd-dependency-update`. See docs/gitlab.md.
+
+spec:
+  inputs:
+    stage:
+      description: Existing pipeline stage for the dependency-update job
+      default: test
+    image:
+      description: Compatible Linux job image; pin custom images by digest
+      default: "debian:bookworm-slim@sha256:abd67ffcfa541b485a3dff59865ab629aa048a6c613e639d36e7456b0b229241"
+    upd_version:
+      description: Exact released upd version
+      default: "v0.6.2"
+      regex: '^v[0-9]+\.[0-9]+\.[0-9]+([+-][0-9A-Za-z.-]+)?$'
+    upd_sha256:
+      description: Archive digest; required when overriding upd_version or upd_target
+      default: ""
+      regex: '^$|^[0-9a-fA-F]{64}$'
+    upd_target:
+      description: Release target; detected for supported Linux runners when empty
+      default: ""
+      regex: '^$|^[0-9A-Za-z_.+-]+$'
+    paths:
+      description: Whitespace-separated repository paths passed to upd
+      default: "."
+    langs:
+      description: Comma-separated ecosystem filter
+      default: ""
+    packages:
+      description: Comma-separated package filter
+      default: ""
+    min_age:
+      description: Minimum eligible release age; empty uses repository configuration
+      default: "7d"
+    max_bump:
+      description: Highest applied bump; empty uses repository configuration
+      default: "minor"
+    lock:
+      description: Regenerate lockfiles; requires ecosystem tools in the job image
+      type: boolean
+      default: false
+    prepare_command:
+      description: Command that installs or prepares repository-specific tooling
+      default: ""
+    validation_command:
+      description: Command run after updates and before publishing
+      default: ""
+    branch:
+      description: Automation-owned rolling branch
+      default: "automation/upd-dependencies"
+    commit_message:
+      description: Conventional Commits message for the generated commit
+      default: "chore(deps): update dependencies with upd"
+    mr_title:
+      description: Merge-request title
+      default: "chore(deps): update dependencies with upd"
+    auto_merge:
+      description: Ask GitLab to merge after all project checks pass
+      type: boolean
+      default: false
+---
+
+.upd-dependency-update:
+  image: "$[[ inputs.image ]]"
+  stage: "$[[ inputs.stage ]]"
+  timeout: 30m
+  interruptible: false
+  resource_group: upd-dependency-update
+  artifacts:
+    when: always
+    expire_in: 1 week
+    paths:
+      - .upd-ci/upd-report.json
+  variables:
+    UPD_VERSION: "$[[ inputs.upd_version ]]"
+    UPD_SHA256: "$[[ inputs.upd_sha256 ]]"
+    UPD_TARGET: "$[[ inputs.upd_target ]]"
+    UPD_PATHS: "$[[ inputs.paths ]]"
+    UPD_LANGS: "$[[ inputs.langs ]]"
+    UPD_PACKAGES: "$[[ inputs.packages ]]"
+    UPD_MIN_AGE: "$[[ inputs.min_age ]]"
+    UPD_MAX_BUMP: "$[[ inputs.max_bump ]]"
+    UPD_LOCK: "$[[ inputs.lock ]]"
+    UPD_PREPARE_COMMAND: "$[[ inputs.prepare_command ]]"
+    UPD_VALIDATION_COMMAND: "$[[ inputs.validation_command ]]"
+    UPD_BRANCH: "$[[ inputs.branch ]]"
+    UPD_COMMIT_MESSAGE: "$[[ inputs.commit_message ]]"
+    UPD_MR_TITLE: "$[[ inputs.mr_title ]]"
+    UPD_GIT_NAME: "upd automation"
+    UPD_GIT_EMAIL: "upd-automation@noreply.invalid"
+    UPD_AUTO_MERGE: "$[[ inputs.auto_merge ]]"
+    # Test/advanced escape hatch. Normal jobs always install a released binary.
+    UPD_EXECUTABLE: ""
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "schedule"'
+    - if: '$CI_PIPELINE_SOURCE == "web"'
+    - when: never
+  before_script:
+    - |
+      missing=""
+      for tool in bash curl cut git grep jq mktemp sha256sum tar tr uname; do
+        command -v "$tool" >/dev/null 2>&1 || missing="$missing $tool"
+      done
+      if [ -n "$missing" ]; then
+        if command -v apt-get >/dev/null 2>&1; then
+          apt-get update
+          apt-get install --yes --no-install-recommends bash ca-certificates coreutils curl git grep jq tar
+        elif command -v apk >/dev/null 2>&1; then
+          apk add --no-cache bash ca-certificates coreutils curl git jq tar
+        else
+          echo "Missing required commands:$missing" >&2
+          echo "Use a compatible image or install them in before_script." >&2
+          exit 2
+        fi
+      fi
+  script:
+    - |
+      bash <<'UPD_JOB'
+      set -euo pipefail
+
+      : "${UPD_GITLAB_TOKEN:?Set the masked, protected UPD_GITLAB_TOKEN CI/CD variable}"
+      : "${CI_API_V4_URL:?GitLab did not provide CI_API_V4_URL}"
+      : "${CI_DEFAULT_BRANCH:?GitLab did not provide CI_DEFAULT_BRANCH}"
+      : "${CI_PROJECT_DIR:?GitLab did not provide CI_PROJECT_DIR}"
+      : "${CI_PROJECT_ID:?GitLab did not provide CI_PROJECT_ID}"
+      : "${CI_PROJECT_PATH:?GitLab did not provide CI_PROJECT_PATH}"
+      : "${CI_SERVER_URL:?GitLab did not provide CI_SERVER_URL}"
+
+      case "${UPD_LOCK}" in
+        true|false) ;;
+        *) echo "UPD_LOCK must be true or false" >&2; exit 4 ;;
+      esac
+      case "${UPD_AUTO_MERGE}" in
+        true|false) ;;
+        *) echo "UPD_AUTO_MERGE must be true or false" >&2; exit 4 ;;
+      esac
+      if ! git check-ref-format --branch "$UPD_BRANCH" >/dev/null 2>&1; then
+        echo "Invalid automation branch: $UPD_BRANCH" >&2
+        exit 4
+      fi
+      if [ "$UPD_BRANCH" = "$CI_DEFAULT_BRANCH" ]; then
+        echo "The automation branch must differ from the default branch" >&2
+        exit 4
+      fi
+
+      work_dir="$(mktemp -d)"
+      trap 'rm -rf "$work_dir"' EXIT
+      mkdir -p "$CI_PROJECT_DIR/.upd-ci"
+      printf '%s\n' '/.upd-ci/' >> .git/info/exclude
+      report="$CI_PROJECT_DIR/.upd-ci/upd-report.json"
+
+      version="${UPD_VERSION}"
+      case "$version" in
+        v*) ;;
+        *) version="v${version}" ;;
+      esac
+
+      if [ -n "$UPD_EXECUTABLE" ]; then
+        upd_bin="$UPD_EXECUTABLE"
+      else
+        target="${UPD_TARGET}"
+        if [ -z "$target" ]; then
+          case "$(uname -m)" in
+            x86_64|amd64) target="x86_64-unknown-linux-gnu" ;;
+            aarch64|arm64) target="aarch64-unknown-linux-gnu" ;;
+            *)
+              echo "Unsupported runner architecture: $(uname -m); set upd_target explicitly" >&2
+              exit 4
+              ;;
+          esac
+        fi
+
+        expected_sha="${UPD_SHA256}"
+        if [ -z "$expected_sha" ] && [ "$version" = "v0.6.2" ]; then
+          case "$target" in
+            x86_64-unknown-linux-gnu)
+              expected_sha="47b2504ff86197ec0097d6e767b5d9ff98f6e105166b8dcdb719a5281e8c5e8c"
+              ;;
+            x86_64-unknown-linux-musl)
+              expected_sha="1003d26dbf8624b08d7ee8156557ac3fd7cf7481a7f62f2ac8204691de4d3ba5"
+              ;;
+            aarch64-unknown-linux-gnu)
+              expected_sha="6ced6937cfbb9f872f10f3ce3b1a9bad929da8eaa2a7cd9fc8ebe730a17b4bf7"
+              ;;
+          esac
+        fi
+        if ! printf '%s\n' "$expected_sha" | grep --extended-regexp --quiet '^[0-9a-fA-F]{64}$'; then
+          echo "Set upd_sha256 when overriding upd_version or upd_target" >&2
+          exit 4
+        fi
+
+        asset="upd-${version}-${target}.tar.gz"
+        release_url="https://github.com/rvben/upd/releases/download/${version}"
+        curl --silent --show-error --fail-with-body --location \
+          --output "$work_dir/$asset" "$release_url/$asset"
+        actual_sha="$(sha256sum "$work_dir/$asset" | cut -d ' ' -f 1)"
+        if [ "$(printf '%s' "$actual_sha" | tr 'A-F' 'a-f')" != \
+          "$(printf '%s' "$expected_sha" | tr 'A-F' 'a-f')" ]; then
+          echo "Checksum verification failed for $asset" >&2
+          exit 2
+        fi
+        tar --extract --gzip --file "$work_dir/$asset" --directory "$work_dir" upd
+        chmod 0755 "$work_dir/upd"
+        upd_bin="$work_dir/upd"
+      fi
+
+      if [ ! -x "$upd_bin" ]; then
+        echo "upd executable is missing or not executable: $upd_bin" >&2
+        exit 2
+      fi
+
+      askpass="$work_dir/git-askpass"
+      cat > "$askpass" <<'ASKPASS'
+      #!/bin/sh
+      case "$1" in
+        Username*) printf '%s\n' oauth2 ;;
+        *) printf '%s\n' "$UPD_GITLAB_TOKEN" ;;
+      esac
+      ASKPASS
+      chmod 0700 "$askpass"
+      export GIT_ASKPASS="$askpass"
+      export GIT_TERMINAL_PROMPT=0
+
+      git_url="${CI_SERVER_URL}/${CI_PROJECT_PATH}.git"
+      mr_api="${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/merge_requests"
+      gitlab_api() {
+        curl --silent --show-error --fail-with-body \
+          --header "PRIVATE-TOKEN: ${UPD_GITLAB_TOKEN}" "$@"
+      }
+      find_open_mrs() {
+        gitlab_api --get \
+          --data-urlencode "state=opened" \
+          --data-urlencode "source_branch=${UPD_BRANCH}" \
+          --data-urlencode "target_branch=${CI_DEFAULT_BRANCH}" \
+          "$mr_api"
+      }
+
+      git fetch --no-tags "$git_url" \
+        "+refs/heads/${CI_DEFAULT_BRANCH}:refs/remotes/origin/${CI_DEFAULT_BRANCH}"
+      if git fetch --no-tags "$git_url" \
+        "+refs/heads/${UPD_BRANCH}:refs/remotes/origin/${UPD_BRANCH}"; then
+        expected_remote_sha="$(git rev-parse "refs/remotes/origin/${UPD_BRANCH}")"
+      else
+        expected_remote_sha=""
+      fi
+      git switch --force-create "$UPD_BRANCH" "refs/remotes/origin/${CI_DEFAULT_BRANCH}"
+
+      if [ -n "$UPD_PREPARE_COMMAND" ]; then
+        bash -euo pipefail -c "$UPD_PREPARE_COMMAND"
+      fi
+      if [ -n "$(git status --porcelain)" ]; then
+        echo "The prepare command changed repository files; refusing to mix setup with updates" >&2
+        exit 2
+      fi
+
+      upd_args=(update --apply --format json)
+      if [ "$UPD_LOCK" = "true" ]; then
+        upd_args+=(--lock)
+      fi
+      if [ -n "$UPD_MIN_AGE" ]; then
+        upd_args+=(--min-age "$UPD_MIN_AGE")
+      fi
+      if [ -n "$UPD_MAX_BUMP" ]; then
+        upd_args+=(--max-bump "$UPD_MAX_BUMP")
+      fi
+      if [ -n "$UPD_LANGS" ]; then
+        upd_args+=(--lang "$UPD_LANGS")
+      fi
+      if [ -n "$UPD_PACKAGES" ]; then
+        upd_args+=(--package "$UPD_PACKAGES")
+      fi
+      read -r -a upd_paths <<< "${UPD_PATHS:-.}"
+
+      "$upd_bin" "${upd_args[@]}" "${upd_paths[@]}" > "$report"
+      jq --exit-status . "$report" >/dev/null
+      jq --raw-output '
+        "upd: \(.summary.updates_total) update(s), " +
+        "\(.summary.files_with_changes) changed file(s), " +
+        "\(.summary.held_back // 0) held back, " +
+        "\(.summary.capped // 0) capped, " +
+        "\(.summary.errors) error(s)"
+      ' "$report"
+      if ! jq --exit-status '(.summary.errors // 0) == 0' "$report" >/dev/null; then
+        echo "upd reported errors; refusing to publish a partial result" >&2
+        exit 2
+      fi
+
+      git add --all
+      if git diff --cached --quiet; then
+        echo "No dependency updates within policy."
+        mr_list="$(find_open_mrs)"
+        mr_count="$(jq 'length' <<< "$mr_list")"
+        if [ "$mr_count" -gt 1 ]; then
+          echo "More than one open upd merge request uses ${UPD_BRANCH}; refusing to choose one" >&2
+          exit 2
+        fi
+        if [ "$mr_count" -eq 1 ]; then
+          mr_iid="$(jq --raw-output '.[0].iid' <<< "$mr_list")"
+          mr_url="$(jq --raw-output '.[0].web_url' <<< "$mr_list")"
+          gitlab_api --request PUT --form "state_event=close" \
+            "$mr_api/$mr_iid" >/dev/null
+          echo "Closed obsolete merge request: $mr_url"
+        fi
+        if [ -n "$expected_remote_sha" ]; then
+          git push \
+            --force-with-lease="refs/heads/${UPD_BRANCH}:${expected_remote_sha}" \
+            "$git_url" ":refs/heads/${UPD_BRANCH}"
+          echo "Removed obsolete automation branch: $UPD_BRANCH"
+        fi
+        exit 0
+      fi
+
+      if [ -n "$UPD_VALIDATION_COMMAND" ]; then
+        bash -euo pipefail -c "$UPD_VALIDATION_COMMAND"
+      fi
+      if ! git diff --quiet || [ -n "$(git ls-files --others --exclude-standard)" ]; then
+        echo "Validation changed uncommitted files; refusing to publish an unvalidated diff" >&2
+        exit 2
+      fi
+
+      git config user.name "$UPD_GIT_NAME"
+      git config user.email "$UPD_GIT_EMAIL"
+      git commit --message "$UPD_COMMIT_MESSAGE"
+      commit_sha="$(git rev-parse HEAD)"
+      git push \
+        --force-with-lease="refs/heads/${UPD_BRANCH}:${expected_remote_sha}" \
+        "$git_url" "HEAD:refs/heads/${UPD_BRANCH}"
+
+      mr_list="$(find_open_mrs)"
+      mr_count="$(jq 'length' <<< "$mr_list")"
+      if [ "$mr_count" -gt 1 ]; then
+        echo "More than one open upd merge request uses ${UPD_BRANCH}; refusing to choose one" >&2
+        exit 2
+      fi
+
+      {
+        echo "Automated, policy-constrained dependency updates generated by [upd](https://github.com/rvben/upd)."
+        echo
+        jq --raw-output '
+          "- Updates: \(.summary.updates_total)\n" +
+          "- Files changed: \(.summary.files_with_changes)\n" +
+          "- Held back by cooldown: \(.summary.held_back // 0)\n" +
+          "- Held back by bump policy: \(.summary.capped // 0)\n" +
+          "- Blocked: \(.summary.skipped // 0)\n" +
+          "- Warnings: \(.summary.warnings)"
+        ' "$report"
+        echo "- Lockfile regeneration: $UPD_LOCK"
+        echo
+        echo "### Applied updates"
+        echo
+        jq --raw-output '
+          .files[] as $file |
+          $file.updates[]? |
+          select(.status == null or .status == "applied" or .status == "pending_relock") |
+          "- `\(.package)` \(.current) → \(.latest) (\(.bump), `\($file.path)`)"
+        ' "$report"
+        echo
+        echo "This rolling proposal is rebuilt from the latest default branch on every run."
+      } > "$work_dir/mr-description.md"
+
+      if [ "$mr_count" -eq 0 ]; then
+        mr_response="$(
+          gitlab_api --request POST \
+            --form "source_branch=${UPD_BRANCH}" \
+            --form "target_branch=${CI_DEFAULT_BRANCH}" \
+            --form "title=${UPD_MR_TITLE}" \
+            --form "remove_source_branch=true" \
+            --form "description=<${work_dir}/mr-description.md" \
+            "$mr_api"
+        )"
+      else
+        mr_iid="$(jq --raw-output '.[0].iid' <<< "$mr_list")"
+        mr_response="$(
+          gitlab_api --request PUT \
+            --form "title=${UPD_MR_TITLE}" \
+            --form "description=<${work_dir}/mr-description.md" \
+            "$mr_api/$mr_iid"
+        )"
+      fi
+
+      mr_iid="$(jq --raw-output .iid <<< "$mr_response")"
+      mr_url="$(jq --raw-output .web_url <<< "$mr_response")"
+      if [ "$mr_iid" = "null" ] || [ "$mr_url" = "null" ]; then
+        echo "GitLab returned an invalid merge-request response" >&2
+        exit 2
+      fi
+      echo "Merge request: $mr_url"
+
+      if [ "$UPD_AUTO_MERGE" = "true" ]; then
+        gitlab_api --request PUT \
+          --form "auto_merge=true" \
+          --form "sha=${commit_sha}" \
+          --form "should_remove_source_branch=true" \
+          "$mr_api/$mr_iid/merge" >/dev/null
+        echo "GitLab auto-merge enabled for $mr_url"
+      elif [ "$(jq --raw-output '.auto_merge_enabled // .merge_when_pipeline_succeeds // false' <<< "$mr_response")" = "true" ]; then
+        gitlab_api --request POST \
+          "$mr_api/$mr_iid/cancel_merge_when_pipeline_succeeds" >/dev/null
+        echo "GitLab auto-merge disabled for $mr_url"
+      fi
+      UPD_JOB

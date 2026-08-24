@@ -283,11 +283,17 @@ Credential detection for PyPI, npm, Cargo, Go, and GitHub, including private
 indexes declared in `pyproject.toml`.
 → [docs/private-registries.md](https://github.com/rvben/upd/blob/main/docs/private-registries.md)
 
-### GitHub Actions
+### GitHub pull requests
 
-SHA-pin safety rules, `blocked` vs `not-examined` reporting, and the reusable
-workflow that opens dependency pull requests.
+Run any supported dependency updates as one rolling GitHub PR, with immutable
+Action SHA verification, validation, artifact reporting, and opt-in auto-merge.
 → [docs/github-actions.md](https://github.com/rvben/upd/blob/main/docs/github-actions.md)
+
+### GitLab merge requests
+
+Run scheduled dependency updates as one rolling GitLab MR, with validation,
+lease-protected branch updates, and explicitly opt-in GitLab-native auto-merge.
+→ [docs/gitlab.md](https://github.com/rvben/upd/blob/main/docs/gitlab.md)
 
 ### Stability
 

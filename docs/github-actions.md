@@ -1,87 +1,15 @@
-# GitHub Actions
+# GitHub dependency pull requests
 
-`upd` updates `uses:` references in `.github/workflows/*.yml` and `*.yaml`,
-covering both actions and reusable workflows. It skips branch refs, local
-actions, and Docker references, and authenticates via `GITHUB_TOKEN` or
-`GH_TOKEN` for higher API rate limits.
+`upd` publishes a reusable GitHub Actions workflow that maintains one rolling,
+policy-constrained dependency pull request. It can update every ecosystem
+supported by `upd`; its backward-compatible default updates GitHub Actions only.
 
-```bash
-upd --lang actions            # Preview Actions updates only
-upd --apply --lang actions    # Write them
-```
+Every run rebuilds the automation branch from the latest default branch. The
+proposal therefore stays current and contains one generated commit.
 
-## Immutable SHA pins
+## Quick start
 
-Commit pins are checked by default, and rewriting one requires a concrete
-version annotation:
-
-```yaml
-- uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
-
-jobs:
-  conformance:
-    uses: rvben/clispec/.github/workflows/conformance.yml@<full-commit-sha> # v0.3.0
-```
-
-```bash
-upd update . \
-  --apply \
-  --lang actions \
-  --min-age 7d \
-  --max-bump minor
-```
-
-Before writing, `upd` verifies that the annotated current tag resolves to the
-pinned commit. It then applies cooldown and bump policy to release versions,
-resolves the selected tag to its full commit SHA, and updates both the SHA and
-comment. A pin is never converted to a mutable tag. A short SHA, missing or
-floating comment (`# v4`), moved tag, or stale comment is never rewritten.
-Structured output reports these under `files[].skipped[]` with
-`status: "blocked"` and a machine-readable `reason`.
-
-`--max-bump minor` is a strict ceiling, and most actions are pinned to a bare
-major tag (`@v4`), so nearly every action release is a major step and is held
-back by it. Held-back updates are reported under `files[].capped[]` and
-`summary.capped` rather than counted as up to date, and they do not change the
-exit code. Read `summary.capped` if the job is meant to notice them; use
-`--max-bump major` if it is meant to take them.
-
-The comment may write the version with or without the `v` prefix, whichever the
-repo's own tags use: `# 7.0.1` and `# v7.0.1` both verify against a repo tagging
-`v7.0.1`. The prefix style of each comment is preserved when it is rewritten, so
-`# 5.0.0` becomes `# 7.0.1` and `# v5.0.0` becomes `# v7.0.1`. The exception is a
-repository that publishes both spellings of one release at different commits:
-there the comment takes the spelling of the tag that was actually resolved, since
-the other one names a different commit. A comment that resolves to some commit
-other than the pinned one is still refused, whichever spelling it uses.
-
-### Turning SHA updates off
-
-With SHA updates turned off (`--no-update-action-shas`, or
-`update_action_shas = false` in `.updrc.toml`), the pins still appear in
-`files[].skipped[]`, under `status: "not-examined"` with
-`reason: "action-sha-updates-off"`, and are counted in
-`summary.not_examined`.
-
-The two statuses answer different questions: `blocked` means the pin was
-examined and a safety condition refused the change, `not-examined` means it was
-never looked at. Neither is `summary.unchanged`, which counts dependencies that
-were checked and found current. In text output the count appears in the summary
-and `--verbose` names each pin.
-
-### Naming an action in config
-
-Configuration pins and `--package` filters use the action's `owner/repo` name.
-For example, `--package actions/checkout` selects every checkout reference,
-including subdirectory actions and reusable workflow paths from that repository.
-Configured targets for immutable pins must also be concrete SemVer tags; a
-floating value such as `v5` is reported as blocked.
-
-## Automated pull requests
-
-This repository publishes a reusable workflow that installs a checksum-verified
-`upd` release, applies only policy-approved Actions updates, validates every
-workflow with `actionlint`, and opens one Conventional Commits pull request:
+Create `.github/workflows/upd.yml` in the consuming repository:
 
 ```yaml
 name: Weekly dependency health
@@ -96,10 +24,10 @@ permissions:
   pull-requests: write
 
 jobs:
-  actions:
-    uses: rvben/upd/.github/workflows/dependency-health.yml@bdc55ece90b7333f177027ad208705b815b6caab # v0.5.2
+  update:
+    uses: rvben/upd/.github/workflows/dependency-health.yml@<FULL_COMMIT_SHA>
     with:
-      upd-version: v0.5.2
+      upd-version: v0.6.2
       min-age: 7d
       max-bump: minor
       validation-command: make test
@@ -107,26 +35,176 @@ jobs:
       pull-request-token: ${{ secrets.UPD_PR_TOKEN }}
 ```
 
-Select an `upd-version` that advertises `--update-action-shas`; the workflow
-checks this capability explicitly and fails with upgrade guidance otherwise.
+Replace `<FULL_COMMIT_SHA>` with a revision containing the reusable workflow.
+Pinning the workflow prevents later changes in this repository from silently
+changing executable CI code. The workflow itself pins its third-party actions,
+the default `upd` archive version, and that archive's SHA-256.
 
-Use a narrowly scoped GitHub App token or fine-grained PAT for
-`UPD_PR_TOKEN` when the generated PR must trigger CI. Without it, the workflow
-falls back to `GITHUB_TOKEN`; GitHub suppresses subsequent workflow runs caused
-by that token. Set `fail-on-blocked: true` when every SHA pin is expected to
-carry a verified version annotation.
+The `pull-request-token` secret is optional. Without it, the workflow uses the
+caller's `GITHUB_TOKEN`. The caller must grant `contents: write` and
+`pull-requests: write`; a reusable workflow cannot elevate permissions withheld
+by its caller.
 
-### Migrating off Dependabot
+Use a narrowly scoped GitHub App installation token or fine-grained personal
+access token when pull-request checks should start without manual approval. Give
+it repository Contents and Pull requests write permissions, plus permission to
+modify workflow files when `langs` includes `actions`. Pull requests created
+with `GITHUB_TOKEN` can require a maintainer to approve their workflow runs, and
+push events created by that token do not recursively start workflows.
 
-For an existing fleet, keep GitHub Actions updates enabled in Dependabot for
-four successful weekly `upd` cycles. During that proving period, review the
-workflow summaries, resolve intentionally blocked legacy pins, and configure
-`UPD_PR_TOKEN` before relying on PR-triggered CI. After four green cycles,
-remove only the overlapping `github-actions` Dependabot updates; keep its other
-package ecosystems enabled.
+## General dependency updates
 
-## See also
+The default `langs: actions` preserves the original integration's behavior. To
+update all detected manifests, pass an empty language filter and select a Linux
+runner with the project's toolchains:
 
-- [Configuration](configuration.md) for `update_action_shas`, `ignore`, and `[pin]`
-- [Private registries](private-registries.md#github-actions-and-pre-commit) for token setup
-- [Ecosystems](ecosystems.md) for pre-commit and the other supported files
+```yaml
+jobs:
+  update:
+    uses: rvben/upd/.github/workflows/dependency-health.yml@<FULL_COMMIT_SHA>
+    with:
+      runner: ubuntu-24.04
+      langs: ""
+      lock: true
+      prepare-command: corepack enable
+      validation-command: make test
+    secrets:
+      pull-request-token: ${{ secrets.UPD_PR_TOKEN }}
+```
+
+Lockfile regeneration requires the ecosystem tools used by the repository.
+Choose an appropriate GitHub-hosted or self-hosted Linux runner, or install tools
+with `prepare-command`. Preparation may initialize tools and caches but must
+leave the repository clean; dependency changes belong exclusively to `upd`.
+
+## Inputs
+
+| Input | Default | Purpose |
+|-------|---------|---------|
+| `runner` | `ubuntu-24.04` | Linux runner label |
+| `upd-version` | `v0.6.2` | Exact released `upd` version |
+| `upd-sha256` | built in for the default version | Exact archive checksum when changing version or target |
+| `upd-target` | detected | Release target; Linux x86-64 and ARM64 GNU are detected |
+| `paths` | `.` | Whitespace-separated repository paths passed to `upd` |
+| `langs` | `actions` | Comma-separated ecosystem filter; empty enables every detected ecosystem |
+| `packages` | empty | Comma-separated package filter |
+| `min-age` | `7d` | Minimum eligible release age; empty uses project configuration |
+| `max-bump` | `minor` | Highest applied bump; empty uses project configuration |
+| `lock` | `false` | Regenerate lockfiles using tools available on the runner |
+| `update-action-shas` | `true` | Verify and update immutable Action SHA pins |
+| `prepare-command` | empty | Prepare project tooling without changing repository files |
+| `validation-command` | empty | Check updates before publishing |
+| `validate-actions` | `true` | Run `actionlint` when workflow files change |
+| `fail-on-blocked` | `false` | Fail when a safety condition blocks an update |
+| `branch` | `automation/upd-github-actions` | Automation-owned rolling branch |
+| `commit-message` | `ci(deps): update dependencies with upd` | Generated commit message |
+| `pull-request-title` | `ci(deps): update dependencies with upd` | Pull-request title |
+| `auto-merge` | `false` | Ask GitHub to merge after repository checks pass |
+| `merge-method` | `squash` | Auto-merge strategy: `squash`, `merge`, or `rebase` |
+
+When changing `upd-version` or `upd-target`, also provide the published archive
+digest:
+
+```yaml
+with:
+  upd-version: v0.6.2
+  upd-target: x86_64-unknown-linux-gnu
+  upd-sha256: 47b2504ff86197ec0097d6e767b5d9ff98f6e105166b8dcdb719a5281e8c5e8c
+```
+
+GitHub-hosted runner images are maintained over time rather than immutable. Use
+a controlled self-hosted runner when the complete execution environment must be
+reproducible. The downloaded `upd` binary remains independently checksum-pinned
+in either case.
+
+## Immutable GitHub Action pins
+
+The Actions updater covers actions and reusable workflows in
+`.github/workflows/*.yml` and `*.yaml`. It skips branch refs, local actions, and
+Docker references. Full commit pins are checked by default, and rewriting one
+requires a concrete version annotation:
+
+```yaml
+- uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+jobs:
+  conformance:
+    uses: rvben/clispec/.github/workflows/conformance.yml@<full-commit-sha> # v0.3.0
+```
+
+Before writing, `upd` verifies that the annotated current tag resolves to the
+pinned commit. It then applies cooldown and bump policy, resolves the selected
+tag to its full commit SHA, and updates both SHA and annotation. A pin is never
+converted to a mutable tag.
+
+A short SHA, missing or floating annotation, moved tag, stale annotation, or
+non-concrete configured target is reported as `blocked` with a machine-readable
+reason. With `update-action-shas: false`, these pins are instead reported as
+`not-examined`. Set `fail-on-blocked: true` when every immutable pin is expected
+to be maintainable automatically.
+
+`max-bump: minor` is a strict ceiling. Bare major references such as `@v4` are
+therefore normally held back; use `max-bump: major` when those updates should be
+eligible. Changed workflows are validated with `actionlint` before publication.
+
+Configuration pins and package filters use an action's `owner/repo` name. For
+example, `packages: actions/checkout` selects checkout references, subdirectory
+actions, and reusable workflows from that repository.
+
+## Safety and lifecycle
+
+The reusable workflow:
+
+- installs an exact `upd` release after verifying a trusted SHA-256;
+- serializes runs per repository;
+- validates the automation ref and keeps it distinct from the default branch;
+- starts from the latest default branch on every run;
+- updates or deletes the branch with an explicit `--force-with-lease` expectation;
+- refuses ambiguous duplicate open pull requests;
+- refuses partial results when `upd` reports errors;
+- fails if preparation or validation leaves unexpected repository changes;
+- retains the JSON update report for seven days;
+- creates or updates the automation-owned title and detailed description; and
+- closes the obsolete pull request and deletes its branch when no eligible
+  updates remain.
+
+Treat the configured branch, generated commit, title, and description as
+automation-owned. Later successful runs replace them.
+
+The reusable workflow exposes `changed` and `pull-request-url` outputs for caller
+jobs.
+
+## Auto-merge
+
+Auto-merge is deliberately opt-in:
+
+```yaml
+with:
+  validation-command: make test
+  auto-merge: true
+  merge-method: squash
+```
+
+The workflow gives GitHub the exact generated commit SHA through
+`--match-head-commit`. GitHub still enforces required checks, approvals,
+conversations, branch protection, rulesets, and merge queues. The workflow never
+uses administrator bypass. Turning `auto-merge` off disables auto-merge if this
+workflow previously enabled it.
+
+The repository must allow the chosen merge method and have auto-merge enabled.
+
+## Migrating off Dependabot
+
+For an existing fleet, keep overlapping Dependabot updates enabled for four
+successful weekly `upd` cycles. Review the generated reports, resolve blocked
+legacy pins, and confirm that the chosen token starts the expected checks. Then
+remove only the overlapping ecosystems from Dependabot.
+
+## Scope
+
+This integration intentionally produces one policy-constrained rolling pull
+request. It does not provide Renovate-style per-package branches, dependency
+dashboards, reviewer assignment, conflict resolution, or automatic rebasing.
+
+See [Configuration](configuration.md) for repository policy and
+[Private registries](private-registries.md) for ecosystem credentials.
