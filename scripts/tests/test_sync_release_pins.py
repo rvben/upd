@@ -45,10 +45,12 @@ class ReleasePinSynchronizerTest(unittest.TestCase):
             )
 
     def test_verified_artifacts_update_every_consumer_idempotently(self) -> None:
-        self.create_artifacts("v0.6.4")
         old = PINS.load_manifest(self.root / "release-pins.json")
+        major, minor, patch = PINS.version_key(old["version"])
+        new_version = f"v{major}.{minor}.{patch + 1}"
+        self.create_artifacts(new_version)
         new = PINS.manifest_from_artifacts(
-            self.artifacts, "v0.6.4", "1" * 40
+            self.artifacts, new_version, "1" * 40
         )
 
         self.assertTrue(PINS.sync_consumers(self.root, old, new))
