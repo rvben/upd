@@ -5,6 +5,20 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.6.3](https://github.com/rvben/upd/compare/v0.6.2...v0.6.3) - 2026-08-24
+
+### Fixed
+
+- **update**: anchor a multi-clause version range on its lower bound ([9b1719c](https://github.com/rvben/upd/commit/9b1719ccadf6939b9db35849d723135125b7d0c0))
+- **update**: report a floor diagnostic once per manifest that wants it ([7d89e71](https://github.com/rvben/upd/commit/7d89e7143eb31f371b2448dc37e7e9f05a4e565d))
+- **update**: count a floor upd was told not to write ([7167892](https://github.com/rvben/upd/commit/71678922a43e4f951b66a1de53b4e2c3d66a84b0))
+- **update**: read a lock-only floor's ignore rule from each project's own config ([a25b974](https://github.com/rvben/upd/commit/a25b974b4992928175ac431eb5c2eb08a0eb3bdf))
+- **update**: count an unwritable floor and never report it as held back ([bfd6dcd](https://github.com/rvben/upd/commit/bfd6dcd43af420aa97bcb44eb101dcdb0aad22d4))
+- **update**: report a lock-only floor above the ceiling as held back ([d72b272](https://github.com/rvben/upd/commit/d72b272056cea221409574b1b61fa1fba60c12c1))
+- **bump**: read the bump level from a range spec's lower bound ([e79cb64](https://github.com/rvben/upd/commit/e79cb6404d4f7965ff5081a0dc86dca16e040684))
+- **bump**: classify a step between zero-major versions as breaking ([2ec6bf5](https://github.com/rvben/upd/commit/2ec6bf558dded08706227bd23932e7f9c4fc8c1a))
+- **bump**: report updates held back by the bump ceiling ([7f83977](https://github.com/rvben/upd/commit/7f83977f0a75b681be54ea680282666668406ebc))
+
 ## [0.6.2](https://github.com/rvben/upd/compare/v0.6.1...v0.6.2) - 2026-08-21
 
 ### Fixed
