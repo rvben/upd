@@ -160,8 +160,36 @@ fn ci_and_release_jobs_install_only_the_tools_they_use() {
         );
     }
     assert_eq!(CI_WORKFLOW.matches("run: mise install rust").count(), 2);
-    assert!(RELEASE_WORKFLOW.contains("run: mise install cargo:cargo-binstall"));
+    assert!(RELEASE_WORKFLOW.contains("run: mise install cargo-binstall"));
+    assert!(!RELEASE_WORKFLOW.contains("mise install cargo:cargo-binstall"));
     assert!(RELEASE_WORKFLOW.contains("run: mise install cargo:maturin cargo:cargo-zigbuild"));
+
+    let mise: toml::Value =
+        toml::from_str(include_str!("../.mise.toml")).expect(".mise.toml should be valid TOML");
+    assert!(
+        mise["tools"]["cargo-binstall"]
+            .as_str()
+            .is_some_and(|version| !version.is_empty()),
+        "cargo-binstall must use mise's prebuilt registry backend",
+    );
+    assert!(
+        mise["tools"].get("cargo:cargo-binstall").is_none(),
+        "cargo-binstall must not bootstrap itself from source",
+    );
+    assert_eq!(
+        mise["settings"]["cargo"]["binstall"].as_bool(),
+        Some(true),
+        "Cargo tools must prefer cargo-binstall's prebuilt artifacts",
+    );
+    assert_eq!(
+        mise["env"]["BINSTALL_DISABLE_TELEMETRY"].as_str(),
+        Some("true"),
+    );
+    let setup = mise["tasks"]["setup"]["run"]
+        .as_str()
+        .expect("setup task should be a script");
+    assert!(!setup.lines().any(|line| line.trim() == "mise install"));
+    assert!(setup.contains("mise install cargo-binstall"));
 }
 
 #[test]

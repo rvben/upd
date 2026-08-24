@@ -2,6 +2,7 @@
 
 [env]
 RUST_BACKTRACE = "1"
+BINSTALL_DISABLE_TELEMETRY = "true"
 
 [tools]
 # Rust toolchain - version matches rust-toolchain.toml
@@ -16,8 +17,10 @@ uv = "0.12.5"
 # GitHub Actions workflow validation
 actionlint = "1.7.12"
 
-# Development tools installed via cargo
-"cargo:cargo-binstall" = "1.22.0"
+# Binary installer bootstrapped from its attested GitHub release via mise's registry
+cargo-binstall = "1.22.0"
+
+# Development tools installed via cargo-binstall
 "cargo:maturin" = "1.14.1"
 "cargo:cargo-zigbuild" = "0.23.0"
 
@@ -27,12 +30,15 @@ zig = "0.15.2"
 [settings]
 experimental = true
 idiomatic_version_file_enable_tools = ["rust"]
+cargo.binstall = true
 
 [tasks.setup]
 description = "Set up the development environment"
 run = """
 echo "Setting up upd development environment..."
-mise install
+mise install rust python uv actionlint zig
+mise install cargo-binstall
+mise install cargo:maturin cargo:cargo-zigbuild
 uv tool install twine
 echo "Setup complete!"
 mise list

@@ -159,7 +159,7 @@ jobs:
         run: mise install rust python zig
 
       - name: Install cargo tool bootstrap
-        run: mise install cargo:cargo-binstall
+        run: mise install cargo-binstall
 
       - name: Install Rust build tools
         run: mise install cargo:maturin cargo:cargo-zigbuild
@@ -251,7 +251,7 @@ jobs:
       - name: Install base source-distribution tools
         run: mise install rust python
       - name: Install cargo tool bootstrap
-        run: mise install cargo:cargo-binstall
+        run: mise install cargo-binstall
       - name: Install maturin
         run: mise install cargo:maturin
       - name: Build source distribution
