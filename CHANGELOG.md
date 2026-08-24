@@ -5,6 +5,20 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.6.4](https://github.com/rvben/upd/compare/v0.6.3...v0.6.4) - 2026-08-24
+
+### Added
+
+- **release**: automate verified integration pin updates ([8bfc014](https://github.com/rvben/upd/commit/8bfc014bbcf9b3ac13d2f33225be83d32d6bf023))
+- **packaging**: publish Python distribution as upd ([1fb9547](https://github.com/rvben/upd/commit/1fb9547ee40f22e69ec10f6f5502ab70aaa3807b))
+- **ci**: add GitHub and GitLab dependency automation ([096a05e](https://github.com/rvben/upd/commit/096a05eec5def0d22e6f3455151c25f2ef64df61))
+
+### Fixed
+
+- **lock**: scope direct edges to the current package ([7daaf08](https://github.com/rvben/upd/commit/7daaf08293f8a80e72f3248585b7e20ef48d0999))
+- **lock**: anchor an ambiguous cargo spec on the lockfile's direct edge ([46fa2de](https://github.com/rvben/upd/commit/46fa2de19cae9bfa91213efc46c46f7b61ea3502))
+- **lock**: qualify an ambiguous cargo package spec with its locked version ([e84868c](https://github.com/rvben/upd/commit/e84868c91fc2c2ad998e929f16996bdea1402b1b))
+
 ## [0.6.3](https://github.com/rvben/upd/compare/v0.6.2...v0.6.3) - 2026-08-24
 
 ### Fixed
