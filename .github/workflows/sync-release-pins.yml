@@ -136,6 +136,10 @@ jobs:
           experimental: true
           install: true
 
+      - name: Install Rust validation components
+        if: steps.synchronize.outputs.changed == 'true'
+        run: rustup component add rustfmt clippy
+
       - name: Validate generated change
         if: steps.synchronize.outputs.changed == 'true'
         run: |
