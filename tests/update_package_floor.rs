@@ -275,10 +275,16 @@ async fn an_annotated_pin_does_not_suppress_a_lock_only_floor() {
     assert_eq!(pyproject, PYPROJECT_BARE, "dry run must not write");
 }
 
-/// (2) A candidate that exceeds `--max-bump` is silently skipped: no floor
-/// entry, exit 0.
+/// (2) A candidate that exceeds `--max-bump` is not floored, and is not
+/// silently dropped either: it is reported as held back, in the floor file's
+/// `capped[]` and in `summary.capped`. Writing nothing and reporting nothing
+/// is how a lock-only dependency several majors behind reads as up to date
+/// forever.
+///
+/// Exit stays 0 and `updates_total` stays 0: the ceiling exists to keep such a
+/// change out of the gate, and nothing was written.
 #[tokio::test]
-async fn max_bump_caps_floor() {
+async fn max_bump_reports_a_capped_floor_as_held_back() {
     let server = wiremock::MockServer::start().await;
     mount_pypi_latest(&server, "lockonly", "1.2.0").await;
 
@@ -312,8 +318,396 @@ async fn max_bump_caps_floor() {
             .map(|u| u.iter().any(|e| e["package"] == "lockonly"))
             .unwrap_or(false)
     });
-    assert!(!has_floor_entry, "{files:?}");
+    assert!(
+        !has_floor_entry,
+        "an above-ceiling candidate must not be floored: {files:?}"
+    );
     assert_eq!(json["summary"]["updates_total"], 0, "{}", json["summary"]);
+    assert_eq!(
+        json["summary"]["files_with_changes"], 0,
+        "{}",
+        json["summary"]
+    );
+
+    let capped = collect_for_path(files, "pyproject.toml", "capped");
+    let entry = capped
+        .iter()
+        .find(|c| c["package"] == "lockonly")
+        .unwrap_or_else(|| panic!("no held-back entry for lockonly in {files:?}"));
+    assert_eq!(entry["current"], "0.40.0", "{entry:?}");
+    assert_eq!(entry["available"], "1.2.0", "{entry:?}");
+    assert_eq!(
+        entry["bump"], "major",
+        "naming the bump says what raising the ceiling would let through: {entry:?}"
+    );
+    assert_eq!(json["summary"]["capped"], 1, "{}", json["summary"]);
+}
+
+/// The negative control for the test above: the same fixture with a candidate
+/// INSIDE the ceiling floors normally and reports nothing as held back.
+/// Without it, an implementation that called every floor capped would pass.
+#[tokio::test]
+async fn a_floor_within_the_ceiling_is_not_reported_as_held_back() {
+    let server = wiremock::MockServer::start().await;
+    mount_pypi_latest(&server, "lockonly", "0.49.1").await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    fs::write(tmp.path().join("pyproject.toml"), PYPROJECT_BARE).unwrap();
+    fs::write(tmp.path().join("uv.lock"), uv_lock_at("lockonly", "0.40.0")).unwrap();
+
+    let (stdout, stderr, code) = run_with_env(
+        &[
+            "update",
+            "--package",
+            "lockonly",
+            "--max-bump",
+            "major",
+            "--format",
+            "json",
+            "--no-cache",
+            ".",
+        ],
+        tmp.path(),
+        &[("UV_INDEX_URL", &server.uri())],
+    );
+
+    assert_eq!(code, 1, "stdout: {stdout}\nstderr: {stderr}");
+
+    let json: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    let files = json["files"].as_array().unwrap();
+    let updates = collect_for_path(files, "pyproject.toml", "updates");
+    assert!(
+        updates
+            .iter()
+            .any(|u| u["package"] == "lockonly" && u["status"] == "planned"),
+        "{updates:?}"
+    );
+    assert_eq!(
+        json["summary"]["capped"].as_u64().unwrap_or(0),
+        0,
+        "{}",
+        json["summary"]
+    );
+}
+
+/// Two sibling projects whose locks both resolve the same lock-only package at
+/// the same version. The floor loop resolves one representative per
+/// `(name, version, ecosystem)` triple, so this is the fixture where a result
+/// reported straight from that loop reaches one manifest instead of both.
+fn two_projects_locking(tmp: &std::path::Path, package: &str, version: &str) {
+    for dir in ["a", "b"] {
+        fs::create_dir_all(tmp.join(dir)).unwrap();
+        fs::write(tmp.join(dir).join("pyproject.toml"), PYPROJECT_BARE).unwrap();
+        fs::write(tmp.join(dir).join("uv.lock"), uv_lock_at(package, version)).unwrap();
+    }
+}
+
+/// (2b) A held-back floor has to reach every lockfile that resolves the triple,
+/// not just the one the floor loop happened to resolve it from. A floor that IS
+/// taken fans out through `route_fix_targets`; one reported from the loop
+/// bypasses that fan-out, and the manifests it misses read as up to date -
+/// exactly the silence `capped[]` exists to end, relocated one level down.
+///
+/// `a_floor_within_the_ceiling_reaches_every_lockfile_that_holds_it` is the
+/// control: it fixes the expected fan-out at 2 on this same fixture, so the
+/// count asserted here is what routing produces rather than a number that
+/// happens to match.
+#[tokio::test]
+async fn a_capped_floor_reaches_every_lockfile_that_holds_it() {
+    let server = wiremock::MockServer::start().await;
+    mount_pypi_latest(&server, "lockonly", "1.2.0").await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    two_projects_locking(tmp.path(), "lockonly", "0.40.0");
+
+    let (stdout, stderr, code) = run_with_env(
+        &[
+            "update",
+            "--package",
+            "lockonly",
+            "--max-bump",
+            "minor",
+            "--format",
+            "json",
+            "--no-cache",
+            ".",
+        ],
+        tmp.path(),
+        &[("UV_INDEX_URL", &server.uri())],
+    );
+
+    assert_eq!(code, 0, "stdout: {stdout}\nstderr: {stderr}");
+
+    let json: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    let files = json["files"].as_array().unwrap();
+    for dir in ["a", "b"] {
+        let capped = collect_for_path(files, &format!("{dir}/pyproject.toml"), "capped");
+        assert!(
+            capped
+                .iter()
+                .any(|c| c["package"] == "lockonly" && c["available"] == "1.2.0"),
+            "{dir}/pyproject.toml has no held-back entry: {files:?}"
+        );
+    }
+    assert_eq!(json["summary"]["capped"], 2, "{}", json["summary"]);
+}
+
+/// The control for the test above: the same two-project fixture with a
+/// candidate INSIDE the ceiling floors both manifests, which is what fixes the
+/// expected fan-out at 2.
+#[tokio::test]
+async fn a_floor_within_the_ceiling_reaches_every_lockfile_that_holds_it() {
+    let server = wiremock::MockServer::start().await;
+    mount_pypi_latest(&server, "lockonly", "0.49.1").await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    two_projects_locking(tmp.path(), "lockonly", "0.40.0");
+
+    let (stdout, stderr, code) = run_with_env(
+        &[
+            "update",
+            "--package",
+            "lockonly",
+            "--max-bump",
+            "major",
+            "--format",
+            "json",
+            "--no-cache",
+            ".",
+        ],
+        tmp.path(),
+        &[("UV_INDEX_URL", &server.uri())],
+    );
+
+    assert_eq!(code, 1, "stdout: {stdout}\nstderr: {stderr}");
+
+    let json: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    let files = json["files"].as_array().unwrap();
+    for dir in ["a", "b"] {
+        let updates = collect_for_path(files, &format!("{dir}/pyproject.toml"), "updates");
+        assert!(
+            updates
+                .iter()
+                .any(|u| u["package"] == "lockonly" && u["status"] == "planned"),
+            "{dir}/pyproject.toml has no floor: {files:?}"
+        );
+    }
+    assert_eq!(json["summary"]["updates_total"], 2, "{}", json["summary"]);
+    assert_eq!(
+        json["summary"]["capped"].as_u64().unwrap_or(0),
+        0,
+        "{}",
+        json["summary"]
+    );
+}
+
+fn write_poetry_project(tmp: &std::path::Path) {
+    fs::write(tmp.join("pyproject.toml"), PYPROJECT_BARE).unwrap();
+    fs::write(
+        tmp.join("poetry.lock"),
+        "[[package]]\nname = \"lockonly\"\nversion = \"0.40.0\"\noptional = false\npython-versions = \"*\"\n",
+    )
+    .unwrap();
+}
+
+fn floor_json(
+    stdout: &str,
+    stderr: &str,
+    code: i32,
+    filename: &str,
+) -> (Vec<serde_json::Value>, Vec<serde_json::Value>) {
+    assert_eq!(code, 0, "stdout: {stdout}\nstderr: {stderr}");
+    let json: serde_json::Value = serde_json::from_str(stdout).unwrap();
+    let files = json["files"].as_array().unwrap().clone();
+    (
+        collect_for_path(&files, filename, "updates"),
+        collect_for_path(&files, filename, "capped"),
+    )
+}
+
+/// (2c) `poetry.lock` has no floor mechanism at all: routing reports every
+/// lock-only floor there as `unfixable`, whatever version was found. The
+/// ceiling therefore changes nothing about what upd can write, and reporting
+/// such a candidate as held back would tell the reader that raising the
+/// ceiling releases an update that no ceiling was ever blocking.
+///
+/// Both ceilings are run in one test because the claim IS the equivalence: the
+/// `major` run is what proves the `minor` run's answer is the honest one rather
+/// than a second silence. `max_bump_reports_a_capped_floor_as_held_back` is the
+/// other side of the control, a uv floor that CAN be written and so must still
+/// report as held back.
+#[tokio::test]
+async fn a_poetry_floor_is_unfixable_whatever_the_ceiling_says() {
+    for max_bump in ["major", "minor"] {
+        let server = wiremock::MockServer::start().await;
+        mount_pypi_latest(&server, "lockonly", "1.2.0").await;
+        let tmp = tempfile::tempdir().unwrap();
+        write_poetry_project(tmp.path());
+
+        let (stdout, stderr, code) = run_with_env(
+            &[
+                "update",
+                "--package",
+                "lockonly",
+                "--max-bump",
+                max_bump,
+                "--format",
+                "json",
+                "--no-cache",
+                ".",
+            ],
+            tmp.path(),
+            &[("UV_INDEX_URL", &server.uri())],
+        );
+
+        let (updates, capped) = floor_json(&stdout, &stderr, code, "poetry.lock");
+        let entry = updates
+            .iter()
+            .find(|u| u["package"] == "lockonly")
+            .unwrap_or_else(|| panic!("--max-bump {max_bump}: no entry in {updates:?}"));
+        assert_eq!(entry["status"], "unfixable", "--max-bump {max_bump}");
+        assert!(
+            entry["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("no floor mechanism exists for poetry.lock"),
+            "--max-bump {max_bump}: {entry:?}"
+        );
+        assert!(
+            capped.is_empty(),
+            "--max-bump {max_bump}: a floor that can never be written is not held back by a ceiling: {capped:?}"
+        );
+    }
+}
+
+/// (2d) The same rule for a target upd cannot write for a reason other than the
+/// lock's kind: an npm direct dependency whose spec cannot be bumped fails the
+/// override guard (see `own_name_direct_with_unbumpable_spec_is_unfixable`,
+/// which is this fixture in cap). Above the ceiling it must reach the same
+/// `unfixable` verdict rather than being reported as merely held back.
+#[tokio::test]
+async fn an_npm_floor_upd_cannot_write_is_unfixable_not_held_back() {
+    let server = wiremock::MockServer::start().await;
+    mount_npm_latest(&server, "examplepkg", "9.9.9").await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    fs::write(
+        tmp.path().join("package.json"),
+        r#"{"name": "t", "version": "1.0.0", "dependencies": {"examplepkg": "file:../local"}}"#,
+    )
+    .unwrap();
+    fs::write(
+        tmp.path().join("package-lock.json"),
+        npm_lock_with("examplepkg", "1.2.0"),
+    )
+    .unwrap();
+
+    let (stdout, stderr, code) = run_with_env(
+        &[
+            "update",
+            "--package",
+            "examplepkg",
+            "--max-bump",
+            "minor",
+            "--format",
+            "json",
+            "--no-cache",
+            ".",
+        ],
+        tmp.path(),
+        &[("NPM_REGISTRY", &server.uri())],
+    );
+
+    let (updates, capped) = floor_json(&stdout, &stderr, code, "package.json");
+    let entry = updates
+        .iter()
+        .find(|u| u["package"] == "examplepkg")
+        .unwrap_or_else(|| panic!("no entry in {updates:?}"));
+    assert_eq!(entry["status"], "unfixable", "{entry:?}");
+    assert!(
+        entry["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("has a spec upd cannot bump"),
+        "{entry:?}"
+    );
+    assert!(
+        capped.is_empty(),
+        "a floor the override guard refuses is not held back by a ceiling: {capped:?}"
+    );
+}
+
+/// (2e) One `(name, version, ecosystem)` triple can resolve in two locks with
+/// different floor mechanisms, and the verdict above the ceiling belongs to the
+/// lock, not to the package. Here `a/uv.lock` can take a constraint floor and
+/// is genuinely waiting on the ceiling alone; `b/poetry.lock` can never take
+/// one. A single verdict for the whole triple gets one of the two wrong: it
+/// either promises the poetry project an update that raising the ceiling
+/// cannot deliver, or silences the uv project that raising the ceiling would
+/// update, leaving it looking up to date.
+///
+/// This fixture carries its own controls: each project is the other's, since
+/// the same package at the same version must come out held back in one and
+/// unfixable in the other.
+#[tokio::test]
+async fn a_capped_floor_is_classified_per_lock_not_per_package() {
+    let server = wiremock::MockServer::start().await;
+    mount_pypi_latest(&server, "lockonly", "1.2.0").await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    for dir in ["a", "b"] {
+        fs::create_dir_all(tmp.path().join(dir)).unwrap();
+        fs::write(tmp.path().join(dir).join("pyproject.toml"), PYPROJECT_BARE).unwrap();
+    }
+    fs::write(
+        tmp.path().join("a/uv.lock"),
+        uv_lock_at("lockonly", "0.40.0"),
+    )
+    .unwrap();
+    fs::write(
+        tmp.path().join("b/poetry.lock"),
+        "[[package]]\nname = \"lockonly\"\nversion = \"0.40.0\"\noptional = false\npython-versions = \"*\"\n",
+    )
+    .unwrap();
+
+    let (stdout, stderr, code) = run_with_env(
+        &[
+            "update",
+            "--package",
+            "lockonly",
+            "--max-bump",
+            "minor",
+            "--format",
+            "json",
+            "--no-cache",
+            ".",
+        ],
+        tmp.path(),
+        &[("UV_INDEX_URL", &server.uri())],
+    );
+
+    assert_eq!(code, 0, "stdout: {stdout}\nstderr: {stderr}");
+    let json: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    let files = json["files"].as_array().unwrap().clone();
+
+    let capped = collect_for_path(&files, "a/pyproject.toml", "capped");
+    assert_eq!(
+        capped.len(),
+        1,
+        "the uv project can take this floor, so the ceiling is what held it: {json}"
+    );
+    assert_eq!(capped[0]["package"], "lockonly");
+    assert_eq!(capped[0]["available"], "1.2.0");
+
+    assert!(
+        collect_for_path(&files, "b/pyproject.toml", "capped").is_empty(),
+        "the poetry project has no floor mechanism, so no ceiling held it: {json}"
+    );
+    let poetry = collect_for_path(&files, "poetry.lock", "updates");
+    assert_eq!(poetry.len(), 1, "{json}");
+    assert_eq!(poetry[0]["status"], "unfixable", "{json}");
+
+    assert_eq!(json["summary"]["capped"].as_u64().unwrap_or(0), 1, "{json}");
 }
 
 /// (3) A requested name that DOES occur in the manifest keeps today's

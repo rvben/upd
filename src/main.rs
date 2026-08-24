@@ -19,7 +19,9 @@ use upd::cli::{BumpLevel, Cli, Command, OutputMode, REVERT_TIP};
 use upd::config::UpdConfig;
 use upd::cooldown::CooldownPolicy;
 use upd::fix::apply::{AppliedFix, FixApplyOptions, FixStatus, apply_fix_targets};
-use upd::fix::{FixKind, FixTarget, UnfixableTarget, resolve_floor_version, route_fix_targets};
+use upd::fix::{
+    FixKind, FixTarget, FloorResolution, UnfixableTarget, resolve_floor_version, route_fix_targets,
+};
 use upd::interactive::{PendingUpdate, prompt_all};
 use upd::lockfile::{LockfileRegenResult, RegenOutcome, regenerate_lockfiles};
 use upd::lockscan;
@@ -1563,8 +1565,13 @@ async fn run_update(cli: &Cli) -> Result<()> {
         }
 
         let mut synthetic_vulnerable: Vec<PackageAuditResult> = Vec::new();
+        // Candidates the ceiling refused, held until routing has said whether
+        // this lock has a floor mechanism at all. Reported as held back only
+        // if it does.
+        let mut capped_pending: Vec<(&upd::lockscan::LockedPackage, String)> = Vec::new();
         let mut floor_ignored: HashMap<PathBuf, Vec<upd::output::IgnoredEntry>> = HashMap::new();
         let mut floor_errors: HashMap<PathBuf, Vec<upd::output::ErrorEntry>> = HashMap::new();
+        let mut floor_capped: HashMap<PathBuf, Vec<upd::output::CappedEntry>> = HashMap::new();
 
         for locked in &distinct {
             let Some(kind) = lock_kind_by_path.get(&locked.lockfile_path).copied() else {
@@ -1622,7 +1629,15 @@ async fn run_update(cli: &Cli) -> Result<()> {
             match resolve_floor_version(registry, &locked.name, &locked.version, lang, &options)
                 .await
             {
-                Ok(Some(candidate)) => {
+                Ok(FloorResolution::Capped(candidate)) => {
+                    // Above the ceiling: nothing is written, but a newer
+                    // release is waiting and has to be visible. Held until the
+                    // router has been asked whether a floor could be written
+                    // here at all, since "held back by the ceiling" promises
+                    // that raising the ceiling releases the update.
+                    capped_pending.push((locked, candidate));
+                }
+                Ok(FloorResolution::Floor(candidate)) => {
                     synthetic_vulnerable.push(PackageAuditResult {
                         package: AuditPackage {
                             name: locked.name.clone(),
@@ -1640,7 +1655,7 @@ async fn run_update(cli: &Cli) -> Result<()> {
                         }],
                     });
                 }
-                Ok(None) => {}
+                Ok(FloorResolution::NotNeeded) => {}
                 Err(e) => {
                     let msg = format!("Error resolving floor for {}: {}", locked.name, e);
                     eprintln!("{}", msg.red());
@@ -1659,7 +1674,19 @@ async fn run_update(cli: &Cli) -> Result<()> {
             }
         }
 
-        let (outcomes, unfixable, apply_notes): (
+        // Shared by the real routing pass and the capped classification pass
+        // below, both of which ask the same question of the same locks.
+        let prov = if synthetic_vulnerable.is_empty() && capped_pending.is_empty() {
+            None
+        } else {
+            Some(lockscan::provenance::classify(
+                &lock_scan.locks,
+                &lock_scan.packages,
+                &manifest_packages,
+            ))
+        };
+
+        let (outcomes, mut unfixable, apply_notes): (
             Vec<AppliedFix>,
             Vec<UnfixableTarget>,
             Vec<String>,
@@ -1672,23 +1699,11 @@ async fn run_update(cli: &Cli) -> Result<()> {
                 errors: Vec::new(),
                 warnings: Vec::new(),
             };
-            let prov = lockscan::provenance::classify(
-                &lock_scan.locks,
-                &lock_scan.packages,
+            let routing = route_fix_targets(
+                &synthetic_audit,
+                prov.as_ref().expect("prov built for a non-empty floor set"),
                 &manifest_packages,
             );
-            let routing = route_fix_targets(&synthetic_audit, &prov, &manifest_packages);
-
-            if !cli.quiet {
-                for u in &routing.unfixable {
-                    eprintln!(
-                        "{} Cannot auto-fix {}: {}",
-                        "⚠".yellow().bold(),
-                        u.package.bold(),
-                        u.reason
-                    );
-                }
-            }
 
             let opts = FixApplyOptions {
                 dry_run,
@@ -1699,6 +1714,100 @@ async fn run_update(cli: &Cli) -> Result<()> {
             let (outcomes, notes) = apply_fix_targets(routing.targets, &opts, &|_, _, _| Ok(false));
             (outcomes, routing.unfixable, notes)
         };
+
+        // Classify the candidates the ceiling refused, discarding the fix
+        // targets' edits: this pass only asks WHERE a floor could have been
+        // written and where it could not. A poetry.lock has no floor mechanism
+        // at all, and an npm direct dependency whose spec upd cannot bump fails
+        // the override guard, so those are unfixable whatever the ceiling says.
+        // Reporting them as held back would promise that raising the ceiling
+        // releases them, when raising it changes nothing; they get the same
+        // unfixable diagnostic, with its actionable guidance, that an in-cap
+        // candidate gets.
+        //
+        // The verdict is per PATH, not per package: one triple can resolve in a
+        // uv.lock that takes a floor and a poetry.lock that cannot, and the uv
+        // project is then genuinely waiting on the ceiling alone. Routing is
+        // asked one triple at a time so each answer stays attached to the triple
+        // that produced it, since a shared pass is matchable back only by name
+        // and version, which two ecosystems can share.
+        for (locked, candidate) in &capped_pending {
+            let capped_audit = AuditResult {
+                vulnerable: vec![PackageAuditResult {
+                    package: AuditPackage {
+                        name: locked.name.clone(),
+                        version: locked.version.clone(),
+                        ecosystem: locked.ecosystem,
+                    },
+                    vulnerabilities: vec![Vulnerability {
+                        id: "floor".to_string(),
+                        summary: None,
+                        severity: None,
+                        url: None,
+                        fixed_version: Some(candidate.clone()),
+                        aliases: Vec::new(),
+                        source: String::new(),
+                    }],
+                }],
+                safe_count: 0,
+                errors: Vec::new(),
+                warnings: Vec::new(),
+            };
+            let routing = route_fix_targets(
+                &capped_audit,
+                prov.as_ref()
+                    .expect("prov built for a non-empty capped set"),
+                &manifest_packages,
+            );
+
+            // One entry per manifest the floor would have been written to,
+            // which is exactly the fan-out routing produces for a floor that is
+            // taken. Anything reported outside that fan-out would land only on
+            // the representative's own manifest, leaving every other project
+            // holding the same package looking up to date.
+            let mut reported: Vec<PathBuf> = Vec::new();
+            for target in &routing.targets {
+                if reported.contains(&target.path) {
+                    continue;
+                }
+                reported.push(target.path.clone());
+                total_result.record_capped(&locked.name, &locked.version, candidate, None);
+                if text_mode && !cli.quiet {
+                    println!(
+                        "{}",
+                        format_capped_line(
+                            &target.path.display().to_string(),
+                            None,
+                            &locked.name,
+                            &locked.version,
+                            candidate,
+                        )
+                    );
+                }
+                floor_capped.entry(target.path.clone()).or_default().push(
+                    upd::output::CappedEntry {
+                        package: locked.name.clone(),
+                        current: locked.version.clone(),
+                        available: candidate.clone(),
+                        bump: classify_update(&locked.version, candidate).as_str(),
+                        line: None,
+                        source: None,
+                    },
+                );
+            }
+            unfixable.extend(routing.unfixable);
+        }
+
+        if !cli.quiet {
+            for u in &unfixable {
+                eprintln!(
+                    "{} Cannot auto-fix {}: {}",
+                    "⚠".yellow().bold(),
+                    u.package.bold(),
+                    u.reason
+                );
+            }
+        }
 
         for note in &apply_notes {
             eprintln!("note: {note}");
@@ -1781,6 +1890,13 @@ async fn run_update(cli: &Cli) -> Result<()> {
                 .entry(path.clone())
                 .or_insert_with(|| empty_floor_report(&path));
             report.errors.extend(errors);
+        }
+
+        for (path, capped) in floor_capped {
+            let report = grouped
+                .entry(path.clone())
+                .or_insert_with(|| empty_floor_report(&path));
+            report.capped.extend(capped);
         }
 
         floor_reports = grouped.into_values().collect();
@@ -2283,6 +2399,18 @@ async fn run_interactive_update(
             Ok(file_result) => {
                 for line in format_scan_diagnostics(path, &file_result) {
                     eprintln!("{}", line);
+                }
+
+                // A capped update has nothing to prompt for, since the ceiling
+                // already decided it, so it is reported here as the file is
+                // scanned rather than through the accept/reject flow. Printing
+                // it here also means it survives a run that HAS changes to
+                // prompt for: gating it on "nothing else to do" would hide it
+                // in exactly the busy repository that needs it most.
+                if !cli.quiet {
+                    for line in format_capped_lines(&path.display().to_string(), &file_result) {
+                        println!("{}", line);
+                    }
                 }
 
                 for update in &file_result.updated {
@@ -4541,6 +4669,52 @@ fn count_updates_by_type(
     )
 }
 
+/// The one rendering of a held-back update, so the non-interactive report,
+/// the interactive scan and the lock-only floor path never drift apart.
+/// Naming the bump that exceeded the ceiling says what raising it would let
+/// through.
+fn format_capped_line(
+    path: &str,
+    line_number: Option<usize>,
+    package: &str,
+    current: &str,
+    available: &str,
+) -> String {
+    let location = match line_number {
+        Some(n) => format!("{}:{}:", path, n),
+        None => format!("{}:", path),
+    };
+    format!(
+        "{} {} {} {} {} {} ({} bump)",
+        location.blue().underline(),
+        "Held back".yellow(),
+        package.bold(),
+        current.dimmed(),
+        "→".dimmed(),
+        available.cyan(),
+        classify_update(current, available).as_str()
+    )
+}
+
+/// Every held-back update for one file, rendered. Produced by a helper rather
+/// than printed in place so `--interactive` can report them without a
+/// terminal-driven test, the same reason `format_scan_diagnostics` exists.
+fn format_capped_lines(path: &str, result: &UpdateResult) -> Vec<String> {
+    result
+        .capped
+        .iter()
+        .map(|capped| {
+            format_capped_line(
+                path,
+                capped.line_number,
+                &capped.package,
+                &capped.current,
+                &capped.available,
+            )
+        })
+        .collect()
+}
+
 fn print_file_result(
     path: &str,
     file_type: FileType,
@@ -4678,23 +4852,8 @@ fn print_file_result(
 
     // An update the ceiling held back always prints, whatever the --filter:
     // filters narrow which updates get written, and this one was not written.
-    // Naming the bump that exceeded the ceiling says what raising it would let
-    // through.
-    for capped in &result.capped {
-        let location = match capped.line_number {
-            Some(n) => format!("{}:{}:", path, n),
-            None => format!("{}:", path),
-        };
-        println!(
-            "{} {} {} {} {} {} ({} bump)",
-            location.blue().underline(),
-            "Held back".yellow(),
-            capped.package.bold(),
-            capped.current.dimmed(),
-            "→".dimmed(),
-            capped.available.cyan(),
-            classify_update(&capped.current, &capped.available).as_str()
-        );
+    for line in format_capped_lines(path, result) {
+        println!("{line}");
     }
 
     // A blocked pin needs attention on the line it is on, so it always prints.
@@ -5489,6 +5648,56 @@ mod tests {
             has_interactive_changes(&pending, &quiet),
             "a pending update is still a change"
         );
+    }
+
+    /// Held-back updates render through the same helper in interactive mode as
+    /// in the report, and `run_interactive_update` calls it inside the per-file
+    /// scan loop rather than in the "nothing to do" branch: a repository with
+    /// both an in-cap update to prompt for and an above-cap one held back must
+    /// show the second, which is precisely the busy repository where losing it
+    /// matters. Asserted here rather than end-to-end because
+    /// `run_interactive_update` rejects non-TTY stdin before any of this runs
+    /// (see tests/interactive_tty.rs), the same reason
+    /// `interactive_lock_only_package_gets_note` lives here.
+    #[test]
+    fn capped_lines_name_the_package_the_versions_and_the_bump() {
+        let result = UpdateResult {
+            capped: vec![
+                upd::updater::CappedUpdate {
+                    package: "reqwest".into(),
+                    current: "0.12.1".into(),
+                    available: "0.13.0".into(),
+                    line_number: Some(7),
+                },
+                upd::updater::CappedUpdate {
+                    package: "serde".into(),
+                    current: "1.0.1".into(),
+                    available: "1.1.0".into(),
+                    line_number: None,
+                },
+            ],
+            ..Default::default()
+        };
+
+        let lines = format_capped_lines("Cargo.toml", &result);
+
+        assert_eq!(lines.len(), 2, "{lines:?}");
+        assert!(lines[0].contains("Cargo.toml:7:"), "{}", lines[0]);
+        assert!(lines[0].contains("reqwest"), "{}", lines[0]);
+        assert!(lines[0].contains("0.12.1"), "{}", lines[0]);
+        assert!(lines[0].contains("0.13.0"), "{}", lines[0]);
+        assert!(
+            lines[0].contains("(major bump)"),
+            "a step between zero-major versions is breaking, and the line has to \
+             say so or it reads as reachable under a minor ceiling: {}",
+            lines[0]
+        );
+        assert!(
+            lines[1].contains("Cargo.toml:") && !lines[1].contains("Cargo.toml:0:"),
+            "an entry with no line number must not invent one: {}",
+            lines[1]
+        );
+        assert!(lines[1].contains("(minor bump)"), "{}", lines[1]);
     }
 
     /// The interactive diagnostic is produced by a helper so the fourth CLI

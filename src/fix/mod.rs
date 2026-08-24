@@ -784,27 +784,42 @@ pub fn route_fix_targets(
     }
 }
 
+/// What resolving a lock-only floor produced. "Nothing to do" and "there is a
+/// newer release, the ceiling refused it" are different facts about the
+/// dependency, and collapsing them into one `None` is what let a lock-only
+/// package sit several majors behind while every run reported it up to date.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FloorResolution {
+    /// No floor needed: the candidate is at or below the locked version, or
+    /// cooldown held it back.
+    NotNeeded,
+    /// The version to floor to.
+    Floor(String),
+    /// A newer version exists but sits above the `--max-bump`/`--only-bump`
+    /// ceiling. Nothing is written; the caller reports it as held back.
+    Capped(String),
+}
+
 /// Resolve the floor version for a lock-only package: config pin if above
 /// the locked version, else registry latest gated by cooldown and the bump
-/// filter. Ok(None) = no floor needed (candidate at/below the locked
-/// version, or capped by cooldown/--max-bump). Registry failures return
-/// Err - the caller pushes them into the update error channel (exit 2);
-/// they are NEVER collapsed into Ok(None), which would silently exit 0.
-/// Lives here rather than in the binary because the per-lang comparison
-/// (crate::align::compare_versions) is crate-private.
+/// filter. Registry failures return Err - the caller pushes them into the
+/// update error channel (exit 2); they are NEVER collapsed into
+/// `NotNeeded`, which would silently exit 0. Lives here rather than in the
+/// binary because the per-lang comparison (crate::align::compare_versions)
+/// is crate-private.
 pub async fn resolve_floor_version(
     registry: &dyn crate::registry::Registry,
     package: &str,
     locked: &str,
     lang: Lang,
     options: &crate::updater::UpdateOptions,
-) -> anyhow::Result<Option<String>> {
+) -> anyhow::Result<FloorResolution> {
     if let Some(pinned) = options.get_pinned_version(package) {
         return Ok(
             if crate::align::compare_versions(pinned, locked, lang) == Ordering::Greater {
-                Some(pinned.to_string())
+                FloorResolution::Floor(pinned.to_string())
             } else {
-                None
+                FloorResolution::NotNeeded
             },
         );
     }
@@ -819,16 +834,16 @@ pub async fn resolve_floor_version(
     let candidate = match outcome {
         crate::updater::CooldownOutcome::Unchanged(v) => v,
         crate::updater::CooldownOutcome::HeldBack { chosen, .. } => chosen,
-        crate::updater::CooldownOutcome::Skipped { .. } => return Ok(None),
+        crate::updater::CooldownOutcome::Skipped { .. } => return Ok(FloorResolution::NotNeeded),
     };
 
     if crate::align::compare_versions(&candidate, locked, lang) != Ordering::Greater {
-        return Ok(None);
+        return Ok(FloorResolution::NotNeeded);
     }
     if !options.allows_bump(locked, &candidate) {
-        return Ok(None);
+        return Ok(FloorResolution::Capped(candidate));
     }
-    Ok(Some(candidate))
+    Ok(FloorResolution::Floor(candidate))
 }
 
 #[cfg(test)]
@@ -1898,7 +1913,7 @@ mod tests {
                     .await
                     .unwrap();
 
-            assert_eq!(result, Some("0.49.1".to_string()));
+            assert_eq!(result, FloorResolution::Floor("0.49.1".to_string()));
         }
 
         #[tokio::test]
@@ -1911,9 +1926,12 @@ mod tests {
                     .await
                     .unwrap();
 
-            assert_eq!(result, None);
+            assert_eq!(result, FloorResolution::NotNeeded);
         }
 
+        /// A candidate above the ceiling is a distinct outcome from "no floor
+        /// needed": there IS a newer release, and the caller has to be able to
+        /// report it as held back rather than as up to date.
         #[tokio::test]
         async fn max_bump_caps_the_floor() {
             let registry = MockRegistry::new("PyPI").with_version("lockonly", "1.2.0");
@@ -1928,7 +1946,7 @@ mod tests {
                     .await
                     .unwrap();
 
-            assert_eq!(result, None);
+            assert_eq!(result, FloorResolution::Capped("1.2.0".to_string()));
         }
 
         #[tokio::test]
@@ -1945,7 +1963,7 @@ mod tests {
                     .await
                     .unwrap();
 
-            assert_eq!(result, Some("0.45.0".to_string()));
+            assert_eq!(result, FloorResolution::Floor("0.45.0".to_string()));
         }
 
         #[tokio::test]
@@ -1962,7 +1980,7 @@ mod tests {
                     .await
                     .unwrap();
 
-            assert_eq!(result, None);
+            assert_eq!(result, FloorResolution::NotNeeded);
         }
 
         #[tokio::test]

@@ -99,7 +99,16 @@ the level that decided whether the change was let through.
 An update above the ceiling is reported as held back, in `files[].capped` and
 `summary.capped`. It is never counted as up to date, and it does not change the
 exit code: the ceiling exists to keep such a change out of the gate, so a run
-can exit `0` with work waiting in `capped`.
+can exit `0` with work waiting in `capped`. This covers lock-only version
+floors as well: a transitive package whose newer release sits above the ceiling
+is reported against every manifest the floor would have been written to.
+
+A lock that has no floor mechanism is a separate answer, not a capped one. The
+verdict belongs to the lock rather than to the package, so one transitive
+package resolved by both a `uv.lock` and a `poetry.lock` is reported as held
+back for the uv project and as unfixable for the poetry one, the latter in
+`files[].updates[]` with `status: "unfixable"` and an `error` naming what to do
+instead.
 
 ## Stable exit codes
 
