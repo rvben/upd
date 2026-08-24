@@ -1,5 +1,3 @@
-"""
-upd-cli: A fast dependency updater for Python and Node.js projects.
-"""
+"""Python support package for the upd command-line tool."""
 
 __version__ = "0.0.1"

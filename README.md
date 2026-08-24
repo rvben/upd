@@ -5,7 +5,7 @@
 # upd
 
 [![crates.io](https://img.shields.io/crates/v/upd.svg)](https://crates.io/crates/upd)
-[![PyPI](https://img.shields.io/pypi/v/upd-cli.svg)](https://pypi.org/project/upd-cli/)
+[![PyPI](https://img.shields.io/pypi/v/upd.svg)](https://pypi.org/project/upd/)
 [![CI](https://github.com/rvben/upd/actions/workflows/ci.yml/badge.svg)](https://github.com/rvben/upd/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](https://github.com/rvben/upd/blob/main/LICENSE)
 
@@ -15,13 +15,13 @@ A fast dependency updater for Python, Node.js, Rust, Go, Ruby, .NET, Terraform, 
 
 ```bash
 # Preview changes without modifying files (default)
-uvx --from upd-cli upd
+uvx upd
 
 # Apply updates
-uvx --from upd-cli upd --apply
+uvx upd --apply
 
 # Or with pipx
-pipx run --spec upd-cli upd --apply
+pipx run upd --apply
 ```
 
 ## Features
@@ -55,10 +55,14 @@ cargo binstall upd
 ### From PyPI
 
 ```bash
-pip install upd-cli
+pip install upd
 # or with uv
-uv pip install upd-cli
+uv pip install upd
 ```
+
+If you installed an earlier release under the old distribution name, migrate
+once with `pip uninstall upd-cli && pip install upd`. The `upd-cli` command
+remains available as a compatibility alias.
 
 ### From source
 
@@ -239,7 +243,7 @@ Available hooks:
 | `upd-check` | Fail if any dependencies are outdated |
 | `upd-check-major` | Fail only on major (breaking) updates |
 
-Both hooks run on `pre-push` by default. Uses `language: python` which installs `upd-cli` from PyPI automatically, so no manual installation is needed.
+Both hooks run on `pre-push` by default. Uses `language: python` which installs `upd` from PyPI automatically, so no manual installation is needed.
 
 ## Documentation
 
