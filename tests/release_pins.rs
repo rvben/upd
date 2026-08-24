@@ -162,7 +162,11 @@ fn ci_and_release_jobs_install_only_the_tools_they_use() {
     assert_eq!(CI_WORKFLOW.matches("run: mise install rust").count(), 2);
     assert!(RELEASE_WORKFLOW.contains("run: mise install cargo-binstall"));
     assert!(!RELEASE_WORKFLOW.contains("mise install cargo:cargo-binstall"));
-    assert!(RELEASE_WORKFLOW.contains("run: mise install cargo:maturin cargo:cargo-zigbuild"));
+    assert!(RELEASE_WORKFLOW.contains("run: mise install cargo:maturin"));
+    assert!(!RELEASE_WORKFLOW.contains("mise install rust python zig"));
+    assert!(RELEASE_WORKFLOW.contains(
+        "if: matrix.os == 'ubuntu-latest'\n        run: mise install zig cargo:cargo-zigbuild"
+    ));
 
     let mise: toml::Value =
         toml::from_str(include_str!("../.mise.toml")).expect(".mise.toml should be valid TOML");

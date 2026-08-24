@@ -156,13 +156,17 @@ jobs:
           install: false
 
       - name: Install base build tools
-        run: mise install rust python zig
+        run: mise install rust python
 
       - name: Install cargo tool bootstrap
         run: mise install cargo-binstall
 
-      - name: Install Rust build tools
-        run: mise install cargo:maturin cargo:cargo-zigbuild
+      - name: Install Rust build tool
+        run: mise install cargo:maturin
+
+      - name: Install Linux cross-compilation tools
+        if: matrix.os == 'ubuntu-latest'
+        run: mise install zig cargo:cargo-zigbuild
 
       - name: Verify zig installation
         if: matrix.os == 'ubuntu-latest'
