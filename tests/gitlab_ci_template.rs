@@ -13,7 +13,15 @@ use wiremock::matchers::{method, path, query_param};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 const TEMPLATE: &str = include_str!("../ci/gitlab-dependency-update.yml");
+const RELEASE_PINS: &str = include_str!("../release-pins.json");
 const BRANCH: &str = "automation/upd-dependencies";
+
+fn release_version() -> String {
+    serde_json::from_str::<serde_json::Value>(RELEASE_PINS).unwrap()["version"]
+        .as_str()
+        .unwrap()
+        .to_string()
+}
 
 fn embedded_script() -> String {
     let marker = "  script:\n    - |\n";
@@ -123,7 +131,7 @@ fi
             .env("CI_PROJECT_ID", "1")
             .env("CI_PROJECT_PATH", "remote")
             .env("CI_SERVER_URL", &self.server_url)
-            .env("UPD_VERSION", "v0.6.2")
+            .env("UPD_VERSION", release_version())
             .env("UPD_SHA256", "")
             .env("UPD_TARGET", "")
             .env("UPD_PATHS", ".")

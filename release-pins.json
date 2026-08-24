@@ -1,0 +1,19 @@
+{
+  "schema": 1,
+  "version": "v0.6.3",
+  "release_commit": "0da39ee2af2743d980f1b792632cc158443f202c",
+  "assets": {
+    "aarch64-unknown-linux-gnu": {
+      "name": "upd-v0.6.3-aarch64-unknown-linux-gnu.tar.gz",
+      "sha256": "2dcad70bd1055e0c8519b7ac9cac04cc9efa7f23100ce803deb51b4ab117b3df"
+    },
+    "x86_64-unknown-linux-gnu": {
+      "name": "upd-v0.6.3-x86_64-unknown-linux-gnu.tar.gz",
+      "sha256": "0e28562f06c852a5438e4e9745c8f99fc31240162ee65e633eeb7359b7e3a351"
+    },
+    "x86_64-unknown-linux-musl": {
+      "name": "upd-v0.6.3-x86_64-unknown-linux-musl.tar.gz",
+      "sha256": "f33188f3ab45652859f0dc9fd4423250690645a64b2dfba55a2752d48dadf24a"
+    }
+  }
+}

@@ -1,2 +1,10 @@
-[hooks]
-post-push = "gh api repos/rvben/upd-pre-commit/dispatches -f event_type=pypi_release"
+[project]
+branch = "main"
+
+[changelog]
+unconventional = "exclude"
+
+[checks]
+lint = false
+tests = true
+test_command = "make check"

@@ -1,4 +1,4 @@
-.PHONY: build release test test-verbose lint fmt fmt-check check ci clean run run-release install release-patch release-minor release-major
+.PHONY: build release test test-verbose lint fmt fmt-check release-pins-check check ci clean run run-release install release-patch release-minor release-major
 
 # Build debug binary
 build:
@@ -28,9 +28,14 @@ fmt:
 fmt-check:
 	cargo fmt -- --check
 
+# Verify that every distributed integration uses the canonical release pins.
+release-pins-check:
+	python3 scripts/sync-release-pins.py --check
+	python3 -m unittest discover -s scripts/tests -p 'test_*.py'
+
 # Everything CI's test job runs, in the order it runs them. CI invokes this
 # target rather than repeating the list, so the two cannot drift apart.
-ci: fmt-check lint test
+ci: release-pins-check fmt-check lint test
 
 # Alias for `ci`
 check: ci

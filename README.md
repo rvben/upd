@@ -250,6 +250,12 @@ Both hooks run on `pre-push` by default. Uses `language: python` which installs 
 Everything you look up rather than read lives in
 [docs/](https://github.com/rvben/upd/tree/main/docs).
 
+### Releases
+
+Vership workflow, publication guarantees, automated integration pins, and safe
+retry procedures.
+→ [docs/releases.md](https://github.com/rvben/upd/blob/main/docs/releases.md)
+
 ### Supported files
 
 Every file `upd` discovers, per ecosystem, plus annotated version pins in files

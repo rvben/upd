@@ -10,7 +10,17 @@ use std::process::{Command, Output};
 use tempfile::TempDir;
 
 const WORKFLOW: &str = include_str!("../.github/workflows/dependency-health.yml");
+const RELEASE_PINS: &str = include_str!("../release-pins.json");
 const BRANCH: &str = "automation/upd-github-actions";
+
+fn release_pin(path: &[&str]) -> String {
+    let manifest: serde_json::Value = serde_json::from_str(RELEASE_PINS).unwrap();
+    let mut value = &manifest;
+    for key in path {
+        value = &value[*key];
+    }
+    value.as_str().unwrap().to_string()
+}
 
 fn publish_script() -> String {
     let step = WORKFLOW
@@ -315,8 +325,10 @@ fn workflow_closes_an_obsolete_pr_and_lease_deletes_its_branch() {
 
 #[test]
 fn workflow_defaults_are_reproducible_and_safe() {
-    assert!(WORKFLOW.contains("default: v0.6.2"));
-    assert!(WORKFLOW.contains("47b2504ff86197ec0097d6e767b5d9ff9"));
+    let version = release_pin(&["version"]);
+    let checksum = release_pin(&["assets", "x86_64-unknown-linux-gnu", "sha256"]);
+    assert!(WORKFLOW.contains(&format!("default: {version}")));
+    assert!(WORKFLOW.contains(&checksum));
     assert!(WORKFLOW.contains("actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1"));
     assert!(WORKFLOW.contains("actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a"));
     assert!(WORKFLOW.contains("--force-with-lease="));

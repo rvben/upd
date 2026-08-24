@@ -1,0 +1,213 @@
+name: Synchronize release pins
+
+on:
+  workflow_call:
+    inputs:
+      version:
+        description: Exact v-prefixed release version
+        required: true
+        type: string
+      release_commit:
+        description: Full commit SHA referenced by the release tag
+        required: true
+        type: string
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Existing v-prefixed release to synchronize
+        required: true
+        type: string
+
+permissions:
+  attestations: read
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: release-pins-${{ github.repository }}
+  cancel-in-progress: false
+
+jobs:
+  synchronize:
+    name: Verify, propose, and merge release pins
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      GH_TOKEN: ${{ github.token }}
+      VERSION: ${{ inputs.version }}
+    steps:
+      - name: Check out latest main
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Resolve and validate release
+        id: release
+        env:
+          REQUESTED_COMMIT: ${{ inputs.release_commit }}
+        run: |
+          set -euo pipefail
+          if [[ ! "$VERSION" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+            echo "version must be an exact stable v-prefixed release" >&2
+            exit 4
+          fi
+
+          git fetch --no-tags origin "+refs/heads/main:refs/remotes/origin/main"
+          git fetch --force origin "+refs/tags/${VERSION}:refs/tags/${VERSION}"
+          release_commit="$(git rev-parse "refs/tags/${VERSION}^{commit}")"
+          if [[ -n "$REQUESTED_COMMIT" && "$REQUESTED_COMMIT" != "$release_commit" ]]; then
+            echo "release tag no longer resolves to the expected commit" >&2
+            exit 2
+          fi
+          if ! git merge-base --is-ancestor "$release_commit" refs/remotes/origin/main; then
+            echo "release commit is not an ancestor of main" >&2
+            exit 2
+          fi
+          if [[ "$(gh release view "$VERSION" --json isDraft --jq .isDraft)" != false ]]; then
+            echo "release is missing or still a draft: $VERSION" >&2
+            exit 2
+          fi
+          published_assets="$(gh release view "$VERSION" --json assets --jq '.assets[].name')"
+          for target in \
+            x86_64-unknown-linux-gnu \
+            x86_64-unknown-linux-musl \
+            aarch64-unknown-linux-gnu \
+            x86_64-apple-darwin \
+            aarch64-apple-darwin \
+            x86_64-pc-windows-msvc; do
+            if [[ "$target" == x86_64-pc-windows-msvc ]]; then
+              archive="upd-${VERSION}-${target}.zip"
+            else
+              archive="upd-${VERSION}-${target}.tar.gz"
+            fi
+            for asset in "$archive" "${archive}.sha256"; do
+              if ! grep --fixed-strings --line-regexp --quiet "$asset" <<< "$published_assets"; then
+                echo "published release is missing $asset" >&2
+                exit 2
+              fi
+            done
+          done
+          echo "commit=$release_commit" >> "$GITHUB_OUTPUT"
+
+      - name: Download and verify published release archives
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts/release-assets
+          gh release download "$VERSION" \
+            --pattern "upd-${VERSION}-*" \
+            --dir artifacts/release-assets
+          mapfile -d '' archives < <(find artifacts/release-assets -type f \
+            \( -name '*.tar.gz' -o -name '*.zip' \) -print0 | sort -z)
+          if [[ "${#archives[@]}" != 6 ]]; then
+            echo "expected six published release archives, found ${#archives[@]}" >&2
+            exit 2
+          fi
+          for archive in "${archives[@]}"; do
+            gh attestation verify "$archive" --repo "$GITHUB_REPOSITORY"
+          done
+
+          smoke_dir="$RUNNER_TEMP/upd-release-smoke"
+          mkdir -p "$smoke_dir"
+          smoke_archive="artifacts/release-assets/upd-${VERSION}-x86_64-unknown-linux-gnu.tar.gz"
+          tar --extract --gzip --file "$smoke_archive" --directory "$smoke_dir" upd
+          "$smoke_dir/upd" --version | grep --fixed-strings "${VERSION#v}"
+
+      - name: Synchronize release-derived defaults
+        id: synchronize
+        env:
+          RELEASE_COMMIT: ${{ steps.release.outputs.commit }}
+        run: |
+          set -euo pipefail
+          python3 scripts/sync-release-pins.py \
+            --artifacts artifacts \
+            --version "$VERSION" \
+            --release-commit "$RELEASE_COMMIT"
+          if git diff --quiet; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Install validation tools
+        if: steps.synchronize.outputs.changed == 'true'
+        uses: jdx/mise-action@3c2e0cf82a5b2e5249f0d3635a4d83d0ae861518 # v4.2.5
+        with:
+          experimental: true
+          install: true
+
+      - name: Validate generated change
+        if: steps.synchronize.outputs.changed == 'true'
+        run: |
+          set -euo pipefail
+          mise install --yes
+          make check
+          actionlint .github/workflows/dependency-health.yml \
+            .github/workflows/dependencies.yml \
+            .github/workflows/release.yml \
+            .github/workflows/sync-release-pins.yml \
+            .github/workflows/upd.yml
+          git diff --check
+
+      - name: Publish version-specific pull request
+        if: steps.synchronize.outputs.changed == 'true'
+        id: pull-request
+        run: |
+          set -euo pipefail
+          branch="automation/release-pins-${VERSION}"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git switch --create "$branch"
+          git add \
+            release-pins.json \
+            .github/workflows/dependency-health.yml \
+            .github/workflows/dependencies.yml \
+            .github/workflows/upd.yml \
+            ci/gitlab-dependency-update.yml \
+            docs/github-actions.md \
+            docs/gitlab.md
+          git commit -m "chore(release): refresh integration pins for ${VERSION}"
+
+          expected_remote_sha="$(git ls-remote --heads origin "refs/heads/${branch}" | cut -f1)"
+          git push origin "HEAD:refs/heads/${branch}" \
+            "--force-with-lease=refs/heads/${branch}:${expected_remote_sha}"
+
+          pull_requests="$(gh pr list \
+            --state open \
+            --base main \
+            --head "$branch" \
+            --json number,url)"
+          count="$(jq length <<< "$pull_requests")"
+          if [[ "$count" == 0 ]]; then
+            url="$(gh pr create \
+              --base main \
+              --head "$branch" \
+              --title "chore(release): refresh integration pins for ${VERSION}" \
+              --body "Synchronizes the GitHub and GitLab integration defaults with the verified ${VERSION} release artifacts.")"
+            number="$(gh pr view "$url" --json number --jq .number)"
+          elif [[ "$count" == 1 ]]; then
+            number="$(jq --raw-output '.[0].number' <<< "$pull_requests")"
+            url="$(jq --raw-output '.[0].url' <<< "$pull_requests")"
+          else
+            echo "multiple open release-pin pull requests found for $branch" >&2
+            exit 2
+          fi
+
+          head_commit="$(git rev-parse HEAD)"
+          gh pr merge "$number" \
+            --squash \
+            --delete-branch \
+            --match-head-commit "$head_commit"
+          echo "url=$url" >> "$GITHUB_OUTPUT"
+          echo "Merged release-pin pull request: $url" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Verify main contains the requested pins
+        run: |
+          set -euo pipefail
+          git fetch --no-tags origin "+refs/heads/main:refs/remotes/origin/main"
+          pinned_version="$(git show refs/remotes/origin/main:release-pins.json | jq --raw-output .version)"
+          if [[ "$pinned_version" != "$VERSION" ]]; then
+            echo "main contains $pinned_version instead of $VERSION" >&2
+            exit 2
+          fi
+          echo "Integration defaults are synchronized at $VERSION." >> "$GITHUB_STEP_SUMMARY"

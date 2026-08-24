@@ -27,7 +27,7 @@ jobs:
   update:
     uses: rvben/upd/.github/workflows/dependency-health.yml@<FULL_COMMIT_SHA>
     with:
-      upd-version: v0.6.2
+      upd-version: v0.6.3
       min-age: 7d
       max-bump: minor
       validation-command: make test
@@ -82,7 +82,7 @@ leave the repository clean; dependency changes belong exclusively to `upd`.
 | Input | Default | Purpose |
 |-------|---------|---------|
 | `runner` | `ubuntu-24.04` | Linux runner label |
-| `upd-version` | `v0.6.2` | Exact released `upd` version |
+| `upd-version` | `v0.6.3` | Exact released `upd` version |
 | `upd-sha256` | built in for the default version | Exact archive checksum when changing version or target |
 | `upd-target` | detected | Release target; Linux x86-64 and ARM64 GNU are detected |
 | `paths` | `.` | Whitespace-separated repository paths passed to `upd` |
@@ -107,9 +107,9 @@ digest:
 
 ```yaml
 with:
-  upd-version: v0.6.2
+  upd-version: v0.6.3
   upd-target: x86_64-unknown-linux-gnu
-  upd-sha256: 47b2504ff86197ec0097d6e767b5d9ff98f6e105166b8dcdb719a5281e8c5e8c
+  upd-sha256: 0e28562f06c852a5438e4e9745c8f99fc31240162ee65e633eeb7359b7e3a351
 ```
 
 GitHub-hosted runner images are maintained over time rather than immutable. Use
