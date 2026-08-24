@@ -18,10 +18,10 @@ jobs:
       - uses: jdx/mise-action@3c2e0cf82a5b2e5249f0d3635a4d83d0ae861518 # v4.2.5
         with:
           experimental: true
-          install: true
+          install: false
 
-      - name: Install mise tools
-        run: mise install --yes
+      - name: Install Rust
+        run: mise install rust
 
       - name: Install Rust components
         run: rustup component add rustfmt clippy
@@ -55,10 +55,10 @@ jobs:
       - uses: jdx/mise-action@3c2e0cf82a5b2e5249f0d3635a4d83d0ae861518 # v4.2.5
         with:
           experimental: true
-          install: true
+          install: false
 
-      - name: Install mise tools
-        run: mise install --yes
+      - name: Install Rust
+        run: mise install rust
 
       - name: Install Rust target
         run: rustup target add ${{ matrix.target }}

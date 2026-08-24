@@ -8,24 +8,23 @@ RUST_BACKTRACE = "1"
 rust = "1.96.0"
 
 # Python for maturin/python bindings
-python = "3.14"
+python = "3.14.7"
 
 # UV - Fast Python package manager
-uv = "latest"
+uv = "0.12.5"
 
 # GitHub Actions workflow validation
 actionlint = "1.7.12"
 
 # Development tools installed via cargo
-"cargo:cargo-binstall" = "latest"
-"cargo:maturin" = "latest"
-"cargo:cargo-zigbuild" = "latest"
+"cargo:cargo-binstall" = "1.22.0"
+"cargo:maturin" = "1.14.1"
+"cargo:cargo-zigbuild" = "0.23.0"
 
 # Zig for cross-compilation
-zig = "0.15"
+zig = "0.15.2"
 
 [settings]
-cargo_binstall = true
 experimental = true
 idiomatic_version_file_enable_tools = ["rust"]
 

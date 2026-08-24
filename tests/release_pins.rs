@@ -7,6 +7,7 @@ use std::path::PathBuf;
 use std::process::Command;
 
 const MANIFEST: &str = include_str!("../release-pins.json");
+const CI_WORKFLOW: &str = include_str!("../.github/workflows/ci.yml");
 const RELEASE_WORKFLOW: &str = include_str!("../.github/workflows/release.yml");
 const SYNC_WORKFLOW: &str = include_str!("../.github/workflows/sync-release-pins.yml");
 const VERSHIP_CONFIG: &str = include_str!("../vership.toml");
@@ -142,4 +143,21 @@ fn release_pin_publication_keeps_its_recovery_and_integrity_guards() {
     assert!(!staged.contains(".github/workflows/"));
     assert!(!SYNC_WORKFLOW.contains("git push --force "));
     assert!(!VERSHIP_CONFIG.contains("post-push"));
+}
+
+#[test]
+fn ci_and_release_jobs_install_only_the_tools_they_use() {
+    for (name, workflow) in [("CI", CI_WORKFLOW), ("release", RELEASE_WORKFLOW)] {
+        assert!(
+            !workflow.contains("install: true"),
+            "{name} must not ask mise-action to install every configured tool"
+        );
+        assert!(
+            !workflow.contains("mise install --yes"),
+            "{name} must not install unrelated tools as a single concurrent batch"
+        );
+    }
+    assert_eq!(CI_WORKFLOW.matches("run: mise install rust").count(), 2);
+    assert!(RELEASE_WORKFLOW.contains("run: mise install cargo:cargo-binstall"));
+    assert!(RELEASE_WORKFLOW.contains("run: mise install cargo:maturin cargo:cargo-zigbuild"));
 }
