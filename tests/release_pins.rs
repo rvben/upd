@@ -8,7 +8,9 @@ use std::process::Command;
 
 const MANIFEST: &str = include_str!("../release-pins.json");
 const CI_WORKFLOW: &str = include_str!("../.github/workflows/ci.yml");
+const MISE_CONFIG: &str = include_str!("../.mise.toml");
 const RELEASE_WORKFLOW: &str = include_str!("../.github/workflows/release.yml");
+const RUST_TOOLCHAIN: &str = include_str!("../rust-toolchain.toml");
 const SYNC_WORKFLOW: &str = include_str!("../.github/workflows/sync-release-pins.yml");
 const VERSHIP_CONFIG: &str = include_str!("../vership.toml");
 
@@ -160,4 +162,11 @@ fn ci_and_release_jobs_install_only_the_tools_they_use() {
     assert_eq!(CI_WORKFLOW.matches("run: mise install rust").count(), 2);
     assert!(RELEASE_WORKFLOW.contains("run: mise install cargo:cargo-binstall"));
     assert!(RELEASE_WORKFLOW.contains("run: mise install cargo:maturin cargo:cargo-zigbuild"));
+}
+
+#[test]
+fn mise_and_rustup_select_the_same_rust_toolchain() {
+    let mise: toml::Value = toml::from_str(MISE_CONFIG).unwrap();
+    let rustup: toml::Value = toml::from_str(RUST_TOOLCHAIN).unwrap();
+    assert_eq!(mise["tools"]["rust"], rustup["toolchain"]["channel"]);
 }
