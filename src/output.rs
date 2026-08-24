@@ -268,6 +268,13 @@ pub struct UpdateSummary {
     /// counts only entries reflecting an actual or would-be write.
     #[serde(default, skip_serializing_if = "is_zero")]
     pub unfixable: usize,
+    /// Version floors `upd` has a mechanism to write but was told not to,
+    /// each visible in `files[].updates[]` with `status: "skipped"` and an
+    /// `error` naming what to drop. Never folded into the up-to-date tally: a
+    /// newer release is waiting, and rerunning without the flag that blocked it
+    /// writes it. Disjoint from `skipped`, which counts `files[].skipped[]`.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub skipped_floors: usize,
 }
 
 fn is_zero(n: &usize) -> bool {

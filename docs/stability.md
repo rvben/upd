@@ -120,8 +120,9 @@ will not rewrite, such as a multi-clause `constraint-dependencies` entry or an
 npm override in the nested object form, which is `unfixable` too. Or `--no-lock`
 may be in force against a `cargo-precise` floor, which mutates nothing but
 `Cargo.lock` and so reports `skipped`. An `unfixable` entry is counted in
-`summary.unfixable`; like `capped`, none of these is folded into the up-to-date
-tally and none changes the exit code.
+`summary.unfixable` and a `skipped` one in `summary.skipped_floors`; like
+`capped`, none of these is folded into the up-to-date tally and none changes the
+exit code.
 
 One floor is written per manifest and package, whatever the lock holds: an
 `overrides` or `constraint-dependencies` entry lifts every locked copy of the

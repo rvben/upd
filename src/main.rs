@@ -2131,6 +2131,7 @@ async fn run_update(cli: &Cli) -> Result<()> {
                 dry_run,
                 filter,
                 count_unfixable_floors(&floor_reports),
+                count_skipped_floors(&floor_reports),
             );
             // Print the revert tip after a mutating run that applied at least one update.
             if !dry_run && applied > 0 {
@@ -2274,10 +2275,24 @@ fn floor_entry_counts_as_update(status: Option<&str>) -> bool {
 /// human, so they are counted in their own right: a run that found one must not
 /// close with "all dependencies up to date".
 fn count_unfixable_floors(floor_reports: &[upd::output::UpdateFileReport]) -> usize {
+    count_floor_status(floor_reports, "unfixable")
+}
+
+/// Floor entries naming a newer release `upd` could write but was told not to,
+/// today only a `cargo-precise` floor under `--no-lock`. Nothing is written, so
+/// these stay out of `updates_total` as well; a release is still waiting, and
+/// unlike an unfixable one it needs no human judgement, only the run again
+/// without the flag. Counting it is what keeps the run from closing on "all
+/// dependencies up to date" one line under the warning saying otherwise.
+fn count_skipped_floors(floor_reports: &[upd::output::UpdateFileReport]) -> usize {
+    count_floor_status(floor_reports, "skipped")
+}
+
+fn count_floor_status(floor_reports: &[upd::output::UpdateFileReport], status: &str) -> usize {
     floor_reports
         .iter()
         .flat_map(|r| &r.updates)
-        .filter(|entry| entry.status == Some("unfixable"))
+        .filter(|entry| entry.status == Some(status))
         .count()
 }
 
@@ -2370,6 +2385,7 @@ fn emit_update_json(input: UpdateReportInput<'_>, bounded: &BoundedOutputParams<
             .count(),
         capped: total_result.capped.len(),
         unfixable: count_unfixable_floors(&floor_reports),
+        skipped_floors: count_skipped_floors(&floor_reports),
     };
 
     files.extend(floor_reports);
@@ -5078,6 +5094,7 @@ fn print_summary(
     dry_run: bool,
     filter: UpdateFilter,
     unfixable_floors: usize,
+    skipped_floors: usize,
 ) -> usize {
     let action = if dry_run { "Would update" } else { "Updated" };
 
@@ -5105,6 +5122,7 @@ fn print_summary(
         && not_examined_count == 0
         && capped_count == 0
         && unfixable_floors == 0
+        && skipped_floors == 0
     {
         print_nothing_to_update_line(file_count, result.unchanged, result.errors.len());
     } else {
@@ -5158,6 +5176,18 @@ fn print_summary(
                 "{} {} package(s) with a newer release available",
                 "Cannot auto-fix".yellow(),
                 unfixable_floors.to_string().yellow().bold()
+            );
+        }
+
+        // Show the count of floors upd was told not to write. The flag that
+        // blocked each one went to stdout per package; this line exists for the
+        // same reason as the one above, and it says "not written" rather than
+        // "skipped" because something is still waiting on this run.
+        if skipped_floors > 0 {
+            println!(
+                "{} {} package(s) with a newer release available",
+                "Not written".yellow(),
+                skipped_floors.to_string().yellow().bold()
             );
         }
 

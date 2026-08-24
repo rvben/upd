@@ -1049,6 +1049,9 @@ async fn capped_copies_fold_into_the_one_floor_that_would_be_written() {
     }
 }
 
+const CARGO_TOML: &str = "[package]\nname = \"t\"\nversion = \"0.1.0\"\n";
+const CARGO_LOCK: &str = "version = 4\n\n[[package]]\nname = \"t\"\nversion = \"0.1.0\"\n\n[[package]]\nname = \"dupcrate\"\nversion = \"1.2.3\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\n";
+
 /// (2i) `--no-lock` refuses a `cargo-precise` floor outright: that floor
 /// mutates nothing but `Cargo.lock`, so there is nothing left for it to do.
 /// The refusal does not depend on the ceiling, so reporting the candidate as
@@ -1061,9 +1064,6 @@ async fn capped_copies_fold_into_the_one_floor_that_would_be_written() {
 /// fixture that cannot see `--max-bump`.
 #[tokio::test]
 async fn a_cargo_floor_blocked_by_no_lock_is_skipped_under_every_ceiling() {
-    const CARGO_TOML: &str = "[package]\nname = \"t\"\nversion = \"0.1.0\"\n";
-    const CARGO_LOCK: &str = "version = 4\n\n[[package]]\nname = \"t\"\nversion = \"0.1.0\"\n\n[[package]]\nname = \"dupcrate\"\nversion = \"1.2.3\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\n";
-
     for no_lock in [true, false] {
         for max_bump in ["major", "minor"] {
             let server = wiremock::MockServer::start().await;
@@ -1133,6 +1133,73 @@ async fn a_cargo_floor_blocked_by_no_lock_is_skipped_under_every_ceiling() {
                 capped.is_empty(),
                 "{who}: no ceiling is holding a floor --no-lock refuses: {json}"
             );
+        }
+    }
+}
+
+/// (2j) A floor `upd` was told not to write is waiting all the same: rerunning
+/// without `--no-lock` writes it. So a text run that found one must not close on
+/// a green tick, and the JSON summary needs a count of its own - an agent asking
+/// "is anything waiting?" reads the summary, and `updates_total` and `capped`
+/// are both 0 here while a major release sits in `files[].updates[]`.
+///
+/// The control is the same fixture with the registry serving the locked
+/// version: nothing is waiting, the tick prints, and the count stays absent.
+#[tokio::test]
+async fn a_floor_blocked_by_no_lock_is_not_reported_as_up_to_date() {
+    for (latest, waiting) in [("2.0.1", true), ("1.2.3", false)] {
+        for format in ["text", "json"] {
+            let server = wiremock::MockServer::start().await;
+            mount_crates_latest(&server, "dupcrate", latest).await;
+            let tmp = tempfile::tempdir().unwrap();
+            fs::write(tmp.path().join("Cargo.toml"), CARGO_TOML).unwrap();
+            fs::write(tmp.path().join("Cargo.lock"), CARGO_LOCK).unwrap();
+
+            let (stdout, stderr, code) = run_with_env(
+                &[
+                    "update",
+                    "--no-lock",
+                    "--package",
+                    "dupcrate",
+                    "--format",
+                    format,
+                    "--no-cache",
+                    "--no-color",
+                    ".",
+                ],
+                tmp.path(),
+                &[("CARGO_REGISTRIES_CRATES_IO_INDEX", &server.uri())],
+            );
+
+            let case = format!("latest {latest}, --format {format}");
+            assert_eq!(code, 0, "{case}: stdout: {stdout}\nstderr: {stderr}");
+
+            if format == "text" {
+                assert_eq!(
+                    stdout.contains("all dependencies up to date"),
+                    !waiting,
+                    "{case}: stdout: {stdout}"
+                );
+                assert_eq!(
+                    stdout.contains("Not written 1 package(s) with a newer release available"),
+                    waiting,
+                    "{case}: stdout: {stdout}"
+                );
+                continue;
+            }
+
+            let json: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+            let summary = &json["summary"];
+            assert_eq!(
+                summary["skipped_floors"],
+                if waiting {
+                    serde_json::json!(1)
+                } else {
+                    serde_json::Value::Null
+                },
+                "{case}: {summary}"
+            );
+            assert_eq!(summary["updates_total"], 0, "{case}: {summary}");
         }
     }
 }
