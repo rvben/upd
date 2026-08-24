@@ -13,6 +13,9 @@ python = "3.14"
 # UV - Fast Python package manager
 uv = "latest"
 
+# GitHub Actions workflow validation
+actionlint = "1.7.12"
+
 # Development tools installed via cargo
 "cargo:cargo-binstall" = "latest"
 "cargo:maturin" = "latest"
