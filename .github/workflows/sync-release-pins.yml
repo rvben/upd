@@ -129,22 +129,23 @@ jobs:
             echo "changed=true" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: Install validation tools
+      - name: Set up validation tool manager
         if: steps.synchronize.outputs.changed == 'true'
         uses: jdx/mise-action@3c2e0cf82a5b2e5249f0d3635a4d83d0ae861518 # v4.2.5
         with:
           experimental: true
-          install: true
+          install: false
 
-      - name: Install Rust validation components
+      - name: Install validation tools
         if: steps.synchronize.outputs.changed == 'true'
-        run: rustup component add rustfmt clippy
+        run: |
+          mise install rust actionlint
+          rustup component add rustfmt clippy
 
       - name: Validate generated change
         if: steps.synchronize.outputs.changed == 'true'
         run: |
           set -euo pipefail
-          mise install --yes
           make check
           actionlint .github/workflows/dependency-health.yml \
             .github/workflows/dependencies.yml \
