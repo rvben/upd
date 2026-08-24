@@ -23,7 +23,8 @@ use upd::fix::apply::{
     AppliedFix, FixApplyOptions, FixStatus, apply_fix_targets, probe_floor_target,
 };
 use upd::fix::{
-    FixKind, FixTarget, FloorResolution, UnfixableTarget, resolve_floor_version, route_fix_targets,
+    FixKind, FixTarget, FloorResolution, NpmOverrideForm, UnfixableTarget, resolve_floor_version,
+    route_fix_targets,
 };
 use upd::interactive::{PendingUpdate, prompt_all};
 use upd::lockfile::{LockfileRegenResult, RegenOutcome, regenerate_lockfiles};
@@ -537,6 +538,47 @@ fn floor_config_lookup_path(lockfile: &Path, kind: lockscan::discover::LockKind)
         lockscan::discover::LockKind::Npm => dir.join("package.json"),
         lockscan::discover::LockKind::Cargo => dir.join("Cargo.toml"),
     }
+}
+
+/// Grouping key for routed floor targets, mirroring the merge
+/// `fix::route_fix_targets` applies to uv/npm floors: `(method, manifest,
+/// normalized package)`. One `overrides` or `constraint-dependencies` entry
+/// lifts every locked copy of the package, so the copies describe one floor. A
+/// `cargo-precise` floor lifts a single locked copy, so its locked version
+/// joins the key and the copies stay apart, exactly as routing keeps them.
+type FloorMergeKey = (&'static str, PathBuf, String, Option<String>);
+
+fn floor_merge_key(target: &FixTarget) -> FloorMergeKey {
+    let normalized = if target.kind == FixKind::UvConstraint {
+        pep503_normalize(&target.package)
+    } else {
+        target.package.to_lowercase()
+    };
+    let copy = (target.kind == FixKind::CargoPrecise).then(|| target.from_version.clone());
+    (target.kind.method(), target.path.clone(), normalized, copy)
+}
+
+/// Merge one routed target into `pool`, the way `fix::merge_floor_group` merges
+/// the targets it routes in a single pass: keep the highest candidate, since
+/// the floor has to clear every locked copy, and the highest locked version,
+/// since that is the copy the floor is reported against.
+fn merge_capped_target(pool: &mut BTreeMap<FloorMergeKey, FixTarget>, target: &FixTarget) {
+    pool.entry(floor_merge_key(target))
+        .and_modify(|existing| {
+            if compare_versions(&target.to_version, &existing.to_version) == Ordering::Greater {
+                existing.to_version = target.to_version.clone();
+            }
+            if compare_versions(&target.from_version, &existing.from_version) == Ordering::Greater {
+                existing.from_version = target.from_version.clone();
+            }
+            // `$name` wins a mix the way routing's merge makes it win: it marks
+            // a package npm refuses to override without one, which is a
+            // property of the manifest, not of the copy that routed here.
+            if target.npm_form == Some(NpmOverrideForm::DollarName) {
+                existing.npm_form = target.npm_form;
+            }
+        })
+        .or_insert_with(|| target.clone());
 }
 
 /// `(file_type, lang)` for a floor report grouped under `path`, derived from
@@ -1536,16 +1578,6 @@ async fn run_update(cli: &Cli) -> Result<()> {
             .map(|l| (l.path.clone(), l.kind))
             .collect();
 
-        // A lockfile belongs to exactly one ecosystem, which is what makes
-        // `(lockfile, package)` an unambiguous key for a per-project verdict:
-        // the name alone is shared across ecosystems, and a fix target carries
-        // no ecosystem of its own.
-        let lock_ecosystem_by_path: HashMap<PathBuf, Ecosystem> = lock_scan
-            .packages
-            .iter()
-            .map(|p| (p.lockfile_path.clone(), p.ecosystem))
-            .collect();
-
         // Rule 2: a requested name is lock-only when it matches no manifest
         // occurrence but resolves via at least one scanned lockfile.
         let mut lock_only: Vec<&upd::lockscan::LockedPackage> = Vec::new();
@@ -1586,9 +1618,13 @@ async fn run_update(cli: &Cli) -> Result<()> {
         let mut floor_errors: HashMap<PathBuf, Vec<upd::output::ErrorEntry>> = HashMap::new();
         let mut floor_capped: HashMap<PathBuf, Vec<upd::output::CappedEntry>> = HashMap::new();
 
-        // Lockfiles whose own config ignores the package, so the fan-out below
-        // can be trimmed back to the projects that actually want the floor.
-        let mut ignoring_locks: HashSet<(PathBuf, String)> = HashSet::new();
+        // Projects whose own config ignores a package, so the fan-out below can
+        // be trimmed back to the projects that actually want the floor. Keyed
+        // by the path the floor is reported against, which is what both a fix
+        // target and an unfixable target carry; the ecosystem rides along
+        // because the name alone is shared across ecosystems and neither kind
+        // of target carries one.
+        let mut ignoring_reports: HashMap<PathBuf, (Ecosystem, HashSet<String>)> = HashMap::new();
 
         for locked in &distinct {
             // Sibling projects can hold one triple under different `.updrc`
@@ -1656,10 +1692,11 @@ async fn run_update(cli: &Cli) -> Result<()> {
                         source: None,
                     },
                 );
-                ignoring_locks.insert((
-                    lp.lockfile_path.clone(),
-                    normalized_package_name(&lp.name, lp.ecosystem),
-                ));
+                ignoring_reports
+                    .entry(report_path.clone())
+                    .or_insert_with(|| (lp.ecosystem, HashSet::new()))
+                    .1
+                    .insert(normalized_package_name(&lp.name, lp.ecosystem));
             }
 
             let Some((locked, report_path, options, _)) = holders.iter().find(|h| !h.3) else {
@@ -1722,22 +1759,17 @@ async fn run_update(cli: &Cli) -> Result<()> {
             }
         }
 
-        // Routing fans one triple out to every lockfile that resolves it,
-        // including the ones whose own project ignores the package. Those
-        // projects have already been reported as `ignored` and must not be
-        // written to, so their targets are dropped before anything reaches a
-        // writer or a capped report.
-        let target_is_ignored = |target: &FixTarget| -> bool {
-            let Some(lockfile) = target.lockfile.as_ref() else {
-                return false;
-            };
-            let Some(ecosystem) = lock_ecosystem_by_path.get(lockfile).copied() else {
-                return false;
-            };
-            ignoring_locks.contains(&(
-                lockfile.clone(),
-                normalized_package_name(&target.package, ecosystem),
-            ))
+        // Routing fans one triple out to every project that resolves it,
+        // including the ones whose own config ignores the package. Those
+        // projects have already been reported as `ignored`, and ignoring is an
+        // answer in itself: they must not be written to, told the update is
+        // held back, or told the floor cannot be written.
+        let floor_is_ignored = |path: &Path, package: &str| -> bool {
+            ignoring_reports
+                .get(path)
+                .is_some_and(|(ecosystem, names)| {
+                    names.contains(&normalized_package_name(package, *ecosystem))
+                })
         };
 
         // Shared by the real routing pass and the capped classification pass
@@ -1770,7 +1802,14 @@ async fn run_update(cli: &Cli) -> Result<()> {
                 prov.as_ref().expect("prov built for a non-empty floor set"),
                 &manifest_packages,
             );
-            routing.targets.retain(|target| !target_is_ignored(target));
+            routing
+                .targets
+                .retain(|target| !floor_is_ignored(&target.path, &target.package));
+            routing.unfixable.retain(|u| {
+                u.path
+                    .as_ref()
+                    .is_none_or(|path| !floor_is_ignored(path, &u.package))
+            });
 
             let opts = FixApplyOptions {
                 dry_run,
@@ -1802,10 +1841,13 @@ async fn run_update(cli: &Cli) -> Result<()> {
         // What is written is one floor per manifest and package, whatever the
         // lock holds: the in-cap path merges every locked copy of a package into
         // that single floor. The per-triple pass here sees the copies one at a
-        // time and so cannot merge them, and it collects reports instead of
-        // printing them, keeping the highest locked version the way the merge
-        // does. A BTreeMap also fixes the order, which routing does not.
-        let mut capped_reports: BTreeMap<(PathBuf, String), (String, String)> = BTreeMap::new();
+        // time, so it collects the routed targets and merges them the same way
+        // before classifying any of them. Classifying first would ask the same
+        // question of the same manifest once per locked copy and answer it once
+        // per copy, so a package locked twice would report its floor twice above
+        // the ceiling and once below it. A BTreeMap also fixes the order, which
+        // routing does not.
+        let mut capped_targets: BTreeMap<FloorMergeKey, FixTarget> = BTreeMap::new();
 
         for (locked, candidate) in &capped_pending {
             let capped_audit = AuditResult {
@@ -1844,54 +1886,67 @@ async fn run_update(cli: &Cli) -> Result<()> {
             for target in &routing.targets {
                 // A project whose own config ignores the package is not waiting
                 // on the ceiling, and has been reported as `ignored` already.
-                if target_is_ignored(target) {
+                if floor_is_ignored(&target.path, &target.package) {
                     continue;
                 }
-
-                // Routing places a target without reading the manifest or the
-                // apply options, so a target alone does not mean the floor can
-                // be written: an existing uv constraint upd will not rewrite,
-                // an `overrides` entry that is not an object, or `--no-lock`
-                // against a floor that mutates only `Cargo.lock` all refuse it
-                // whatever the ceiling says. Only a floor that would really
-                // have been written leaves the ceiling as the reason the update
-                // is waiting; every other answer is the one this candidate gets
-                // in cap, so the diagnostic a reader sees stops depending on
-                // where the ceiling happens to sit.
-                if let Some((status, error)) = probe_floor_target(target, !cli.no_lock) {
-                    outcomes.push(AppliedFix {
-                        target: target.clone(),
-                        status,
-                        error,
-                    });
-                    continue;
-                }
-
-                // A floor already being written to this manifest at or above
-                // the candidate leaves the ceiling holding nothing back: an
-                // in-cap copy of the same package is floored to a version that
-                // lifts this copy too. Reporting it as held back would ask for
-                // a --max-bump that changes what is written not at all.
-                if outcomes.iter().any(|o| {
-                    floor_entry_counts_as_update(Some(o.status.as_str()))
-                        && o.target.path == target.path
-                        && o.target.package == target.package
-                        && compare_versions(&o.target.to_version, candidate) != Ordering::Less
-                }) {
-                    continue;
-                }
-
-                let entry = capped_reports
-                    .entry((target.path.clone(), locked.name.clone()))
-                    .or_insert_with(|| (locked.version.clone(), candidate.clone()));
-                if compare_versions(&locked.version, &entry.0) == Ordering::Greater {
-                    entry.0 = locked.version.clone();
-                }
-                if compare_versions(candidate, &entry.1) == Ordering::Greater {
-                    entry.1 = candidate.clone();
-                }
+                merge_capped_target(&mut capped_targets, target);
             }
-            unfixable.extend(routing.unfixable);
+            unfixable.extend(routing.unfixable.into_iter().filter(|u| {
+                u.path
+                    .as_ref()
+                    .is_none_or(|path| !floor_is_ignored(path, &u.package))
+            }));
+        }
+
+        let mut capped_reports: BTreeMap<(PathBuf, String), (String, String)> = BTreeMap::new();
+
+        for target in capped_targets.values() {
+            // Routing places a target without reading the manifest or the apply
+            // options, so a target alone does not mean the floor can be
+            // written: an existing uv constraint upd will not rewrite, an
+            // `overrides` entry that is not an object, or `--no-lock` against a
+            // floor that mutates only `Cargo.lock` all refuse it whatever the
+            // ceiling says. Only a floor that would really have been written
+            // leaves the ceiling as the reason the update is waiting; every
+            // other answer is the one this candidate gets in cap, so the
+            // diagnostic a reader sees stops depending on where the ceiling
+            // happens to sit.
+            if let Some((status, error)) = probe_floor_target(target, !cli.no_lock) {
+                outcomes.push(AppliedFix {
+                    target: target.clone(),
+                    status,
+                    error,
+                });
+                continue;
+            }
+
+            // A floor already being written to this manifest at or above the
+            // candidate leaves the ceiling holding nothing back: an in-cap copy
+            // of the same package is floored to a version that lifts this copy
+            // too. Reporting it as held back would ask for a --max-bump that
+            // changes what is written not at all.
+            if outcomes.iter().any(|o| {
+                floor_entry_counts_as_update(Some(o.status.as_str()))
+                    && o.target.path == target.path
+                    && o.target.package == target.package
+                    && compare_versions(&o.target.to_version, &target.to_version) != Ordering::Less
+            }) {
+                continue;
+            }
+
+            // Cargo floors stay one per locked copy above, since
+            // `cargo update --precise` lifts one copy at a time; the capped
+            // channel still reports one entry per manifest and package,
+            // carrying the highest locked version.
+            let entry = capped_reports
+                .entry((target.path.clone(), target.package.clone()))
+                .or_insert_with(|| (target.from_version.clone(), target.to_version.clone()));
+            if compare_versions(&target.from_version, &entry.0) == Ordering::Greater {
+                entry.0 = target.from_version.clone();
+            }
+            if compare_versions(&target.to_version, &entry.1) == Ordering::Greater {
+                entry.1 = target.to_version.clone();
+            }
         }
 
         for ((path, package), (current, available)) in capped_reports {

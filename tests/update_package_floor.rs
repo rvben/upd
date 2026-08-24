@@ -1051,6 +1051,7 @@ async fn capped_copies_fold_into_the_one_floor_that_would_be_written() {
 
 const CARGO_TOML: &str = "[package]\nname = \"t\"\nversion = \"0.1.0\"\n";
 const CARGO_LOCK: &str = "version = 4\n\n[[package]]\nname = \"t\"\nversion = \"0.1.0\"\n\n[[package]]\nname = \"dupcrate\"\nversion = \"1.2.3\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\n";
+const CARGO_LOCK_TWO: &str = "version = 4\n\n[[package]]\nname = \"t\"\nversion = \"0.1.0\"\n\n[[package]]\nname = \"dupcrate\"\nversion = \"1.2.3\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\n\n[[package]]\nname = \"dupcrate\"\nversion = \"1.3.0\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\n";
 
 /// (2i) `--no-lock` refuses a `cargo-precise` floor outright: that floor
 /// mutates nothing but `Cargo.lock`, so there is nothing left for it to do.
@@ -1201,6 +1202,141 @@ async fn a_floor_blocked_by_no_lock_is_not_reported_as_up_to_date() {
             );
             assert_eq!(summary["updates_total"], 0, "{case}: {summary}");
         }
+    }
+}
+
+/// (2k) A refusal describes the floor, not the locked copy that ran into it:
+/// one `overrides` entry would have lifted every copy of the package, so a
+/// manifest that refuses it refuses it once. Above the ceiling the copies are
+/// routed one at a time, and without merging them first the same manifest is
+/// asked the same question once per copy and answers once per copy: the refusal
+/// appears twice, and `summary.unfixable` counts one manifest twice.
+///
+/// The `--max-bump major` run is the control: the same fixture through the
+/// in-cap path, which merges the copies, so it pins both the entry count and
+/// the locked version the capped-side answer has to match.
+#[tokio::test]
+async fn a_refused_floor_is_reported_once_per_manifest_under_every_ceiling() {
+    for max_bump in ["major", "minor"] {
+        let server = wiremock::MockServer::start().await;
+        mount_npm_latest(&server, "dupdep", "2.0.0").await;
+        let tmp = tempfile::tempdir().unwrap();
+        fs::write(
+            tmp.path().join("package.json"),
+            r#"{"name": "t", "version": "1.0.0", "dependencies": {"hosta": "^1.0.0", "hostb": "^1.0.0"}, "overrides": "not-an-object"}"#,
+        )
+        .unwrap();
+        fs::write(
+            tmp.path().join("package-lock.json"),
+            npm_lock_with_two("dupdep", "1.0.0", "1.1.0"),
+        )
+        .unwrap();
+
+        let (stdout, stderr, code) = run_with_env(
+            &[
+                "update",
+                "--package",
+                "dupdep",
+                "--max-bump",
+                max_bump,
+                "--format",
+                "json",
+                "--no-cache",
+                ".",
+            ],
+            tmp.path(),
+            &[("NPM_REGISTRY", &server.uri())],
+        );
+
+        let (updates, capped) = floor_json(&stdout, &stderr, code, "package.json");
+        let json: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+        let label = format!("--max-bump {max_bump}");
+
+        assert_eq!(updates.len(), 1, "{label}: {updates:?}");
+        assert_eq!(updates[0]["status"], "unfixable", "{label}: {updates:?}");
+        assert_eq!(
+            updates[0]["current"], "1.1.0",
+            "{label}: the entry describes the floor, so it carries the highest \
+             locked copy - the one the floor would have had to clear: {updates:?}"
+        );
+        assert_eq!(updates[0]["latest"], "2.0.0", "{label}: {updates:?}");
+        assert_eq!(
+            json["summary"]["unfixable"], 1,
+            "{label}: {}",
+            json["summary"]
+        );
+        assert!(
+            capped.is_empty(),
+            "{label}: no ceiling is holding a floor the manifest refuses: {capped:?}"
+        );
+        assert_eq!(
+            stderr.matches("Cannot auto-fix").count(),
+            0,
+            "{label}: an apply-time refusal reports through updates[], not the \
+             routing-time warning: {stderr}"
+        );
+    }
+}
+
+/// (2l) The mirror of (2k), and its counterweight: a `cargo-precise` floor is
+/// NOT one floor per manifest. `cargo update --precise` lifts one locked copy,
+/// so two copies are two floors and stay two entries, where an `overrides` or
+/// `constraint-dependencies` entry would have been merged into one. Merging them
+/// would report one copy and leave the other silently locked behind.
+///
+/// Both ceilings run and are each other's control: above the ceiling the copies
+/// are routed one at a time and merged before they are classified, in cap they
+/// go through the fix machinery's own merge, and the two must agree on how many
+/// entries a reader sees.
+#[tokio::test]
+async fn cargo_precise_floors_stay_one_entry_per_locked_copy() {
+    for max_bump in ["major", "minor"] {
+        let server = wiremock::MockServer::start().await;
+        mount_crates_latest(&server, "dupcrate", "2.0.1").await;
+        let tmp = tempfile::tempdir().unwrap();
+        fs::write(tmp.path().join("Cargo.toml"), CARGO_TOML).unwrap();
+        fs::write(tmp.path().join("Cargo.lock"), CARGO_LOCK_TWO).unwrap();
+
+        let (stdout, stderr, code) = run_with_env(
+            &[
+                "update",
+                "--no-lock",
+                "--package",
+                "dupcrate",
+                "--max-bump",
+                max_bump,
+                "--format",
+                "json",
+                "--no-cache",
+                ".",
+            ],
+            tmp.path(),
+            &[("CARGO_REGISTRIES_CRATES_IO_INDEX", &server.uri())],
+        );
+
+        let (updates, capped) = floor_json(&stdout, &stderr, code, "Cargo.lock");
+        let json: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+        let label = format!("--max-bump {max_bump}");
+
+        assert_eq!(updates.len(), 2, "{label}: {updates:?}");
+        let mut locked: Vec<&str> = updates
+            .iter()
+            .map(|u| u["current"].as_str().unwrap_or_default())
+            .collect();
+        locked.sort_unstable();
+        assert_eq!(locked, ["1.2.3", "1.3.0"], "{label}: {updates:?}");
+        for entry in &updates {
+            assert_eq!(entry["status"], "skipped", "{label}: {updates:?}");
+        }
+        assert_eq!(
+            json["summary"]["skipped_floors"], 2,
+            "{label}: {}",
+            json["summary"]
+        );
+        assert!(
+            capped.is_empty(),
+            "{label}: no ceiling is holding a floor --no-lock refuses: {capped:?}"
+        );
     }
 }
 
@@ -1645,6 +1781,88 @@ async fn a_sibling_that_ignores_the_package_neither_receives_the_floor_nor_suppr
                 assert!(updates.is_empty(), "{label}: {updates:?}");
             }
         }
+    }
+}
+
+/// (7c) Ignoring a package is a complete answer for that project, not just a
+/// veto on writing to it. `poetry.lock` has no floor mechanism, so every project
+/// holding the package is routed as unfixable; a project whose own `.updrc`
+/// ignores it has to be left out of that too, or it is reported as ignored and
+/// unfixable at once, counted in `summary.unfixable`, and warned about on
+/// stderr - all for a package it asked not to hear about.
+///
+/// Both directions run and are each other's control: the sibling that does not
+/// ignore the package keeps its unfixable entry whichever project holds the
+/// `ignore`, so a verdict taken from one project and applied to both cannot
+/// satisfy both directions.
+#[tokio::test]
+async fn a_sibling_that_ignores_the_package_is_not_reported_unfixable() {
+    let server = wiremock::MockServer::start().await;
+    mount_pypi_latest(&server, "lockonly", "1.2.0").await;
+
+    for (ignoring, wanting) in [("a_proj", "z_proj"), ("z_proj", "a_proj")] {
+        let tmp = tempfile::tempdir().unwrap();
+        for proj in [ignoring, wanting] {
+            let dir = tmp.path().join(proj);
+            fs::create_dir_all(&dir).unwrap();
+            write_poetry_project(&dir);
+        }
+        fs::write(
+            tmp.path().join(ignoring).join(".updrc.toml"),
+            "ignore = [\"lockonly\"]\n",
+        )
+        .unwrap();
+
+        let label = format!("ignoring={ignoring}");
+        let (stdout, stderr, code) = run_with_env(
+            &[
+                "update",
+                "--package",
+                "lockonly",
+                "--format",
+                "json",
+                "--no-cache",
+                ".",
+            ],
+            tmp.path(),
+            &[("UV_INDEX_URL", &server.uri())],
+        );
+
+        assert_eq!(code, 0, "{label}: {stdout}\nstderr: {stderr}");
+        let json: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+        let files = json["files"].as_array().unwrap();
+        let lock_of = |proj: &str| format!("{proj}/poetry.lock");
+
+        let ignored = collect_for_path(files, &lock_of(ignoring), "ignored");
+        assert_eq!(ignored.len(), 1, "{label}: {ignored:?}");
+        assert_eq!(ignored[0]["package"], "lockonly", "{label}");
+        let silenced = collect_for_path(files, &lock_of(ignoring), "updates");
+        assert!(
+            silenced.is_empty(),
+            "{label}: the project ignoring lockonly must not be told its floor \
+             is unfixable: {silenced:?}"
+        );
+
+        let updates = collect_for_path(files, &lock_of(wanting), "updates");
+        assert_eq!(updates.len(), 1, "{label}: {updates:?}");
+        assert_eq!(updates[0]["status"], "unfixable", "{label}: {updates:?}");
+        assert_eq!(updates[0]["latest"], "1.2.0", "{label}: {updates:?}");
+
+        assert_eq!(
+            json["summary"]["unfixable"], 1,
+            "{label}: {}",
+            json["summary"]
+        );
+        assert_eq!(
+            json["summary"]["ignored"], 1,
+            "{label}: {}",
+            json["summary"]
+        );
+        assert_eq!(
+            stderr.matches("Cannot auto-fix").count(),
+            1,
+            "{label}: one project is waiting, so the warning prints once: {stderr}"
+        );
     }
 }
 

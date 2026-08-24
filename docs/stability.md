@@ -129,13 +129,20 @@ One floor is written per manifest and package, whatever the lock holds: an
 package at once. Held back is reported against that same single floor, so a
 package locked at several versions produces one `capped` entry per manifest,
 carrying the highest locked version, and produces none at all when a copy within
-the ceiling is already floored to a version that covers the rest.
+the ceiling is already floored to a version that covers the rest. A refusal
+folds the same way, since it is the same floor being refused: a package locked
+at several versions produces one `unfixable` or `skipped` entry per manifest,
+whichever side of the ceiling it falls. The exception is `cargo-precise`, where
+each locked copy is lifted by its own `cargo update --precise` and so is its own
+entry.
 
 Sibling projects that lock the same package each answer for themselves. A floor
 is written to a project only if that project's own `.updrc` admits the package,
 so an `ignore` entry keeps the floor out of that manifest (reported in its
 `ignored[]`) without withholding it from a sibling whose config says nothing
-about the package.
+about the package. Ignoring is a complete answer: an ignored project is not
+reported as held back or as unfixable either, since neither describes a floor
+that project asked for.
 
 ## Stable exit codes
 
