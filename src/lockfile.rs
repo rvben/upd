@@ -404,7 +404,7 @@ struct LockedCrate {
 ///
 /// An unreadable or unparseable lockfile answers empty, which leaves every
 /// spec bare and hands the diagnosis to cargo.
-fn locked_versions(lock_path: &Path) -> HashMap<String, LockedCrate> {
+fn locked_versions(lock_path: &Path, owner: Option<&str>) -> HashMap<String, LockedCrate> {
     #[derive(serde::Deserialize)]
     struct Lock {
         #[serde(default)]
@@ -438,9 +438,13 @@ fn locked_versions(lock_path: &Path) -> HashMap<String, LockedCrate> {
     // A workspace member carries no source, so its dependency list is the set of
     // edges the manifests declare. Cargo writes an edge as a bare name and adds
     // the version only where the name alone would be ambiguous, which is exactly
-    // the case a spec has to resolve.
+    // the case a spec has to resolve. Only the package the rewritten manifest
+    // defines counts: a sibling member reaching a different copy of the same
+    // crate would otherwise look like a second edge of this one. A virtual
+    // workspace root defines no package, and its `[workspace.dependencies]`
+    // govern every member, so there all members count.
     for package in &lock.package {
-        if package.source.is_some() {
+        if package.source.is_some() || owner.is_some_and(|owner| owner != package.name) {
             continue;
         }
         for edge in &package.dependencies {
@@ -614,10 +618,13 @@ fn locked_entries_to_update<'a>(requirements: &[String], locked: &'a LockedCrate
 /// singled out, leaving cargo to report the ambiguity itself.
 fn cargo_update_specs(manifest_path: &Path, changed: &[String]) -> Vec<String> {
     let dir = manifest_path.parent().unwrap_or(Path::new("."));
-    let locked = locked_versions(&dir.join("Cargo.lock"));
     let manifest = std::fs::read_to_string(manifest_path)
         .ok()
         .and_then(|text| text.parse::<toml::Table>().ok());
+    let owner = manifest
+        .as_ref()
+        .and_then(|doc| doc.get("package")?.get("name")?.as_str());
+    let locked = locked_versions(&dir.join("Cargo.lock"), owner);
 
     changed
         .iter()
@@ -938,6 +945,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "sibling"
+version = "0.1.0"
+dependencies = [
+ "thiserror 1.0.69",
+]
+
+[[package]]
 name = "serde"
 version = "1.0.228"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -953,10 +967,59 @@ version = "1.1.0"
 source = "git+https://example.invalid/thiserror#0c0ffee"
 "#;
         let specs = specs_for_lock(
-            "[dependencies]\nserde = \"1.0.228\"\nthiserror = \"1.2.0\"\n",
+            concat!(
+                "[package]\nname = \"fixture\"\n",
+                "[dependencies]\nserde = \"1.0.228\"\nthiserror = \"1.2.0\"\n",
+            ),
             lock,
         );
+        // The sibling member reaches the other copy, which is not this
+        // manifest's edge to follow.
         assert_eq!(specs, vec!["serde", "thiserror@1.1.0"]);
+    }
+
+    #[test]
+    fn a_sibling_members_edge_does_not_anchor_this_manifests_jump() {
+        let lock = r#"version = 4
+
+[[package]]
+name = "fixture"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "thiserror 1.0.69",
+]
+
+[[package]]
+name = "sibling"
+version = "0.1.0"
+dependencies = [
+ "thiserror 2.0.18",
+]
+
+[[package]]
+name = "serde"
+version = "1.0.228"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+
+[[package]]
+name = "thiserror"
+version = "1.0.69"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+
+[[package]]
+name = "thiserror"
+version = "2.0.18"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+"#;
+        let specs = specs_for_lock(
+            concat!(
+                "[package]\nname = \"fixture\"\n",
+                "[dependencies]\nserde = \"1.0.228\"\nthiserror = \"3.0.1\"\n",
+            ),
+            lock,
+        );
+        assert_eq!(specs, vec!["serde", "thiserror@1.0.69"]);
     }
 
     #[test]
