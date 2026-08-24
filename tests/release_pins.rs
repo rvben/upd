@@ -29,22 +29,6 @@ fn every_release_pin_consumer_matches_the_manifest() {
 
     let consumers: BTreeMap<&str, (usize, &[(&str, usize)])> = BTreeMap::from([
         (
-            ".github/workflows/dependency-health.yml",
-            (
-                3,
-                &[
-                    ("aarch64-unknown-linux-gnu", 1),
-                    ("x86_64-unknown-linux-gnu", 1),
-                    ("x86_64-unknown-linux-musl", 1),
-                ][..],
-            ),
-        ),
-        (
-            ".github/workflows/dependencies.yml",
-            (1, &[("x86_64-unknown-linux-gnu", 1)][..]),
-        ),
-        (".github/workflows/upd.yml", (1, &[][..])),
-        (
             "ci/gitlab-dependency-update.yml",
             (
                 2,
@@ -57,7 +41,7 @@ fn every_release_pin_consumer_matches_the_manifest() {
         ),
         (
             "docs/github-actions.md",
-            (3, &[("x86_64-unknown-linux-gnu", 1)][..]),
+            (1, &[("x86_64-unknown-linux-gnu", 1)][..]),
         ),
         (
             "docs/gitlab.md",
@@ -101,13 +85,24 @@ fn release_pin_synchronizer_accepts_the_checked_in_state() {
 }
 
 #[test]
-fn release_workflows_pin_every_external_action_to_a_full_commit() {
-    for (name, workflow) in [
-        ("release", RELEASE_WORKFLOW),
-        ("release-pin sync", SYNC_WORKFLOW),
-    ] {
+fn every_repository_workflow_pins_external_actions_to_full_commits() {
+    let directory = repo_root().join(".github/workflows");
+    for entry in std::fs::read_dir(directory).unwrap() {
+        let path = entry.unwrap().path();
+        if !matches!(
+            path.extension().and_then(|extension| extension.to_str()),
+            Some("yml" | "yaml")
+        ) {
+            continue;
+        }
+        let name = path.file_name().unwrap().to_string_lossy();
+        let workflow = std::fs::read_to_string(&path).unwrap();
         for line in workflow.lines() {
-            let Some(reference) = line.trim().strip_prefix("uses: ") else {
+            let trimmed = line.trim();
+            let Some(reference) = trimmed
+                .strip_prefix("uses: ")
+                .or_else(|| trimmed.strip_prefix("- uses: "))
+            else {
                 continue;
             };
             if reference.starts_with("./") {
@@ -137,6 +132,14 @@ fn release_pin_publication_keeps_its_recovery_and_integrity_guards() {
     assert!(SYNC_WORKFLOW.contains("gh attestation verify"));
     assert!(SYNC_WORKFLOW.contains("--force-with-lease="));
     assert!(SYNC_WORKFLOW.contains("--match-head-commit"));
+    let staged = SYNC_WORKFLOW
+        .split_once("          git add \\\n")
+        .unwrap()
+        .1
+        .split_once("          git commit")
+        .unwrap()
+        .0;
+    assert!(!staged.contains(".github/workflows/"));
     assert!(!SYNC_WORKFLOW.contains("git push --force "));
     assert!(!VERSHIP_CONFIG.contains("post-push"));
 }

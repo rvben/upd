@@ -10,22 +10,15 @@ use std::process::{Command, Output};
 use tempfile::TempDir;
 
 const WORKFLOW: &str = include_str!("../.github/workflows/dependency-health.yml");
-const RELEASE_PINS: &str = include_str!("../release-pins.json");
+const RUST_WORKFLOW: &str = include_str!("../.github/workflows/dependencies.yml");
+const ACTIONS_WORKFLOW: &str = include_str!("../.github/workflows/upd.yml");
 const BRANCH: &str = "automation/upd-github-actions";
 
-fn release_pin(path: &[&str]) -> String {
-    let manifest: serde_json::Value = serde_json::from_str(RELEASE_PINS).unwrap();
-    let mut value = &manifest;
-    for key in path {
-        value = &value[*key];
-    }
-    value.as_str().unwrap().to_string()
-}
-
-fn publish_script() -> String {
+fn workflow_script(name: &str) -> String {
+    let heading = format!("      - name: {name}\n");
     let step = WORKFLOW
-        .split_once("      - name: Publish rolling pull request\n")
-        .expect("workflow has the publish step")
+        .split_once(&heading)
+        .unwrap_or_else(|| panic!("workflow has the {name} step"))
         .1;
     let block = step
         .split_once("        run: |\n")
@@ -45,6 +38,13 @@ fn publish_script() -> String {
         })
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+fn write_executable(path: &Path, content: &str) {
+    fs::write(path, content).unwrap();
+    let mut permissions = fs::metadata(path).unwrap().permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(path, permissions).unwrap();
 }
 
 fn run(command: &mut Command) -> Output {
@@ -99,7 +99,7 @@ impl Fixture {
         git(&checkout, &["push", "origin", "main"]);
 
         let gh = fake_bin.join("gh");
-        fs::write(
+        write_executable(
             &gh,
             r#"#!/usr/bin/env bash
 set -euo pipefail
@@ -139,11 +139,7 @@ case "${1:-}:${2:-}" in
     ;;
 esac
 "#,
-        )
-        .unwrap();
-        let mut permissions = fs::metadata(&gh).unwrap().permissions();
-        permissions.set_mode(0o755);
-        fs::set_permissions(&gh, permissions).unwrap();
+        );
 
         Self {
             _temp: temp,
@@ -221,7 +217,7 @@ esac
         );
         let output = Command::new("bash")
             .arg("-c")
-            .arg(publish_script())
+            .arg(workflow_script("Publish rolling pull request"))
             .current_dir(&self.checkout)
             .env("AUTO_MERGE", auto_merge.to_string())
             .env("BASE_BRANCH", "main")
@@ -281,6 +277,106 @@ esac
 }
 
 #[test]
+fn default_install_resolves_and_verifies_the_canonical_manifest() {
+    let temp = tempfile::tempdir().unwrap();
+    let fake_bin = temp.path().join("bin");
+    let runner_temp = temp.path().join("runner");
+    let github_path = temp.path().join("github-path");
+    let log = temp.path().join("curl-log");
+    fs::create_dir(&fake_bin).unwrap();
+    fs::create_dir(&runner_temp).unwrap();
+    fs::write(&github_path, "").unwrap();
+
+    write_executable(
+        &fake_bin.join("curl"),
+        r#"#!/usr/bin/env bash
+set -euo pipefail
+output=
+url=
+while (($#)); do
+  case "$1" in
+    --output) output="$2"; shift 2 ;;
+    http*) url="$1"; shift ;;
+    *) shift ;;
+  esac
+done
+printf '%s\n' "$url" >> "$FAKE_CURL_LOG"
+printf '{}\n' > "$output"
+"#,
+    );
+    write_executable(
+        &fake_bin.join("jq"),
+        r#"#!/usr/bin/env bash
+set -euo pipefail
+query="${@: -2:1}"
+case "$query" in
+  .schema) printf '%s\n' 1 ;;
+  .version) printf '%s\n' v9.8.7 ;;
+  *'.name') printf '%s\n' upd-v9.8.7-x86_64-unknown-linux-gnu.tar.gz ;;
+  *'.sha256') printf '%064d\n' 0 ;;
+  *) echo "unexpected jq query: $query" >&2; exit 2 ;;
+esac
+"#,
+    );
+    write_executable(
+        &fake_bin.join("sha256sum"),
+        "#!/usr/bin/env bash\nprintf '%064d  %s\\n' 0 \"$1\"\n",
+    );
+    write_executable(
+        &fake_bin.join("tar"),
+        r#"#!/usr/bin/env bash
+set -euo pipefail
+directory=
+while (($#)); do
+  if [[ "$1" == --directory ]]; then directory="$2"; shift 2; else shift; fi
+done
+printf '%s\n' '#!/usr/bin/env bash' 'echo "upd 9.8.7"' > "$directory/upd"
+chmod 0755 "$directory/upd"
+"#,
+    );
+
+    let path = format!("{}:{}", fake_bin.display(), std::env::var("PATH").unwrap());
+    let run_install = |version: &str| {
+        Command::new("bash")
+            .arg("-c")
+            .arg(workflow_script("Install verified upd release"))
+            .env("FAKE_CURL_LOG", &log)
+            .env("GITHUB_PATH", &github_path)
+            .env("PATH", &path)
+            .env("REQUESTED_SHA256", "")
+            .env("REQUESTED_TARGET", "x86_64-unknown-linux-gnu")
+            .env("REQUESTED_VERSION", version)
+            .env("RUNNER_TEMP", &runner_temp)
+            .output()
+            .unwrap()
+    };
+
+    let output = run_install("");
+    assert!(
+        output.status.success(),
+        "install failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let requests = fs::read_to_string(&log).unwrap();
+    assert!(requests.contains("/rvben/upd/main/release-pins.json"));
+    assert!(
+        requests.contains("/releases/download/v9.8.7/upd-v9.8.7-x86_64-unknown-linux-gnu.tar.gz")
+    );
+    assert!(
+        fs::read_to_string(&github_path)
+            .unwrap()
+            .contains("runner/upd-bin")
+    );
+
+    let rejected = run_install("v9.8.6");
+    assert_eq!(rejected.status.code(), Some(4));
+    assert!(
+        String::from_utf8_lossy(&rejected.stderr).contains("Set upd-sha256 when selecting v9.8.6")
+    );
+}
+
+#[test]
 fn workflow_creates_a_single_commit_rolling_pull_request() {
     let fixture = Fixture::new();
     fixture.run_publish(true, "new", false);
@@ -325,13 +421,30 @@ fn workflow_closes_an_obsolete_pr_and_lease_deletes_its_branch() {
 
 #[test]
 fn workflow_defaults_are_reproducible_and_safe() {
-    let version = release_pin(&["version"]);
-    let checksum = release_pin(&["assets", "x86_64-unknown-linux-gnu", "sha256"]);
-    assert!(WORKFLOW.contains(&format!("default: {version}")));
-    assert!(WORKFLOW.contains(&checksum));
+    assert!(
+        WORKFLOW.contains("https://raw.githubusercontent.com/rvben/upd/main/release-pins.json")
+    );
+    assert!(WORKFLOW.contains(".assets[$target].name"));
+    assert!(WORKFLOW.contains(".assets[$target].sha256"));
+    assert!(WORKFLOW.contains("manifest_asset\" != \"$expected_asset"));
+    assert!(WORKFLOW.contains("--retry 3 --retry-all-errors"));
     assert!(WORKFLOW.contains("actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1"));
     assert!(WORKFLOW.contains("actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a"));
     assert!(WORKFLOW.contains("--force-with-lease="));
     assert!(!WORKFLOW.contains("default: latest"));
+    assert!(!WORKFLOW.contains("default: v0."));
     assert!(!WORKFLOW.contains("git push --force "));
+}
+
+#[test]
+fn repository_dependency_jobs_share_the_hardened_workflow() {
+    assert!(RUST_WORKFLOW.contains("uses: ./.github/workflows/dependency-health.yml"));
+    assert!(RUST_WORKFLOW.contains("langs: rust"));
+    assert!(RUST_WORKFLOW.contains("lock: true"));
+    assert!(RUST_WORKFLOW.contains("branch: deps/upd"));
+    assert!(!RUST_WORKFLOW.contains("git push"));
+    assert!(!RUST_WORKFLOW.contains("upd-version:"));
+
+    assert!(ACTIONS_WORKFLOW.contains("uses: ./.github/workflows/dependency-health.yml"));
+    assert!(!ACTIONS_WORKFLOW.contains("upd-version:"));
 }

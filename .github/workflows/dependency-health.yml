@@ -8,11 +8,11 @@ on:
         type: string
         default: ubuntu-24.04
       upd-version:
-        description: Exact released upd version
+        description: Exact released upd version; empty follows the verified release manifest
         type: string
-        default: v0.6.3
+        default: ""
       upd-sha256:
-        description: Archive digest; required when overriding upd-version or upd-target
+        description: Archive digest; required for a version absent from the release manifest
         type: string
         default: ""
       upd-target:
@@ -101,11 +101,11 @@ on:
         type: string
         default: ubuntu-24.04
       upd-version:
-        description: Exact released upd version
+        description: Exact released upd version; empty follows the verified release manifest
         type: string
-        default: v0.6.3
+        default: ""
       upd-sha256:
-        description: Archive digest when changing version or target
+        description: Archive digest for a version absent from the release manifest
         type: string
         default: ""
       upd-target:
@@ -212,7 +212,7 @@ jobs:
           UPD_VERSION: ${{ inputs.upd-version }}
         run: |
           set -euo pipefail
-          if [[ ! "$UPD_VERSION" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([+-][0-9A-Za-z.-]+)?$ ]]; then
+          if [[ -n "$UPD_VERSION" && ! "$UPD_VERSION" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([+-][0-9A-Za-z.-]+)?$ ]]; then
             echo "upd-version must be an exact v-prefixed release" >&2
             exit 4
           fi
@@ -251,21 +251,42 @@ jobs:
           fi
 
           expected_sha="$REQUESTED_SHA256"
-          if [[ -z "$expected_sha" && "$version" == v0.6.3 ]]; then
-            case "$target" in
-              x86_64-unknown-linux-gnu)
-                expected_sha=0e28562f06c852a5438e4e9745c8f99fc31240162ee65e633eeb7359b7e3a351
-                ;;
-              x86_64-unknown-linux-musl)
-                expected_sha=f33188f3ab45652859f0dc9fd4423250690645a64b2dfba55a2752d48dadf24a
-                ;;
-              aarch64-unknown-linux-gnu)
-                expected_sha=2dcad70bd1055e0c8519b7ac9cac04cc9efa7f23100ce803deb51b4ab117b3df
-                ;;
-            esac
+          if [[ -z "$version" || -z "$expected_sha" ]]; then
+            manifest="$RUNNER_TEMP/upd-release-pins.json"
+            curl --silent --show-error --fail-with-body --location \
+              --retry 3 --retry-all-errors \
+              --output "$manifest" \
+              https://raw.githubusercontent.com/rvben/upd/main/release-pins.json
+
+            schema="$(jq --exit-status --raw-output '.schema' "$manifest")"
+            manifest_version="$(jq --exit-status --raw-output '.version' "$manifest")"
+            if [[ "$schema" != 1 || ! "$manifest_version" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+              echo "The canonical upd release manifest is invalid" >&2
+              exit 2
+            fi
+            if [[ -z "$version" ]]; then
+              version="$manifest_version"
+            fi
+            if [[ -z "$expected_sha" ]]; then
+              if [[ "$version" != "$manifest_version" ]]; then
+                echo "Set upd-sha256 when selecting $version; the release manifest pins $manifest_version" >&2
+                exit 4
+              fi
+              expected_asset="upd-${version}-${target}.tar.gz"
+              manifest_asset="$(jq --exit-status --raw-output --arg target "$target" '.assets[$target].name' "$manifest")"
+              expected_sha="$(jq --exit-status --raw-output --arg target "$target" '.assets[$target].sha256' "$manifest")"
+              if [[ "$manifest_asset" != "$expected_asset" ]]; then
+                echo "The release manifest does not contain the expected asset for $target" >&2
+                exit 2
+              fi
+            fi
+          fi
+          if [[ ! "$version" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([+-][0-9A-Za-z.-]+)?$ ]]; then
+            echo "Resolved upd version is invalid" >&2
+            exit 2
           fi
           if [[ ! "$expected_sha" =~ ^[0-9a-fA-F]{64}$ ]]; then
-            echo "Set upd-sha256 when overriding upd-version or upd-target" >&2
+            echo "upd-sha256 must be a 64-character hexadecimal digest" >&2
             exit 4
           fi
 
@@ -273,6 +294,7 @@ jobs:
           mkdir -p "$install_dir"
           asset="upd-${version}-${target}.tar.gz"
           curl --silent --show-error --fail-with-body --location \
+            --retry 3 --retry-all-errors \
             --output "$install_dir/$asset" \
             "https://github.com/rvben/upd/releases/download/${version}/${asset}"
           actual_sha="$(sha256sum "$install_dir/$asset" | cut -d ' ' -f 1)"

@@ -13,7 +13,6 @@ jobs:
   update:
     uses: ./.github/workflows/dependency-health.yml
     with:
-      upd-version: v0.6.3
       min-age: 7d
       max-bump: minor
       validation-command: make check

@@ -27,7 +27,6 @@ jobs:
   update:
     uses: rvben/upd/.github/workflows/dependency-health.yml@<FULL_COMMIT_SHA>
     with:
-      upd-version: v0.6.3
       min-age: 7d
       max-bump: minor
       validation-command: make test
@@ -38,7 +37,10 @@ jobs:
 Replace `<FULL_COMMIT_SHA>` with a revision containing the reusable workflow.
 Pinning the workflow prevents later changes in this repository from silently
 changing executable CI code. The workflow itself pins its third-party actions,
-the default `upd` archive version, and that archive's SHA-256.
+and its default install resolves the current release from upd's canonical
+`release-pins.json` manifest before verifying that archive's SHA-256. To freeze
+the binary version as well as the workflow code, set both `upd-version` and
+`upd-sha256` explicitly.
 
 The `pull-request-token` secret is optional. Without it, the workflow uses the
 caller's `GITHUB_TOKEN`. The caller must grant `contents: write` and
@@ -82,8 +84,8 @@ leave the repository clean; dependency changes belong exclusively to `upd`.
 | Input | Default | Purpose |
 |-------|---------|---------|
 | `runner` | `ubuntu-24.04` | Linux runner label |
-| `upd-version` | `v0.6.3` | Exact released `upd` version |
-| `upd-sha256` | built in for the default version | Exact archive checksum when changing version or target |
+| `upd-version` | current verified manifest | Exact released `upd` version; empty follows the canonical release manifest |
+| `upd-sha256` | manifest checksum | Exact archive checksum; required when the selected version is absent from the manifest |
 | `upd-target` | detected | Release target; Linux x86-64 and ARM64 GNU are detected |
 | `paths` | `.` | Whitespace-separated repository paths passed to `upd` |
 | `langs` | `actions` | Comma-separated ecosystem filter; empty enables every detected ecosystem |
@@ -102,8 +104,8 @@ leave the repository clean; dependency changes belong exclusively to `upd`.
 | `auto-merge` | `false` | Ask GitHub to merge after repository checks pass |
 | `merge-method` | `squash` | Auto-merge strategy: `squash`, `merge`, or `rebase` |
 
-When changing `upd-version` or `upd-target`, also provide the published archive
-digest:
+For a fully static installation, provide the published archive version and
+digest together:
 
 ```yaml
 with:

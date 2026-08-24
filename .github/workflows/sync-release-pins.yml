@@ -165,9 +165,6 @@ jobs:
           git switch --create "$branch"
           git add \
             release-pins.json \
-            .github/workflows/dependency-health.yml \
-            .github/workflows/dependencies.yml \
-            .github/workflows/upd.yml \
             ci/gitlab-dependency-update.yml \
             docs/github-actions.md \
             docs/gitlab.md

@@ -27,21 +27,12 @@ COMMIT_RE = re.compile(r"^[0-9a-f]{40}$")
 # shape. Add new distributed consumers here instead of scattering release-time
 # edits through the workflow.
 CONSUMERS: dict[str, dict[str, Any]] = {
-    ".github/workflows/dependency-health.yml": {
-        "version": 3,
-        "hashes": {target: 1 for target in TARGETS},
-    },
-    ".github/workflows/dependencies.yml": {
-        "version": 1,
-        "hashes": {"x86_64-unknown-linux-gnu": 1},
-    },
-    ".github/workflows/upd.yml": {"version": 1, "hashes": {}},
     "ci/gitlab-dependency-update.yml": {
         "version": 2,
         "hashes": {target: 1 for target in TARGETS},
     },
     "docs/github-actions.md": {
-        "version": 3,
+        "version": 1,
         "hashes": {"x86_64-unknown-linux-gnu": 1},
     },
     "docs/gitlab.md": {

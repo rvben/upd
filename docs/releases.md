@@ -23,10 +23,11 @@ The workflow validates that the tag matches the package version, builds and
 attests every platform archive, publishes crates.io, PyPI, and the GitHub
 release, and verifies the release artifacts. It then generates
 `release-pins.json` from the exact archive bytes and checksum sidecars. A
-version-specific pull request updates the GitHub workflow, GitLab component,
-self-hosting workflow, documentation, and their contract tests together. The
-pull request is merged only after the generated tree passes `make check` and
-workflow validation.
+version-specific pull request updates the manifest, GitLab component, and
+documentation together. GitHub workflows resolve their default binary from the
+manifest, so the release bot never needs permission to rewrite executable
+workflow files. The pull request is merged only after the generated tree passes
+`make check` and workflow validation.
 
 ## Retry release-pin synchronization
 
