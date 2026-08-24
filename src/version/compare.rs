@@ -5,7 +5,7 @@
 /// (so `1.10 > 1.9` and `v0.10.0.0 > v0.9.0.0`). Lexicographic string compare
 /// would get those wrong, which breaks selection across non-strict-semver
 /// ecosystems like PyPI and multi-segment GitHub tags.
-pub(crate) fn compare_versions(a: &str, b: &str) -> std::cmp::Ordering {
+pub fn compare_versions(a: &str, b: &str) -> std::cmp::Ordering {
     let stripped_a = a.strip_prefix('v').unwrap_or(a);
     let stripped_b = b.strip_prefix('v').unwrap_or(b);
     if let (Ok(va), Ok(vb)) = (

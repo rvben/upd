@@ -101,14 +101,34 @@ An update above the ceiling is reported as held back, in `files[].capped` and
 exit code: the ceiling exists to keep such a change out of the gate, so a run
 can exit `0` with work waiting in `capped`. This covers lock-only version
 floors as well: a transitive package whose newer release sits above the ceiling
-is reported against every manifest the floor would have been written to.
+is reported against every manifest the floor would have been written to. A
+manifest already carrying the floor is one of them, since the floor is not the
+only thing the update moves: the constraint needs no rewrite, the lock below it
+does, and regenerating that lock is the work the ceiling is holding back.
 
-A lock that has no floor mechanism is a separate answer, not a capped one. The
-verdict belongs to the lock rather than to the package, so one transitive
-package resolved by both a `uv.lock` and a `poetry.lock` is reported as held
-back for the uv project and as unfixable for the poetry one, the latter in
-`files[].updates[]` with `status: "unfixable"` and an `error` naming what to do
-instead.
+A floor `upd` cannot write is a separate answer, not a capped one, because no
+ceiling is holding it: it is reported in `files[].updates[]` with its own
+`status` and an `error` naming what to do instead. Held back and blocked are
+decided independently, so a candidate gets the same verdict wherever the ceiling
+sits, and only the manifests that would really have taken the floor are
+described as waiting on `--max-bump`. Three things can refuse it. The lock may
+have no floor mechanism at all (`poetry.lock`), which makes the verdict belong
+to the lock rather than to the package: one transitive package resolved by both
+a `uv.lock` and a `poetry.lock` is held back for the uv project and
+`unfixable` for the poetry one. The manifest may already hold an entry `upd`
+will not rewrite, such as a multi-clause `constraint-dependencies` entry or an
+npm override in the nested object form, which is `unfixable` too. Or `--no-lock`
+may be in force against a `cargo-precise` floor, which mutates nothing but
+`Cargo.lock` and so reports `skipped`. An `unfixable` entry is counted in
+`summary.unfixable`; like `capped`, none of these is folded into the up-to-date
+tally and none changes the exit code.
+
+One floor is written per manifest and package, whatever the lock holds: an
+`overrides` or `constraint-dependencies` entry lifts every locked copy of the
+package at once. Held back is reported against that same single floor, so a
+package locked at several versions produces one `capped` entry per manifest,
+carrying the highest locked version, and produces none at all when a copy within
+the ceiling is already floored to a version that covers the rest.
 
 ## Stable exit codes
 

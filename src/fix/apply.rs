@@ -328,6 +328,67 @@ fn finalize_rolled_back(target: FixTarget, prov: Provisional, message: &str) -> 
     }
 }
 
+/// Hand one floor target to its writer. `dry_run` decides only whether the
+/// file is written; every outcome, including a refusal the writer can reach
+/// only by reading the manifest, is the same either way.
+fn write_floor_target(target: &FixTarget, dry_run: bool) -> anyhow::Result<FloorWriteOutcome> {
+    match target.kind {
+        FixKind::UvConstraint => {
+            write_uv_constraint_floor(&target.path, &target.package, &target.to_version, dry_run)
+        }
+        FixKind::NpmOverride => write_npm_override_floor(
+            &target.path,
+            &target.package,
+            &target.to_version,
+            target.npm_form.unwrap_or(NpmOverrideForm::Range),
+            dry_run,
+        ),
+        FixKind::ManifestEdit | FixKind::CargoPrecise => {
+            unreachable!("partitioned into manifest_targets / never grouped here")
+        }
+    }
+}
+
+/// What would refuse this floor target whatever the bump ceiling says, with
+/// nothing written. `None` means nothing would, and the target is held back by
+/// the ceiling alone.
+///
+/// Routing places a target without reading the manifest or consulting the apply
+/// options, so a routed target is not evidence the floor can be written. The
+/// manifest may already hold a uv constraint upd will not rewrite or an
+/// `overrides` entry that is not an object, and `--no-lock` blocks a
+/// `CargoPrecise` floor outright, since that floor mutates nothing but
+/// `Cargo.lock`. A caller classifying a target it is not going to apply asks
+/// here rather than inferring writability from the fact that routing produced
+/// a target, and gets the same answer a dry run would reach.
+///
+/// A manifest already holding a floor at or above the candidate answers `None`
+/// too, because the floor is not the only thing the target moves. A candidate
+/// reaches a classifying caller only while the lock still sits below it, so
+/// such a target needs no manifest edit and a relock all the same, which is
+/// work a ceiling can hold back. Reporting it as satisfied would answer for the
+/// floor and leave the lock unaccounted for.
+///
+/// `relock_floors` is [`FixApplyOptions::relock_floors`]. `ManifestEdit` never
+/// answers here: it is dispatched through the caller's own edit function.
+pub fn probe_floor_target(
+    target: &FixTarget,
+    relock_floors: bool,
+) -> Option<(FixStatus, Option<String>)> {
+    match target.kind {
+        FixKind::CargoPrecise if !relock_floors => Some((
+            FixStatus::Skipped,
+            Some(CARGO_PRECISE_NO_LOCK_HINT.to_string()),
+        )),
+        FixKind::CargoPrecise | FixKind::ManifestEdit => None,
+        FixKind::UvConstraint | FixKind::NpmOverride => match write_floor_target(target, true) {
+            Ok(FloorWriteOutcome::Written | FloorWriteOutcome::AlreadySatisfied) => None,
+            Ok(FloorWriteOutcome::Unfixable(reason)) => Some((FixStatus::Unfixable, Some(reason))),
+            Err(e) => Some((FixStatus::Failed, Some(e.to_string()))),
+        },
+    }
+}
+
 /// Apply one non-`CargoPrecise` group: the `ManifestEdit` cluster runs
 /// first, then the floor writers (uv-constraint / npm-override), then the
 /// group's relock decision resolves every target's final status (rules
@@ -442,22 +503,7 @@ fn apply_edit_group(
             continue;
         }
 
-        let result = match target.kind {
-            FixKind::UvConstraint => {
-                write_uv_constraint_floor(&path, &target.package, &target.to_version, opts.dry_run)
-            }
-            FixKind::NpmOverride => write_npm_override_floor(
-                &path,
-                &target.package,
-                &target.to_version,
-                target.npm_form.unwrap_or(NpmOverrideForm::Range),
-                opts.dry_run,
-            ),
-            FixKind::ManifestEdit | FixKind::CargoPrecise => {
-                unreachable!("partitioned into manifest_targets / never grouped here")
-            }
-        };
-        match result {
+        match write_floor_target(&target, opts.dry_run) {
             Ok(FloorWriteOutcome::Written) => items.push((target, Provisional::Wrote)),
             Ok(FloorWriteOutcome::AlreadySatisfied) => {
                 items.push((target, Provisional::AlreadySatisfied))

@@ -4,6 +4,7 @@ use clap::Parser;
 use colored::Colorize;
 use futures::stream::{self, StreamExt};
 
+use std::cmp::Ordering;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
@@ -18,7 +19,9 @@ use upd::cache::{Cache, CachedRegistry};
 use upd::cli::{BumpLevel, Cli, Command, OutputMode, REVERT_TIP};
 use upd::config::UpdConfig;
 use upd::cooldown::CooldownPolicy;
-use upd::fix::apply::{AppliedFix, FixApplyOptions, FixStatus, apply_fix_targets};
+use upd::fix::apply::{
+    AppliedFix, FixApplyOptions, FixStatus, apply_fix_targets, probe_floor_target,
+};
 use upd::fix::{
     FixKind, FixTarget, FloorResolution, UnfixableTarget, resolve_floor_version, route_fix_targets,
 };
@@ -38,7 +41,7 @@ use upd::updater::{
     UpdateOptions, UpdateResult, Updater, classify_bump, discover_files_with, ecosystem_key,
     read_file_safe, write_file_atomic,
 };
-use upd::version::match_version_precision;
+use upd::version::{compare_versions, match_version_precision};
 
 /// Walk up from `start` to find the nearest ancestor directory that contains a
 /// `.git` entry (file or directory). Returns the path to that ancestor.
@@ -1686,7 +1689,7 @@ async fn run_update(cli: &Cli) -> Result<()> {
             ))
         };
 
-        let (outcomes, mut unfixable, apply_notes): (
+        let (mut outcomes, mut unfixable, apply_notes): (
             Vec<AppliedFix>,
             Vec<UnfixableTarget>,
             Vec<String>,
@@ -1731,6 +1734,15 @@ async fn run_update(cli: &Cli) -> Result<()> {
         // asked one triple at a time so each answer stays attached to the triple
         // that produced it, since a shared pass is matchable back only by name
         // and version, which two ecosystems can share.
+        //
+        // What is written is one floor per manifest and package, whatever the
+        // lock holds: the in-cap path merges every locked copy of a package into
+        // that single floor. The per-triple pass here sees the copies one at a
+        // time and so cannot merge them, and it collects reports instead of
+        // printing them, keeping the highest locked version the way the merge
+        // does. A BTreeMap also fixes the order, which routing does not.
+        let mut capped_reports: BTreeMap<(PathBuf, String), (String, String)> = BTreeMap::new();
+
         for (locked, candidate) in &capped_pending {
             let capped_audit = AuditResult {
                 vulnerable: vec![PackageAuditResult {
@@ -1760,42 +1772,83 @@ async fn run_update(cli: &Cli) -> Result<()> {
                 &manifest_packages,
             );
 
-            // One entry per manifest the floor would have been written to,
-            // which is exactly the fan-out routing produces for a floor that is
-            // taken. Anything reported outside that fan-out would land only on
-            // the representative's own manifest, leaving every other project
+            // Routing fans a floor out over every manifest it would be written
+            // to, which is exactly the set of projects waiting on the ceiling.
+            // Anything reported outside that fan-out would land only on the
+            // representative's own manifest, leaving every other project
             // holding the same package looking up to date.
-            let mut reported: Vec<PathBuf> = Vec::new();
             for target in &routing.targets {
-                if reported.contains(&target.path) {
+                // Routing places a target without reading the manifest or the
+                // apply options, so a target alone does not mean the floor can
+                // be written: an existing uv constraint upd will not rewrite,
+                // an `overrides` entry that is not an object, or `--no-lock`
+                // against a floor that mutates only `Cargo.lock` all refuse it
+                // whatever the ceiling says. Only a floor that would really
+                // have been written leaves the ceiling as the reason the update
+                // is waiting; every other answer is the one this candidate gets
+                // in cap, so the diagnostic a reader sees stops depending on
+                // where the ceiling happens to sit.
+                if let Some((status, error)) = probe_floor_target(target, !cli.no_lock) {
+                    outcomes.push(AppliedFix {
+                        target: target.clone(),
+                        status,
+                        error,
+                    });
                     continue;
                 }
-                reported.push(target.path.clone());
-                total_result.record_capped(&locked.name, &locked.version, candidate, None);
-                if text_mode && !cli.quiet {
-                    println!(
-                        "{}",
-                        format_capped_line(
-                            &target.path.display().to_string(),
-                            None,
-                            &locked.name,
-                            &locked.version,
-                            candidate,
-                        )
-                    );
+
+                // A floor already being written to this manifest at or above
+                // the candidate leaves the ceiling holding nothing back: an
+                // in-cap copy of the same package is floored to a version that
+                // lifts this copy too. Reporting it as held back would ask for
+                // a --max-bump that changes what is written not at all.
+                if outcomes.iter().any(|o| {
+                    floor_entry_counts_as_update(Some(o.status.as_str()))
+                        && o.target.path == target.path
+                        && o.target.package == target.package
+                        && compare_versions(&o.target.to_version, candidate) != Ordering::Less
+                }) {
+                    continue;
                 }
-                floor_capped.entry(target.path.clone()).or_default().push(
-                    upd::output::CappedEntry {
-                        package: locked.name.clone(),
-                        current: locked.version.clone(),
-                        available: candidate.clone(),
-                        bump: classify_update(&locked.version, candidate).as_str(),
-                        line: None,
-                        source: None,
-                    },
-                );
+
+                let entry = capped_reports
+                    .entry((target.path.clone(), locked.name.clone()))
+                    .or_insert_with(|| (locked.version.clone(), candidate.clone()));
+                if compare_versions(&locked.version, &entry.0) == Ordering::Greater {
+                    entry.0 = locked.version.clone();
+                }
+                if compare_versions(candidate, &entry.1) == Ordering::Greater {
+                    entry.1 = candidate.clone();
+                }
             }
             unfixable.extend(routing.unfixable);
+        }
+
+        for ((path, package), (current, available)) in capped_reports {
+            total_result.record_capped(&package, &current, &available, None);
+            if text_mode && !cli.quiet {
+                println!(
+                    "{}",
+                    format_capped_line(
+                        &path.display().to_string(),
+                        None,
+                        &package,
+                        &current,
+                        &available,
+                    )
+                );
+            }
+            floor_capped
+                .entry(path)
+                .or_default()
+                .push(upd::output::CappedEntry {
+                    package,
+                    current: current.clone(),
+                    available: available.clone(),
+                    bump: classify_update(&current, &available).as_str(),
+                    line: None,
+                    source: None,
+                });
         }
 
         if !cli.quiet {
@@ -2002,7 +2055,13 @@ async fn run_update(cli: &Cli) -> Result<()> {
     if text_mode {
         if !cli.quiet {
             println!();
-            let applied = print_summary(&total_result, file_count, dry_run, filter);
+            let applied = print_summary(
+                &total_result,
+                file_count,
+                dry_run,
+                filter,
+                count_unfixable_floors(&floor_reports),
+            );
             // Print the revert tip after a mutating run that applied at least one update.
             if !dry_run && applied > 0 {
                 println!("{}", REVERT_TIP);
@@ -2138,6 +2197,20 @@ fn floor_entry_counts_as_update(status: Option<&str>) -> bool {
     matches!(status, Some("planned" | "applied" | "pending_relock"))
 }
 
+/// Floor entries naming a newer release `upd` has no mechanism to write.
+///
+/// These make no manifest change, so `floor_entry_counts_as_update` keeps them
+/// out of `updates_total`. They are still a discovered release waiting on a
+/// human, so they are counted in their own right: a run that found one must not
+/// close with "all dependencies up to date".
+fn count_unfixable_floors(floor_reports: &[upd::output::UpdateFileReport]) -> usize {
+    floor_reports
+        .iter()
+        .flat_map(|r| &r.updates)
+        .filter(|entry| entry.status == Some("unfixable"))
+        .count()
+}
+
 fn emit_update_json(input: UpdateReportInput<'_>, bounded: &BoundedOutputParams<'_>) -> Result<()> {
     use upd::output::{UpdateReport, UpdateSummary, build_update_file_report};
 
@@ -2226,6 +2299,7 @@ fn emit_update_json(input: UpdateReportInput<'_>, bounded: &BoundedOutputParams<
             .filter(|s| s.status == SkipStatus::NotExamined)
             .count(),
         capped: total_result.capped.len(),
+        unfixable: count_unfixable_floors(&floor_reports),
     };
 
     files.extend(floor_reports);
@@ -4933,6 +5007,7 @@ fn print_summary(
     file_count: usize,
     dry_run: bool,
     filter: UpdateFilter,
+    unfixable_floors: usize,
 ) -> usize {
     let action = if dry_run { "Would update" } else { "Updated" };
 
@@ -4959,6 +5034,7 @@ fn print_summary(
         && blocked_count == 0
         && not_examined_count == 0
         && capped_count == 0
+        && unfixable_floors == 0
     {
         print_nothing_to_update_line(file_count, result.unchanged, result.errors.len());
     } else {
@@ -5001,6 +5077,17 @@ fn print_summary(
                 "{} {} package(s) to configured versions",
                 pinned_action,
                 pinned_count.to_string().cyan().bold()
+            );
+        }
+
+        // Show the count of newer releases upd found but has no mechanism to
+        // write. The reason went to stderr per package; this line exists so
+        // stdout never closes on a tick claiming everything is current.
+        if unfixable_floors > 0 {
+            println!(
+                "{} {} package(s) with a newer release available",
+                "Cannot auto-fix".yellow(),
+                unfixable_floors.to_string().yellow().bold()
             );
         }
 

@@ -261,6 +261,13 @@ pub struct UpdateSummary {
     /// up-to-date tally: something is waiting for each one.
     #[serde(default, skip_serializing_if = "is_zero")]
     pub capped: usize,
+    /// Newer releases `upd` found but has no mechanism to write, each visible
+    /// in `files[].updates[]` with `status: "unfixable"` and an `error` naming
+    /// the reason. Never folded into the up-to-date tally: a release is
+    /// waiting, it just needs a human. Disjoint from `updates_total`, which
+    /// counts only entries reflecting an actual or would-be write.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub unfixable: usize,
 }
 
 fn is_zero(n: &usize) -> bool {

@@ -107,6 +107,24 @@ async fn mount_npm_latest(server: &wiremock::MockServer, name: &str, version: &s
         .await;
 }
 
+/// Mounts the crates.io API endpoint `CARGO_REGISTRIES_CRATES_IO_INDEX`
+/// resolves to (`{index}/api/v1/crates/{name}`) with a single-release body.
+async fn mount_crates_latest(server: &wiremock::MockServer, name: &str, version: &str) {
+    wiremock::Mock::given(wiremock::matchers::method("GET"))
+        .and(wiremock::matchers::path(format!("/api/v1/crates/{name}")))
+        .respond_with(
+            wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "crate": { "max_stable_version": version },
+                "versions": [{
+                    "num": version, "yanked": false,
+                    "created_at": "2024-01-01T00:00:00Z"
+                }]
+            })),
+        )
+        .mount(server)
+        .await;
+}
+
 /// `name` is locked only as a NESTED copy under `node_modules/host/`, never
 /// as a top-level `node_modules/{name}` entry. `classify()`'s npm branch
 /// treats a top-level locator whose path segment matches a direct
@@ -708,6 +726,415 @@ async fn a_capped_floor_is_classified_per_lock_not_per_package() {
     assert_eq!(poetry[0]["status"], "unfixable", "{json}");
 
     assert_eq!(json["summary"]["capped"].as_u64().unwrap_or(0), 1, "{json}");
+    assert_eq!(
+        json["summary"]["unfixable"].as_u64().unwrap_or(0),
+        1,
+        "{json}"
+    );
+}
+
+/// (2f) A newer release `upd` has no mechanism to write is still a newer
+/// release, so a text run that found one must not close on a green tick
+/// claiming every dependency is current. The reason goes to stderr per
+/// package; the summary line on stdout is what stops the run reading as clean.
+///
+/// Both ceilings run because neither is what refuses the write, and the same
+/// fixture with the registry serving the locked version is the control that
+/// the tick still prints when nothing is actually waiting.
+#[tokio::test]
+async fn an_unfixable_floor_is_not_reported_as_up_to_date() {
+    for (latest, waiting) in [("1.2.0", true), ("0.40.0", false)] {
+        for max_bump in ["major", "minor"] {
+            let server = wiremock::MockServer::start().await;
+            mount_pypi_latest(&server, "lockonly", latest).await;
+            let tmp = tempfile::tempdir().unwrap();
+            write_poetry_project(tmp.path());
+
+            let (stdout, stderr, code) = run_with_env(
+                &[
+                    "update",
+                    "--package",
+                    "lockonly",
+                    "--max-bump",
+                    max_bump,
+                    "--format",
+                    "text",
+                    "--no-cache",
+                    ".",
+                ],
+                tmp.path(),
+                &[("UV_INDEX_URL", &server.uri())],
+            );
+
+            let case = format!("latest {latest}, --max-bump {max_bump}");
+            assert_eq!(code, 0, "{case}: stdout: {stdout}\nstderr: {stderr}");
+            assert_eq!(
+                stdout.contains("all dependencies up to date"),
+                !waiting,
+                "{case}: stdout: {stdout}"
+            );
+            assert_eq!(
+                stdout.contains("Cannot auto-fix 1 package(s) with a newer release available"),
+                waiting,
+                "{case}: stdout: {stdout}"
+            );
+        }
+    }
+}
+
+/// One writer-refusal fixture: a manifest whose existing floor entry the writer
+/// will not rewrite, paired with the writable spelling of the same manifest as
+/// its control.
+struct WriterCase {
+    label: &'static str,
+    manifest: &'static str,
+    lock: &'static str,
+    lock_body: String,
+    npm: bool,
+    package: &'static str,
+    latest: &'static str,
+    writable: &'static str,
+    unwritable: &'static str,
+    refusal: &'static str,
+}
+
+/// (2g) Routing places a floor target without ever reading the manifest, so a
+/// routed target is not proof the floor can be written. An existing uv
+/// constraint `upd` will not rewrite, or an npm override already in the nested
+/// form, refuses the write wherever the ceiling sits; reporting such a
+/// candidate as held back tells the reader that raising `--max-bump` applies
+/// it, when raising it produces the refusal instead. The refusal is also the
+/// only answer carrying the guidance for fixing it by hand, so the held-back
+/// wording costs the reader the one thing they could have acted on.
+///
+/// The writable spelling of each manifest is the control, and it is what makes
+/// the equality mean anything: it shows the fixture DOES observe a
+/// ceiling-dependent answer (`planned` in cap, `capped` above it), so the
+/// unwritable spelling reporting identically under both ceilings is an
+/// invariant rather than a fixture blind to `--max-bump`.
+#[tokio::test]
+async fn a_floor_the_writer_refuses_is_unfixable_under_every_ceiling() {
+    let cases = [
+        WriterCase {
+            label: "uv constraint",
+            manifest: "pyproject.toml",
+            lock: "uv.lock",
+            lock_body: uv_lock_at("lockonly", "0.40.0"),
+            npm: false,
+            package: "lockonly",
+            latest: "1.2.0",
+            writable: PYPROJECT_BARE,
+            unwritable: "[project]\nname = \"t\"\nversion = \"1.0.0\"\ndependencies = []\n\n[tool.uv]\nconstraint-dependencies = [\"lockonly>=0.1,<1.0\"]\n",
+            refusal: "is not a simple form",
+        },
+        WriterCase {
+            label: "npm override",
+            manifest: "package.json",
+            lock: "package-lock.json",
+            lock_body: npm_lock_with("examplepkg", "1.2.0"),
+            npm: true,
+            package: "examplepkg",
+            latest: "9.9.9",
+            writable: r#"{"name": "t", "version": "1.0.0", "dependencies": {"host": "^1.0.0"}}"#,
+            unwritable: r#"{"name": "t", "version": "1.0.0", "dependencies": {"host": "^1.0.0"}, "overrides": {"examplepkg": {".": ">=1.0.0"}}}"#,
+            refusal: "nested override form",
+        },
+    ];
+
+    for case in cases {
+        for (shape, manifest) in [("writable", case.writable), ("unwritable", case.unwritable)] {
+            for max_bump in ["major", "minor"] {
+                let server = wiremock::MockServer::start().await;
+                if case.npm {
+                    mount_npm_latest(&server, case.package, case.latest).await;
+                } else {
+                    mount_pypi_latest(&server, case.package, case.latest).await;
+                }
+                let tmp = tempfile::tempdir().unwrap();
+                fs::write(tmp.path().join(case.manifest), manifest).unwrap();
+                fs::write(tmp.path().join(case.lock), &case.lock_body).unwrap();
+
+                let env_key = if case.npm {
+                    "NPM_REGISTRY"
+                } else {
+                    "UV_INDEX_URL"
+                };
+                let (stdout, stderr, _) = run_with_env(
+                    &[
+                        "update",
+                        "--package",
+                        case.package,
+                        "--max-bump",
+                        max_bump,
+                        "--format",
+                        "json",
+                        "--no-cache",
+                        ".",
+                    ],
+                    tmp.path(),
+                    &[(env_key, &server.uri())],
+                );
+
+                let who = format!("{} / {shape} / --max-bump {max_bump}", case.label);
+                let json: serde_json::Value = serde_json::from_str(&stdout)
+                    .unwrap_or_else(|e| panic!("{who}: {e}\nstdout: {stdout}\nstderr: {stderr}"));
+                let files = json["files"].as_array().unwrap().clone();
+                let updates = collect_for_path(&files, case.manifest, "updates");
+                let capped = collect_for_path(&files, case.manifest, "capped");
+                let entry = updates.iter().find(|u| u["package"] == case.package);
+
+                if shape == "writable" {
+                    // The control: this manifest CAN take the floor, so the
+                    // ceiling alone decides, and the two runs must differ.
+                    if max_bump == "major" {
+                        assert_eq!(
+                            entry.map(|e| e["status"].clone()),
+                            Some(serde_json::json!("planned")),
+                            "{who}: {json}"
+                        );
+                        assert!(capped.is_empty(), "{who}: {json}");
+                    } else {
+                        assert_eq!(capped.len(), 1, "{who}: {json}");
+                        assert_eq!(capped[0]["available"], case.latest, "{who}: {json}");
+                        assert!(entry.is_none(), "{who}: {json}");
+                    }
+                    continue;
+                }
+
+                let entry = entry.unwrap_or_else(|| panic!("{who}: no entry in {json}"));
+                assert_eq!(entry["status"], "unfixable", "{who}: {json}");
+                assert!(
+                    entry["error"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .contains(case.refusal),
+                    "{who}: the guidance for fixing it by hand is the whole point of the \
+                     unfixable answer: {json}"
+                );
+                assert!(
+                    capped.is_empty(),
+                    "{who}: no ceiling is holding a floor the writer refuses: {json}"
+                );
+                assert_eq!(
+                    json["summary"]["unfixable"].as_u64().unwrap_or(0),
+                    1,
+                    "{who}: {json}"
+                );
+            }
+        }
+    }
+}
+
+/// A lock holding TWO nested copies of `name`, one under each host, so a
+/// single `--package` run resolves the same name at two different versions.
+/// Both are nested for the reason [`npm_lock_with`] documents.
+fn npm_lock_with_two(name: &str, first: &str, second: &str) -> String {
+    format!(
+        r#"{{
+  "name": "t", "version": "1.0.0", "lockfileVersion": 3, "requires": true,
+  "packages": {{
+    "": {{ "name": "t", "version": "1.0.0" }},
+    "node_modules/hosta": {{ "version": "1.0.0" }},
+    "node_modules/hosta/node_modules/{name}": {{ "version": "{first}" }},
+    "node_modules/hostb": {{ "version": "1.0.0" }},
+    "node_modules/hostb/node_modules/{name}": {{ "version": "{second}" }}
+  }}
+}}"#
+    )
+}
+
+/// (2h) One floor is written per manifest and package, whatever the lock holds:
+/// an `overrides` entry at `>=1.2.0` lifts every copy of the package at once.
+/// The in-cap path merges the copies into that one floor, so the report above
+/// the ceiling has to describe the same single floor.
+///
+/// Two shapes, because the fan-out breaks it in two different ways. With one
+/// copy in cap and one above it, the in-cap copy's floor already covers the
+/// capped one, so reporting the capped copy as held back asks for a
+/// `--max-bump` that changes nothing about what gets written. With both copies
+/// above the ceiling, the report has to fold to one entry at the highest locked
+/// version, which is the version the merge keeps.
+///
+/// The `--max-bump major` run of the both-capped shape is the control: it is
+/// the same fixture going through the merging path, and it pins the entry count
+/// and the version the capped report has to match.
+#[tokio::test]
+async fn capped_copies_fold_into_the_one_floor_that_would_be_written() {
+    let manifest = r#"{"name": "t", "version": "1.0.0", "dependencies": {"hosta": "^1.0.0"}}"#;
+
+    // One copy in cap (1.0.0 -> 1.2.0 is minor), one above it (0.9.0 -> 1.2.0
+    // is major): the planned floor covers both, so nothing is held back.
+    let server = wiremock::MockServer::start().await;
+    mount_npm_latest(&server, "examplepkg", "1.2.0").await;
+    let tmp = tempfile::tempdir().unwrap();
+    fs::write(tmp.path().join("package.json"), manifest).unwrap();
+    fs::write(
+        tmp.path().join("package-lock.json"),
+        npm_lock_with_two("examplepkg", "0.9.0", "1.0.0"),
+    )
+    .unwrap();
+
+    let (stdout, stderr, code) = run_with_env(
+        &[
+            "update",
+            "--package",
+            "examplepkg",
+            "--max-bump",
+            "minor",
+            "--format",
+            "json",
+            "--no-cache",
+            ".",
+        ],
+        tmp.path(),
+        &[("NPM_REGISTRY", &server.uri())],
+    );
+    assert_eq!(code, 1, "stdout: {stdout}\nstderr: {stderr}");
+    let json: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    let files = json["files"].as_array().unwrap().clone();
+    let updates = collect_for_path(&files, "package.json", "updates");
+    let capped = collect_for_path(&files, "package.json", "capped");
+    assert_eq!(updates.len(), 1, "{json}");
+    assert_eq!(updates[0]["status"], "planned", "{json}");
+    assert_eq!(updates[0]["latest"], "1.2.0", "{json}");
+    assert!(
+        capped.is_empty(),
+        "the planned floor at 1.2.0 lifts the 0.9.0 copy too, so no ceiling is \
+         holding it back: {json}"
+    );
+
+    // Both copies above the ceiling: one entry, at the higher locked version.
+    for max_bump in ["minor", "major"] {
+        let server = wiremock::MockServer::start().await;
+        mount_npm_latest(&server, "examplepkg", "1.2.0").await;
+        let tmp = tempfile::tempdir().unwrap();
+        fs::write(tmp.path().join("package.json"), manifest).unwrap();
+        fs::write(
+            tmp.path().join("package-lock.json"),
+            npm_lock_with_two("examplepkg", "0.8.0", "0.9.0"),
+        )
+        .unwrap();
+
+        let (stdout, stderr, _) = run_with_env(
+            &[
+                "update",
+                "--package",
+                "examplepkg",
+                "--max-bump",
+                max_bump,
+                "--format",
+                "json",
+                "--no-cache",
+                ".",
+            ],
+            tmp.path(),
+            &[("NPM_REGISTRY", &server.uri())],
+        );
+        let json: serde_json::Value = serde_json::from_str(&stdout)
+            .unwrap_or_else(|e| panic!("{max_bump}: {e}\nstdout: {stdout}\nstderr: {stderr}"));
+        let files = json["files"].as_array().unwrap().clone();
+        let updates = collect_for_path(&files, "package.json", "updates");
+        let capped = collect_for_path(&files, "package.json", "capped");
+
+        // The control: in cap the merge produces one floor at the higher locked
+        // version, which is the entry the capped report has to mirror.
+        let (entries, other) = if max_bump == "major" {
+            (updates, capped)
+        } else {
+            (capped, updates)
+        };
+        assert_eq!(entries.len(), 1, "{max_bump}: {json}");
+        assert_eq!(entries[0]["current"], "0.9.0", "{max_bump}: {json}");
+        assert!(other.is_empty(), "{max_bump}: {json}");
+    }
+}
+
+/// (2i) `--no-lock` refuses a `cargo-precise` floor outright: that floor
+/// mutates nothing but `Cargo.lock`, so there is nothing left for it to do.
+/// The refusal does not depend on the ceiling, so reporting the candidate as
+/// held back would send the reader to `--max-bump`, which produces the same
+/// refusal, instead of to the flag that is actually blocking it.
+///
+/// The run without `--no-lock` is the control: it is the same fixture with a
+/// ceiling-dependent answer (`planned` in cap, `capped` above it), which is what
+/// makes the `--no-lock` runs answering identically an invariant rather than a
+/// fixture that cannot see `--max-bump`.
+#[tokio::test]
+async fn a_cargo_floor_blocked_by_no_lock_is_skipped_under_every_ceiling() {
+    const CARGO_TOML: &str = "[package]\nname = \"t\"\nversion = \"0.1.0\"\n";
+    const CARGO_LOCK: &str = "version = 4\n\n[[package]]\nname = \"t\"\nversion = \"0.1.0\"\n\n[[package]]\nname = \"dupcrate\"\nversion = \"1.2.3\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\n";
+
+    for no_lock in [true, false] {
+        for max_bump in ["major", "minor"] {
+            let server = wiremock::MockServer::start().await;
+            mount_crates_latest(&server, "dupcrate", "2.0.1").await;
+            let tmp = tempfile::tempdir().unwrap();
+            fs::write(tmp.path().join("Cargo.toml"), CARGO_TOML).unwrap();
+            fs::write(tmp.path().join("Cargo.lock"), CARGO_LOCK).unwrap();
+
+            let mut args = vec![
+                "update",
+                "--package",
+                "dupcrate",
+                "--max-bump",
+                max_bump,
+                "--format",
+                "json",
+                "--no-cache",
+                ".",
+            ];
+            if no_lock {
+                args.insert(1, "--no-lock");
+            }
+            let (stdout, stderr, _) = run_with_env(
+                &args,
+                tmp.path(),
+                &[("CARGO_REGISTRIES_CRATES_IO_INDEX", &server.uri())],
+            );
+
+            let who = format!("no_lock={no_lock} / --max-bump {max_bump}");
+            let json: serde_json::Value = serde_json::from_str(&stdout)
+                .unwrap_or_else(|e| panic!("{who}: {e}\nstdout: {stdout}\nstderr: {stderr}"));
+            let files = json["files"].as_array().unwrap().clone();
+            let updates = collect_for_path(&files, "Cargo.lock", "updates");
+            let capped = collect_for_path(&files, "Cargo.lock", "capped");
+
+            if !no_lock {
+                // The control: the ceiling alone decides when nothing else
+                // blocks the floor.
+                if max_bump == "major" {
+                    assert_eq!(
+                        updates.first().map(|u| u["status"].clone()),
+                        Some(serde_json::json!("planned")),
+                        "{who}: {json}"
+                    );
+                    assert!(capped.is_empty(), "{who}: {json}");
+                } else {
+                    assert_eq!(capped.len(), 1, "{who}: {json}");
+                    assert_eq!(capped[0]["available"], "2.0.1", "{who}: {json}");
+                    assert!(updates.is_empty(), "{who}: {json}");
+                }
+                continue;
+            }
+
+            let entry = updates
+                .iter()
+                .find(|u| u["package"] == "dupcrate")
+                .unwrap_or_else(|| panic!("{who}: no entry in {json}"));
+            assert_eq!(entry["status"], "skipped", "{who}: {json}");
+            assert!(
+                entry["error"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .contains("rerun without --no-lock"),
+                "{who}: the blocking flag is the one thing the reader can act on: {json}"
+            );
+            assert!(
+                capped.is_empty(),
+                "{who}: no ceiling is holding a floor --no-lock refuses: {json}"
+            );
+        }
+    }
 }
 
 /// (3) A requested name that DOES occur in the manifest keeps today's
@@ -1128,3 +1555,64 @@ async fn update_no_lock_pending_relock_counts_in_summary() {
 // an integration test can never reach it without a real pty. The detection
 // helper (`is_lock_only_name`) and the note text (`lock_only_interactive_note`)
 // are private to the binary crate and directly testable there.
+
+/// (2m) A manifest can already carry a floor at or above the candidate while
+/// its lockfile still holds the older version. The floor needs no rewrite, but
+/// the lock does, and `--lock` regenerating it is exactly the work the ceiling
+/// is holding back: the candidate got into the capped set only because the lock
+/// sits below it. Reporting the target as satisfied there answers a question
+/// nobody asked - the floor's state - and hides the update.
+///
+/// The `major` run is the control that makes the claim falsifiable: the same
+/// fixture with the ceiling raised has nothing held back, so a `capped` entry
+/// under `minor` can only be the ceiling talking.
+#[tokio::test]
+async fn a_capped_floor_already_in_the_manifest_is_still_held_back() {
+    for max_bump in ["major", "minor"] {
+        let server = wiremock::MockServer::start().await;
+        mount_pypi_latest(&server, "lockonly", "2.0.0").await;
+        let tmp = tempfile::tempdir().unwrap();
+        fs::write(
+            tmp.path().join("pyproject.toml"),
+            "[project]\nname = \"t\"\nversion = \"1.0.0\"\ndependencies = []\n\n[tool.uv]\nconstraint-dependencies = [\"lockonly>=2.0.0\"]\n",
+        )
+        .unwrap();
+        fs::write(tmp.path().join("uv.lock"), uv_lock_at("lockonly", "1.0.0")).unwrap();
+
+        let (stdout, stderr, code) = run_with_env(
+            &[
+                "update",
+                "--package",
+                "lockonly",
+                "--max-bump",
+                max_bump,
+                "--format",
+                "json",
+                "--no-cache",
+                ".",
+            ],
+            tmp.path(),
+            &[("UV_INDEX_URL", &server.uri())],
+        );
+
+        let (_, capped) = floor_json(&stdout, &stderr, code, "pyproject.toml");
+        let json: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+        let label = format!("--max-bump {max_bump}");
+
+        if max_bump == "major" {
+            assert!(
+                capped.is_empty(),
+                "{label}: no ceiling is above the candidate: {json}"
+            );
+            continue;
+        }
+
+        let entry = capped
+            .iter()
+            .find(|c| c["package"] == "lockonly")
+            .unwrap_or_else(|| panic!("{label}: no held-back entry in {json}"));
+        assert_eq!(entry["current"], "1.0.0", "{label}: {entry:?}");
+        assert_eq!(entry["available"], "2.0.0", "{label}: {entry:?}");
+        assert_eq!(json["summary"]["capped"], 1, "{label}: {}", json["summary"]);
+    }
+}
