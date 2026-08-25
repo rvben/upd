@@ -25,6 +25,7 @@ pub use terraform::TerraformRegistry;
 
 // The constraint grammars, shared with the updaters that have to decide whether
 // a release a manifest already admits is worth rewriting the manifest for.
+pub(crate) use nuget::matches_nuget_range;
 pub(crate) use rubygems::matches_ruby_constraint;
 pub(crate) use terraform::matches_terraform_constraint;
 

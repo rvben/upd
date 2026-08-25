@@ -1,9 +1,9 @@
 use super::{
     FileType, ParsedDependency, UpdateOptions, UpdateResult, Updater, downgrade_warning,
-    read_file_safe, write_file_atomic,
+    read_file_safe, unpinnable_error, unreadable_error, unrewritable_warning, write_file_atomic,
 };
 use crate::align::compare_versions;
-use crate::registry::Registry;
+use crate::registry::{Registry, matches_nuget_range};
 use crate::updater::Lang;
 use crate::version::match_version_precision;
 use anyhow::Result;
@@ -197,11 +197,6 @@ impl Updater for CsprojUpdater {
         let mut fetch_deps: Vec<(usize, String, String, bool)> = Vec::new();
 
         for pkg in &packages {
-            // Skip range constraints
-            if pkg.has_range_constraint {
-                continue;
-            }
-
             if options.is_package_filtered_out(&pkg.name) {
                 result.unchanged += 1;
                 continue;
@@ -213,6 +208,15 @@ impl Updater for CsprojUpdater {
             }
 
             if let Some(pinned_version) = options.get_pinned_version(&pkg.name) {
+                if pkg.has_range_constraint {
+                    // The pin was configured and cannot be written into interval
+                    // notation, so the file does not say what the config says it
+                    // should. That is a failed instruction, not a note.
+                    result
+                        .errors
+                        .push(unpinnable_error(&pkg.name, pinned_version, &pkg.version));
+                    continue;
+                }
                 pinned_packages.push((
                     pkg.line_idx,
                     pkg.name.clone(),
@@ -334,6 +338,28 @@ impl Updater for CsprojUpdater {
                 let pkg = &packages[pkg_idx];
 
                 if pkg.has_range_constraint {
+                    // upd does not rewrite NuGet interval notation, but whether the
+                    // range still admits the newest release is a fact about this
+                    // project. Dropping the dependency here left it out of the
+                    // counts as well, so a range that had fallen years behind read
+                    // exactly like one that was current.
+                    match version_map.remove(&line_idx) {
+                        Some(Ok(latest_version)) => {
+                            match matches_nuget_range(&latest_version, &pkg.version) {
+                                Some(true) => result.unchanged += 1,
+                                Some(false) => result.warnings.push(unrewritable_warning(
+                                    &pkg.name,
+                                    &latest_version,
+                                    &pkg.version,
+                                )),
+                                None => result
+                                    .errors
+                                    .push(unreadable_error(&pkg.name, &pkg.version)),
+                            }
+                        }
+                        Some(Err(e)) => result.errors.push(format!("{}: {}", pkg.name, e)),
+                        None => {}
+                    }
                     new_lines.push(line.to_string());
                     continue;
                 }
@@ -624,12 +650,124 @@ mod tests {
     }
 
     #[test]
-    fn test_skips_range_constraints() {
+    fn test_recognizes_range_constraints() {
         let updater = CsprojUpdater::new();
 
         let line = r#"    <PackageReference Include="Constrained.Pkg" Version="[1.0.0, 2.0.0)" />"#;
         let parsed = updater.parse_inline(line).unwrap();
         assert!(parsed.has_range_constraint);
+    }
+
+    /// A project file holding one package reference at one version spec.
+    fn project_file(package: &str, version: &str) -> NamedTempFile {
+        let mut file = NamedTempFile::new().unwrap();
+        write!(
+            file,
+            "<Project Sdk=\"Microsoft.NET.Sdk\">\n  <ItemGroup>\n    <PackageReference Include=\"{package}\" Version=\"{version}\" />\n  </ItemGroup>\n</Project>\n"
+        )
+        .unwrap();
+        file
+    }
+
+    #[tokio::test]
+    async fn a_range_that_admits_the_latest_release_is_counted_as_up_to_date() {
+        let file = project_file("Newtonsoft.Json", "[12.0.0,14.0.0)");
+        let registry = MockRegistry::new("nuget").with_version("Newtonsoft.Json", "13.0.3");
+
+        let updater = CsprojUpdater::new();
+        let result = updater
+            .update(file.path(), &registry, UpdateOptions::new(false, false))
+            .await
+            .unwrap();
+
+        // The range used to be dropped before any counter saw it, so a project
+        // whose only dependency was a range reported nothing at all.
+        assert_eq!(result.unchanged, 1);
+        assert!(result.warnings.is_empty(), "{:?}", result.warnings);
+        assert!(result.updated.is_empty());
+        let contents = std::fs::read_to_string(file.path()).unwrap();
+        assert!(
+            contents.contains(r#"Version="[12.0.0,14.0.0)""#),
+            "{contents}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_range_the_latest_release_has_outgrown_is_reported() {
+        let file = project_file("Newtonsoft.Json", "[11.0.0,12.0.0)");
+        let registry = MockRegistry::new("nuget").with_version("Newtonsoft.Json", "13.0.3");
+
+        let updater = CsprojUpdater::new();
+        let result = updater
+            .update(file.path(), &registry, UpdateOptions::new(false, false))
+            .await
+            .unwrap();
+
+        assert_eq!(result.warnings.len(), 1);
+        assert!(
+            result.warnings[0].contains("13.0.3") && result.warnings[0].contains("[11.0.0,12.0.0)"),
+            "{}",
+            result.warnings[0]
+        );
+        // Reported, not rewritten: the file is left exactly as written.
+        let contents = std::fs::read_to_string(file.path()).unwrap();
+        assert!(
+            contents.contains(r#"Version="[11.0.0,12.0.0)""#),
+            "{contents}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_version_spec_that_is_not_notation_is_an_error() {
+        let file = project_file("Newtonsoft.Json", "12.0.0,13.0.0");
+        let registry = MockRegistry::new("nuget").with_version("Newtonsoft.Json", "13.0.3");
+
+        let updater = CsprojUpdater::new();
+        let result = updater
+            .update(file.path(), &registry, UpdateOptions::new(false, false))
+            .await
+            .unwrap();
+
+        // Not a warning: nothing has looked at this dependency, which is a
+        // different fact from a range that excludes the newest release.
+        assert_eq!(result.errors.len(), 1);
+        assert!(
+            result.errors[0].contains("cannot check 'Newtonsoft.Json'"),
+            "{}",
+            result.errors[0]
+        );
+        assert!(result.warnings.is_empty(), "{:?}", result.warnings);
+    }
+
+    #[tokio::test]
+    async fn a_pin_into_a_range_is_an_error() {
+        use crate::config::UpdConfig;
+        use std::sync::Arc;
+
+        let file = project_file("Newtonsoft.Json", "[12.0.0,14.0.0)");
+        let registry = MockRegistry::new("nuget").with_version("Newtonsoft.Json", "13.0.3");
+
+        let mut pins = std::collections::HashMap::new();
+        pins.insert("Newtonsoft.Json".to_string(), "13.0.1".to_string());
+        let config = UpdConfig {
+            pin: pins,
+            ..Default::default()
+        };
+
+        let updater = CsprojUpdater::new();
+        let options = UpdateOptions::new(false, false).with_config(Arc::new(config));
+        let result = updater
+            .update(file.path(), &registry, options)
+            .await
+            .unwrap();
+
+        assert_eq!(result.errors.len(), 1);
+        assert!(
+            result.errors[0].contains("cannot pin 'Newtonsoft.Json'"),
+            "{}",
+            result.errors[0]
+        );
+        assert!(result.pinned.is_empty());
     }
 
     #[tokio::test]

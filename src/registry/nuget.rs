@@ -142,11 +142,192 @@ impl Registry for NuGetRegistry {
     }
 }
 
+/// Whether `version` falls inside a NuGet version range.
+///
+/// `Some(true)` when the range admits it, `Some(false)` when it excludes it, and
+/// `None` when the range is not NuGet interval notation at all. The third answer
+/// exists because a range upd cannot read is a different fact from one that
+/// excludes the release, and reporting the first as the second would tell a user
+/// their dependency is behind when nothing has actually looked at it.
+///
+/// Interval notation, from the NuGet docs: `1.0` is a minimum (inclusive),
+/// `[1.0]` is exact, a square bracket includes its bound and a parenthesis
+/// excludes it, and an omitted bound is unbounded on that side.
+pub(crate) fn matches_nuget_range(version: &str, range: &str) -> Option<bool> {
+    let range = range.trim();
+    let open = range.chars().next()?;
+
+    if open != '[' && open != '(' {
+        // A bare version is a minimum, not an exact match. A comma outside
+        // brackets is not notation NuGet defines.
+        if range.contains(',') {
+            return None;
+        }
+        return Some(nuget_cmp(version, range)? != std::cmp::Ordering::Less);
+    }
+
+    let close = range.chars().last()?;
+    if close != ']' && close != ')' {
+        return None;
+    }
+    let lower_inclusive = open == '[';
+    let upper_inclusive = close == ']';
+    let inner = &range[open.len_utf8()..range.len() - close.len_utf8()];
+    if inner.matches(',').count() > 1 {
+        return None;
+    }
+
+    let Some((lower, upper)) = inner.split_once(',') else {
+        // No comma: an exact version, which only square brackets express.
+        if !(lower_inclusive && upper_inclusive) {
+            return None;
+        }
+        let exact = inner.trim();
+        if exact.is_empty() {
+            return None;
+        }
+        return Some(nuget_cmp(version, exact)? == std::cmp::Ordering::Equal);
+    };
+
+    let (lower, upper) = (lower.trim(), upper.trim());
+    if lower.is_empty() && upper.is_empty() {
+        return None;
+    }
+
+    if lower.is_empty() {
+        // An inclusive bracket over an omitted bound bounds nothing.
+        if lower_inclusive {
+            return None;
+        }
+    } else {
+        match nuget_cmp(version, lower)? {
+            std::cmp::Ordering::Less => return Some(false),
+            std::cmp::Ordering::Equal if !lower_inclusive => return Some(false),
+            _ => {}
+        }
+    }
+
+    if upper.is_empty() {
+        if upper_inclusive {
+            return None;
+        }
+    } else {
+        match nuget_cmp(version, upper)? {
+            std::cmp::Ordering::Greater => return Some(false),
+            std::cmp::Ordering::Equal if !upper_inclusive => return Some(false),
+            _ => {}
+        }
+    }
+
+    Some(true)
+}
+
+/// Order two NuGet versions, or `None` if either is not a version.
+///
+/// NuGet pads a missing component with zero, so `1.0` and `1.0.0` are the same
+/// version, and a pre-release suffix orders below the release it qualifies.
+fn nuget_cmp(a: &str, b: &str) -> Option<std::cmp::Ordering> {
+    let (a_release, a_pre) = split_prerelease(a);
+    let (b_release, b_pre) = split_prerelease(b);
+    let (mut a_parts, mut b_parts) = (release_parts(a_release)?, release_parts(b_release)?);
+    let width = a_parts.len().max(b_parts.len());
+    a_parts.resize(width, 0);
+    b_parts.resize(width, 0);
+
+    Some(a_parts.cmp(&b_parts).then_with(|| match (a_pre, b_pre) {
+        (None, None) => std::cmp::Ordering::Equal,
+        // A release outranks any pre-release of the same numbers.
+        (None, Some(_)) => std::cmp::Ordering::Greater,
+        (Some(_), None) => std::cmp::Ordering::Less,
+        (Some(x), Some(y)) => x.to_lowercase().cmp(&y.to_lowercase()),
+    }))
+}
+
+/// Split a version into its numeric release and its pre-release suffix.
+fn split_prerelease(version: &str) -> (&str, Option<&str>) {
+    match version.split_once('-') {
+        Some((release, pre)) => (release, Some(pre)),
+        None => (version, None),
+    }
+}
+
+/// The numeric components of a release, or `None` if any component is not a number.
+fn release_parts(release: &str) -> Option<Vec<u64>> {
+    // Build metadata orders nothing, so it is dropped rather than rejected.
+    let release = release.split_once('+').map_or(release, |(v, _)| v);
+    if release.is_empty() {
+        return None;
+    }
+    release.split('.').map(|part| part.parse().ok()).collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    #[test]
+    fn a_bracket_range_admits_only_what_it_bounds() {
+        // The bound that closes with a parenthesis is the one release excluded.
+        assert_eq!(matches_nuget_range("13.0.3", "[12.0.0,14.0.0)"), Some(true));
+        assert_eq!(
+            matches_nuget_range("14.0.0", "[12.0.0,14.0.0)"),
+            Some(false)
+        );
+        assert_eq!(
+            matches_nuget_range("11.9.9", "[12.0.0,14.0.0)"),
+            Some(false)
+        );
+        assert_eq!(matches_nuget_range("12.0.0", "[12.0.0,14.0.0)"), Some(true));
+        assert_eq!(
+            matches_nuget_range("12.0.0", "(12.0.0,14.0.0]"),
+            Some(false)
+        );
+        assert_eq!(matches_nuget_range("14.0.0", "(12.0.0,14.0.0]"), Some(true));
+    }
+
+    #[test]
+    fn an_omitted_bound_is_unbounded_on_that_side() {
+        assert_eq!(matches_nuget_range("99.0.0", "[12.0.0,)"), Some(true));
+        assert_eq!(matches_nuget_range("11.0.0", "[12.0.0,)"), Some(false));
+        assert_eq!(matches_nuget_range("1.0.0", "(,14.0.0)"), Some(true));
+        assert_eq!(matches_nuget_range("14.0.0", "(,14.0.0)"), Some(false));
+    }
+
+    #[test]
+    fn a_bare_version_is_a_minimum_not_an_exact_match() {
+        assert_eq!(matches_nuget_range("13.0.3", "12.0.0"), Some(true));
+        assert_eq!(matches_nuget_range("11.0.0", "12.0.0"), Some(false));
+        assert_eq!(matches_nuget_range("12.0.0", "[12.0.0]"), Some(true));
+        assert_eq!(matches_nuget_range("13.0.3", "[12.0.0]"), Some(false));
+    }
+
+    #[test]
+    fn a_missing_component_is_zero_and_a_prerelease_orders_below_its_release() {
+        assert_eq!(matches_nuget_range("1.0", "[1.0.0]"), Some(true));
+        assert_eq!(matches_nuget_range("1.0.0-beta", "[1.0.0,)"), Some(false));
+        assert_eq!(
+            matches_nuget_range("1.0.0-beta", "(1.0.0-alpha,)"),
+            Some(true)
+        );
+        assert_eq!(matches_nuget_range("1.0.0+build.7", "[1.0.0]"), Some(true));
+    }
+
+    #[test]
+    fn a_range_that_is_not_notation_reads_as_unreadable_not_as_excluded() {
+        // Distinguishable from Some(false): nothing has looked at the dependency.
+        assert_eq!(matches_nuget_range("1.0.0", "[1.0.0"), None);
+        assert_eq!(matches_nuget_range("1.0.0", "(1.0.0)"), None);
+        assert_eq!(matches_nuget_range("1.0.0", "[,2.0.0)"), None);
+        assert_eq!(matches_nuget_range("1.0.0", "[1.0.0,]"), None);
+        assert_eq!(matches_nuget_range("1.0.0", "(,)"), None);
+        assert_eq!(matches_nuget_range("1.0.0", "[1.0,2.0,3.0]"), None);
+        assert_eq!(matches_nuget_range("1.0.0", "1.0,2.0"), None);
+        assert_eq!(matches_nuget_range("1.0.0", "[latest,)"), None);
+        assert_eq!(matches_nuget_range("not-a-version", "[1.0.0,)"), None);
+        assert_eq!(matches_nuget_range("1.0.0", ""), None);
+    }
 
     #[tokio::test]
     async fn test_get_latest_version() {
