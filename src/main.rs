@@ -2646,6 +2646,14 @@ async fn run_interactive_update(
                     {
                         println!("{}", line);
                     }
+                    // And again for the same reason: a blocked pin is a
+                    // dependency that could not be checked at all, so there is
+                    // nothing to accept or reject, but it must not go unsaid.
+                    for line in
+                        format_skipped_lines(&path.display().to_string(), &file_result, cli.verbose)
+                    {
+                        println!("{}", line);
+                    }
                 }
 
                 for update in &file_result.updated {
@@ -2691,6 +2699,42 @@ async fn run_interactive_update(
         .iter()
         .map(|scanned| scanned.result.annotations.len())
         .sum();
+    // Both statuses withhold the tick, and both are counted here rather than
+    // only the ones the scan loop named: a not-examined pin prints per-line
+    // only under --verbose, so without this its count would be the sole thing
+    // saying the run left SHA pins alone. Matches the non-interactive summary.
+    let blocked_total: usize = scanned_results
+        .iter()
+        .map(|scanned| {
+            scanned
+                .result
+                .skipped
+                .iter()
+                .filter(|skipped| skipped.status == SkipStatus::Blocked)
+                .count()
+        })
+        .sum();
+    let not_examined_total: usize = scanned_results
+        .iter()
+        .map(|scanned| scanned.result.skipped.len())
+        .sum::<usize>()
+        - blocked_total;
+    if !cli.quiet {
+        if blocked_total > 0 {
+            println!(
+                "{} {} package(s) blocked by safety checks",
+                "Blocked".yellow(),
+                blocked_total.to_string().yellow().bold()
+            );
+        }
+        if not_examined_total > 0 {
+            println!(
+                "{} {} SHA-pinned action(s), not checked while SHA updates are off",
+                "Skipped".dimmed(),
+                not_examined_total.to_string().dimmed()
+            );
+        }
+    }
     if annotation_total > 0 && !cli.quiet {
         println!(
             "{} {} SHA pin(s) can have the release they name written beside them; run without {} to write them",
@@ -2702,31 +2746,17 @@ async fn run_interactive_update(
 
     if !has_interactive_changes(&pending_updates, &scanned_results) {
         if !cli.quiet {
-            // A capped update has nothing to prompt for, since the ceiling
-            // already decided it. It still means something is waiting, so it
-            // must not be reported as up to date.
             let capped: usize = scanned_results
                 .iter()
                 .map(|scanned| scanned.result.capped.len())
                 .sum();
-            if capped > 0 {
-                println!(
-                    "{} Scanned {} file(s), {} update(s) held back by the bump ceiling (--max-bump/--only-bump)",
-                    "!".yellow().bold(),
-                    files.len(),
-                    capped.to_string().yellow().bold()
-                );
-            } else if annotation_total == 0 {
-                // Failed lookups count as interactive changes (see
-                // has_interactive_changes), so this branch is only reached when
-                // every lookup succeeded and the tick is accurate. An
-                // annotation waiting to be written makes it inaccurate too, and
-                // the line above has already said so.
-                println!(
-                    "{} Scanned {} file(s), all dependencies up to date",
-                    "✓".green(),
-                    files.len()
-                );
+            if let Some(line) = format_interactive_closing_line(
+                files.len(),
+                capped,
+                annotation_total,
+                blocked_total + not_examined_total,
+            ) {
+                println!("{line}");
             }
         }
         return Ok(());
@@ -5008,6 +5038,39 @@ fn format_annotation_lines(path: &str, result: &UpdateResult, dry_run: bool) -> 
         .collect()
 }
 
+/// Every skipped pin for one file, rendered.
+///
+/// A blocked pin needs attention on the line it is on, so it always prints. A
+/// not-examined pin is the steady state for anyone who leaves SHA-pin updates
+/// off, and a repo that pins every action would otherwise emit a line per
+/// action on every run; the summary always reports the count, and `--verbose`
+/// names them.
+fn format_skipped_lines(path: &str, result: &UpdateResult, verbose: bool) -> Vec<String> {
+    result
+        .skipped
+        .iter()
+        .filter(|skipped| verbose || skipped.status != SkipStatus::NotExamined)
+        .map(|skipped| {
+            let location = match skipped.line_number {
+                Some(n) => format!("{}:{}:", path, n),
+                None => format!("{}:", path),
+            };
+            let label = match skipped.status {
+                SkipStatus::Blocked => skipped.status.label().yellow(),
+                SkipStatus::NotExamined => skipped.status.label().dimmed(),
+            };
+            format!(
+                "{} {} {} {} ({})",
+                location.blue().underline(),
+                label,
+                skipped.package.bold(),
+                skipped.message,
+                skipped.reason.dimmed()
+            )
+        })
+        .collect()
+}
+
 /// Every held-back update for one file, rendered. Produced by a helper rather
 /// than printed in place so `--interactive` can report them without a
 /// terminal-driven test, the same reason `format_scan_diagnostics` exists.
@@ -5175,31 +5238,8 @@ fn print_file_result(
         println!("{line}");
     }
 
-    // A blocked pin needs attention on the line it is on, so it always prints.
-    // A not-examined pin is the steady state for anyone who leaves SHA-pin
-    // updates off, and a repo that pins every action would otherwise emit a
-    // line per action on every run; the summary always reports the count, and
-    // --verbose names them.
-    for skipped in &result.skipped {
-        if skipped.status == SkipStatus::NotExamined && !verbose {
-            continue;
-        }
-        let location = match skipped.line_number {
-            Some(n) => format!("{}:{}:", path, n),
-            None => format!("{}:", path),
-        };
-        let label = match skipped.status {
-            SkipStatus::Blocked => skipped.status.label().yellow(),
-            SkipStatus::NotExamined => skipped.status.label().dimmed(),
-        };
-        println!(
-            "{} {} {} {} ({})",
-            location.blue().underline(),
-            label,
-            skipped.package.bold(),
-            skipped.message,
-            skipped.reason.dimmed()
-        );
+    for line in format_skipped_lines(path, result, verbose) {
+        println!("{line}");
     }
 
     for error in &result.errors {
@@ -5221,6 +5261,44 @@ fn print_file_result(
             warning
         );
     }
+}
+
+/// The closing line for an interactive run with nothing left to prompt for.
+///
+/// The green tick claims every dependency was checked, so it is withheld
+/// whenever something was not: a skipped pin is one whose version was never
+/// read, and an annotation is a write still waiting to happen. Both have
+/// already printed their own lines, so `None` means those lines have said
+/// everything there is to say and a closing summary would only repeat them.
+///
+/// A capped update outranks the tick for the same reason it does in the
+/// non-interactive summary: the ceiling, not the registry, decided it, and the
+/// user is the one who set the ceiling.
+///
+/// Produced by a helper rather than printed in place so it can be asserted
+/// without a terminal, the same reason `format_capped_lines` is one.
+fn format_interactive_closing_line(
+    file_count: usize,
+    capped: usize,
+    annotations: usize,
+    skipped: usize,
+) -> Option<String> {
+    if capped > 0 {
+        return Some(format!(
+            "{} Scanned {} file(s), {} update(s) held back by the bump ceiling (--max-bump/--only-bump)",
+            "!".yellow().bold(),
+            file_count,
+            capped.to_string().yellow().bold()
+        ));
+    }
+    if annotations > 0 || skipped > 0 {
+        return None;
+    }
+    Some(format!(
+        "{} Scanned {} file(s), all dependencies up to date",
+        "✓".green(),
+        file_count
+    ))
 }
 
 /// The closing line for a run that found nothing to update.
@@ -6062,6 +6140,133 @@ mod tests {
             lines[1]
         );
         assert!(lines[1].contains("(minor bump)"), "{}", lines[1]);
+    }
+
+    /// The tick is a claim that every dependency was checked. These cover what
+    /// has to be true for the interactive run to make it, since the run itself
+    /// needs a terminal (see tests/interactive_tty.rs).
+    #[test]
+    fn the_tick_is_withheld_from_anything_left_unchecked_or_unwritten() {
+        let ticked = format_interactive_closing_line(2, 0, 0, 0)
+            .expect("a run that checked everything closes by saying so");
+        assert!(ticked.contains("all dependencies up to date"), "{ticked}");
+        assert!(ticked.contains("Scanned 2 file(s)"), "{ticked}");
+
+        assert_eq!(
+            format_interactive_closing_line(1, 0, 3, 0),
+            None,
+            "an annotation is a write still waiting to happen, so the run has \
+             not finished and must not claim it has"
+        );
+        assert_eq!(
+            format_interactive_closing_line(1, 0, 0, 2),
+            None,
+            "a skipped pin is a dependency whose version was never read, so \
+             calling it up to date claims a check that never happened"
+        );
+        assert_eq!(
+            format_interactive_closing_line(1, 0, 3, 2),
+            None,
+            "{:?}",
+            format_interactive_closing_line(1, 0, 3, 2)
+        );
+    }
+
+    /// The ceiling is the user's own setting, so a run it held back reports
+    /// that in preference to anything else, exactly as the non-interactive
+    /// summary does.
+    #[test]
+    fn a_capped_update_outranks_the_tick_and_the_silence() {
+        let capped = format_interactive_closing_line(1, 4, 0, 0)
+            .expect("a held-back update is not nothing to report");
+        assert!(capped.contains("held back by the bump ceiling"), "{capped}");
+        assert!(capped.contains('4'), "{capped}");
+        assert!(
+            !capped.contains("up to date"),
+            "an update the ceiling refused is not up to date: {capped}"
+        );
+
+        let still_capped = format_interactive_closing_line(1, 4, 2, 3)
+            .expect("the ceiling outranks findings that print their own lines");
+        assert!(
+            still_capped.contains("held back by the bump ceiling"),
+            "{still_capped}"
+        );
+    }
+
+    /// A blocked pin is the one kind of finding that needs attention on its own
+    /// line whatever the verbosity: it says a dependency could not be checked
+    /// at all. Rendered by a helper so `--interactive` reports it without a
+    /// terminal, the `format_capped_lines` precedent above.
+    #[test]
+    fn a_blocked_pin_names_its_line_its_package_and_why() {
+        let result = UpdateResult {
+            skipped: vec![upd::updater::SkippedUpdate {
+                package: "actions/checkout".into(),
+                current: "f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a".into(),
+                status: SkipStatus::Blocked,
+                reason: "unreleased-commit",
+                message: "no tag names this commit".into(),
+                line_number: Some(8),
+            }],
+            ..Default::default()
+        };
+
+        let lines = format_skipped_lines(".github/workflows/ci.yml", &result, false);
+
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert!(
+            lines[0].contains(".github/workflows/ci.yml:8:"),
+            "{}",
+            lines[0]
+        );
+        assert!(lines[0].contains("Blocked"), "{}", lines[0]);
+        assert!(lines[0].contains("actions/checkout"), "{}", lines[0]);
+        assert!(
+            lines[0].contains("no tag names this commit"),
+            "{}",
+            lines[0]
+        );
+        assert!(
+            lines[0].contains("unreleased-commit"),
+            "the reason is the machine-readable half of the line and has to \
+             survive into the human one: {}",
+            lines[0]
+        );
+    }
+
+    /// A repo that SHA-pins every action would emit a line per action on every
+    /// run, so leaving SHA updates off stays quiet until asked. The count still
+    /// reaches the summary, which is what stops the run claiming it checked
+    /// them.
+    #[test]
+    fn a_not_examined_pin_is_named_only_when_asked() {
+        let result = UpdateResult {
+            skipped: vec![upd::updater::SkippedUpdate {
+                package: "actions/cache".into(),
+                current: "55cc8345863c7cc4c66a329aec7e433d2d1c52a9".into(),
+                status: SkipStatus::NotExamined,
+                reason: "sha-updates-disabled",
+                message: "SHA-pinned action updates are off".into(),
+                line_number: Some(12),
+            }],
+            ..Default::default()
+        };
+
+        assert!(
+            format_skipped_lines("ci.yml", &result, false).is_empty(),
+            "a settled configuration choice is not a per-line finding"
+        );
+
+        let verbose = format_skipped_lines("ci.yml", &result, true);
+        assert_eq!(verbose.len(), 1, "{verbose:?}");
+        assert!(verbose[0].contains("Not checked"), "{}", verbose[0]);
+        assert!(
+            !verbose[0].contains("Blocked"),
+            "a configuration choice must not be dressed as a safety problem: {}",
+            verbose[0]
+        );
+        assert!(verbose[0].contains("actions/cache"), "{}", verbose[0]);
     }
 
     /// The interactive diagnostic is produced by a helper so the fourth CLI
