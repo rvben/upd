@@ -638,10 +638,15 @@ impl Updater for PackageJsonUpdater {
                     registry
                         .get_latest_version_including_prereleases(package)
                         .await
-                } else if matches!(prefix.as_str(), "^" | "~") {
+                } else if matches!(prefix.as_str(), "^" | "~" | "~>") {
                     // Honor the caret/tilde bound: select the highest version that
                     // satisfies the original spec, never crossing the implied
-                    // range (`^4.0.0` stays <5, `~4.17.0` stays <4.18).
+                    // range (`^4.0.0` stays <5, `~4.17.0` stays <4.18). `~>` is
+                    // npm's other spelling of the tilde and declares the same
+                    // ceiling, so it has to be looked up the same way: routing
+                    // it here on the operator it is, rather than on the two
+                    // characters `~` alone, is what keeps the lookup from
+                    // returning a release the spec excludes.
                     registry
                         .get_latest_version_matching(package, version_str)
                         .await
@@ -1090,6 +1095,47 @@ mod tests {
         assert!(
             !content.contains("4.18.1"),
             "must not cross the tilde minor bound; got: {content}"
+        );
+    }
+
+    /// `~>` is npm's other spelling of the tilde, so it declares the same
+    /// ceiling and has to be looked up inside it. Reading the `>` as an
+    /// operator of its own turns the spec into an open floor, and the release
+    /// that comes back is one the author's range excludes.
+    #[tokio::test]
+    async fn the_tilde_spelled_with_an_arrow_keeps_its_ceiling() {
+        let mut file = NamedTempFile::with_suffix(".json").unwrap();
+        write!(
+            file,
+            r#"{{
+  "dependencies": {{
+    "lodash": "~>4.17.0"
+  }}
+}}"#
+        )
+        .unwrap();
+
+        let registry = MockRegistry::new("npm")
+            .with_version("lodash", "4.18.1")
+            .with_constrained("lodash", "~>4.17.0", "4.17.21");
+
+        let result = PackageJsonUpdater::new()
+            .update(file.path(), &registry, UpdateOptions::new(false, false))
+            .await
+            .unwrap();
+
+        assert!(result.errors.is_empty(), "errors: {:?}", result.errors);
+        assert!(
+            result.warnings.is_empty(),
+            "warnings: {:?}",
+            result.warnings
+        );
+
+        let content = fs::read_to_string(file.path()).unwrap();
+        assert!(
+            content.contains("\"lodash\": \"~>4.17.21\""),
+            "the arrow is the author's spelling and 4.18.1 is past the tilde's \
+             ceiling; got: {content}"
         );
     }
 

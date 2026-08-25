@@ -259,6 +259,11 @@ impl Op {
 /// allows whitespace between the two (`">= 1.2.7"`), so the version is returned
 /// without it - always as a suffix of `token`, which is what lets a rewrite
 /// recover the operator exactly as the author spelled it.
+///
+/// `~>` is npm's second spelling of the tilde and means exactly what `~` does,
+/// so it has to be read before `~` or its `>` would be left in front of the
+/// version. The two spellings stay distinct on the page: a rewrite puts back
+/// the characters the author wrote, not the operator's canonical form.
 fn split_operator(token: &str) -> (Op, &str) {
     for (prefix, op) in [
         (">=", Op::Ge),
@@ -267,6 +272,7 @@ fn split_operator(token: &str) -> (Op, &str) {
         ("<", Op::Lt),
         ("=", Op::Eq),
         ("^", Op::Caret),
+        ("~>", Op::Tilde),
         ("~", Op::Tilde),
     ] {
         if let Some(rest) = token.strip_prefix(prefix) {
@@ -830,6 +836,49 @@ mod tests {
         // An operator with nothing after it still names no version.
         assert_eq!(classify(">= 1.0.0 <"), SpecShape::Unsupported);
         assert_eq!(classify(">= >= 1.0.0"), SpecShape::Unsupported);
+    }
+
+    /// npm reads `~>` as the tilde, so the range it names caps at the next
+    /// minor just as `~` does. Reading the `>` as an operator of its own turns
+    /// a capped range into an open floor, and a rewrite that follows that
+    /// reading walks the dependency straight through the ceiling its author
+    /// wrote.
+    #[test]
+    fn the_tilde_may_be_written_with_a_trailing_arrow() {
+        for spec in ["~>4.17.0", "~> 4.17.0"] {
+            assert_eq!(classify(spec), SpecShape::CaretOrTilde, "spec {spec:?}");
+            assert!(admitted(spec, "4.17.21"), "spec {spec:?}");
+            assert!(!admitted(spec, "4.18.1"), "spec {spec:?}");
+            // The arrow is a spelling, not a second operator: the range it
+            // stands for is the plain tilde's, to the letter.
+            assert_eq!(parse_npm_range(spec), parse_npm_range("~4.17.0"));
+        }
+
+        // A partial version behind the arrow floats the same way `~4.17` does,
+        // and the rewrite puts the author's spelling back around it.
+        assert_eq!(classify("~>4.17"), SpecShape::ShapeRange);
+        assert_eq!(
+            rewrite_lower_bound("~>4.17", "5.2.0").as_deref(),
+            Some("~>5.2")
+        );
+        assert_eq!(
+            rewrite_lower_bound("~> 4.17", "5.2.0").as_deref(),
+            Some("~> 5.2")
+        );
+
+        // The arrow reaches the tilde's expansion, not the x-range one, so a
+        // number written after a wildcard is a range behind it exactly as it is
+        // behind a plain tilde.
+        assert_eq!(classify("~>1.x.3"), SpecShape::ShapeRange);
+        assert_eq!(parse_npm_range("~>1.x.3"), parse_npm_range("~1.x"));
+
+        // The negative control: the plain tilde and the plain `>` keep their
+        // own readings, so neither spelling has swallowed the other.
+        assert_eq!(classify("~4.17.0"), SpecShape::CaretOrTilde);
+        assert!(!admitted("~4.17.0", "4.18.1"));
+        assert_eq!(classify(">4.17.0"), SpecShape::OpaqueRange);
+        assert!(admitted(">4.17.0", "4.18.1"));
+        assert_eq!(rewrite_lower_bound(">4.17.0", "4.18.1"), None);
     }
 
     #[test]
