@@ -1041,6 +1041,37 @@ mod tests {
         assert_eq!(contents, "gem 'rails', '!= 8.1.0'\n");
     }
 
+    /// RubyGems reads a missing component as zero, so `8.1` and `8.1.0` name
+    /// the same release and `!= 8.1` rules out `8.1.0`. Reading the two as
+    /// different versions makes the exclusion look satisfied, and the gem it
+    /// holds back passes under a green tick.
+    #[tokio::test]
+    async fn an_exclusion_written_short_still_names_the_release_it_rules_out() {
+        let mut file = NamedTempFile::new().unwrap();
+        write!(file, "gem 'rails', '!= 8.1'\n").unwrap();
+
+        let registry = MockRegistry::new("rubygems")
+            .with_version("rails", "8.1.0")
+            .with_constrained("rails", "!= 8.1", "8.0.2");
+
+        let updater = GemfileUpdater::new();
+        let result = updater
+            .update(file.path(), &registry, UpdateOptions::new(false, false))
+            .await
+            .unwrap();
+
+        assert!(result.updated.is_empty());
+        assert_eq!(result.warnings.len(), 1, "{:?}", result.warnings);
+        assert!(
+            result.warnings[0].contains("8.1.0") && result.warnings[0].contains("!= 8.1"),
+            "{}",
+            result.warnings[0]
+        );
+        assert_eq!(result.unchanged, 0);
+        let contents = std::fs::read_to_string(file.path()).unwrap();
+        assert_eq!(contents, "gem 'rails', '!= 8.1'\n");
+    }
+
     /// A ceiling names no floor to carry forward, so nothing is rewritten. The
     /// release it is behind is still worth naming: no future release will
     /// satisfy it either.

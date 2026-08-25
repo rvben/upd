@@ -215,58 +215,149 @@ pub(crate) fn matches_ruby_constraint(version: &str, constraint: &str) -> bool {
 }
 
 fn matches_single_ruby_constraint(version: &str, constraint: &str) -> bool {
-    let parts: Vec<&str> = constraint.trim().splitn(2, ' ').collect();
-    let (op, required) = match parts.len() {
-        2 => (parts[0].trim(), parts[1].trim()),
-        1 => ("=", parts[0].trim()),
-        _ => return false,
-    };
+    let constraint = constraint.trim();
+    // The operator may be written against the version (`~>7.1`) or apart from
+    // it (`~> 7.1`), so it is read as a prefix. Two-character operators come
+    // first: `>` would otherwise claim the `>` of `>=`.
+    let (op, required) = ["~>", ">=", "<=", "!=", "==", ">", "<", "="]
+        .into_iter()
+        .find_map(|op| constraint.strip_prefix(op).map(|rest| (op, rest.trim())))
+        .unwrap_or(("=", constraint));
 
-    let ver = parse_ruby_version(version);
-    let req = parse_ruby_version(required);
+    let ver = canonical_segments(version);
+    let req = canonical_segments(required);
+    let ordering = compare_segments(&ver, &req);
 
     match op {
-        ">=" => ver >= req,
-        "<=" => ver <= req,
-        ">" => ver > req,
-        "<" => ver < req,
-        "=" | "==" => ver == req,
-        "!=" => ver != req,
-        "~>" => {
-            // Pessimistic constraint: ~> 2.1 means >= 2.1 and < 3.0
-            // ~> 2.1.0 means >= 2.1.0 and < 2.2.0
-            if ver < req {
-                return false;
+        ">=" => ordering.is_ge(),
+        "<=" => ordering.is_le(),
+        ">" => ordering.is_gt(),
+        "<" => ordering.is_lt(),
+        "=" | "==" => ordering.is_eq(),
+        "!=" => ordering.is_ne(),
+        // The pessimistic operator is `>= required` together with a ceiling
+        // one component up: `~> 2.1` admits 2.9 but not 3.0, and `~> 2.1.0`
+        // admits 2.1.9 but not 2.2. The ceiling is tested against the version
+        // with its prerelease dropped, so 3.0.0.rc1 is out of `~> 2.1` even
+        // though the prerelease itself sorts below 3.0.
+        "~>" => match bumped_segments(required) {
+            Some(ceiling) => {
+                ordering.is_ge() && compare_segments(&release_segments(version), &ceiling).is_lt()
             }
-            // Upper bound: bump the second-to-last component
-            let req_parts: Vec<u64> = required.split('.').filter_map(|s| s.parse().ok()).collect();
-            if req_parts.len() < 2 {
-                return ver >= req;
-            }
-            let mut upper = req_parts.clone();
-            let bump_idx = upper.len() - 2;
-            upper[bump_idx] += 1;
-            // Truncate to just the bumped component (upper bound is exclusive)
-            upper.truncate(bump_idx + 1);
-            let ver_parts: Vec<u64> = version.split('.').filter_map(|s| s.parse().ok()).collect();
-            // Compare version < upper bound (compare only up to upper's length)
-            for (v, u) in ver_parts.iter().zip(upper.iter()) {
-                match v.cmp(u) {
-                    std::cmp::Ordering::Less => return true,
-                    std::cmp::Ordering::Greater => return false,
-                    std::cmp::Ordering::Equal => continue,
-                }
-            }
-            // All compared parts equal means version equals upper bound prefix,
-            // which is not less than the upper bound
-            false
-        }
+            None => ordering.is_ge(),
+        },
         _ => false,
     }
 }
 
-fn parse_ruby_version(v: &str) -> Vec<u64> {
-    v.split('.').filter_map(|s| s.parse().ok()).collect()
+/// One component of a RubyGems version. `Gem::Version` reads a version as runs
+/// of digits and runs of letters, so `8.1.0.rc1` is `8`, `1`, `0`, `rc`, `1`
+/// and the digits in `rc10` are the number ten. A run of letters sorts below
+/// any number in the same position, which is what puts a prerelease below the
+/// release it precedes.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+enum Segment {
+    Text(String),
+    Number(u64),
+}
+
+/// Split a version the way `Gem::Version` does: runs of digits and runs of
+/// letters, with everything else read as a separator.
+fn segments_of(v: &str) -> Vec<Segment> {
+    let mut segments = Vec::new();
+    let mut chars = v.chars().peekable();
+    while let Some(&c) = chars.peek() {
+        if c.is_ascii_digit() {
+            let mut run = String::new();
+            while chars.peek().is_some_and(|c| c.is_ascii_digit()) {
+                run.push(chars.next().unwrap());
+            }
+            // A run of digits longer than u64 holds is not a version anyone
+            // published; saturate rather than drop the component and let a
+            // shorter number take its place in the ordering.
+            segments.push(Segment::Number(run.parse().unwrap_or(u64::MAX)));
+        } else if c.is_ascii_alphabetic() {
+            let mut run = String::new();
+            while chars.peek().is_some_and(|c| c.is_ascii_alphabetic()) {
+                run.push(chars.next().unwrap());
+            }
+            segments.push(Segment::Text(run));
+        } else {
+            chars.next();
+        }
+    }
+    segments
+}
+
+/// The segments `Gem::Version` compares with. A trailing zero is no part of a
+/// version, so `8.1.0` and `8.1` are one release; the numeric head and the
+/// prerelease tail each drop their own trailing zeros.
+fn canonical_segments(v: &str) -> Vec<Segment> {
+    let segments = segments_of(v);
+    let split_at = segments
+        .iter()
+        .position(|s| matches!(s, Segment::Text(_)))
+        .unwrap_or(segments.len());
+    let (head, tail) = segments.split_at(split_at);
+    let mut canonical = without_trailing_zeros(head);
+    canonical.extend(without_trailing_zeros(tail));
+    canonical
+}
+
+/// The version with its prerelease dropped: everything from the first run of
+/// letters onwards. `8.1.0.rc1` releases as `8.1.0`. The zeros stay, because
+/// the pessimistic ceiling is built by raising the component before the last
+/// one the requirement states and `~> 2.1.0` ceils a component lower than
+/// `~> 2.1` does.
+fn release_segments(v: &str) -> Vec<Segment> {
+    let segments = segments_of(v);
+    let split_at = segments
+        .iter()
+        .position(|s| matches!(s, Segment::Text(_)))
+        .unwrap_or(segments.len());
+    segments[..split_at].to_vec()
+}
+
+/// The exclusive ceiling the pessimistic operator names: drop the prerelease,
+/// drop the last component when more than one remains, and raise what is left.
+/// `~> 2.1.0` ceils at 2.2, `~> 2.1` at 3, `~> 2` at 3.
+fn bumped_segments(required: &str) -> Option<Vec<Segment>> {
+    let mut segments = release_segments(required);
+    if segments.len() > 1 {
+        segments.pop();
+    }
+    match segments.pop() {
+        Some(Segment::Number(n)) => {
+            segments.push(Segment::Number(n.saturating_add(1)));
+            Some(segments)
+        }
+        // A requirement with no numeric component names no ceiling to bump.
+        _ => None,
+    }
+}
+
+fn without_trailing_zeros(segments: &[Segment]) -> Vec<Segment> {
+    let end = segments
+        .iter()
+        .rposition(|s| !matches!(s, Segment::Number(0)))
+        .map_or(0, |i| i + 1);
+    segments[..end].to_vec()
+}
+
+/// Compare two canonical segment lists. A component the shorter version does
+/// not state is the number zero, which is how `8.1` and `8.1.0.0` compare
+/// equal while `8.1.0.rc1` stays below both.
+fn compare_segments(left: &[Segment], right: &[Segment]) -> std::cmp::Ordering {
+    let zero = Segment::Number(0);
+    for i in 0..left.len().max(right.len()) {
+        let l = left.get(i).unwrap_or(&zero);
+        let r = right.get(i).unwrap_or(&zero);
+        match l.cmp(r) {
+            std::cmp::Ordering::Equal => continue,
+            other => return other,
+        }
+    }
+    std::cmp::Ordering::Equal
 }
 
 #[cfg(test)]
@@ -414,6 +505,79 @@ mod tests {
 
         assert!(matches_ruby_constraint("1.5.4", "= 1.5.4"));
         assert!(!matches_ruby_constraint("1.5.5", "= 1.5.4"));
+    }
+
+    /// `Gem::Version` treats a trailing zero as no part of the version, so
+    /// `8.1` and `8.1.0` are one release under every operator. Reading the
+    /// segments as a plain list orders the shorter one first, which turns
+    /// `!= 8.1` into a constraint the release it names satisfies.
+    #[test]
+    fn a_trailing_zero_names_the_same_release() {
+        assert!(matches_ruby_constraint("8.1.0", "= 8.1"));
+        assert!(matches_ruby_constraint("8.1", "= 8.1.0"));
+        assert!(!matches_ruby_constraint("8.1.0", "!= 8.1"));
+        assert!(!matches_ruby_constraint("8.1", "!= 8.1.0"));
+        assert!(!matches_ruby_constraint("8.1.0", "> 8.1"));
+        assert!(!matches_ruby_constraint("8.1.0", "< 8.1"));
+        assert!(matches_ruby_constraint("8.1.0", ">= 8.1"));
+        assert!(matches_ruby_constraint("8.1.0", "<= 8.1"));
+        assert!(matches_ruby_constraint("8.1.0.0", "= 8.1"));
+
+        // A zero that is not trailing still separates two releases.
+        assert!(!matches_ruby_constraint("8.1.0", "= 8.0.1"));
+        assert!(matches_ruby_constraint("8.1.1", "> 8.1"));
+
+        // The numeric head drops its own trailing zeros even when a prerelease
+        // follows, so `8.1.0.rc1` and `8.1.rc1` are one release. Keeping them
+        // would leave a zero standing where the other version has its first
+        // letter, and a number outranks any text in the same position.
+        assert!(matches_ruby_constraint("8.1.0.rc1", "= 8.1.rc1"));
+        assert!(matches_ruby_constraint("8.1.rc1", "= 8.1.0.rc1"));
+        assert!(!matches_ruby_constraint("8.1.0.rc1", "> 8.1.rc1"));
+        assert!(!matches_ruby_constraint("8.1.0.rc1", "!= 8.1.rc1"));
+    }
+
+    /// A prerelease sorts below the release it precedes: `8.1.0.rc1` is not
+    /// `8.1.0`. Dropping the segments that do not parse as numbers makes the
+    /// two compare equal, so a constraint that rules the release out admits
+    /// its prerelease and one that requires it accepts the prerelease instead.
+    #[test]
+    fn a_prerelease_sorts_below_the_release_it_precedes() {
+        assert!(matches_ruby_constraint("8.1.0.rc1", "< 8.1.0"));
+        assert!(!matches_ruby_constraint("8.1.0.rc1", ">= 8.1.0"));
+        assert!(!matches_ruby_constraint("8.1.0.rc1", "= 8.1.0"));
+        assert!(matches_ruby_constraint("8.1.0.rc1", "!= 8.1.0"));
+        assert!(matches_ruby_constraint("8.1.0.rc2", "> 8.1.0.rc1"));
+        assert!(matches_ruby_constraint("8.1.0", "> 8.1.0.rc1"));
+
+        // RubyGems splits a segment where the character class changes, so the
+        // digits in `rc10` are the number ten rather than the text "10".
+        assert!(matches_ruby_constraint("8.1.0.rc10", "> 8.1.0.rc2"));
+
+        // The pessimistic ceiling is tested against the release a prerelease
+        // qualifies, so 8.2.0.beta1 is inside `~> 8.1` and 9.0.0.beta1 is not,
+        // even though the prerelease itself sorts below 9.
+        assert!(matches_ruby_constraint("8.2.0.beta1", "~> 8.1"));
+        assert!(!matches_ruby_constraint("9.0.0.beta1", "~> 8.1"));
+
+        // A run of letters is below the zero a missing component stands for.
+        assert!(matches_ruby_constraint("1.0.a", "< 1.0"));
+        assert!(matches_ruby_constraint("1.0", "> 1.0.a"));
+    }
+
+    /// The pessimistic operator raises the component before the last one the
+    /// requirement states, so how many it states is what sets the ceiling. A
+    /// requirement of one component still has one: `~> 8` stops below 9.
+    #[test]
+    fn the_pessimistic_ceiling_follows_the_components_the_requirement_states() {
+        assert!(matches_ruby_constraint("8.5.0", "~> 8"));
+        assert!(!matches_ruby_constraint("9.0.0", "~> 8"));
+        assert!(!matches_ruby_constraint("7.9.0", "~> 8"));
+
+        // Written without a space between the operator and the version.
+        assert!(matches_ruby_constraint("7.2.3", "~>7.1"));
+        assert!(!matches_ruby_constraint("8.0.0", "~>7.1"));
+        assert!(matches_ruby_constraint("5.0.0", ">=4.9.0"));
     }
 
     #[tokio::test]
