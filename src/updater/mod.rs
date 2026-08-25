@@ -68,9 +68,18 @@ pub(crate) fn downgrade_warning(pkg: &str, latest: &str, current: &str) -> Strin
     format!("skipping {pkg}: latest \"{latest}\" is not greater than current \"{current}\"")
 }
 
-/// Where a version specifier's floor is written, as the byte range of that
-/// version within the string `constraint` was taken from. `base` is
-/// `constraint`'s own offset there.
+/// The version a specifier is anchored at, and whether an update may move it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SpecifierFloor {
+    /// Byte range of that version within the string the caller passed a slice
+    /// of, so a rewrite lands on the right clause of the whole line.
+    pub(crate) range: std::ops::Range<usize>,
+    /// Whether the clause the version was taken from admits it, which is what
+    /// makes it the release the author is on rather than one they ruled out.
+    pub(crate) raisable: bool,
+}
+
+/// Where a version specifier's floor is written.
 ///
 /// A specifier is a set of clauses and carries no order: `botocore<1.35.0,>=1.34.0`
 /// is what setuptools and pip write, and it means exactly what
@@ -81,15 +90,20 @@ pub(crate) fn downgrade_warning(pkg: &str, latest: &str, current: &str) -> Strin
 /// latest release compares as a downgrade, so the package is passed over as
 /// already ahead of the registry and never updated.
 ///
-/// A specifier with no lower bound at all answers with its first clause, which
-/// leaves a ceiling-only spec (`<6`) reading as it always has. Callers refuse to
-/// rewrite those on their own account. A clause whose version does not start
-/// with a digit is passed over entirely, so a wildcard or otherwise unreadable
-/// requirement answers `None` and the caller keeps whatever handling it had.
-pub(crate) fn specifier_floor_range(
-    constraint: &str,
-    base: usize,
-) -> Option<std::ops::Range<usize>> {
+/// Only an *inclusive* lower bound is `raisable`. A `>` names the one version
+/// the author has ruled out, not one they are on, so there is nothing under it
+/// to carry forward and writing the newest release into it produces a specifier
+/// that excludes that very release: `urllib3>2.0` became `urllib3>2.7` with 2.7
+/// the newest release, and the next run could not resolve the file upd had just
+/// written. A ceiling (`<6`) and an exclusion (`!=1.5`) name no floor at all and
+/// answer the same way, so a caller cannot mistake either for a version to move.
+/// The range is still reported for all of them, because reading a specifier and
+/// rewriting it are different questions and the callers that only read one, like
+/// the lockfile anchor, still need the position.
+///
+/// A clause whose version does not start with a digit is passed over entirely,
+/// so a wildcard (`*`) or otherwise unreadable requirement answers `None`.
+pub(crate) fn specifier_floor(constraint: &str, base: usize) -> Option<SpecifierFloor> {
     let mut first: Option<std::ops::Range<usize>> = None;
     let mut offset = 0usize;
 
@@ -116,12 +130,60 @@ pub(crate) fn specifier_floor_range(
         if first.is_none() {
             first = Some(range.clone());
         }
-        if matches!(op, ">=" | ">" | "==" | "===" | "=" | "~=" | "~" | "^") {
-            return Some(range);
+        // A bare version is Cargo's `serde = "1.0"`, which means `^1.0` and is
+        // the commonest floor there is.
+        if matches!(op, "" | ">=" | "==" | "===" | "=" | "~=" | "~" | "^") {
+            return Some(SpecifierFloor {
+                range,
+                raisable: true,
+            });
         }
     }
 
-    first
+    first.map(|range| SpecifierFloor {
+        range,
+        raisable: false,
+    })
+}
+
+/// Whether `constraint` admits `version`, read with the ecosystem's own parser.
+///
+/// `None` when that parser cannot read the constraint, which is not the same
+/// answer as `false`: one says the dependency is behind, the other says nothing
+/// looked at it.
+pub(crate) fn pep440_admits(constraint: &str, version: &str) -> Option<bool> {
+    use std::str::FromStr;
+    let specifiers = pep440_rs::VersionSpecifiers::from_str(constraint).ok()?;
+    let version = pep440_rs::Version::from_str(version).ok()?;
+    Some(specifiers.contains(&version))
+}
+
+/// Whether `requirement` admits `version` under Cargo's reading of it.
+///
+/// Cargo's partial bounds are not PEP 440's: `>1.0` there means `>=1.1.0`, so
+/// `serde = ">1.0"` admits no 1.0.x release at all. Answering that question with
+/// the wrong ecosystem's parser would report such a requirement as satisfied.
+pub(crate) fn cargo_admits(requirement: &str, version: &str) -> Option<bool> {
+    let req = semver::VersionReq::parse(requirement).ok()?;
+    let version = semver::Version::parse(version).ok()?;
+    Some(req.matches(&version))
+}
+
+/// Build the standard warning for a spec upd can read but must not rewrite.
+///
+/// Centralised beside [`downgrade_warning`] so every ecosystem says this the
+/// same way: the release exists, upd looked, and the manifest is the reason
+/// nothing moved.
+pub(crate) fn unrewritable_warning(pkg: &str, latest: &str, spec: &str) -> String {
+    format!("{pkg}: {latest} is available, but '{spec}' is a range upd does not rewrite")
+}
+
+/// Build the standard error for a spec upd cannot read at all.
+///
+/// An error rather than a warning: a warning leaves the run exiting 0 with a
+/// green tick over a dependency nothing has looked at.
+pub(crate) fn unreadable_error(pkg: &str, spec: &str) -> String {
+    format!("cannot check '{pkg}': '{spec}' is not a version range upd can read")
 }
 
 /// UTF-8 byte-order mark, as bytes.
@@ -1404,32 +1466,45 @@ mod tests {
     use std::fs;
     use tempfile::tempdir;
 
-    /// The clause `specifier_floor_range` picks, as the text it points at.
-    fn floor_of(constraint: &str) -> Option<&str> {
-        specifier_floor_range(constraint, 0).map(|range| &constraint[range])
+    /// The clause `specifier_floor` picks, as the text it points at, paired with
+    /// whether an update may move it.
+    fn floor_of(constraint: &str) -> Option<(&str, bool)> {
+        specifier_floor(constraint, 0).map(|f| (&constraint[f.range], f.raisable))
     }
 
     #[test]
     fn a_specifier_floor_is_its_lower_bound_wherever_it_is_written() {
-        assert_eq!(floor_of(">=1.0,<2.0"), Some("1.0"));
-        assert_eq!(floor_of("<2.0,>=1.0"), Some("1.0"));
-        assert_eq!(floor_of("!=1.2,>=1.0,<2.0"), Some("1.0"));
-        assert_eq!(floor_of(">1.0,<2.0"), Some("1.0"));
-        assert_eq!(floor_of("~=1.4"), Some("1.4"));
-        assert_eq!(floor_of("==1.0.0"), Some("1.0.0"));
-        assert_eq!(floor_of("===1.0.0"), Some("1.0.0"));
-        assert_eq!(floor_of(">= 1.0 , < 2.0"), Some("1.0"));
+        assert_eq!(floor_of(">=1.0,<2.0"), Some(("1.0", true)));
+        assert_eq!(floor_of("<2.0,>=1.0"), Some(("1.0", true)));
+        assert_eq!(floor_of("!=1.2,>=1.0,<2.0"), Some(("1.0", true)));
+        assert_eq!(floor_of("~=1.4"), Some(("1.4", true)));
+        assert_eq!(floor_of("==1.0.0"), Some(("1.0.0", true)));
+        assert_eq!(floor_of("===1.0.0"), Some(("1.0.0", true)));
+        assert_eq!(floor_of(">= 1.0 , < 2.0"), Some(("1.0", true)));
+        // Cargo's bare requirement, which means `^1.0`.
+        assert_eq!(floor_of("1.0"), Some(("1.0", true)));
+        assert_eq!(floor_of("^1.0"), Some(("1.0", true)));
+        assert_eq!(floor_of("~1.0"), Some(("1.0", true)));
     }
 
-    /// A specifier with no lower bound has no floor to move, so it answers with
-    /// its first clause and callers refuse it on their own account. Answering
-    /// `None` instead would make a ceiling-only entry unparseable rather than
-    /// merely unmovable.
+    /// A bound that names a version the specifier does not admit is not a floor,
+    /// whatever direction it points. `>1.0` rules that version out rather than
+    /// standing on it, so raising it writes a specifier that excludes the release
+    /// it was raised to; a ceiling or an exclusion never had a floor to begin
+    /// with. The position is still reported, because callers that only read a
+    /// specifier need it and only callers that rewrite one need `raisable`.
     #[test]
-    fn a_specifier_without_a_lower_bound_answers_with_its_first_clause() {
-        assert_eq!(floor_of("<6"), Some("6"));
-        assert_eq!(floor_of("<6,!=5.0"), Some("6"));
+    fn a_bound_the_specifier_does_not_admit_is_not_a_floor() {
+        assert_eq!(floor_of(">1.0"), Some(("1.0", false)));
+        assert_eq!(floor_of(">1.0,<2.0"), Some(("1.0", false)));
+        assert_eq!(floor_of("<2.0,>1.0"), Some(("2.0", false)));
+        assert_eq!(floor_of("<6"), Some(("6", false)));
+        assert_eq!(floor_of("<=6"), Some(("6", false)));
+        assert_eq!(floor_of("<6,!=5.0"), Some(("6", false)));
+        assert_eq!(floor_of("!=1.5"), Some(("1.5", false)));
+        // Nothing that reads as a version at all.
         assert_eq!(floor_of(""), None);
+        assert_eq!(floor_of("*"), None);
     }
 
     /// The range is a byte offset into the caller's own string, not into the
@@ -1438,8 +1513,30 @@ mod tests {
     fn a_specifier_floor_range_is_offset_by_its_base() {
         let line = "botocore<1.35.0,>=1.34.0";
         let base = "botocore".len();
-        let range = specifier_floor_range(&line[base..], base).unwrap();
-        assert_eq!(&line[range], "1.34.0");
+        let floor = specifier_floor(&line[base..], base).unwrap();
+        assert_eq!(&line[floor.range], "1.34.0");
+        assert!(floor.raisable);
+    }
+
+    /// Each ecosystem reads a partial bound its own way, and the difference is
+    /// not cosmetic: `>1.0` admits 1.0.229 under PEP 440 and admits nothing in
+    /// the 1.0 series under Cargo. Answering with the other ecosystem's parser
+    /// reports a requirement no release satisfies as satisfied.
+    #[test]
+    fn each_ecosystem_reads_a_partial_bound_with_its_own_parser() {
+        assert_eq!(pep440_admits(">2.0", "2.7.0"), Some(true));
+        assert_eq!(cargo_admits(">1.0", "1.0.229"), Some(false));
+        assert_eq!(cargo_admits(">1.0", "1.1.0"), Some(true));
+
+        assert_eq!(pep440_admits("<6", "5.2.0"), Some(true));
+        assert_eq!(pep440_admits("<6", "6.0.1"), Some(false));
+        assert_eq!(cargo_admits("<2.0", "1.0.229"), Some(true));
+        assert_eq!(cargo_admits("*", "1.5.0"), Some(true));
+
+        // Unreadable is its own answer, never "behind".
+        assert_eq!(pep440_admits("not-a-spec", "1.0"), None);
+        assert_eq!(cargo_admits(">=1.0.0 <2.0.0", "1.5.0"), None);
+        assert_eq!(cargo_admits("<2.0", "not-a-version"), None);
     }
 
     #[test]

@@ -1,6 +1,7 @@
 use super::{
-    FileType, ParsedDependency, UpdateOptions, UpdateResult, Updater, downgrade_warning,
-    read_file_safe, specifier_floor_range, write_file_atomic,
+    FileType, ParsedDependency, UpdateOptions, UpdateResult, Updater, cargo_admits,
+    downgrade_warning, read_file_safe, specifier_floor, unreadable_error, unrewritable_warning,
+    write_file_atomic,
 };
 use crate::align::compare_versions;
 use crate::registry::{CratesIoRegistry, Registry};
@@ -35,22 +36,37 @@ type DependencyLookup = (String, ReqSpec, String, Option<String>, Option<usize>)
 struct ReqSpec {
     text: String,
     floor: std::ops::Range<usize>,
+    /// Whether the recorded position holds a version this requirement admits,
+    /// which is what makes it one an update may carry forward. See
+    /// [`specifier_floor`].
+    raisable: bool,
 }
 
 impl ReqSpec {
     /// Handles `1.0`, `^1.0`, `~1.0`, `>=1.0`, `=1.0`, `>=1.0, <2.0` and
     /// `<2.0, >=1.0`. A requirement with no readable version, such as `*`,
-    /// records an empty floor at the first digit, which leaves the whole
-    /// requirement standing as the prefix a rewrite appends to.
+    /// records an empty floor at the first digit so it reads as versionless,
+    /// and is never raisable: there is no version in it to move.
     fn parse(version_req: &str) -> Self {
         let text = version_req.trim().to_string();
-        let floor = specifier_floor_range(&text, 0).unwrap_or_else(|| {
-            let start = text
-                .find(|c: char| c.is_ascii_digit())
-                .unwrap_or(text.len());
-            start..text.len()
-        });
-        Self { text, floor }
+        match specifier_floor(&text, 0) {
+            Some(floor) => Self {
+                text,
+                floor: floor.range,
+                raisable: floor.raisable,
+            },
+            None => {
+                let start = text
+                    .find(|c: char| c.is_ascii_digit())
+                    .unwrap_or(text.len());
+                let floor = start..text.len();
+                Self {
+                    text,
+                    floor,
+                    raisable: false,
+                }
+            }
+        }
     }
 
     /// The version this requirement floors the package at.
@@ -58,11 +74,19 @@ impl ReqSpec {
         &self.text[self.floor.clone()]
     }
 
-    /// This requirement with its floor moved to `version`.
-    fn with_version(&self, version: &str) -> String {
+    /// This requirement with its floor moved to `version`, or `None` when it has
+    /// no floor to move.
+    ///
+    /// Returning the rewrite rather than performing it unconditionally is what
+    /// keeps `<2.0` from becoming `<4.18.1` and `*` from becoming `*1.5.0`: the
+    /// caller cannot write a requirement this type refuses to build.
+    fn with_version(&self, version: &str) -> Option<String> {
+        if !self.raisable {
+            return None;
+        }
         let mut out = self.text.clone();
         out.replace_range(self.floor.clone(), version);
-        out
+        Some(out)
     }
 
     /// Whether this requirement bounds the versions above, so a lookup has to
@@ -325,8 +349,9 @@ impl CargoTomlUpdater {
                 match_version_precision(&current_version, &pinned_version)
             };
 
-            if matched_version != current_version {
-                let new_version_req = req.with_version(&matched_version);
+            if matched_version == current_version {
+                result.unchanged += 1;
+            } else if let Some(new_version_req) = req.with_version(&matched_version) {
                 if let Some(item) = table.get_mut(&key) {
                     Self::set_version(item, &new_version_req);
                 }
@@ -334,7 +359,13 @@ impl CargoTomlUpdater {
                     .pinned
                     .push((key.clone(), current_version, matched_version, line_num));
             } else {
-                result.unchanged += 1;
+                // The pin was configured and cannot be written, so the manifest
+                // does not say what the config says it should. That is a failed
+                // instruction, not a note.
+                result.errors.push(format!(
+                    "cannot pin '{key}' to '{pinned_version}': '{}' has no lower bound that version fits",
+                    req.text
+                ));
             }
         }
 
@@ -362,7 +393,13 @@ impl CargoTomlUpdater {
                 };
 
                 async move {
-                    if !is_stable_semver(current_version) {
+                    if !req.raisable {
+                        // Nothing here can be rewritten, so the only question
+                        // left is whether the newest release is one this
+                        // requirement already admits. Asking for the newest
+                        // release *matching* it would answer that with itself.
+                        effective_registry.get_latest_version(key).await
+                    } else if !is_stable_semver(current_version) {
                         effective_registry
                             .get_latest_version_including_prereleases(key)
                             .await
@@ -396,6 +433,21 @@ impl CargoTomlUpdater {
             };
 
             match version_result {
+                Ok(latest_version) if !req.raisable => {
+                    // A requirement with no floor to raise is still a
+                    // requirement upd can read: saying whether it is current is
+                    // the difference between one doing its job and one that has
+                    // quietly frozen a dependency.
+                    match cargo_admits(&req.text, &latest_version) {
+                        Some(true) => result.unchanged += 1,
+                        Some(false) => result.warnings.push(unrewritable_warning(
+                            &key,
+                            &latest_version,
+                            &req.text,
+                        )),
+                        None => result.errors.push(unreadable_error(&key, &req.text)),
+                    }
+                }
                 Ok(latest_version) => {
                     // When the current version is a pre-release, we fetched the latest
                     // pre-release. If the registry returned a stable version instead
@@ -467,8 +519,7 @@ impl CargoTomlUpdater {
                                 &matched_version,
                                 line_num,
                             );
-                        } else {
-                            let new_version_req = req.with_version(&matched_version);
+                        } else if let Some(new_version_req) = req.with_version(&matched_version) {
                             if let Some(item) = table.get_mut(&key) {
                                 Self::set_version(item, &new_version_req);
                             }
@@ -488,6 +539,14 @@ impl CargoTomlUpdater {
                                     skipped_published_at,
                                 ));
                             }
+                        } else {
+                            // `raisable` routed this requirement here and the
+                            // rewrite refused it, so the two disagree about it
+                            // and neither reading can be trusted.
+                            result.errors.push(format!(
+                                "{key}: '{}' was read as a requirement with a floor to raise, but it has none",
+                                req.text
+                            ));
                         }
                     } else {
                         result.unchanged += 1;
@@ -870,20 +929,33 @@ mod tests {
             (">=1.0,!=1.2,<2.0", ">=1.5.0,!=1.2,<2.0"),
         ] {
             assert_eq!(
-                ReqSpec::parse(req).with_version("1.5.0"),
-                rewritten,
+                ReqSpec::parse(req).with_version("1.5.0").as_deref(),
+                Some(rewritten),
                 "{req}"
             );
         }
     }
 
-    /// A requirement naming no version keeps the shape it always had: the whole
-    /// text stands as a prefix and the new version is appended.
+    /// A requirement with no floor to raise refuses the rewrite instead of
+    /// splicing the new version into whatever it does hold. `*` has no version
+    /// at all and used to answer `*1.5.0`, which cargo cannot parse; `<2.0` and
+    /// `>1.0` hold versions that are not floors, and moving either writes a
+    /// requirement that no longer means what its author wrote.
     #[test]
-    fn a_requirement_without_a_version_is_left_as_a_prefix() {
-        let req = ReqSpec::parse("*");
-        assert_eq!(req.version(), "");
-        assert_eq!(req.with_version("1.5.0"), "*1.5.0");
+    fn a_requirement_with_no_floor_refuses_the_rewrite() {
+        let star = ReqSpec::parse("*");
+        assert_eq!(star.version(), "");
+        assert_eq!(star.with_version("1.5.0"), None);
+
+        for req in ["<2.0", "<=2.0", ">1.0", ">1.0, <2.0", "<2.0, >1.0"] {
+            assert_eq!(ReqSpec::parse(req).with_version("1.5.0"), None, "{req}");
+        }
+
+        // The inclusive forms are untouched: naming a version the requirement
+        // admits is exactly what makes it movable.
+        for req in ["1.0", "^1.0", "~1.0", ">=1.0", "=1.0", ">=1.0, <2.0"] {
+            assert!(ReqSpec::parse(req).with_version("1.5.0").is_some(), "{req}");
+        }
     }
 
     #[test]
@@ -1096,6 +1168,154 @@ rand = "~3.0.0"
             !content.contains("4.6.1") && !content.contains("3.5.0"),
             "must not cross the caret/tilde bound; got: {content}"
         );
+    }
+
+    /// A requirement with no floor is left exactly as written. `<2.0` was
+    /// rewritten to `<4.18.1`, deleting the ceiling the author asked for; `*`
+    /// became `*1.5.0`, which cargo cannot parse at all.
+    #[tokio::test]
+    async fn a_requirement_with_no_floor_is_left_exactly_as_written() {
+        let mut file = NamedTempFile::with_suffix(".toml").unwrap();
+        write!(
+            file,
+            r#"[dependencies]
+anyhow = "<2.0"
+serde = "*"
+"#
+        )
+        .unwrap();
+
+        let registry = MockRegistry::new("crates.io")
+            .with_version("anyhow", "1.0.229")
+            .with_version("serde", "1.5.0");
+
+        let result = CargoTomlUpdater::new()
+            .update(file.path(), &registry, UpdateOptions::new(false, false))
+            .await
+            .unwrap();
+
+        assert_eq!(result.updated.len(), 0);
+        assert_eq!(result.unchanged, 2, "both requirements admit their newest");
+        assert!(result.warnings.is_empty(), "{:?}", result.warnings);
+        assert!(result.errors.is_empty(), "{:?}", result.errors);
+
+        let content = fs::read_to_string(file.path()).unwrap();
+        assert!(content.contains(r#"anyhow = "<2.0""#), "{content}");
+        assert!(content.contains(r#"serde = "*""#), "{content}");
+    }
+
+    /// A ceiling has frozen the crate below the newest major, and upd says so
+    /// without touching it. The constrained answer is what a lookup *matching*
+    /// the requirement would return, and it is inside the ceiling by
+    /// construction: asking that question of a requirement upd cannot rewrite
+    /// answers it with itself and reports a frozen crate as current.
+    #[tokio::test]
+    async fn a_ceiling_the_newest_release_is_outside_is_reported() {
+        let mut file = NamedTempFile::with_suffix(".toml").unwrap();
+        write!(
+            file,
+            r#"[dependencies]
+anyhow = "<2.0"
+"#
+        )
+        .unwrap();
+
+        let registry = MockRegistry::new("crates.io")
+            .with_version("anyhow", "2.5.0")
+            .with_constrained("anyhow", "<2.0", "1.0.229");
+
+        let result = CargoTomlUpdater::new()
+            .update(file.path(), &registry, UpdateOptions::new(false, false))
+            .await
+            .unwrap();
+
+        assert_eq!(result.updated.len(), 0);
+        assert_eq!(result.unchanged, 0, "2.5.0 is outside '<2.0', not current");
+        assert_eq!(
+            result.warnings,
+            vec!["anyhow: 2.5.0 is available, but '<2.0' is a range upd does not rewrite"]
+        );
+
+        let content = fs::read_to_string(file.path()).unwrap();
+        assert!(content.contains(r#"anyhow = "<2.0""#), "{content}");
+    }
+
+    /// Cargo reads a partial bound with its own rules: `>1.0` is
+    /// `Comparator { op: Greater, major: 1, minor: Some(0), patch: None }`,
+    /// which admits 1.1.0 but no 1.0.x release at all. So the newest 1.0.229 is
+    /// outside a requirement that looks like it should hold it, and saying so is
+    /// the only useful thing upd can do with a bound it must not move.
+    #[tokio::test]
+    async fn an_exclusive_lower_bound_the_newest_release_is_outside_is_reported() {
+        let mut file = NamedTempFile::with_suffix(".toml").unwrap();
+        write!(
+            file,
+            r#"[dependencies]
+serde = ">1.0"
+"#
+        )
+        .unwrap();
+
+        let registry = MockRegistry::new("crates.io").with_version("serde", "1.0.229");
+
+        let result = CargoTomlUpdater::new()
+            .update(file.path(), &registry, UpdateOptions::new(false, false))
+            .await
+            .unwrap();
+
+        assert_eq!(result.updated.len(), 0);
+        assert_eq!(result.unchanged, 0);
+        assert_eq!(
+            result.warnings,
+            vec!["serde: 1.0.229 is available, but '>1.0' is a range upd does not rewrite"]
+        );
+
+        let content = fs::read_to_string(file.path()).unwrap();
+        assert!(content.contains(r#"serde = ">1.0""#), "{content}");
+    }
+
+    /// A configured pin is an instruction. When the requirement has no floor to
+    /// write it into, the manifest does not say what the config says it should,
+    /// so the run reports a failure rather than passing silently.
+    #[tokio::test]
+    async fn a_pin_a_requirement_cannot_hold_is_an_error() {
+        use crate::config::UpdConfig;
+
+        let mut file = NamedTempFile::with_suffix(".toml").unwrap();
+        write!(
+            file,
+            r#"[dependencies]
+anyhow = "<2.0"
+"#
+        )
+        .unwrap();
+
+        let registry = MockRegistry::new("crates.io").with_version("anyhow", "1.0.229");
+
+        let mut pin = HashMap::new();
+        pin.insert("anyhow".to_string(), "1.0.100".to_string());
+        let config = UpdConfig {
+            pin,
+            ..Default::default()
+        };
+
+        let result = CargoTomlUpdater::new()
+            .update(
+                file.path(),
+                &registry,
+                UpdateOptions::new(false, false).with_config(Arc::new(config)),
+            )
+            .await
+            .unwrap();
+
+        assert!(result.pinned.is_empty());
+        assert_eq!(
+            result.errors,
+            vec!["cannot pin 'anyhow' to '1.0.100': '<2.0' has no lower bound that version fits"]
+        );
+
+        let content = fs::read_to_string(file.path()).unwrap();
+        assert!(content.contains(r#"anyhow = "<2.0""#), "{content}");
     }
 
     #[tokio::test]

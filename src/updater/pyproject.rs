@@ -1,6 +1,7 @@
 use super::{
     FileType, ParsedDependency, UpdateOptions, UpdateResult, Updater, downgrade_warning,
-    read_file_safe, specifier_floor_range, write_file_atomic,
+    pep440_admits, read_file_safe, specifier_floor, unreadable_error, unrewritable_warning,
+    write_file_atomic,
 };
 use crate::align::compare_versions;
 use crate::registry::{DeclaredIndex, IndexChain, Registry};
@@ -59,6 +60,18 @@ struct PyProjectLineIndex {
     lines_by_section: HashMap<String, HashMap<String, usize>>,
 }
 
+/// One PEP 508 dependency string, read.
+struct ParsedDep {
+    package: String,
+    /// The version the specifier is anchored at, for display and comparison.
+    version: String,
+    /// The full constraint string (e.g. `">=2.8.0,<9"`).
+    full_constraint: String,
+    /// Whether `version` is a floor an update may carry forward, rather than a
+    /// ceiling or a version the specifier rules out. See [`specifier_floor`].
+    raisable: bool,
+}
+
 #[derive(Clone)]
 struct ArraySectionState {
     section_path: String,
@@ -91,24 +104,28 @@ impl PyProjectUpdater {
         }
     }
 
-    /// Where this dependency's floor version sits, as a byte range within `dep`.
+    /// Where this dependency's floor version sits, and whether it is one an
+    /// update may carry forward.
     ///
-    /// Falls back to the first clause's version for anything
-    /// [`specifier_floor_range`] cannot place, which keeps a dependency with no
-    /// recognizable constraint reading as it always has.
-    fn floor_range(&self, dep: &str) -> Option<std::ops::Range<usize>> {
+    /// Falls back to the single-operator match for anything [`specifier_floor`]
+    /// cannot place, which keeps a dependency with no recognizable constraint
+    /// reading as it always has. That fallback reads its own operator rather
+    /// than assuming a floor, so `pkg<v2` is no more rewritable than `pkg<2`.
+    fn floor(&self, dep: &str) -> Option<super::SpecifierFloor> {
         let constraint = self.constraint_re.captures(dep).and_then(|c| c.get(3));
         constraint
-            .and_then(|m| specifier_floor_range(m.as_str(), m.start()))
+            .and_then(|m| specifier_floor(m.as_str(), m.start()))
             .or_else(|| {
-                self.version_re
-                    .captures(dep)
-                    .map(|caps| caps.get(4).unwrap().range())
+                let caps = self.version_re.captures(dep)?;
+                Some(super::SpecifierFloor {
+                    range: caps.get(4).unwrap().range(),
+                    raisable: matches!(caps.get(3).map(|m| m.as_str()), Some("==" | ">=" | "~=")),
+                })
             })
     }
 
-    /// Parse dependency string and return (package, floor_version, full_constraint)
-    fn parse_dependency(&self, dep: &str) -> Option<(String, String, String)> {
+    /// Parse a PEP 508 dependency string into the pieces an update needs.
+    fn parse_dependency(&self, dep: &str) -> Option<ParsedDep> {
         // First get the full constraint
         let full_constraint = self
             .constraint_re
@@ -117,14 +134,15 @@ impl PyProjectUpdater {
             .map(|m| m.as_str().to_string())
             .unwrap_or_default();
 
-        let floor = self.floor_range(dep);
-        self.version_re.captures(dep).map(|caps| {
-            let package = caps.get(1).unwrap().as_str().to_string();
-            let version = floor.map_or_else(
+        let floor = self.floor(dep);
+        self.version_re.captures(dep).map(|caps| ParsedDep {
+            package: caps.get(1).unwrap().as_str().to_string(),
+            version: floor.as_ref().map_or_else(
                 || caps.get(4).unwrap().as_str().to_string(),
-                |range| dep[range].to_string(),
-            );
-            (package, version, full_constraint)
+                |f| dep[f.range.clone()].to_string(),
+            ),
+            raisable: floor.is_some_and(|f| f.raisable),
+            full_constraint,
         })
     }
 
@@ -152,16 +170,8 @@ impl PyProjectUpdater {
         true
     }
 
-    /// Check if constraint is an upper-bound-only constraint (e.g., "<6", "<=5.0")
-    /// These should never be "updated" because they define a ceiling, not a floor.
-    /// Updating them would only make the constraint more restrictive.
-    fn is_upper_bound_only(constraint: &str) -> bool {
-        let trimmed = constraint.trim();
-        (trimmed.starts_with('<') || trimmed.starts_with("<=")) && !trimmed.contains(',') // No other constraints (like >=x,<y)
-    }
-
     fn update_dependency(&self, dep: &str, new_version: &str) -> String {
-        if let Some(range) = self.floor_range(dep) {
+        if let Some(range) = self.floor(dep).map(|f| f.range) {
             // Only replace the floor version itself, preserving everything else
             // (package name, extras, operator, AND any other constraints like ,<6)
             let mut result = dep.to_string();
@@ -431,48 +441,50 @@ impl PyProjectUpdater {
         let mut ignored_deps: Vec<(String, String, Option<usize>)> = Vec::new();
         let mut pinned_deps: Vec<(usize, String, String, String, String, Option<usize>)> =
             Vec::new();
-        let mut deps_to_check: Vec<(usize, String, String, String, String, Option<usize>)> =
-            Vec::new();
+        let mut deps_to_check: Vec<(usize, String, ParsedDep, Option<usize>)> = Vec::new();
 
         for i in 0..array.len() {
             if let Some(item) = array.get(i)
                 && let Some(s) = item.as_str()
-                && let Some((package, current_version, full_constraint)) = self.parse_dependency(s)
+                && let Some(parsed) = self.parse_dependency(s)
             {
-                let line_num = line_index.line_for(section_path, &package);
+                let line_num = line_index.line_for(section_path, &parsed.package);
 
-                if options.is_package_filtered_out(&package) {
+                if options.is_package_filtered_out(&parsed.package) {
                     result.unchanged += 1;
                     continue;
                 }
 
                 // Check if package should be ignored
-                if options.should_ignore(&package) {
-                    ignored_deps.push((package, current_version, line_num));
+                if options.should_ignore(&parsed.package) {
+                    ignored_deps.push((parsed.package, parsed.version, line_num));
                     continue;
                 }
 
                 // Check if package has a pinned version
-                if let Some(pinned_version) = options.get_pinned_version(&package) {
+                if let Some(pinned_version) = options.get_pinned_version(&parsed.package) {
+                    if !parsed.raisable {
+                        // The pin was configured and cannot be written, so the
+                        // manifest does not say what the config says it should.
+                        // That is a failed instruction, not a note.
+                        result.errors.push(format!(
+                            "cannot pin '{}' to '{pinned_version}': '{}' has no lower bound that version fits",
+                            parsed.package, parsed.full_constraint
+                        ));
+                        continue;
+                    }
                     pinned_deps.push((
                         i,
                         s.to_string(),
-                        package,
-                        current_version,
+                        parsed.package,
+                        parsed.version,
                         pinned_version.to_string(),
                         line_num,
                     ));
                     continue;
                 }
 
-                deps_to_check.push((
-                    i,
-                    s.to_string(),
-                    package,
-                    current_version,
-                    full_constraint,
-                    line_num,
-                ));
+                deps_to_check.push((i, s.to_string(), parsed, line_num));
             }
         }
 
@@ -504,33 +516,60 @@ impl PyProjectUpdater {
         // Fetch versions for remaining deps in parallel
         let version_futures: Vec<_> = deps_to_check
             .iter()
-            .map(
-                |(_, _, package, current_version, full_constraint, _)| async {
-                    if !is_stable_pep440(current_version) {
-                        registry
-                            .get_latest_version_including_prereleases(package)
-                            .await
-                    } else if Self::is_simple_constraint(full_constraint) {
-                        registry.get_latest_version(package).await
-                    } else {
-                        registry
-                            .get_latest_version_matching(package, full_constraint)
-                            .await
-                    }
-                },
-            )
+            .map(|(_, _, parsed, _)| async {
+                if !parsed.raisable {
+                    // Nothing here can be rewritten, so the only question left
+                    // is whether the newest release is one this specifier
+                    // already admits. Asking for the newest release *matching*
+                    // it would answer that with itself.
+                    registry.get_latest_version(&parsed.package).await
+                } else if !is_stable_pep440(&parsed.version) {
+                    registry
+                        .get_latest_version_including_prereleases(&parsed.package)
+                        .await
+                } else if Self::is_simple_constraint(&parsed.full_constraint) {
+                    registry.get_latest_version(&parsed.package).await
+                } else {
+                    registry
+                        .get_latest_version_matching(&parsed.package, &parsed.full_constraint)
+                        .await
+                }
+            })
             .collect();
 
         let version_results = join_all(version_futures).await;
 
         // Process results and collect updates
-        for ((i, dep_str, package, current_version, full_constraint, line_num), version_result) in
+        for ((i, dep_str, parsed, line_num), version_result) in
             deps_to_check.into_iter().zip(version_results)
         {
-            // Skip upper-bound-only constraints (e.g., "<6", "<=5.0")
-            // These define a ceiling, not a floor - updating them would only restrict versions
-            if Self::is_upper_bound_only(&full_constraint) {
-                result.unchanged += 1;
+            let ParsedDep {
+                package,
+                version: current_version,
+                full_constraint,
+                raisable,
+            } = parsed;
+
+            // A specifier with no floor to raise (a ceiling like "<6", an
+            // exclusive bound like ">2.0", an exclusion like "!=1.5") is still
+            // one upd can read: saying whether it is current is the difference
+            // between a specifier doing its job and one that has quietly frozen
+            // a dependency.
+            if !raisable {
+                match version_result {
+                    Ok(latest) => match pep440_admits(&full_constraint, &latest) {
+                        Some(true) => result.unchanged += 1,
+                        Some(false) => result.warnings.push(unrewritable_warning(
+                            &package,
+                            &latest,
+                            &full_constraint,
+                        )),
+                        None => result
+                            .errors
+                            .push(unreadable_error(&package, &full_constraint)),
+                    },
+                    Err(e) => result.errors.push(format!("{}: {}", package, e)),
+                }
                 continue;
             }
 
@@ -885,11 +924,11 @@ impl PyProjectLineIndex {
     ) {
         for caps in literal_re.captures_iter(line) {
             let dep = caps.get(1).or_else(|| caps.get(2)).unwrap().as_str();
-            if let Some((package, _, _)) = updater.parse_dependency(dep) {
+            if let Some(parsed) = updater.parse_dependency(dep) {
                 lines_by_section
                     .entry(section_path.to_string())
                     .or_default()
-                    .entry(package)
+                    .entry(parsed.package)
                     .or_insert(line_num);
             }
         }
@@ -1206,13 +1245,13 @@ impl Updater for PyProjectUpdater {
             if let Some(Item::Value(Value::Array(arr))) = project.get("dependencies") {
                 for item in arr.iter() {
                     if let Some(s) = item.as_str()
-                        && let Some((name, version, constraint)) = self.parse_dependency(s)
+                        && let Some(parsed) = self.parse_dependency(s)
                     {
-                        let has_upper_bound = !Self::is_simple_constraint(&constraint);
-                        let line_num = line_index.line_for("project.dependencies", &name);
+                        let has_upper_bound = !Self::is_simple_constraint(&parsed.full_constraint);
+                        let line_num = line_index.line_for("project.dependencies", &parsed.package);
                         deps.push(ParsedDependency {
-                            name,
-                            version,
+                            name: parsed.package,
+                            version: parsed.version,
                             line_number: line_num,
                             has_upper_bound,
                             is_bumpable: true,
@@ -1227,16 +1266,17 @@ impl Updater for PyProjectUpdater {
                     if let Some(arr) = group_deps.as_array() {
                         for item in arr.iter() {
                             if let Some(s) = item.as_str()
-                                && let Some((name, version, constraint)) = self.parse_dependency(s)
+                                && let Some(parsed) = self.parse_dependency(s)
                             {
-                                let has_upper_bound = !Self::is_simple_constraint(&constraint);
+                                let has_upper_bound =
+                                    !Self::is_simple_constraint(&parsed.full_constraint);
                                 let line_num = line_index.line_for(
                                     &format!("project.optional-dependencies.{}", group_name),
-                                    &name,
+                                    &parsed.package,
                                 );
                                 deps.push(ParsedDependency {
-                                    name,
-                                    version,
+                                    name: parsed.package,
+                                    version: parsed.version,
                                     line_number: line_num,
                                     has_upper_bound,
                                     is_bumpable: true,
@@ -1297,23 +1337,26 @@ mod tests {
     fn test_parse_dependency() {
         let updater = PyProjectUpdater::new();
 
-        let (pkg, ver, constraint) = updater.parse_dependency("requests>=2.28.0").unwrap();
-        assert_eq!(pkg, "requests");
-        assert_eq!(ver, "2.28.0");
-        assert_eq!(constraint, ">=2.28.0");
+        let dep = updater.parse_dependency("requests>=2.28.0").unwrap();
+        assert_eq!(dep.package, "requests");
+        assert_eq!(dep.version, "2.28.0");
+        assert_eq!(dep.full_constraint, ">=2.28.0");
+        assert!(dep.raisable);
 
-        let (pkg, ver, constraint) = updater
+        let dep = updater
             .parse_dependency("uvicorn[standard]>=0.20.0")
             .unwrap();
-        assert_eq!(pkg, "uvicorn");
-        assert_eq!(ver, "0.20.0");
-        assert_eq!(constraint, ">=0.20.0");
+        assert_eq!(dep.package, "uvicorn");
+        assert_eq!(dep.version, "0.20.0");
+        assert_eq!(dep.full_constraint, ">=0.20.0");
+        assert!(dep.raisable);
 
         // Test constraint with upper bound
-        let (pkg, ver, constraint) = updater.parse_dependency("flask>=2.0.0,<3.0.0").unwrap();
-        assert_eq!(pkg, "flask");
-        assert_eq!(ver, "2.0.0");
-        assert_eq!(constraint, ">=2.0.0,<3.0.0");
+        let dep = updater.parse_dependency("flask>=2.0.0,<3.0.0").unwrap();
+        assert_eq!(dep.package, "flask");
+        assert_eq!(dep.version, "2.0.0");
+        assert_eq!(dep.full_constraint, ">=2.0.0,<3.0.0");
+        assert!(dep.raisable);
     }
 
     #[test]
@@ -1336,22 +1379,37 @@ mod tests {
         assert!(!PyProjectUpdater::is_simple_constraint("!=1.5.0"));
     }
 
+    /// Which specifiers offer a floor an update may carry forward. A ceiling
+    /// never had one; `>1.0.0` and `!=1.5.0` hold a version each, and each is
+    /// one the specifier rules out, so raising either writes a specifier that
+    /// excludes the release it was raised to.
     #[test]
-    fn test_is_upper_bound_only() {
-        // Upper-bound-only constraints - should not be updated
-        assert!(PyProjectUpdater::is_upper_bound_only("<6"));
-        assert!(PyProjectUpdater::is_upper_bound_only("<4.2"));
-        assert!(PyProjectUpdater::is_upper_bound_only("<=5.0"));
-        assert!(PyProjectUpdater::is_upper_bound_only("<=2.0.0"));
+    fn a_dependency_knows_whether_its_version_is_a_floor_to_raise() {
+        let updater = PyProjectUpdater::new();
+        let raisable = |dep: &str| updater.parse_dependency(dep).unwrap().raisable;
 
-        // NOT upper-bound-only (have lower bounds or are pinned)
-        assert!(!PyProjectUpdater::is_upper_bound_only(">=1.0.0,<2.0.0")); // Has lower bound
-        assert!(!PyProjectUpdater::is_upper_bound_only(">=2.8.0,<9")); // Has lower bound
-        assert!(!PyProjectUpdater::is_upper_bound_only("==1.0.0")); // Pinned
-        assert!(!PyProjectUpdater::is_upper_bound_only(">=1.0.0")); // Lower bound only
-        assert!(!PyProjectUpdater::is_upper_bound_only(">1.0.0")); // Lower bound only
-        assert!(!PyProjectUpdater::is_upper_bound_only("~=1.4")); // Compatible release
-        assert!(!PyProjectUpdater::is_upper_bound_only("!=1.5.0")); // Exclusion
+        for dep in [
+            "pkg>=1.0.0",
+            "pkg==1.0.0",
+            "pkg~=1.4",
+            "pkg>=1.0.0,<2.0.0",
+            "pkg<2.0.0,>=1.0.0",
+            "pkg>=2.8.0,<9",
+        ] {
+            assert!(raisable(dep), "{dep}");
+        }
+        for dep in [
+            "pkg<6",
+            "pkg<4.2",
+            "pkg<=5.0",
+            "pkg<=2.0.0",
+            "pkg>1.0.0",
+            "pkg>1.0.0,<2.0.0",
+            "pkg!=1.5.0",
+            "pkg<6,!=5.0",
+        ] {
+            assert!(!raisable(dep), "{dep}");
+        }
     }
 
     #[test]
@@ -1641,6 +1699,131 @@ dependencies = ["requests>=2.31.0"]
 
         assert_eq!(result.updated.len(), 0);
         assert_eq!(result.unchanged, 1);
+    }
+
+    /// A ceiling holds no floor to raise, but upd can still say the dependency
+    /// has been frozen below the newest release. Reading a specifier it will not
+    /// rewrite is the difference between a ceiling doing its job and one that
+    /// has quietly stopped a package receiving updates.
+    #[tokio::test]
+    async fn a_ceiling_the_newest_release_is_outside_is_reported_not_rewritten() {
+        let mut file = NamedTempFile::with_suffix(".toml").unwrap();
+        write!(
+            file,
+            r#"[project]
+name = "myproject"
+dependencies = ["django<6", "flask<=3.0"]
+"#
+        )
+        .unwrap();
+
+        // The constrained answer is what a lookup *matching* the specifier would
+        // return, and it is inside the ceiling by construction: asking that
+        // question of a specifier upd cannot rewrite answers it with itself and
+        // reports a frozen dependency as current.
+        let registry = MockRegistry::new("PyPI")
+            .with_version("django", "6.1.0")
+            .with_constrained("django", "<6", "5.2.0")
+            .with_version("flask", "2.3.0");
+
+        let result = PyProjectUpdater::new()
+            .update(file.path(), &registry, UpdateOptions::new(false, false))
+            .await
+            .unwrap();
+
+        assert_eq!(result.updated.len(), 0);
+        assert_eq!(result.unchanged, 1, "flask's 2.3.0 is inside '<=3.0'");
+        assert_eq!(
+            result.warnings,
+            vec!["django: 6.1.0 is available, but '<6' is a range upd does not rewrite"]
+        );
+        assert!(result.errors.is_empty());
+
+        let contents = std::fs::read_to_string(file.path()).unwrap();
+        assert!(contents.contains(r#""django<6""#));
+        assert!(contents.contains(r#""flask<=3.0""#));
+    }
+
+    /// `urllib3>2.0` names the one release the author refuses. Raising it wrote
+    /// `urllib3>2.7` with 2.7 the newest release, and the next run could not
+    /// resolve the manifest upd had just written.
+    #[tokio::test]
+    async fn an_exclusive_lower_bound_is_never_raised() {
+        let mut file = NamedTempFile::with_suffix(".toml").unwrap();
+        write!(
+            file,
+            r#"[project]
+name = "myproject"
+dependencies = ["urllib3>2.0", "chardet>4.0,<6.0", "pkg!=1.5.0"]
+"#
+        )
+        .unwrap();
+
+        let registry = MockRegistry::new("PyPI")
+            .with_version("urllib3", "2.7.0")
+            .with_version("chardet", "5.2.0")
+            .with_version("pkg", "2.0.0");
+
+        let result = PyProjectUpdater::new()
+            .update(file.path(), &registry, UpdateOptions::new(false, false))
+            .await
+            .unwrap();
+
+        assert_eq!(result.updated.len(), 0);
+        assert_eq!(result.unchanged, 3, "each specifier admits its newest");
+        assert!(result.warnings.is_empty(), "{:?}", result.warnings);
+        assert!(result.errors.is_empty());
+
+        let contents = std::fs::read_to_string(file.path()).unwrap();
+        assert!(contents.contains(r#""urllib3>2.0""#));
+        assert!(contents.contains(r#""chardet>4.0,<6.0""#));
+        assert!(contents.contains(r#""pkg!=1.5.0""#));
+    }
+
+    /// A configured pin is an instruction. When the specifier has no floor to
+    /// write it into, the manifest does not say what the config says it should,
+    /// so the run reports a failure rather than passing silently.
+    #[tokio::test]
+    async fn a_pin_a_specifier_cannot_hold_is_an_error() {
+        use crate::config::UpdConfig;
+        use std::collections::HashMap;
+
+        let mut file = NamedTempFile::with_suffix(".toml").unwrap();
+        write!(
+            file,
+            r#"[project]
+name = "myproject"
+dependencies = ["django<6"]
+"#
+        )
+        .unwrap();
+
+        let registry = MockRegistry::new("PyPI").with_version("django", "5.2.0");
+
+        let mut pin = HashMap::new();
+        pin.insert("django".to_string(), "5.1.0".to_string());
+        let config = UpdConfig {
+            pin,
+            ..Default::default()
+        };
+
+        let result = PyProjectUpdater::new()
+            .update(
+                file.path(),
+                &registry,
+                UpdateOptions::new(false, false).with_config(Arc::new(config)),
+            )
+            .await
+            .unwrap();
+
+        assert!(result.pinned.is_empty());
+        assert_eq!(
+            result.errors,
+            vec!["cannot pin 'django' to '5.1.0': '<6' has no lower bound that version fits"]
+        );
+
+        let contents = std::fs::read_to_string(file.path()).unwrap();
+        assert!(contents.contains(r#""django<6""#));
     }
 
     // Error path tests

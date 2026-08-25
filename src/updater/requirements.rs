@@ -1,6 +1,7 @@
 use super::{
     FileType, ParsedDependency, PendingVersion, UpdateOptions, UpdateResult, Updater,
-    downgrade_warning, read_file_safe, specifier_floor_range, write_file_atomic,
+    downgrade_warning, pep440_admits, read_file_safe, specifier_floor, unreadable_error,
+    unrewritable_warning, write_file_atomic,
 };
 use crate::align::compare_versions;
 use crate::registry::{DeclaredIndex, IndexChain, Registry};
@@ -32,6 +33,10 @@ struct ParsedDep {
     first_version: String,
     /// The full constraint string (e.g., ">=2.8.0,<9")
     full_constraint: String,
+    /// Whether `first_version` is a floor an update may carry forward, rather
+    /// than a ceiling or a version the specifier rules out. See
+    /// [`specifier_floor`].
+    raisable: bool,
 }
 
 impl RequirementsUpdater {
@@ -156,9 +161,10 @@ impl RequirementsUpdater {
             let full_constraint = caps.get(3).unwrap().as_str().to_string();
 
             // Extract the floor version for display
-            let first_version = self
-                .floor_range(code_part)
-                .map(|range| code_part[range].to_string())
+            let floor = self.floor(code_part);
+            let raisable = floor.as_ref().is_some_and(|f| f.raisable);
+            let first_version = floor
+                .map(|f| code_part[f.range].to_string())
                 .unwrap_or_default();
 
             return Some(ParsedDep {
@@ -166,6 +172,7 @@ impl RequirementsUpdater {
                 extras,
                 first_version,
                 full_constraint,
+                raisable,
             });
         }
 
@@ -198,37 +205,32 @@ impl RequirementsUpdater {
         true
     }
 
-    /// Check if constraint is an upper-bound-only constraint (e.g., "<6", "<=5.0")
-    /// These should never be "updated" because they define a ceiling, not a floor.
-    /// Updating them would only make the constraint more restrictive.
-    fn is_upper_bound_only(constraint: &str) -> bool {
-        // Upper-bound-only constraints start with < or <= and have no lower bound
-        let trimmed = constraint.trim();
-        (trimmed.starts_with('<') || trimmed.starts_with("<=")) && !trimmed.contains(',') // No other constraints (like >=x,<y)
-    }
-
-    /// Where this line's floor version sits, as a byte range within `line`.
+    /// Where this line's floor version sits, and whether it is one an update may
+    /// carry forward.
     ///
-    /// Falls back to the first clause's version for anything
-    /// [`specifier_floor_range`] cannot place, which keeps a line with no
-    /// recognizable constraint reading as it always has.
-    fn floor_range(&self, line: &str) -> Option<std::ops::Range<usize>> {
+    /// Falls back to the single-operator match for anything [`specifier_floor`]
+    /// cannot place, which keeps a line with no recognizable constraint reading
+    /// as it always has. That fallback reads its own operator rather than
+    /// assuming a floor, so `pkg<v2` is no more rewritable than `pkg<2`.
+    fn floor(&self, line: &str) -> Option<super::SpecifierFloor> {
         let code_part = line.split('#').next().unwrap_or(line);
         let constraint = self
             .constraint_re
             .captures(code_part)
             .and_then(|c| c.get(3));
         constraint
-            .and_then(|m| specifier_floor_range(m.as_str(), m.start()))
+            .and_then(|m| specifier_floor(m.as_str(), m.start()))
             .or_else(|| {
-                self.package_re
-                    .captures(code_part)
-                    .map(|caps| caps.get(4).unwrap().range())
+                let caps = self.package_re.captures(code_part)?;
+                Some(super::SpecifierFloor {
+                    range: caps.get(4).unwrap().range(),
+                    raisable: matches!(caps.get(3).map(|m| m.as_str()), Some("==" | ">=" | "~=")),
+                })
             })
     }
 
     fn update_line(&self, line: &str, new_version: &str) -> String {
-        if let Some(range) = self.floor_range(line) {
+        if let Some(range) = self.floor(line).map(|f| f.range) {
             // Only replace the floor version itself, preserving everything else
             // (package name, extras, operator, AND any other constraints like ,<6).
             // Known limitation: if the new version string is a different length than the
@@ -302,6 +304,16 @@ impl Updater for RequirementsUpdater {
 
             // Check if package has a pinned version
             if let Some(pinned_version) = options.get_pinned_version(&parsed.package) {
+                if !parsed.raisable {
+                    // The pin was configured and cannot be written, so the file
+                    // does not say what the config says it should. That is a
+                    // failed instruction, not a note.
+                    result.errors.push(format!(
+                        "cannot pin '{}' to '{pinned_version}': '{}' has no lower bound that version fits",
+                        parsed.package, parsed.full_constraint
+                    ));
+                    continue;
+                }
                 pinned_packages.push((
                     *line_idx,
                     parsed.package.clone(),
@@ -336,7 +348,13 @@ impl Updater for RequirementsUpdater {
         let version_futures: Vec<_> = fetch_deps
             .iter()
             .map(|(_, _, parsed)| async {
-                if is_prerelease_pep440(&parsed.first_version) {
+                if !parsed.raisable {
+                    // Nothing here can be rewritten, so the only question left
+                    // is whether the newest release is one this specifier
+                    // already admits. Asking for the newest release *matching*
+                    // it would answer that with itself.
+                    effective_registry.get_latest_version(&parsed.package).await
+                } else if is_prerelease_pep440(&parsed.first_version) {
                     effective_registry
                         .get_latest_version_including_prereleases(&parsed.package)
                         .await
@@ -372,11 +390,35 @@ impl Updater for RequirementsUpdater {
             let line_num = line_idx + 1; // 1-indexed for display
 
             if let Some(parsed) = self.parse_line(line) {
-                // Skip upper-bound-only constraints (e.g., "<6", "<=5.0")
-                // These define a ceiling, not a floor - updating them would only restrict versions
-                if Self::is_upper_bound_only(&parsed.full_constraint) {
-                    result.unchanged += 1;
+                // A specifier with no floor to raise (a ceiling like "<6", an
+                // exclusive bound like ">2.0", an exclusion like "!=1.5") is
+                // still one upd can read: saying whether it is current is the
+                // difference between a specifier doing its job and one that has
+                // quietly frozen a dependency.
+                if !parsed.raisable {
                     new_lines.push(line.to_string());
+                    match version_map.remove(&line_idx) {
+                        Some(PendingVersion::Registry(Ok(latest))) => {
+                            match pep440_admits(&parsed.full_constraint, &latest) {
+                                Some(true) => result.unchanged += 1,
+                                Some(false) => result.warnings.push(unrewritable_warning(
+                                    &parsed.package,
+                                    &latest,
+                                    &parsed.full_constraint,
+                                )),
+                                None => result.errors.push(unreadable_error(
+                                    &parsed.package,
+                                    &parsed.full_constraint,
+                                )),
+                            }
+                        }
+                        Some(PendingVersion::Registry(Err(e))) => {
+                            result.errors.push(format!("{}: {}", parsed.package, e));
+                        }
+                        // Filtered out, ignored, or refused as an unpinnable
+                        // pin: all of them are already recorded.
+                        Some(PendingVersion::Pinned(_)) | None => {}
+                    }
                     continue;
                 }
 
@@ -827,22 +869,37 @@ hda-common>=1.0.908
         assert!(!RequirementsUpdater::is_simple_constraint("!=1.5.0"));
     }
 
+    /// Which lines offer a floor an update may carry forward. A ceiling never
+    /// had one; `>1.0.0` and `!=1.5.0` hold a version each, and each is one the
+    /// specifier rules out, so raising either writes a line that excludes the
+    /// release it was raised to.
     #[test]
-    fn test_is_upper_bound_only() {
-        // Upper-bound-only constraints - should not be updated
-        assert!(RequirementsUpdater::is_upper_bound_only("<6"));
-        assert!(RequirementsUpdater::is_upper_bound_only("<4.2"));
-        assert!(RequirementsUpdater::is_upper_bound_only("<=5.0"));
-        assert!(RequirementsUpdater::is_upper_bound_only("<=2.0.0"));
+    fn a_line_knows_whether_its_version_is_a_floor_to_raise() {
+        let updater = RequirementsUpdater::new();
+        let raisable = |line: &str| updater.parse_line(line).unwrap().raisable;
 
-        // NOT upper-bound-only (have lower bounds or are pinned)
-        assert!(!RequirementsUpdater::is_upper_bound_only(">=1.0.0,<2.0.0")); // Has lower bound
-        assert!(!RequirementsUpdater::is_upper_bound_only(">=2.8.0,<9")); // Has lower bound
-        assert!(!RequirementsUpdater::is_upper_bound_only("==1.0.0")); // Pinned
-        assert!(!RequirementsUpdater::is_upper_bound_only(">=1.0.0")); // Lower bound only
-        assert!(!RequirementsUpdater::is_upper_bound_only(">1.0.0")); // Lower bound only
-        assert!(!RequirementsUpdater::is_upper_bound_only("~=1.4")); // Compatible release
-        assert!(!RequirementsUpdater::is_upper_bound_only("!=1.5.0")); // Exclusion
+        for line in [
+            "pkg>=1.0.0",
+            "pkg==1.0.0",
+            "pkg~=1.4",
+            "pkg>=1.0.0,<2.0.0",
+            "pkg<2.0.0,>=1.0.0",
+            "pkg>=2.8.0,<9",
+        ] {
+            assert!(raisable(line), "{line}");
+        }
+        for line in [
+            "pkg<6",
+            "pkg<4.2",
+            "pkg<=5.0",
+            "pkg<=2.0.0",
+            "pkg>1.0.0",
+            "pkg>1.0.0,<2.0.0",
+            "pkg!=1.5.0",
+            "pkg<6,!=5.0",
+        ] {
+            assert!(!raisable(line), "{line}");
+        }
     }
 
     #[test]
@@ -1175,6 +1232,159 @@ hda-common>=1.0.908
             contents.contains("flask<=3.0"),
             "flask constraint should remain unchanged"
         );
+    }
+
+    /// A ceiling holds no floor to raise, but upd can still say the dependency
+    /// has been frozen below the newest release. Reading a specifier it will not
+    /// rewrite is the difference between a ceiling doing its job and one that
+    /// has quietly stopped a package receiving updates.
+    #[tokio::test]
+    async fn a_ceiling_the_newest_release_is_outside_is_reported_not_rewritten() {
+        let mut file = NamedTempFile::new().unwrap();
+        writeln!(file, "django<6").unwrap();
+
+        // The constrained answer is what a lookup *matching* the specifier would
+        // return, and it is inside the ceiling by construction: asking that
+        // question of a specifier upd cannot rewrite answers it with itself and
+        // reports a frozen dependency as current.
+        let registry = MockRegistry::new("PyPI")
+            .with_version("django", "6.1.0")
+            .with_constrained("django", "<6", "5.2.0");
+
+        let result = RequirementsUpdater::new()
+            .update(file.path(), &registry, UpdateOptions::new(false, false))
+            .await
+            .unwrap();
+
+        assert_eq!(result.updated.len(), 0);
+        assert_eq!(result.unchanged, 0, "6.1.0 is outside '<6', not current");
+        assert_eq!(
+            result.warnings,
+            vec!["django: 6.1.0 is available, but '<6' is a range upd does not rewrite"]
+        );
+        assert!(result.errors.is_empty());
+
+        let contents = std::fs::read_to_string(file.path()).unwrap();
+        assert!(contents.contains("django<6"));
+    }
+
+    /// A specifier PEP 440 refuses to read is a third answer, and it is an error
+    /// rather than a warning: a warning leaves the run exiting 0 with a green
+    /// tick over a dependency nothing has looked at. `<2.*` is not a legal PEP
+    /// 440 clause, though the `1.0` beside it is a perfectly good version, so
+    /// the line survives the check that the floor itself is readable.
+    #[tokio::test]
+    async fn a_specifier_pep_440_cannot_read_is_an_error() {
+        let mut file = NamedTempFile::new().unwrap();
+        writeln!(file, "django>1.0,<2.*").unwrap();
+
+        let registry = MockRegistry::new("PyPI").with_version("django", "6.1.0");
+
+        let result = RequirementsUpdater::new()
+            .update(file.path(), &registry, UpdateOptions::new(false, false))
+            .await
+            .unwrap();
+
+        assert_eq!(result.updated.len(), 0);
+        assert_eq!(result.unchanged, 0);
+        assert!(result.warnings.is_empty(), "{:?}", result.warnings);
+        assert_eq!(
+            result.errors,
+            vec!["cannot check 'django': '>1.0,<2.*' is not a version range upd can read"]
+        );
+
+        let contents = std::fs::read_to_string(file.path()).unwrap();
+        assert!(contents.contains("django>1.0,<2.*"));
+    }
+
+    /// `urllib3>2.0` names the one release the author refuses. Raising it wrote
+    /// `urllib3>2.7` with 2.7 the newest release, and the next run could not
+    /// resolve the file upd had just written.
+    #[tokio::test]
+    async fn an_exclusive_lower_bound_is_never_raised() {
+        let mut file = NamedTempFile::new().unwrap();
+        writeln!(file, "urllib3>2.0").unwrap();
+        writeln!(file, "chardet>4.0,<6.0").unwrap();
+
+        let registry = MockRegistry::new("PyPI")
+            .with_version("urllib3", "2.7.0")
+            .with_version("chardet", "5.2.0");
+
+        let result = RequirementsUpdater::new()
+            .update(file.path(), &registry, UpdateOptions::new(false, false))
+            .await
+            .unwrap();
+
+        assert_eq!(result.updated.len(), 0);
+        assert_eq!(result.unchanged, 2, "both specifiers admit their newest");
+        assert!(result.warnings.is_empty(), "{:?}", result.warnings);
+        assert!(result.errors.is_empty());
+
+        let contents = std::fs::read_to_string(file.path()).unwrap();
+        assert!(contents.contains("urllib3>2.0"));
+        assert!(contents.contains("chardet>4.0,<6.0"));
+    }
+
+    /// An exclusion names a release to avoid. Writing the newest release into it
+    /// turns "anything but 1.5.0" into a line that excludes the very release the
+    /// run was meant to move the project to.
+    #[tokio::test]
+    async fn an_exclusion_is_never_rewritten_to_exclude_the_newest_release() {
+        let mut file = NamedTempFile::new().unwrap();
+        writeln!(file, "pkg!=1.5.0").unwrap();
+
+        let registry = MockRegistry::new("PyPI").with_version("pkg", "2.0.0");
+
+        let result = RequirementsUpdater::new()
+            .update(file.path(), &registry, UpdateOptions::new(false, false))
+            .await
+            .unwrap();
+
+        assert_eq!(result.updated.len(), 0);
+        assert_eq!(result.unchanged, 1);
+        assert!(result.warnings.is_empty(), "{:?}", result.warnings);
+
+        let contents = std::fs::read_to_string(file.path()).unwrap();
+        assert!(contents.contains("pkg!=1.5.0"));
+    }
+
+    /// A configured pin is an instruction. When the specifier has no floor to
+    /// write it into, the file does not say what the config says it should, so
+    /// the run reports a failure rather than passing silently.
+    #[tokio::test]
+    async fn a_pin_a_specifier_cannot_hold_is_an_error() {
+        use crate::config::UpdConfig;
+        use std::collections::HashMap;
+
+        let mut file = NamedTempFile::new().unwrap();
+        writeln!(file, "django<6").unwrap();
+
+        let registry = MockRegistry::new("PyPI").with_version("django", "5.2.0");
+
+        let mut pin = HashMap::new();
+        pin.insert("django".to_string(), "5.1.0".to_string());
+        let config = UpdConfig {
+            pin,
+            ..Default::default()
+        };
+
+        let result = RequirementsUpdater::new()
+            .update(
+                file.path(),
+                &registry,
+                UpdateOptions::new(false, false).with_config(Arc::new(config)),
+            )
+            .await
+            .unwrap();
+
+        assert!(result.pinned.is_empty());
+        assert_eq!(
+            result.errors,
+            vec!["cannot pin 'django' to '5.1.0': '<6' has no lower bound that version fits"]
+        );
+
+        let contents = std::fs::read_to_string(file.path()).unwrap();
+        assert!(contents.contains("django<6"));
     }
 
     #[tokio::test]

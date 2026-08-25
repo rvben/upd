@@ -10,7 +10,7 @@ use std::process::Command;
 
 use colored::Colorize;
 
-use crate::updater::specifier_floor_range;
+use crate::updater::specifier_floor;
 
 /// The outcome of attempting to regenerate a single lockfile.
 #[derive(Debug)]
@@ -539,10 +539,15 @@ fn locked_entries_to_update<'a>(requirements: &[String], locked: &'a LockedCrate
     let mut unsatisfied: Vec<&str> = Vec::new();
 
     for requirement in requirements {
-        let Some(range) = specifier_floor_range(requirement, 0) else {
+        // Only a declaration upd can rewrite can have outgrown its locked
+        // entry, so only one of those anchors the update. A ceiling or an
+        // exclusive bound is left standing by every updater, and reading its
+        // version as a floor points `cargo update` at a compatibility key
+        // nothing in this manifest moved.
+        let Some(floor) = specifier_floor(requirement, 0).filter(|f| f.raisable) else {
             continue;
         };
-        let floor = &requirement[range];
+        let floor = &requirement[floor.range];
         let Some(key) = cargo_compat_key(floor) else {
             continue;
         };
@@ -884,6 +889,31 @@ version = "2.0.18"
             "[build-dependencies]\nthiserror = \"3.0.1\"\n",
         ));
         assert_eq!(specs, vec!["serde", "thiserror@1.0.69"]);
+    }
+
+    /// A ceiling is left standing by every updater, so it cannot have outgrown
+    /// its locked entry and must not name one. Read as a floor, `<3.0` asks for
+    /// a compatibility key the lockfile does not carry, and the entry nearest
+    /// below it gets updated on behalf of a declaration nothing rewrote.
+    #[test]
+    fn a_declaration_upd_cannot_rewrite_does_not_name_a_locked_entry() {
+        let specs = specs_for(concat!(
+            "[dependencies]\nserde = \"1.0.229\"\nthiserror = \"1.0.70\"\n",
+            "[build-dependencies]\nthiserror = \"<3.0\"\n",
+        ));
+        assert_eq!(specs, vec!["serde", "thiserror@1.0.69"]);
+    }
+
+    /// Nor may one claim an entry, which would push a real cross-major jump onto
+    /// a different entry: the `<2.0` build-dependency reads as claiming 2.0.18,
+    /// leaving the 2.x -> 3.x bump anchored on the 1.x transitive copy.
+    #[test]
+    fn a_declaration_upd_cannot_rewrite_does_not_displace_a_major_jumps_anchor() {
+        let specs = specs_for(concat!(
+            "[dependencies]\nserde = \"1.0.229\"\nthiserror = \"3.0.1\"\n",
+            "[build-dependencies]\nthiserror = \"<2.0\"\n",
+        ));
+        assert_eq!(specs, vec!["serde", "thiserror@2.0.18"]);
     }
 
     /// A lockfile whose workspace member depends on `thiserror` at the version
