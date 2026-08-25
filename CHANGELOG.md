@@ -5,6 +5,16 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.7.0](https://github.com/rvben/upd/compare/v0.6.5...v0.7.0) - 2026-08-25
+
+### Added
+
+- **discovery**: include annotated files by glob ([1163ef1](https://github.com/rvben/upd/commit/1163ef17f1a8b1b308a749f14099171200dce2c0))
+
+### Fixed
+
+- **interactive**: withhold the up-to-date tick from unchecked pins ([38e0584](https://github.com/rvben/upd/commit/38e0584c1c780e277374d1ae682d37100b9eb5f5))
+
 ## [0.6.5](https://github.com/rvben/upd/compare/v0.6.4...v0.6.5) - 2026-08-25
 
 ### Added
