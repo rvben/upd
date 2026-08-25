@@ -366,6 +366,35 @@ impl Registry for IndexChain<'_> {
             .unwrap_or_else(|| super::ref_resolution_unsupported(self.name(), package, reference)))
     }
 
+    /// First link that names the commit wins.
+    ///
+    /// A link that failed is reported rather than flattened into "no tag names
+    /// this commit": the caller writes a version comment from this answer, and
+    /// an outage that reads as a definitive absence would have it annotate, or
+    /// refuse to annotate, on evidence nobody gathered. Only when every link
+    /// answered, and none of them had a tag, is the empty answer real. A chain
+    /// of registries that all lack tags stays `Unsupported`, which is a third
+    /// fact again.
+    async fn tags_at_commit(&self, package: &str, commit: &str) -> Result<super::TagsAtCommit> {
+        let mut last_error = None;
+        let mut any_answered = false;
+        for link in self.links_for(package) {
+            match link.registry().tags_at_commit(package, commit).await {
+                Ok(super::TagsAtCommit::Known(tags)) if !tags.is_empty() => {
+                    return Ok(super::TagsAtCommit::Known(tags));
+                }
+                Ok(super::TagsAtCommit::Known(_)) => any_answered = true,
+                Ok(super::TagsAtCommit::Unsupported) => {}
+                Err(error) => last_error = Some(error),
+            }
+        }
+        match (last_error, any_answered) {
+            (Some(error), _) => Err(error),
+            (None, true) => Ok(super::TagsAtCommit::Known(Vec::new())),
+            (None, false) => super::tags_at_commit_unsupported(),
+        }
+    }
+
     fn name(&self) -> &'static str {
         "pypi"
     }

@@ -219,11 +219,37 @@ pub fn ref_resolution_unsupported(registry: &str, package: &str, reference: &str
     anyhow!("registry '{registry}' cannot resolve Git ref '{reference}' for '{package}'")
 }
 
+/// What a registry knows about the tags naming a particular commit.
+///
+/// The three answers a caller must tell apart are "the repository publishes
+/// these tags at that commit", "this registry has no tags to look at" and, as an
+/// `Err`, "the question went unanswered". A plain `Vec` would collapse the first
+/// two, because an empty list is a real and common answer here: a commit that no
+/// release names is exactly the case the caller has to report honestly rather
+/// than guess around. Making it a type means a registry cannot express the
+/// absence of an answer as an empty one by accident.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TagsAtCommit {
+    /// The repository was consulted. These tags name the commit, in no
+    /// particular order, and an empty list means none do.
+    Known(Vec<String>),
+    /// This registry has no concept of tags, so nothing was learned.
+    Unsupported,
+}
+
+/// The answer from a registry with no tag concept.
+///
+/// Distinct from `Known(vec![])`, which says the repository was asked and no tag
+/// names the commit.
+pub fn tags_at_commit_unsupported() -> Result<TagsAtCommit> {
+    Ok(TagsAtCommit::Unsupported)
+}
+
 /// A package registry.
 ///
-/// **The capability methods - `list_versions`, `list_ref_names` and
-/// `resolve_ref_to_commit` - have no default body, and a new method describing
-/// what a registry can do must not have one either.** `Registry` is wrapped by
+/// **The capability methods - `list_versions`, `list_ref_names`,
+/// `resolve_ref_to_commit` and `tags_at_commit` - have no default body, and a
+/// new method describing what a registry can do must not have one either.** `Registry` is wrapped by
 /// decorators ([`crate::cache::CachedRegistry`], [`IndexChain`],
 /// [`MultiPyPiRegistry`]), and a default body is silently inherited by every one
 /// of them: the wrapped registry is never consulted and the caller receives the
@@ -231,8 +257,8 @@ pub fn ref_resolution_unsupported(registry: &str, package: &str, reference: &str
 /// shipped from this trait before. Requiring these forces every decorator to
 /// state whether it forwards, and makes forgetting one a compile error rather
 /// than a silent wrong answer. A registry that genuinely lacks a capability says
-/// so explicitly with [`no_ref_names`], [`no_version_metadata`], or
-/// [`ref_resolution_unsupported`].
+/// so explicitly with [`no_ref_names`], [`no_version_metadata`],
+/// [`ref_resolution_unsupported`], or [`tags_at_commit_unsupported`].
 ///
 /// The two lookup methods below keep a default because theirs degrades to a real
 /// answer from the same registry - the stable version, the latest version -
@@ -293,6 +319,24 @@ pub trait Registry: Send + Sync {
     /// An `Err` carrying [`RefNotFound`] means the repository answered that the
     /// ref does not exist. Any other `Err` means the question went unanswered.
     async fn resolve_ref_to_commit(&self, package: &str, reference: &str) -> Result<String>;
+
+    /// List the tag names that point at `commit`, the inverse of
+    /// [`resolve_ref_to_commit`](Registry::resolve_ref_to_commit).
+    ///
+    /// A GitHub Action pinned to a bare commit carries no record of which
+    /// release it is, which is what stops such a pin from ever being updated.
+    /// The repository still knows, because the release that shipped that commit
+    /// tagged it, so the Actions updater asks here rather than making the user
+    /// annotate every pin by hand.
+    ///
+    /// A registry with no tag concept answers [`tags_at_commit_unsupported`].
+    /// `Known(vec![])` is a real answer meaning no tag names this commit, and a
+    /// caller must not soften it into "unknown": a commit off every release is
+    /// precisely what a caller has to refuse to guess about. An `Err` means the
+    /// lookup did not complete, which is a third fact again, and a registry that
+    /// can only see part of the tag list MUST report `Err` rather than a `Known`
+    /// list assembled from what it managed to read.
+    async fn tags_at_commit(&self, package: &str, commit: &str) -> Result<TagsAtCommit>;
 
     /// Registry name for display
     fn name(&self) -> &'static str;
@@ -446,6 +490,10 @@ mod tests {
 
         async fn resolve_ref_to_commit(&self, package: &str, reference: &str) -> Result<String> {
             Err(ref_resolution_unsupported(self.name(), package, reference))
+        }
+
+        async fn tags_at_commit(&self, _package: &str, _commit: &str) -> Result<TagsAtCommit> {
+            tags_at_commit_unsupported()
         }
 
         fn name(&self) -> &'static str {

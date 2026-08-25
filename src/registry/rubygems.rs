@@ -192,6 +192,10 @@ impl Registry for RubyGemsRegistry {
         ))
     }
 
+    async fn tags_at_commit(&self, _package: &str, _commit: &str) -> Result<super::TagsAtCommit> {
+        super::tags_at_commit_unsupported()
+    }
+
     fn name(&self) -> &'static str {
         "rubygems"
     }

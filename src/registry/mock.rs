@@ -1,6 +1,6 @@
 //! Mock registry for testing updaters without network calls.
 
-use super::{RefNotFound, Registry, VersionMeta};
+use super::{RefNotFound, Registry, TagsAtCommit, VersionMeta};
 use anyhow::{Result, anyhow};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
@@ -24,6 +24,10 @@ pub struct MockRegistry {
     resolved_refs: HashMap<(String, String), String>,
     /// Refs whose lookup fails without answering whether they exist
     unavailable_refs: HashSet<(String, String)>,
+    /// Commits whose tag lookup fails without answering which tags name them
+    unavailable_commit_tags: HashSet<(String, String)>,
+    /// Packages whose registry has no tag concept at all
+    without_tag_concept: HashSet<String>,
     /// Registry name
     name: &'static str,
 }
@@ -40,6 +44,8 @@ impl MockRegistry {
             unavailable_versions: HashSet::new(),
             resolved_refs: HashMap::new(),
             unavailable_refs: HashSet::new(),
+            unavailable_commit_tags: HashSet::new(),
+            without_tag_concept: HashSet::new(),
             name,
         }
     }
@@ -94,6 +100,23 @@ impl MockRegistry {
     pub fn with_unavailable_ref(mut self, package: &str, reference: &str) -> Self {
         self.unavailable_refs
             .insert((package.to_string(), reference.to_string()));
+        self
+    }
+
+    /// Declare a commit whose tag lookup fails without saying which tags name
+    /// it, as a rate limit or an outage does. A commit with no declared refs is
+    /// reported as tagged by nothing instead, which is the registry answering
+    /// the question.
+    pub fn with_unavailable_commit_tags(mut self, package: &str, commit: &str) -> Self {
+        self.unavailable_commit_tags
+            .insert((package.to_string(), commit.to_string()));
+        self
+    }
+
+    /// Declare a package whose registry has no tag concept, so a commit lookup
+    /// teaches the caller nothing rather than reporting the commit untagged.
+    pub fn without_tag_concept(mut self, package: &str) -> Self {
+        self.without_tag_concept.insert(package.to_string());
         self
     }
 
@@ -194,6 +217,33 @@ impl Registry for MockRegistry {
                 "Ref not found: {package}@{reference}"
             )))
         })
+    }
+
+    /// Derived from the declared refs rather than configured separately, so a
+    /// fixture cannot state that `v1.2.3` resolves to one commit while claiming
+    /// a different set of tags names it. A test that declares the resolution
+    /// gets the inverse for free and the two can never drift apart.
+    async fn tags_at_commit(&self, package: &str, commit: &str) -> Result<TagsAtCommit> {
+        if self.without_tag_concept.contains(package) {
+            return super::tags_at_commit_unsupported();
+        }
+        if self
+            .unavailable_commit_tags
+            .contains(&(package.to_string(), commit.to_string()))
+        {
+            return Err(anyhow!("Tag lookup failed: {package}@{commit}"));
+        }
+        let mut tags: Vec<String> = self
+            .resolved_refs
+            .iter()
+            .filter(|((pkg, _), sha)| pkg == package && sha.eq_ignore_ascii_case(commit))
+            .map(|((_, reference), _)| reference.clone())
+            .collect();
+        // A HashMap yields its entries in an arbitrary order, which would make
+        // the mock's answer differ between runs and hide an ordering bug in the
+        // caller behind an intermittent test.
+        tags.sort();
+        Ok(TagsAtCommit::Known(tags))
     }
 
     fn name(&self) -> &'static str {

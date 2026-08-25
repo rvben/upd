@@ -611,6 +611,7 @@ fn empty_floor_report(path: &Path) -> upd::output::UpdateFileReport {
         skipped_by_cooldown: Vec::new(),
         skipped: Vec::new(),
         capped: Vec::new(),
+        annotations: Vec::new(),
         errors: Vec::new(),
         warnings: Vec::new(),
     }
@@ -756,7 +757,7 @@ fn collect_selected_changes_for_file(
 }
 
 fn file_has_manifest_changes(result: &UpdateResult) -> bool {
-    !result.updated.is_empty() || !result.pinned.is_empty()
+    !result.updated.is_empty() || !result.pinned.is_empty() || !result.annotations.is_empty()
 }
 
 fn has_checkable_manifest_changes(result: &UpdateResult, filter: UpdateFilter) -> bool {
@@ -765,8 +766,17 @@ fn has_checkable_manifest_changes(result: &UpdateResult, filter: UpdateFilter) -
     // `--check` into signaling "pending work". Held-back entries do count:
     // they mean we are already writing a different version than the registry
     // latest, so there is something actionable (the safer pin).
+    //
+    // Annotations count for the plainest reason: `--apply` writes them. What
+    // `--check` reports is what an apply would do, so a check that stayed quiet
+    // about them would call a tree up to date that the next apply rewrites. The
+    // bump filter does not reach them - an annotation moves no version, so
+    // there is no bump level for `--major`/`--minor`/`--patch` to select on.
     let (_, _, _, filtered_total) = count_updates_by_type(&result.updated, filter);
-    filtered_total > 0 || !result.pinned.is_empty() || !result.held_back.is_empty()
+    filtered_total > 0
+        || !result.pinned.is_empty()
+        || !result.held_back.is_empty()
+        || !result.annotations.is_empty()
 }
 
 fn has_interactive_changes(
@@ -2439,6 +2449,7 @@ fn emit_update_json(input: UpdateReportInput<'_>, bounded: &BoundedOutputParams<
             .filter(|s| s.status == SkipStatus::NotExamined)
             .count(),
         capped: total_result.capped.len(),
+        annotations: total_result.annotations.len(),
         unfixable: count_unfixable_floors(&floor_reports),
         skipped_floors: count_skipped_floors(&floor_reports),
     };
@@ -2626,6 +2637,15 @@ async fn run_interactive_update(
                     for line in format_capped_lines(&path.display().to_string(), &file_result) {
                         println!("{}", line);
                     }
+                    // Reported here for the same reason, and left unwritten:
+                    // the accept/reject flow carries version transitions, and
+                    // an annotation is not one. A run without --interactive
+                    // writes them.
+                    for line in
+                        format_annotation_lines(&path.display().to_string(), &file_result, true)
+                    {
+                        println!("{}", line);
+                    }
                 }
 
                 for update in &file_result.updated {
@@ -2667,6 +2687,19 @@ async fn run_interactive_update(
         }
     }
 
+    let annotation_total: usize = scanned_results
+        .iter()
+        .map(|scanned| scanned.result.annotations.len())
+        .sum();
+    if annotation_total > 0 && !cli.quiet {
+        println!(
+            "{} {} SHA pin(s) can have the release they name written beside them; run without {} to write them",
+            "!".yellow().bold(),
+            annotation_total.to_string().cyan().bold(),
+            "--interactive".bold()
+        );
+    }
+
     if !has_interactive_changes(&pending_updates, &scanned_results) {
         if !cli.quiet {
             // A capped update has nothing to prompt for, since the ceiling
@@ -2683,10 +2716,12 @@ async fn run_interactive_update(
                     files.len(),
                     capped.to_string().yellow().bold()
                 );
-            } else {
+            } else if annotation_total == 0 {
                 // Failed lookups count as interactive changes (see
                 // has_interactive_changes), so this branch is only reached when
-                // every lookup succeeded and the tick is accurate.
+                // every lookup succeeded and the tick is accurate. An
+                // annotation waiting to be written makes it inaccurate too, and
+                // the line above has already said so.
                 println!(
                     "{} Scanned {} file(s), all dependencies up to date",
                     "✓".green(),
@@ -4911,6 +4946,68 @@ fn format_capped_line(
     )
 }
 
+/// The one rendering of an annotation, naming the release that was written and
+/// the commit it describes.
+///
+/// The version is shown without an arrow: nothing moved, and rendering it as
+/// `current → new` would read as an update that happened to keep its version.
+fn format_annotation_line(
+    path: &str,
+    line_number: Option<usize>,
+    package: &str,
+    version: &str,
+    commit: &str,
+    dry_run: bool,
+) -> String {
+    let location = match line_number {
+        Some(n) => format!("{}:{}:", path, n),
+        None => format!("{}:", path),
+    };
+    let action = if dry_run {
+        "Would annotate"
+    } else {
+        "Annotated"
+    };
+    format!(
+        "{} {} {} {} {}",
+        location.blue().underline(),
+        action.cyan(),
+        package.bold(),
+        version.cyan(),
+        format!("({})", short_commit(commit)).dimmed()
+    )
+}
+
+/// A commit rendered the way Git and GitHub render one in prose: enough to
+/// recognise, short enough to read beside a version.
+fn short_commit(commit: &str) -> &str {
+    let end = commit
+        .char_indices()
+        .nth(7)
+        .map_or(commit.len(), |(idx, _)| idx);
+    &commit[..end]
+}
+
+/// Every annotation for one file, rendered. A helper for the same reason
+/// `format_capped_lines` is one: `--interactive` reports them without going
+/// through the accept/reject flow, since there is no version choice to make.
+fn format_annotation_lines(path: &str, result: &UpdateResult, dry_run: bool) -> Vec<String> {
+    result
+        .annotations
+        .iter()
+        .map(|annotation| {
+            format_annotation_line(
+                path,
+                annotation.line_number,
+                &annotation.package,
+                &annotation.version,
+                &annotation.commit,
+                dry_run,
+            )
+        })
+        .collect()
+}
+
 /// Every held-back update for one file, rendered. Produced by a helper rather
 /// than printed in place so `--interactive` can report them without a
 /// terminal-driven test, the same reason `format_scan_diagnostics` exists.
@@ -4948,6 +5045,7 @@ fn print_file_result(
         && result.skipped_by_cooldown.is_empty()
         && result.skipped.is_empty()
         && result.capped.is_empty()
+        && result.annotations.is_empty()
     {
         return;
     }
@@ -5002,6 +5100,12 @@ fn print_file_result(
             new.cyan(),
             "(pinned)".dimmed()
         );
+    }
+
+    // An annotation always prints, whatever the --filter: filters select a bump
+    // level to write, and an annotation has no bump level to select on.
+    for line in format_annotation_lines(path, result, dry_run) {
+        println!("{line}");
     }
 
     // Cooldown-related lines share a per-file location, but not a cooldown
@@ -5168,6 +5272,7 @@ fn print_summary(
         .count();
     let not_examined_count = result.skipped.len() - blocked_count;
     let capped_count = result.capped.len();
+    let annotation_count = result.annotations.len();
 
     if filtered_total == 0
         && pinned_count == 0
@@ -5176,6 +5281,7 @@ fn print_summary(
         && blocked_count == 0
         && not_examined_count == 0
         && capped_count == 0
+        && annotation_count == 0
         && unfixable_floors == 0
         && skipped_floors == 0
     {
@@ -5220,6 +5326,22 @@ fn print_summary(
                 "{} {} package(s) to configured versions",
                 pinned_action,
                 pinned_count.to_string().cyan().bold()
+            );
+        }
+
+        // Show the annotation count. Nothing moved, so this cannot ride along
+        // on the update line, and the file was rewritten, so it cannot be
+        // folded into the up-to-date tally either.
+        if annotation_count > 0 {
+            let annotate_action = if dry_run {
+                "Would annotate"
+            } else {
+                "Annotated"
+            };
+            println!(
+                "{} {} package(s) with the release their pinned commit belongs to",
+                annotate_action,
+                annotation_count.to_string().cyan().bold()
             );
         }
 

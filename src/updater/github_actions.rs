@@ -17,13 +17,95 @@ pub struct GithubActionsUpdater {
     version_comment_re: Regex,
 }
 
+/// A SHA pin as the scan found it, before the repository has been consulted.
 #[derive(Debug, Clone)]
-struct ShaAction {
+struct ScannedShaPin {
     line_idx: usize,
     owner_repo: String,
     current_sha: String,
-    current_version: String,
+    /// The release named by the line's version comment, or `None` when the line
+    /// carries nothing after the pin and the release has to be read back from
+    /// the commit.
+    current_version: Option<String>,
     pinned_version: Option<String>,
+}
+
+/// A SHA pin with its release established, one way or another.
+#[derive(Debug, Clone)]
+struct ShaAction {
+    owner_repo: String,
+    current_sha: String,
+    version: PinVersion,
+    pinned_version: Option<String>,
+}
+
+/// How the release a SHA pin names was established.
+#[derive(Debug, Clone)]
+enum PinVersion {
+    /// Read from the version comment beside the pin. The comment is somebody's
+    /// claim about the commit, so it is verified against the repository before
+    /// anything is written.
+    Annotated(String),
+    /// Read back from the commit itself, because the line carries no comment.
+    /// True by construction and so not verified again; whatever else the run
+    /// does with this pin, it also writes the comment the line was missing.
+    Recovered(String),
+    /// The commit could not be tied to a release, so the pin is left alone.
+    Unrecoverable(RecoveryFailure),
+}
+
+/// Why a SHA pin with no version comment could not be tied to a release.
+///
+/// The four are kept apart because they call for different things: two are a
+/// property of the pin that a human has to resolve, one is a property of the
+/// registry, and one is a lookup that never answered and may well answer next
+/// run. Reporting them as one another would either invent a permanent problem
+/// out of a rate limit or describe an outage as a workflow that needs editing.
+#[derive(Debug, Clone)]
+enum RecoveryFailure {
+    /// The repository answered and no tag names the commit. A pin to a branch
+    /// head, or to a commit between releases, lands here.
+    Untagged,
+    /// Tags name the commit but none of them is a concrete version, so none can
+    /// say which release the commit was.
+    FloatingOnly(Vec<String>),
+    /// This registry has no tag concept, so nothing was learned either way.
+    Unsupported,
+    /// The lookup did not complete, so whether a release names the commit is
+    /// still unknown.
+    Failed(String),
+}
+
+impl RecoveryFailure {
+    /// Stable token for machine-readable output.
+    ///
+    /// `Failed` has none: a lookup that did not answer is reported as an error
+    /// rather than as a pin that needs editing.
+    fn reason(&self) -> &'static str {
+        match self {
+            Self::Untagged => "unreleased-commit",
+            Self::FloatingOnly(_) => "floating-tag-only",
+            Self::Unsupported | Self::Failed(_) => "missing-version-comment",
+        }
+    }
+
+    fn message(&self) -> String {
+        let remedy = "add a concrete version comment such as `# v4.2.2` to make this SHA pin safely updateable";
+        match self {
+            Self::Untagged => {
+                format!(
+                    "no tag names this commit, so the release it belongs to cannot be read back from the repository; {remedy}"
+                )
+            }
+            Self::FloatingOnly(tags) => {
+                format!(
+                    "this commit is named only by {}, which cannot say which release it is; {remedy}",
+                    tags.join(", ")
+                )
+            }
+            Self::Unsupported | Self::Failed(_) => remedy.to_string(),
+        }
+    }
 }
 
 /// Resolve a hand-written version string to the commit it names.
@@ -130,15 +212,75 @@ impl GithubActionsUpdater {
         semver::Version::parse(version.strip_prefix('v').unwrap_or(version)).is_ok()
     }
 
+    /// Whether anything follows the `uses:` reference on the line.
+    ///
+    /// A pin with nothing after it is one this updater may annotate. Anything
+    /// else - a floating `# v4`, a note to a colleague, the closing brace of a
+    /// flow mapping - is text somebody wrote, and there is no way to add a
+    /// version comment to it without deciding what it meant.
+    fn has_trailing_text(line: &str, uses_end: usize) -> bool {
+        let suffix = &line[uses_end..];
+        let unquoted = suffix.strip_prefix(['"', '\'']).unwrap_or(suffix);
+        !unquoted.trim().is_empty()
+    }
+
+    /// The release a commit belongs to, chosen from every tag that names it.
+    ///
+    /// A commit is routinely named by more than one tag: a release tag plus the
+    /// floating major alias the repository moves onto its newest release, and
+    /// occasionally two release tags when a version was re-cut without new code.
+    /// Only a concrete version can anchor a pin, since a floating `v7` cannot
+    /// say which release the commit was and writing it as the comment would make
+    /// the next run refuse the line, so the aliases are discarded and the highest
+    /// concrete version wins.
+    ///
+    /// The `v` prefix is kept as the repository publishes it. Where one version
+    /// is published under both spellings the prefixed one is taken, which is what
+    /// Actions repositories publish; either resolves back to this commit, so the
+    /// choice is style. It is decided here rather than left to the order the tags
+    /// arrived in, so one repository state always produces one comment.
+    fn release_at_commit(tags: &[String]) -> Option<String> {
+        tags.iter()
+            .filter_map(|tag| {
+                let parsed =
+                    semver::Version::parse(tag.strip_prefix('v').unwrap_or(tag.as_str())).ok()?;
+                Some((parsed, tag))
+            })
+            .max_by(|(left_version, left_tag), (right_version, right_tag)| {
+                left_version
+                    .cmp(right_version)
+                    .then_with(|| left_tag.cmp(right_tag))
+            })
+            .map(|(_, tag)| tag.clone())
+    }
+
+    /// Write the release a SHA pin names into the line, leaving the commit alone.
+    ///
+    /// A pin whose release was recovered from its own commit is not an update -
+    /// the same commit runs before and after - so the only change is the comment
+    /// the line was missing. Expressed as a pin rewrite from the commit to
+    /// itself, so an annotation written on its own cannot come out differently
+    /// from the one an update writes.
+    pub fn annotate_sha_pin(&self, line: &str, sha: &str, version: &str) -> Option<String> {
+        self.replace_sha_pin(line, sha, version, sha, version)
+    }
+
     /// Rewrite one `uses:` line from one verified SHA pin to another, moving the
     /// commit and its version comment together.
     ///
-    /// Returns `None` unless the line still carries `current_sha` annotated with
-    /// exactly `current_version`, which keeps the pin immutable: a line that
-    /// drifted since the scan is left alone rather than rewritten from stale
-    /// input. Every path that edits a SHA pin goes through here, so an
-    /// interactively approved update cannot rewrite the line differently from
-    /// the same update applied in one pass.
+    /// Returns `None` unless the line still carries `current_sha` and either the
+    /// version comment `current_version` or nothing at all, which keeps the pin
+    /// immutable: a line that drifted since the scan is left alone rather than
+    /// rewritten from stale input. Every path that edits a SHA pin goes through
+    /// here, so an interactively approved update cannot rewrite the line
+    /// differently from the same update applied in one pass.
+    ///
+    /// A line with nothing after the pin is one whose release was read back from
+    /// the commit, so the rewrite writes the comment as well as the commit. That
+    /// is safe whatever the line said at scan time: the comment written names
+    /// `new_sha`, which is beside it, and a line that has since acquired any
+    /// other trailing text is refused by the same check that refuses a
+    /// mismatched comment.
     pub fn replace_sha_pin(
         &self,
         line: &str,
@@ -156,14 +298,25 @@ impl GithubActionsUpdater {
         let mut updated = line.replacen(current_sha, new_sha, 1);
         let uses_end = self.uses_re.captures(&updated)?.get(0)?.end();
         let suffix = &updated[uses_end..];
-        let caps = self.version_comment_re.captures(suffix)?;
-        let version = caps.get(1)?;
-        if version.as_str() != current_version {
+        if let Some(caps) = self.version_comment_re.captures(suffix) {
+            let version = caps.get(1)?;
+            if version.as_str() != current_version {
+                return None;
+            }
+            let start = uses_end + version.start();
+            let end = uses_end + version.end();
+            updated.replace_range(start..end, new_version);
+            return Some(updated);
+        }
+        if Self::has_trailing_text(&updated, uses_end) {
             return None;
         }
-        let start = uses_end + version.start();
-        let end = uses_end + version.end();
-        updated.replace_range(start..end, new_version);
+        // Only the closing quote of a quoted reference survives; trailing spaces
+        // would sit between the pin and the comment being added.
+        let quote_len = usize::from(suffix.starts_with(['"', '\'']));
+        updated.truncate(uses_end + quote_len);
+        updated.push_str(" # ");
+        updated.push_str(new_version);
         Some(updated)
     }
 
@@ -337,7 +490,7 @@ impl Updater for GithubActionsUpdater {
         let mut ignored_actions: Vec<(usize, String, String)> = Vec::new();
         let mut pinned_actions: Vec<(usize, String, String, String)> = Vec::new();
         let mut actions_to_check: Vec<(usize, String, String)> = Vec::new();
-        let mut sha_actions: Vec<ShaAction> = Vec::new();
+        let mut scanned_sha_pins: Vec<ScannedShaPin> = Vec::new();
 
         let mut in_block_scalar = false;
         let mut block_parent_indent: usize = 0;
@@ -413,22 +566,26 @@ impl Updater for GithubActionsUpdater {
                         });
                         continue;
                     }
-                    let Some(current_version) =
-                        self.version_comment(line, caps.get(0).unwrap().end())
-                    else {
+                    let uses_end = caps.get(0).unwrap().end();
+                    let current_version = self.version_comment(line, uses_end);
+                    // A pin followed by something that is not a version comment
+                    // could still have its release read off the commit, but
+                    // writing it down means deciding what to do with text
+                    // somebody else put there, so the line is left for a human.
+                    if current_version.is_none() && Self::has_trailing_text(line, uses_end) {
                         result.skipped.push(super::SkippedUpdate {
                             package: owner_repo,
                             current: version_ref.to_string(),
                             status: SkipStatus::Blocked,
                             reason: "missing-version-comment",
-                            message: "add a concrete version comment such as `# v4.2.2` to make this SHA pin safely updateable".to_string(),
+                            message: "replace the trailing text with a concrete version comment such as `# v4.2.2` to make this SHA pin safely updateable".to_string(),
                             line_number: Some(line_idx + 1),
                         });
                         continue;
-                    };
+                    }
                     let pinned_version =
                         options.get_pinned_version(&owner_repo).map(str::to_string);
-                    sha_actions.push(ShaAction {
+                    scanned_sha_pins.push(ScannedShaPin {
                         line_idx,
                         owner_repo,
                         current_sha: version_ref.to_ascii_lowercase(),
@@ -472,9 +629,9 @@ impl Updater for GithubActionsUpdater {
                     repos.push(owner_repo.clone());
                 }
             }
-            for action in &sha_actions {
-                if action.pinned_version.is_none() && seen.insert(action.owner_repo.clone()) {
-                    repos.push(action.owner_repo.clone());
+            for pin in &scanned_sha_pins {
+                if pin.pinned_version.is_none() && seen.insert(pin.owner_repo.clone()) {
+                    repos.push(pin.owner_repo.clone());
                 }
             }
             repos
@@ -576,9 +733,78 @@ impl Updater for GithubActionsUpdater {
             action_info.insert(line_idx, (owner_repo, current_version, true));
         }
 
-        let sha_action_info: HashMap<usize, ShaAction> = sha_actions
+        // Pass 2c: a pin with no version comment names its release only through
+        // the commit, so the release is read back from the repository. Keyed by
+        // commit rather than by line: a workflow that uses one action in five
+        // jobs pins it at one commit, and one answer serves all five.
+        let commits_needing_release: Vec<(String, String)> = {
+            let mut seen = std::collections::HashSet::new();
+            scanned_sha_pins
+                .iter()
+                .filter(|pin| pin.current_version.is_none())
+                .map(|pin| (pin.owner_repo.clone(), pin.current_sha.clone()))
+                .filter(|key| seen.insert(key.clone()))
+                .collect()
+        };
+        let release_results = join_all(
+            commits_needing_release
+                .iter()
+                .map(|(owner_repo, commit)| registry.tags_at_commit(owner_repo, commit)),
+        )
+        .await;
+        let commit_releases: HashMap<(String, String), PinVersion> = commits_needing_release
             .into_iter()
-            .map(|action| (action.line_idx, action))
+            .zip(release_results)
+            .map(|(key, release_result)| {
+                let version = match release_result {
+                    Ok(crate::registry::TagsAtCommit::Known(tags)) => {
+                        match Self::release_at_commit(&tags) {
+                            Some(version) => PinVersion::Recovered(version),
+                            None if tags.is_empty() => {
+                                PinVersion::Unrecoverable(RecoveryFailure::Untagged)
+                            }
+                            None => PinVersion::Unrecoverable(RecoveryFailure::FloatingOnly(tags)),
+                        }
+                    }
+                    Ok(crate::registry::TagsAtCommit::Unsupported) => {
+                        PinVersion::Unrecoverable(RecoveryFailure::Unsupported)
+                    }
+                    Err(error) => {
+                        PinVersion::Unrecoverable(RecoveryFailure::Failed(error.to_string()))
+                    }
+                };
+                (key, version)
+            })
+            .collect();
+
+        let sha_action_info: HashMap<usize, ShaAction> = scanned_sha_pins
+            .into_iter()
+            .map(|pin| {
+                let version = match pin.current_version {
+                    Some(version) => PinVersion::Annotated(version),
+                    // Every pin without a comment was queried above, so the miss
+                    // arm is unreachable. It reports rather than assuming an
+                    // answer, because the assumption available here - that no
+                    // release names the commit - is one a reader would act on.
+                    None => commit_releases
+                        .get(&(pin.owner_repo.clone(), pin.current_sha.clone()))
+                        .cloned()
+                        .unwrap_or_else(|| {
+                            PinVersion::Unrecoverable(RecoveryFailure::Failed(
+                                "the release lookup for this commit did not run".to_string(),
+                            ))
+                        }),
+                };
+                (
+                    pin.line_idx,
+                    ShaAction {
+                        owner_repo: pin.owner_repo,
+                        current_sha: pin.current_sha,
+                        version,
+                        pinned_version: pin.pinned_version,
+                    },
+                )
+            })
             .collect();
 
         // Pass 3: Apply updates
@@ -603,39 +829,94 @@ impl Updater for GithubActionsUpdater {
             }
 
             if let Some(action) = sha_action_info.get(&line_idx) {
-                let expected_current = match resolve_version_ref(
-                    registry,
-                    &action.owner_repo,
-                    &action.current_version,
-                )
-                .await
-                {
-                    Ok(commit) => commit.to_ascii_lowercase(),
-                    Err(error) => {
-                        result.errors.push(format!(
-                            "{}@{}: failed to verify current SHA pin: {}",
-                            action.owner_repo, action.current_version, error
-                        ));
-                        new_lines.push(line.to_string());
-                        continue;
-                    }
-                };
+                let current_version =
+                    match &action.version {
+                        PinVersion::Annotated(version) => {
+                            let expected_current =
+                                match resolve_version_ref(registry, &action.owner_repo, version)
+                                    .await
+                                {
+                                    Ok(commit) => commit.to_ascii_lowercase(),
+                                    Err(error) => {
+                                        result.errors.push(format!(
+                                            "{}@{}: failed to verify current SHA pin: {}",
+                                            action.owner_repo, version, error
+                                        ));
+                                        new_lines.push(line.to_string());
+                                        continue;
+                                    }
+                                };
+                            if expected_current != action.current_sha {
+                                result.skipped.push(super::SkippedUpdate {
+                                    package: action.owner_repo.clone(),
+                                    current: action.current_sha.clone(),
+                                    status: SkipStatus::Blocked,
+                                    reason: "version-comment-mismatch",
+                                    message: format!(
+                                        "comment {} resolves to {}, not the pinned commit",
+                                        version, expected_current
+                                    ),
+                                    line_number: Some(line_num),
+                                });
+                                new_lines.push(line.to_string());
+                                continue;
+                            }
+                            version.clone()
+                        }
+                        // Recovered from the commit itself, so the check above would
+                        // be asking the repository to confirm what it just said.
+                        PinVersion::Recovered(version) => version.clone(),
+                        PinVersion::Unrecoverable(failure) => {
+                            match failure {
+                            RecoveryFailure::Failed(error) => result.errors.push(format!(
+                                "{}@{}: failed to look up the release this commit belongs to: {}",
+                                action.owner_repo, action.current_sha, error
+                            )),
+                            _ => result.skipped.push(super::SkippedUpdate {
+                                package: action.owner_repo.clone(),
+                                current: action.current_sha.clone(),
+                                status: SkipStatus::Blocked,
+                                reason: failure.reason(),
+                                message: failure.message(),
+                                line_number: Some(line_num),
+                            }),
+                        }
+                            new_lines.push(line.to_string());
+                            continue;
+                        }
+                    };
 
-                if expected_current != action.current_sha {
-                    result.skipped.push(super::SkippedUpdate {
-                        package: action.owner_repo.clone(),
-                        current: action.current_sha.clone(),
-                        status: SkipStatus::Blocked,
-                        reason: "version-comment-mismatch",
-                        message: format!(
-                            "comment {} resolves to {}, not the pinned commit",
-                            action.current_version, expected_current
+                // A recovered pin gets its comment whatever else happens to it:
+                // the release it names has been established, and dropping that
+                // because the run had no update to write would leave the next
+                // run establishing it again. The line the run keeps when it
+                // writes no update is therefore the annotated one, and the line
+                // an update rewrites is the annotated one too, so both go
+                // through one rewrite rather than two.
+                let (kept_line, annotation) = if matches!(action.version, PinVersion::Recovered(_))
+                {
+                    match self.annotate_sha_pin(line, &action.current_sha, &current_version) {
+                        Some(annotated) => (
+                            annotated,
+                            Some(super::Annotation {
+                                package: action.owner_repo.clone(),
+                                version: current_version.clone(),
+                                commit: action.current_sha.clone(),
+                                line_number: Some(line_num),
+                            }),
                         ),
-                        line_number: Some(line_num),
-                    });
-                    new_lines.push(line.to_string());
-                    continue;
-                }
+                        None => {
+                            result.errors.push(format!(
+                                "{}: could not safely annotate SHA pin at line {}",
+                                action.owner_repo, line_num
+                            ));
+                            new_lines.push(line.to_string());
+                            continue;
+                        }
+                    }
+                } else {
+                    (line.to_string(), None)
+                };
 
                 let is_config_pinned = action.pinned_version.is_some();
                 let target_result = match &action.pinned_version {
@@ -651,14 +932,15 @@ impl Updater for GithubActionsUpdater {
                         result
                             .errors
                             .push(format!("{}: {}", action.owner_repo, error));
-                        new_lines.push(line.to_string());
+                        result.annotations.extend(annotation);
+                        new_lines.push(kept_line);
                         continue;
                     }
                 };
                 if !Self::is_concrete_version(&target_version) {
                     result.skipped.push(super::SkippedUpdate {
                         package: action.owner_repo.clone(),
-                        current: action.current_version.clone(),
+                        current: current_version.clone(),
                         status: SkipStatus::Blocked,
                         reason: "non-concrete-target",
                         message: format!(
@@ -667,7 +949,8 @@ impl Updater for GithubActionsUpdater {
                         ),
                         line_number: Some(line_num),
                     });
-                    new_lines.push(line.to_string());
+                    result.annotations.extend(annotation);
+                    new_lines.push(kept_line);
                     continue;
                 }
 
@@ -677,7 +960,7 @@ impl Updater for GithubActionsUpdater {
                     let (outcome, note) = crate::updater::apply_cooldown(
                         registry,
                         &action.owner_repo,
-                        &action.current_version,
+                        &current_version,
                         &target_version,
                         None,
                         false,
@@ -700,11 +983,12 @@ impl Updater for GithubActionsUpdater {
                         } => {
                             result.skipped_by_cooldown.push((
                                 action.owner_repo.clone(),
-                                action.current_version.clone(),
+                                current_version.clone(),
                                 skipped_version,
                                 skipped_published_at,
                             ));
-                            new_lines.push(line.to_string());
+                            result.annotations.extend(annotation);
+                            new_lines.push(kept_line);
                             continue;
                         }
                     }
@@ -714,8 +998,7 @@ impl Updater for GithubActionsUpdater {
                 // comparison decides whether there is anything to do here.
                 // String equality would send an up-to-date pin whose comment
                 // spells the tag differently into the downgrade branch below.
-                let ordering =
-                    compare_versions(&target_version, &action.current_version, Lang::Actions);
+                let ordering = compare_versions(&target_version, &current_version, Lang::Actions);
                 if ordering == std::cmp::Ordering::Equal {
                     // A configured pin is an instruction, so a repo publishing
                     // `1.2.3` and `v1.2.3` at different commits makes the pinned
@@ -725,13 +1008,20 @@ impl Updater for GithubActionsUpdater {
                     // a pin: doing it for the latest version would cost a request
                     // for every action already up to date.
                     let satisfied = !is_config_pinned
-                        || target_version == action.current_version
+                        || target_version == current_version
                         || resolve_version_ref(registry, &action.owner_repo, &target_version)
                             .await
                             .is_ok_and(|commit| commit.to_ascii_lowercase() == action.current_sha);
                     if satisfied {
-                        result.unchanged += 1;
-                        new_lines.push(line.to_string());
+                        // An annotation is a change to the file, so a run that
+                        // wrote one has not left every dependency as it found
+                        // it. Counting it as unchanged as well would report the
+                        // same pin twice, once as written and once as not.
+                        if annotation.is_none() {
+                            result.unchanged += 1;
+                        }
+                        result.annotations.extend(annotation);
+                        new_lines.push(kept_line);
                         continue;
                     }
                 }
@@ -739,26 +1029,28 @@ impl Updater for GithubActionsUpdater {
                     result.warnings.push(downgrade_warning(
                         &action.owner_repo,
                         &target_version,
-                        &action.current_version,
+                        &current_version,
                     ));
-                    result.unchanged += 1;
-                    new_lines.push(line.to_string());
+                    if annotation.is_none() {
+                        result.unchanged += 1;
+                    }
+                    result.annotations.extend(annotation);
+                    new_lines.push(kept_line);
                     continue;
                 }
-                if !is_config_pinned
-                    && !options.allows_bump(&action.current_version, &target_version)
-                {
+                if !is_config_pinned && !options.allows_bump(&current_version, &target_version) {
                     // The update is known and writable; only the ceiling holds it
                     // back, which is `capped` rather than a `Blocked` skip. The
                     // other blocked reasons mean the line cannot be updated at
                     // all, and a reader needs to tell those two apart.
                     result.record_capped(
                         &action.owner_repo,
-                        &action.current_version,
+                        &current_version,
                         &target_version,
                         Some(line_num),
                     );
-                    new_lines.push(line.to_string());
+                    result.annotations.extend(annotation);
+                    new_lines.push(kept_line);
                     continue;
                 }
 
@@ -775,7 +1067,8 @@ impl Updater for GithubActionsUpdater {
                             "{}@{}: failed to resolve target SHA: {}",
                             action.owner_repo, target_version, error
                         ));
-                        new_lines.push(line.to_string());
+                        result.annotations.extend(annotation);
+                        new_lines.push(kept_line);
                         continue;
                     }
                 };
@@ -784,14 +1077,17 @@ impl Updater for GithubActionsUpdater {
                         "{}@{}: registry returned an invalid commit SHA",
                         action.owner_repo, target_version
                     ));
-                    new_lines.push(line.to_string());
+                    result.annotations.extend(annotation);
+                    new_lines.push(kept_line);
                     continue;
                 }
 
                 // The tag resolves the commit; the comment keeps the prefix style
                 // the file already used, the same way the non-pinned path does.
+                // A recovered pin has no style of its own, so it inherits the
+                // spelling the repository publishes its tags under.
                 let styled_version =
-                    Self::compute_updated_version(&action.current_version, &target_version, true);
+                    Self::compute_updated_version(&current_version, &target_version, true);
 
                 // A comment has to name the commit written beside it, or the next
                 // run reads the line as a forged pin and refuses it. Restyling is
@@ -817,10 +1113,14 @@ impl Updater for GithubActionsUpdater {
                     }
                 };
 
+                // Rewritten from the annotated line rather than the original, so
+                // a recovered pin's comment is written by the same routine that
+                // moves it and the update cannot come out shaped differently
+                // from the annotation it would have got on its own.
                 let Some(new_line) = self.replace_sha_pin(
-                    line,
+                    &kept_line,
                     &action.current_sha,
-                    &action.current_version,
+                    &current_version,
                     &new_sha,
                     &comment_version,
                 ) else {
@@ -828,14 +1128,18 @@ impl Updater for GithubActionsUpdater {
                         "{}: could not safely rewrite SHA pin at line {}",
                         action.owner_repo, line_num
                     ));
-                    new_lines.push(line.to_string());
+                    result.annotations.extend(annotation);
+                    new_lines.push(kept_line);
                     continue;
                 };
                 new_lines.push(new_line);
 
+                // The comment goes out as part of the update, which names both
+                // the version the pin was at and the one it moved to. Recording
+                // an annotation as well would report one line twice.
                 let change = super::ActionShaUpdate {
                     package: action.owner_repo.clone(),
-                    current_version: action.current_version.clone(),
+                    current_version: current_version.clone(),
                     new_version: comment_version.clone(),
                     current_commit: action.current_sha.clone(),
                     new_commit: new_sha,
@@ -845,21 +1149,21 @@ impl Updater for GithubActionsUpdater {
                 if is_config_pinned {
                     result.pinned.push((
                         action.owner_repo.clone(),
-                        action.current_version.clone(),
+                        current_version.clone(),
                         comment_version,
                         Some(line_num),
                     ));
                 } else {
                     result.updated.push((
                         action.owner_repo.clone(),
-                        action.current_version.clone(),
+                        current_version.clone(),
                         comment_version.clone(),
                         Some(line_num),
                     ));
                     if let Some((skipped_version, skipped_published_at)) = held_back_record {
                         result.held_back.push((
                             action.owner_repo.clone(),
-                            action.current_version.clone(),
+                            current_version.clone(),
                             comment_version,
                             skipped_version,
                             skipped_published_at,
@@ -1030,7 +1334,11 @@ impl Updater for GithubActionsUpdater {
             }
         }
 
-        if (!result.updated.is_empty() || !result.pinned.is_empty()) && !options.dry_run {
+        if (!result.updated.is_empty()
+            || !result.pinned.is_empty()
+            || !result.annotations.is_empty())
+            && !options.dry_run
+        {
             let line_ending = if content.contains("\r\n") {
                 "\r\n"
             } else {

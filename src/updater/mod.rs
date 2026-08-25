@@ -539,6 +539,9 @@ pub struct UpdateResult {
     /// Updates that exist but were not written because the bump exceeds the
     /// `--only-bump` / `--max-bump` ceiling.
     pub capped: Vec<CappedUpdate>,
+    /// Dependencies whose recorded identity was completed without their version
+    /// changing.
+    pub annotations: Vec<Annotation>,
 }
 
 /// An available update held back by the bump ceiling.
@@ -552,6 +555,25 @@ pub struct CappedUpdate {
     pub package: String,
     pub current: String,
     pub available: String,
+    pub line_number: Option<usize>,
+}
+
+/// A dependency whose identity was written into the file without its version
+/// changing.
+///
+/// A GitHub Actions SHA pin carries no version of its own: the release it names
+/// lives in a comment beside it, and a pin without that comment is one nothing
+/// can safely move. Recovering the release from the commit and writing it down
+/// changes the file while running exactly the same commit as before, so it is
+/// neither an update (no version moved) nor unchanged (bytes were written), and
+/// reporting it as either would misstate one of the two.
+#[derive(Debug, Clone)]
+pub struct Annotation {
+    pub package: String,
+    /// The release the dependency was found to be at.
+    pub version: String,
+    /// The immutable reference the annotation describes.
+    pub commit: String,
     pub line_number: Option<usize>,
 }
 
@@ -623,6 +645,7 @@ impl UpdateResult {
         self.action_sha_updates.extend(other.action_sha_updates);
         self.skipped.extend(other.skipped);
         self.capped.extend(other.capped);
+        self.annotations.extend(other.annotations);
     }
 
     /// Record an update that the bump ceiling refused to write.

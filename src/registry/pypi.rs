@@ -866,6 +866,11 @@ impl Registry for MultiPyPiRegistry {
         ))
     }
 
+    /// See `list_ref_names`: every index here is a `PyPiRegistry`.
+    async fn tags_at_commit(&self, _package: &str, _commit: &str) -> Result<super::TagsAtCommit> {
+        super::tags_at_commit_unsupported()
+    }
+
     fn name(&self) -> &'static str {
         "pypi"
     }
@@ -984,6 +989,11 @@ impl Registry for PyPiRegistry {
             package,
             reference,
         ))
+    }
+
+    /// Python distributions are not pinned to Git refs.
+    async fn tags_at_commit(&self, _package: &str, _commit: &str) -> Result<super::TagsAtCommit> {
+        super::tags_at_commit_unsupported()
     }
 
     fn name(&self) -> &'static str {

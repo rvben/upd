@@ -1,4 +1,4 @@
-use super::{RefNotFound, Registry, VersionMeta, get_with_retry, http_error_message};
+use super::{RefNotFound, Registry, TagsAtCommit, VersionMeta, get_with_retry, http_error_message};
 use crate::version::TagVersion;
 use anyhow::{Result, anyhow};
 use async_trait::async_trait;
@@ -21,6 +21,15 @@ struct ReleaseResponse {
 #[derive(Debug, Deserialize)]
 struct TagResponse {
     name: String,
+    #[serde(default)]
+    commit: Option<TagCommit>,
+}
+
+/// The commit a tag names. GitHub dereferences an annotated tag here, so this is
+/// the commit SHA rather than the tag object's own SHA.
+#[derive(Debug, Deserialize)]
+struct TagCommit {
+    sha: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -125,6 +134,111 @@ impl GitHubReleasesRegistry {
         let tags: Vec<TagResponse> = response.json().await?;
         Ok(tags.into_iter().map(|t| t.name).collect())
     }
+
+    /// Collect every tag naming `commit`, walking the paginated tag list.
+    ///
+    /// The whole list is read rather than stopping at the first match, because a
+    /// commit is routinely named by several tags at once - a release `v7.0.1`
+    /// beside a floating `v7` - and only the concrete one is usable. Stopping
+    /// early can see the floating tag alone and report a perfectly ordinary
+    /// release as unidentifiable.
+    async fn fetch_tags_at_commit(
+        &self,
+        owner: &str,
+        repo: &str,
+        commit: &str,
+    ) -> Result<Vec<String>> {
+        let target = commit.to_ascii_lowercase();
+        let mut url = format!(
+            "{}/repos/{}/{}/tags?per_page={}",
+            self.api_url, owner, repo, TAG_PAGE_SIZE
+        );
+        let mut names = Vec::new();
+
+        for _ in 0..MAX_TAG_PAGES {
+            let response = get_with_retry(&self.client, &url).await?;
+
+            if !response.status().is_success() {
+                let status = response.status();
+                let hint = match status.as_u16() {
+                    403 | 429 => Some("Set GITHUB_TOKEN to increase the API rate limit."),
+                    _ => None,
+                };
+                return Err(anyhow!(http_error_message(
+                    status,
+                    "Repository",
+                    &format!("{}/{}", owner, repo),
+                    hint,
+                )));
+            }
+
+            let next = next_page_url(response.headers(), &self.api_url);
+            let tags: Vec<TagResponse> = response.json().await?;
+
+            for tag in tags {
+                if tag
+                    .commit
+                    .is_some_and(|c| c.sha.eq_ignore_ascii_case(&target))
+                {
+                    names.push(tag.name);
+                }
+            }
+
+            match next {
+                Some(next_url) => url = next_url,
+                None => return Ok(names),
+            }
+        }
+
+        // Answering with the tags found so far would be indistinguishable from
+        // having read the whole list, and the caller writes a version comment
+        // from this answer. A repository this heavily tagged gets an honest
+        // failure instead of a pin annotated from a partial view.
+        Err(anyhow!(
+            "Repository '{owner}/{repo}' publishes more than {} tags; \
+             upd stopped before identifying commit {commit}. \
+             Annotate this pin by hand with the release it names.",
+            MAX_TAG_PAGES * TAG_PAGE_SIZE,
+        ))
+    }
+}
+
+/// Tags requested per page. GitHub's maximum, so the common repository is one
+/// request.
+const TAG_PAGE_SIZE: usize = 100;
+
+/// Pages walked before a commit lookup gives up and reports failure.
+const MAX_TAG_PAGES: usize = 20;
+
+/// The `rel="next"` URL from a `Link` header, if the response has one.
+///
+/// The URL is only followed when it addresses the same origin the request went
+/// to, so a redirecting proxy in front of the API cannot walk the client, and
+/// its `Authorization` header, onto a host the user never configured.
+fn next_page_url(headers: &reqwest::header::HeaderMap, api_url: &str) -> Option<String> {
+    let link = headers.get(reqwest::header::LINK)?.to_str().ok()?;
+
+    let candidate = link.split(',').find_map(|entry| {
+        let (target, params) = entry.split_once(';')?;
+        if !params
+            .split(';')
+            .any(|p| matches!(p.trim(), "rel=\"next\"" | "rel=next"))
+        {
+            return None;
+        }
+        let target = target.trim();
+        target
+            .strip_prefix('<')
+            .and_then(|t| t.strip_suffix('>'))
+            .map(str::to_string)
+    })?;
+
+    let base = reqwest::Url::parse(api_url).ok()?;
+    let next = reqwest::Url::parse(&candidate).ok()?;
+    (next.scheme() == base.scheme()
+        && next.host_str() == base.host_str()
+        && next.port_or_known_default() == base.port_or_known_default())
+    .then_some(candidate)
 }
 
 impl Default for GitHubReleasesRegistry {
@@ -265,6 +379,20 @@ impl Registry for GitHubReleasesRegistry {
         Ok(commit.sha.to_ascii_lowercase())
     }
 
+    /// A release tags the commit it shipped, so the repository can name the
+    /// release a bare commit pin refers to even though the workflow file cannot.
+    async fn tags_at_commit(&self, package: &str, commit: &str) -> Result<TagsAtCommit> {
+        let (owner, repo) = Self::extract_owner_repo(package)?;
+        if commit.len() != 40 || !commit.chars().all(|c| c.is_ascii_hexdigit()) {
+            return Err(anyhow!(
+                "'{commit}' is not a full 40-character commit SHA for '{owner}/{repo}'"
+            ));
+        }
+        self.fetch_tags_at_commit(owner, repo, commit)
+            .await
+            .map(TagsAtCommit::Known)
+    }
+
     async fn list_versions(&self, package: &str) -> Result<Vec<VersionMeta>> {
         let (owner, repo) = Self::extract_owner_repo(package)?;
         let url = format!("{}/repos/{}/{}/releases", self.api_url, owner, repo);
@@ -358,6 +486,180 @@ mod tests {
                 "HTTP {status} was classified wrongly: {error}"
             );
         }
+    }
+
+    /// A commit is routinely named by a release tag and a floating major at
+    /// once, and the caller needs both to pick the concrete one.
+    #[tokio::test]
+    async fn every_tag_naming_the_commit_is_returned() {
+        let sha = "1234567890abcdef1234567890abcdef12345678";
+        let other = "abcdefabcdefabcdefabcdefabcdefabcdefabcd";
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/repos/acme/action/tags"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(format!(
+                r#"[{{"name": "v2.1.0", "commit": {{"sha": "{sha}"}}}},
+                    {{"name": "v2", "commit": {{"sha": "{sha}"}}}},
+                    {{"name": "v2.0.9", "commit": {{"sha": "{other}"}}}}]"#
+            )))
+            .mount(&server)
+            .await;
+
+        assert_eq!(
+            registry(&server)
+                .tags_at_commit("acme/action", sha)
+                .await
+                .unwrap(),
+            TagsAtCommit::Known(vec!["v2.1.0".to_string(), "v2".to_string()])
+        );
+    }
+
+    /// A commit off every release is a real answer the caller must act on, not
+    /// an absence of one: it is what stops upd inventing a version comment for a
+    /// pin nobody can identify.
+    #[tokio::test]
+    async fn a_commit_no_tag_names_is_an_answer_not_an_absence() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/repos/acme/action/tags"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                r#"[{"name": "v1", "commit": {"sha": "abcdefabcdefabcdefabcdefabcdefabcdefabcd"}}]"#,
+            ))
+            .mount(&server)
+            .await;
+
+        assert_eq!(
+            registry(&server)
+                .tags_at_commit("acme/action", "1234567890abcdef1234567890abcdef12345678")
+                .await
+                .unwrap(),
+            TagsAtCommit::Known(Vec::new())
+        );
+    }
+
+    /// The tag naming the commit can sit on any page, so a lookup that read only
+    /// the first would report an ordinary release as unidentifiable.
+    #[tokio::test]
+    async fn the_tag_list_is_walked_across_pages() {
+        let sha = "1234567890abcdef1234567890abcdef12345678";
+        let other = "abcdefabcdefabcdefabcdefabcdefabcdefabcd";
+        let server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/repos/acme/action/tags"))
+            .and(query_param("page", "2"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(format!(
+                r#"[{{"name": "v9.9.9", "commit": {{"sha": "{sha}"}}}}]"#
+            )))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let next = format!(
+            "{}/repos/acme/action/tags?per_page=100&page=2",
+            server.uri()
+        );
+        Mock::given(method("GET"))
+            .and(path("/repos/acme/action/tags"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("link", format!(r#"<{next}>; rel="next""#).as_str())
+                    .set_body_string(format!(
+                        r#"[{{"name": "v1.0.0", "commit": {{"sha": "{other}"}}}}]"#
+                    )),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        assert_eq!(
+            registry(&server)
+                .tags_at_commit("acme/action", sha)
+                .await
+                .unwrap(),
+            TagsAtCommit::Known(vec!["v9.9.9".to_string()])
+        );
+    }
+
+    /// A `Link` header pointing somewhere else must not walk the client, and its
+    /// `Authorization` header, onto a host the user never configured. The walk
+    /// stops instead, which for this fixture means the off-origin page's tag is
+    /// never seen.
+    #[tokio::test]
+    async fn pagination_does_not_follow_a_link_to_another_origin() {
+        let sha = "1234567890abcdef1234567890abcdef12345678";
+        let server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/repos/acme/action/tags"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header(
+                        "link",
+                        r#"<https://attacker.example/repos/acme/action/tags?page=2>; rel="next""#,
+                    )
+                    .set_body_string("[]"),
+            )
+            .mount(&server)
+            .await;
+
+        assert_eq!(
+            registry(&server)
+                .tags_at_commit("acme/action", sha)
+                .await
+                .unwrap(),
+            TagsAtCommit::Known(Vec::new())
+        );
+    }
+
+    /// Answering with the tags read so far would be indistinguishable from
+    /// having read them all, and the caller writes a version comment from this
+    /// answer. A partial view is reported as a failure instead.
+    #[tokio::test]
+    async fn a_tag_list_too_long_to_read_fails_rather_than_reporting_none() {
+        let server = MockServer::start().await;
+        let next = format!(
+            "{}/repos/acme/action/tags?per_page=100&page=2",
+            server.uri()
+        );
+
+        Mock::given(method("GET"))
+            .and(path("/repos/acme/action/tags"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("link", format!(r#"<{next}>; rel="next""#).as_str())
+                    .set_body_string("[]"),
+            )
+            .mount(&server)
+            .await;
+
+        let error = registry(&server)
+            .tags_at_commit("acme/action", "1234567890abcdef1234567890abcdef12345678")
+            .await
+            .expect_err("a tag list that never ends must not answer 'no tags'");
+
+        assert!(
+            error.to_string().contains("more than"),
+            "the error must say the list was too long to read: {error}"
+        );
+    }
+
+    /// A rate limit is not evidence that a commit belongs to no release.
+    #[tokio::test]
+    async fn a_failed_tag_lookup_is_an_error_not_an_empty_answer() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/repos/acme/action/tags"))
+            .respond_with(ResponseTemplate::new(429))
+            .mount(&server)
+            .await;
+
+        assert!(
+            registry(&server)
+                .tags_at_commit("acme/action", "1234567890abcdef1234567890abcdef12345678")
+                .await
+                .is_err()
+        );
     }
 
     #[tokio::test]

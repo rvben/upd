@@ -1259,6 +1259,15 @@ mod tests {
             self.inner.resolve_ref_to_commit(package, reference).await
         }
 
+        async fn tags_at_commit(
+            &self,
+            package: &str,
+            commit: &str,
+        ) -> Result<crate::registry::TagsAtCommit> {
+            self.calls.fetch_add(1, AtomicOrdering::SeqCst);
+            self.inner.tags_at_commit(package, commit).await
+        }
+
         fn name(&self) -> &'static str {
             self.inner.name()
         }

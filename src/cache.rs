@@ -1,4 +1,4 @@
-use crate::registry::{Registry, VersionMeta};
+use crate::registry::{Registry, TagsAtCommit, VersionMeta};
 use anyhow::Result;
 use async_trait::async_trait;
 use directories::ProjectDirs;
@@ -289,6 +289,13 @@ impl<R: Registry> Registry for CachedRegistry<R> {
     /// current answer before it writes anything.
     async fn resolve_ref_to_commit(&self, package: &str, reference: &str) -> Result<String> {
         self.inner.resolve_ref_to_commit(package, reference).await
+    }
+
+    /// Forwarded without caching, for the same reason as `resolve_ref_to_commit`:
+    /// the answer decides which release a SHA pin is annotated with, and a tag
+    /// can be moved onto or off a commit between runs.
+    async fn tags_at_commit(&self, package: &str, commit: &str) -> Result<TagsAtCommit> {
+        self.inner.tags_at_commit(package, commit).await
     }
 
     fn name(&self) -> &'static str {
@@ -809,6 +816,62 @@ mod forwarding_tests {
         assert!(
             versions[0].published_at.is_some(),
             "the publish date cooldown depends on must survive the decorator"
+        );
+    }
+
+    #[tokio::test]
+    async fn cached_registry_forwards_commit_tag_lookup() {
+        let sha = "1234567890abcdef1234567890abcdef12345678";
+        let inner = MockRegistry::new("github-releases")
+            .with_resolved_ref("actions/checkout", "v4.2.2", sha)
+            .with_resolved_ref("actions/checkout", "v4", sha);
+        let cached = CachedRegistry::new(inner, Cache::new_shared(), true);
+
+        assert_eq!(
+            cached
+                .tags_at_commit("actions/checkout", sha)
+                .await
+                .unwrap(),
+            TagsAtCommit::Known(vec!["v4".to_string(), "v4.2.2".to_string()]),
+            "CachedRegistry must forward tags_at_commit to the inner registry"
+        );
+    }
+
+    /// The companion to the mock test above: this one reaches the wire, so a
+    /// forward that quietly answers on its own behalf leaves `expect(1)`
+    /// unsatisfied and fails when the server drops. Without it, a `tags_at_commit`
+    /// that never consulted the inner registry would return `Known(vec![])` and
+    /// every SHA pin in the fleet would report as belonging to no release.
+    #[tokio::test]
+    async fn cached_registry_commit_tag_lookup_reaches_the_http_layer() {
+        let sha = "1234567890abcdef1234567890abcdef12345678";
+        let other = "abcdefabcdefabcdefabcdefabcdefabcdefabcd";
+        let server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/repos/actions/checkout/tags"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(format!(
+                r#"[{{"name": "v4.2.2", "commit": {{"sha": "{sha}"}}}},
+                    {{"name": "v4", "commit": {{"sha": "{sha}"}}}},
+                    {{"name": "v4.2.1", "commit": {{"sha": "{other}"}}}}]"#
+            )))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let cached = CachedRegistry::new(
+            GitHubReleasesRegistry::with_api_url(server.uri()),
+            Cache::new_shared(),
+            true,
+        );
+
+        assert_eq!(
+            cached
+                .tags_at_commit("actions/checkout", sha)
+                .await
+                .unwrap(),
+            TagsAtCommit::Known(vec!["v4.2.2".to_string(), "v4".to_string()]),
+            "the decorator must return the tags the HTTP layer served for this commit"
         );
     }
 }

@@ -93,8 +93,28 @@ pub struct UpdateFileReport {
     pub skipped: Vec<SkippedEntry>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub capped: Vec<CappedEntry>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub annotations: Vec<AnnotationEntry>,
     pub errors: Vec<ErrorEntry>,
     pub warnings: Vec<String>,
+}
+
+/// A dependency whose identity was written into the file without its version
+/// changing.
+///
+/// Separate from `updates`, which records a version moving, and from the
+/// up-to-date tally, which counts dependencies the run left as it found them.
+/// An annotated dependency is at the same release before and after; what changed
+/// is that the file now says which one that is.
+#[derive(Debug, Serialize)]
+pub struct AnnotationEntry {
+    pub package: String,
+    /// The release the dependency was found to be at, written as the comment.
+    pub version: String,
+    /// The immutable reference the annotation describes.
+    pub commit: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub line: Option<usize>,
 }
 
 /// An available update the bump ceiling refused to write.
@@ -261,6 +281,13 @@ pub struct UpdateSummary {
     /// up-to-date tally: something is waiting for each one.
     #[serde(default, skip_serializing_if = "is_zero")]
     pub capped: usize,
+    /// Dependencies whose identity was written into the file without their
+    /// version changing, detailed in `files[].annotations[]`. Disjoint from
+    /// `updates_total`: nothing moved. Counted as pending work all the same,
+    /// because an `--apply` run writes them, so a `--check` run that found any
+    /// exits 1.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub annotations: usize,
     /// Newer releases `upd` found but has no mechanism to write, each visible
     /// in `files[].updates[]` with `status: "unfixable"` and an `error` naming
     /// the reason. Never folded into the up-to-date tally: a release is
@@ -579,6 +606,17 @@ pub fn build_update_file_report(
         })
         .collect();
 
+    let annotations = result
+        .annotations
+        .iter()
+        .map(|entry| AnnotationEntry {
+            package: entry.package.clone(),
+            version: entry.version.clone(),
+            commit: entry.commit.clone(),
+            line: entry.line_number,
+        })
+        .collect();
+
     let path_str = path.display().to_string();
     let errors = result
         .errors
@@ -597,6 +635,7 @@ pub fn build_update_file_report(
         skipped_by_cooldown,
         skipped,
         capped,
+        annotations,
         errors,
         warnings: result.warnings.clone(),
     }
