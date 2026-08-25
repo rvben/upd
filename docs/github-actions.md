@@ -177,9 +177,9 @@ digest together:
 
 ```yaml
 with:
-  upd-version: v0.7.0
+  upd-version: v0.7.1
   upd-target: x86_64-unknown-linux-gnu
-  upd-sha256: 6fad4e7086707242005149efd715a678dc3b20c5dda6ee9a559ca40b968a87df
+  upd-sha256: 5fd199ec1b159c925dd777992042fe70610aac9368427793f282f3609d57b4bd
 ```
 
 GitHub-hosted runner images are maintained over time rather than immutable. Use
