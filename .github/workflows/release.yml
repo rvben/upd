@@ -239,6 +239,10 @@ jobs:
             upd-*-${{ matrix.target }}.zip*
           name: release-${{ matrix.target }}
           if-no-files-found: error
+          # Archives are already compressed. Recompressing them can leave the
+          # self-hosted macOS runner without upload progress long enough for
+          # upload-artifact's five-minute stall detector to abort the job.
+          compression-level: 0
 
   sdist:
     runs-on: ubuntu-latest
