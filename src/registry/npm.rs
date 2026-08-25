@@ -1,5 +1,6 @@
 use super::utils::home_dir;
 use super::{Registry, VersionMeta, get_with_retry, http_error_message};
+use crate::npm_range;
 use anyhow::{Result, anyhow};
 use async_trait::async_trait;
 use reqwest::Client;
@@ -511,20 +512,32 @@ impl Registry for NpmRegistry {
         constraints: &str,
     ) -> Result<String> {
         let data = self.fetch_package_with_scope_resolution(package).await?;
-        let versions = Self::get_stable_versions(&data);
+        // The range is the gate here, so it does the filtering: a comparator
+        // admits a prerelease only when it names the same major.minor.patch and
+        // carries a prerelease of its own, which is node-semver's rule and the
+        // semver crate's alike. Dropping prereleases before the range is read
+        // instead leaves a range written over them (`1.0.0-beta.1 -
+        // 1.0.0-beta.5`) with nothing to choose from, and upd answers a range
+        // whose author asked for exactly those releases with "no version
+        // matches".
+        let versions = Self::get_all_versions(&data);
 
-        // Parse npm-style version requirements (^1.0.0, ~2.0.0, >=1.0.0 <2.0.0, etc.)
-        let req = semver::VersionReq::parse(constraints).map_err(|e| {
+        // npm's range grammar is not the semver crate's: a space means AND
+        // where the crate wants a comma, and `1.2.x`, `1.2.3 - 2.0.0` and
+        // `^1 || ^2` have no spelling in it at all. Handing the raw spec to
+        // VersionReq::parse rejects most real ranges, so translate first.
+        let reqs = npm_range::parse_npm_range(constraints).ok_or_else(|| {
             anyhow!(
-                "Failed to parse version constraints '{}': {}",
+                "Failed to parse version constraints '{}' for '{}'",
                 constraints,
-                e
+                package
             )
         })?;
 
-        // Find the highest version that matches
+        // Versions are sorted descending, so the first match is the newest one
+        // the range admits.
         for (version, version_str) in versions {
-            if req.matches(&version) {
+            if reqs.iter().any(|req| req.matches(&version)) {
                 return Ok(version_str);
             }
         }
@@ -862,6 +875,108 @@ mod tests {
             rc.published_at.is_some(),
             "5.0.0-rc.1 timestamp should parse"
         );
+    }
+
+    /// The registry is where the translation has to happen, and it is the one
+    /// layer a `MockRegistry` test cannot see: every updater test above it
+    /// answers from a map. Handing these ranges straight to
+    /// `VersionReq::parse` is what made upd report a dependency as current
+    /// without ever having looked it up.
+    #[tokio::test]
+    async fn a_range_in_npm_syntax_selects_the_newest_version_inside_it() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/ranged"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                r#"{
+              "name": "ranged",
+              "dist-tags": {"latest": "5.0.0"},
+              "versions": {
+                "4.17.0": {"version": "4.17.0"},
+                "4.18.0": {"version": "4.18.0"},
+                "4.19.0": {"version": "4.19.0"},
+                "5.0.0": {"version": "5.0.0"}
+              }
+            }"#,
+            ))
+            .mount(&mock_server)
+            .await;
+
+        let registry = NpmRegistry::with_registry_url(mock_server.uri());
+        for (constraint, expected) in [
+            (">=4.17.0 <5.0.0", "4.19.0"),
+            ("<5.0.0 >=4.17.0", "4.19.0"),
+            ("4.17.0 - 4.18.0", "4.18.0"),
+            ("4.18.x", "4.18.0"),
+            ("^4.17.0 || ^5.0.0", "5.0.0"),
+        ] {
+            let picked = registry
+                .get_latest_version_matching("ranged", constraint)
+                .await
+                .unwrap_or_else(|e| panic!("{constraint} was not evaluated: {e}"));
+            assert_eq!(picked, expected, "constraint {constraint}");
+        }
+
+        // And a spec outside the grammar has to fail loudly rather than answer.
+        let err = registry
+            .get_latest_version_matching("ranged", ">=1.0.0 <<2")
+            .await
+            .expect_err("an unreadable range is not an empty match");
+        assert!(err.to_string().contains(">=1.0.0 <<2"), "{err}");
+    }
+
+    /// A range written over prereleases is asking for prereleases. node-semver
+    /// admits one only where a comparator names its own major.minor.patch and
+    /// carries a prerelease itself, so the range decides and a filter in front
+    /// of it can only take choices away: a window that holds nothing else is
+    /// answered with "no version matches" while the releases its author named
+    /// sit in the registry.
+    #[tokio::test]
+    async fn a_range_written_over_prereleases_selects_from_them() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/pre"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                r#"{
+              "name": "pre",
+              "dist-tags": {"latest": "2.0.0"},
+              "versions": {
+                "1.0.0-beta.1": {"version": "1.0.0-beta.1"},
+                "1.0.0-beta.5": {"version": "1.0.0-beta.5"},
+                "1.0.0-beta.9": {"version": "1.0.0-beta.9"},
+                "1.0.0": {"version": "1.0.0"},
+                "2.0.0-rc.1": {"version": "2.0.0-rc.1"},
+                "2.0.0": {"version": "2.0.0"}
+              }
+            }"#,
+            ))
+            .mount(&mock_server)
+            .await;
+
+        let registry = NpmRegistry::with_registry_url(mock_server.uri());
+        for (constraint, expected) in [
+            (">=1.0.0-beta.1 <1.0.0", "1.0.0-beta.9"),
+            ("1.0.0-beta.1 - 1.0.0-beta.5", "1.0.0-beta.5"),
+            // A range that names no prerelease still admits none, so the
+            // 2.0.0-rc.1 the registry holds is not what `<3.0.0` reaches.
+            (">=1.0.0 <2.0.0", "1.0.0"),
+            (">=1.0.0 <3.0.0", "2.0.0"),
+            // The opt-in is per release, not per range: naming the 1.0.0
+            // prereleases says nothing about 2.0.0's.
+            (">=1.0.0-beta.1 <3.0.0", "2.0.0"),
+        ] {
+            let picked = registry
+                .get_latest_version_matching("pre", constraint)
+                .await
+                .unwrap_or_else(|e| panic!("{constraint} was not evaluated: {e}"));
+            assert_eq!(picked, expected, "constraint {constraint}");
+        }
     }
 
     #[test]

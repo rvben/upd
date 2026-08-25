@@ -11,6 +11,7 @@ pub mod interactive;
 pub mod lockfile;
 pub mod lockscan;
 pub mod normalize;
+pub mod npm_range;
 pub mod output;
 pub mod registry;
 pub mod schema;

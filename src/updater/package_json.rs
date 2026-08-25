@@ -1,9 +1,9 @@
-use super::npm_range::{SpecShape, classify, lower_bound_anchor, rewrite_lower_bound};
 use super::{
     FileType, ParsedDependency, UpdateOptions, UpdateResult, Updater, downgrade_warning,
-    read_file_safe, write_file_atomic,
+    read_file_safe, unreadable_error, unrewritable_warning, write_file_atomic,
 };
 use crate::align::compare_versions;
+use crate::npm_range::{SpecShape, admits, classify, lower_bound_anchor, rewrite_lower_bound};
 use crate::registry::Registry;
 use crate::updater::Lang;
 use crate::version::{is_prerelease_semver, match_version_precision};
@@ -234,14 +234,18 @@ impl Updater for PackageJsonUpdater {
             if let Some(deps) = json.get(section).and_then(|v| v.as_object()) {
                 for (package, version_value) in deps {
                     if let Some(version_str) = version_value.as_str() {
-                        // Skip non-version values (git urls, file paths, etc.)
-                        if version_str.starts_with("git")
-                            || version_str.starts_with("http")
-                            || version_str.starts_with("file:")
-                            || version_str.contains('/')
-                            || version_str == "*"
-                            || version_str == "latest"
-                        {
+                        // Classify the spec once. Every branch below routes on
+                        // the shape, and re-parsing the string per branch is how
+                        // the same spec ends up read two different ways.
+                        let spec_shape = classify(version_str);
+
+                        // A spec that names no published version - "*",
+                        // "latest", a workspace/file/link protocol, a git
+                        // shorthand - resolves somewhere other than the
+                        // registry. There is nothing to look up, so there is
+                        // nothing to report either: warning about these would
+                        // put a line on every dependency of every monorepo.
+                        if spec_shape == SpecShape::NoVersion {
                             continue;
                         }
 
@@ -261,14 +265,9 @@ impl Updater for PackageJsonUpdater {
                             continue;
                         }
 
-                        // Classify the spec once so both the pinned branch and the
-                        // comparator branch below can use the same shape without
-                        // re-parsing the string.
-                        let spec_shape = classify(version_str);
-
                         if let Some(pinned_version) = options.get_pinned_version(package) {
                             match spec_shape {
-                                SpecShape::SingleComparator | SpecShape::TwoComparatorRange => {
+                                SpecShape::BoundedRange | SpecShape::ShapeRange => {
                                     // Rewrite the lower bound of the range to the pinned
                                     // version while preserving the upper bound.  We bypass
                                     // pinned_packages because its later loop uses
@@ -295,8 +294,12 @@ impl Updater for PackageJsonUpdater {
                                             result.unchanged += 1;
                                         }
                                     } else {
-                                        result.warnings.push(format!(
-                                            "cannot pin range spec '{version_str}' for '{package}': no lower bound to rewrite"
+                                        // The pin was configured and could not be
+                                        // written, so the manifest does not say
+                                        // what the config says it should. That is
+                                        // a failed instruction, not a note.
+                                        result.errors.push(format!(
+                                            "cannot pin '{package}' to '{pinned_version}': '{version_str}' has no lower bound that version fits"
                                         ));
                                     }
                                     continue;
@@ -317,20 +320,54 @@ impl Updater for PackageJsonUpdater {
                             }
                         }
 
-                        // Route comparator-style specs through the range module.
-                        // These fail semver::Version::parse on the extracted token,
-                        // so they must be classified before the validity check below.
-                        if semver::Version::parse(&current_version).is_err() {
+                        // The path after this loop strips the operator off the
+                        // spec, looks up the newest release and writes the
+                        // operator back in front of it. That reproduces the
+                        // range the author wrote only where the operator names
+                        // a floor or a pin: ">=1.2.3" becomes ">=4.5.6" and
+                        // still means "at least this", while "<1.2.3" becomes
+                        // "<4.5.6", which raises a ceiling the author chose and
+                        // reports the loosened bound as an update. So the shape
+                        // decides the route; whether the token
+                        // extract_version_info pulled out happens to parse only
+                        // decides whether that path can use it at all.
+                        let names_a_floor = matches!(
+                            spec_shape,
+                            SpecShape::ExactPin | SpecShape::CaretOrTilde | SpecShape::BoundedRange
+                        );
+                        if !names_a_floor || semver::Version::parse(&current_version).is_err() {
                             match spec_shape {
-                                SpecShape::SingleComparator | SpecShape::TwoComparatorRange => {
-                                    match registry
-                                        .get_latest_version_matching(package, version_str)
-                                        .await
-                                    {
+                                SpecShape::BoundedRange | SpecShape::ShapeRange => {
+                                    // A bounded range carries a ceiling its
+                                    // author chose independently of the floor,
+                                    // so the replacement has to be picked from
+                                    // inside the range or the rewrite silently
+                                    // discards that ceiling. A shape range gets
+                                    // its ceiling from its own floor, like a
+                                    // caret, so it follows the newest release
+                                    // and the whole shape moves with it.
+                                    let bounded = spec_shape == SpecShape::BoundedRange;
+                                    let lookup = if bounded {
+                                        registry
+                                            .get_latest_version_matching(package, version_str)
+                                            .await
+                                    } else {
+                                        registry.get_latest_version(package).await
+                                    };
+                                    // Cooldown chooses among the same releases
+                                    // the lookup was free to return, so it is
+                                    // held to the spec only where the spec
+                                    // bounds the lookup. Reading a shape range
+                                    // as a constraint would confine the choice
+                                    // to the shape the manifest states today
+                                    // and report an eligible release outside
+                                    // it as one the window is holding back.
+                                    let cooldown_constraint =
+                                        if bounded { Some(version_str) } else { None };
+                                    match lookup {
                                         Ok(matched) => {
                                             // Apply cooldown using the lower-bound anchor as
-                                            // the current-version proxy and the original spec
-                                            // as the constraint so selection stays in-range.
+                                            // the current-version proxy.
                                             // held_back_info carries skipped info if cooldown
                                             // chose an older version; it is pushed to
                                             // result.held_back only after the update is confirmed.
@@ -339,14 +376,14 @@ impl Updater for PackageJsonUpdater {
                                                     lower_bound_anchor(version_str)
                                                 {
                                                     let anchor_is_pre =
-                                                        is_prerelease_semver(anchor);
+                                                        is_prerelease_semver(&anchor);
                                                     let (outcome, note) =
                                                         crate::updater::apply_cooldown(
                                                             registry,
                                                             package,
-                                                            anchor,
+                                                            &anchor,
                                                             &matched,
-                                                            Some(version_str),
+                                                            cooldown_constraint,
                                                             anchor_is_pre,
                                                             &options,
                                                         )
@@ -389,14 +426,39 @@ impl Updater for PackageJsonUpdater {
                                                 };
 
                                             if let Some(effective) = effective_version {
-                                                if let Some(new_spec) =
+                                                // A shape range is looked up
+                                                // without a constraint, and the
+                                                // release a registry calls the
+                                                // latest is a pointer its
+                                                // publisher can move back to an
+                                                // earlier one. Rewriting the
+                                                // shape to it would walk the
+                                                // manifest down and report the
+                                                // loss as an update.
+                                                if lower_bound_anchor(version_str).is_some_and(
+                                                    |anchor| {
+                                                        compare_versions(
+                                                            &effective,
+                                                            &anchor,
+                                                            Lang::Node,
+                                                        )
+                                                        .is_lt()
+                                                    },
+                                                ) {
+                                                    result.warnings.push(downgrade_warning(
+                                                        package,
+                                                        &effective,
+                                                        version_str,
+                                                    ));
+                                                    result.unchanged += 1;
+                                                } else if let Some(new_spec) =
                                                     rewrite_lower_bound(version_str, &effective)
                                                 {
                                                     if new_spec != version_str
                                                         && lower_bound_anchor(version_str)
                                                             .is_some_and(|cur| {
                                                                 !options
-                                                                    .allows_bump(cur, &effective)
+                                                                    .allows_bump(&cur, &effective)
                                                             })
                                                     {
                                                         // Bump level exceeds the
@@ -441,8 +503,13 @@ impl Updater for PackageJsonUpdater {
                                                         result.unchanged += 1;
                                                     }
                                                 } else {
-                                                    result.warnings.push(format!(
-                                                        "skipping range spec '{version_str}' for '{package}': no lower bound to bump"
+                                                    // Classification promised a
+                                                    // floor and the rewrite found
+                                                    // none, so the two disagree
+                                                    // about this spec and neither
+                                                    // reading can be trusted.
+                                                    result.errors.push(format!(
+                                                        "{package}: '{version_str}' was read as a range with a lower bound to raise, but it has none"
                                                     ));
                                                 }
                                             }
@@ -450,18 +517,61 @@ impl Updater for PackageJsonUpdater {
                                             // branch already pushed to skipped_by_cooldown.
                                         }
                                         Err(e) => {
-                                            result.warnings.push(format!("{package}: {e}"));
+                                            // The lookup did not happen, which is
+                                            // not the same as the dependency being
+                                            // current. It has to land in the
+                                            // "could not be checked" tally, not in
+                                            // a warning the green tick prints over.
+                                            result.errors.push(format!("{package}: {e}"));
+                                        }
+                                    }
+                                    continue;
+                                }
+                                SpecShape::OpaqueRange
+                                | SpecShape::ExactPin
+                                | SpecShape::CaretOrTilde => {
+                                    // Specs with no single floor to raise:
+                                    // alternation, where no branch is the obvious
+                                    // one to edit, upper-only bounds, which have
+                                    // no floor at all, and exclusive lower bounds
+                                    // (">1.2.3"), whose version is the one the
+                                    // author has ruled out. Exact pins and
+                                    // caret/tilde ranges reach here only when
+                                    // their anchor is spelled in a way the
+                                    // ordinary path cannot read ("=1.2.3",
+                                    // "^v1.2.3"), which leaves them equally
+                                    // unrewritable. upd can still say whether they
+                                    // are current, and saying so is the difference
+                                    // between a spec that is doing its job and one
+                                    // that has quietly frozen a dependency.
+                                    match registry.get_latest_version(package).await {
+                                        Ok(latest) => match admits(version_str, &latest) {
+                                            Some(true) => result.unchanged += 1,
+                                            Some(false) => result.warnings.push(
+                                                unrewritable_warning(package, &latest, version_str),
+                                            ),
+                                            None => result
+                                                .errors
+                                                .push(unreadable_error(package, version_str)),
+                                        },
+                                        Err(e) => {
+                                            result.errors.push(format!("{package}: {e}"));
                                         }
                                     }
                                     continue;
                                 }
                                 SpecShape::Unsupported => {
-                                    result.warnings.push(format!(
-                                        "skipping unrecognised version spec '{version_str}' for '{package}'"
-                                    ));
+                                    // Reporting this as a warning left the run
+                                    // exiting 0 with a green tick over a
+                                    // dependency nothing had looked at.
+                                    result.errors.push(unreadable_error(package, version_str));
                                     continue;
                                 }
-                                SpecShape::ExactPin | SpecShape::CaretOrTilde => {
+                                // Left the loop before the lookup, at the top of
+                                // the iteration. Repeated rather than made
+                                // unreachable so adding a shape here cannot
+                                // silently turn into a panic.
+                                SpecShape::NoVersion => {
                                     continue;
                                 }
                             }
@@ -1574,6 +1684,13 @@ mod tests {
             result.errors.is_empty(),
             "workspace: protocol must not produce errors"
         );
+        assert!(
+            result.warnings.is_empty(),
+            "nor warnings: a workspace dependency has no registry version to be \
+             behind, so a line about it is noise on every dependency of every \
+             monorepo: {:?}",
+            result.warnings
+        );
 
         let content = fs::read_to_string(file.path()).unwrap();
         assert!(content.contains("\"workspace:^\""));
@@ -1959,6 +2076,191 @@ mod tests {
         );
     }
 
+    /// A shape range takes its ceiling from its own floor, so the shape moves
+    /// with the release it is rewritten to and every newer release is a
+    /// candidate. Read as a constraint, `4.3.x` says the opposite: it pins the
+    /// choice inside 4.3, so an eligible 4.4.0 is reported as held back by a
+    /// cooldown window it is well outside of.
+    #[tokio::test]
+    async fn a_shape_range_is_not_confined_to_its_own_shape_by_cooldown() {
+        use crate::cooldown::CooldownPolicy;
+        use chrono::{Duration, Utc};
+
+        let now = Utc::now();
+
+        let mut file = NamedTempFile::with_suffix(".json").unwrap();
+        write!(
+            file,
+            r#"{{
+  "dependencies": {{
+    "shaped": "4.3.x"
+  }}
+}}"#
+        )
+        .unwrap();
+
+        let registry = MockRegistry::new("npm")
+            .with_version("shaped", "4.4.0")
+            .with_version_meta(
+                "shaped",
+                "4.3.0",
+                Some(now - Duration::days(400)),
+                false,
+                false,
+            )
+            .with_version_meta(
+                "shaped",
+                "4.4.0",
+                Some(now - Duration::days(30)),
+                false,
+                false,
+            );
+
+        let policy = CooldownPolicy {
+            default: Duration::days(7),
+            per_ecosystem: std::collections::HashMap::new(),
+            force_override: None,
+        };
+
+        let updater = PackageJsonUpdater::new();
+        let options = UpdateOptions::new(false, false).with_cooldown_policy(policy, now);
+
+        let result = updater
+            .update(file.path(), &registry, options)
+            .await
+            .unwrap();
+
+        assert!(
+            result.skipped_by_cooldown.is_empty(),
+            "4.4.0 is 30 days old under a 7 day window: {:?}",
+            result.skipped_by_cooldown
+        );
+        assert_eq!(result.updated.len(), 1, "{:?}", result.updated);
+        assert_eq!(result.updated[0].1, "4.3.x");
+        assert_eq!(result.updated[0].2, "4.4.x");
+
+        let content = fs::read_to_string(file.path()).unwrap();
+        assert!(content.contains("\"4.4.x\""), "got: {content}");
+    }
+
+    /// The mirror of the case above: a bounded range carries a ceiling its
+    /// author chose, so cooldown has to be held to it. Left unconstrained,
+    /// cooldown steps over the ceiling to find a release old enough to ship
+    /// and the floor is rewritten above the bound that is still standing
+    /// beside it, leaving a range no version can satisfy.
+    #[tokio::test]
+    async fn cooldown_may_not_step_over_the_ceiling_a_bounded_range_states() {
+        use crate::cooldown::CooldownPolicy;
+        use chrono::{Duration, Utc};
+
+        let now = Utc::now();
+
+        let mut file = NamedTempFile::with_suffix(".json").unwrap();
+        write!(
+            file,
+            r#"{{
+  "dependencies": {{
+    "bounded": ">=1.0.0 <2.0.0"
+  }}
+}}"#
+        )
+        .unwrap();
+
+        // 1.9.0 is the newest release inside the range and is too new to ship.
+        // 2.5.0 is old enough but sits above the ceiling, so it is not a
+        // candidate at all.
+        let registry = MockRegistry::new("npm")
+            .with_constrained("bounded", ">=1.0.0 <2.0.0", "1.9.0")
+            .with_version_meta(
+                "bounded",
+                "1.0.0",
+                Some(now - Duration::days(500)),
+                false,
+                false,
+            )
+            .with_version_meta(
+                "bounded",
+                "1.9.0",
+                Some(now - Duration::days(2)),
+                false,
+                false,
+            )
+            .with_version_meta(
+                "bounded",
+                "2.5.0",
+                Some(now - Duration::days(400)),
+                false,
+                false,
+            );
+
+        let policy = CooldownPolicy {
+            default: Duration::days(7),
+            per_ecosystem: std::collections::HashMap::new(),
+            force_override: None,
+        };
+
+        let updater = PackageJsonUpdater::new();
+        let options = UpdateOptions::new(false, false).with_cooldown_policy(policy, now);
+
+        let result = updater
+            .update(file.path(), &registry, options)
+            .await
+            .unwrap();
+
+        assert!(
+            result.updated.is_empty(),
+            "2.5.0 is outside the range and 1.9.0 is inside the window: {:?}",
+            result.updated
+        );
+        assert_eq!(
+            result.skipped_by_cooldown.len(),
+            1,
+            "{:?}",
+            result.skipped_by_cooldown
+        );
+        assert_eq!(result.skipped_by_cooldown[0].2, "1.9.0");
+
+        let content = fs::read_to_string(file.path()).unwrap();
+        assert!(content.contains("\">=1.0.0 <2.0.0\""), "got: {content}");
+    }
+
+    /// A shape range is looked up unconstrained, and npm's `latest` tag is a
+    /// pointer its publisher can move backwards: after a bad release it names
+    /// an earlier one. Rewriting the shape to it would walk the manifest down
+    /// a major and report the loss as an update.
+    #[tokio::test]
+    async fn a_shape_range_is_never_rewritten_downwards() {
+        let mut file = NamedTempFile::with_suffix(".json").unwrap();
+        write!(
+            file,
+            r#"{{
+  "dependencies": {{
+    "shaped": "4.3.x"
+  }}
+}}"#
+        )
+        .unwrap();
+
+        let registry = MockRegistry::new("npm").with_version("shaped", "4.2.9");
+
+        let updater = PackageJsonUpdater::new();
+        let result = updater
+            .update(file.path(), &registry, UpdateOptions::new(false, false))
+            .await
+            .unwrap();
+
+        assert!(result.updated.is_empty(), "{:?}", result.updated);
+        assert_eq!(result.warnings.len(), 1, "{:?}", result.warnings);
+        assert!(
+            result.warnings[0].contains("shaped") && result.warnings[0].contains("4.2.9"),
+            "{}",
+            result.warnings[0]
+        );
+
+        let content = fs::read_to_string(file.path()).unwrap();
+        assert!(content.contains("\"4.3.x\""), "got: {content}");
+    }
+
     /// Regression: pinning a comparator-range spec must preserve the upper bound.
     ///
     /// Before the fix, the pinned_packages loop would call match_version_precision on
@@ -2015,6 +2317,292 @@ mod tests {
         assert!(
             content.contains("\">=1.5.0 <2.0.0\""),
             "file must preserve upper bound, got: {content}"
+        );
+    }
+
+    /// A hyphen range is npm's other way of writing a floor and a ceiling, and
+    /// it has to survive the rewrite as one. Writing the raised floor as a bare
+    /// version would drop the ceiling the author chose.
+    #[tokio::test]
+    async fn a_hyphen_range_keeps_its_ceiling_and_its_shape() {
+        let mut file = NamedTempFile::with_suffix(".json").unwrap();
+        write!(
+            file,
+            r#"{{
+  "dependencies": {{
+    "hyphened": "4.17.0 - 4.18.0"
+  }}
+}}"#
+        )
+        .unwrap();
+
+        // The newest release is outside the range, so only a lookup that
+        // respects the ceiling can produce a version the range still admits.
+        let registry = MockRegistry::new("npm")
+            .with_version("hyphened", "5.0.0")
+            .with_constrained("hyphened", "4.17.0 - 4.18.0", "4.17.21");
+
+        let result = PackageJsonUpdater::new()
+            .update(file.path(), &registry, UpdateOptions::new(false, false))
+            .await
+            .unwrap();
+
+        assert_eq!(result.updated.len(), 1, "{:?}", result.warnings);
+        assert_eq!(result.updated[0].2, "4.17.21 - 4.18.0");
+        let content = fs::read_to_string(file.path()).unwrap();
+        assert!(content.contains("\"4.17.21 - 4.18.0\""), "{content}");
+    }
+
+    /// A wildcard range has no ceiling of its own: like a caret, it takes one
+    /// from wherever its floor lands. So it follows the newest release rather
+    /// than the newest release inside itself, and keeps its own width and
+    /// wildcard character on the way.
+    #[tokio::test]
+    async fn a_wildcard_range_follows_the_newest_release_and_keeps_its_shape() {
+        let mut file = NamedTempFile::with_suffix(".json").unwrap();
+        write!(
+            file,
+            r#"{{
+  "dependencies": {{
+    "shaped": "4.3.x",
+    "widened": "^1.2"
+  }}
+}}"#
+        )
+        .unwrap();
+
+        // The constrained answers are what a ceiling-respecting lookup would
+        // return. A wildcard range must not use them: it is not pinned inside
+        // itself, and taking 4.3.9 here would freeze it at 4.3 forever.
+        let registry = MockRegistry::new("npm")
+            .with_version("shaped", "4.4.3")
+            .with_constrained("shaped", "4.3.x", "4.3.9")
+            .with_version("widened", "3.1.4")
+            .with_constrained("widened", "^1.2", "1.9.9");
+
+        let result = PackageJsonUpdater::new()
+            .update(file.path(), &registry, UpdateOptions::new(false, false))
+            .await
+            .unwrap();
+
+        let mut written: Vec<(&str, &str)> = result
+            .updated
+            .iter()
+            .map(|(package, _, new, _)| (package.as_str(), new.as_str()))
+            .collect();
+        written.sort();
+        assert_eq!(
+            written,
+            vec![("shaped", "4.4.x"), ("widened", "^3.1")],
+            "warnings: {:?} errors: {:?}",
+            result.warnings,
+            result.errors
+        );
+    }
+
+    /// A range with no floor to raise is still a dependency upd can say
+    /// something true about. Saying it outright is the difference between a
+    /// spec doing its job and one that has quietly frozen a dependency.
+    #[tokio::test]
+    async fn a_range_that_cannot_be_rewritten_is_still_checked() {
+        let mut file = NamedTempFile::with_suffix(".json").unwrap();
+        write!(
+            file,
+            r#"{{
+  "dependencies": {{
+    "current": "^1.0.0 || ^2.0.0",
+    "behind": "^1.0.0 || ^2.0.0"
+  }}
+}}"#
+        )
+        .unwrap();
+
+        let registry = MockRegistry::new("npm")
+            .with_version("current", "2.5.0")
+            .with_version("behind", "3.0.0");
+
+        let result = PackageJsonUpdater::new()
+            .update(file.path(), &registry, UpdateOptions::new(false, false))
+            .await
+            .unwrap();
+
+        assert!(
+            result.updated.is_empty(),
+            "alternation must not be rewritten"
+        );
+        assert_eq!(
+            result.unchanged, 1,
+            "the range admits 2.5.0, so 'current' is current"
+        );
+        assert_eq!(result.warnings.len(), 1, "{:?}", result.warnings);
+        assert!(
+            result.warnings[0].starts_with("behind: 3.0.0 is available"),
+            "the warning has to name what is available: {}",
+            result.warnings[0]
+        );
+        assert!(result.errors.is_empty(), "{:?}", result.errors);
+    }
+
+    /// A bound that is not a floor must not be moved as if it were one. Both
+    /// forms here were rewritten and reported as updates: `"<4.0.0"` became
+    /// `"<4.18.1"`, raising a ceiling its author chose deliberately, and
+    /// `">4.0.0 <5.0.0"` became `">4.18.1 <5.0.0"`, a range that excludes the
+    /// very release written into it and leaves the next run unable to resolve
+    /// the dependency at all.
+    #[tokio::test]
+    async fn a_bound_that_is_not_a_floor_is_not_raised() {
+        let mut file = NamedTempFile::with_suffix(".json").unwrap();
+        write!(
+            file,
+            r#"{{
+  "dependencies": {{
+    "ceiling": "<4.0.0",
+    "ceiling_inclusive": "<=4.0.0",
+    "excluded_floor": ">4.0.0",
+    "excluded_floor_capped": ">4.0.0 <5.0.0",
+    "floor": ">=4.0.0"
+  }}
+}}"#
+        )
+        .unwrap();
+
+        let registry = MockRegistry::new("npm")
+            .with_version("ceiling", "4.18.1")
+            .with_version("ceiling_inclusive", "6.0.0")
+            .with_version("excluded_floor", "4.18.1")
+            .with_version("excluded_floor_capped", "6.0.0")
+            .with_constrained("excluded_floor_capped", ">4.0.0 <5.0.0", "4.18.1")
+            .with_version("floor", "4.18.1");
+
+        let result = PackageJsonUpdater::new()
+            .update(file.path(), &registry, UpdateOptions::new(false, false))
+            .await
+            .unwrap();
+
+        // The positive control: the one bound here that does name a floor still
+        // moves, so a run that rewrites nothing cannot pass this test.
+        let written: Vec<&str> = result
+            .updated
+            .iter()
+            .map(|(package, _, _, _)| package.as_str())
+            .collect();
+        assert_eq!(
+            written,
+            vec!["floor"],
+            "warnings: {:?} errors: {:?}",
+            result.warnings,
+            result.errors
+        );
+
+        let content = fs::read_to_string(file.path()).unwrap();
+        assert!(content.contains(r#""ceiling": "<4.0.0""#), "{content}");
+        assert!(
+            content.contains(r#""ceiling_inclusive": "<=4.0.0""#),
+            "{content}"
+        );
+        assert!(
+            content.contains(r#""excluded_floor": ">4.0.0""#),
+            "{content}"
+        );
+        assert!(
+            content.contains(r#""excluded_floor_capped": ">4.0.0 <5.0.0""#),
+            "{content}"
+        );
+        assert!(content.contains(r#""floor": ">=4.18.1""#), "{content}");
+
+        // ">4.0.0" already admits the newest release, so there is nothing to
+        // say about it; the other three are held below one and are reported.
+        assert_eq!(
+            result.unchanged, 1,
+            "'>4.0.0' admits 4.18.1, so it is current: {:?}",
+            result.warnings
+        );
+        let mut warned: Vec<&str> = result
+            .warnings
+            .iter()
+            .map(|w| w.split(':').next().unwrap())
+            .collect();
+        warned.sort();
+        assert_eq!(
+            warned,
+            vec!["ceiling", "ceiling_inclusive", "excluded_floor_capped"]
+        );
+        assert!(result.errors.is_empty(), "{:?}", result.errors);
+    }
+
+    /// A spec upd cannot read is a dependency nothing looked at. It goes in the
+    /// error tally, which withholds the green tick and fails the run, because a
+    /// warning left the run exiting 0 and claiming everything was checked.
+    #[tokio::test]
+    async fn a_spec_upd_cannot_read_is_an_error_not_a_warning() {
+        let mut file = NamedTempFile::with_suffix(".json").unwrap();
+        write!(
+            file,
+            r#"{{
+  "dependencies": {{
+    "broken": ">=1.0.0 <<2"
+  }}
+}}"#
+        )
+        .unwrap();
+
+        let registry = MockRegistry::new("npm").with_version("broken", "3.0.0");
+
+        let result = PackageJsonUpdater::new()
+            .update(file.path(), &registry, UpdateOptions::new(false, false))
+            .await
+            .unwrap();
+
+        assert!(result.warnings.is_empty(), "{:?}", result.warnings);
+        assert_eq!(result.errors.len(), 1, "{:?}", result.errors);
+        assert!(
+            result.errors[0].contains("broken") && result.errors[0].contains(">=1.0.0 <<2"),
+            "the error has to name the package and the spec: {}",
+            result.errors[0]
+        );
+        assert_eq!(
+            result.unchanged, 0,
+            "an unreadable spec must not be counted as up to date"
+        );
+    }
+
+    /// The counterpart to the test above: a spec that resolves somewhere other
+    /// than the registry, or at the registry but by a name it re-decides daily,
+    /// is not unreadable - it is out of scope. Reporting it would put a line on
+    /// every dependency of every monorepo, and `latest` is only the most common
+    /// of the tags npm resolves this way.
+    #[tokio::test]
+    async fn a_spec_that_names_no_published_version_is_reported_nowhere() {
+        let mut file = NamedTempFile::with_suffix(".json").unwrap();
+        write!(
+            file,
+            r#"{{
+  "dependencies": {{
+    "floating": "*",
+    "tagged": "latest",
+    "prereleased": "next",
+    "testing": "beta",
+    "sibling": "workspace:*",
+    "forked": "github:chalk/chalk#v5.3.0",
+    "local": "file:../local"
+  }}
+}}"#
+        )
+        .unwrap();
+
+        let registry = MockRegistry::new("npm");
+
+        let result = PackageJsonUpdater::new()
+            .update(file.path(), &registry, UpdateOptions::new(false, false))
+            .await
+            .unwrap();
+
+        assert!(result.updated.is_empty());
+        assert!(result.warnings.is_empty(), "{:?}", result.warnings);
+        assert!(result.errors.is_empty(), "{:?}", result.errors);
+        assert_eq!(
+            result.unchanged, 0,
+            "counting these as checked would let the tick speak for them"
         );
     }
 }
