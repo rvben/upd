@@ -83,9 +83,16 @@ on:
         description: Auto-merge method (squash, merge, or rebase)
         type: string
         default: squash
+      app-id:
+        description: GitHub App identifier; the recommended credential, minted per run
+        type: string
+        default: ""
     secrets:
+      app-private-key:
+        description: Private key of the App named by app-id
+        required: false
       pull-request-token:
-        description: GitHub App or fine-grained PAT; recommended so the PR triggers CI
+        description: Fine-grained PAT; an alternative to app-id for a single repository
         required: false
     outputs:
       changed:
@@ -178,6 +185,10 @@ on:
         type: choice
         options: [squash, merge, rebase]
         default: squash
+      app-id:
+        description: GitHub App identifier
+        type: string
+        default: ""
 
 permissions:
   contents: write
@@ -195,14 +206,25 @@ jobs:
       changed: ${{ steps.update.outputs.changed }}
       pull-request-url: ${{ steps.publish.outputs.url }}
     env:
-      GH_TOKEN: ${{ secrets.pull-request-token || github.token }}
       BASE_BRANCH: ${{ github.event.repository.default_branch }}
     steps:
+      # An installation token is minted per run and expires within the hour, so
+      # the repository stores a key rather than a credential that can be
+      # replayed. It is also the only one of the three that GitHub lets write
+      # `.github/workflows`, which `langs: actions` exists to update.
+      - name: Mint installation token
+        id: app-token
+        if: inputs.app-id != ''
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ inputs.app-id }}
+          private-key: ${{ secrets.app-private-key }}
+
       - name: Check out repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
-          token: ${{ secrets.pull-request-token || github.token }}
+          token: ${{ steps.app-token.outputs.token || secrets.pull-request-token || github.token }}
 
       - name: Validate configuration
         env:
@@ -339,6 +361,9 @@ jobs:
       - name: Apply policy-approved dependency updates
         id: update
         env:
+          # Unauthenticated GitHub API calls are throttled to 60 an hour, which
+          # upd reports as lookup errors rather than as up-to-date actions.
+          GITHUB_TOKEN: ${{ steps.app-token.outputs.token || secrets.pull-request-token || github.token }}
           LOCK: ${{ inputs.lock }}
           MAX_BUMP: ${{ inputs.max-bump }}
           MIN_AGE: ${{ inputs.min-age }}
@@ -371,6 +396,42 @@ jobs:
           else
             echo "changed=true" >> "$GITHUB_OUTPUT"
           fi
+
+      # GitHub refuses a push that creates or updates a file under
+      # .github/workflows unless the pushing credential carries the `workflows`
+      # permission, and GITHUB_TOKEN cannot be granted it: the `permissions:`
+      # block has no key for it. The push is the last thing this job does, so
+      # without this check every run does all of its work and then dies on a git
+      # error that names the restriction but not the remedy. Checked only when
+      # a workflow file actually changed, because a repository that updates
+      # other ecosystems never needs the stronger credential.
+      - name: Require a credential that may write workflow files
+        if: steps.update.outputs.changed == 'true'
+        env:
+          HAS_ELEVATED_TOKEN: ${{ steps.app-token.outputs.token != '' || secrets.pull-request-token != '' }}
+        run: |
+          set -euo pipefail
+          if [[ "$HAS_ELEVATED_TOKEN" == true ]]; then
+            exit 0
+          fi
+          if ! git diff --cached --name-only --diff-filter=ACMR -- \
+            '.github/workflows/*.yml' '.github/workflows/*.yaml' | grep --quiet .; then
+            exit 0
+          fi
+          {
+            echo "This run updates a workflow file, which GITHUB_TOKEN may not push."
+            echo
+            echo "Supply a credential that carries the workflows permission:"
+            echo "  - a GitHub App, via the app-id input and the app-private-key secret"
+            echo "  - or a fine-grained PAT with Workflows write, via pull-request-token"
+            echo
+            echo "Changed workflow files:"
+            git diff --cached --name-only --diff-filter=ACMR -- \
+              '.github/workflows/*.yml' '.github/workflows/*.yaml' | sed 's/^/  - /'
+            echo
+            echo "See https://github.com/rvben/upd/blob/main/docs/github-actions.md"
+          } | tee -a "$GITHUB_STEP_SUMMARY" >&2
+          exit 4
 
       - name: Validate changed workflow syntax
         if: steps.update.outputs.changed == 'true' && inputs.validate-actions
@@ -442,6 +503,7 @@ jobs:
           AUTO_MERGE: ${{ inputs.auto-merge }}
           BRANCH: ${{ inputs.branch }}
           CHANGED: ${{ steps.update.outputs.changed }}
+          GH_TOKEN: ${{ steps.app-token.outputs.token || secrets.pull-request-token || github.token }}
           COMMIT_MESSAGE: ${{ inputs.commit-message }}
           EXPECTED_REMOTE_SHA: ${{ steps.branch.outputs.expected-remote-sha }}
           LOCK: ${{ inputs.lock }}
