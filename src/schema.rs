@@ -199,7 +199,7 @@ fn build_schema() -> Value {
                 "output_fields": [
                     {"name": "command", "type": "string", "description": "Always \"update\""},
                     {"name": "mode", "type": "string", "description": "\"dry-run\" or \"applied\""},
-                    {"name": "files", "type": "array", "items": {"type": "object"}, "description": "Per-file update reports. Verified GitHub Actions SHA updates include reference_kind, current_commit, and latest_commit; pins left alone appear in skipped[] with status (\"blocked\" for a failed safety condition, \"not-examined\" when SHA-pin updates are off) and reason. A SHA pin carrying no version comment has the release its commit belongs to read back from the repository: recovered and already current, it appears in annotations[] with package, version, commit and line, the comment being written beside the unchanged commit; recovered and behind, it is an ordinary entry in updates[]; not recoverable, it is blocked in skipped[] with reason \"unreleased-commit\" (the repository has no tag at that commit), \"floating-tag-only\" (only a moving alias such as v7 names it) or \"missing-version-comment\" (the registry has no tags to consult). A lookup that failed to answer is an error, never a skip. Updates that exist but exceed the --max-bump/--only-bump ceiling appear in capped[] with package, current, available and bump, lock-only version floors included; they are never counted as up to date and do not affect the exit code, so a run can exit 0 with work waiting in capped[]. A capped entry omits line when the update has no manifest line of its own. Each entry in updates[] may also carry method and status for lock-only version floors"},
+                    {"name": "files", "type": "array", "items": {"type": "object"}, "description": "Per-file update reports. Verified GitHub Actions SHA updates include reference_kind, current_commit, and latest_commit; pins left alone appear in skipped[] with status (\"blocked\" for a failed safety condition, \"not-examined\" when SHA-pin updates are off) and reason. A SHA pin carrying no version comment has the release its commit belongs to read back from the repository: recovered and already current, it appears in annotations[] with package, version, commit and line, the comment being written beside the unchanged commit; recovered and behind, it is an ordinary entry in updates[]; not recoverable, it is blocked in skipped[] with reason \"unreleased-commit\" (the repository has no tag at that commit), \"floating-tag-only\" (only a moving alias such as v7 names it) or \"missing-version-comment\" (the registry has no tags to consult). A lookup that failed to answer is an error, never a skip. Updates that exist but exceed the --max-bump/--only-bump ceiling appear in capped[] with package, current, available and bump, lock-only version floors included; they are never counted as up to date and do not affect the exit code, so a run can exit 0 with work waiting in capped[]. A capped entry omits line when the update has no manifest line of its own. Each entry in updates[] may also carry method and status for lock-only version floors. Every file report also carries errors[] and warnings[]. A warning names a dependency that was checked and deliberately left as it was found, with something to say about it: a constraint that names no floor to raise (a bare ceiling, an exclusion, an npm OR range, a NuGet interval) and that the newest release has already outgrown. An error names a dependency that could not be checked at all, because its constraint could not be read or its registry lookup did not answer; any entry in errors[] exits 2"},
                     {"name": "summary", "type": "object", "description": "Aggregate counts (files_scanned, updates_total, etc.). updates_total counts only updates that were or would be written, so \"is anything waiting?\" also has to read capped (held back by the bump ceiling), unfixable (a newer release upd found but has no mechanism to write) and skipped_floors (a floor upd can write but was told not to, today only a cargo-precise floor under --no-lock); the latter two are detailed per package in files[].updates[] with status \"unfixable\"/\"skipped\" and an error. All three can be non-zero while updates_total is 0 and the exit code is 0. annotations counts SHA pins whose release was written beside them without their commit moving; it is disjoint from updates_total, but unlike capped it does affect the exit code, because --apply writes these and --check must report exactly what --apply would write"},
                     {"name": "warnings", "type": "array", "items": {"type": "object"}, "description": "Lockfile-discovery warnings (e.g. an ancestor lock outside the scanned paths), populated only when --package triggers lockfile scanning for version floors; signals incomplete coverage without failing the command"}
                 ]
@@ -324,7 +324,13 @@ fn build_schema() -> Value {
         "errors": [
             {
                 "kind": "io_error",
-                "description": "File read or write failed, or a required path does not exist",
+                "description": "A file could not be read or written, a required path does not exist, a lockfile refresh failed, or a dependency could not be checked. A dependency-level failure (a version constraint that cannot be read, a registry lookup that did not answer) is listed in files[].errors and exits 2 without an error envelope. Exit 2 takes precedence over every other exit code, including the outcome codes",
+                "exit_code": 2,
+                "retryable": false
+            },
+            {
+                "kind": "confirmation_required",
+                "description": "--interactive needs a terminal on stdin to prompt with, and stdin is not one. Use --check or --dry-run to preview the updates instead",
                 "exit_code": 2,
                 "retryable": false
             },
@@ -464,6 +470,43 @@ mod tests {
                 .any(|e| e["kind"].as_str() == Some("conflict")),
             "schema must declare a 'conflict' error kind"
         );
+    }
+
+    /// `errors[]` is the finite set of kinds a consumer writes handlers
+    /// against, so a kind the binary emits without declaring here reaches that
+    /// consumer as a failure it has no branch for. The literal envelopes are
+    /// what drift; the three kinds the fatal classifier picks between reach the
+    /// envelope through a variable and are declared with them.
+    #[test]
+    fn schema_declares_every_error_kind_the_binary_emits() {
+        const MAIN_SOURCE: &str = include_str!("main.rs");
+        let s = build_schema();
+        let declared: Vec<&str> = s["errors"]
+            .as_array()
+            .expect("errors must be an array")
+            .iter()
+            .filter_map(|e| e["kind"].as_str())
+            .collect();
+
+        let mut emitted: Vec<&str> = MAIN_SOURCE
+            .split("\"kind\": \"")
+            .skip(1)
+            .filter_map(|tail| tail.split('"').next())
+            .filter(|kind| !kind.is_empty())
+            .collect();
+        emitted.sort_unstable();
+        emitted.dedup();
+        assert!(
+            !emitted.is_empty(),
+            "the scan must find the error envelopes it is guarding"
+        );
+
+        for kind in emitted {
+            assert!(
+                declared.contains(&kind),
+                "error kind '{kind}' is emitted by the binary but not declared in errors[]; declared: {declared:?}"
+            );
+        }
     }
 
     /// Helper: find a command by name.
