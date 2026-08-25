@@ -67,6 +67,98 @@ pub(crate) fn downgrade_warning(pkg: &str, latest: &str, current: &str) -> Strin
     format!("skipping {pkg}: latest \"{latest}\" is not greater than current \"{current}\"")
 }
 
+/// One clause of a version specifier: an operator and the version it bounds.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Clause<'a> {
+    /// The comparison operator, empty for a bare version.
+    pub(crate) op: &'a str,
+    /// The version the operator bounds, without surrounding whitespace.
+    pub(crate) version: &'a str,
+    /// Byte range of `version` within the string the caller passed a slice of,
+    /// so a rewrite lands on this clause and not on a look-alike elsewhere.
+    pub(crate) range: std::ops::Range<usize>,
+}
+
+/// Read one clause of a specifier, with `version`'s byte range offset by `base`.
+///
+/// `None` when the clause holds no digit-led version, which is how a wildcard
+/// (`*`) and any other clause with nothing to rewrite answer.
+pub(crate) fn parse_clause(clause: &str, base: usize) -> Option<Clause<'_>> {
+    let after_space = clause.trim_start();
+    let op_at = clause.len() - after_space.len();
+    let op_len = after_space
+        .bytes()
+        .take_while(|b| matches!(b, b'=' | b'<' | b'>' | b'!' | b'~' | b'^'))
+        .count();
+    let (op, rest) = after_space.split_at(op_len);
+
+    let version = rest.trim_start();
+    let version_at = op_at + op_len + (rest.len() - version.len());
+    let version = version.trim_end();
+    if !version.starts_with(|c: char| c.is_ascii_digit()) {
+        return None;
+    }
+
+    Some(Clause {
+        op,
+        version,
+        range: base + version_at..base + version_at + version.len(),
+    })
+}
+
+/// Read a comma-separated specifier as the clause set it is.
+///
+/// Clauses that hold no version are dropped, so the iterator yields only what a
+/// caller could read or rewrite.
+pub(crate) fn comma_clauses(constraint: &str, base: usize) -> impl Iterator<Item = Clause<'_>> {
+    let mut offset = 0usize;
+    constraint.split(',').filter_map(move |clause| {
+        let clause_at = offset;
+        offset += clause.len() + 1;
+        parse_clause(clause, base + clause_at)
+    })
+}
+
+/// Whether `op` names the release the manifest is on, so an update may move it.
+///
+/// A bare version is Cargo's `serde = "1.0"`, which means `^1.0`, and RubyGems'
+/// `gem 'puma', '5.1.0'`, which means `= 5.1.0`; both are the release in use and
+/// both are the commonest floor there is. `>` names the one version the author
+/// ruled out, and a ceiling or an exclusion names none at all.
+pub(crate) fn operator_is_raisable(op: &str) -> bool {
+    matches!(op, "" | ">=" | "==" | "===" | "=" | "~=" | "~" | "~>" | "^")
+}
+
+/// Whether any clause can exclude the newest release, so the release to raise a
+/// floor to has to be looked up against the specifier rather than taken as the
+/// newest one published.
+///
+/// A pure lower bound never excludes it, and neither does an exact pin, whose
+/// whole purpose is to be replaced by the newest release.
+pub(crate) fn caps_from_above(clauses: &[Clause<'_>]) -> bool {
+    clauses
+        .iter()
+        .any(|c| matches!(c.op, "<" | "<=" | "~>" | "!="))
+}
+
+/// The clause an update may rewrite, or the first readable one when there is none.
+///
+/// Reported for both so that a caller which only reads a specifier, like the
+/// lockfile anchor, still gets a position; `raisable` is what says whether
+/// writing to that position is allowed.
+pub(crate) fn floor_of(clauses: &[Clause<'_>]) -> Option<SpecifierFloor> {
+    if let Some(clause) = clauses.iter().find(|c| operator_is_raisable(c.op)) {
+        return Some(SpecifierFloor {
+            range: clause.range.clone(),
+            raisable: true,
+        });
+    }
+    clauses.first().map(|clause| SpecifierFloor {
+        range: clause.range.clone(),
+        raisable: false,
+    })
+}
+
 /// The version a specifier is anchored at, and whether an update may move it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct SpecifierFloor {
@@ -103,46 +195,7 @@ pub(crate) struct SpecifierFloor {
 /// A clause whose version does not start with a digit is passed over entirely,
 /// so a wildcard (`*`) or otherwise unreadable requirement answers `None`.
 pub(crate) fn specifier_floor(constraint: &str, base: usize) -> Option<SpecifierFloor> {
-    let mut first: Option<std::ops::Range<usize>> = None;
-    let mut offset = 0usize;
-
-    for clause in constraint.split(',') {
-        let clause_at = offset;
-        offset += clause.len() + 1;
-
-        let after_space = clause.trim_start();
-        let op_at = clause_at + (clause.len() - after_space.len());
-        let op_len = after_space
-            .bytes()
-            .take_while(|b| matches!(b, b'=' | b'<' | b'>' | b'!' | b'~' | b'^'))
-            .count();
-        let (op, rest) = after_space.split_at(op_len);
-
-        let version = rest.trim_start();
-        let version_at = op_at + op_len + (rest.len() - version.len());
-        let version = version.trim_end();
-        if !version.starts_with(|c: char| c.is_ascii_digit()) {
-            continue;
-        }
-
-        let range = base + version_at..base + version_at + version.len();
-        if first.is_none() {
-            first = Some(range.clone());
-        }
-        // A bare version is Cargo's `serde = "1.0"`, which means `^1.0` and is
-        // the commonest floor there is.
-        if matches!(op, "" | ">=" | "==" | "===" | "=" | "~=" | "~" | "^") {
-            return Some(SpecifierFloor {
-                range,
-                raisable: true,
-            });
-        }
-    }
-
-    first.map(|range| SpecifierFloor {
-        range,
-        raisable: false,
-    })
+    floor_of(&comma_clauses(constraint, base).collect::<Vec<_>>())
 }
 
 /// Whether `constraint` admits `version`, read with the ecosystem's own parser.
@@ -183,6 +236,15 @@ pub(crate) fn unrewritable_warning(pkg: &str, latest: &str, spec: &str) -> Strin
 /// green tick over a dependency nothing has looked at.
 pub(crate) fn unreadable_error(pkg: &str, spec: &str) -> String {
     format!("cannot check '{pkg}': '{spec}' is not a version range upd can read")
+}
+
+/// Build the standard error for a pin that cannot be written into a specifier.
+///
+/// A specifier with no raisable floor has nowhere to put the pinned version, and
+/// writing it into a ceiling produces a specifier the pin does not satisfy. An
+/// error rather than a silent skip: the user asked for that exact version.
+pub(crate) fn unpinnable_error(pkg: &str, pinned: &str, spec: &str) -> String {
+    format!("cannot pin '{pkg}' to '{pinned}': '{spec}' has no lower bound that version fits")
 }
 
 /// UTF-8 byte-order mark, as bytes.
@@ -1467,23 +1529,23 @@ mod tests {
 
     /// The clause `specifier_floor` picks, as the text it points at, paired with
     /// whether an update may move it.
-    fn floor_of(constraint: &str) -> Option<(&str, bool)> {
+    fn floor_text(constraint: &str) -> Option<(&str, bool)> {
         specifier_floor(constraint, 0).map(|f| (&constraint[f.range], f.raisable))
     }
 
     #[test]
     fn a_specifier_floor_is_its_lower_bound_wherever_it_is_written() {
-        assert_eq!(floor_of(">=1.0,<2.0"), Some(("1.0", true)));
-        assert_eq!(floor_of("<2.0,>=1.0"), Some(("1.0", true)));
-        assert_eq!(floor_of("!=1.2,>=1.0,<2.0"), Some(("1.0", true)));
-        assert_eq!(floor_of("~=1.4"), Some(("1.4", true)));
-        assert_eq!(floor_of("==1.0.0"), Some(("1.0.0", true)));
-        assert_eq!(floor_of("===1.0.0"), Some(("1.0.0", true)));
-        assert_eq!(floor_of(">= 1.0 , < 2.0"), Some(("1.0", true)));
+        assert_eq!(floor_text(">=1.0,<2.0"), Some(("1.0", true)));
+        assert_eq!(floor_text("<2.0,>=1.0"), Some(("1.0", true)));
+        assert_eq!(floor_text("!=1.2,>=1.0,<2.0"), Some(("1.0", true)));
+        assert_eq!(floor_text("~=1.4"), Some(("1.4", true)));
+        assert_eq!(floor_text("==1.0.0"), Some(("1.0.0", true)));
+        assert_eq!(floor_text("===1.0.0"), Some(("1.0.0", true)));
+        assert_eq!(floor_text(">= 1.0 , < 2.0"), Some(("1.0", true)));
         // Cargo's bare requirement, which means `^1.0`.
-        assert_eq!(floor_of("1.0"), Some(("1.0", true)));
-        assert_eq!(floor_of("^1.0"), Some(("1.0", true)));
-        assert_eq!(floor_of("~1.0"), Some(("1.0", true)));
+        assert_eq!(floor_text("1.0"), Some(("1.0", true)));
+        assert_eq!(floor_text("^1.0"), Some(("1.0", true)));
+        assert_eq!(floor_text("~1.0"), Some(("1.0", true)));
     }
 
     /// A bound that names a version the specifier does not admit is not a floor,
@@ -1494,16 +1556,16 @@ mod tests {
     /// specifier need it and only callers that rewrite one need `raisable`.
     #[test]
     fn a_bound_the_specifier_does_not_admit_is_not_a_floor() {
-        assert_eq!(floor_of(">1.0"), Some(("1.0", false)));
-        assert_eq!(floor_of(">1.0,<2.0"), Some(("1.0", false)));
-        assert_eq!(floor_of("<2.0,>1.0"), Some(("2.0", false)));
-        assert_eq!(floor_of("<6"), Some(("6", false)));
-        assert_eq!(floor_of("<=6"), Some(("6", false)));
-        assert_eq!(floor_of("<6,!=5.0"), Some(("6", false)));
-        assert_eq!(floor_of("!=1.5"), Some(("1.5", false)));
+        assert_eq!(floor_text(">1.0"), Some(("1.0", false)));
+        assert_eq!(floor_text(">1.0,<2.0"), Some(("1.0", false)));
+        assert_eq!(floor_text("<2.0,>1.0"), Some(("2.0", false)));
+        assert_eq!(floor_text("<6"), Some(("6", false)));
+        assert_eq!(floor_text("<=6"), Some(("6", false)));
+        assert_eq!(floor_text("<6,!=5.0"), Some(("6", false)));
+        assert_eq!(floor_text("!=1.5"), Some(("1.5", false)));
         // Nothing that reads as a version at all.
-        assert_eq!(floor_of(""), None);
-        assert_eq!(floor_of("*"), None);
+        assert_eq!(floor_text(""), None);
+        assert_eq!(floor_text("*"), None);
     }
 
     /// The range is a byte offset into the caller's own string, not into the

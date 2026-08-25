@@ -1,7 +1,7 @@
 use super::{
     FileType, ParsedDependency, UpdateOptions, UpdateResult, Updater, cargo_admits,
-    downgrade_warning, read_file_safe, specifier_floor, unreadable_error, unrewritable_warning,
-    write_file_atomic,
+    downgrade_warning, read_file_safe, specifier_floor, unpinnable_error, unreadable_error,
+    unrewritable_warning, write_file_atomic,
 };
 use crate::align::compare_versions;
 use crate::registry::{CratesIoRegistry, Registry};
@@ -362,10 +362,9 @@ impl CargoTomlUpdater {
                 // The pin was configured and cannot be written, so the manifest
                 // does not say what the config says it should. That is a failed
                 // instruction, not a note.
-                result.errors.push(format!(
-                    "cannot pin '{key}' to '{pinned_version}': '{}' has no lower bound that version fits",
-                    req.text
-                ));
+                result
+                    .errors
+                    .push(unpinnable_error(&key, &pinned_version, &req.text));
             }
         }
 

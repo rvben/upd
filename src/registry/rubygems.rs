@@ -202,8 +202,19 @@ impl Registry for RubyGemsRegistry {
 }
 
 /// Check if a version matches a Ruby version constraint.
-/// Supports ~> (pessimistic), >=, <=, >, <, = operators.
-fn matches_ruby_constraint(version: &str, constraint: &str) -> bool {
+///
+/// Supports ~> (pessimistic), >=, <=, >, <, =, != operators. A Gemfile may state
+/// several at once (`gem 'rails', '>= 6.0', '< 7.0'`) and RubyGems requires all
+/// of them, so a comma-separated list is read as the conjunction it is.
+pub(crate) fn matches_ruby_constraint(version: &str, constraint: &str) -> bool {
+    constraint
+        .split(',')
+        .map(str::trim)
+        .filter(|c| !c.is_empty())
+        .all(|c| matches_single_ruby_constraint(version, c))
+}
+
+fn matches_single_ruby_constraint(version: &str, constraint: &str) -> bool {
     let parts: Vec<&str> = constraint.trim().splitn(2, ' ').collect();
     let (op, required) = match parts.len() {
         2 => (parts[0].trim(), parts[1].trim()),

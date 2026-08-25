@@ -1,6 +1,6 @@
 use super::{
     FileType, ParsedDependency, UpdateOptions, UpdateResult, Updater, downgrade_warning,
-    read_file_safe, unreadable_error, unrewritable_warning, write_file_atomic,
+    read_file_safe, unpinnable_error, unreadable_error, unrewritable_warning, write_file_atomic,
 };
 use crate::align::compare_versions;
 use crate::npm_range::{SpecShape, admits, classify, lower_bound_anchor, rewrite_lower_bound};
@@ -298,8 +298,10 @@ impl Updater for PackageJsonUpdater {
                                         // written, so the manifest does not say
                                         // what the config says it should. That is
                                         // a failed instruction, not a note.
-                                        result.errors.push(format!(
-                                            "cannot pin '{package}' to '{pinned_version}': '{version_str}' has no lower bound that version fits"
+                                        result.errors.push(unpinnable_error(
+                                            package,
+                                            pinned_version,
+                                            version_str,
                                         ));
                                     }
                                     continue;

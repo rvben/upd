@@ -23,6 +23,11 @@ pub use pypi::{MultiPyPiRegistry, PyPiCredentials, PyPiRegistry};
 pub use rubygems::RubyGemsRegistry;
 pub use terraform::TerraformRegistry;
 
+// The constraint grammars, shared with the updaters that have to decide whether
+// a release a manifest already admits is worth rewriting the manifest for.
+pub(crate) use rubygems::matches_ruby_constraint;
+pub(crate) use terraform::matches_terraform_constraint;
+
 use anyhow::{Result, anyhow};
 use async_trait::async_trait;
 use reqwest::{Client, Response};

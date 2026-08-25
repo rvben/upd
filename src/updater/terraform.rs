@@ -1,9 +1,10 @@
 use super::{
-    FileType, ParsedDependency, PendingVersion, UpdateOptions, UpdateResult, Updater,
-    downgrade_warning, read_file_safe, write_file_atomic,
+    Clause, FileType, ParsedDependency, PendingVersion, UpdateOptions, UpdateResult, Updater,
+    caps_from_above, comma_clauses, downgrade_warning, floor_of, operator_is_raisable,
+    read_file_safe, unpinnable_error, unrewritable_warning, write_file_atomic,
 };
 use crate::align::compare_versions;
-use crate::registry::Registry;
+use crate::registry::{Registry, matches_terraform_constraint};
 use crate::updater::Lang;
 use crate::version::match_version_precision;
 use anyhow::Result;
@@ -19,29 +20,135 @@ pub struct TerraformUpdater {
     version_re: Regex,
 }
 
+/// One version constraint of a Terraform dependency.
+///
+/// Terraform takes a comma-separated set of them and requires all of them at
+/// once, so `version = ">= 4.0, < 5.0"` means 4.x only. Reading the set as a
+/// single operator plus a single version leaves everything past the first
+/// comma inside "the version", which is how `">= 4.0, < 5.0"` was rewritten to
+/// `">= 6.61.0"` and the ceiling silently disappeared.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TfClause {
+    /// The comparison operator, empty for an exact version.
+    op: String,
+    /// The version the operator bounds.
+    version: String,
+    /// Byte range of `version` within the line, so a rewrite lands on this
+    /// clause rather than on the first text that happens to look like it.
+    range: std::ops::Range<usize>,
+}
+
 /// Parsed Terraform dependency (provider or module)
 struct ParsedTerraformDep {
     /// The source identifier (e.g., "hashicorp/aws" or "terraform-aws-modules/vpc/aws")
     source: String,
-    /// The version constraint operator (e.g., "~>", ">=", ""), empty for exact versions
-    operator: String,
-    /// The version number (e.g., "5.0", "5.1.0")
-    version: String,
+    /// Every constraint of the version attribute, in the order written.
+    clauses: Vec<TfClause>,
     /// Line number where the version attribute appears (0-indexed)
     version_line_idx: usize,
+}
+
+impl ParsedTerraformDep {
+    /// The constraints as Terraform requirement text, which is what the registry
+    /// and every message about this dependency quote.
+    fn constraint_text(&self) -> String {
+        self.clauses
+            .iter()
+            .map(|c| {
+                if c.op.is_empty() {
+                    c.version.clone()
+                } else {
+                    format!("{} {}", c.op, c.version)
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+
+    /// The constraints as the shared clause vocabulary reads them, so which
+    /// bound is a floor and which caps from above is decided in one place for
+    /// every ecosystem.
+    fn as_clauses(&self) -> Vec<Clause<'_>> {
+        self.clauses
+            .iter()
+            .map(|c| Clause {
+                op: &c.op,
+                version: &c.version,
+                range: c.range.clone(),
+            })
+            .collect()
+    }
+
+    /// The clause an update may rewrite, paired with whether it may.
+    fn floor(&self) -> Option<(&TfClause, bool)> {
+        let raisable = floor_of(&self.as_clauses())?.raisable;
+        let clause = if raisable {
+            self.clauses.iter().find(|c| operator_is_raisable(&c.op))?
+        } else {
+            self.clauses.first()?
+        };
+        Some((clause, raisable))
+    }
+
+    /// The version this declaration is anchored at, for reporting and comparison.
+    fn anchor_version(&self) -> &str {
+        self.floor().map(|(c, _)| c.version.as_str()).unwrap_or("")
+    }
+
+    /// The operator of the clause a rewrite would land on, which decides whether
+    /// the pessimistic `~>` rules apply.
+    fn anchor_op(&self) -> &str {
+        self.floor().map(|(c, _)| c.op.as_str()).unwrap_or("")
+    }
+
+    /// Whether a clause can exclude the newest release, so the release to raise
+    /// to has to be looked up against the constraints.
+    fn caps_from_above(&self) -> bool {
+        caps_from_above(&self.as_clauses())
+    }
+
+    /// Whether the release to consider has to be looked up against the
+    /// constraints rather than taken as the newest one published.
+    ///
+    /// Only a raisable floor is ever rewritten, and only then does a ceiling
+    /// above it decide which release can go in. Where nothing is rewritten the
+    /// question is the opposite one - does the newest release there is fit
+    /// these constraints - and a lookup made against the constraints cannot
+    /// answer it: it comes back with a release that fits by construction, so
+    /// every such declaration reads as current no matter how far behind it is.
+    fn lookup_is_constrained(&self) -> bool {
+        self.floor().is_some_and(|(_, raisable)| raisable) && self.caps_from_above()
+    }
 }
 
 impl TerraformUpdater {
     pub fn new() -> Self {
         let source_re = Regex::new(r#"^\s*source\s*=\s*"([^"]+)""#).expect("Invalid regex");
-        let version_re =
-            Regex::new(r#"^\s*version\s*=\s*"(~>\s*|>=\s*|<=\s*|>\s*|<\s*|=\s*|!=\s*)?([^"]+)""#)
-                .expect("Invalid regex");
+        // Captures the whole constraint set, operators and commas included; the
+        // clause vocabulary splits it. A regex that captures one operator plus
+        // one version cannot represent `">= 4.0, < 5.0"` at all.
+        let version_re = Regex::new(r#"^\s*version\s*=\s*"([^"]+)""#).expect("Invalid regex");
 
         Self {
             source_re,
             version_re,
         }
+    }
+
+    /// Read a version attribute's constraint set, with byte ranges relative to
+    /// the line so a rewrite can splice one clause and leave the rest standing.
+    fn parse_constraint(caps: &regex::Captures<'_>) -> Vec<TfClause> {
+        let m = match caps.get(1) {
+            Some(m) => m,
+            None => return Vec::new(),
+        };
+        comma_clauses(m.as_str(), m.start())
+            .map(|c| TfClause {
+                op: c.op.to_string(),
+                version: c.version.to_string(),
+                range: c.range,
+            })
+            .collect()
     }
 
     fn parse_content(&self, content: &str) -> Vec<ParsedTerraformDep> {
@@ -116,18 +223,14 @@ impl TerraformUpdater {
                     && let Some((ref source, _)) = provider_source
                     && brace_depth >= provider_block_depth
                 {
-                    let operator = caps
-                        .get(1)
-                        .map(|m| m.as_str().trim().to_string())
-                        .unwrap_or_default();
-                    let version = caps.get(2).unwrap().as_str().trim().to_string();
-
-                    deps.push(ParsedTerraformDep {
-                        source: source.clone(),
-                        operator,
-                        version,
-                        version_line_idx: line_idx,
-                    });
+                    let clauses = Self::parse_constraint(&caps);
+                    if !clauses.is_empty() {
+                        deps.push(ParsedTerraformDep {
+                            source: source.clone(),
+                            clauses,
+                            version_line_idx: line_idx,
+                        });
+                    }
                 }
 
                 // Reset provider source when exiting a provider's block
@@ -166,18 +269,14 @@ impl TerraformUpdater {
                 if let Some(caps) = self.version_re.captures(line)
                     && let Some(ref source) = module_source
                 {
-                    let operator = caps
-                        .get(1)
-                        .map(|m| m.as_str().trim().to_string())
-                        .unwrap_or_default();
-                    let version = caps.get(2).unwrap().as_str().trim().to_string();
-
-                    deps.push(ParsedTerraformDep {
-                        source: source.clone(),
-                        operator,
-                        version,
-                        version_line_idx: line_idx,
-                    });
+                    let clauses = Self::parse_constraint(&caps);
+                    if !clauses.is_empty() {
+                        deps.push(ParsedTerraformDep {
+                            source: source.clone(),
+                            clauses,
+                            version_line_idx: line_idx,
+                        });
+                    }
                 }
             }
         }
@@ -185,13 +284,17 @@ impl TerraformUpdater {
         deps
     }
 
-    fn update_line(&self, line: &str, old_version: &str, new_version: &str) -> String {
-        line.replacen(old_version, new_version, 1)
-    }
-
-    /// Check if the constraint has an upper bound that requires constraint-aware lookup
-    fn has_upper_bound(operator: &str) -> bool {
-        matches!(operator, "~>" | "<" | "<=" | "!=")
+    /// Write `new_version` over the byte range the old one occupies.
+    ///
+    /// Positional rather than textual: `version = ">= 4.0, < 5.0"` holds two
+    /// versions and a search for the first match of either would land on the
+    /// wrong clause whenever the floor is not written first.
+    fn update_line(&self, line: &str, range: &std::ops::Range<usize>, new_version: &str) -> String {
+        let mut updated = String::with_capacity(line.len() + new_version.len());
+        updated.push_str(&line[..range.start]);
+        updated.push_str(new_version);
+        updated.push_str(&line[range.end..]);
+        updated
     }
 
     /// Computes the new `~>` constraint version when the existing constraint no longer
@@ -307,16 +410,27 @@ impl Updater for TerraformUpdater {
                 ignored_packages.push((
                     dep.version_line_idx,
                     dep.source.clone(),
-                    dep.version.clone(),
+                    dep.anchor_version().to_string(),
                 ));
                 continue;
             }
 
             if let Some(pinned_version) = options.get_pinned_version(&dep.source) {
+                if !dep.floor().is_some_and(|(_, raisable)| raisable) {
+                    // The pin was configured and cannot be written, so the file
+                    // does not say what the config says it should. That is a
+                    // failed instruction, not a note.
+                    result.errors.push(unpinnable_error(
+                        &dep.source,
+                        pinned_version,
+                        &dep.constraint_text(),
+                    ));
+                    continue;
+                }
                 pinned_packages.push((
                     dep.version_line_idx,
                     dep.source.clone(),
-                    dep.version.clone(),
+                    dep.anchor_version().to_string(),
                     pinned_version.to_string(),
                 ));
                 continue;
@@ -330,7 +444,7 @@ impl Updater for TerraformUpdater {
         }
 
         // Deduplicate registry lookups
-        let unique_sources: Vec<(String, String, String)> = {
+        let unique_sources: Vec<(String, String, bool)> = {
             let mut seen = std::collections::HashSet::new();
             fetch_deps
                 .iter()
@@ -338,8 +452,8 @@ impl Updater for TerraformUpdater {
                     if seen.insert(dep.source.clone()) {
                         Some((
                             dep.source.clone(),
-                            dep.operator.clone(),
-                            dep.version.clone(),
+                            dep.constraint_text(),
+                            dep.lookup_is_constrained(),
                         ))
                     } else {
                         None
@@ -350,16 +464,9 @@ impl Updater for TerraformUpdater {
 
         let version_futures: Vec<_> = unique_sources
             .iter()
-            .map(|(name, operator, version)| async move {
-                if Self::has_upper_bound(operator) {
-                    let constraint = if operator.is_empty() {
-                        format!("= {}", version)
-                    } else {
-                        format!("{} {}", operator, version)
-                    };
-                    registry
-                        .get_latest_version_matching(name, &constraint)
-                        .await
+            .map(|(name, constraint, constrained)| async move {
+                if *constrained {
+                    registry.get_latest_version_matching(name, constraint).await
                 } else {
                     registry.get_latest_version(name).await
                 }
@@ -414,24 +521,32 @@ impl Updater for TerraformUpdater {
             let line_num = line_idx + 1;
 
             if let Some(dep) = dep_by_line.get(&line_idx) {
+                let Some((floor, raisable)) = dep.floor() else {
+                    new_lines.push(line.to_string());
+                    continue;
+                };
+                let anchor = floor.version.clone();
+                let floor_range = floor.range.clone();
+                let anchor_op = dep.anchor_op().to_string();
+
                 if let Some(version_result) = version_map.remove(&line_idx) {
                     match version_result {
                         PendingVersion::Pinned(pinned_version) => {
                             let matched_version = if options.full_precision {
                                 pinned_version.clone()
                             } else {
-                                match_version_precision(&dep.version, &pinned_version)
+                                match_version_precision(&anchor, &pinned_version)
                             };
-                            if matched_version != dep.version {
+                            if matched_version != anchor {
                                 result.pinned.push((
                                     dep.source.clone(),
-                                    dep.version.clone(),
+                                    anchor.clone(),
                                     matched_version.clone(),
                                     Some(line_num),
                                 ));
                                 new_lines.push(self.update_line(
                                     line,
-                                    &dep.version,
+                                    &floor_range,
                                     &matched_version,
                                 ));
                                 modified = true;
@@ -441,15 +556,31 @@ impl Updater for TerraformUpdater {
                             }
                         }
                         PendingVersion::Registry(Ok(latest_version)) => {
+                            // A bound that is not a floor names no release to carry
+                            // forward: `> 4.0` names the one version ruled out and a
+                            // ceiling or exclusion names none at all. Say what is
+                            // available and leave the declaration alone.
+                            if !raisable {
+                                let constraint_text = dep.constraint_text();
+                                if matches_terraform_constraint(&latest_version, &constraint_text) {
+                                    result.unchanged += 1;
+                                } else {
+                                    result.warnings.push(unrewritable_warning(
+                                        &dep.source,
+                                        &latest_version,
+                                        &constraint_text,
+                                    ));
+                                }
+                                new_lines.push(line.to_string());
+                                continue;
+                            }
+
                             // For `~>` constraints, if the latest version still falls within
                             // the range the constraint already expresses, leave the constraint
                             // untouched. Rewriting it would silently raise the floor (e.g.
                             // `~> 4.0` → `~> 4.67`) and block rollback to earlier releases.
-                            if dep.operator == "~>"
-                                && Self::pessimistic_constraint_satisfied(
-                                    &dep.version,
-                                    &latest_version,
-                                )
+                            if anchor_op == "~>"
+                                && Self::pessimistic_constraint_satisfied(&anchor, &latest_version)
                             {
                                 result.unchanged += 1;
                                 new_lines.push(line.to_string());
@@ -460,33 +591,30 @@ impl Updater for TerraformUpdater {
                             // constraint at the start of the new series (e.g. `5.0`)
                             // rather than the exact latest (e.g. `5.2`), so the full
                             // new major/minor range remains accessible.
-                            let matched_version = if dep.operator == "~>" {
-                                Self::pessimistic_constraint_new_version(
-                                    &dep.version,
-                                    &latest_version,
-                                )
+                            let matched_version = if anchor_op == "~>" {
+                                Self::pessimistic_constraint_new_version(&anchor, &latest_version)
                             } else if options.full_precision {
                                 latest_version.clone()
                             } else {
-                                match_version_precision(&dep.version, &latest_version)
+                                match_version_precision(&anchor, &latest_version)
                             };
-                            if matched_version != dep.version {
+                            if matched_version != anchor {
                                 // Refuse to write a downgrade.
-                                if compare_versions(&matched_version, &dep.version, Lang::Terraform)
+                                if compare_versions(&matched_version, &anchor, Lang::Terraform)
                                     != std::cmp::Ordering::Greater
                                 {
                                     result.warnings.push(downgrade_warning(
                                         &dep.source,
                                         &matched_version,
-                                        &dep.version,
+                                        &anchor,
                                     ));
                                     result.unchanged += 1;
                                     new_lines.push(line.to_string());
-                                } else if !options.allows_bump(&dep.version, &matched_version) {
+                                } else if !options.allows_bump(&anchor, &matched_version) {
                                     // Bump level exceeds the --only-bump/--max-bump ceiling.
                                     result.record_capped(
                                         &dep.source,
-                                        &dep.version,
+                                        &anchor,
                                         &matched_version,
                                         Some(line_num),
                                     );
@@ -494,13 +622,13 @@ impl Updater for TerraformUpdater {
                                 } else {
                                     result.updated.push((
                                         dep.source.clone(),
-                                        dep.version.clone(),
+                                        anchor.clone(),
                                         matched_version.clone(),
                                         Some(line_num),
                                     ));
                                     new_lines.push(self.update_line(
                                         line,
-                                        &dep.version,
+                                        &floor_range,
                                         &matched_version,
                                     ));
                                     modified = true;
@@ -553,10 +681,10 @@ impl Updater for TerraformUpdater {
         Ok(parsed
             .into_iter()
             .map(|dep| ParsedDependency {
-                name: dep.source,
-                version: dep.version,
+                version: dep.anchor_version().to_string(),
+                has_upper_bound: dep.caps_from_above(),
                 line_number: Some(dep.version_line_idx + 1),
-                has_upper_bound: Self::has_upper_bound(&dep.operator),
+                name: dep.source,
                 is_bumpable: true,
             })
             .collect())
@@ -569,6 +697,27 @@ mod tests {
     use crate::registry::MockRegistry;
     use std::io::Write;
     use tempfile::NamedTempFile;
+
+    /// A dependency's clauses as `(operator, version)` pairs.
+    fn clauses_of(dep: &ParsedTerraformDep) -> Vec<(String, String)> {
+        dep.clauses
+            .iter()
+            .map(|c| (c.op.clone(), c.version.clone()))
+            .collect()
+    }
+
+    /// Rewrite a version line's floor the way `update` does: at the byte range
+    /// the clause occupies, not at the first text that looks like it.
+    fn rewrite_floor(updater: &TerraformUpdater, line: &str, new_version: &str) -> String {
+        let caps = updater.version_re.captures(line).expect("line parses");
+        let dep = ParsedTerraformDep {
+            source: "test/provider".to_string(),
+            clauses: TerraformUpdater::parse_constraint(&caps),
+            version_line_idx: 0,
+        };
+        let (floor, _) = dep.floor().expect("line has a floor");
+        updater.update_line(line, &floor.range, new_version)
+    }
 
     #[test]
     fn test_parse_required_providers() {
@@ -591,12 +740,61 @@ terraform {
         assert_eq!(deps.len(), 2);
 
         assert_eq!(deps[0].source, "hashicorp/aws");
-        assert_eq!(deps[0].operator, "~>");
-        assert_eq!(deps[0].version, "5.0");
+        assert_eq!(
+            clauses_of(&deps[0]),
+            vec![("~>".to_string(), "5.0".to_string())]
+        );
 
         assert_eq!(deps[1].source, "hashicorp/random");
-        assert_eq!(deps[1].operator, "");
-        assert_eq!(deps[1].version, "3.6.0");
+        assert_eq!(
+            clauses_of(&deps[1]),
+            vec![(String::new(), "3.6.0".to_string())]
+        );
+    }
+
+    #[test]
+    fn every_clause_of_a_multi_clause_constraint_is_read() {
+        let updater = TerraformUpdater::new();
+        let content = r#"
+terraform {
+  required_providers {
+    aws = {
+      source  = "hashicorp/aws"
+      version = ">= 4.0, < 5.0"
+    }
+  }
+}
+"#;
+        // Terraform requires all of them at once. Reading the set as one
+        // operator plus one version swallowed `, < 5.0` into "the version" and
+        // the rewrite then deleted the ceiling.
+        let deps = updater.parse_content(content);
+        assert_eq!(deps.len(), 1);
+        assert_eq!(
+            clauses_of(&deps[0]),
+            vec![
+                (">=".to_string(), "4.0".to_string()),
+                ("<".to_string(), "5.0".to_string()),
+            ]
+        );
+        assert_eq!(deps[0].constraint_text(), ">= 4.0, < 5.0");
+        assert_eq!(deps[0].anchor_version(), "4.0");
+        assert!(deps[0].caps_from_above());
+    }
+
+    #[test]
+    fn a_multi_clause_rewrite_lands_on_the_floor_and_leaves_the_ceiling() {
+        let updater = TerraformUpdater::new();
+
+        assert_eq!(
+            rewrite_floor(&updater, r#"  version = ">= 4.0, < 5.0""#, "4.67"),
+            r#"  version = ">= 4.67, < 5.0""#
+        );
+        // The ceiling is written first here, so a textual search would rewrite it.
+        assert_eq!(
+            rewrite_floor(&updater, r#"  version = "< 5.0, >= 4.0""#, "4.67"),
+            r#"  version = "< 5.0, >= 4.67""#
+        );
     }
 
     #[test]
@@ -613,8 +811,10 @@ module "vpc" {
         let deps = updater.parse_content(content);
         assert_eq!(deps.len(), 1);
         assert_eq!(deps[0].source, "terraform-aws-modules/vpc/aws");
-        assert_eq!(deps[0].operator, "");
-        assert_eq!(deps[0].version, "5.1.0");
+        assert_eq!(
+            clauses_of(&deps[0]),
+            vec![(String::new(), "5.1.0".to_string())]
+        );
     }
 
     #[test]
@@ -727,10 +927,10 @@ module "vpc" {{
     fn test_preserves_constraint_operator() {
         let updater = TerraformUpdater::new();
 
-        let result = updater.update_line(r#"      version = "~> 5.0""#, "5.0", "5.83");
+        let result = rewrite_floor(&updater, r#"      version = "~> 5.0""#, "5.83");
         assert_eq!(result, r#"      version = "~> 5.83""#);
 
-        let result = updater.update_line(r#"      version = ">= 4.9.0""#, "4.9.0", "4.10.0");
+        let result = rewrite_floor(&updater, r#"      version = ">= 4.9.0""#, "4.10.0");
         assert_eq!(result, r#"      version = ">= 4.10.0""#);
     }
 
@@ -832,6 +1032,246 @@ module "vpc" {{
         assert!(!updated_names.contains(&"hashicorp/random"));
     }
 
+    /// A required_providers block for one provider at one constraint.
+    fn provider_file(source: &str, constraint: &str) -> NamedTempFile {
+        let mut file = NamedTempFile::new().unwrap();
+        write!(
+            file,
+            "terraform {{\n  required_providers {{\n    p = {{\n      source  = \"{source}\"\n      version = \"{constraint}\"\n    }}\n  }}\n}}\n"
+        )
+        .unwrap();
+        file
+    }
+
+    /// A constraint with nothing above it admits every release, so the release
+    /// to raise to is the registry's own newest and asking for it is one cheap
+    /// request. Routing it through the constrained lookup instead asks the
+    /// registry to enumerate and filter, and answers with whatever that
+    /// enumeration holds.
+    #[tokio::test]
+    async fn an_uncapped_constraint_asks_for_the_newest_release_outright() {
+        let file = provider_file("hashicorp/aws", ">= 5.0.0");
+
+        let registry = MockRegistry::new("terraform")
+            .with_version("hashicorp/aws", "6.61.0")
+            .with_constrained("hashicorp/aws", ">= 5.0.0", "5.9.9");
+
+        let updater = TerraformUpdater::new();
+        let result = updater
+            .update(file.path(), &registry, UpdateOptions::new(false, false))
+            .await
+            .unwrap();
+
+        assert!(result.warnings.is_empty(), "{:?}", result.warnings);
+        let contents = std::fs::read_to_string(file.path()).unwrap();
+        assert!(contents.contains(r#"version = ">= 6.61.0""#), "{contents}");
+    }
+
+    #[tokio::test]
+    async fn a_multi_clause_constraint_keeps_its_ceiling() {
+        let file = provider_file("hashicorp/aws", ">= 4.0, < 5.0");
+
+        // The unconstrained answer is 6.61.0. If the whole constraint set does not
+        // reach the registry, the lookup falls back to it and the rewrite replaces
+        // everything after the operator, ceiling included.
+        let registry = MockRegistry::new("terraform")
+            .with_version("hashicorp/aws", "6.61.0")
+            .with_constrained("hashicorp/aws", ">= 4.0, < 5.0", "4.67.0");
+
+        let updater = TerraformUpdater::new();
+        let result = updater
+            .update(file.path(), &registry, UpdateOptions::new(false, false))
+            .await
+            .unwrap();
+
+        assert_eq!(result.updated.len(), 1);
+        let contents = std::fs::read_to_string(file.path()).unwrap();
+        assert!(
+            contents.contains(r#"version = ">= 4.67, < 5.0""#),
+            "{contents}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_exclusive_lower_bound_is_not_raised_over_the_release_it_names() {
+        let file = provider_file("hashicorp/aws", "> 4.0");
+
+        // `> 4.0` names the one version the author refuses. Raising it to `> 6.61.0`
+        // would write a constraint that excludes the release it was raised to.
+        let registry = MockRegistry::new("terraform").with_version("hashicorp/aws", "6.61.0");
+
+        let updater = TerraformUpdater::new();
+        let result = updater
+            .update(file.path(), &registry, UpdateOptions::new(false, false))
+            .await
+            .unwrap();
+
+        assert!(result.updated.is_empty());
+        assert_eq!(result.unchanged, 1);
+        assert!(result.warnings.is_empty(), "{:?}", result.warnings);
+        let contents = std::fs::read_to_string(file.path()).unwrap();
+        assert!(contents.contains(r#"version = "> 4.0""#), "{contents}");
+    }
+
+    #[tokio::test]
+    async fn an_exclusion_that_admits_the_release_is_up_to_date() {
+        let file = provider_file("hashicorp/aws", "!= 4.0.0");
+
+        let registry = MockRegistry::new("terraform")
+            .with_version("hashicorp/aws", "6.61.0")
+            .with_constrained("hashicorp/aws", "!= 4.0.0", "6.61.0");
+
+        let updater = TerraformUpdater::new();
+        let result = updater
+            .update(file.path(), &registry, UpdateOptions::new(false, false))
+            .await
+            .unwrap();
+
+        // Rewriting the exclusion made `!= 6.61.0`, which rules out the newest
+        // release and was reported as a successful major update.
+        assert!(result.updated.is_empty());
+        assert_eq!(result.unchanged, 1);
+        assert!(result.warnings.is_empty(), "{:?}", result.warnings);
+        let contents = std::fs::read_to_string(file.path()).unwrap();
+        assert!(contents.contains(r#"version = "!= 4.0.0""#), "{contents}");
+    }
+
+    /// An exclusion that rules out the newest release there is leaves the
+    /// configuration off that release, and saying so is the only report that is
+    /// true. The registry still holds releases the exclusion admits, so a
+    /// lookup made against the constraint answers with one of those and the
+    /// provider reads as current - which is how a dependency held off the
+    /// newest release passes under a green tick.
+    #[tokio::test]
+    async fn an_exclusion_that_rules_out_the_newest_release_names_it() {
+        let file = provider_file("hashicorp/aws", "!= 6.61.0");
+
+        let registry = MockRegistry::new("terraform")
+            .with_version("hashicorp/aws", "6.61.0")
+            .with_constrained("hashicorp/aws", "!= 6.61.0", "6.60.0");
+
+        let updater = TerraformUpdater::new();
+        let result = updater
+            .update(file.path(), &registry, UpdateOptions::new(false, false))
+            .await
+            .unwrap();
+
+        assert!(result.updated.is_empty());
+        assert_eq!(result.warnings.len(), 1, "{:?}", result.warnings);
+        assert!(
+            result.warnings[0].contains("6.61.0") && result.warnings[0].contains("!= 6.61.0"),
+            "{}",
+            result.warnings[0]
+        );
+        assert_eq!(result.unchanged, 0);
+        let contents = std::fs::read_to_string(file.path()).unwrap();
+        assert!(contents.contains(r#"version = "!= 6.61.0""#), "{contents}");
+    }
+
+    /// A ceiling names no floor to carry forward, so nothing is rewritten. The
+    /// release it is behind is still worth naming: no future release will
+    /// satisfy it either.
+    #[tokio::test]
+    async fn a_ceiling_below_every_release_is_left_alone_and_named() {
+        let file = provider_file("hashicorp/aws", "< 5.0");
+
+        let registry = MockRegistry::new("terraform")
+            .with_version("hashicorp/aws", "6.61.0")
+            .with_constrained("hashicorp/aws", "< 5.0", "4.67.0");
+
+        let updater = TerraformUpdater::new();
+        let result = updater
+            .update(file.path(), &registry, UpdateOptions::new(false, false))
+            .await
+            .unwrap();
+
+        assert!(result.updated.is_empty());
+        assert_eq!(result.warnings.len(), 1, "{:?}", result.warnings);
+        assert!(
+            result.warnings[0].contains("6.61.0") && result.warnings[0].contains("< 5.0"),
+            "{}",
+            result.warnings[0]
+        );
+        assert_eq!(result.unchanged, 0);
+        let contents = std::fs::read_to_string(file.path()).unwrap();
+        assert!(contents.contains(r#"version = "< 5.0""#), "{contents}");
+    }
+
+    /// The control for the two above: a ceiling the newest release still fits
+    /// under is current, and says nothing.
+    #[tokio::test]
+    async fn a_ceiling_the_newest_release_fits_under_is_up_to_date() {
+        let file = provider_file("hashicorp/aws", "< 9.0");
+
+        let registry = MockRegistry::new("terraform")
+            .with_version("hashicorp/aws", "6.61.0")
+            .with_constrained("hashicorp/aws", "< 9.0", "4.67.0");
+
+        let updater = TerraformUpdater::new();
+        let result = updater
+            .update(file.path(), &registry, UpdateOptions::new(false, false))
+            .await
+            .unwrap();
+
+        assert!(result.updated.is_empty());
+        assert!(result.warnings.is_empty(), "{:?}", result.warnings);
+        assert_eq!(result.unchanged, 1);
+        let contents = std::fs::read_to_string(file.path()).unwrap();
+        assert!(contents.contains(r#"version = "< 9.0""#), "{contents}");
+    }
+
+    #[tokio::test]
+    async fn a_bound_no_release_satisfies_names_what_is_available() {
+        let file = provider_file("hashicorp/aws", "> 9.9.9");
+
+        let registry = MockRegistry::new("terraform").with_version("hashicorp/aws", "6.61.0");
+
+        let updater = TerraformUpdater::new();
+        let result = updater
+            .update(file.path(), &registry, UpdateOptions::new(false, false))
+            .await
+            .unwrap();
+
+        assert_eq!(result.warnings.len(), 1);
+        assert!(
+            result.warnings[0].contains("6.61.0") && result.warnings[0].contains("> 9.9.9"),
+            "{}",
+            result.warnings[0]
+        );
+        assert!(result.updated.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_pin_that_cannot_be_written_is_an_error() {
+        use crate::config::UpdConfig;
+        use std::sync::Arc;
+
+        let file = provider_file("hashicorp/aws", "< 5.0");
+        let registry = MockRegistry::new("terraform").with_version("hashicorp/aws", "6.61.0");
+
+        let mut pins = std::collections::HashMap::new();
+        pins.insert("hashicorp/aws".to_string(), "4.67.0".to_string());
+        let config = UpdConfig {
+            pin: pins,
+            ..Default::default()
+        };
+
+        let updater = TerraformUpdater::new();
+        let options = UpdateOptions::new(false, false).with_config(Arc::new(config));
+        let result = updater
+            .update(file.path(), &registry, options)
+            .await
+            .unwrap();
+
+        assert_eq!(result.errors.len(), 1);
+        assert!(
+            result.errors[0].contains("cannot pin 'hashicorp/aws'"),
+            "{}",
+            result.errors[0]
+        );
+        assert!(result.pinned.is_empty());
+    }
+
     #[test]
     fn test_handles() {
         let updater = TerraformUpdater::new();
@@ -853,7 +1293,7 @@ module "aws" {
         assert_eq!(deps.len(), 1, "prefixed module source must be parsed");
         // The prefix must be stripped for the internal lookup key.
         assert_eq!(deps[0].source, "hashicorp/aws/aws");
-        assert_eq!(deps[0].version, "3.0.0");
+        assert_eq!(deps[0].anchor_version(), "3.0.0");
     }
 
     #[tokio::test]
@@ -908,7 +1348,7 @@ module "vpc" {
         let deps = updater.parse_content(content);
         assert_eq!(deps.len(), 1);
         assert_eq!(deps[0].source, "hashicorp/aws/aws");
-        assert_eq!(deps[0].version, "3.0.0");
+        assert_eq!(deps[0].anchor_version(), "3.0.0");
     }
 
     #[test]

@@ -1,7 +1,7 @@
 use super::{
     FileType, ParsedDependency, PendingVersion, UpdateOptions, UpdateResult, Updater,
-    downgrade_warning, pep440_admits, read_file_safe, specifier_floor, unreadable_error,
-    unrewritable_warning, write_file_atomic,
+    downgrade_warning, pep440_admits, read_file_safe, specifier_floor, unpinnable_error,
+    unreadable_error, unrewritable_warning, write_file_atomic,
 };
 use crate::align::compare_versions;
 use crate::registry::{DeclaredIndex, IndexChain, Registry};
@@ -308,9 +308,10 @@ impl Updater for RequirementsUpdater {
                     // The pin was configured and cannot be written, so the file
                     // does not say what the config says it should. That is a
                     // failed instruction, not a note.
-                    result.errors.push(format!(
-                        "cannot pin '{}' to '{pinned_version}': '{}' has no lower bound that version fits",
-                        parsed.package, parsed.full_constraint
+                    result.errors.push(unpinnable_error(
+                        &parsed.package,
+                        pinned_version,
+                        &parsed.full_constraint,
                     ));
                     continue;
                 }

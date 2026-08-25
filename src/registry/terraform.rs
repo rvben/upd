@@ -245,7 +245,7 @@ impl Registry for TerraformRegistry {
 /// Check if a version matches a Terraform version constraint string.
 /// Supports ~> (pessimistic), >=, <=, >, <, = operators.
 /// Multiple constraints can be comma-separated: ">= 5.0, < 6.0"
-fn matches_terraform_constraint(version: &str, constraint: &str) -> bool {
+pub(crate) fn matches_terraform_constraint(version: &str, constraint: &str) -> bool {
     // Split on commas for multiple constraints
     for part in constraint.split(',') {
         let part = part.trim();
