@@ -175,7 +175,15 @@ a caret, so it follows the newest release and the whole shape moves with it:
 `"4.3.x"` becomes `"4.4.x"` and `"^1.2"` becomes `"^3.1"`, never a fully
 written version. npm lets a comparator stand apart from the version it applies
 to, and that spacing is part of the shape: `">= 1.2.7 < 1.3.0"` is read as the
-range it is and comes back spaced the same way.
+range it is and comes back spaced the same way. npm's tilde has two spellings
+and `"~>1.2.3"` means what `"~1.2.3"` does, ceiling included; each comes back
+spelled the way it was written.
+
+An npm spec that names no published version is left alone and reported nowhere:
+`"*"`, a dist-tag (`"latest"`, `"next"`, `"beta"`), and the `workspace:`,
+`file:`, `link:`, `npm:`, `git+ssh:` and `github:owner/repo` forms all resolve
+somewhere other than a release on the registry, so there is no version to
+compare and nothing an update could move.
 
 ### Bounds that are not floors
 
