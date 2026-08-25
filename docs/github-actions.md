@@ -207,11 +207,42 @@ pinned commit. It then applies cooldown and bump policy, resolves the selected
 tag to its full commit SHA, and updates both SHA and annotation. A pin is never
 converted to a mutable tag.
 
-A short SHA, missing or floating annotation, moved tag, stale annotation, or
-non-concrete configured target is reported as `blocked` with a machine-readable
-reason. With `update-action-shas: false`, these pins are instead reported as
-`not-examined`. Set `fail-on-blocked: true` when every immutable pin is expected
-to be maintainable automatically.
+A pin with no annotation at all is not blocked. The commit itself says which
+release it belongs to, so `upd` asks the repository which tags name that commit
+and takes the highest concrete version among them, discarding moving aliases
+such as `v7`. From there the pin behaves like an annotated one: behind the
+latest release it is an ordinary update, and already at it, the recovered
+version is written beside the unchanged commit and reported in `annotations[]`
+rather than as an update. Both spellings of the run say what happened:
+
+```yaml
+# before
+- uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+
+# after
+- uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+```
+
+An annotation is a write, so `--check` reports it and exits `1`, and `--apply`
+performs it. It is counted separately from updates because nothing moved: the
+same commit runs before and after.
+
+Three conditions leave a bare pin alone, each with its own reason. The commit
+may belong to no release (`unreleased-commit`, typical of a pin taken from a
+branch head), it may be named only by a moving alias (`floating-tag-only`), or
+the registry may have no tags to consult (`missing-version-comment`). All three
+are settled by writing the version comment yourself. A lookup that never
+answered - a rate limit, an outage - is an error rather than a blocked pin, so
+a run does not tell you to edit a workflow that would have resolved itself.
+
+A short SHA, floating annotation, moved tag, stale annotation, non-concrete
+configured target, or trailing text where the annotation would go is reported as
+`blocked` with a machine-readable reason. With `update-action-shas: false`, these
+pins are instead reported as `not-examined`. Set `fail-on-blocked: true` when
+every immutable pin is expected to be maintainable automatically.
+
+Interactive runs report annotations but do not write them; run without
+`--interactive` to apply them.
 
 `max-bump: minor` is a strict ceiling. Bare major references such as `@v4` are
 therefore normally held back; use `max-bump: major` when those updates should be
