@@ -1,6 +1,6 @@
 //! Minimal CVSS v3.0/3.1 base-score parser and severity-label mapper.
 //!
-//! Only the base score is computed — temporal and environmental metrics are
+//! Only the base score is computed - temporal and environmental metrics are
 //! ignored, which matches the OSV API's score field (base-score only).
 //!
 //! Reference: FIRST CVSS v3.1 specification
@@ -36,7 +36,7 @@ impl SeverityLabel {
 
     /// Map a CVSS v3.x base score to the NIST severity band.
     ///
-    /// Bands: 0.0 None / 0.1–3.9 Low / 4.0–6.9 Medium / 7.0–8.9 High / 9.0–10.0 Critical
+    /// Bands: 0.0 None / 0.1-3.9 Low / 4.0-6.9 Medium / 7.0-8.9 High / 9.0-10.0 Critical
     pub fn from_score(score: f64) -> Self {
         if score == 0.0 {
             SeverityLabel::None
@@ -92,7 +92,7 @@ impl Ac {
     const H: f64 = 0.44; // High
 }
 
-/// Privileges Required weights — scope-dependent
+/// Privileges Required weights - scope-dependent
 struct Pr;
 impl Pr {
     // Unchanged scope
@@ -271,7 +271,7 @@ fn parse_cvss3_base(metrics: &str) -> Option<f64> {
 }
 
 /// CVSS v4.0 approximation: pick the highest CIA impact value and map it to a
-/// rough score threshold. This is intentionally coarse — v4.0 scoring is
+/// rough score threshold. This is intentionally coarse - v4.0 scoring is
 /// significantly more complex, and the approximation is preferable to
 /// returning `None` for every v4.0 vector.
 fn parse_cvss4_approx(metrics: &str) -> Option<f64> {

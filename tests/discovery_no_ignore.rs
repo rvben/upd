@@ -109,7 +109,7 @@ fn discovery_verbose_logs_gitignored_skip() {
 }
 
 /// `--no-ignore` with `--verbose` should NOT emit skip lines (nothing was
-/// skipped — gitignore is disabled). Pinning this avoids spurious noise.
+/// skipped - gitignore is disabled). Pinning this avoids spurious noise.
 #[test]
 fn discovery_no_ignore_with_verbose_emits_no_skip_lines() {
     let (tmp, _kept, _ignored) = workspace_with_gitignored_package_json();

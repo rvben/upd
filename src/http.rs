@@ -49,7 +49,7 @@ where
 ///
 /// Treats `from_pem_bundle` failures as fatal. An empty buffer (or a buffer with
 /// no `BEGIN CERTIFICATE` markers) returns an `Err` so callers can surface a
-/// meaningful diagnostic — silently producing an empty cert list would mask a
+/// meaningful diagnostic - silently producing an empty cert list would mask a
 /// misconfigured CA bundle path.
 pub(crate) fn parse_pem_bundle(bytes: &[u8]) -> Result<Vec<Certificate>> {
     if bytes.is_empty() {
@@ -85,7 +85,7 @@ const TLS_MARKERS: &[&str] = &[
 /// known TLS-trust-failure marker (case-insensitive).
 ///
 /// Generic over `dyn std::error::Error` so it can be unit-tested with synthetic
-/// error types — `reqwest::Error` has no public constructor for arbitrary chains.
+/// error types - `reqwest::Error` has no public constructor for arbitrary chains.
 pub(crate) fn chain_indicates_tls_failure(err: &(dyn std::error::Error + 'static)) -> bool {
     let mut current: Option<&(dyn std::error::Error + 'static)> = Some(err);
     while let Some(e) = current {
@@ -130,12 +130,12 @@ where
 /// path must not block the run.
 ///
 /// **Library callers:** clients constructed before `init` is called see
-/// [`HttpOptions::default`] forever — only clients constructed after `init`
+/// [`HttpOptions::default`] forever - only clients constructed after `init`
 /// pick up the configured CAs and `--insecure` flag.
 pub fn init(insecure: bool) -> Result<()> {
     let extra_certs =
         compute_extra_certs(insecure, |k| std::env::var(k).ok(), |p| std::fs::read(p))?;
-    // OnceLock::set is fallible if already set; that's fine — first init wins, later
+    // OnceLock::set is fallible if already set; that's fine - first init wins, later
     // calls in the same process are silent no-ops (the value is already correct).
     let _ = HTTP_OPTIONS.set(HttpOptions {
         insecure,

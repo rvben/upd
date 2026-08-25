@@ -16,7 +16,7 @@ fn run_offline(args: &[&str], cwd: &Path, cache_dir: &Path) -> (String, String, 
     cmd.args(args)
         .current_dir(cwd)
         .env("UPD_CACHE_DIR", cache_dir)
-        // Ensure that if OSV were contacted it would fail immediately —
+        // Ensure that if OSV were contacted it would fail immediately -
         // this makes accidental network calls obvious.
         .env("OSV_API_URL", "http://127.0.0.1:0");
     let output = cmd.output().expect("failed to run upd");
@@ -111,7 +111,7 @@ fn audit_offline_reads_from_cache_and_does_not_contact_osv() {
 #[test]
 fn audit_offline_empty_cache_exits_2_with_cache_miss_message() {
     let cache_tmp = isolated_cache();
-    // Leave the cache directory empty — no audit.json.
+    // Leave the cache directory empty - no audit.json.
 
     let work_tmp = isolated_cache();
     write_requirements(work_tmp.path(), "requests==2.31.0\n");

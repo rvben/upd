@@ -45,7 +45,7 @@ impl RegenOutcome {
         match self {
             RegenOutcome::Ok(_) => None,
             RegenOutcome::ToolMissing { lockfile, tool } => Some(format!(
-                "{tool} not found on PATH — cannot regenerate {}\nhint: install {tool} or remove --lock",
+                "{tool} not found on PATH - cannot regenerate {}\nhint: install {tool} or remove --lock",
                 lockfile.filename()
             )),
             RegenOutcome::Failed { message, .. } => Some(message.clone()),
@@ -297,7 +297,7 @@ pub fn tool_available(tool: &str) -> bool {
     match Command::new(tool).arg("--version").output() {
         Ok(_) => true,
         Err(e) if e.kind() == io::ErrorKind::NotFound => false,
-        // Unexpected OS error — assume the tool exists to avoid a false error.
+        // Unexpected OS error - assume the tool exists to avoid a false error.
         Err(_) => true,
     }
 }

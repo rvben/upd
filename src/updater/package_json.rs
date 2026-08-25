@@ -422,7 +422,7 @@ impl Updater for PackageJsonUpdater {
                                                     }
                                                 }
                                                 } else {
-                                                    // No lower bound anchor — no cooldown possible,
+                                                    // No lower bound anchor - no cooldown possible,
                                                     // proceed with the matched version directly.
                                                     (Some(matched), None)
                                                 };
@@ -1702,7 +1702,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_update_package_json_does_not_touch_overrides() {
-        // `overrides` is not part of DEPENDENCY_SECTIONS — any pin in there
+        // `overrides` is not part of DEPENDENCY_SECTIONS - any pin in there
         // must be left untouched. This guards against accidental drift if
         // the DEPENDENCY_SECTIONS list is reshuffled.
         let mut file = NamedTempFile::with_suffix(".json").unwrap();
@@ -1831,7 +1831,7 @@ mod tests {
         )
         .unwrap();
 
-        // Registry only has a stable version — no pre-release at all.
+        // Registry only has a stable version - no pre-release at all.
         // get_latest_version_including_prereleases will return "2.0.0" (stable),
         // which is newer than 1.0.0-beta.1. Without the guard this would silently promote.
         let registry = MockRegistry::new("npm").with_version("my-lib", "2.0.0");
@@ -2034,7 +2034,7 @@ mod tests {
         )
         .unwrap();
 
-        // Latest matching version was published just 1 day ago — inside a 7-day cooldown.
+        // Latest matching version was published just 1 day ago - inside a 7-day cooldown.
         let registry = MockRegistry::new("npm")
             .with_version("ranged", "2.0.0")
             .with_constrained("ranged", ">=1.0.0 <2.0.0", "1.5.0")

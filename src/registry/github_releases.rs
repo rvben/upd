@@ -256,7 +256,7 @@ impl Registry for GitHubReleasesRegistry {
     async fn get_latest_version(&self, package: &str) -> Result<String> {
         let (owner, repo) = Self::extract_owner_repo(package)?;
 
-        // Try releases/latest first — it returns the most recent non-prerelease.
+        // Try releases/latest first - it returns the most recent non-prerelease.
         let latest_url = format!("{}/repos/{}/{}/releases/latest", self.api_url, owner, repo);
         let response = get_with_retry(&self.client, &latest_url).await?;
         let status = response.status();
@@ -264,7 +264,7 @@ impl Registry for GitHubReleasesRegistry {
         if status.is_success() {
             let release: ReleaseResponse = response.json().await?;
             // A repository may publish releases whose tags are not versions at
-            // all — dated artifact bundles alongside the code releases, say.
+            // all - dated artifact bundles alongside the code releases, say.
             // GitHub calls the newest of those "latest" regardless, so an
             // unparsable tag means this endpoint cannot answer the question,
             // not that the repository has no versions. Fall through to the tag
@@ -923,7 +923,7 @@ mod tests {
     async fn test_four_segment_tags_shellcheck_py_regression() {
         let server = MockServer::start().await;
 
-        // releases/latest returns 404 — shellcheck-py has no GitHub Releases.
+        // releases/latest returns 404 - shellcheck-py has no GitHub Releases.
         Mock::given(method("GET"))
             .and(path("/repos/shellcheck-py/shellcheck-py/releases/latest"))
             .respond_with(ResponseTemplate::new(404))

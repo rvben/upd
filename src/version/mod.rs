@@ -34,11 +34,11 @@ pub fn match_version_precision(original: &str, new_version: &str) -> String {
         let new_len = new.release().len();
 
         return if orig_len >= new_len {
-            // Same or fewer release segments — keep the full new version string
+            // Same or fewer release segments - keep the full new version string
             // (including any post/pre/dev suffix) as written by the caller.
             new_version.to_string()
         } else {
-            // More release segments than original — truncate to original precision.
+            // More release segments than original - truncate to original precision.
             // Any post/pre/dev suffix on the new version is intentionally dropped
             // since it belongs to a more specific release than we're tracking.
             new.release()[..orig_len]

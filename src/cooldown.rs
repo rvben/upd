@@ -143,7 +143,7 @@ pub fn select(
     }
 
     // PEP 440 exact pins (`==X`, `===X`) and semver exact pins (`=X`) are the
-    // current version rather than a real upper/lower bound — the outer updater
+    // current version rather than a real upper/lower bound - the outer updater
     // rewrites them on update. Drop them here so they don't spuriously force
     // the constraint-unparseable path or reject every candidate.
     let constraints = constraints.and_then(strip_exact_pin);
@@ -170,7 +170,7 @@ pub fn select(
     // When the constraint is provided but cannot be evaluated with semver
     // syntax (PyPI `~=1.4`, Ruby `~> 7.1`, etc.), we cannot prove any older
     // version satisfies it. The caller already resolved a constraint-satisfying
-    // `latest`, so restrict candidates to exactly that version — either it is
+    // `latest`, so restrict candidates to exactly that version - either it is
     // old enough to ship, or we skip.
     let constraint_unparseable = match constraints {
         Some(spec) => semver::VersionReq::parse(spec).is_err(),

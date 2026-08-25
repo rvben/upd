@@ -186,7 +186,7 @@ mod tests {
     }
 
     fn expired_timestamp() -> u64 {
-        // 25 hours in the past — clearly beyond the 24-hour TTL
+        // 25 hours in the past - clearly beyond the 24-hour TTL
         fresh_timestamp() - (25 * 3600)
     }
 

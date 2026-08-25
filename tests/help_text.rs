@@ -1,6 +1,6 @@
 //! Integration tests for the revert tip in `--help` and post-run summary.
 //!
-//! The tip line `Tip: changes are applied in-place — use git to revert.`
+//! The tip line `Tip: changes are applied in-place - use git to revert.`
 //! must appear:
 //!   - at the bottom of `upd --help`
 //!   - after a mutating run that applied at least one update
@@ -102,7 +102,7 @@ fn check_mode_does_not_print_tip() {
 /// `--dry-run` must NOT print the tip even when an update is available.
 ///
 /// We mock the registry to serve version 99.0.0 for `requests` while the
-/// manifest pins 1.0.0, so the run would apply an update in mutating mode —
+/// manifest pins 1.0.0, so the run would apply an update in mutating mode -
 /// exercising the `!dry_run` guard in the real post-summary path.
 #[tokio::test]
 async fn dry_run_does_not_print_tip() {

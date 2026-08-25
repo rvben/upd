@@ -15,7 +15,7 @@ use std::path::Path;
 /// Updater for `.mise.toml` and `.tool-versions` files.
 ///
 /// Symbolic versions (`latest`, `lts`, `system`, `global`, and `ref:` prefixes)
-/// are intentionally preserved — upd cannot resolve them to a concrete release.
+/// are intentionally preserved - upd cannot resolve them to a concrete release.
 /// Only pinned numeric versions (e.g. `1.22.1`) are checked and updated.
 ///
 /// For `.tool-versions` files with multiple versions on one line

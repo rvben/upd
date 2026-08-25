@@ -1195,7 +1195,7 @@ mod tests {
         let mut file = NamedTempFile::new().unwrap();
         writeln!(file, "gem 'rails', '8.0.0.beta1'").unwrap();
 
-        // Registry only has a stable version — no pre-release at all.
+        // Registry only has a stable version - no pre-release at all.
         // get_latest_version_including_prereleases will return "8.1.0" (stable),
         // which is newer than 8.0.0.beta1. Without the guard this would silently promote.
         let registry = MockRegistry::new("rubygems").with_version("rails", "8.1.0");

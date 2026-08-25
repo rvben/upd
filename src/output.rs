@@ -187,7 +187,7 @@ pub struct SkippedEntry {
     pub line: Option<usize>,
 }
 
-/// A package update held back by cooldown — the chosen version is older than
+/// A package update held back by cooldown - the chosen version is older than
 /// the absolute latest, which was too new.
 #[derive(Debug, Serialize)]
 pub struct HeldBackEntry {
@@ -207,7 +207,7 @@ pub struct HeldBackEntry {
     pub source: Option<&'static str>,
 }
 
-/// A package skipped by cooldown entirely — every newer version is too new,
+/// A package skipped by cooldown entirely - every newer version is too new,
 /// so the current version is kept.
 #[derive(Debug, Serialize)]
 pub struct SkippedByCooldownEntry {
@@ -1693,7 +1693,7 @@ mod tests {
             "https://osv.dev/vulnerability/GHSA-abcd-1234-efgh"
         );
 
-        // Second vuln has no fixed_version — field should be absent.
+        // Second vuln has no fixed_version - field should be absent.
         let second_result = &json["runs"][0]["results"][1];
         assert!(
             second_result["properties"].get("fixedVersion").is_none()

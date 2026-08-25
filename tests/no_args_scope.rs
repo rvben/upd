@@ -150,7 +150,7 @@ async fn no_args_inside_git_repo_is_dry_run_with_hint() {
 #[test]
 fn no_args_outside_git_repo_exits_two() {
     let tmp = tempfile::tempdir().unwrap();
-    // Deliberately NOT calling git_init — we need a plain directory.
+    // Deliberately NOT calling git_init - we need a plain directory.
 
     let (_stdout, stderr, code) = run(&[], tmp.path());
 
@@ -226,7 +226,7 @@ async fn explicit_path_without_apply_is_dry_run() {
     let server = setup_fake_pypi().await;
 
     let tmp = tempfile::tempdir().unwrap();
-    // No git init — explicit path bypasses VCS check.
+    // No git init - explicit path bypasses VCS check.
 
     let req_path = tmp.path().join("requirements.txt");
     fs::write(&req_path, "requests==1.0.0\n").unwrap();
@@ -266,7 +266,7 @@ async fn explicit_path_with_apply_mutates_files() {
     let server = setup_fake_pypi().await;
 
     let tmp = tempfile::tempdir().unwrap();
-    // No git init — explicit path bypasses VCS check.
+    // No git init - explicit path bypasses VCS check.
 
     let req_path = tmp.path().join("requirements.txt");
     fs::write(&req_path, "requests==1.0.0\n").unwrap();
@@ -294,7 +294,7 @@ async fn explicit_path_with_apply_mutates_files() {
 // ── test 7: -i explicit path, no TTY → TTY error, not VCS error ──────────────
 
 /// `upd -i ./path` with no TTY must fail with the TTY error, NOT with
-/// "not inside a git repository" — the explicit path bypasses the VCS check
+/// "not inside a git repository" - the explicit path bypasses the VCS check
 /// before the TTY guard fires.
 #[test]
 fn interactive_explicit_path_no_tty_gives_tty_error_not_vcs_error() {

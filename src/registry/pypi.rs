@@ -956,7 +956,7 @@ impl Registry for PyPiRegistry {
             let all_yanked = !files.is_empty() && files.iter().all(|f| f.yanked);
             // `releases` deserialises into a HashMap, so file order is
             // non-deterministic. Use the earliest upload timestamp across all
-            // files — that's when the version first became fetchable.
+            // files - that's when the version first became fetchable.
             let published_at = files
                 .iter()
                 .filter_map(|f| {
@@ -1272,7 +1272,7 @@ mod tests {
 
     #[test]
     fn test_parse_simple_api_json_response_empty_string_yanked() {
-        // yanked: "" is treated as not-yanked — an empty string carries no yank reason.
+        // yanked: "" is treated as not-yanked - an empty string carries no yank reason.
         // PyPI uses true (bool) for no-reason yanks; empty string is not a valid yank signal.
         let registry = PyPiRegistry::new();
         let json = r#"{

@@ -117,7 +117,7 @@ async fn max_bump_minor_skips_major_update() {
 
     let server = MockServer::start().await;
 
-    // Advertise version 2.0.0 — a major bump from 1.0.0.
+    // Advertise version 2.0.0 - a major bump from 1.0.0.
     let html = r#"<!DOCTYPE html><html><body>
 <a href="requests-2.0.0.tar.gz">requests-2.0.0.tar.gz</a>
 </body></html>"#;
@@ -155,7 +155,7 @@ async fn max_bump_minor_allows_minor_update() {
 
     let server = MockServer::start().await;
 
-    // Advertise version 1.1.0 — a minor bump from 1.0.0.
+    // Advertise version 1.1.0 - a minor bump from 1.0.0.
     let html = r#"<!DOCTYPE html><html><body>
 <a href="requests-1.1.0.tar.gz">requests-1.1.0.tar.gz</a>
 </body></html>"#;
@@ -191,7 +191,7 @@ async fn only_bump_minor_skips_major_update() {
 
     let server = MockServer::start().await;
 
-    // Advertise version 2.0.0 — a major bump from 1.0.0.
+    // Advertise version 2.0.0 - a major bump from 1.0.0.
     let html = r#"<!DOCTYPE html><html><body>
 <a href="requests-2.0.0.tar.gz">requests-2.0.0.tar.gz</a>
 </body></html>"#;
@@ -230,7 +230,7 @@ async fn apply_max_bump_minor_does_not_write_major() {
 
     let server = MockServer::start().await;
 
-    // Advertise version 2.0.0 — a major bump from 1.0.0.
+    // Advertise version 2.0.0 - a major bump from 1.0.0.
     let html = r#"<!DOCTYPE html><html><body>
 <a href="requests-2.0.0.tar.gz">requests-2.0.0.tar.gz</a>
 </body></html>"#;
@@ -272,7 +272,7 @@ async fn apply_max_bump_minor_writes_minor() {
 
     let server = MockServer::start().await;
 
-    // Advertise version 1.1.0 — a minor bump from 1.0.0.
+    // Advertise version 1.1.0 - a minor bump from 1.0.0.
     let html = r#"<!DOCTYPE html><html><body>
 <a href="requests-1.1.0.tar.gz">requests-1.1.0.tar.gz</a>
 </body></html>"#;
@@ -540,7 +540,7 @@ async fn max_bump_patch_skips_minor_and_major_updates() {
 
     let server = MockServer::start().await;
 
-    // Advertise version 1.1.0 — a minor bump from 1.0.0.
+    // Advertise version 1.1.0 - a minor bump from 1.0.0.
     let html = r#"<!DOCTYPE html><html><body>
 <a href="requests-1.1.0.tar.gz">requests-1.1.0.tar.gz</a>
 </body></html>"#;

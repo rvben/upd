@@ -238,7 +238,7 @@ impl OsvClient {
                 && let Ok(guard) = c.lock()
                 && let Some(entry) = guard.get(&key)
             {
-                // Cache hit — replay the stored result.
+                // Cache hit - replay the stored result.
                 let mut vulns = entry.vulnerabilities.clone();
                 if vulns.is_empty() {
                     result.safe_count += 1;
@@ -993,7 +993,7 @@ mod tests {
             );
         }
 
-        // Point client at an unused address — if OSV were contacted, the test
+        // Point client at an unused address - if OSV were contacted, the test
         // would fail with a connection error.
         let client = OsvClient::with_base_url("http://127.0.0.1:0".to_string());
         let pkgs = vec![sample_package("requests")];
@@ -1054,7 +1054,7 @@ mod tests {
         use cache::{AuditCache, AuditKey};
         use wiremock::MockServer;
 
-        // Start a mock server but mount NO mocks — any request would be unexpected.
+        // Start a mock server but mount NO mocks - any request would be unexpected.
         let server = MockServer::start().await;
 
         let cache = AuditCache::new_shared();

@@ -83,7 +83,7 @@ fn package_flag_accepts_repeated() {
 fn package_filter_excludes_non_matching_packages_dry_run() {
     let tmp = tempfile::tempdir().unwrap();
 
-    // No mock registry — this test only verifies the CLI accepts the flag; filter behaviour is covered by unit tests.
+    // No mock registry - this test only verifies the CLI accepts the flag; filter behaviour is covered by unit tests.
     fs::write(tmp.path().join("requirements.txt"), "requests==2.28.0\n").unwrap();
     let path_str = tmp.path().to_str().unwrap().to_string();
 

@@ -33,7 +33,7 @@ fn nonsense_positional_exits_two_with_error() {
     let (_stdout, stderr, code) = run(&["foobar"], tmp.path());
     assert_eq!(
         code, 2,
-        "'foobar' is not a path or subcommand — must exit 2, got {code}; stderr: {stderr}"
+        "'foobar' is not a path or subcommand - must exit 2, got {code}; stderr: {stderr}"
     );
     assert!(
         stderr.contains("'foobar' is not a known subcommand or existing path"),
@@ -58,7 +58,7 @@ fn nonexistent_absolute_path_exits_two_with_error() {
     );
 }
 
-/// `upd ./tmpdir` — an existing directory — must work normally (exit 0 on
+/// `upd ./tmpdir` - an existing directory - must work normally (exit 0 on
 /// empty workspace with no dependency files found).
 #[test]
 fn existing_directory_works_normally() {
@@ -104,7 +104,7 @@ fn check_flag_with_existing_directory_works() {
     );
 }
 
-/// `upd audit <tmpdir>` — real audit subcommand with an existing directory —
+/// `upd audit <tmpdir>` - real audit subcommand with an existing directory -
 /// must not be affected by the new path validation.
 #[test]
 fn audit_subcommand_with_existing_directory_works() {
@@ -125,7 +125,7 @@ fn help_flag_still_works() {
     assert_eq!(code, 0, "--help must exit 0, got {code}");
 }
 
-/// `upd aling` — a misspelling of `align` — must exit 2 since it is not an
+/// `upd aling` - a misspelling of `align` - must exit 2 since it is not an
 /// existing path and is not a known subcommand.
 #[test]
 fn typo_subcommand_exits_two_with_error() {

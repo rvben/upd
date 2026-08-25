@@ -2,7 +2,7 @@ use crate::updater::Lang;
 use clap::{Parser, Subcommand, ValueEnum};
 use std::path::PathBuf;
 
-pub const REVERT_TIP: &str = "Tip: changes are applied in-place \u{2014} use git to revert.";
+pub const REVERT_TIP: &str = "Tip: changes are applied in-place - use git to revert.";
 
 /// Three-valued output mode for clispec P1 compliance.
 ///
@@ -52,7 +52,7 @@ pub enum OutputFormat {
     author,
     version,
     about = "A fast dependency updater for Python, Node.js, Rust, Go, Ruby, .NET, Terraform, GitHub Actions, pre-commit, and Mise/asdf projects",
-    after_help = "Run 'upd schema' for machine-readable interface description (clispec v0.3).\n\nTip: changes are applied in-place \u{2014} use git to revert."
+    after_help = "Run 'upd schema' for machine-readable interface description (clispec v0.3).\n\nTip: changes are applied in-place - use git to revert."
 )]
 pub struct Cli {
     #[command(subcommand)]

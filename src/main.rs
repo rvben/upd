@@ -135,7 +135,7 @@ fn init_tls(cli: &Cli) -> anyhow::Result<()> {
     upd::http::init(cli.insecure).context("Failed to initialize TLS options")?;
     if cli.insecure {
         eprintln!(
-            "{}: TLS certificate verification disabled \u{2014} connections are not authenticated",
+            "{}: TLS certificate verification disabled - connections are not authenticated",
             "warning".yellow().bold()
         );
     }
@@ -2107,7 +2107,7 @@ async fn run_update(cli: &Cli) -> Result<()> {
         // Group changed package names by the directory of their manifest file.
         // Each directory gets its own targeted-command invocation so we never
         // pull in transitive churn from sibling subprojects. Both registry
-        // updates and config pins modify the manifest, so both contribute —
+        // updates and config pins modify the manifest, so both contribute -
         // otherwise pin-only changes would silently degrade to a broad refresh.
         let mut changed_by_dir: HashMap<PathBuf, Vec<String>> = HashMap::new();
         for scanned_file in &scanned {
@@ -2164,7 +2164,7 @@ async fn run_update(cli: &Cli) -> Result<()> {
                     .map(|n| n.to_string_lossy().into_owned())
                     .unwrap_or_default();
                 eprintln!(
-                    "note: no lockfile found for {} — skipping (nothing to regenerate)",
+                    "note: no lockfile found for {} - skipping (nothing to regenerate)",
                     manifest_name
                 );
                 continue;
@@ -2877,7 +2877,7 @@ async fn run_interactive_update(
             // Record which packages changed per manifest directory so the
             // lockfile regeneration step can issue targeted commands. Registry
             // updates and config pins both modify the manifest, so both must
-            // contribute — otherwise a pin-only run would silently emit a
+            // contribute - otherwise a pin-only run would silently emit a
             // broad refresh (e.g. `cargo update --workspace`).
             if scanned_file.file_type != FileType::Annotated
                 && let Some(dir) = scanned_file.path.parent()

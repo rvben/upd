@@ -1250,7 +1250,7 @@ const ALLOWED_HIDDEN_ENTRIES: &[&str] = &[
 #[derive(Debug, Clone, Copy, Default)]
 pub struct DiscoverOptions<'a> {
     /// When true, ignore `.gitignore`, `.git/info/exclude`, and the global
-    /// gitignore — walk every dependency file regardless. Mirrors
+    /// gitignore - walk every dependency file regardless. Mirrors
     /// `rg --no-ignore`.
     pub no_ignore: bool,
     /// When true, emit one `skipping <path>: gitignored` (or `excluded by
@@ -1273,7 +1273,7 @@ pub struct DiscoverOptions<'a> {
 /// Discover dependency files in the given paths, optionally filtered by language.
 ///
 /// Directory walks honor `.gitignore`, `.git/info/exclude`, and the global
-/// gitignore — even outside a git repository. Hidden directories and files are
+/// gitignore - even outside a git repository. Hidden directories and files are
 /// skipped except for the small allowlist in [`ALLOWED_HIDDEN_ENTRIES`]. Explicit
 /// file paths bypass the filter and are always processed.
 ///
@@ -1477,7 +1477,7 @@ fn walk_dependency_files(
 
                 let name = entry.file_name().to_string_lossy();
 
-                // `.git` is internal — never descend into it.
+                // `.git` is internal - never descend into it.
                 if name == ".git" {
                     return false;
                 }
@@ -2446,7 +2446,7 @@ mod tests {
     }
 
     /// Files listed in .gitignore must not be discovered when walking a
-    /// directory. This is the single most-requested default — users expect
+    /// directory. This is the single most-requested default - users expect
     /// `upd` to ignore the same things git does.
     #[test]
     fn test_discover_files_respects_gitignore() {
@@ -2528,7 +2528,7 @@ mod tests {
         assert!(!paths.contains(&workflows.join("drop.yml")));
     }
 
-    /// Explicit file arguments bypass the gitignore filter — `upd
+    /// Explicit file arguments bypass the gitignore filter - `upd
     /// path/to/file` should always process the file the user pointed at,
     /// matching `rg` / `fd` semantics for explicit paths.
     #[test]
@@ -2606,7 +2606,7 @@ mod tests {
         assert_eq!(paths, vec![root.join("pyproject.toml")]);
     }
 
-    /// Nested `.gitignore` files (in a subdirectory) must be honored — the
+    /// Nested `.gitignore` files (in a subdirectory) must be honored - the
     /// `ignore` crate handles this; this test pins the behavior so a future
     /// refactor can't regress it.
     #[test]
@@ -2856,7 +2856,7 @@ mod tests {
         assert_eq!(paths, vec![root.join("package.json")]);
     }
 
-    /// `.git` directories must never be walked into — they are not in
+    /// `.git` directories must never be walked into - they are not in
     /// `.gitignore` (git itself manages them) but still contain YAML/TOML
     /// content that would otherwise be picked up.
     #[test]

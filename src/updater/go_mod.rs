@@ -522,7 +522,7 @@ impl Updater for GoModUpdater {
                 let module = caps.get(1).unwrap().as_str();
                 let current_version = caps.get(2).unwrap().as_str();
 
-                // Skip replaced modules entirely — they point to a local or forked
+                // Skip replaced modules entirely - they point to a local or forked
                 // path and cannot be resolved via the registry.
                 if replaced_modules.contains(module) {
                     continue;
@@ -1350,7 +1350,7 @@ require (
         assert!(semver_dep.is_bumpable);
     }
 
-    /// The update path must continue to skip pseudo-versions — they must remain
+    /// The update path must continue to skip pseudo-versions - they must remain
     /// unchanged after `update_file`.
     #[tokio::test]
     async fn test_update_still_skips_pseudo_versions() {

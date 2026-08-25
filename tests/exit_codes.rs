@@ -1,9 +1,9 @@
 //! Integration tests for exit-code semantics.
 //!
 //! Exit-code contract:
-//!   0 — clean run, no updates pending, no errors
-//!   1 — `--check` / `--dry-run` with pending updates (no errors)
-//!   2 — any run where at least one error occurred (network, parse, io, …)
+//!   0 - clean run, no updates pending, no errors
+//!   1 - `--check` / `--dry-run` with pending updates (no errors)
+//!   2 - any run where at least one error occurred (network, parse, io, …)
 
 use serde_json::Value;
 use std::fs;
@@ -46,7 +46,7 @@ fn parse_json(stdout: &str) -> Value {
         .unwrap_or_else(|e| panic!("stdout is not valid JSON ({e}):\n{stdout}"))
 }
 
-/// Exit 0: `--check` on an empty workspace — no updates, no errors.
+/// Exit 0: `--check` on an empty workspace - no updates, no errors.
 #[test]
 fn check_on_empty_workspace_exits_zero() {
     let tmp = tempfile::tempdir().unwrap();
@@ -55,7 +55,7 @@ fn check_on_empty_workspace_exits_zero() {
     assert_eq!(code, 0, "expected 0 for clean --check, got {code}");
 }
 
-/// Exit 0: `--dry-run` mode on an empty workspace — no files, no registry
+/// Exit 0: `--dry-run` mode on an empty workspace - no files, no registry
 /// calls, no errors.
 #[test]
 fn mutate_clean_workspace_exits_zero() {
@@ -103,7 +103,7 @@ fn dry_run_with_corrupted_requirements_exits_two() {
     // A requirements.txt that triggers a parse error via an invalid version spec
     // that our updater considers an error (not just a warning/skip).
     // Using a file whose name is recognised as requirements.txt but whose first
-    // package line has a URL reference with a broken fragment — the safest way
+    // package line has a URL reference with a broken fragment - the safest way
     // to exercise the Err path is via a package.json (JSON parse is strict).
     // Use package.json since its parse error is deterministic.
     fs::write(tmp.path().join("package.json"), b"INVALID").unwrap();
@@ -252,7 +252,7 @@ async fn dry_run_with_pending_updates_exits_one() {
     );
 }
 
-/// Exit 0: `--dry-run` on an empty workspace — no updates, no errors.
+/// Exit 0: `--dry-run` on an empty workspace - no updates, no errors.
 #[test]
 fn dry_run_on_empty_workspace_exits_zero() {
     let tmp = tempfile::tempdir().unwrap();
@@ -267,7 +267,7 @@ fn dry_run_on_empty_workspace_exits_zero() {
 /// Exit 2: `--check` when the registry is unreachable (network/registry error).
 ///
 /// `NPM_REGISTRY` is pointed at a loopback address with no listener, which
-/// produces an immediate connection-refused error — deterministic and fast.
+/// produces an immediate connection-refused error - deterministic and fast.
 #[test]
 fn check_with_registry_error_exits_two() {
     let tmp = tempfile::tempdir().unwrap();
@@ -356,7 +356,7 @@ fn decide_audit_exit_code_vulns_with_no_fail() {
     assert_eq!(decide_audit_exit_code(162, 0, true), 0);
 }
 
-/// Unit test: scan errors take precedence over vulns — always exit 2.
+/// Unit test: scan errors take precedence over vulns - always exit 2.
 #[test]
 fn decide_audit_exit_code_errors_take_precedence() {
     use upd::decide_audit_exit_code;
@@ -372,7 +372,7 @@ fn decide_audit_exit_code_errors_take_precedence() {
 
 // ── audit integration tests ───────────────────────────────────────────────────
 
-/// Exit 0: `audit` on an empty workspace — no packages, no errors.
+/// Exit 0: `audit` on an empty workspace - no packages, no errors.
 #[test]
 fn audit_on_empty_workspace_exits_zero() {
     let tmp = tempfile::tempdir().unwrap();
@@ -468,7 +468,7 @@ async fn audit_with_vulns_and_no_fail_exits_zero() {
     );
 }
 
-/// Exit 2: `audit` when OSV is unreachable — scan error, not a vuln result.
+/// Exit 2: `audit` when OSV is unreachable - scan error, not a vuln result.
 #[test]
 fn audit_with_osv_unreachable_exits_two() {
     let tmp = tempfile::tempdir().unwrap();
@@ -697,7 +697,7 @@ fn show_config_text_still_documents_the_schema() {
 /// must surface a visible parse error on stderr.
 ///
 /// This is the "original bug": before the fix, `load_from_path` swallowed the
-/// error and the user saw zero output — the config was silently ignored.
+/// error and the user saw zero output - the config was silently ignored.
 #[test]
 fn bad_config_wrong_ignore_format_prints_error_on_stderr() {
     let tmp = tempfile::tempdir().unwrap();
@@ -718,7 +718,7 @@ fn bad_config_wrong_ignore_format_prints_error_on_stderr() {
     let path_str = tmp.path().to_str().unwrap();
     let (_stdout, stderr, _code) = run(&["--dry-run", "--no-cache", path_str], tmp.path());
 
-    // The error must be visible — the user must not see silence.
+    // The error must be visible - the user must not see silence.
     assert!(
         stderr.to_lowercase().contains("error"),
         "stderr must contain 'error' when config fails to parse; got:\n{stderr}"

@@ -266,7 +266,7 @@ fn compare_semver(a: &str, b: &str) -> std::cmp::Ordering {
     let clean_a = a.trim_start_matches(['^', '~', '=', 'v']);
     let clean_b = b.trim_start_matches(['^', '~', '=', 'v']);
 
-    // Strict semver path — preserves prerelease ordering for ecosystems
+    // Strict semver path - preserves prerelease ordering for ecosystems
     // that rely on it (Node, Rust, Ruby, .NET, Go).
     if let (Ok(va), Ok(vb)) = (
         semver::Version::parse(clean_a),
@@ -464,7 +464,7 @@ mod tests {
         let packages = scan_packages(&files, &[], ParseWarnings::Suppress).unwrap();
         let result = find_alignments(packages);
 
-        // There must be no misaligned occurrences — the pseudo-version is a pin, not
+        // There must be no misaligned occurrences - the pseudo-version is a pin, not
         // a version choice that should be aligned to v0.17.0.
         assert_eq!(
             result.misaligned_count, 0,
@@ -545,7 +545,7 @@ mod tests {
     }
 
     /// compare_semver must preserve strict semver ordering for prereleases in the
-    /// 3-segment case — this is what Node, Rust, Ruby, .NET depend on.
+    /// 3-segment case - this is what Node, Rust, Ruby, .NET depend on.
     #[test]
     fn test_compare_semver_preserves_prerelease_ordering() {
         use std::cmp::Ordering;

@@ -908,7 +908,7 @@ module "vpc" {{
             .await
             .unwrap();
 
-        // hashicorp/aws uses ~> 5.0 and latest 5.83.0 satisfies that constraint —
+        // hashicorp/aws uses ~> 5.0 and latest 5.83.0 satisfies that constraint -
         // the constraint floor must not be raised, so aws stays unchanged.
         assert_eq!(result.updated.len(), 2);
         assert_eq!(result.unchanged, 1);
@@ -1375,7 +1375,7 @@ module "local" {
 
     #[test]
     fn test_pessimistic_constraint_satisfied_two_components() {
-        // ~> 4.0 allows >= 4.0, < 5.0 — any 4.x satisfies it
+        // ~> 4.0 allows >= 4.0, < 5.0 - any 4.x satisfies it
         assert!(TerraformUpdater::pessimistic_constraint_satisfied(
             "4.0", "4.67.1"
         ));
@@ -1385,7 +1385,7 @@ module "local" {
         assert!(TerraformUpdater::pessimistic_constraint_satisfied(
             "4.0", "4.99.99"
         ));
-        // Major version changed — no longer satisfied
+        // Major version changed - no longer satisfied
         assert!(!TerraformUpdater::pessimistic_constraint_satisfied(
             "4.0", "5.0.0"
         ));
@@ -1399,14 +1399,14 @@ module "local" {
 
     #[test]
     fn test_pessimistic_constraint_satisfied_three_components() {
-        // ~> 4.0.5 allows >= 4.0.5, < 4.1.0 — any 4.0.x satisfies it
+        // ~> 4.0.5 allows >= 4.0.5, < 4.1.0 - any 4.0.x satisfies it
         assert!(TerraformUpdater::pessimistic_constraint_satisfied(
             "4.0.5", "4.0.9"
         ));
         assert!(TerraformUpdater::pessimistic_constraint_satisfied(
             "4.0.5", "4.0.5"
         ));
-        // Minor version changed — no longer satisfied
+        // Minor version changed - no longer satisfied
         assert!(!TerraformUpdater::pessimistic_constraint_satisfied(
             "4.0.5", "4.1.0"
         ));
@@ -1417,7 +1417,7 @@ module "local" {
 
     #[tokio::test]
     async fn test_tilde_gt_two_components_no_change_when_satisfied() {
-        // ~> 4.0 with latest 4.67.1 — constraint already covers latest, leave untouched
+        // ~> 4.0 with latest 4.67.1 - constraint already covers latest, leave untouched
         let mut file = NamedTempFile::new().unwrap();
         write!(
             file,
@@ -1454,7 +1454,7 @@ module "local" {
 
     #[tokio::test]
     async fn test_tilde_gt_three_components_no_change_when_satisfied() {
-        // ~> 4.0.5 with latest 4.0.9 — same minor, leave untouched
+        // ~> 4.0.5 with latest 4.0.9 - same minor, leave untouched
         let mut file = NamedTempFile::new().unwrap();
         write!(
             file,
@@ -1491,7 +1491,7 @@ module "local" {
 
     #[tokio::test]
     async fn test_tilde_gt_two_components_bumps_on_major_change() {
-        // ~> 4.0 with latest 5.2.1 — major changed, bump to ~> 5.0 (preserve precision)
+        // ~> 4.0 with latest 5.2.1 - major changed, bump to ~> 5.0 (preserve precision)
         let mut file = NamedTempFile::new().unwrap();
         write!(
             file,
@@ -1527,7 +1527,7 @@ module "local" {
 
     #[tokio::test]
     async fn test_tilde_gt_three_components_bumps_on_minor_change() {
-        // ~> 4.0.5 with latest 4.1.0 — minor changed, bump to ~> 4.1.0
+        // ~> 4.0.5 with latest 4.1.0 - minor changed, bump to ~> 4.1.0
         let mut file = NamedTempFile::new().unwrap();
         write!(
             file,

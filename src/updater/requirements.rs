@@ -1581,7 +1581,7 @@ hda-common>=1.0.908
             .await
             .unwrap();
 
-        // Only django should have been updated — flask and numpy have invalid versions
+        // Only django should have been updated - flask and numpy have invalid versions
         assert_eq!(
             result.updated.len(),
             1,
@@ -1636,8 +1636,8 @@ hda-common>=1.0.908
         writeln!(file, "flask==3.0.0").unwrap();
 
         let registry = MockRegistry::new("PyPI")
-            .with_version("requests", "4.0.0") // lower — must be refused
-            .with_version("flask", "4.0.0"); // higher — normal upgrade
+            .with_version("requests", "4.0.0") // lower - must be refused
+            .with_version("flask", "4.0.0"); // higher - normal upgrade
 
         let updater = RequirementsUpdater::new();
         let options = UpdateOptions::new(false, false);
@@ -1754,7 +1754,7 @@ hda-common>=1.0.908
         let mut file = NamedTempFile::new().unwrap();
         writeln!(file, "mylib==1.0a1").unwrap();
 
-        // Registry only has a stable version — no pre-release at all.
+        // Registry only has a stable version - no pre-release at all.
         // get_latest_version_including_prereleases will return "2.0.0" (stable),
         // which is newer than 1.0a1. Without the guard this would silently promote.
         let registry = MockRegistry::new("PyPI").with_version("mylib", "2.0.0");
@@ -1766,7 +1766,7 @@ hda-common>=1.0.908
             .await
             .unwrap();
 
-        // No update should happen — the only available "latest" is a stable, not a pre-release.
+        // No update should happen - the only available "latest" is a stable, not a pre-release.
         assert_eq!(
             result.updated.len(),
             0,
@@ -1781,7 +1781,7 @@ hda-common>=1.0.908
         );
     }
 
-    /// Current pre-release, higher pre-release available across versions — pick the highest.
+    /// Current pre-release, higher pre-release available across versions - pick the highest.
     #[tokio::test]
     async fn test_prerelease_picks_highest_prerelease() {
         let mut file = NamedTempFile::new().unwrap();
@@ -1829,7 +1829,7 @@ hda-common>=1.0.908
     }
 
     /// Equal versions (current == latest after precision-matching) must NOT trigger the
-    /// no-downgrade warning — the existing unchanged branch handles them.
+    /// no-downgrade warning - the existing unchanged branch handles them.
     #[tokio::test]
     async fn test_equal_version_no_warning() {
         let mut file = NamedTempFile::new().unwrap();

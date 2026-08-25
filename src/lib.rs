@@ -39,12 +39,12 @@ pub use updater::{
 
 /// Determine the process exit code given the outcome of a run.
 ///
-/// - `2` — one or more errors occurred (network, parse, IO, …); takes
+/// - `2` - one or more errors occurred (network, parse, IO, …); takes
 ///   precedence over all other conditions so that CI can reliably distinguish
 ///   a broken run from a clean one.
-/// - `1` — `non_mutating` is true (i.e. `--check` or `--dry-run`) and there
+/// - `1` - `non_mutating` is true (i.e. `--check` or `--dry-run`) and there
 ///   are pending updates (no errors).
-/// - `0` — everything is clean.
+/// - `0` - everything is clean.
 pub fn decide_exit_code(non_mutating: bool, has_pending_updates: bool, has_errors: bool) -> i32 {
     if has_errors {
         2
@@ -57,14 +57,14 @@ pub fn decide_exit_code(non_mutating: bool, has_pending_updates: bool, has_error
 
 /// Determine the process exit code for the `audit` subcommand.
 ///
-/// - `2` — scan errors occurred; errors take precedence over vulnerability
+/// - `2` - scan errors occurred; errors take precedence over vulnerability
 ///   findings so that CI can distinguish a broken scan from a clean one.
-/// - `6` — vulnerabilities were found and `no_fail` is `false`; a dedicated
+/// - `6` - vulnerabilities were found and `no_fail` is `false`; a dedicated
 ///   code, distinct from the update exit codes (1 = pending updates,
 ///   2 = errors) and from the error exit codes declared in the schema, so
 ///   callers can branch on the exit code alone. Declared as the
 ///   `vulnerabilities_found` outcome in the schema.
-/// - `0` — no vulnerabilities found, or `no_fail` suppresses the non-zero exit.
+/// - `0` - no vulnerabilities found, or `no_fail` suppresses the non-zero exit.
 pub fn decide_audit_exit_code(vuln_count: usize, error_count: usize, no_fail: bool) -> i32 {
     if error_count > 0 {
         2

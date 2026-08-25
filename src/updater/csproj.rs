@@ -973,7 +973,7 @@ mod tests {
         let mut file = NamedTempFile::new().unwrap();
         write!(file, "{}", content).unwrap();
 
-        // Registry returns an older version — the real trigger case.
+        // Registry returns an older version - the real trigger case.
         let registry = MockRegistry::new("nuget").with_version("Microsoft.AspNetCore.App", "2.2.8");
 
         let updater = CsprojUpdater::new();
