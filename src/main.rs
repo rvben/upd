@@ -2762,11 +2762,16 @@ async fn run_interactive_update(
                 .iter()
                 .map(|scanned| scanned.result.capped.len())
                 .sum();
+            let warning_total: usize = scanned_results
+                .iter()
+                .map(|scanned| scanned.result.warnings.len())
+                .sum();
             if let Some(line) = format_interactive_closing_line(
                 files.len(),
                 capped,
                 annotation_total,
                 blocked_total + not_examined_total,
+                warning_total,
             ) {
                 println!("{line}");
             }
@@ -5281,7 +5286,8 @@ fn print_file_result(
 ///
 /// The green tick claims every dependency was checked, so it is withheld
 /// whenever something was not: a skipped pin is one whose version was never
-/// read, and an annotation is a write still waiting to happen. Both have
+/// read, an annotation is a write still waiting to happen, and a warning is a
+/// dependency that did not end where the run meant to leave it. All three have
 /// already printed their own lines, so `None` means those lines have said
 /// everything there is to say and a closing summary would only repeat them.
 ///
@@ -5296,6 +5302,7 @@ fn format_interactive_closing_line(
     capped: usize,
     annotations: usize,
     skipped: usize,
+    warnings: usize,
 ) -> Option<String> {
     if capped > 0 {
         return Some(format!(
@@ -5305,7 +5312,7 @@ fn format_interactive_closing_line(
             capped.to_string().yellow().bold()
         ));
     }
-    if annotations > 0 || skipped > 0 {
+    if annotations > 0 || skipped > 0 || warnings > 0 {
         return None;
     }
     Some(format!(
@@ -5339,6 +5346,37 @@ fn print_nothing_to_update_line(file_count: usize, up_to_date: usize, failed_loo
     }
 }
 
+/// Whether the run left nothing for the user to act on, so the closing tick can
+/// claim every dependency is current.
+///
+/// The tick is a claim about the whole run, which makes every channel carrying
+/// unfinished business a veto on it: updates the filter still shows, floors that
+/// could not be raised, dependencies something declined to touch, and warnings
+/// about ones upd looked at but would not rewrite. A run that prints one of
+/// those and then a green tick has told the user two different things, and the
+/// tick is the one they read.
+///
+/// A pure function rather than a condition written in place so each veto can be
+/// asserted without a terminal, the same reason [`format_interactive_closing_line`]
+/// is one.
+fn nothing_outstanding(
+    result: &UpdateResult,
+    filtered_total: usize,
+    unfixable_floors: usize,
+    skipped_floors: usize,
+) -> bool {
+    filtered_total == 0
+        && result.pinned.is_empty()
+        && result.held_back.is_empty()
+        && result.skipped_by_cooldown.is_empty()
+        && result.skipped.is_empty()
+        && result.capped.is_empty()
+        && result.annotations.is_empty()
+        && result.warnings.is_empty()
+        && unfixable_floors == 0
+        && skipped_floors == 0
+}
+
 fn print_summary(
     result: &UpdateResult,
     file_count: usize,
@@ -5365,18 +5403,12 @@ fn print_summary(
     let not_examined_count = result.skipped.len() - blocked_count;
     let capped_count = result.capped.len();
     let annotation_count = result.annotations.len();
+    // A warning is something that did not go the way the run intended: a
+    // dependency upd found newer but will not rewrite, a version already ahead
+    // of its registry.
+    let warning_count = result.warnings.len();
 
-    if filtered_total == 0
-        && pinned_count == 0
-        && held_back_count == 0
-        && skipped_cooldown_count == 0
-        && blocked_count == 0
-        && not_examined_count == 0
-        && capped_count == 0
-        && annotation_count == 0
-        && unfixable_floors == 0
-        && skipped_floors == 0
-    {
+    if nothing_outstanding(result, filtered_total, unfixable_floors, skipped_floors) {
         print_nothing_to_update_line(file_count, result.unchanged, result.errors.len());
     } else {
         // Build breakdown string for updates
@@ -5502,6 +5534,17 @@ fn print_summary(
                 "{} {} SHA-pinned action(s), not checked while SHA updates are off",
                 "Skipped".dimmed(),
                 not_examined_count.to_string().dimmed()
+            );
+        }
+
+        // Each warning already named its package on stderr. This line exists so
+        // that stdout, which is where the tick would otherwise be, carries the
+        // count too.
+        if warning_count > 0 {
+            println!(
+                "{} {} warning(s), see above",
+                "Warning".yellow(),
+                warning_count.to_string().yellow().bold()
             );
         }
     }
@@ -6161,28 +6204,156 @@ mod tests {
     /// needs a terminal (see tests/interactive_tty.rs).
     #[test]
     fn the_tick_is_withheld_from_anything_left_unchecked_or_unwritten() {
-        let ticked = format_interactive_closing_line(2, 0, 0, 0)
+        let ticked = format_interactive_closing_line(2, 0, 0, 0, 0)
             .expect("a run that checked everything closes by saying so");
         assert!(ticked.contains("all dependencies up to date"), "{ticked}");
         assert!(ticked.contains("Scanned 2 file(s)"), "{ticked}");
 
         assert_eq!(
-            format_interactive_closing_line(1, 0, 3, 0),
+            format_interactive_closing_line(1, 0, 3, 0, 0),
             None,
             "an annotation is a write still waiting to happen, so the run has \
              not finished and must not claim it has"
         );
         assert_eq!(
-            format_interactive_closing_line(1, 0, 0, 2),
+            format_interactive_closing_line(1, 0, 0, 2, 0),
             None,
             "a skipped pin is a dependency whose version was never read, so \
              calling it up to date claims a check that never happened"
         );
         assert_eq!(
-            format_interactive_closing_line(1, 0, 3, 2),
+            format_interactive_closing_line(1, 0, 0, 0, 1),
+            None,
+            "a warning is a dependency that did not end where the run meant to \
+             leave it, so the tick would be claiming the opposite about it"
+        );
+        assert_eq!(
+            format_interactive_closing_line(1, 0, 3, 2, 1),
             None,
             "{:?}",
-            format_interactive_closing_line(1, 0, 3, 2)
+            format_interactive_closing_line(1, 0, 3, 2, 1)
+        );
+    }
+
+    /// The same claim in the non-interactive summary, where it decides between
+    /// the green tick and a breakdown. Every channel is exercised one at a time:
+    /// a veto that only works alongside another one is not a veto.
+    #[test]
+    fn every_unfinished_channel_withholds_the_non_interactive_tick() {
+        let clean = UpdateResult {
+            unchanged: 7,
+            ..Default::default()
+        };
+        assert!(
+            nothing_outstanding(&clean, 0, 0, 0),
+            "a run whose every dependency was current has nothing to report"
+        );
+
+        // An error is deliberately not a veto here: the tick line itself counts
+        // them and says how many could not be checked (see
+        // print_nothing_to_update_line), so vetoing would suppress that count.
+        let failed = UpdateResult {
+            errors: vec!["boom".to_string()],
+            ..clean.clone()
+        };
+        assert!(
+            nothing_outstanding(&failed, 0, 0, 0),
+            "a failed lookup is reported by the closing line, not instead of it"
+        );
+
+        let vetoes: Vec<(&str, UpdateResult)> = vec![
+            (
+                "a dependency upd found newer but will not rewrite",
+                UpdateResult {
+                    warnings: vec!["lodash: 5.0.0 is available".to_string()],
+                    ..clean.clone()
+                },
+            ),
+            (
+                "a version the config pinned",
+                UpdateResult {
+                    pinned: vec![("a".into(), "1.0".into(), "1.0".into(), None)],
+                    ..clean.clone()
+                },
+            ),
+            (
+                "an update cooldown kept the run away from",
+                UpdateResult {
+                    skipped_by_cooldown: vec![("a".into(), "1.0".into(), "2.0".into(), None)],
+                    ..clean.clone()
+                },
+            ),
+            (
+                "an update cooldown settled for an older release than the latest",
+                UpdateResult {
+                    held_back: vec![(
+                        "a".into(),
+                        "1.0".into(),
+                        "1.5".into(),
+                        "2.0".into(),
+                        chrono::Utc::now(),
+                    )],
+                    ..clean.clone()
+                },
+            ),
+            (
+                "a dependency something declined to touch",
+                UpdateResult {
+                    skipped: vec![upd::updater::SkippedUpdate {
+                        package: "a".into(),
+                        current: "1.0".into(),
+                        status: SkipStatus::Blocked,
+                        reason: "pinned",
+                        message: "pinned by config".into(),
+                        line_number: None,
+                    }],
+                    ..clean.clone()
+                },
+            ),
+            (
+                "an update the bump ceiling held back",
+                UpdateResult {
+                    capped: vec![upd::updater::CappedUpdate {
+                        package: "a".into(),
+                        current: "1.0".into(),
+                        available: "2.0".into(),
+                        line_number: None,
+                    }],
+                    ..clean.clone()
+                },
+            ),
+            (
+                "a pin whose release upd wrote down without moving it",
+                UpdateResult {
+                    annotations: vec![upd::updater::Annotation {
+                        package: "a".into(),
+                        version: "1.0".into(),
+                        commit: "deadbeef".into(),
+                        line_number: None,
+                    }],
+                    ..clean.clone()
+                },
+            ),
+        ];
+        for (what, result) in vetoes {
+            assert!(
+                !nothing_outstanding(&result, 0, 0, 0),
+                "the tick claims every dependency is current, over {what}"
+            );
+        }
+
+        // The counts that reach the function as plain numbers.
+        assert!(
+            !nothing_outstanding(&clean, 1, 0, 0),
+            "an update is pending"
+        );
+        assert!(
+            !nothing_outstanding(&clean, 0, 1, 0),
+            "a floor that could not be raised is unfinished work"
+        );
+        assert!(
+            !nothing_outstanding(&clean, 0, 0, 1),
+            "a floor left alone is unfinished work"
         );
     }
 
@@ -6191,7 +6362,7 @@ mod tests {
     /// summary does.
     #[test]
     fn a_capped_update_outranks_the_tick_and_the_silence() {
-        let capped = format_interactive_closing_line(1, 4, 0, 0)
+        let capped = format_interactive_closing_line(1, 4, 0, 0, 0)
             .expect("a held-back update is not nothing to report");
         assert!(capped.contains("held back by the bump ceiling"), "{capped}");
         assert!(capped.contains('4'), "{capped}");
@@ -6200,7 +6371,7 @@ mod tests {
             "an update the ceiling refused is not up to date: {capped}"
         );
 
-        let still_capped = format_interactive_closing_line(1, 4, 2, 3)
+        let still_capped = format_interactive_closing_line(1, 4, 2, 3, 1)
             .expect("the ceiling outranks findings that print their own lines");
         assert!(
             still_capped.contains("held back by the bump ceiling"),
