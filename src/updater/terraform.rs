@@ -443,13 +443,17 @@ impl Updater for TerraformUpdater {
             result.ignored.push((package, version, Some(line_idx + 1)));
         }
 
-        // Deduplicate registry lookups
+        // Deduplicate registry lookups: one request per source and constraint.
+        // One source can be required by more than one block, and where the
+        // constraints differ so does the release each block can take, so the
+        // constraint is part of what identifies a lookup.
         let unique_sources: Vec<(String, String, bool)> = {
             let mut seen = std::collections::HashSet::new();
             fetch_deps
                 .iter()
                 .filter_map(|(_, dep)| {
-                    if seen.insert(dep.source.clone()) {
+                    let key = (dep.source.clone(), dep.constraint_text());
+                    if seen.insert(key) {
                         Some((
                             dep.source.clone(),
                             dep.constraint_text(),
@@ -475,17 +479,20 @@ impl Updater for TerraformUpdater {
 
         let version_results = join_all(version_futures).await;
 
-        // Build a map from source -> latest version result
-        let source_versions: HashMap<String, Result<String, String>> = unique_sources
+        // Build a map from source and constraint -> latest version result
+        let source_versions: HashMap<(String, String), Result<String, String>> = unique_sources
             .into_iter()
             .zip(version_results)
-            .map(|((name, _, _), result)| (name, result.map_err(|e| e.to_string())))
+            .map(|((name, constraint, _), result)| {
+                ((name, constraint), result.map_err(|e| e.to_string()))
+            })
             .collect();
 
         // Map results back to every line index that references each source
         let mut version_map: HashMap<usize, PendingVersion> = HashMap::new();
         for (_, dep) in &fetch_deps {
-            if let Some(result) = source_versions.get(&dep.source) {
+            if let Some(result) = source_versions.get(&(dep.source.clone(), dep.constraint_text()))
+            {
                 match result {
                     Ok(version) => {
                         version_map.insert(
@@ -1065,6 +1072,90 @@ module "vpc" {{
         assert!(result.warnings.is_empty(), "{:?}", result.warnings);
         let contents = std::fs::read_to_string(file.path()).unwrap();
         assert!(contents.contains(r#"version = ">= 6.61.0""#), "{contents}");
+    }
+
+    /// Two sources can carry the same constraint text, which says nothing about
+    /// either of them sharing a release. A lookup identified by constraint
+    /// alone drops the second source from the run entirely: not updated, not
+    /// current, not reported.
+    #[tokio::test]
+    async fn two_sources_at_the_same_constraint_are_each_looked_up() {
+        let mut file = NamedTempFile::new().unwrap();
+        write!(
+            file,
+            r#"terraform {{
+  required_providers {{
+    aws = {{
+      source  = "hashicorp/aws"
+      version = ">= 5.0.0"
+    }}
+    random = {{
+      source  = "hashicorp/random"
+      version = ">= 5.0.0"
+    }}
+  }}
+}}
+"#
+        )
+        .unwrap();
+
+        let registry = MockRegistry::new("terraform")
+            .with_version("hashicorp/aws", "6.61.0")
+            .with_version("hashicorp/random", "5.9.0");
+
+        let updater = TerraformUpdater::new();
+        let result = updater
+            .update(file.path(), &registry, UpdateOptions::new(false, false))
+            .await
+            .unwrap();
+
+        assert!(result.warnings.is_empty(), "{:?}", result.warnings);
+        assert_eq!(result.updated.len(), 2, "{:?}", result.updated);
+        let contents = std::fs::read_to_string(file.path()).unwrap();
+        assert!(contents.contains(r#"version = ">= 6.61.0""#), "{contents}");
+        assert!(contents.contains(r#"version = ">= 5.9.0""#), "{contents}");
+    }
+
+    /// Two blocks may name one source at different constraints, and the release
+    /// each of them can take is then a different release. Deduplicating the
+    /// lookup by source alone hands the second block the first block's answer,
+    /// which is a version its own constraint may have nothing to do with: here
+    /// it rewrites a deliberate `~> 3.0` into `~> 5.0`.
+    #[tokio::test]
+    async fn one_source_at_two_constraints_is_looked_up_at_each_of_them() {
+        let mut file = NamedTempFile::new().unwrap();
+        write!(
+            file,
+            r#"module "prod" {{
+  source  = "terraform-aws-modules/vpc/aws"
+  version = "~> 5.0"
+}}
+
+module "legacy" {{
+  source  = "terraform-aws-modules/vpc/aws"
+  version = "~> 3.0"
+}}
+"#
+        )
+        .unwrap();
+
+        let registry = MockRegistry::new("terraform")
+            .with_version("terraform-aws-modules/vpc/aws", "5.21.0")
+            .with_constrained("terraform-aws-modules/vpc/aws", "~> 5.0", "5.21.0")
+            .with_constrained("terraform-aws-modules/vpc/aws", "~> 3.0", "3.19.0");
+
+        let updater = TerraformUpdater::new();
+        let result = updater
+            .update(file.path(), &registry, UpdateOptions::new(false, false))
+            .await
+            .unwrap();
+
+        assert!(result.updated.is_empty(), "{:?}", result.updated);
+        assert!(result.warnings.is_empty(), "{:?}", result.warnings);
+        assert_eq!(result.unchanged, 2);
+        let contents = std::fs::read_to_string(file.path()).unwrap();
+        assert!(contents.contains(r#"version = "~> 5.0""#), "{contents}");
+        assert!(contents.contains(r#"version = "~> 3.0""#), "{contents}");
     }
 
     #[tokio::test]

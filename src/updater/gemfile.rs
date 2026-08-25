@@ -299,14 +299,18 @@ impl Updater for GemfileUpdater {
             result.ignored.push((package, version, Some(line_idx + 1)));
         }
 
-        // Deduplicate registry lookups: one request per unique gem name
-        // (same gem can appear multiple times, e.g. in different groups)
+        // Deduplicate registry lookups: one request per gem and requirement.
+        // The same gem can be declared more than once (in different groups, or
+        // for disjoint platforms), and where the requirements differ so does
+        // the release each declaration can take, so the requirement is part of
+        // what identifies a lookup.
         let unique_gems: Vec<(String, String, String, bool)> = {
             let mut seen = std::collections::HashSet::new();
             fetch_deps
                 .iter()
                 .filter_map(|(_, _, parsed)| {
-                    if seen.insert(parsed.name.clone()) {
+                    let key = (parsed.name.clone(), parsed.constraint_text());
+                    if seen.insert(key) {
                         Some((
                             parsed.name.clone(),
                             parsed.constraint_text(),
@@ -340,17 +344,20 @@ impl Updater for GemfileUpdater {
 
         let version_results = join_all(version_futures).await;
 
-        // Build a map from gem name -> latest version result
-        let gem_versions: HashMap<String, Result<String, String>> = unique_gems
+        // Build a map from gem and requirement -> latest version result
+        let gem_versions: HashMap<(String, String), Result<String, String>> = unique_gems
             .into_iter()
             .zip(version_results)
-            .map(|((name, _, _, _), result)| (name, result.map_err(|e| e.to_string())))
+            .map(|((name, constraint, _, _), result)| {
+                ((name, constraint), result.map_err(|e| e.to_string()))
+            })
             .collect();
 
         // Map results back to every line index that references each gem
         let mut version_map: HashMap<usize, PendingVersion> = HashMap::new();
         for (line_idx, _, parsed) in &fetch_deps {
-            if let Some(result) = gem_versions.get(&parsed.name) {
+            if let Some(result) = gem_versions.get(&(parsed.name.clone(), parsed.constraint_text()))
+            {
                 match result {
                     Ok(version) => {
                         version_map
@@ -936,6 +943,69 @@ mod tests {
         assert!(result.warnings.is_empty(), "{:?}", result.warnings);
         let contents = std::fs::read_to_string(file.path()).unwrap();
         assert_eq!(contents, "gem 'rails', '>= 8.1.0'\n");
+    }
+
+    /// Two gems can carry the same requirement text, which says nothing about
+    /// either of them sharing a release. A lookup identified by requirement
+    /// alone drops the second gem from the run entirely: not updated, not
+    /// current, not reported.
+    #[tokio::test]
+    async fn two_gems_at_the_same_requirement_are_each_looked_up() {
+        let mut file = NamedTempFile::new().unwrap();
+        write!(file, "gem 'rails', '>= 7.0.0'\ngem 'puma', '>= 7.0.0'\n").unwrap();
+
+        let registry = MockRegistry::new("rubygems")
+            .with_version("rails", "8.1.0")
+            .with_version("puma", "7.0.3");
+
+        let updater = GemfileUpdater::new();
+        let result = updater
+            .update(file.path(), &registry, UpdateOptions::new(false, false))
+            .await
+            .unwrap();
+
+        assert!(result.warnings.is_empty(), "{:?}", result.warnings);
+        assert_eq!(result.updated.len(), 2, "{:?}", result.updated);
+        let contents = std::fs::read_to_string(file.path()).unwrap();
+        assert_eq!(
+            contents,
+            "gem 'rails', '>= 8.1.0'\ngem 'puma', '>= 7.0.3'\n"
+        );
+    }
+
+    /// Bundler lets one gem be declared twice for disjoint platforms, at
+    /// different requirements. The release each declaration can take is then a
+    /// different release, and deduplicating the lookup by gem name alone hands
+    /// the second declaration the first one's answer: here it writes a floor
+    /// above the ceiling on the same line.
+    #[tokio::test]
+    async fn one_gem_at_two_requirements_is_looked_up_at_each_of_them() {
+        let mut file = NamedTempFile::new().unwrap();
+        write!(
+            file,
+            "gem 'nokogiri', '>= 1.15.0', platforms: :ruby\n\
+             gem 'nokogiri', '>= 1.14.0', '< 1.15.0', platforms: :jruby\n"
+        )
+        .unwrap();
+
+        let registry = MockRegistry::new("rubygems")
+            .with_version("nokogiri", "1.18.0")
+            .with_constrained("nokogiri", ">= 1.14.0, < 1.15.0", "1.14.5");
+
+        let updater = GemfileUpdater::new();
+        let result = updater
+            .update(file.path(), &registry, UpdateOptions::new(false, false))
+            .await
+            .unwrap();
+
+        assert!(result.warnings.is_empty(), "{:?}", result.warnings);
+        assert_eq!(result.updated.len(), 2, "{:?}", result.updated);
+        let contents = std::fs::read_to_string(file.path()).unwrap();
+        assert_eq!(
+            contents,
+            "gem 'nokogiri', '>= 1.18.0', platforms: :ruby\n\
+             gem 'nokogiri', '>= 1.14.5', '< 1.15.0', platforms: :jruby\n"
+        );
     }
 
     /// An exclusion that rules out the newest release there is leaves the
