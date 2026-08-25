@@ -2940,3 +2940,562 @@ jobs:
         );
     }
 }
+
+/// A SHA pin carries no version of its own: the release it names lives in a
+/// comment beside it. These cover reading that release back from the commit
+/// when the comment is missing, and writing it down.
+#[cfg(test)]
+mod sha_pin_annotation_tests {
+    use super::*;
+    use crate::registry::MockRegistry;
+    use std::fs;
+    use std::io::Write;
+    use tempfile::NamedTempFile;
+
+    const BARE_SHA: &str = "4444444444444444444444444444444444444444";
+
+    /// A repository that names one commit with both its release tag and the
+    /// floating major it moves onto that release. Only the release can anchor a
+    /// pin, so the alias must not be what gets written.
+    #[test]
+    fn a_floating_alias_never_becomes_the_release_a_commit_names() {
+        let tags = vec!["v7".to_string(), "v7.0.1".to_string()];
+        assert_eq!(
+            GithubActionsUpdater::release_at_commit(&tags),
+            Some("v7.0.1".to_string())
+        );
+    }
+
+    /// A commit re-tagged without new code carries two releases. The highest is
+    /// the one the repository is offering, and the choice must not depend on the
+    /// order the tags arrived in.
+    #[test]
+    fn the_highest_release_naming_a_commit_wins() {
+        let ascending = vec!["v1.2.3".to_string(), "v1.10.0".to_string()];
+        let descending = vec!["v1.10.0".to_string(), "v1.2.3".to_string()];
+        assert_eq!(
+            GithubActionsUpdater::release_at_commit(&ascending),
+            Some("v1.10.0".to_string()),
+            "1.10.0 orders above 1.2.3 by version, not by string"
+        );
+        assert_eq!(
+            GithubActionsUpdater::release_at_commit(&descending),
+            GithubActionsUpdater::release_at_commit(&ascending),
+            "one repository state must produce one comment whatever order the tags arrive in"
+        );
+    }
+
+    /// One release published under both spellings. Either resolves back to the
+    /// commit, so the tie is style, but it has to be settled the same way every
+    /// run or the file churns.
+    #[test]
+    fn one_release_published_under_both_spellings_settles_on_the_prefixed_tag() {
+        let tags = vec!["1.3.0".to_string(), "v1.3.0".to_string()];
+        assert_eq!(
+            GithubActionsUpdater::release_at_commit(&tags),
+            Some("v1.3.0".to_string())
+        );
+    }
+
+    #[test]
+    fn a_commit_named_only_by_floating_tags_has_no_release() {
+        let tags = vec!["v7".to_string(), "main".to_string()];
+        assert_eq!(GithubActionsUpdater::release_at_commit(&tags), None);
+    }
+
+    #[test]
+    fn a_commit_named_by_nothing_has_no_release() {
+        assert_eq!(GithubActionsUpdater::release_at_commit(&[]), None);
+    }
+
+    #[test]
+    fn annotating_a_bare_pin_writes_the_comment_it_was_missing() {
+        let updater = GithubActionsUpdater::new();
+        assert_eq!(
+            updater
+                .annotate_sha_pin(
+                    &format!("      - uses: actions/checkout@{BARE_SHA}"),
+                    BARE_SHA,
+                    "v7.0.1"
+                )
+                .as_deref(),
+            Some(format!("      - uses: actions/checkout@{BARE_SHA} # v7.0.1").as_str())
+        );
+    }
+
+    /// The comment belongs outside the quotes: inside them it becomes part of
+    /// the action reference and the workflow stops resolving.
+    #[test]
+    fn annotating_a_quoted_pin_keeps_the_comment_outside_the_quotes() {
+        let updater = GithubActionsUpdater::new();
+        assert_eq!(
+            updater
+                .annotate_sha_pin(
+                    &format!(r#"    uses: "rvben/clispec/.github/workflows/x.yml@{BARE_SHA}""#),
+                    BARE_SHA,
+                    "v0.3.0"
+                )
+                .as_deref(),
+            Some(
+                format!(r#"    uses: "rvben/clispec/.github/workflows/x.yml@{BARE_SHA}" # v0.3.0"#)
+                    .as_str()
+            )
+        );
+    }
+
+    /// Trailing whitespace is not text somebody wrote, so it is absorbed rather
+    /// than left sitting between the pin and its new comment.
+    #[test]
+    fn annotating_a_pin_with_trailing_spaces_does_not_leave_them_in_the_line() {
+        let updater = GithubActionsUpdater::new();
+        assert_eq!(
+            updater
+                .annotate_sha_pin(
+                    &format!("      - uses: actions/checkout@{BARE_SHA}   "),
+                    BARE_SHA,
+                    "v7.0.1"
+                )
+                .as_deref(),
+            Some(format!("      - uses: actions/checkout@{BARE_SHA} # v7.0.1").as_str())
+        );
+    }
+
+    /// Anything else after the pin is text with a meaning this updater cannot
+    /// read, and appending to it means guessing what it meant.
+    #[test]
+    fn a_pin_followed_by_foreign_text_is_never_annotated() {
+        let updater = GithubActionsUpdater::new();
+        for suffix in ["# v4", "# pinned by security review", "}", "# renovate: ok"] {
+            assert_eq!(
+                updater.annotate_sha_pin(
+                    &format!("      - uses: actions/checkout@{BARE_SHA} {suffix}"),
+                    BARE_SHA,
+                    "v7.0.1"
+                ),
+                None,
+                "trailing text {suffix:?} is somebody's, and must be left alone"
+            );
+        }
+    }
+
+    /// The line drifted since the scan, so the release established for the old
+    /// commit says nothing about the one now on the line.
+    #[test]
+    fn a_line_whose_commit_moved_is_never_annotated() {
+        let updater = GithubActionsUpdater::new();
+        assert_eq!(
+            updater.annotate_sha_pin(
+                &format!("      - uses: actions/checkout@{BARE_SHA}"),
+                "5555555555555555555555555555555555555555",
+                "v7.0.1"
+            ),
+            None
+        );
+    }
+
+    /// A pin already at the latest release with no comment beside it. Nothing
+    /// moves, but the file is not what it was: the release the commit names is
+    /// now written down, so the next run does not have to establish it again.
+    #[tokio::test]
+    async fn a_bare_pin_at_the_latest_release_is_annotated_rather_than_left_bare() {
+        let mut file = NamedTempFile::new().unwrap();
+        write!(file, "steps:\n  - uses: actions/checkout@{BARE_SHA}\n").unwrap();
+
+        let registry = MockRegistry::new("github-releases")
+            .with_version("actions/checkout", "v7.0.1")
+            .with_resolved_ref("actions/checkout", "v7.0.1", BARE_SHA)
+            .with_resolved_ref("actions/checkout", "v7", BARE_SHA);
+
+        let result = GithubActionsUpdater::new()
+            .update(
+                file.path(),
+                &registry,
+                UpdateOptions::new(false, false).with_action_sha_updates(true),
+            )
+            .await
+            .unwrap();
+
+        assert!(result.errors.is_empty(), "errors: {:?}", result.errors);
+        assert!(
+            result.skipped.is_empty(),
+            "the release was established, so nothing is blocked: {:?}",
+            result.skipped
+        );
+        assert!(
+            result.updated.is_empty(),
+            "the commit did not move, so this is not an update: {:?}",
+            result.updated
+        );
+        assert_eq!(result.annotations.len(), 1);
+        assert_eq!(result.annotations[0].package, "actions/checkout");
+        assert_eq!(result.annotations[0].version, "v7.0.1");
+        assert_eq!(result.annotations[0].commit, BARE_SHA);
+        assert_eq!(result.annotations[0].line_number, Some(2));
+        assert_eq!(
+            result.unchanged, 0,
+            "a line that was rewritten is not one the run left as it found it"
+        );
+        let content = fs::read_to_string(file.path()).unwrap();
+        assert!(
+            content.contains(&format!("actions/checkout@{BARE_SHA} # v7.0.1")),
+            "content: {content}"
+        );
+    }
+
+    /// The same run that recovers the release also has an update to write. One
+    /// rewrite carries both, and the update names where the pin came from, so
+    /// reporting an annotation as well would report one line twice.
+    #[tokio::test]
+    async fn a_bare_pin_behind_the_latest_release_is_updated_not_annotated() {
+        const NEW_SHA: &str = "6666666666666666666666666666666666666666";
+        let mut file = NamedTempFile::new().unwrap();
+        write!(file, "steps:\n  - uses: actions/checkout@{BARE_SHA}\n").unwrap();
+
+        let registry = MockRegistry::new("github-releases")
+            .with_version("actions/checkout", "v7.0.1")
+            .with_resolved_ref("actions/checkout", "v4.2.2", BARE_SHA)
+            .with_resolved_ref("actions/checkout", "v7.0.1", NEW_SHA);
+
+        let result = GithubActionsUpdater::new()
+            .update(
+                file.path(),
+                &registry,
+                UpdateOptions::new(false, false).with_action_sha_updates(true),
+            )
+            .await
+            .unwrap();
+
+        assert!(result.errors.is_empty(), "errors: {:?}", result.errors);
+        assert_eq!(result.updated.len(), 1);
+        assert_eq!(
+            result.updated[0].1, "v4.2.2",
+            "the release the pin was at is the one read back from its commit"
+        );
+        assert_eq!(result.updated[0].2, "v7.0.1");
+        assert!(
+            result.annotations.is_empty(),
+            "the update already names both releases: {:?}",
+            result.annotations
+        );
+        let content = fs::read_to_string(file.path()).unwrap();
+        assert!(
+            content.contains(&format!("actions/checkout@{NEW_SHA} # v7.0.1")),
+            "content: {content}"
+        );
+    }
+
+    /// An annotation is a write, so a run that writes nothing must not perform
+    /// it - and must still report it, or `--check` would call the tree clean
+    /// while `--apply` rewrites it.
+    #[tokio::test]
+    async fn a_dry_run_reports_the_annotation_without_writing_it() {
+        let mut file = NamedTempFile::new().unwrap();
+        write!(file, "steps:\n  - uses: actions/checkout@{BARE_SHA}\n").unwrap();
+
+        let registry = MockRegistry::new("github-releases")
+            .with_version("actions/checkout", "v7.0.1")
+            .with_resolved_ref("actions/checkout", "v7.0.1", BARE_SHA);
+
+        let result = GithubActionsUpdater::new()
+            .update(
+                file.path(),
+                &registry,
+                UpdateOptions::new(true, false).with_action_sha_updates(true),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(result.annotations.len(), 1);
+        let content = fs::read_to_string(file.path()).unwrap();
+        assert!(
+            content.contains(&format!("actions/checkout@{BARE_SHA}\n")),
+            "a dry run writes nothing, got: {content}"
+        );
+    }
+
+    /// One action used in several jobs is pinned at one commit. The release is
+    /// established once and every line carrying that commit gets it.
+    #[tokio::test]
+    async fn one_release_lookup_serves_every_line_pinned_at_that_commit() {
+        let mut file = NamedTempFile::new().unwrap();
+        write!(
+            file,
+            "jobs:\n  a:\n    steps:\n      - uses: actions/checkout@{BARE_SHA}\n  b:\n    steps:\n      - uses: actions/checkout@{BARE_SHA}\n"
+        )
+        .unwrap();
+
+        let registry = MockRegistry::new("github-releases")
+            .with_version("actions/checkout", "v7.0.1")
+            .with_resolved_ref("actions/checkout", "v7.0.1", BARE_SHA);
+
+        let result = GithubActionsUpdater::new()
+            .update(
+                file.path(),
+                &registry,
+                UpdateOptions::new(false, false).with_action_sha_updates(true),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(result.annotations.len(), 2);
+        assert_eq!(
+            result
+                .annotations
+                .iter()
+                .map(|a| a.line_number)
+                .collect::<Vec<_>>(),
+            vec![Some(4), Some(7)]
+        );
+        let content = fs::read_to_string(file.path()).unwrap();
+        assert_eq!(
+            content
+                .matches(&format!("actions/checkout@{BARE_SHA} # v7.0.1"))
+                .count(),
+            2,
+            "content: {content}"
+        );
+    }
+
+    /// A pin to a branch head, or to a commit between releases. The repository
+    /// answered and there is no release to write, which is a property of the pin
+    /// that a human has to resolve.
+    #[tokio::test]
+    async fn a_pin_to_a_commit_no_tag_names_is_blocked_as_unreleased() {
+        let mut file = NamedTempFile::new().unwrap();
+        write!(
+            file,
+            "steps:\n  - uses: dtolnay/rust-toolchain@{BARE_SHA}\n"
+        )
+        .unwrap();
+
+        let registry = MockRegistry::new("github-releases")
+            .with_version("dtolnay/rust-toolchain", "v1.0.0")
+            .with_resolved_ref(
+                "dtolnay/rust-toolchain",
+                "v1.0.0",
+                "7777777777777777777777777777777777777777",
+            );
+
+        let result = GithubActionsUpdater::new()
+            .update(
+                file.path(),
+                &registry,
+                UpdateOptions::new(false, false).with_action_sha_updates(true),
+            )
+            .await
+            .unwrap();
+
+        assert!(result.errors.is_empty(), "errors: {:?}", result.errors);
+        assert!(result.annotations.is_empty());
+        assert_eq!(result.skipped.len(), 1);
+        assert_eq!(result.skipped[0].reason, "unreleased-commit");
+        assert_eq!(result.skipped[0].status, SkipStatus::Blocked);
+        assert_eq!(result.skipped[0].line_number, Some(2));
+        assert!(
+            result.skipped[0]
+                .message
+                .contains("no tag names this commit"),
+            "message: {}",
+            result.skipped[0].message
+        );
+        let content = fs::read_to_string(file.path()).unwrap();
+        assert!(
+            content.contains(&format!("rust-toolchain@{BARE_SHA}\n")),
+            "content: {content}"
+        );
+    }
+
+    /// The repository moves a floating major onto this commit but has published
+    /// no release at it, so nothing can say which release the pin is at.
+    #[tokio::test]
+    async fn a_pin_named_only_by_a_floating_tag_says_so() {
+        let mut file = NamedTempFile::new().unwrap();
+        write!(file, "steps:\n  - uses: acme/action@{BARE_SHA}\n").unwrap();
+
+        let registry = MockRegistry::new("github-releases")
+            .with_version("acme/action", "v2.0.0")
+            .with_resolved_ref("acme/action", "v2", BARE_SHA);
+
+        let result = GithubActionsUpdater::new()
+            .update(
+                file.path(),
+                &registry,
+                UpdateOptions::new(false, false).with_action_sha_updates(true),
+            )
+            .await
+            .unwrap();
+
+        assert!(result.errors.is_empty(), "errors: {:?}", result.errors);
+        assert_eq!(result.skipped.len(), 1);
+        assert_eq!(result.skipped[0].reason, "floating-tag-only");
+        assert!(
+            result.skipped[0].message.contains("v2"),
+            "the tag that could not settle it is named: {}",
+            result.skipped[0].message
+        );
+    }
+
+    /// A registry with no tag concept teaches the run nothing about the commit,
+    /// which leaves the pin exactly as it was before: missing its comment.
+    #[tokio::test]
+    async fn a_registry_without_tags_leaves_the_pin_needing_its_comment() {
+        let mut file = NamedTempFile::new().unwrap();
+        write!(file, "steps:\n  - uses: acme/action@{BARE_SHA}\n").unwrap();
+
+        let registry = MockRegistry::new("github-releases")
+            .with_version("acme/action", "v2.0.0")
+            .without_tag_concept("acme/action");
+
+        let result = GithubActionsUpdater::new()
+            .update(
+                file.path(),
+                &registry,
+                UpdateOptions::new(false, false).with_action_sha_updates(true),
+            )
+            .await
+            .unwrap();
+
+        assert!(result.errors.is_empty(), "errors: {:?}", result.errors);
+        assert_eq!(result.skipped.len(), 1);
+        assert_eq!(result.skipped[0].reason, "missing-version-comment");
+    }
+
+    /// A rate limit is not a workflow that needs editing. It is reported as an
+    /// error, so the run fails rather than telling the user to go and add a
+    /// comment that the next run would have written itself.
+    #[tokio::test]
+    async fn a_failed_release_lookup_is_an_error_not_a_pin_to_edit() {
+        let mut file = NamedTempFile::new().unwrap();
+        write!(file, "steps:\n  - uses: acme/action@{BARE_SHA}\n").unwrap();
+
+        let registry = MockRegistry::new("github-releases")
+            .with_version("acme/action", "v2.0.0")
+            .with_unavailable_commit_tags("acme/action", BARE_SHA);
+
+        let result = GithubActionsUpdater::new()
+            .update(
+                file.path(),
+                &registry,
+                UpdateOptions::new(false, false).with_action_sha_updates(true),
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            result.skipped.is_empty(),
+            "an outage is not a property of the pin: {:?}",
+            result.skipped
+        );
+        assert_eq!(result.errors.len(), 1);
+        assert!(
+            result.errors[0].contains("failed to look up the release this commit belongs to"),
+            "errors: {:?}",
+            result.errors
+        );
+    }
+
+    /// The ceiling holds the update back, but the release the pin is at was
+    /// still established, and writing it down is what lets the capped report
+    /// name a version rather than a commit.
+    #[tokio::test]
+    async fn a_capped_update_still_writes_the_release_its_pin_was_at() {
+        const NEW_SHA: &str = "6666666666666666666666666666666666666666";
+        let mut file = NamedTempFile::new().unwrap();
+        write!(file, "steps:\n  - uses: actions/checkout@{BARE_SHA}\n").unwrap();
+
+        let registry = MockRegistry::new("github-releases")
+            .with_version("actions/checkout", "v7.0.1")
+            .with_resolved_ref("actions/checkout", "v4.2.2", BARE_SHA)
+            .with_resolved_ref("actions/checkout", "v7.0.1", NEW_SHA);
+        let options = UpdateOptions::new(false, false)
+            .with_action_sha_updates(true)
+            .with_bump_filter(crate::updater::BumpFilter {
+                major: false,
+                minor: true,
+                patch: true,
+            });
+
+        let result = GithubActionsUpdater::new()
+            .update(file.path(), &registry, options)
+            .await
+            .unwrap();
+
+        assert!(result.updated.is_empty());
+        assert_eq!(result.capped.len(), 1);
+        assert_eq!(result.capped[0].current, "v4.2.2");
+        assert_eq!(result.capped[0].available, "v7.0.1");
+        assert_eq!(result.annotations.len(), 1);
+        let content = fs::read_to_string(file.path()).unwrap();
+        assert!(
+            content.contains(&format!("actions/checkout@{BARE_SHA} # v4.2.2")),
+            "the commit stays where the ceiling left it, with its release named: {content}"
+        );
+    }
+
+    /// Two runs in a row must converge. The second reads the comment the first
+    /// wrote, so the pin is annotated exactly once.
+    #[tokio::test]
+    async fn annotating_a_pin_is_not_repeated_on_the_next_run() {
+        let mut file = NamedTempFile::new().unwrap();
+        write!(file, "steps:\n  - uses: actions/checkout@{BARE_SHA}\n").unwrap();
+
+        let registry = MockRegistry::new("github-releases")
+            .with_version("actions/checkout", "v7.0.1")
+            .with_resolved_ref("actions/checkout", "v7.0.1", BARE_SHA);
+        let updater = GithubActionsUpdater::new();
+        let options = || UpdateOptions::new(false, false).with_action_sha_updates(true);
+
+        let first = updater
+            .update(file.path(), &registry, options())
+            .await
+            .unwrap();
+        assert_eq!(first.annotations.len(), 1);
+
+        let second = updater
+            .update(file.path(), &registry, options())
+            .await
+            .unwrap();
+        assert!(
+            second.annotations.is_empty(),
+            "the comment is already there: {:?}",
+            second.annotations
+        );
+        assert!(second.errors.is_empty(), "errors: {:?}", second.errors);
+        assert_eq!(
+            second.unchanged, 1,
+            "with nothing left to write the pin is an up-to-date dependency again"
+        );
+        let content = fs::read_to_string(file.path()).unwrap();
+        assert_eq!(content.matches("# v7.0.1").count(), 1, "content: {content}");
+    }
+
+    /// Opting out of SHA-pin updates opts out of touching the file at all, so a
+    /// pin with no comment is reported unexamined rather than annotated.
+    #[tokio::test]
+    async fn a_bare_pin_is_not_annotated_when_sha_updates_are_off() {
+        let mut file = NamedTempFile::new().unwrap();
+        write!(file, "steps:\n  - uses: actions/checkout@{BARE_SHA}\n").unwrap();
+
+        let registry = MockRegistry::new("github-releases")
+            .with_version("actions/checkout", "v7.0.1")
+            .with_resolved_ref("actions/checkout", "v7.0.1", BARE_SHA);
+
+        let result = GithubActionsUpdater::new()
+            .update(
+                file.path(),
+                &registry,
+                UpdateOptions::new(false, false).with_action_sha_updates(false),
+            )
+            .await
+            .unwrap();
+
+        assert!(result.annotations.is_empty());
+        assert_eq!(result.skipped.len(), 1);
+        assert_eq!(result.skipped[0].reason, "action-sha-updates-off");
+        let content = fs::read_to_string(file.path()).unwrap();
+        assert!(
+            content.contains(&format!("actions/checkout@{BARE_SHA}\n")),
+            "content: {content}"
+        );
+    }
+}
