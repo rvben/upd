@@ -5,6 +5,28 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.6.5](https://github.com/rvben/upd/compare/v0.6.4...v0.6.5) - 2026-08-25
+
+### Added
+
+- **cli**: add package filter shorthand ([9dd6c8d](https://github.com/rvben/upd/commit/9dd6c8d5087021795382830d313e4b56a58fef68))
+
+### Fixed
+
+- **ci**: support GitHub App update credentials ([cc30410](https://github.com/rvben/upd/commit/cc304104b309cb04e5e0682040ff487e62a13047))
+- **actions**: recover releases for bare SHA pins ([e9eb595](https://github.com/rvben/upd/commit/e9eb59599d1dd5f6670a716b9e90760429673c0b))
+- **release**: bootstrap cargo tools from binaries ([9f8bf3b](https://github.com/rvben/upd/commit/9f8bf3b10804beef0396eff67b691bc62d5e7332))
+- **toolchain**: align Rust version declarations ([9789051](https://github.com/rvben/upd/commit/9789051f401f2146476991640a4884d59c1483cd))
+- **ci**: isolate mise tool installation ([b5299ef](https://github.com/rvben/upd/commit/b5299efba219bbf62fa9814074029c35d7942075))
+- **release**: remove workflow permission from pin sync ([bc8f707](https://github.com/rvben/upd/commit/bc8f70776d338db91d19cbaea2429dcf69d2e052))
+- **release**: isolate pin validation tooling ([0181c26](https://github.com/rvben/upd/commit/0181c261aa5ad5d61d2e170a1d88da0156a8a81a))
+- **release**: install Rust components for pin validation ([c14b1dc](https://github.com/rvben/upd/commit/c14b1dc4f8953fcfa3b88a997ec36a5daead8137))
+
+### Performance
+
+- **release**: install maturin from attested binaries ([21e7f31](https://github.com/rvben/upd/commit/21e7f31c85bec5e43f0abfa4742d231423067fe1))
+- **release**: scope cross tools to Linux ([4f20409](https://github.com/rvben/upd/commit/4f2040985eb4ab39ca69885412473ed1e513f4f5))
+
 ## [0.6.4](https://github.com/rvben/upd/compare/v0.6.3...v0.6.4) - 2026-08-24
 
 ### Added
