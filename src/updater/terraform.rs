@@ -1259,6 +1259,36 @@ module "legacy" {{
         assert!(contents.contains(r#"version = "!= 6.61.0""#), "{contents}");
     }
 
+    /// Terraform pads a version to three segments, so `6.61` and `6.61.0` name
+    /// the same release and `!= 6.61` rules out `6.61.0`. Reading the two as
+    /// different versions makes the exclusion look satisfied, and the provider
+    /// it holds back passes under a green tick.
+    #[tokio::test]
+    async fn an_exclusion_written_short_still_names_the_release_it_rules_out() {
+        let file = provider_file("hashicorp/aws", "!= 6.61");
+
+        let registry = MockRegistry::new("terraform")
+            .with_version("hashicorp/aws", "6.61.0")
+            .with_constrained("hashicorp/aws", "!= 6.61", "6.60.0");
+
+        let updater = TerraformUpdater::new();
+        let result = updater
+            .update(file.path(), &registry, UpdateOptions::new(false, false))
+            .await
+            .unwrap();
+
+        assert!(result.updated.is_empty());
+        assert_eq!(result.warnings.len(), 1, "{:?}", result.warnings);
+        assert!(
+            result.warnings[0].contains("6.61.0") && result.warnings[0].contains("!= 6.61"),
+            "{}",
+            result.warnings[0]
+        );
+        assert_eq!(result.unchanged, 0);
+        let contents = std::fs::read_to_string(file.path()).unwrap();
+        assert!(contents.contains(r#"version = "!= 6.61""#), "{contents}");
+    }
+
     /// A ceiling names no floor to carry forward, so nothing is rewritten. The
     /// release it is behind is still worth naming: no future release will
     /// satisfy it either.

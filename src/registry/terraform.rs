@@ -281,46 +281,168 @@ fn matches_single_constraint(version: &str, constraint: &str) -> bool {
         ("=", constraint)
     };
 
-    let ver = parse_version_parts(version);
-    let req = parse_version_parts(required);
+    let ver = TerraformVersion::parse(version);
+    let req = TerraformVersion::parse(required);
+    let ordering = ver.compare(&req);
 
     match op {
-        ">=" => ver >= req,
-        "<=" => ver <= req,
-        ">" => ver > req,
-        "<" => ver < req,
-        "=" | "==" => ver == req,
-        "!=" => ver != req,
-        "~>" => {
-            // Pessimistic constraint: ~> 5.0 means >= 5.0 and < 6.0
-            // ~> 5.1.0 means >= 5.1.0 and < 5.2.0
-            if ver < req {
-                return false;
-            }
-            let req_parts: Vec<u64> = required.split('.').filter_map(|s| s.parse().ok()).collect();
-            if req_parts.len() < 2 {
-                return ver >= req;
-            }
-            let mut upper = req_parts.clone();
-            let bump_idx = upper.len() - 2;
-            upper[bump_idx] += 1;
-            upper.truncate(bump_idx + 1);
-            let ver_parts: Vec<u64> = version.split('.').filter_map(|s| s.parse().ok()).collect();
-            for (v, u) in ver_parts.iter().zip(upper.iter()) {
-                match v.cmp(u) {
-                    std::cmp::Ordering::Less => return true,
-                    std::cmp::Ordering::Greater => return false,
-                    std::cmp::Ordering::Equal => continue,
-                }
-            }
-            false
-        }
+        // Equality reads the versions alone: a prerelease is simply not the
+        // release it qualifies, so `= 6.61` rules out 6.61.0-rc1 and
+        // `!= 6.61` admits it.
+        "=" | "==" => ordering.is_eq(),
+        "!=" => ordering.is_ne(),
+        ">=" => ver.comparable_with(&req) && ordering.is_ge(),
+        "<=" => ver.comparable_with(&req) && ordering.is_le(),
+        ">" => ver.comparable_with(&req) && ordering.is_gt(),
+        "<" => ver.comparable_with(&req) && ordering.is_lt(),
+        "~>" => ver.satisfies_pessimistic(&req),
         _ => false,
     }
 }
 
-fn parse_version_parts(v: &str) -> Vec<u64> {
-    v.split('.').filter_map(|s| s.parse().ok()).collect()
+/// A version as Terraform reads it. Segments are padded to three, so `6.61`
+/// and `6.61.0` are one release, and how many were written is remembered
+/// because the pessimistic operator bounds on the ones the author stated.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TerraformVersion {
+    segments: Vec<u64>,
+    /// How many segments the string stated, before padding.
+    stated: usize,
+    prerelease: String,
+}
+
+impl TerraformVersion {
+    fn parse(v: &str) -> Self {
+        let v = v.trim().trim_start_matches('v');
+        // Build metadata takes no part in ordering.
+        let core = v.split('+').next().unwrap_or(v);
+        let (core, prerelease) = match core.split_once('-') {
+            Some((core, pre)) => (core, pre.to_string()),
+            None => (core, String::new()),
+        };
+        // A segment that is not a number is no version Terraform would accept;
+        // reading it as zero keeps the comparison total instead of dropping the
+        // component and shifting every later one into its place.
+        let mut segments: Vec<u64> = core
+            .split('.')
+            .map(|s| s.trim().parse().unwrap_or(0))
+            .collect();
+        let stated = segments.len();
+        while segments.len() < 3 {
+            segments.push(0);
+        }
+        Self {
+            segments,
+            stated,
+            prerelease,
+        }
+    }
+
+    fn compare(&self, other: &Self) -> std::cmp::Ordering {
+        for i in 0..self.segments.len().max(other.segments.len()) {
+            let left = self.segments.get(i).copied().unwrap_or(0);
+            let right = other.segments.get(i).copied().unwrap_or(0);
+            match left.cmp(&right) {
+                std::cmp::Ordering::Equal => continue,
+                other => return other,
+            }
+        }
+        compare_prereleases(&self.prerelease, &other.prerelease)
+    }
+
+    /// Whether an ordering comparison against `required` is meaningful at all.
+    /// A requirement that names no prerelease is about released versions, so a
+    /// prerelease never satisfies it; a requirement that does name one speaks
+    /// only of prereleases of the very release it names.
+    fn comparable_with(&self, required: &Self) -> bool {
+        match (!self.prerelease.is_empty(), !required.prerelease.is_empty()) {
+            (true, true) => self.segments == required.segments,
+            (true, false) => false,
+            _ => true,
+        }
+    }
+
+    /// The pessimistic operator: at least `required`, with every segment before
+    /// the last one stated held equal. `~> 5.1` keeps the major, `~> 5.1.0`
+    /// keeps major and minor, and `~> 5` bounds nothing above.
+    fn satisfies_pessimistic(&self, required: &Self) -> bool {
+        if !self.comparable_with(required) {
+            return false;
+        }
+        // A prerelease requirement admits only prereleases.
+        if !required.prerelease.is_empty() && self.prerelease.is_empty() {
+            return false;
+        }
+        if self.compare(required).is_lt() {
+            return false;
+        }
+        if required.segments.len() > self.segments.len() {
+            return false;
+        }
+        for i in 0..required.stated.saturating_sub(1) {
+            if self.segments.get(i) != required.segments.get(i) {
+                return false;
+            }
+        }
+        let last = required.segments.len() - 1;
+        required.segments[last] <= self.segments.get(last).copied().unwrap_or(0)
+    }
+}
+
+/// Compare two prerelease strings. A release outranks any prerelease of it, and
+/// the prereleases themselves compare identifier by identifier: one that is all
+/// digits compares as the number it is and ranks below one that is not.
+fn compare_prereleases(left: &str, right: &str) -> std::cmp::Ordering {
+    if left == right {
+        return std::cmp::Ordering::Equal;
+    }
+    match (left.is_empty(), right.is_empty()) {
+        (true, false) => return std::cmp::Ordering::Greater,
+        (false, true) => return std::cmp::Ordering::Less,
+        _ => {}
+    }
+    let left: Vec<&str> = left.split('.').collect();
+    let right: Vec<&str> = right.split('.').collect();
+    for i in 0..left.len().max(right.len()) {
+        let l = left.get(i).copied().unwrap_or("");
+        let r = right.get(i).copied().unwrap_or("");
+        match compare_prerelease_part(l, r) {
+            std::cmp::Ordering::Equal => continue,
+            other => return other,
+        }
+    }
+    std::cmp::Ordering::Equal
+}
+
+fn compare_prerelease_part(left: &str, right: &str) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    if left == right {
+        return Ordering::Equal;
+    }
+    let left_number = left.parse::<u64>().ok();
+    let right_number = right.parse::<u64>().ok();
+    // An identifier the other side does not have ranks below a number and
+    // above anything else, which is what makes `rc` precede `rc.1`.
+    if left.is_empty() {
+        return if right_number.is_some() {
+            Ordering::Less
+        } else {
+            Ordering::Greater
+        };
+    }
+    if right.is_empty() {
+        return if left_number.is_some() {
+            Ordering::Greater
+        } else {
+            Ordering::Less
+        };
+    }
+    match (left_number, right_number) {
+        (Some(left), Some(right)) => left.cmp(&right),
+        (Some(_), None) => Ordering::Less,
+        (None, Some(_)) => Ordering::Greater,
+        (None, None) => left.cmp(right),
+    }
 }
 
 #[cfg(test)]
@@ -430,6 +552,74 @@ mod tests {
         assert!(!matches_terraform_constraint("3.0.0", ">= 4.0.0"));
         assert!(matches_terraform_constraint("5.0.0", "< 6.0.0"));
         assert!(!matches_terraform_constraint("6.0.0", "< 6.0.0"));
+    }
+
+    /// Terraform pads a version to the length of the one it is compared with,
+    /// so `6.61` and `6.61.0` are one release under every operator. Reading the
+    /// segments as a plain list orders the shorter one first, which turns
+    /// `!= 6.61` into a constraint the release it names satisfies.
+    #[test]
+    fn a_missing_segment_reads_as_zero() {
+        assert!(matches_terraform_constraint("6.61.0", "= 6.61"));
+        assert!(matches_terraform_constraint("6.61", "= 6.61.0"));
+        assert!(!matches_terraform_constraint("6.61.0", "!= 6.61"));
+        assert!(!matches_terraform_constraint("6.61", "!= 6.61.0"));
+        assert!(!matches_terraform_constraint("6.61.0", "> 6.61"));
+        assert!(!matches_terraform_constraint("6.61.0", "< 6.61"));
+        assert!(matches_terraform_constraint("6.61.0", ">= 6.61"));
+        assert!(matches_terraform_constraint("6.61.0", "<= 6.61"));
+
+        // A zero that is not trailing still separates two releases.
+        assert!(!matches_terraform_constraint("6.61.0", "= 6.0.61"));
+        assert!(matches_terraform_constraint("6.61.1", "> 6.61"));
+
+        // The pessimistic operator reads how many segments each side carries,
+        // so the padding has to be in place before the lengths are compared.
+        // `6.61` is `6.61.0`, and a constraint may not out-state a version that
+        // names the same release.
+        assert!(matches_terraform_constraint("6.61", "~> 6.61.0"));
+    }
+
+    /// A constraint that names no prerelease is about released versions, so a
+    /// prerelease satisfies none of its ordering operators however the numbers
+    /// compare. Dropping the segment that carries the prerelease hides that:
+    /// `6.61.1-rc1` reads as `6.61` and passes for a release.
+    #[test]
+    fn a_prerelease_answers_only_to_a_constraint_that_names_one() {
+        assert!(!matches_terraform_constraint("6.61.0-rc1", "< 6.61.0"));
+        assert!(!matches_terraform_constraint("6.61.0-rc1", ">= 6.61.0"));
+        assert!(!matches_terraform_constraint("6.61.1-rc1", "> 6.61.0"));
+        assert!(!matches_terraform_constraint("6.61.0-rc1", "~> 6.61.0"));
+        assert!(!matches_terraform_constraint("6.62.0-rc1", "> 6.61.0-rc1"));
+
+        // Equality reads the versions alone: a prerelease is not the release it
+        // qualifies, so the exclusion admits it and the pin rules it out.
+        assert!(!matches_terraform_constraint("6.61.0-rc1", "= 6.61"));
+        assert!(matches_terraform_constraint("6.61.0-rc1", "!= 6.61"));
+
+        // Between prereleases of one release the identifiers decide, and one
+        // that is all digits compares as the number it is.
+        assert!(matches_terraform_constraint("6.61.0-rc2", "> 6.61.0-rc1"));
+        assert!(matches_terraform_constraint(
+            "6.61.0-rc.10",
+            "> 6.61.0-rc.2"
+        ));
+        assert!(matches_terraform_constraint("6.61.0-rc.1", "> 6.61.0-rc"));
+    }
+
+    /// The pessimistic operator holds every segment before the last one the
+    /// constraint states, so how many it states is what sets the ceiling. A
+    /// constraint of one segment states no ceiling at all.
+    #[test]
+    fn the_pessimistic_ceiling_follows_the_segments_the_constraint_states() {
+        assert!(matches_terraform_constraint("5.5.0", "~> 5"));
+        assert!(matches_terraform_constraint("6.0.0", "~> 5"));
+        assert!(!matches_terraform_constraint("4.9.0", "~> 5"));
+
+        assert!(matches_terraform_constraint("5.2.0", "~> 5.1"));
+        assert!(!matches_terraform_constraint("6.0.0", "~> 5.1"));
+        assert!(matches_terraform_constraint("5.1.9", "~> 5.1.0"));
+        assert!(!matches_terraform_constraint("5.2.0", "~> 5.1.0"));
     }
 
     #[test]
