@@ -88,7 +88,7 @@ upd --apply requirements.txt pyproject.toml
 upd -i
 
 # Only the packages you name
-upd --package requests,flask
+upd -p requests,flask
 
 # Cap the bump level (allow patch + minor, skip major). Updates above the
 # ceiling are reported as held back, never as up to date, and do not

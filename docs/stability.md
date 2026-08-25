@@ -18,7 +18,7 @@ Global flags (accepted on every subcommand):
 | `--check` | | Make `align` exit 1 if misalignments are found (`update` and `audit` already exit non-zero; see exit codes) |
 | `--only-bump <major\|minor\|patch>` | | Restrict to exactly these bump levels (repeatable, comma-separated) |
 | `--max-bump <major\|minor\|patch>` | | Include updates up to and including this level |
-| `--package <NAME>` | | Restrict to named packages (repeatable, comma-separated) |
+| `--package <NAME>` | `-p` | Restrict to named packages (repeatable, comma-separated) |
 | `--lang <LANG>` | `-l` | Filter by ecosystem (repeatable) |
 | `--full-precision` | | Output full versions |
 | `--no-cache` | | Disable version cache |

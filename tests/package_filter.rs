@@ -163,6 +163,13 @@ fn cli_parses_package_single() {
 }
 
 #[test]
+fn cli_parses_package_short() {
+    use clap::Parser;
+    let cli = upd::cli::Cli::try_parse_from(["upd", "-p", "foo"]).unwrap();
+    assert_eq!(cli.packages, vec!["foo".to_string()]);
+}
+
+#[test]
 fn cli_parses_package_comma_separated() {
     use clap::Parser;
     let cli = upd::cli::Cli::try_parse_from(["upd", "--package", "foo,bar"]).unwrap();

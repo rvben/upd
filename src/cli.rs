@@ -227,6 +227,7 @@ pub struct Cli {
     ///
     /// Comma-separated or repeatable. Exact case-sensitive match.
     #[arg(
+        short = 'p',
         long = "package",
         value_name = "NAME",
         global = true,
