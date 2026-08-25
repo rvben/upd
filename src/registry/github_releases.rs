@@ -259,15 +259,23 @@ impl Registry for GitHubReleasesRegistry {
         // Try releases/latest first — it returns the most recent non-prerelease.
         let latest_url = format!("{}/repos/{}/{}/releases/latest", self.api_url, owner, repo);
         let response = get_with_retry(&self.client, &latest_url).await?;
+        let status = response.status();
 
-        if response.status().is_success() {
+        if status.is_success() {
             let release: ReleaseResponse = response.json().await?;
-            return Ok(release.tag_name);
-        }
-
-        // On 404 (no releases published), fall back to the tags endpoint.
-        if response.status().as_u16() != 404 {
-            let status = response.status();
+            // A repository may publish releases whose tags are not versions at
+            // all — dated artifact bundles alongside the code releases, say.
+            // GitHub calls the newest of those "latest" regardless, so an
+            // unparsable tag means this endpoint cannot answer the question,
+            // not that the repository has no versions. Fall through to the tag
+            // scan below, which filters non-versions out. Returning the tag
+            // verbatim instead leaves the caller with an unusable version and
+            // the pin silently counted as up to date.
+            if TagVersion::parse(&release.tag_name).is_some() {
+                return Ok(release.tag_name);
+            }
+        } else if status.as_u16() != 404 {
+            // On 404 (no releases published), fall back to the tags endpoint.
             let hint = match status.as_u16() {
                 403 | 429 => Some("Set GITHUB_TOKEN to increase the API rate limit."),
                 _ => None,
@@ -715,6 +723,40 @@ mod tests {
             .unwrap();
 
         assert_eq!(version, "v4.2.0");
+    }
+
+    #[tokio::test]
+    async fn a_latest_release_whose_tag_is_not_a_version_falls_back_to_tags() {
+        let server = MockServer::start().await;
+
+        // A repository that publishes dated artifact bundles beside its code
+        // releases: GitHub names the newest bundle "latest" even though its tag
+        // is not a version, so this endpoint cannot answer on its own.
+        Mock::given(method("GET"))
+            .and(path("/repos/rvben/husker/releases/latest"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                r#"{"tag_name": "images-2026-08-24T193611Z", "name": "Default images"}"#,
+            ))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path("/repos/rvben/husker/tags"))
+            .and(query_param("per_page", "100"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                r#"[{"name": "images-2026-08-24T193611Z"}, {"name": "v0.4.48"}, {"name": "images-2026-08-23T134321Z"}, {"name": "v0.4.47"}]"#,
+            ))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let version = registry(&server)
+            .get_latest_version("rvben/husker")
+            .await
+            .unwrap();
+
+        assert_eq!(version, "v0.4.48");
     }
 
     #[tokio::test]
