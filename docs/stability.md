@@ -104,6 +104,18 @@ author wrote it, so `>=1.0, <2.0` becomes `>=1.5.0, <2.0`. An upper bound is
 also honored when picking the new version: the release chosen is the newest one
 the requirement already admits, never one above the cap.
 
+Only an *inclusive* lower bound is that anchor. `>1.2.3` names the one version
+its author refuses rather than the one they are on, a ceiling (`<3`, `<=3`) and
+an exclusion (`!= 1.5`) name no floor at all, an npm OR range (`^1 || ^2`) has
+no single branch to edit, and a NuGet interval (`[12.0.0,14.0.0)`) is not a form
+`upd` writes. None of them is raised, and none is reported as an update. Each is
+still measured against the registry and lands in one of three places: counted as
+up to date when the constraint admits the newest release, a warning in
+`files[].warnings` naming the release and the constraint when it does not, or an
+error in `files[].errors` when the spec cannot be read. Only the last changes
+the exit code, and it does so deliberately: nothing looked at that dependency,
+so counting it as up to date would put a green tick over an unchecked answer.
+
 An update above the ceiling is reported as held back, in `files[].capped` and
 `summary.capped`. It is never counted as up to date, and it does not change the
 exit code: the ceiling exists to keep such a change out of the gate, so a run
@@ -158,7 +170,7 @@ that project asked for.
 |------|---------|
 | `0` | Success. No action required, or updates applied cleanly |
 | `1` | Pending updates or misalignments found (dry-run / `--check`). Not an error. |
-| `2` | I/O error. A file could not be read/written, or a required path does not exist |
+| `2` | An error was reported. A file could not be read/written, a required path does not exist, a lockfile refresh failed, a dependency could not be checked (its constraint could not be read, or its registry lookup did not answer), or `--interactive` was given with no terminal on stdin. Takes precedence over every other code |
 | `3` | Network error. A registry was unreachable or timed out |
 | `4` | Invalid CLI arguments or an unparseable dependency file / configuration |
 | `6` | Vulnerabilities found (`upd audit`). Pass `--no-fail` to force exit 0. |

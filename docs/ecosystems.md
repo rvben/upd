@@ -48,7 +48,9 @@ An explicitly passed file path bypasses discovery entirely, which is how
 - `Directory.Packages.props` and `Directory.Build.props` (`PackageVersion` elements)
 - Supports both inline `Version` attributes and child `<Version>` elements
 - Queries the NuGet v3 API (`api.nuget.org`)
-- Skips range version constraints (`[1.0, 2.0)`)
+- Does not rewrite interval-notation ranges (`[1.0,2.0)`), but reports them:
+  up to date when the range admits the newest release, a warning when the
+  release has outgrown it, an error when the notation cannot be read
 
 ## Terraform / OpenTofu
 

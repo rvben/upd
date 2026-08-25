@@ -162,11 +162,38 @@ Output includes clickable `file:line:` locations (recognized by VS Code, iTerm2,
 | `>=2.0` | Updates to any version >= 2.0 |
 | `==2.0.0` | Updates the exact pin to the latest version (e.g. `==2.0.0` → `==3.1.5`). To freeze a package, use `[pin]` or `ignore` in `.updrc.toml`. |
 
-For npm, comparator ranges such as `">=1.0.0 <2.0.0"` are rewritten with a
-**bump strategy**: the lower bound moves to the highest version satisfying the
-constraint, preserving the upper bound. Hyphen (`"1 - 2"`) and OR
-(`"^1 || ^2"`) ranges are reported as warnings and left untouched rather than
-rewritten wrongly.
+An update moves the **lower bound** and leaves every other clause where the
+author wrote it, so `>=1.0, <2.0` becomes `>=1.5.0, <2.0`. A constraint is an
+unordered set of clauses, so the lower bound is found wherever it sits
+(`<2.0, >=1.0` answers alike), and an upper bound is honored when picking the
+new version: the release chosen is the newest one the constraint already admits.
+
+npm ranges keep the shape they were written in. A comparator range
+(`">=1.0.0 <2.0.0"`) and a hyphen range (`"4.17.0 - 4.18.0"`) each keep their
+ceiling. A wildcard or partial range takes its ceiling from its own floor, like
+a caret, so it follows the newest release and the whole shape moves with it:
+`"4.3.x"` becomes `"4.4.x"` and `"^1.2"` becomes `"^3.1"`, never a fully
+written version. npm lets a comparator stand apart from the version it applies
+to, and that spacing is part of the shape: `">= 1.2.7 < 1.3.0"` is read as the
+range it is and comes back spaced the same way.
+
+### Bounds that are not floors
+
+Only an **inclusive** lower bound names the version a project is on, so only
+that bound is raised. `>1.2.3` names the one version its author refuses, `<3`
+and `<=3` are ceilings, `!= 1.5` is an exclusion, and an OR range
+(`"^1 || ^2"`) has no single branch to edit. None of them is a floor, so none
+of them is moved. They are checked against the registry and reported anyway:
+
+| Outcome | Reported as |
+|---------|-------------|
+| The constraint admits the newest release | Up to date |
+| The newest release has outgrown it | A warning naming the release and the constraint |
+| The spec cannot be read at all | An error, exit `2` |
+
+The last row is the point of the other two: a dependency nothing looked at must
+not be counted as up to date, and a constraint that has quietly frozen a
+dependency should say so rather than pass under a green tick.
 
 ## Annotated Version Pins
 
