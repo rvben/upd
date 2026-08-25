@@ -19,6 +19,12 @@
 //!     "**/vendored/requirements.txt",
 //! ]
 //!
+//! # Otherwise-unknown files to scan for `upd:` annotations - top-level array
+//! include = [
+//!     "ansible/roles/*/vars/*.yml",
+//!     "docker-compose.yml",
+//! ]
+//!
 //! # Leave SHA-pinned GitHub Actions alone; updating them is the default
 //! update_action_shas = false
 //!
@@ -59,7 +65,14 @@ use std::path::{Path, PathBuf};
 const MAX_CONFIG_FILE_SIZE: u64 = 1024 * 1024;
 
 /// All valid top-level keys in the config schema.
-const KNOWN_KEYS: &[&str] = &["ignore", "exclude", "pin", "cooldown", "update_action_shas"];
+const KNOWN_KEYS: &[&str] = &[
+    "ignore",
+    "include",
+    "exclude",
+    "pin",
+    "cooldown",
+    "update_action_shas",
+];
 
 /// Raw cooldown config as written in the TOML file. Parsed into a
 /// `crate::cooldown::CooldownPolicy` at runtime via `UpdConfig::to_cooldown_policy`.
@@ -79,6 +92,15 @@ pub struct UpdConfig {
     /// Package names to ignore (never update or align)
     #[serde(default)]
     pub ignore: Vec<String>,
+
+    /// Path glob patterns that add otherwise-unknown files to discovery as
+    /// annotated files.
+    ///
+    /// A detected manifest type always wins, and `exclude` takes precedence.
+    /// Explicit file-path CLI arguments already work as annotated files and do
+    /// not need to be listed here.
+    #[serde(default)]
+    pub include: Vec<String>,
 
     /// Path glob patterns to exclude from file discovery.
     ///
@@ -289,6 +311,15 @@ impl UpdConfig {
 # (lowercased; runs of `-`, `_`, and `.` are treated as equivalent).
 ignore = []
 
+# include: path glob patterns that add otherwise-unknown files to discovery as
+# annotated files (top-level array of strings). A detected manifest type always
+# wins, so this never reinterprets files such as Terraform or GitHub Actions.
+# Patterns are relative to the scanned directory. `exclude` takes precedence.
+include = [
+    # "ansible/roles/*/vars/*.yml",
+    # "docker-compose.yml",
+]
+
 # exclude: path glob patterns dropped during file discovery (top-level array of
 # strings). Honored by every subcommand that scans for files (align, update,
 # audit). Patterns are matched against the discovered file path; a leading
@@ -392,6 +423,7 @@ exclude = [
     /// Check if any configuration is present
     pub fn has_config(&self) -> bool {
         !self.ignore.is_empty()
+            || !self.include.is_empty()
             || !self.exclude.is_empty()
             || !self.pin.is_empty()
             || self.cooldown.is_some()
@@ -403,6 +435,12 @@ exclude = [
         for pkg in other.ignore {
             if !self.ignore.contains(&pkg) {
                 self.ignore.push(pkg);
+            }
+        }
+        // Extend include list
+        for pattern in other.include {
+            if !self.include.contains(&pattern) {
+                self.include.push(pattern);
             }
         }
         // Extend exclude list
@@ -531,6 +569,7 @@ impl EffectiveConfig<'_> {
         }
 
         out.push_str(&render_list("ignore", &self.config.ignore));
+        out.push_str(&render_list("include", &self.config.include));
         out.push_str(&render_list("exclude", &self.config.exclude));
 
         if self.config.pin.is_empty() {
@@ -576,6 +615,7 @@ impl EffectiveConfig<'_> {
             "config_file": self.source.map(|p| p.display().to_string()),
             "config_file_explicit": self.explicit,
             "ignore": self.config.ignore,
+            "include": self.config.include,
             "exclude": self.config.exclude,
             "pin": pin,
             "update_action_shas": self.update_action_shas,
@@ -715,6 +755,47 @@ exclude = ["**/archive/**", "**/vendored/requirements.txt"]
     }
 
     #[test]
+    fn test_include_parses_and_is_a_known_key() {
+        let content = r#"
+include = ["ansible/roles/*/vars/*.yml", "docker-compose.yml"]
+"#;
+        let (config, warnings) = UpdConfig::parse_with_warnings(content, "test.toml").unwrap();
+        assert!(
+            warnings.is_empty(),
+            "include must be a known top-level key (no warning); got: {warnings:?}"
+        );
+        assert_eq!(
+            config.include,
+            vec![
+                "ansible/roles/*/vars/*.yml".to_string(),
+                "docker-compose.yml".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn test_has_config_true_with_only_include() {
+        let config = UpdConfig {
+            include: vec!["versions.yml".to_string()],
+            ..Default::default()
+        };
+        assert!(config.has_config());
+    }
+
+    #[test]
+    fn test_merge_extends_include_without_duplicates() {
+        let mut base = UpdConfig {
+            include: vec!["a.yml".to_string()],
+            ..Default::default()
+        };
+        base.merge(UpdConfig {
+            include: vec!["a.yml".to_string(), "b.yml".to_string()],
+            ..Default::default()
+        });
+        assert_eq!(base.include, vec!["a.yml".to_string(), "b.yml".to_string()]);
+    }
+
+    #[test]
     fn test_has_config_true_with_only_exclude() {
         let config = UpdConfig {
             exclude: vec!["**/archive/**".to_string()],
@@ -746,6 +827,15 @@ exclude = ["**/archive/**", "**/vendored/requirements.txt"]
         assert!(
             schema.contains("exclude"),
             "schema must document the exclude key: {schema}"
+        );
+    }
+
+    #[test]
+    fn test_schema_toml_documents_include() {
+        let schema = UpdConfig::schema_toml();
+        assert!(
+            schema.contains("include") && schema.contains("docker-compose.yml"),
+            "schema must document the include key: {schema}"
         );
     }
 

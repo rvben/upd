@@ -98,6 +98,11 @@ NODE_VERSION := 22.11.0  # upd: npm node
 - Scanned by name: `Makefile`, `makefile`, `GNUmakefile`, `*.mk`, `justfile`,
   `Justfile`, `*.sh`, `*.bash`. Any other file works when passed explicitly:
   `upd update path/to/versions.env`
+- The top-level `include` config key adds otherwise-unknown files to directory
+  discovery as annotated files. Patterns are relative to the scanned directory:
+  `include = ["ansible/roles/*/vars/*.yml", "docker-compose.yml"]`
+- `include` does not reinterpret a recognized file type (`main.tf` remains
+  Terraform), and `exclude` takes precedence when both match
 - The version on the line is found and rewritten in place, keeping a leading
   `v` and the line's own precision (`v2.60` becomes `v2.65`, not `v2.65.4`)
 - One package name may not appear under two different sources in the same file
@@ -106,6 +111,8 @@ NODE_VERSION := 22.11.0  # upd: npm node
   one key, as are `"foo-bar"` and `"foo_bar"`
 - `exclude` filters discovered files with path globs; explicitly passed file
   paths bypass it
+- `--verbose` inspects otherwise-unknown UTF-8 text files up to 1 MiB, reports
+  those containing an `upd:` annotation marker, and suggests an `include` glob
 - `upd align` and `upd audit` ignore annotated lines: a package name is only
   meaningful together with its source, so grouping them across files is not safe
 

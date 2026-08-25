@@ -30,6 +30,16 @@ ignore = [
     "pre-commit/pre-commit-hooks",  # Pre-commit hooks too
 ]
 
+# Add otherwise-unknown files to discovery as annotated files. Patterns are
+# relative to the directory being scanned.
+include = [
+    "ansible/roles/*/vars/*.yml",
+    "docker-compose.yml",
+]
+
+# Drop matching files from discovery. Exclude takes precedence over include.
+exclude = ["**/archive/**"]
+
 # Leave SHA-pinned GitHub Actions unchecked for this repository. Checking them
 # is the default; --update-action-shas still wins when given.
 update_action_shas = false
@@ -45,11 +55,20 @@ django = "4.2.0"
 | Option | Type | Description |
 |--------|------|-------------|
 | `ignore` | `string[]` | List of package names to skip during updates |
+| `include` | `string[]` | Path globs that add otherwise-unknown files to discovery as annotated files |
+| `exclude` | `string[]` | Path globs removed from discovery; takes precedence over `include` |
 | `pin` | `table` | Map of package names to pinned versions |
 | `update_action_shas` | `bool` | Whether SHA-pinned GitHub Actions are checked and updated. Defaults to `true`; `--update-action-shas` and `--no-update-action-shas` override it |
 
 Package matching is PEP 503-normalized, so `"Oven-SH/bun"` and `"oven-sh/bun"`
 are one key, as are `"foo-bar"` and `"foo_bar"`.
+
+`include` only fills gaps in file-type detection. It never reinterprets a
+recognized manifest, so `main.tf` still uses the Terraform parser even when an
+include glob matches it. Explicit file paths bypass both discovery globs, just
+as they bypass ignore-file filtering. Run with `--verbose` to report files that
+contain an `upd:` marker but are not discovery candidates; this diagnostic
+inspection is limited to UTF-8 text files up to 1 MiB.
 
 ### Seeing what was ignored or pinned
 

@@ -1131,9 +1131,14 @@ pub struct DiscoverOptions<'a> {
     /// `rg --no-ignore`.
     pub no_ignore: bool,
     /// When true, emit one `skipping <path>: gitignored` (or `excluded by
-    /// config`) line on stderr for each dependency file discovery dropped, so
-    /// users can see why `upd` is silent on a given file.
+    /// config`) line on stderr for each dependency file discovery dropped, and
+    /// report bounded text files with unreachable annotation markers, so users
+    /// can see why `upd` is silent on a given file.
     pub verbose: bool,
+    /// Path glob patterns (from config `include`) that add otherwise-unknown
+    /// files to discovery as [`FileType::Annotated`]. A real detected file type
+    /// always wins, and explicit file paths do not need an include pattern.
+    pub include: &'a [String],
     /// Path glob patterns (from config `exclude`) dropped during discovery.
     ///
     /// Matched against each discovered dependency file path; a leading `**/`
@@ -1159,7 +1164,7 @@ pub fn discover_files(paths: &[PathBuf], langs: &[Lang]) -> Vec<(PathBuf, FileTy
 /// Returns `None` when there are no usable patterns. Individual invalid
 /// patterns emit a warning on stderr and are skipped so one typo does not
 /// silently disable the rest of the list.
-fn build_exclude_set(patterns: &[String]) -> Option<globset::GlobSet> {
+fn build_glob_set(patterns: &[String], key: &str) -> Option<globset::GlobSet> {
     if patterns.is_empty() {
         return None;
     }
@@ -1172,7 +1177,7 @@ fn build_exclude_set(patterns: &[String]) -> Option<globset::GlobSet> {
                 builder.add(glob);
                 added += 1;
             }
-            Err(e) => eprintln!("warning: invalid exclude pattern '{pattern}': {e}"),
+            Err(e) => eprintln!("warning: invalid {key} pattern '{pattern}': {e}"),
         }
     }
 
@@ -1183,10 +1188,54 @@ fn build_exclude_set(patterns: &[String]) -> Option<globset::GlobSet> {
     match builder.build() {
         Ok(set) => Some(set),
         Err(e) => {
-            eprintln!("warning: failed to compile exclude patterns: {e}");
+            eprintln!("warning: failed to compile {key} patterns: {e}");
             None
         }
     }
+}
+
+/// Match both the path as returned by the walker and its path relative to each
+/// scanned directory. The latter makes repository-root patterns such as
+/// `docker-compose.yml` work whether the CLI path was `.`, relative, or
+/// absolute; matching the former preserves existing depth-independent globs.
+fn glob_matches(set: Option<&globset::GlobSet>, path: &Path, scan_paths: &[PathBuf]) -> bool {
+    let Some(set) = set else {
+        return false;
+    };
+    set.is_match(path)
+        || scan_paths.iter().filter(|root| root.is_dir()).any(|root| {
+            path.strip_prefix(root)
+                .is_ok_and(|relative| set.is_match(relative))
+        })
+}
+
+#[derive(Default)]
+struct WalkResult {
+    files: Vec<(PathBuf, FileType)>,
+    skipped_markers: Vec<PathBuf>,
+}
+
+/// Verbose discovery only: recognize the same annotation grammar the updater
+/// uses, without turning content sniffing into an implicit discovery rule.
+/// Keep the diagnostic bounded because this runs over otherwise-unknown files.
+fn contains_annotation_marker(path: &Path) -> bool {
+    const MAX_MARKER_SNIFF_SIZE: u64 = 1024 * 1024;
+
+    let Ok(metadata) = std::fs::metadata(path) else {
+        return false;
+    };
+    if metadata.len() > MAX_MARKER_SNIFF_SIZE {
+        return false;
+    }
+    let Ok(content) = std::fs::read_to_string(path) else {
+        return false;
+    };
+    content.lines().any(|line| {
+        !matches!(
+            crate::annotation::parse_line(line),
+            crate::annotation::ParseOutcome::None
+        )
+    })
 }
 
 /// Discover dependency files with explicit [`DiscoverOptions`].
@@ -1195,7 +1244,14 @@ pub fn discover_files_with(
     langs: &[Lang],
     options: DiscoverOptions<'_>,
 ) -> Vec<(PathBuf, FileType)> {
-    let after_gitignore = walk_dependency_files(paths, langs, options.no_ignore);
+    let include_set = build_glob_set(options.include, "include");
+    let after_gitignore = walk_dependency_files(
+        paths,
+        langs,
+        options.no_ignore,
+        include_set.as_ref(),
+        options.verbose,
+    );
 
     // Explicit file-path arguments bypass the exclude list, just as they bypass
     // gitignore (the directory walker is never consulted for them).
@@ -1205,13 +1261,13 @@ pub fn discover_files_with(
         .map(|p| p.as_path())
         .collect();
 
-    let exclude_set = build_exclude_set(options.exclude);
+    let exclude_set = build_glob_set(options.exclude, "exclude");
 
-    let mut kept: Vec<(PathBuf, FileType)> = Vec::with_capacity(after_gitignore.len());
+    let mut kept: Vec<(PathBuf, FileType)> = Vec::with_capacity(after_gitignore.files.len());
     let mut excluded: Vec<PathBuf> = Vec::new();
-    for (path, file_type) in after_gitignore {
+    for (path, file_type) in after_gitignore.files {
         let dropped = !explicit_files.contains(path.as_path())
-            && exclude_set.as_ref().is_some_and(|set| set.is_match(&path));
+            && glob_matches(exclude_set.as_ref(), &path, paths);
         if dropped {
             excluded.push(path);
         } else {
@@ -1225,13 +1281,20 @@ pub fn discover_files_with(
         // Gitignored files: present without ignore rules but absent after them.
         // Diff against the pre-exclude set so exclude drops are not mislabeled.
         if !options.no_ignore {
-            let unrestricted = walk_dependency_files(paths, langs, true);
+            let unrestricted =
+                walk_dependency_files(paths, langs, true, include_set.as_ref(), options.verbose);
             let after_gitignore_set: std::collections::HashSet<&Path> = kept
                 .iter()
                 .map(|(p, _)| p.as_path())
                 .chain(excluded.iter().map(|p| p.as_path()))
+                .chain(after_gitignore.skipped_markers.iter().map(|p| p.as_path()))
                 .collect();
-            for (path, _) in &unrestricted {
+            for path in unrestricted
+                .files
+                .iter()
+                .map(|(path, _)| path)
+                .chain(unrestricted.skipped_markers.iter())
+            {
                 if !after_gitignore_set.contains(path.as_path()) {
                     eprintln!("skipping {}: gitignored", path.display());
                 }
@@ -1239,6 +1302,12 @@ pub fn discover_files_with(
         }
         for path in &excluded {
             eprintln!("skipping {}: excluded by config", path.display());
+        }
+        for path in &after_gitignore.skipped_markers {
+            eprintln!(
+                "skipping {}: contains an `upd:` marker but is not a discovery candidate (add an `include` glob to .updrc.toml)",
+                path.display()
+            );
         }
     }
 
@@ -1249,8 +1318,10 @@ fn walk_dependency_files(
     paths: &[PathBuf],
     langs: &[Lang],
     no_ignore: bool,
-) -> Vec<(PathBuf, FileType)> {
-    let mut files = Vec::new();
+    include_set: Option<&globset::GlobSet>,
+    sniff_skipped_markers: bool,
+) -> WalkResult {
+    let mut result = WalkResult::default();
 
     for path in paths {
         if path.is_file() {
@@ -1259,7 +1330,7 @@ fn walk_dependency_files(
                     || langs.contains(&file_type.lang())
                     || file_type == FileType::Annotated)
             {
-                files.push((path.clone(), file_type));
+                result.files.push((path.clone(), file_type));
             }
             continue;
         }
@@ -1292,7 +1363,11 @@ fn walk_dependency_files(
                     return true;
                 }
 
-                ALLOWED_HIDDEN_ENTRIES.contains(&name.as_ref())
+                // Hidden files can be selected by `include` (for example
+                // `.gitlab-ci.yml`) and inspected for the verbose marker
+                // diagnostic. Continue pruning unknown hidden directories.
+                entry.file_type().is_some_and(|kind| kind.is_file())
+                    || ALLOWED_HIDDEN_ENTRIES.contains(&name.as_ref())
             })
             .build();
 
@@ -1301,17 +1376,26 @@ fn walk_dependency_files(
             if !entry_path.is_file() {
                 continue;
             }
-            if let Some(file_type) = FileType::detect_with_annotated(entry_path, false)
+            let detected = FileType::detect_with_annotated(entry_path, false);
+            let file_type = detected.or_else(|| {
+                glob_matches(include_set, entry_path, paths).then_some(FileType::Annotated)
+            });
+            if let Some(file_type) = file_type
                 && (langs.is_empty()
                     || langs.contains(&file_type.lang())
                     || file_type == FileType::Annotated)
             {
-                files.push((entry_path.to_path_buf(), file_type));
+                result.files.push((entry_path.to_path_buf(), file_type));
+            } else if detected.is_none()
+                && sniff_skipped_markers
+                && contains_annotation_marker(entry_path)
+            {
+                result.skipped_markers.push(entry_path.to_path_buf());
             }
         }
     }
 
-    files
+    result
 }
 
 #[cfg(test)]
@@ -1551,7 +1635,14 @@ mod tests {
         .unwrap();
         fs::write(dir.path().join("Cargo.toml"), "[package]\nname = \"x\"\n").unwrap();
 
-        let found = walk_dependency_files(&[dir.path().to_path_buf()], &[Lang::Python], true);
+        let found = walk_dependency_files(
+            &[dir.path().to_path_buf()],
+            &[Lang::Python],
+            true,
+            None,
+            false,
+        )
+        .files;
 
         assert!(
             found.iter().any(|(_, ft)| *ft == FileType::Annotated),
@@ -1562,7 +1653,14 @@ mod tests {
             "--lang python must still drop Cargo.toml: {found:?}"
         );
 
-        let explicit = walk_dependency_files(&[dir.path().join("Makefile")], &[Lang::Rust], true);
+        let explicit = walk_dependency_files(
+            &[dir.path().join("Makefile")],
+            &[Lang::Rust],
+            true,
+            None,
+            false,
+        )
+        .files;
         assert_eq!(
             explicit.len(),
             1,
@@ -2316,6 +2414,7 @@ mod tests {
             DiscoverOptions {
                 no_ignore: true,
                 verbose: false,
+                include: &[],
                 exclude: &[],
             },
         );
@@ -2394,6 +2493,7 @@ mod tests {
             DiscoverOptions {
                 no_ignore: false,
                 verbose: false,
+                include: &[],
                 exclude: &patterns,
             },
         );
@@ -2407,6 +2507,110 @@ mod tests {
             !paths.contains(&archive.join("requirements.txt")),
             "file under archive/ must be excluded; got: {paths:?}"
         );
+    }
+
+    #[test]
+    fn test_discover_files_include_adds_unknown_file_as_annotated() {
+        let temp = tempdir().unwrap();
+        let root = temp.path();
+        let vars = root.join("ansible/roles/shinyhub/vars");
+        fs::create_dir_all(&vars).unwrap();
+        let main_yml = vars.join("main.yml");
+        fs::write(
+            &main_yml,
+            "shinyhub_version: \"0.11.16\"  # upd: pypi shinyhub\n",
+        )
+        .unwrap();
+
+        let include = vec!["ansible/roles/*/vars/*.yml".to_string()];
+        let files = discover_files_with(
+            &[root.to_path_buf()],
+            &[],
+            DiscoverOptions {
+                no_ignore: false,
+                verbose: false,
+                include: &include,
+                exclude: &[],
+            },
+        );
+
+        assert_eq!(files, vec![(main_yml, FileType::Annotated)]);
+    }
+
+    #[test]
+    fn test_discover_files_include_matches_exact_and_hidden_file_names() {
+        let temp = tempdir().unwrap();
+        let root = temp.path();
+        let compose = root.join("docker-compose.yml");
+        let gitlab = root.join(".gitlab-ci.yml");
+        fs::write(&compose, "version: 1.0.0  # upd: pypi example\n").unwrap();
+        fs::write(&gitlab, "version: 1.0.0  # upd: pypi example\n").unwrap();
+
+        let include = vec![
+            "docker-compose.yml".to_string(),
+            ".gitlab-ci.yml".to_string(),
+        ];
+        let files = discover_files_with(
+            &[root.to_path_buf()],
+            &[],
+            DiscoverOptions {
+                no_ignore: false,
+                verbose: false,
+                include: &include,
+                exclude: &[],
+            },
+        );
+        let discovered: std::collections::HashMap<_, _> = files.into_iter().collect();
+
+        assert_eq!(discovered.get(&compose), Some(&FileType::Annotated));
+        assert_eq!(discovered.get(&gitlab), Some(&FileType::Annotated));
+    }
+
+    #[test]
+    fn test_discover_files_exclude_wins_over_include() {
+        let temp = tempdir().unwrap();
+        let root = temp.path();
+        let vars = root.join("ansible/roles/shinyhub/vars");
+        fs::create_dir_all(&vars).unwrap();
+        let main_yml = vars.join("main.yml");
+        fs::write(&main_yml, "version: 1.0.0  # upd: pypi shinyhub\n").unwrap();
+
+        let include = vec!["ansible/roles/*/vars/*.yml".to_string()];
+        let exclude = vec!["**/shinyhub/**".to_string()];
+        let files = discover_files_with(
+            &[root.to_path_buf()],
+            &[],
+            DiscoverOptions {
+                no_ignore: false,
+                verbose: false,
+                include: &include,
+                exclude: &exclude,
+            },
+        );
+
+        assert!(files.is_empty(), "exclude must veto include: {files:?}");
+    }
+
+    #[test]
+    fn test_discover_files_include_never_overrides_detected_type() {
+        let temp = tempdir().unwrap();
+        let root = temp.path();
+        let terraform = root.join("main.tf");
+        fs::write(&terraform, "variable \"version\" { default = \"1.0.0\" }\n").unwrap();
+
+        let include = vec!["*.tf".to_string()];
+        let files = discover_files_with(
+            &[root.to_path_buf()],
+            &[],
+            DiscoverOptions {
+                no_ignore: false,
+                verbose: false,
+                include: &include,
+                exclude: &[],
+            },
+        );
+
+        assert_eq!(files, vec![(terraform, FileType::TerraformTf)]);
     }
 
     /// An explicit file-path argument bypasses `exclude` even when the glob
@@ -2428,6 +2632,7 @@ mod tests {
             DiscoverOptions {
                 no_ignore: false,
                 verbose: false,
+                include: &[],
                 exclude: &patterns,
             },
         );
@@ -2460,6 +2665,7 @@ mod tests {
             DiscoverOptions {
                 no_ignore: false,
                 verbose: false,
+                include: &[],
                 exclude: &patterns,
             },
         );

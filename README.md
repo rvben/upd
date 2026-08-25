@@ -39,7 +39,7 @@ pipx run upd --apply
 - **Check mode**: exit 1 if updates are available (for CI and pre-commit)
 - **Gitignore-aware**: honors `.gitignore` and prunes hidden directories, without missing the dotfiles it updates
 - **Private registries**: authentication for PyPI, npm, Cargo, Go, and GitHub
-- **Config file**: ignore or pin packages via `.updrc.toml`
+- **Config file**: include or exclude paths, ignore packages, and pin versions via `.updrc.toml`
 
 ## Installation
 
@@ -167,6 +167,28 @@ For npm, comparator ranges such as `">=1.0.0 <2.0.0"` are rewritten with a
 constraint, preserving the upper bound. Hyphen (`"1 - 2"`) and OR
 (`"^1 || ^2"`) ranges are reported as warnings and left untouched rather than
 rewritten wrongly.
+
+## Annotated Version Pins
+
+Files without a dependency-manifest format can carry a trailing annotation:
+
+```yaml
+shinyhub_version: "0.11.16"  # upd: pypi shinyhub
+```
+
+Directory walks scan annotations in `Makefile`, `makefile`, `GNUmakefile`,
+`justfile`, `Justfile`, `*.mk`, `*.sh`, and `*.bash`. Any file passed explicitly
+is scanned as annotated. To add other files to normal repository discovery, use
+repository-relative globs in `.updrc.toml`:
+
+```toml
+include = ["ansible/roles/*/vars/*.yml", "docker-compose.yml"]
+exclude = ["**/archive/**"] # exclude wins over include
+```
+
+An include never changes a recognized manifest's parser: for example, a
+matching `main.tf` remains Terraform. Use `--verbose` to diagnose an `upd:`
+marker in an otherwise undiscovered UTF-8 text file up to 1 MiB.
 
 ## Version Precision
 

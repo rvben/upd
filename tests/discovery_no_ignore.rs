@@ -125,3 +125,21 @@ fn discovery_no_ignore_with_verbose_emits_no_skip_lines() {
         "with --no-ignore there is nothing to skip; stderr should not mention gitignored:\n{stderr}"
     );
 }
+
+#[test]
+fn discovery_verbose_reports_marker_in_unknown_file() {
+    let tmp = tempfile::tempdir().unwrap();
+    fs::write(
+        tmp.path().join("deps.yml"),
+        "version: 1.0.0  # upd: pypi example\n",
+    )
+    .unwrap();
+
+    let path = tmp.path().to_str().unwrap();
+    let (_stdout, stderr, _code) = run(&["--check", "--no-cache", "--verbose", path], tmp.path());
+
+    assert!(
+        stderr.contains("deps.yml") && stderr.contains("upd:") && stderr.contains("include"),
+        "verbose mode must explain how to make the skipped annotation reachable; stderr:\n{stderr}"
+    );
+}

@@ -306,6 +306,17 @@ fn log_update_config_usage(resolved: &ResolvedUpdateConfig) {
             .dimmed()
         );
     }
+
+    if !resolved.config.include.is_empty() {
+        println!(
+            "{}",
+            format!(
+                "  Including {} annotated path pattern(s)",
+                resolved.config.include.len()
+            )
+            .dimmed()
+        );
+    }
 }
 
 fn discover_update_config(start_dir: &Path) -> Result<Option<ResolvedUpdateConfig>, String> {
@@ -320,7 +331,7 @@ fn discover_update_config(start_dir: &Path) -> Result<Option<ResolvedUpdateConfi
 
 /// Resolve the single config that governs discovery-level settings.
 ///
-/// Discovery-level settings (the `exclude` path globs, and the `ignore` list
+/// Discovery-level settings (the `include`/`exclude` path globs, and the `ignore` list
 /// for `align`) describe the whole scan rather than an individual file, so they
 /// are resolved once from a single config: an explicit `--config` when given,
 /// otherwise the nearest config discovered upward from the first scan path.
@@ -1119,7 +1130,7 @@ async fn run_update(cli: &Cli) -> Result<()> {
     // --check, or --dry-run), the run behaves as dry-run.
     let effective_dry_run = cli.is_effective_dry_run();
 
-    // `exclude` is a discovery-level setting resolved once from the root config;
+    // `include`/`exclude` are discovery-level settings resolved once from the root config;
     // per-file `ignore`/`pin` are loaded separately by `load_update_configs`.
     let root_config = resolve_root_config(cli, &paths)?;
 
@@ -1129,6 +1140,7 @@ async fn run_update(cli: &Cli) -> Result<()> {
         DiscoverOptions {
             no_ignore: cli.no_ignore,
             verbose: cli.verbose,
+            include: &root_config.config.include,
             exclude: &root_config.config.exclude,
         },
     );
@@ -3016,7 +3028,7 @@ async fn run_align(cli: &Cli) -> Result<()> {
         }
     };
 
-    // Resolve config before discovery: `exclude` decides which files to scan
+    // Resolve config before discovery: `include` and `exclude` decide which files to scan
     // and `ignore` decides which packages to align, so both must be known up
     // front. Precedence mirrors `update`: explicit `--config` wins, else the
     // nearest discovered config.
@@ -3033,6 +3045,7 @@ async fn run_align(cli: &Cli) -> Result<()> {
         DiscoverOptions {
             no_ignore: cli.no_ignore,
             verbose: cli.verbose,
+            include: &config.include,
             exclude: &config.exclude,
         },
     );
@@ -3329,7 +3342,7 @@ async fn run_audit(cli: &Cli) -> Result<()> {
             explicit
         }
     };
-    // `exclude` path globs are honored uniformly across subcommands; resolve the
+    // `include`/`exclude` path globs are honored uniformly across subcommands; resolve the
     // root config so audit drops the same files `update`/`align` would.
     let root_config = resolve_root_config(cli, &paths)?;
     let files = discover_files_with(
@@ -3338,6 +3351,7 @@ async fn run_audit(cli: &Cli) -> Result<()> {
         DiscoverOptions {
             no_ignore: cli.no_ignore,
             verbose: cli.verbose,
+            include: &root_config.config.include,
             exclude: &root_config.config.exclude,
         },
     );

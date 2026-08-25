@@ -492,6 +492,7 @@ fn audit_with_osv_unreachable_exits_two() {
 /// A config file exercising every setting `--show-config` claims to report.
 const SHOW_CONFIG_FIXTURE: &str = r#"
 ignore = ["left-pad"]
+include = ["ansible/roles/*/vars/*.yml"]
 exclude = ["**/vendor/**"]
 
 [pin]
@@ -520,6 +521,7 @@ fn show_config_reports_resolved_settings() {
     for needle in [
         ".updrc.toml",
         "left-pad",
+        "ansible/roles/*/vars/*.yml",
         "**/vendor/**",
         "sigstore/cosign-installer",
         "14d",
@@ -614,6 +616,7 @@ fn show_config_json_reports_resolved_settings() {
 
     let json = parse_json(&stdout);
     assert_eq!(json["ignore"][0], "left-pad");
+    assert_eq!(json["include"][0], "ansible/roles/*/vars/*.yml");
     assert_eq!(json["exclude"][0], "**/vendor/**");
     assert_eq!(json["pin"]["sigstore/cosign-installer"], "v4.1.2");
     assert_eq!(json["cooldown"]["default_seconds"], 14 * 86_400);
