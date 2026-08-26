@@ -1,7 +1,7 @@
 use super::{
     Clause, FileType, ParsedDependency, PendingVersion, UpdateOptions, UpdateResult, Updater,
-    caps_from_above, comma_clauses, downgrade_warning, floor_of, operator_is_raisable,
-    read_file_safe, unpinnable_error, unrewritable_warning, write_file_atomic,
+    all_comma_clauses, caps_from_above, downgrade_warning, floor_of, read_file_safe,
+    unpinnable_error, unreadable_error, unrewritable_warning, write_file_atomic,
 };
 use crate::align::compare_versions;
 use crate::registry::{Registry, matches_terraform_constraint};
@@ -42,17 +42,35 @@ struct TfClause {
 struct ParsedTerraformDep {
     /// The source identifier (e.g., "hashicorp/aws" or "terraform-aws-modules/vpc/aws")
     source: String,
-    /// Every constraint of the version attribute, in the order written.
+    /// The version attribute exactly as the author wrote it, which is what a
+    /// message about a constraint upd could not read has to quote: there are no
+    /// clauses to rebuild it from in that case, and quoting anything else names
+    /// text that is not in the file.
+    written: String,
+    /// Every constraint of the version attribute, in the order written, or none
+    /// at all when Terraform's own parser would refuse `written`.
     clauses: Vec<TfClause>,
     /// Line number where the version attribute appears (0-indexed)
     version_line_idx: usize,
+}
+
+/// Whether Terraform's own constraint parser has this operator.
+///
+/// It takes `=`, `!=`, `>`, `>=`, `<`, `<=` and `~>`, plus a bare version
+/// meaning `=`. Anything else belongs to another ecosystem: `^` is npm's and
+/// Cargo's, and `terraform init` refuses a file carrying one rather than
+/// reading it as a caret range.
+fn is_terraform_operator(op: &str) -> bool {
+    matches!(op, "" | "=" | "!=" | ">" | ">=" | "<" | "<=" | "~>")
 }
 
 /// The clause an update may rewrite, paired with whether it may.
 ///
 /// Takes the clauses rather than the whole dependency so that a caller holding
 /// nothing but one version attribute, like the interactive write, asks the same
-/// question the scan asked and gets the same answer.
+/// question the scan asked and gets the same answer. The clause is found by the
+/// position the shared vocabulary reports rather than searched for again here,
+/// so which of several bounds is the floor is decided once for every ecosystem.
 fn floor_clause(clauses: &[TfClause]) -> Option<(&TfClause, bool)> {
     let shared: Vec<Clause<'_>> = clauses
         .iter()
@@ -62,13 +80,9 @@ fn floor_clause(clauses: &[TfClause]) -> Option<(&TfClause, bool)> {
             range: c.range.clone(),
         })
         .collect();
-    let raisable = floor_of(&shared)?.raisable;
-    let clause = if raisable {
-        clauses.iter().find(|c| operator_is_raisable(&c.op))?
-    } else {
-        clauses.first()?
-    };
-    Some((clause, raisable))
+    let floor = floor_of(&shared)?;
+    let clause = clauses.iter().find(|c| c.range == floor.range)?;
+    Some((clause, floor.raisable))
 }
 
 impl ParsedTerraformDep {
@@ -154,18 +168,29 @@ impl TerraformUpdater {
 
     /// Read a version attribute's constraint set, with byte ranges relative to
     /// the line so a rewrite can splice one clause and leave the rest standing.
-    fn parse_constraint(caps: &regex::Captures<'_>) -> Vec<TfClause> {
-        let m = match caps.get(1) {
-            Some(m) => m,
-            None => return Vec::new(),
-        };
-        comma_clauses(m.as_str(), m.start())
-            .map(|c| TfClause {
-                op: c.op.to_string(),
-                version: c.version.to_string(),
-                range: c.range,
+    ///
+    /// Answers with the text as the author wrote it alongside the clauses, and
+    /// with no clauses at all when Terraform's own parser would refuse that
+    /// text. Reading part of such a constraint is worse than reading none of
+    /// it: what parses describes a file `terraform init` will not load, so upd
+    /// would report an update, rewrite the floor and leave the file as broken
+    /// as it found it.
+    fn parse_constraint(caps: &regex::Captures<'_>) -> Option<(String, Vec<TfClause>)> {
+        let m = caps.get(1)?;
+        let clauses = all_comma_clauses(m.as_str(), m.start())
+            .filter(|clauses| clauses.iter().all(|c| is_terraform_operator(c.op)))
+            .map(|clauses| {
+                clauses
+                    .into_iter()
+                    .map(|c| TfClause {
+                        op: c.op.to_string(),
+                        version: c.version.to_string(),
+                        range: c.range,
+                    })
+                    .collect()
             })
-            .collect()
+            .unwrap_or_default();
+        Some((m.as_str().to_string(), clauses))
     }
 
     fn parse_content(&self, content: &str) -> Vec<ParsedTerraformDep> {
@@ -239,15 +264,14 @@ impl TerraformUpdater {
                 if let Some(caps) = self.version_re.captures(line)
                     && let Some((ref source, _)) = provider_source
                     && brace_depth >= provider_block_depth
+                    && let Some((written, clauses)) = Self::parse_constraint(&caps)
                 {
-                    let clauses = Self::parse_constraint(&caps);
-                    if !clauses.is_empty() {
-                        deps.push(ParsedTerraformDep {
-                            source: source.clone(),
-                            clauses,
-                            version_line_idx: line_idx,
-                        });
-                    }
+                    deps.push(ParsedTerraformDep {
+                        source: source.clone(),
+                        written,
+                        clauses,
+                        version_line_idx: line_idx,
+                    });
                 }
 
                 // Reset provider source when exiting a provider's block
@@ -285,15 +309,14 @@ impl TerraformUpdater {
 
                 if let Some(caps) = self.version_re.captures(line)
                     && let Some(ref source) = module_source
+                    && let Some((written, clauses)) = Self::parse_constraint(&caps)
                 {
-                    let clauses = Self::parse_constraint(&caps);
-                    if !clauses.is_empty() {
-                        deps.push(ParsedTerraformDep {
-                            source: source.clone(),
-                            clauses,
-                            version_line_idx: line_idx,
-                        });
-                    }
+                    deps.push(ParsedTerraformDep {
+                        source: source.clone(),
+                        written,
+                        clauses,
+                        version_line_idx: line_idx,
+                    });
                 }
             }
         }
@@ -329,7 +352,7 @@ impl TerraformUpdater {
         old_version: &str,
         new_version: &str,
     ) -> Option<String> {
-        let clauses = Self::parse_constraint(&self.version_re.captures(line)?);
+        let (_, clauses) = Self::parse_constraint(&self.version_re.captures(line)?)?;
         let (floor, raisable) = floor_clause(&clauses)?;
         if !raisable || floor.version != old_version {
             return None;
@@ -452,6 +475,16 @@ impl Updater for TerraformUpdater {
                     dep.source.clone(),
                     dep.anchor_version().to_string(),
                 ));
+                continue;
+            }
+
+            // Reported before the pin is considered, because "upd cannot read
+            // this constraint" is the fact underneath "the pin has nowhere to
+            // go" and is the one the author can act on.
+            if dep.clauses.is_empty() {
+                result
+                    .errors
+                    .push(unreadable_error(&dep.source, &dep.written));
                 continue;
             }
 
@@ -727,6 +760,7 @@ impl Updater for TerraformUpdater {
 
         Ok(parsed
             .into_iter()
+            .filter(|dep| !dep.clauses.is_empty())
             .map(|dep| ParsedDependency {
                 version: dep.anchor_version().to_string(),
                 has_upper_bound: dep.caps_from_above(),
@@ -1125,6 +1159,105 @@ module "vpc" {{
         )
         .unwrap();
         file
+    }
+
+    /// Terraform rejects the whole constraint when even one comma-separated
+    /// clause is malformed. Reading only the valid prefix would let upd report
+    /// and write an update into a file Terraform still cannot load.
+    #[tokio::test]
+    async fn a_partly_malformed_constraint_is_an_error_and_is_left_alone() {
+        let file = provider_file("hashicorp/aws", ">= 5.0, banana");
+        let original = std::fs::read_to_string(file.path()).unwrap();
+        let registry = MockRegistry::new("terraform").with_version("hashicorp/aws", "6.61.0");
+
+        let result = TerraformUpdater::new()
+            .update(file.path(), &registry, UpdateOptions::new(false, false))
+            .await
+            .unwrap();
+
+        assert!(result.updated.is_empty(), "{:?}", result.updated);
+        assert!(result.warnings.is_empty(), "{:?}", result.warnings);
+        assert_eq!(result.errors.len(), 1, "{:?}", result.errors);
+        assert!(
+            result.errors[0].contains("hashicorp/aws")
+                && result.errors[0].contains(">= 5.0, banana"),
+            "{}",
+            result.errors[0]
+        );
+        assert_eq!(result.unchanged, 0);
+        assert_eq!(std::fs::read_to_string(file.path()).unwrap(), original);
+    }
+
+    /// A caret belongs to npm and Cargo, not Terraform. Treating it as a
+    /// raisable floor would make upd accept and rewrite a file Terraform rejects.
+    #[tokio::test]
+    async fn an_operator_terraform_does_not_have_is_an_error() {
+        let file = provider_file("hashicorp/aws", "^5.0");
+        let original = std::fs::read_to_string(file.path()).unwrap();
+        let registry = MockRegistry::new("terraform").with_version("hashicorp/aws", "6.61.0");
+
+        let result = TerraformUpdater::new()
+            .update(file.path(), &registry, UpdateOptions::new(false, false))
+            .await
+            .unwrap();
+
+        assert!(result.updated.is_empty(), "{:?}", result.updated);
+        assert!(result.warnings.is_empty(), "{:?}", result.warnings);
+        assert_eq!(result.errors.len(), 1, "{:?}", result.errors);
+        assert!(
+            result.errors[0].contains("hashicorp/aws") && result.errors[0].contains("^5.0"),
+            "{}",
+            result.errors[0]
+        );
+        assert_eq!(result.unchanged, 0);
+        assert_eq!(std::fs::read_to_string(file.path()).unwrap(), original);
+    }
+
+    /// A configured pin does not make an unreadable declaration writable: the
+    /// manifest has to become valid before upd can safely choose a floor.
+    #[tokio::test]
+    async fn a_pin_does_not_overwrite_an_unreadable_constraint() {
+        use crate::config::UpdConfig;
+        use std::sync::Arc;
+
+        let file = provider_file("hashicorp/aws", ">= 5.0, banana");
+        let original = std::fs::read_to_string(file.path()).unwrap();
+        let registry = MockRegistry::new("terraform").with_version("hashicorp/aws", "6.61.0");
+
+        let mut pins = std::collections::HashMap::new();
+        pins.insert("hashicorp/aws".to_string(), "6.60.0".to_string());
+        let options = UpdateOptions::new(false, false).with_config(Arc::new(UpdConfig {
+            pin: pins,
+            ..Default::default()
+        }));
+
+        let result = TerraformUpdater::new()
+            .update(file.path(), &registry, options)
+            .await
+            .unwrap();
+
+        assert!(result.pinned.is_empty(), "{:?}", result.pinned);
+        assert_eq!(result.errors.len(), 1, "{:?}", result.errors);
+        assert!(
+            result.errors[0].contains("not a version range upd can read"),
+            "{}",
+            result.errors[0]
+        );
+        assert_eq!(std::fs::read_to_string(file.path()).unwrap(), original);
+    }
+
+    /// Alignment cannot report why a dependency was unreadable, so it must
+    /// leave that dependency out rather than compare or try to write an empty
+    /// version derived from it.
+    #[test]
+    fn an_unreadable_constraint_is_not_an_alignment_candidate() {
+        let file = provider_file("hashicorp/aws", ">= 5.0, banana");
+
+        let deps = TerraformUpdater::new()
+            .parse_dependencies(file.path())
+            .unwrap();
+
+        assert!(deps.is_empty(), "{deps:?}");
     }
 
     /// A constraint with nothing above it admits every release, so the release

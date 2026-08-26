@@ -119,6 +119,28 @@ pub(crate) fn comma_clauses(constraint: &str, base: usize) -> impl Iterator<Item
     })
 }
 
+/// Read a comma-separated specifier as the clause set it is, or `None` when any
+/// part of it holds no version.
+///
+/// The strict counterpart to [`comma_clauses`], for an ecosystem whose own
+/// parser refuses a whole constraint when one clause of it is malformed. Such a
+/// caller cannot use a reading that leaves the malformed clause out, because
+/// what remains parses cleanly and describes a file the ecosystem will not
+/// load: `">= 5.0, banana"` reads as `">= 5.0"` and answers as an ordinary
+/// constraint, while `terraform init` on that file fails before it looks up
+/// anything.
+pub(crate) fn all_comma_clauses(constraint: &str, base: usize) -> Option<Vec<Clause<'_>>> {
+    let mut offset = 0usize;
+    constraint
+        .split(',')
+        .map(|clause| {
+            let clause_at = offset;
+            offset += clause.len() + 1;
+            parse_clause(clause, base + clause_at)
+        })
+        .collect()
+}
+
 /// Whether `op` names the release the manifest is on, so an update may move it.
 ///
 /// A bare version is Cargo's `serde = "1.0"`, which means `^1.0`, and RubyGems'
@@ -1598,7 +1620,10 @@ mod tests {
         // qualifies rather than over it.
         assert_eq!(floor_text(">=2.0,>=2.0.1"), Some(("2.0.1", true)));
         assert_eq!(floor_text(">=2.0.1,>=2.0"), Some(("2.0.1", true)));
-        assert_eq!(floor_text(">=2.0.0-rc.1,>=1.9.0"), Some(("2.0.0-rc.1", true)));
+        assert_eq!(
+            floor_text(">=2.0.0-rc.1,>=1.9.0"),
+            Some(("2.0.0-rc.1", true))
+        );
         assert_eq!(floor_text(">=2.0.0-rc.1,>=2.0.0"), Some(("2.0.0", true)));
         // A bound that names no floor takes no part in the ranking, whichever
         // side of the highest one it is written.
