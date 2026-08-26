@@ -2551,6 +2551,10 @@ async fn run_interactive_update(
     let mut pending_updates: Vec<PendingUpdate> = Vec::new();
     let mut planned_changes: Vec<PlannedChange> = Vec::new();
     let mut scanned_results: Vec<ScannedFileResult> = Vec::new();
+    // A file the scan could not process at all. Counted here because it never
+    // reaches `scanned_results`, so nothing downstream would otherwise know it
+    // happened.
+    let mut unscannable_files: usize = 0;
 
     for (path, file_type) in files {
         let cooldown_policy = file_cooldowns.get(path).and_then(|p| p.as_ref());
@@ -2703,9 +2707,22 @@ async fn run_interactive_update(
                     "{}",
                     format!("Error processing {}: {}", path.display(), e).red()
                 );
+                unscannable_files += 1;
             }
         }
     }
+
+    // A dependency that could not be read, or a configured pin that could not
+    // be written, is a failed run however the session ends. The non-interactive
+    // path reports these through `decide_exit_code`; interactive mode has three
+    // ways out and has to say the same thing at each of them, or the same
+    // manifest that exits 2 under `--check` exits 0 here and a script reads the
+    // run as clean.
+    let scan_errors: usize = unscannable_files
+        + scanned_results
+            .iter()
+            .map(|scanned| scanned.result.errors.len())
+            .sum::<usize>();
 
     let annotation_total: usize = scanned_results
         .iter()
@@ -2776,7 +2793,7 @@ async fn run_interactive_update(
                 println!("{line}");
             }
         }
-        return Ok(());
+        return finish_interactive(scan_errors);
     }
 
     let configured_pin_count: usize = scanned_results
@@ -2799,7 +2816,7 @@ async fn run_interactive_update(
         if !cli.quiet {
             println!("\n{}", "No updates applied.".yellow());
         }
-        return Ok(());
+        return finish_interactive(scan_errors);
     }
 
     let mut apply_parts = Vec::new();
@@ -3015,6 +3032,18 @@ async fn run_interactive_update(
         }
     }
 
+    finish_interactive(scan_errors)
+}
+
+/// Close an interactive session, reporting a scan error the way every other
+/// command reports one. Applying whatever the session did approve is still the
+/// right outcome, so this runs after the writes rather than instead of them:
+/// the exit code says a dependency was left unresolved, not that nothing
+/// happened.
+fn finish_interactive(scan_errors: usize) -> Result<()> {
+    if scan_errors > 0 {
+        std::process::exit(2);
+    }
     Ok(())
 }
 
