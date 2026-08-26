@@ -141,13 +141,48 @@ pub(crate) fn caps_from_above(clauses: &[Clause<'_>]) -> bool {
         .any(|c| matches!(c.op, "<" | "<=" | "~>" | "!="))
 }
 
+/// The clause naming the highest version among `floors`, or `None` when they
+/// cannot all be ranked against each other.
+///
+/// Ranking is by release segments so it holds across ecosystems, and a version
+/// spelled in a way that carries no such segments (a PEP 440 epoch or
+/// post-release, a Cargo build suffix) makes the whole set unrankable rather
+/// than sorting to one end of it: naming the wrong clause the floor is what
+/// this exists to prevent.
+fn greatest_floor<'c>(floors: &[&'c Clause<'c>]) -> Option<&'c Clause<'c>> {
+    let mut best = *floors.first()?;
+    let mut best_version = crate::version::TagVersion::parse(best.version)?;
+    for clause in &floors[1..] {
+        let version = crate::version::TagVersion::parse(clause.version)?;
+        if version > best_version {
+            best = clause;
+            best_version = version;
+        }
+    }
+    Some(best)
+}
+
 /// The clause an update may rewrite, or the first readable one when there is none.
 ///
 /// Reported for both so that a caller which only reads a specifier, like the
 /// lockfile anchor, still gets a position; `raisable` is what says whether
 /// writing to that position is allowed.
+///
+/// A specifier may carry more than one lower bound, and every resolver reads
+/// their conjunction: `requests>=1.0,>=2.30` installs 2.30 or better, so 2.30
+/// is the release in use and 1.0 names nothing anyone is on. Taking whichever
+/// came first made the same requirement answer two ways depending on the order
+/// it was typed in, reporting a major bump from 1.0 in one spelling and a minor
+/// one from 2.30 in the other, which then decided differently under
+/// `--max-bump`. When the bounds cannot be ranked the first is still used, so a
+/// specifier upd cannot fully read keeps the position it always had.
 pub(crate) fn floor_of(clauses: &[Clause<'_>]) -> Option<SpecifierFloor> {
-    if let Some(clause) = clauses.iter().find(|c| operator_is_raisable(c.op)) {
+    let floors: Vec<&Clause<'_>> = clauses
+        .iter()
+        .filter(|c| operator_is_raisable(c.op))
+        .collect();
+    if let Some(first) = floors.first() {
+        let clause = greatest_floor(&floors).unwrap_or(first);
         return Some(SpecifierFloor {
             range: clause.range.clone(),
             raisable: true,
@@ -1546,6 +1581,35 @@ mod tests {
         assert_eq!(floor_text("1.0"), Some(("1.0", true)));
         assert_eq!(floor_text("^1.0"), Some(("1.0", true)));
         assert_eq!(floor_text("~1.0"), Some(("1.0", true)));
+    }
+
+    /// Several lower bounds are read together by every resolver, so the release
+    /// in use is the highest of them and the lower ones name nothing anyone is
+    /// on. Reading whichever came first made one requirement answer two ways
+    /// depending on how it was typed, which then reported a different bump
+    /// level and gated differently under `--max-bump`.
+    #[test]
+    fn the_highest_of_several_lower_bounds_is_the_floor() {
+        // The pair that motivates this: one requirement, two spellings.
+        assert_eq!(floor_text(">=1.0,>=2.30,<3.0"), Some(("2.30", true)));
+        assert_eq!(floor_text(">=2.30,>=1.0,<3.0"), Some(("2.30", true)));
+        // Ranking is by release segments, so a shorter bound is not the lower
+        // one for being shorter, and a prerelease sits under the release it
+        // qualifies rather than over it.
+        assert_eq!(floor_text(">=2.0,>=2.0.1"), Some(("2.0.1", true)));
+        assert_eq!(floor_text(">=2.0.1,>=2.0"), Some(("2.0.1", true)));
+        assert_eq!(floor_text(">=2.0.0-rc.1,>=1.9.0"), Some(("2.0.0-rc.1", true)));
+        assert_eq!(floor_text(">=2.0.0-rc.1,>=2.0.0"), Some(("2.0.0", true)));
+        // A bound that names no floor takes no part in the ranking, whichever
+        // side of the highest one it is written.
+        assert_eq!(floor_text(">=1.0,>2.30,<3.0"), Some(("1.0", true)));
+        assert_eq!(floor_text(">=1.0,~=2.4"), Some(("2.4", true)));
+
+        // Equal bounds keep the first, and bounds that cannot be ranked at all
+        // keep it too, so a specifier upd cannot fully read answers as before.
+        let floor = |c: &str| specifier_floor(c, 0).unwrap().range;
+        assert_eq!(floor(">=2.0,>=2.0"), 2..5);
+        assert_eq!(floor(">=1!2.0,>=3.0"), 2..7);
     }
 
     /// A bound that names a version the specifier does not admit is not a floor,
