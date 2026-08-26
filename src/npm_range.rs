@@ -142,6 +142,23 @@ pub fn lower_bound_anchor(spec: &str) -> Option<String> {
     }
 }
 
+/// Whether `spec` admits the version at its own floor, which is how a range
+/// that admits nothing at all is told from one that admits something.
+///
+/// Every shape with a floor to speak of includes it: [`lower_bound_anchor`]
+/// answers for a hyphen, a wildcard and a `">="`, and each of those is
+/// inclusive, while a `">"` names a version its author refuses and so carries
+/// no floor to test. So on the shapes it answers for, this is an exact
+/// emptiness test rather than a sample: if the smallest admissible version is
+/// turned away, so is every version above a ceiling that already turned it
+/// away. A spec with no single floor answers `false`, having shown no version
+/// it holds.
+pub fn holds_its_floor(spec: &str) -> bool {
+    lower_bound_anchor(spec)
+        .and_then(|floor| admits(spec, &floor))
+        .unwrap_or(false)
+}
+
 /// Rewrite `spec` so its floor becomes `new_version`, preserving the shape the
 /// author wrote: a ceiling stays where it is, a hyphen stays a hyphen, and a
 /// wildcard range keeps both its wildcard character and its component count
@@ -1445,5 +1462,30 @@ mod tests {
             rewrite_lower_bound(">=1.0.0-beta <2.0.0", "1.0.0-rc.1").as_deref(),
             Some(">=1.0.0-rc.1 <2.0.0")
         );
+    }
+
+    #[test]
+    fn a_range_whose_floor_sits_above_its_ceiling_holds_nothing() {
+        // A floor under the ceiling, at it, and over it: the middle one is
+        // what makes this a boundary rather than a direction.
+        assert!(holds_its_floor(">=1.9.9 <2.0.0"));
+        assert!(!holds_its_floor(">=2.0.0 <2.0.0"));
+        assert!(!holds_its_floor(">=2.0.1 <2.0.0"));
+        // A hyphen names both ends inclusively, so its own ends are the case
+        // the bounded form cannot reach.
+        assert!(holds_its_floor("2.0.0 - 2.0.0"));
+        assert!(!holds_its_floor("2.0.1 - 2.0.0"));
+        // A prerelease floor is ordered below the release it qualifies, so a
+        // ceiling on that release still leaves it room.
+        assert!(holds_its_floor(">=2.0.0-rc.1 <2.0.0"));
+        // Shapes with no ceiling to sit above always hold their floor.
+        for spec in ["1.x", ">=1.0.0", "1.2.x", ">=1.0.0 <2.0.0 <3.0.0"] {
+            assert!(holds_its_floor(spec), "{spec}");
+        }
+        // A spec naming no single floor shows no version it holds, whether it
+        // has one somewhere ("^1.0.0") or names none at all.
+        for spec in ["^1.0.0", "~1.0.0", "1.0.0", "<3", ">1.2.3", "^1 || ^2", "*", "latest", ""] {
+            assert!(!holds_its_floor(spec), "{spec}");
+        }
     }
 }

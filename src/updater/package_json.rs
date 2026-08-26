@@ -3,7 +3,9 @@ use super::{
     read_file_safe, unpinnable_error, unreadable_error, unrewritable_warning, write_file_atomic,
 };
 use crate::align::compare_versions;
-use crate::npm_range::{SpecShape, admits, classify, lower_bound_anchor, rewrite_lower_bound};
+use crate::npm_range::{
+    SpecShape, admits, classify, holds_its_floor, lower_bound_anchor, rewrite_lower_bound,
+};
 use crate::registry::Registry;
 use crate::updater::Lang;
 use crate::version::{is_prerelease_semver, match_version_precision};
@@ -273,8 +275,19 @@ impl Updater for PackageJsonUpdater {
                                     // pinned_packages because its later loop uses
                                     // match_version_precision on the extracted current_version
                                     // token, which is garbage for comparator specs.
+                                    //
+                                    // Keeping the author's ceiling is what makes the
+                                    // rewrite honest, and it is also what a pin above
+                                    // that ceiling turns into a range holding nothing:
+                                    // `">=1.0.0 <2.0.0"` pinned to 3.0.0 spells
+                                    // `">=3.0.0 <2.0.0"`, which npm refuses with
+                                    // ETARGET. A range admits its own floor or it
+                                    // admits no version at all, so that is the question
+                                    // asked of the string before it is written, and a
+                                    // pin the range cannot hold is reported instead.
                                     if let Some(new_spec) =
                                         rewrite_lower_bound(version_str, pinned_version)
+                                            .filter(|new_spec| holds_its_floor(new_spec))
                                     {
                                         if new_spec != version_str {
                                             let line_num = line_index.line_for(section, package);
@@ -2468,6 +2481,92 @@ mod tests {
         assert!(content.contains(r#""ceiling": "<3""#), "{content}");
         assert!(content.contains(r#""above": ">1.2.3""#), "{content}");
         assert!(content.contains(r#""either": "^1 || ^2""#), "{content}");
+    }
+
+    /// Preserving the author's ceiling is what makes a pin into a range
+    /// honest, and it is also what a pin above that ceiling turns into a range
+    /// holding no version at all. npm refuses such a manifest outright
+    /// (ETARGET), so writing one trades a pin that cannot be honoured for an
+    /// install that cannot run, and says nothing about either.
+    #[tokio::test]
+    async fn a_pin_the_range_cannot_hold_is_reported_not_written() {
+        use crate::config::UpdConfig;
+        use std::sync::Arc;
+
+        let mut file = NamedTempFile::with_suffix(".json").unwrap();
+        write!(
+            file,
+            r#"{{
+  "dependencies": {{
+    "over": ">=1.0.0 <2.0.0",
+    "spanover": "1.0.0 - 2.0.0",
+    "inside": ">=1.0.0 <3.0.0",
+    "spaninside": "1.0.0 - 2.0.0"
+  }}
+}}"#
+        )
+        .unwrap();
+
+        let mut registry = MockRegistry::new("npm");
+        let mut pin = std::collections::HashMap::new();
+        // The pins above the ceiling and the pins the range still holds run in
+        // one manifest, so a fix that reports the first by refusing every pin
+        // fails here rather than passing half of it.
+        for (package, pinned) in [
+            ("over", "5.0.0"),
+            ("spanover", "5.0.0"),
+            ("inside", "2.0"),
+            ("spaninside", "1.5.0"),
+        ] {
+            registry = registry.with_version(package, "9.0.0");
+            pin.insert(package.to_string(), pinned.to_string());
+        }
+        let config = UpdConfig {
+            pin,
+            ..Default::default()
+        };
+        let options = UpdateOptions::new(false, false).with_config(Arc::new(config));
+
+        let updater = PackageJsonUpdater::new();
+        let result = updater
+            .update(file.path(), &registry, options)
+            .await
+            .unwrap();
+
+        assert_eq!(result.errors.len(), 2, "{:?}", result.errors);
+        for (package, spec) in [("over", ">=1.0.0 <2.0.0"), ("spanover", "1.0.0 - 2.0.0")] {
+            assert!(
+                result.errors.iter().any(|e| e
+                    == &format!(
+                        "cannot pin '{package}' to '5.0.0': '{spec}' has no lower bound that version fits"
+                    )),
+                "{:?}",
+                result.errors
+            );
+        }
+
+        // A pinned version written with fewer components than a `semver`
+        // version has is still one the range holds, and the floor it names is
+        // the one the rewrite puts back.
+        let written: Vec<(&str, &str)> = result
+            .pinned
+            .iter()
+            .map(|(package, _, new_spec, _)| (package.as_str(), new_spec.as_str()))
+            .collect();
+        assert_eq!(
+            written,
+            vec![("inside", ">=2.0 <3.0.0"), ("spaninside", "1.5.0 - 2.0.0")],
+            "{written:?}"
+        );
+
+        let content = fs::read_to_string(file.path()).unwrap();
+        assert!(content.contains(r#""over": ">=1.0.0 <2.0.0""#), "{content}");
+        assert!(content.contains(r#""spanover": "1.0.0 - 2.0.0""#), "{content}");
+        assert!(content.contains(r#""inside": ">=2.0 <3.0.0""#), "{content}");
+        assert!(
+            content.contains(r#""spaninside": "1.5.0 - 2.0.0""#),
+            "{content}"
+        );
     }
 
     /// upd cannot say what an unreadable spec means, so it cannot say what
