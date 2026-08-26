@@ -306,9 +306,11 @@ impl Updater for PackageJsonUpdater {
                                     }
                                     continue;
                                 }
-                                _ => {
-                                    // Non-comparator specs go through the standard
-                                    // pinned_packages flow (processed after the loop).
+                                SpecShape::ExactPin | SpecShape::CaretOrTilde => {
+                                    // These carry the version at a known place,
+                                    // so the standard pinned_packages flow
+                                    // (processed after the loop) can put the
+                                    // pinned one there.
                                     pinned_packages.push((
                                         section.to_string(),
                                         package.clone(),
@@ -317,6 +319,39 @@ impl Updater for PackageJsonUpdater {
                                         current_version,
                                         pinned_version.to_string(),
                                     ));
+                                    continue;
+                                }
+                                SpecShape::OpaqueRange => {
+                                    // No position in the spec means "the version
+                                    // you are on", so there is nowhere to put the
+                                    // pinned one. The standard flow would write it
+                                    // over whatever number it found: `<3` would
+                                    // become `<5`, raising a ceiling instead of
+                                    // pinning; `>1.2.3` would become `>5.0.0`,
+                                    // which excludes the very version asked for;
+                                    // `^1 || ^2` would lose a branch. Every other
+                                    // ecosystem reports this rather than guessing.
+                                    result.errors.push(unpinnable_error(
+                                        package,
+                                        pinned_version,
+                                        version_str,
+                                    ));
+                                    continue;
+                                }
+                                SpecShape::Unsupported => {
+                                    // upd cannot say what this spec means, so it
+                                    // cannot say what replacing it would mean
+                                    // either. This is the same answer the update
+                                    // path gives such a spec.
+                                    result.errors.push(unreadable_error(package, version_str));
+                                    continue;
+                                }
+                                SpecShape::NoVersion => {
+                                    // Filtered out above, before the config
+                                    // guards: there is no registry version to pin
+                                    // to. Named here so that a shape added later
+                                    // has to choose a route rather than falling
+                                    // into the pin flow.
                                     continue;
                                 }
                             }
@@ -2366,6 +2401,118 @@ mod tests {
             content.contains("\">=1.5.0 <2.0.0\""),
             "file must preserve upper bound, got: {content}"
         );
+    }
+
+    /// A spec whose every bound is something other than "the version you are
+    /// on" has nowhere to put a pinned version, so the pin is a failed
+    /// instruction and has to be reported as one. Writing it anyway lands the
+    /// number on whichever bound the spec happens to carry: `<3` becomes `<5`,
+    /// which raises a ceiling instead of pinning; `>1.2.3` becomes `>5.0.0`,
+    /// which admits everything except the version that was asked for; and
+    /// `^1 || ^2` loses a branch outright. Each leaves the manifest disagreeing
+    /// with the config under a clean exit.
+    #[tokio::test]
+    async fn a_pin_onto_a_spec_with_no_floor_to_raise_is_reported_not_written() {
+        use crate::config::UpdConfig;
+        use std::sync::Arc;
+
+        let mut file = NamedTempFile::with_suffix(".json").unwrap();
+        write!(
+            file,
+            r#"{{
+  "dependencies": {{
+    "ceiling": "<3",
+    "above": ">1.2.3",
+    "either": "^1 || ^2"
+  }}
+}}"#
+        )
+        .unwrap();
+
+        let registry = MockRegistry::new("npm")
+            .with_version("ceiling", "5.0.0")
+            .with_version("above", "5.0.0")
+            .with_version("either", "5.0.0");
+
+        let mut pin = std::collections::HashMap::new();
+        for package in ["ceiling", "above", "either"] {
+            pin.insert(package.to_string(), "5.0.0".to_string());
+        }
+        let config = UpdConfig {
+            pin,
+            ..Default::default()
+        };
+        let options = UpdateOptions::new(false, false).with_config(Arc::new(config));
+
+        let updater = PackageJsonUpdater::new();
+        let result = updater
+            .update(file.path(), &registry, options)
+            .await
+            .unwrap();
+
+        assert!(result.pinned.is_empty(), "{:?}", result.pinned);
+        assert!(result.updated.is_empty(), "{:?}", result.updated);
+        assert_eq!(result.errors.len(), 3, "{:?}", result.errors);
+        for package in ["ceiling", "above", "either"] {
+            assert!(
+                result
+                    .errors
+                    .iter()
+                    .any(|e| e.contains(&format!("cannot pin '{package}' to '5.0.0'"))),
+                "{:?}",
+                result.errors
+            );
+        }
+
+        let content = fs::read_to_string(file.path()).unwrap();
+        assert!(content.contains(r#""ceiling": "<3""#), "{content}");
+        assert!(content.contains(r#""above": ">1.2.3""#), "{content}");
+        assert!(content.contains(r#""either": "^1 || ^2""#), "{content}");
+    }
+
+    /// upd cannot say what an unreadable spec means, so it cannot say what
+    /// replacing it would mean either. Writing the pinned version over it
+    /// substitutes a spec upd understands for one it never read, which is the
+    /// one outcome worse than declining: the manifest now says something
+    /// definite that nobody chose.
+    #[tokio::test]
+    async fn a_pin_onto_a_spec_upd_cannot_read_is_reported_not_written() {
+        use crate::config::UpdConfig;
+        use std::sync::Arc;
+
+        let mut file = NamedTempFile::with_suffix(".json").unwrap();
+        write!(
+            file,
+            r#"{{
+  "dependencies": {{
+    "junk": "1.2.3.4.5-!!"
+  }}
+}}"#
+        )
+        .unwrap();
+
+        let registry = MockRegistry::new("npm").with_version("junk", "5.0.0");
+
+        let mut pin = std::collections::HashMap::new();
+        pin.insert("junk".to_string(), "5.0.0".to_string());
+        let config = UpdConfig {
+            pin,
+            ..Default::default()
+        };
+        let options = UpdateOptions::new(false, false).with_config(Arc::new(config));
+
+        let updater = PackageJsonUpdater::new();
+        let result = updater
+            .update(file.path(), &registry, options)
+            .await
+            .unwrap();
+
+        assert!(result.pinned.is_empty(), "{:?}", result.pinned);
+        assert_eq!(result.errors.len(), 1, "{:?}", result.errors);
+        assert!(result.errors[0].contains("junk"), "{}", result.errors[0]);
+
+        let content = fs::read_to_string(file.path()).unwrap();
+        assert!(content.contains(r#""junk": "1.2.3.4.5-!!""#), "{content}");
     }
 
     /// A hyphen range is npm's other way of writing a floor and a ceiling, and
