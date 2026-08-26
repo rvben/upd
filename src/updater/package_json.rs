@@ -2561,7 +2561,10 @@ mod tests {
 
         let content = fs::read_to_string(file.path()).unwrap();
         assert!(content.contains(r#""over": ">=1.0.0 <2.0.0""#), "{content}");
-        assert!(content.contains(r#""spanover": "1.0.0 - 2.0.0""#), "{content}");
+        assert!(
+            content.contains(r#""spanover": "1.0.0 - 2.0.0""#),
+            "{content}"
+        );
         assert!(content.contains(r#""inside": ">=2.0 <3.0.0""#), "{content}");
         assert!(
             content.contains(r#""spaninside": "1.5.0 - 2.0.0""#),

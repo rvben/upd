@@ -1484,7 +1484,9 @@ mod tests {
         }
         // A spec naming no single floor shows no version it holds, whether it
         // has one somewhere ("^1.0.0") or names none at all.
-        for spec in ["^1.0.0", "~1.0.0", "1.0.0", "<3", ">1.2.3", "^1 || ^2", "*", "latest", ""] {
+        for spec in [
+            "^1.0.0", "~1.0.0", "1.0.0", "<3", ">1.2.3", "^1 || ^2", "*", "latest", "",
+        ] {
             assert!(!holds_its_floor(spec), "{spec}");
         }
     }
