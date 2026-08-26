@@ -5,6 +5,33 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.8.0](https://github.com/rvben/upd/compare/v0.7.1...v0.8.0) - 2026-08-26
+
+### Added
+
+- **npm**: update hyphen, wildcard and comparator ranges ([6548401](https://github.com/rvben/upd/commit/65484016d0d3d32a05bee5ad9709d71e3e82a880))
+
+### Fixed
+
+- **terraform**: reject unreadable version constraints ([d0c2be3](https://github.com/rvben/upd/commit/d0c2be3cde56d1ee375e7fe2bb8f678439de0bbf))
+- **update**: read the highest of several lower bounds as the floor ([2a4a319](https://github.com/rvben/upd/commit/2a4a3199574495f606265e73b8fef639e3e22bd3))
+- **npm**: report a pin the range cannot hold instead of writing it ([c9cfce8](https://github.com/rvben/upd/commit/c9cfce820964170d164c6c56813c19d8469ab8e8))
+- **rubygems**: read a hyphen as the prerelease marker Gem::Version writes ([b575928](https://github.com/rvben/upd/commit/b575928d29d559189dab9a620633b1358994095f))
+- **interactive**: write a floor that follows a ceiling ([fa6666c](https://github.com/rvben/upd/commit/fa6666cd9a0344abd8df1cccfc440195f5321c90))
+- **npm**: treat a bound written over a wildcard as floorless ([4eb0196](https://github.com/rvben/upd/commit/4eb0196781b3450e4b6b0b2bc9b6ab11abcd4d2e))
+- **nuget**: order pre-release identifiers the way NuGet does ([1b2641e](https://github.com/rvben/upd/commit/1b2641eeb09e96087d36a9ce36b52184391b734a))
+- **interactive**: report a scan error in the exit code ([c8b47be](https://github.com/rvben/upd/commit/c8b47bef31398bdd2a7901ef80e40a494eb87d51))
+- **npm**: report a pin that has no floor to raise instead of writing it ([3e3f833](https://github.com/rvben/upd/commit/3e3f833acfcde1f3a2161f120e3aa2ab13ea1bfc))
+- **terraform**: compare versions the way the registry does ([987993f](https://github.com/rvben/upd/commit/987993fe090d31ff4cb416bb3b8d19ccb1cf911b))
+- **rubygems**: compare versions the way Gem::Version does ([10cc2a7](https://github.com/rvben/upd/commit/10cc2a7e4a5fb83007fb6e812622c06c09e23420))
+- **npm**: read the tilde npm spells with a trailing arrow ([cfe682c](https://github.com/rvben/upd/commit/cfe682c89f799af9ea0b3170bb0fd4095d85b733))
+- **update**: look each declaration up at its own requirement ([0f99439](https://github.com/rvben/upd/commit/0f994395e4546b6ec82b6c7c116bf97e9d8a01a1))
+- **schema**: declare every error kind and what exit 2 covers ([9236d5c](https://github.com/rvben/upd/commit/9236d5c7e3f7aa3bbef83503cc8c5b8e0f1ef9ed))
+- **nuget**: report a version range instead of skipping it silently ([e65cac5](https://github.com/rvben/upd/commit/e65cac597e32cd6583a16a9712eb6b76eeada86e))
+- **update**: leave a bound that is not a floor alone and report it ([4b607ab](https://github.com/rvben/upd/commit/4b607ab8c726ba1a046c37940ac05ddaabcac26e))
+- **output**: withhold the up to date tick while a warning stands ([44c1162](https://github.com/rvben/upd/commit/44c1162d218c2a544c8352e0c4cfdba97698d334))
+- **update**: refuse to raise a bound that is not a floor ([6e2a1c2](https://github.com/rvben/upd/commit/6e2a1c2007caa3d609c6aa03a570f25500b29d42))
+
 ## [0.7.1](https://github.com/rvben/upd/compare/v0.7.0...v0.7.1) - 2026-08-25
 
 ### Fixed
