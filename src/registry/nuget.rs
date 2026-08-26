@@ -227,8 +227,8 @@ pub(crate) fn matches_nuget_range(version: &str, range: &str) -> Option<bool> {
 /// NuGet pads a missing component with zero, so `1.0` and `1.0.0` are the same
 /// version, and a pre-release suffix orders below the release it qualifies.
 fn nuget_cmp(a: &str, b: &str) -> Option<std::cmp::Ordering> {
-    let (a_release, a_pre) = split_prerelease(a);
-    let (b_release, b_pre) = split_prerelease(b);
+    let (a_release, a_pre) = split_version(a);
+    let (b_release, b_pre) = split_version(b);
     let (mut a_parts, mut b_parts) = (release_parts(a_release)?, release_parts(b_release)?);
     let width = a_parts.len().max(b_parts.len());
     a_parts.resize(width, 0);
@@ -239,22 +239,65 @@ fn nuget_cmp(a: &str, b: &str) -> Option<std::cmp::Ordering> {
         // A release outranks any pre-release of the same numbers.
         (None, Some(_)) => std::cmp::Ordering::Greater,
         (Some(_), None) => std::cmp::Ordering::Less,
-        (Some(x), Some(y)) => x.to_lowercase().cmp(&y.to_lowercase()),
+        (Some(x), Some(y)) => cmp_prerelease(x, y),
     }))
 }
 
 /// Split a version into its numeric release and its pre-release suffix.
-fn split_prerelease(version: &str) -> (&str, Option<&str>) {
+///
+/// Build metadata orders nothing, so it comes off first and is never compared.
+/// Taking it off before looking for the pre-release is what makes
+/// `1.0.0+build-7` the release `1.0.0`: the hyphen belongs to the metadata, and
+/// reading it as a separator would rank a released package below itself.
+fn split_version(version: &str) -> (&str, Option<&str>) {
+    let version = version.split_once('+').map_or(version, |(v, _)| v);
     match version.split_once('-') {
         Some((release, pre)) => (release, Some(pre)),
         None => (version, None),
     }
 }
 
+/// Order two pre-release suffixes.
+///
+/// A suffix is a dot-separated list of identifiers, compared one position at a
+/// time. An identifier that is a number is compared as a number, so `beta.2`
+/// precedes `beta.10` where comparing the suffixes as plain text would put
+/// `beta.10` first and call a package up to date that is ten pre-releases
+/// behind. A number also orders below text at the same position, and text is
+/// compared without regard to case. When one suffix runs out with everything
+/// before it equal, the shorter one orders first: `alpha` precedes `alpha.1`.
+fn cmp_prerelease(a: &str, b: &str) -> std::cmp::Ordering {
+    let (mut a_ids, mut b_ids) = (a.split('.'), b.split('.'));
+    loop {
+        let ordering = match (a_ids.next(), b_ids.next()) {
+            (None, None) => return std::cmp::Ordering::Equal,
+            (None, Some(_)) => return std::cmp::Ordering::Less,
+            (Some(_), None) => return std::cmp::Ordering::Greater,
+            (Some(x), Some(y)) => match (numeric_identifier(x), numeric_identifier(y)) {
+                (Some(m), Some(n)) => m.cmp(&n),
+                (Some(_), None) => std::cmp::Ordering::Less,
+                (None, Some(_)) => std::cmp::Ordering::Greater,
+                (None, None) => x.to_ascii_lowercase().cmp(&y.to_ascii_lowercase()),
+            },
+        };
+        if ordering != std::cmp::Ordering::Equal {
+            return ordering;
+        }
+    }
+}
+
+/// The value of an identifier NuGet reads as a number, or `None` where it reads
+/// it as text.
+///
+/// The width is NuGet's: an identifier counts as a number when it fits in a
+/// signed 32-bit integer. A longer run of digits is text to NuGet and is text
+/// here, which is why `beta.10000000000` orders below `beta.9999999999`.
+fn numeric_identifier(identifier: &str) -> Option<i32> {
+    identifier.parse().ok()
+}
+
 /// The numeric components of a release, or `None` if any component is not a number.
 fn release_parts(release: &str) -> Option<Vec<u64>> {
-    // Build metadata orders nothing, so it is dropped rather than rejected.
-    let release = release.split_once('+').map_or(release, |(v, _)| v);
     if release.is_empty() {
         return None;
     }
@@ -312,6 +355,105 @@ mod tests {
             Some(true)
         );
         assert_eq!(matches_nuget_range("1.0.0+build.7", "[1.0.0]"), Some(true));
+    }
+
+    #[test]
+    fn a_numeric_prerelease_identifier_counts_rather_than_spells() {
+        // `beta.10` is eight pre-releases past `beta.2`. Spelling the suffixes
+        // out and comparing the text puts `beta.10` first, which lets a range
+        // that stops at `beta.2` admit it: the newest release then reads as one
+        // the project already allows, and a package ten pre-releases behind is
+        // reported up to date.
+        assert_eq!(
+            matches_nuget_range("2.0.0-beta.10", "[1.0.0,2.0.0-beta.2]"),
+            Some(false)
+        );
+        // The same misreading in the other direction hides a release the range
+        // does admit.
+        assert_eq!(
+            matches_nuget_range("2.0.0-beta.9", "[1.0.0,2.0.0-beta.10]"),
+            Some(true)
+        );
+        // Only dot-separated identifiers are read as numbers. `beta10` is one
+        // identifier and NuGet compares it as text, so it stays below `beta2`.
+        assert_eq!(
+            matches_nuget_range("2.0.0-beta10", "[2.0.0-beta10,2.0.0-beta2]"),
+            Some(true)
+        );
+        assert_eq!(
+            matches_nuget_range("2.0.0-beta2", "[2.0.0-beta10,2.0.0-beta2]"),
+            Some(true)
+        );
+        // A number orders below text at the same position.
+        assert_eq!(
+            matches_nuget_range("1.0.0-1", "[1.0.0-1,1.0.0-alpha]"),
+            Some(true)
+        );
+        assert_eq!(
+            matches_nuget_range("1.0.0-alpha", "[1.0.0-1,1.0.0-alpha]"),
+            Some(true)
+        );
+        // A suffix that runs out first orders first.
+        assert_eq!(
+            matches_nuget_range("1.0.0-alpha", "[1.0.0-alpha,1.0.0-alpha.1.0]"),
+            Some(true)
+        );
+        assert_eq!(
+            matches_nuget_range("1.0.0-alpha.1", "[1.0.0-alpha.1.0,)"),
+            Some(false)
+        );
+        // Case says nothing about order. Comparing text with case intact would
+        // sort every capital ahead of every lowercase letter, so `Beta` would
+        // fall below `alpha` on its capital alone.
+        assert_eq!(
+            matches_nuget_range("2.0.0-Beta.10", "[2.0.0-BETA.2,)"),
+            Some(true)
+        );
+        assert_eq!(
+            matches_nuget_range("1.0.0-alpha", "[1.0.0-Beta,)"),
+            Some(false)
+        );
+        assert_eq!(
+            matches_nuget_range("1.0.0-Zeta", "[1.0.0-alpha,)"),
+            Some(true)
+        );
+        // A run of digits too long to be a number is text to NuGet, and
+        // comparing it as text is the rule, not an approximation of one:
+        // `10000000000` orders below `9999999999`.
+        assert_eq!(
+            matches_nuget_range(
+                "1.0.0-beta.10000000000",
+                "[1.0.0-beta.10000000000,1.0.0-beta.9999999999]"
+            ),
+            Some(true)
+        );
+        assert_eq!(
+            matches_nuget_range("1.0.0-beta.2147483648", "(1.0.0-beta.2147483647,)"),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn build_metadata_orders_nothing_wherever_it_appears() {
+        // Metadata is not part of the version's order, so a version carrying it
+        // is the version without it.
+        assert_eq!(
+            matches_nuget_range("1.0.0-beta+build.7", "[1.0.0-beta]"),
+            Some(true)
+        );
+        assert_eq!(
+            matches_nuget_range("1.0.0-beta", "[1.0.0-beta+001]"),
+            Some(true)
+        );
+        // Metadata starts at the first `+`, so a hyphen inside it is not the
+        // start of a pre-release. Reading it as one would rank the released
+        // `1.0.0+build-7` below `1.0.0`, and a project pinned to `[1.0.0]`
+        // would be told its own release does not satisfy it.
+        assert_eq!(matches_nuget_range("1.0.0+build-7", "[1.0.0]"), Some(true));
+        assert_eq!(
+            matches_nuget_range("1.0.0+build-7", "(1.0.0-7,)"),
+            Some(true)
+        );
     }
 
     #[test]
