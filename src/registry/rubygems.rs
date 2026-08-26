@@ -263,11 +263,19 @@ enum Segment {
 
 /// Split a version the way `Gem::Version` does: runs of digits and runs of
 /// letters, with everything else read as a separator.
+///
+/// A hyphen is not a separator. `Gem::Version` rewrites it to `.pre.` as it
+/// reads the string, so `1.0-1` is `1.0.pre.1` and sorts BELOW `1.0` rather
+/// than above it. Reading the hyphen as a separator puts the same version one
+/// release too high and hands a gem an update it does not accept.
 fn segments_of(v: &str) -> Vec<Segment> {
     let mut segments = Vec::new();
     let mut chars = v.chars().peekable();
     while let Some(&c) = chars.peek() {
-        if c.is_ascii_digit() {
+        if c == '-' {
+            chars.next();
+            segments.push(Segment::Text("pre".to_string()));
+        } else if c.is_ascii_digit() {
             let mut run = String::new();
             while chars.peek().is_some_and(|c| c.is_ascii_digit()) {
                 run.push(chars.next().unwrap());
@@ -563,6 +571,46 @@ mod tests {
         // A run of letters is below the zero a missing component stands for.
         assert!(matches_ruby_constraint("1.0.a", "< 1.0"));
         assert!(matches_ruby_constraint("1.0", "> 1.0.a"));
+    }
+
+    /// A hyphen is not a separator. `Gem::Version` rewrites it to `.pre.` as it
+    /// reads the string, so `1.0-1` is `1.0.pre.1` and sorts below `1.0`.
+    /// Skipping the hyphen leaves `1.0.1`, one release above, so a gem held at
+    /// `>= 1.0` is offered a version RubyGems itself refuses.
+    #[test]
+    fn a_hyphen_names_a_prerelease_rather_than_a_separator() {
+        assert!(matches_ruby_constraint("1.0-1", "= 1.0.pre.1"));
+        assert!(matches_ruby_constraint("1.0-1", "< 1.0"));
+        assert!(!matches_ruby_constraint("1.0-1", ">= 1.0"));
+        assert!(!matches_ruby_constraint("1.0-1", "= 1.0.1"));
+        assert!(!matches_ruby_constraint("1.0-1", "~> 1.0"));
+        assert!(matches_ruby_constraint("1.0", "> 1.0-1"));
+
+        // The text the hyphen writes in takes part in the ordering, so the
+        // comparison runs against "pre" and not against the suffix behind it.
+        assert!(matches_ruby_constraint("1.0-zulu", "< 1.0.quebec"));
+        assert!(!matches_ruby_constraint("1.0-zulu", "> 1.0.quebec"));
+
+        // Every hyphen writes another one in: `1.0-1-2` is `1.0.pre.1.pre.2`,
+        // which the trailing "pre" puts below `1.0-1` rather than above it.
+        assert!(!matches_ruby_constraint("1.0-1-2", "= 1.0-1"));
+        assert!(matches_ruby_constraint("1.0-1-2", "< 1.0-1"));
+        assert!(matches_ruby_constraint("1.0-1-2", "< 1.0"));
+
+        // The prerelease tail drops its own trailing zero, so `1.0-0` is the
+        // bare prerelease `1.0.pre` and not the release `1.0`.
+        assert!(!matches_ruby_constraint("1.0-0", ">= 1.0"));
+        assert!(matches_ruby_constraint("1.0-0", "< 1.0"));
+        assert!(matches_ruby_constraint("1.0-0", "= 1.0-0"));
+
+        // The pessimistic ceiling is read from the release the prerelease
+        // qualifies, so `~> 8.1-1` ceils where `~> 8.1` does, and a hyphenated
+        // version sits inside a range the release it qualifies belongs to.
+        assert!(matches_ruby_constraint("8.1-1", "~> 8.1-1"));
+        assert!(matches_ruby_constraint("8.2.0", "~> 8.1-1"));
+        assert!(!matches_ruby_constraint("9.0.0", "~> 8.1-1"));
+        assert!(!matches_ruby_constraint("8.1-1", ">= 8.1"));
+        assert!(matches_ruby_constraint("1.2.3-4", "~> 1.0"));
     }
 
     /// The pessimistic operator raises the component before the last one the
