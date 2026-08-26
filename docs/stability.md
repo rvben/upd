@@ -116,6 +116,12 @@ error in `files[].errors` when the spec cannot be read. Only the last changes
 the exit code, and it does so deliberately: nothing looked at that dependency,
 so counting it as up to date would put a green tick over an unchecked answer.
 
+A `[pin]` onto one of these specs is reported the same way. A pin names the
+version the spec must resolve to, and a spec with no floor has nowhere to put
+it: writing the pinned version over the number such a spec does contain would
+raise a ceiling or invert an exclusion rather than pin anything. The pin is
+reported in `files[].errors` and the spec is left as its author wrote it.
+
 An update above the ceiling is reported as held back, in `files[].capped` and
 `summary.capped`. It is never counted as up to date, and it does not change the
 exit code: the ceiling exists to keep such a change out of the gate, so a run
@@ -170,7 +176,7 @@ that project asked for.
 |------|---------|
 | `0` | Success. No action required, or updates applied cleanly |
 | `1` | Pending updates or misalignments found (dry-run / `--check`). Not an error. |
-| `2` | An error was reported. A file could not be read/written, a required path does not exist, a lockfile refresh failed, a dependency could not be checked (its constraint could not be read, or its registry lookup did not answer), or `--interactive` was given with no terminal on stdin. Takes precedence over every other code |
+| `2` | An error was reported. A file could not be read/written, a required path does not exist, a lockfile refresh failed, a dependency could not be checked (its constraint could not be read, or its registry lookup did not answer), or `--interactive` was given with no terminal on stdin. Takes precedence over every other code. An interactive session reports these the same way a plain run does, after applying whatever it approved |
 | `3` | Network error. A registry was unreachable or timed out |
 | `4` | Invalid CLI arguments or an unparseable dependency file / configuration |
 | `6` | Vulnerabilities found (`upd audit`). Pass `--no-fail` to force exit 0. |
