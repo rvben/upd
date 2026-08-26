@@ -209,6 +209,33 @@ impl GemfileUpdater {
         updated
     }
 
+    /// Rewrite the floor of the gem declared on `line`, or `None` when the line
+    /// no longer declares `package` at `old_version`.
+    ///
+    /// The interactive path scans, prompts, and only then writes, so it reads
+    /// each line again at write time to answer "is this still the declaration
+    /// the user approved?". Answering with this parser rather than a second,
+    /// regex-shaped one is what keeps the two paths agreeing: a floor written
+    /// after a ceiling (`gem 'rails', '< 9.0', '>= 6.0'`) is found where it
+    /// actually is, not assumed to be the first version on the line.
+    pub fn rewrite_floor(
+        &self,
+        line: &str,
+        package: &str,
+        old_version: &str,
+        new_version: &str,
+    ) -> Option<String> {
+        let parsed = self.parse_line(line)?;
+        if parsed.name != package {
+            return None;
+        }
+        let (floor, raisable) = parsed.floor()?;
+        if !raisable || floor.version != old_version {
+            return None;
+        }
+        Some(self.update_line(line, &floor.range, new_version))
+    }
+
     /// Check if a Ruby gem version string is a pre-release.
     /// RubyGems pre-releases include a letter component in the version segments,
     /// commonly expressed as `.pre`, `.rc`, `.beta`, `.alpha`, or similar suffixes.
@@ -623,12 +650,18 @@ mod tests {
             .collect()
     }
 
-    /// Rewrite a line's floor the way `update` does: at the byte range the
-    /// clause occupies, not at the first text that looks like it.
-    fn rewrite_floor(updater: &GemfileUpdater, line: &str, new_version: &str) -> String {
-        let parsed = updater.parse_line(line).expect("line parses");
-        let (floor, _) = parsed.floor().expect("line has a floor");
-        updater.update_line(line, &floor.range, new_version)
+    /// Rewrite a line's floor through the entry point the interactive write
+    /// uses, so the test cannot pass on a rewrite the binary would not make.
+    fn rewrite_floor(
+        updater: &GemfileUpdater,
+        line: &str,
+        package: &str,
+        old_version: &str,
+        new_version: &str,
+    ) -> String {
+        updater
+            .rewrite_floor(line, package, old_version, new_version)
+            .expect("line has a raisable floor at old_version")
     }
 
     #[test]
@@ -687,13 +720,64 @@ mod tests {
         let updater = GemfileUpdater::new();
 
         assert_eq!(
-            rewrite_floor(&updater, "gem 'rails', '>= 6.0', '< 7.0'", "6.1"),
+            rewrite_floor(
+                &updater,
+                "gem 'rails', '>= 6.0', '< 7.0'",
+                "rails",
+                "6.0",
+                "6.1"
+            ),
             "gem 'rails', '>= 6.1', '< 7.0'"
         );
         // The ceiling is written first here, so a textual search would rewrite it.
         assert_eq!(
-            rewrite_floor(&updater, "gem 'rails', '< 7.0', '>= 6.0'", "6.1"),
+            rewrite_floor(
+                &updater,
+                "gem 'rails', '< 7.0', '>= 6.0'",
+                "rails",
+                "6.0",
+                "6.1"
+            ),
             "gem 'rails', '< 7.0', '>= 6.1'"
+        );
+    }
+
+    #[test]
+    fn a_rewrite_is_refused_when_the_line_is_not_the_one_that_was_approved() {
+        let updater = GemfileUpdater::new();
+
+        // The interactive path prompts before it writes, so between the two the
+        // line can have become a different declaration. Each of these is a way
+        // for that to have happened, and writing anyway would put the new
+        // version somewhere nobody agreed to.
+        for line in [
+            // A different gem now occupies the line.
+            "gem 'rack', '>= 6.0', '< 7.0'",
+            // The floor moved, so the version approved is no longer there.
+            "gem 'rails', '>= 6.2', '< 7.0'",
+            // The version approved is still on the line, but as a ceiling: it
+            // is the release the author now rules out, not the one they are on.
+            "gem 'rails', '< 6.0'",
+            // Nothing on the line is a floor any more.
+            "gem 'rails', '< 7.0'",
+            // The declaration is gone.
+            "# gem 'rails', '>= 6.0'",
+        ] {
+            assert_eq!(
+                updater.rewrite_floor(line, "rails", "6.0", "6.1"),
+                None,
+                "line {line:?}"
+            );
+        }
+
+        // The control: the same call on the line as approved does rewrite it,
+        // so the refusals above are the check working rather than the call
+        // never succeeding.
+        assert_eq!(
+            updater
+                .rewrite_floor("gem 'rails', '>= 6.0', '< 7.0'", "rails", "6.0", "6.1")
+                .as_deref(),
+            Some("gem 'rails', '>= 6.1', '< 7.0'")
         );
     }
 
@@ -765,7 +849,7 @@ mod tests {
         let updater = GemfileUpdater::new();
 
         // ~> 7.1 with latest 7.2.3 should preserve 2-part precision
-        let result = rewrite_floor(&updater, "gem 'rails', '~> 7.1'", "7.2");
+        let result = rewrite_floor(&updater, "gem 'rails', '~> 7.1'", "rails", "7.1", "7.2");
         assert_eq!(result, "gem 'rails', '~> 7.2'");
     }
 
@@ -795,10 +879,16 @@ mod tests {
     fn test_preserves_constraint_operator() {
         let updater = GemfileUpdater::new();
 
-        let result = rewrite_floor(&updater, "gem 'devise', '>= 4.9.0'", "4.10.0");
+        let result = rewrite_floor(
+            &updater,
+            "gem 'devise', '>= 4.9.0'",
+            "devise",
+            "4.9.0",
+            "4.10.0",
+        );
         assert_eq!(result, "gem 'devise', '>= 4.10.0'");
 
-        let result = rewrite_floor(&updater, "gem 'puma', '~> 6.0'", "6.4");
+        let result = rewrite_floor(&updater, "gem 'puma', '~> 6.0'", "puma", "6.0", "6.4");
         assert_eq!(result, "gem 'puma', '~> 6.4'");
     }
 

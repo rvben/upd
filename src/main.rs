@@ -4665,16 +4665,9 @@ fn apply_gemfile_version(
     update: &VersionEdit<'_>,
     target_version: &str,
 ) -> bool {
-    let pattern = format!(
-        r#"(gem\s+['"]{}['"]\s*,\s*['"](?:~>\s*|>=\s*|<=\s*|>\s*|<\s*|=\s*|!=\s*)?){}(['"])"#,
-        regex::escape(update.package),
-        regex::escape(update.old_version)
-    );
-    let re = regex::Regex::new(&pattern).unwrap();
-    let replacement = format!("${{1}}{}${{2}}", target_version);
-
+    let updater = GemfileUpdater::new();
     apply_line_replacement(document, update.line_num, |line| {
-        replace_first_match(line, &re, &replacement)
+        updater.rewrite_floor(line, update.package, update.old_version, target_version)
     })
 }
 
@@ -4867,15 +4860,9 @@ fn apply_terraform_version(
     update: &VersionEdit<'_>,
     target_version: &str,
 ) -> bool {
-    let pattern = format!(
-        r#"(^\s*version\s*=\s*"(?:~>\s*|>=\s*|<=\s*|>\s*|<\s*|=\s*|!=\s*)?){}(")"#,
-        regex::escape(update.old_version)
-    );
-    let re = regex::Regex::new(&pattern).unwrap();
-    let replacement = format!(r#"${{1}}{}${{2}}"#, target_version);
-
+    let updater = TerraformUpdater::new();
     apply_line_replacement(document, update.line_num, |line| {
-        replace_first_match(line, &re, &replacement)
+        updater.rewrite_floor(line, update.old_version, target_version)
     })
 }
 
@@ -6663,6 +6650,49 @@ mod tests {
             applied.content,
             "[project]\ndependencies = [\"django>=3.10,<4\"]\n"
         );
+    }
+
+    /// A constraint set carries no order, so the floor an interactive session
+    /// approved may be written after a ceiling. The write has to find it where
+    /// it is: reading the first version on the line instead matched nothing, so
+    /// the session reported "Failed to apply 1 version edit(s)", exited 2, and
+    /// wrote nothing, for a file every other mode of the same binary updates.
+    #[test]
+    fn test_apply_version_updates_writes_a_floor_that_follows_a_ceiling() {
+        for (file_type, content, expected) in [
+            (
+                FileType::Gemfile,
+                "source 'https://rubygems.org'\ngem 'rails', '< 9.0', '>= 6.0'\n",
+                "source 'https://rubygems.org'\ngem 'rails', '< 9.0', '>= 8.1'\n",
+            ),
+            (
+                FileType::TerraformTf,
+                "terraform {\n  required_providers {\n    aws = {\n      source  = \"hashicorp/aws\"\n      version = \"< 9.0, >= 6.0\"\n    }\n  }\n}\n",
+                "terraform {\n  required_providers {\n    aws = {\n      source  = \"hashicorp/aws\"\n      version = \"< 9.0, >= 8.1\"\n    }\n  }\n}\n",
+            ),
+        ] {
+            let line_num = content
+                .lines()
+                .position(|line| line.contains(">= 6.0"))
+                .map(|index| index + 1);
+            let updates = [VersionEdit {
+                package: if file_type == FileType::Gemfile {
+                    "rails"
+                } else {
+                    "hashicorp/aws"
+                },
+                old_version: "6.0",
+                new_version: "8.1",
+                line_num,
+                expected_source: None,
+                sha_pin: None,
+            }];
+
+            let applied = apply_version_updates(content, &updates, file_type, false).unwrap();
+
+            assert_eq!(applied.applied_count(), 1, "file type {file_type:?}");
+            assert_eq!(applied.content, expected, "file type {file_type:?}");
+        }
     }
 
     #[test]

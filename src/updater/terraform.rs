@@ -48,6 +48,29 @@ struct ParsedTerraformDep {
     version_line_idx: usize,
 }
 
+/// The clause an update may rewrite, paired with whether it may.
+///
+/// Takes the clauses rather than the whole dependency so that a caller holding
+/// nothing but one version attribute, like the interactive write, asks the same
+/// question the scan asked and gets the same answer.
+fn floor_clause(clauses: &[TfClause]) -> Option<(&TfClause, bool)> {
+    let shared: Vec<Clause<'_>> = clauses
+        .iter()
+        .map(|c| Clause {
+            op: &c.op,
+            version: &c.version,
+            range: c.range.clone(),
+        })
+        .collect();
+    let raisable = floor_of(&shared)?.raisable;
+    let clause = if raisable {
+        clauses.iter().find(|c| operator_is_raisable(&c.op))?
+    } else {
+        clauses.first()?
+    };
+    Some((clause, raisable))
+}
+
 impl ParsedTerraformDep {
     /// The constraints as Terraform requirement text, which is what the registry
     /// and every message about this dependency quote.
@@ -81,13 +104,7 @@ impl ParsedTerraformDep {
 
     /// The clause an update may rewrite, paired with whether it may.
     fn floor(&self) -> Option<(&TfClause, bool)> {
-        let raisable = floor_of(&self.as_clauses())?.raisable;
-        let clause = if raisable {
-            self.clauses.iter().find(|c| operator_is_raisable(&c.op))?
-        } else {
-            self.clauses.first()?
-        };
-        Some((clause, raisable))
+        floor_clause(&self.clauses)
     }
 
     /// The version this declaration is anchored at, for reporting and comparison.
@@ -295,6 +312,29 @@ impl TerraformUpdater {
         updated.push_str(new_version);
         updated.push_str(&line[range.end..]);
         updated
+    }
+
+    /// Rewrite the floor of the version attribute on `line`, or `None` when the
+    /// line no longer constrains `old_version`.
+    ///
+    /// The interactive path scans, prompts, and only then writes, so it reads
+    /// each line again at write time to answer "is this still the constraint
+    /// the user approved?". Answering with this parser rather than a second,
+    /// regex-shaped one is what keeps the two paths agreeing: a floor written
+    /// after a ceiling (`version = "< 9.0, >= 6.0"`) is found where it actually
+    /// is, not assumed to be the first version in the attribute.
+    pub fn rewrite_floor(
+        &self,
+        line: &str,
+        old_version: &str,
+        new_version: &str,
+    ) -> Option<String> {
+        let clauses = Self::parse_constraint(&self.version_re.captures(line)?);
+        let (floor, raisable) = floor_clause(&clauses)?;
+        if !raisable || floor.version != old_version {
+            return None;
+        }
+        Some(self.update_line(line, &floor.range, new_version))
     }
 
     /// Computes the new `~>` constraint version when the existing constraint no longer
@@ -713,17 +753,18 @@ mod tests {
             .collect()
     }
 
-    /// Rewrite a version line's floor the way `update` does: at the byte range
-    /// the clause occupies, not at the first text that looks like it.
-    fn rewrite_floor(updater: &TerraformUpdater, line: &str, new_version: &str) -> String {
-        let caps = updater.version_re.captures(line).expect("line parses");
-        let dep = ParsedTerraformDep {
-            source: "test/provider".to_string(),
-            clauses: TerraformUpdater::parse_constraint(&caps),
-            version_line_idx: 0,
-        };
-        let (floor, _) = dep.floor().expect("line has a floor");
-        updater.update_line(line, &floor.range, new_version)
+    /// Rewrite a version line's floor through the entry point the interactive
+    /// write uses, so the test cannot pass on a rewrite the binary would not
+    /// make.
+    fn rewrite_floor(
+        updater: &TerraformUpdater,
+        line: &str,
+        old_version: &str,
+        new_version: &str,
+    ) -> String {
+        updater
+            .rewrite_floor(line, old_version, new_version)
+            .expect("line has a raisable floor at old_version")
     }
 
     #[test]
@@ -794,13 +835,49 @@ terraform {
         let updater = TerraformUpdater::new();
 
         assert_eq!(
-            rewrite_floor(&updater, r#"  version = ">= 4.0, < 5.0""#, "4.67"),
+            rewrite_floor(&updater, r#"  version = ">= 4.0, < 5.0""#, "4.0", "4.67"),
             r#"  version = ">= 4.67, < 5.0""#
         );
         // The ceiling is written first here, so a textual search would rewrite it.
         assert_eq!(
-            rewrite_floor(&updater, r#"  version = "< 5.0, >= 4.0""#, "4.67"),
+            rewrite_floor(&updater, r#"  version = "< 5.0, >= 4.0""#, "4.0", "4.67"),
             r#"  version = "< 5.0, >= 4.67""#
+        );
+    }
+
+    #[test]
+    fn a_rewrite_is_refused_when_the_line_is_not_the_one_that_was_approved() {
+        let updater = TerraformUpdater::new();
+
+        // The interactive path prompts before it writes, so between the two the
+        // line can have become a different constraint. Writing anyway would put
+        // the new version somewhere nobody agreed to.
+        for line in [
+            // The floor moved, so the version approved is no longer there.
+            r#"  version = ">= 4.1, < 5.0""#,
+            // The version approved is still on the line, but as a ceiling: it
+            // is the release the author now rules out, not the one they are on.
+            r#"  version = "< 4.0""#,
+            // Nothing on the line is a floor any more.
+            r#"  version = "< 5.0""#,
+            // The attribute is gone.
+            r#"  source = "hashicorp/aws""#,
+        ] {
+            assert_eq!(
+                updater.rewrite_floor(line, "4.0", "4.67"),
+                None,
+                "line {line:?}"
+            );
+        }
+
+        // The control: the same call on the line as approved does rewrite it,
+        // so the refusals above are the check working rather than the call
+        // never succeeding.
+        assert_eq!(
+            updater
+                .rewrite_floor(r#"  version = ">= 4.0, < 5.0""#, "4.0", "4.67")
+                .as_deref(),
+            Some(r#"  version = ">= 4.67, < 5.0""#)
         );
     }
 
@@ -934,10 +1011,10 @@ module "vpc" {{
     fn test_preserves_constraint_operator() {
         let updater = TerraformUpdater::new();
 
-        let result = rewrite_floor(&updater, r#"      version = "~> 5.0""#, "5.83");
+        let result = rewrite_floor(&updater, r#"      version = "~> 5.0""#, "5.0", "5.83");
         assert_eq!(result, r#"      version = "~> 5.83""#);
 
-        let result = rewrite_floor(&updater, r#"      version = ">= 4.9.0""#, "4.10.0");
+        let result = rewrite_floor(&updater, r#"      version = ">= 4.9.0""#, "4.9.0", "4.10.0");
         assert_eq!(result, r#"      version = ">= 4.10.0""#);
     }
 
