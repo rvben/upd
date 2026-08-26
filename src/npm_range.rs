@@ -531,32 +531,40 @@ struct Branch<'a> {
 }
 
 impl Branch<'_> {
+    /// Whether the tokens spell npm's hyphen range, in which the two versions
+    /// are bounds rather than comparators.
+    ///
+    /// Read from the tokens rather than from the shape because the two answer
+    /// different questions: the form decides what the range *means*, the shape
+    /// only decides whether upd may rewrite it. A floorless hyphen range
+    /// (`"* - 2.0.0"`) is opaque to a rewrite and still evaluates as `"<=2.0.0"`.
+    fn is_hyphen_range(&self) -> bool {
+        self.tokens.len() == 3 && self.tokens[1] == "-"
+    }
+
     fn to_req(&self) -> Option<semver::VersionReq> {
         let mut comparators: Vec<String> = Vec::new();
-        match self.shape {
-            BranchShape::Hyphen => {
-                let low = parse_partial(self.tokens[0])?;
-                let high = parse_partial(self.tokens[2])?;
-                comparators.push(format!(">={}", low.floor()));
-                // A partial on the right widens to the end of what it names:
-                // "1.2.3 - 2.3" reaches every 2.3.z, so it stops below 2.4.0.
-                comparators.push(match high.ceiling() {
-                    Ceiling::Any => ">=0.0.0".to_string(),
-                    Ceiling::Below(hi) => format!("<{hi}"),
-                    Ceiling::Exact => format!("<={}", high.floor()),
-                });
+        if self.is_hyphen_range() {
+            let low = parse_partial(self.tokens[0])?;
+            let high = parse_partial(self.tokens[2])?;
+            comparators.push(format!(">={}", low.floor()));
+            // A partial on the right widens to the end of what it names:
+            // "1.2.3 - 2.3" reaches every 2.3.z, so it stops below 2.4.0.
+            comparators.push(match high.ceiling() {
+                Ceiling::Any => ">=0.0.0".to_string(),
+                Ceiling::Below(hi) => format!("<{hi}"),
+                Ceiling::Exact => format!("<={}", high.floor()),
+            });
+        } else {
+            for token in &self.tokens {
+                let (op, partial) = parse_comparator(token)?;
+                comparators.extend(partial.expand(op));
             }
-            _ => {
-                for token in &self.tokens {
-                    let (op, partial) = parse_comparator(token)?;
-                    comparators.extend(partial.expand(op));
-                }
-                // An alternative with nothing in it constrains nothing. Spelled
-                // out rather than left to an empty parse so the prerelease rule
-                // is the same one every other comparator here gets.
-                if comparators.is_empty() {
-                    comparators.push(">=0.0.0".to_string());
-                }
+            // An alternative with nothing in it constrains nothing. Spelled
+            // out rather than left to an empty parse so the prerelease rule
+            // is the same one every other comparator here gets.
+            if comparators.is_empty() {
+                comparators.push(">=0.0.0".to_string());
             }
         }
         semver::VersionReq::parse(&comparators.join(", ")).ok()
@@ -623,8 +631,18 @@ fn analyze(branch: &str) -> Option<Branch<'_>> {
         if tokens.len() != 3 || position != 1 {
             return None;
         }
-        parse_partial(tokens[0])?;
+        let lower = parse_partial(tokens[0])?;
         parse_partial(tokens[2])?;
+        if lower.numeric == 0 {
+            // `* - 2.0.0` is how npm writes `<=2.0.0`: a ceiling with nothing
+            // under it. There is no floor in that position to raise, and
+            // writing the newest release there turns a range that admitted
+            // every version up to the ceiling into an exact pin on one.
+            return Some(Branch {
+                tokens,
+                shape: BranchShape::Opaque,
+            });
+        }
         return Some(Branch {
             tokens,
             shape: BranchShape::Hyphen,
@@ -634,7 +652,13 @@ fn analyze(branch: &str) -> Option<Branch<'_>> {
     let mut lower_bounds: Vec<usize> = Vec::new();
     let mut other_floors = 0usize;
     for (index, token) in tokens.iter().enumerate() {
-        let (op, _) = parse_comparator(token)?;
+        let (op, partial) = parse_comparator(token)?;
+        // A comparator written over a bare wildcard bounds nothing: npm reads
+        // `">=*"` as `"*"`. It is neither a floor to raise nor a floor that
+        // competes with one, so it takes no part in either count.
+        if partial.numeric == 0 {
+            continue;
+        }
         match op {
             Op::Ge | Op::Gt => lower_bounds.push(index),
             other if other.bounds_below() => other_floors += 1,
@@ -661,7 +685,10 @@ fn analyze(branch: &str) -> Option<Branch<'_>> {
             Op::Caret | Op::Tilde if partial.numeric > 0 => BranchShape::Shape,
             Op::Eq if partial.numeric == 3 => BranchShape::Exact,
             Op::Eq if partial.numeric > 0 => BranchShape::Shape,
-            Op::Ge => BranchShape::Bounded { lower: 0 },
+            // `">=1.0.0"` names a version to raise; `">=*"` is npm's `"*"` with
+            // an operator in front of it and names none, so there is no floor
+            // there and writing one in would narrow a range that took anything.
+            Op::Ge if partial.numeric > 0 => BranchShape::Bounded { lower: 0 },
             _ => BranchShape::Opaque,
         }
     } else if lower_bounds.len() == 1 && other_floors == 0 && raisable(lower_bounds[0]) {
@@ -692,6 +719,12 @@ mod tests {
         assert_eq!(classify("<2.0.0 >=1.0.0"), SpecShape::BoundedRange);
         assert_eq!(classify(">=1.0.0"), SpecShape::BoundedRange);
         assert_eq!(classify("1.2.3 - 2.0.0"), SpecShape::BoundedRange);
+        // A partial floor is still a floor. Unlike a partial caret, whose width
+        // carries meaning, ">=16" and ">=16.0.0" are the same range, so there
+        // is a home here for the new version at full width.
+        assert_eq!(classify(">=1"), SpecShape::BoundedRange);
+        assert_eq!(classify(">=1.2"), SpecShape::BoundedRange);
+        assert_eq!(classify("1 - 2"), SpecShape::BoundedRange);
         assert_eq!(classify("4.3.x"), SpecShape::ShapeRange);
         assert_eq!(classify("1.x"), SpecShape::ShapeRange);
         assert_eq!(classify("1.2"), SpecShape::ShapeRange);
@@ -708,6 +741,40 @@ mod tests {
         assert_eq!(classify(">1.2.3 <2.0.0"), SpecShape::OpaqueRange);
         // Two floors, no home for the replacement, whichever kind they are.
         assert_eq!(classify(">=1.0.0 >2.0.0"), SpecShape::OpaqueRange);
+    }
+
+    #[test]
+    fn a_bound_written_over_a_wildcard_is_not_a_floor_to_raise() {
+        // npm reads each of these as a range with nothing under it: ">=*" and
+        // ">=x" are both "*", and "* - 2.0.0" is "<=2.0.0". Writing the newest
+        // release into that position would invent a lower bound the author
+        // never set, and in the hyphen case collapse the range onto one version.
+        for spec in [">=*", ">=x", ">=X", ">= *", "* - 2.0.0", "x - 2.0.0"] {
+            assert_eq!(classify(spec), SpecShape::OpaqueRange, "spec {spec:?}");
+            assert_eq!(lower_bound_anchor(spec), None, "spec {spec:?}");
+            assert_eq!(rewrite_lower_bound(spec, "3.1.4"), None, "spec {spec:?}");
+        }
+
+        // A wildcard bound alongside a real one leaves the real one raisable:
+        // it constrains nothing, so it is not a second floor competing for the
+        // new version.
+        assert_eq!(classify(">=* <2.0.0"), SpecShape::OpaqueRange);
+        assert_eq!(classify(">=1.0.0 >=*"), SpecShape::BoundedRange);
+        assert_eq!(
+            rewrite_lower_bound(">=1.0.0 >=*", "1.9.0").as_deref(),
+            Some(">=1.9.0 >=*")
+        );
+
+        // Refusing to rewrite must not cost the ability to read the range:
+        // which versions it admits is a separate question from whether upd may
+        // move its floor, and npm's answers are still these.
+        assert!(admitted(">=*", "9.9.9"));
+        assert!(admitted(">=x", "0.0.1"));
+        assert!(admitted("* - 2.0.0", "1.9.9"));
+        assert!(admitted("* - 2.0.0", "2.0.0"));
+        assert!(!admitted("* - 2.0.0", "2.0.1"));
+        assert!(admitted(">=* <2.0.0", "1.5.0"));
+        assert!(!admitted(">=* <2.0.0", "2.5.0"));
     }
 
     #[test]
@@ -1098,6 +1165,7 @@ mod tests {
             Some("1.0.0")
         );
         assert_eq!(lower_bound_anchor(">=1.2").as_deref(), Some("1.2.0"));
+        assert_eq!(lower_bound_anchor(">=1").as_deref(), Some("1.0.0"));
         assert_eq!(
             lower_bound_anchor("4.17.0 - 4.18.0").as_deref(),
             Some("4.17.0")
