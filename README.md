@@ -1,28 +1,69 @@
 <p align="center">
-  <img src="assets/logo-wide.svg" alt="upd logo" width="400">
+  <img src="https://raw.githubusercontent.com/rvben/upd/main/assets/logo-wide.svg" alt="upd logo" width="400">
 </p>
 
 # upd
+
+<p align="center">
+  <strong>Update dependencies across a polyglot repository—locally, safely, and in one command.</strong>
+</p>
+
+<p align="center">
+  Python · Node.js · Rust · Go · Ruby · .NET · Terraform · GitHub Actions · pre-commit · Mise
+</p>
 
 [![crates.io](https://img.shields.io/crates/v/upd.svg)](https://crates.io/crates/upd)
 [![PyPI](https://img.shields.io/pypi/v/upd.svg)](https://pypi.org/project/upd/)
 [![CI](https://github.com/rvben/upd/actions/workflows/ci.yml/badge.svg)](https://github.com/rvben/upd/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](https://github.com/rvben/upd/blob/main/LICENSE)
 
-A fast dependency updater for Python, Node.js, Rust, Go, Ruby, .NET, Terraform, GitHub Actions, pre-commit, and Mise projects, written in Rust.
+`upd` gives you one reviewable update plan across mixed stacks. It preserves
+hand-written constraints, comments, and formatting; previews every proposed
+change before it writes; and runs without a hosted service or repository
+onboarding.
 
-## Quick Start
+## Try it now
+
+From any directory inside a Git repository:
 
 ```bash
-# Preview changes without modifying files (default)
 uvx upd
-
-# Apply updates
-uvx upd --apply
-
-# Or with pipx
-pipx run upd --apply
 ```
+
+That first run is a dry run: it reports what would change and leaves every file
+untouched. Review the plan, then apply it with `uvx upd --apply`.
+
+<p align="center">
+  <img src="https://raw.githubusercontent.com/rvben/upd/main/assets/terminal-demo.svg" alt="upd previewing six dependency updates across four files without changing them" width="1000">
+</p>
+
+<p align="center">
+  <sub>One preview across four file types. Nothing changes until you pass <code>--apply</code>.</sub>
+</p>
+
+<p align="center">
+  <a href="#installation">Install another way</a> ·
+  <a href="https://github.com/rvben/upd/blob/main/docs/ecosystems.md">See every supported file</a> ·
+  <a href="https://github.com/rvben/upd/blob/main/docs/comparison.md">Compare dependency tools</a>
+</p>
+
+## Why upd
+
+- **One command for a mixed stack.** Check application dependencies, tool
+  versions, GitHub Actions, pre-commit hooks, and Terraform modules in the same
+  run instead of assembling a different updater for each file type.
+- **Safe on the first run.** Dry-run is the default, constraints and formatting
+  are preserved, and major updates are called out before you decide what to
+  apply.
+- **Local first, automation ready.** Start with an interactive terminal review,
+  then use the same CLI, configuration, stable exit codes, JSON/SARIF output,
+  and rolling PR or MR workflows in CI.
+
+`upd` is a local checker and editor, not a package manager or a hosted update
+bot. It can delegate lockfile refreshes to the package managers already in your
+project and can run inside your own GitHub or GitLab automation. See the
+[decision guide and dated benchmarks](https://github.com/rvben/upd/blob/main/docs/comparison.md)
+for an exact comparison with adjacent tools.
 
 ## Features
 
@@ -324,10 +365,22 @@ Every file `upd` discovers, per ecosystem, plus annotated version pins in files
 it does not otherwise understand.
 → [docs/ecosystems.md](https://github.com/rvben/upd/blob/main/docs/ecosystems.md)
 
+### Comparison and benchmarks
+
+A dated feature matrix for related dependency tools, plus workload-based,
+reproducible benchmarks that avoid ranking unlike operations.
+→ [docs/comparison.md](https://github.com/rvben/upd/blob/main/docs/comparison.md)
+
 ### Security auditing
 
 OSV vulnerability scanning, `--fix-audit`, SARIF output, and CI integration.
 → [docs/audit.md](https://github.com/rvben/upd/blob/main/docs/audit.md)
+
+### Security policy
+
+Private vulnerability reporting, supported versions, trust boundaries, and
+release integrity.
+→ [SECURITY.md](https://github.com/rvben/upd/blob/main/SECURITY.md)
 
 ### Configuration file
 

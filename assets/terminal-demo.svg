@@ -1,0 +1,28 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="470" viewBox="0 0 1200 470" role="img" aria-labelledby="title desc" xml:space="preserve">
+  <title id="title">upd dry-run preview</title>
+  <desc id="desc">A terminal showing upd finding six dependency updates across four files while leaving every file unchanged.</desc>
+
+  <rect width="1200" height="470" rx="22" fill="#0d1117"/>
+  <rect x="1" y="1" width="1198" height="468" rx="21" fill="none" stroke="#30363d" stroke-width="2"/>
+  <path d="M1 58h1198" stroke="#30363d" stroke-width="2"/>
+
+  <circle cx="30" cy="29" r="7" fill="#ff5f57"/>
+  <circle cx="54" cy="29" r="7" fill="#febc2e"/>
+  <circle cx="78" cy="29" r="7" fill="#28c840"/>
+  <text x="600" y="36" fill="#8b949e" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="16" text-anchor="middle">upd — dry run</text>
+
+  <g font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="17">
+    <text x="34" y="98"><tspan fill="#f0883e">$</tspan><tspan fill="#f0f6fc"> uvx upd</tspan></text>
+
+    <text x="34" y="145"><tspan fill="#79c0ff">.pre-commit-config.yaml:37</tspan><tspan fill="#c9d1d9">  pre-commit-hooks v4.6.0 → v6.0.0</tspan><tspan fill="#ff7b72">  MAJOR</tspan></text>
+    <text x="34" y="181"><tspan fill="#79c0ff">.github/workflows/ci.yml:16</tspan><tspan fill="#c9d1d9">  actions/checkout v4 → v7</tspan><tspan fill="#ff7b72">  MAJOR</tspan></text>
+    <text x="34" y="217"><tspan fill="#79c0ff">.github/workflows/ci.yml:18</tspan><tspan fill="#c9d1d9">  jdx/mise-action v2 → v4</tspan><tspan fill="#ff7b72">  MAJOR</tspan></text>
+    <text x="34" y="253"><tspan fill="#79c0ff">.mise.toml:8</tspan><tspan fill="#c9d1d9">  rust 1.91.1 → 1.94.0</tspan></text>
+    <text x="34" y="289"><tspan fill="#79c0ff">Cargo.toml:33</tspan><tspan fill="#c9d1d9">  clap 4.5.53 → 4.6.0</tspan></text>
+    <text x="34" y="325"><tspan fill="#79c0ff">Cargo.toml:36</tspan><tspan fill="#c9d1d9">  tokio 1.48.0 → 1.50.0</tspan></text>
+
+    <text x="34" y="385" fill="#f0f6fc">Would update 6 packages in 4 files</text>
+    <text x="34" y="421" fill="#8b949e">Run with --apply to write these updates.</text>
+    <text x="1166" y="421" fill="#3fb950" text-anchor="end">DRY RUN · 0 FILES CHANGED</text>
+  </g>
+</svg>
