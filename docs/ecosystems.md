@@ -115,6 +115,11 @@ NODE_VERSION := 22.11.0  # upd: npm node
 - `ignore` and `pin` in `.updrc.toml` reach annotated packages by name. Package
   matching is PEP 503-normalized, so `"Oven-SH/bun"` and `"oven-sh/bun"` are
   one key, as are `"foo-bar"` and `"foo_bar"`
+- `--lang annotated` selects every annotated line whatever its source, and a
+  source's own lang (`--lang github-releases`) selects its lines individually.
+  In a workflow these are separate from `--lang actions`, which selects the
+  `uses:` refs and nothing else: see
+  [GitHub Actions](github-actions.md#selecting-them-with---lang)
 - `exclude` filters discovered files with path globs; explicitly passed file
   paths bypass it
 - `--verbose` inspects otherwise-unknown UTF-8 text files up to 1 MiB, reports

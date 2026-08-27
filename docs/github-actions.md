@@ -280,6 +280,31 @@ other line is free.
 Annotated entries are updates like any other. They obey `ignore`, `pin`,
 cooldown, and `max-bump`, and they keep the line's own precision.
 
+### Selecting them with `--lang`
+
+The two passes are selected separately, because they update different things:
+
+| `--lang` | `uses:` refs | annotated lines |
+| --- | --- | --- |
+| *(omitted)* | yes | yes |
+| `actions` | yes | no |
+| `annotated` | no | yes |
+| the annotation's own source, e.g. `github-releases` | no | yes |
+| `actions,annotated` | yes | yes |
+
+So `-l actions` alone does **not** cover the annotated lines in a workflow, and
+`-l annotated` alone does not touch its `uses:` refs. A weekly job that wants
+both asks for both:
+
+```bash
+upd --dry-run -l actions,annotated
+```
+
+A workflow is opened by any selection that could reach an annotation, whichever
+source it names, and each line is then filtered on its own. A selection that
+reaches neither the workflow's own refs nor any annotation, such as `-l
+terraform`, leaves the file out of discovery entirely.
+
 ## Safety and lifecycle
 
 The reusable workflow:

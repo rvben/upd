@@ -159,6 +159,18 @@ fn lang_selected(langs: &[Lang], source: AnnotationSource) -> bool {
     langs.is_empty() || langs.contains(&Lang::Annotated) || langs.contains(&source.lang())
 }
 
+/// Whether a selection can reach any annotation at all.
+///
+/// This decides whether a file is worth opening; [`lang_selected`] then decides
+/// each line inside it. Asked of the same predicate over every source so the two
+/// cannot disagree: a selection that opens no file must be one that would have
+/// admitted no line either, or a pin goes unreported with nothing said.
+pub fn selection_reaches_annotations(langs: &[Lang]) -> bool {
+    AnnotationSource::ALL
+        .iter()
+        .any(|source| lang_selected(langs, *source))
+}
+
 /// Match the current token's precision unless the caller asked for full
 /// precision, then restore its `v` prefix.
 fn choose_write_value(current: &str, resolved: &str, full_precision: bool) -> String {
@@ -629,6 +641,39 @@ mod tests {
     use crate::cache::Cache;
     use crate::registry::PyPiRegistry;
     use std::sync::Mutex;
+
+    /// The outer gate must agree with the inner one: a selection that opens no
+    /// file has to be one that would have admitted no line either. Asserted
+    /// against `lang_selected` itself over every source, so a new source cannot
+    /// satisfy one and not the other.
+    #[test]
+    fn a_selection_reaches_annotations_exactly_when_some_source_does() {
+        for langs in [
+            vec![],
+            vec![Lang::Annotated],
+            vec![Lang::Python],
+            vec![Lang::GithubReleases],
+            vec![Lang::Actions],
+            vec![Lang::Terraform],
+            vec![Lang::Actions, Lang::Annotated],
+        ] {
+            let any_line = AnnotationSource::ALL
+                .iter()
+                .any(|source| lang_selected(&langs, *source));
+            assert_eq!(
+                selection_reaches_annotations(&langs),
+                any_line,
+                "disagreement on {langs:?}"
+            );
+        }
+
+        // The two outcomes, named, so the loop above is not comparing one
+        // constant against another.
+        assert!(selection_reaches_annotations(&[Lang::Annotated]));
+        assert!(selection_reaches_annotations(&[Lang::GithubReleases]));
+        assert!(!selection_reaches_annotations(&[Lang::Actions]));
+        assert!(!selection_reaches_annotations(&[Lang::Terraform]));
+    }
 
     /// A `RegistrySet::resolving` built from real registries. No network call
     /// happens: constructing a registry only builds an HTTP client, and the

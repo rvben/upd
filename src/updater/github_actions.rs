@@ -479,6 +479,10 @@ impl OwnsLines for GithubActionsUpdater {
     fn owns_line(&self, line: &str) -> bool {
         self.uses_re.is_match(line)
     }
+
+    fn lang(&self) -> Lang {
+        Lang::Actions
+    }
 }
 
 impl Default for GithubActionsUpdater {
@@ -3758,6 +3762,133 @@ jobs:
             result.updated.iter().any(|(pkg, ..)| pkg == "jdx/mise"),
             "annotated update not reported: {:?}",
             result.updated
+        );
+    }
+
+    /// The dispatch in `main.rs` sends this type through
+    /// `update_with_annotations`, and `file_type_selected` has to know that to
+    /// let a lang selection naming only annotations reach the file. Nothing in
+    /// the type system holds the two together, so this does.
+    #[test]
+    fn github_actions_is_scanned_for_annotations() {
+        assert!(FileType::GithubActions.scans_annotations());
+        assert_eq!(GithubActionsUpdater::new().lang(), Lang::Actions);
+        // The two halves answer different questions: this type's own lang is
+        // what a selection must name to get the `uses:` refs rewritten, and it
+        // is not one an annotation can carry.
+        assert_ne!(FileType::GithubActions.lang(), Lang::Annotated);
+    }
+
+    /// `--lang annotated` admits this file for its annotations. The file's own
+    /// dependencies are not what was asked for, and must stay put.
+    #[tokio::test]
+    async fn a_selection_of_annotations_alone_leaves_the_uses_refs_alone() {
+        let file = workflow_file(WORKFLOW_WITH_ANNOTATED_INPUT);
+
+        let result = update_with_annotations(
+            &GithubActionsUpdater::new(),
+            &mise_annotated_updater(),
+            file.path(),
+            &actions_registry(),
+            UpdateOptions::new(false, false).with_langs(vec![Lang::Annotated]),
+        )
+        .await
+        .unwrap();
+
+        let content = fs::read_to_string(file.path()).unwrap();
+        assert!(
+            content.contains("version: 2026.8.14 # upd: github-releases jdx/mise"),
+            "annotated input not rewritten: {content}"
+        );
+        assert!(
+            content.contains("actions/checkout@v4"),
+            "a `uses:` ref moved under `--lang annotated`: {content}"
+        );
+        assert_eq!(
+            result
+                .updated
+                .iter()
+                .map(|(pkg, ..)| pkg.as_str())
+                .collect::<Vec<_>>(),
+            vec!["jdx/mise"],
+        );
+    }
+
+    /// The mirror image, and the control that keeps the test above honest: the
+    /// file's own lang moves the `uses:` refs and no annotation.
+    #[tokio::test]
+    async fn a_selection_of_the_files_own_lang_leaves_the_annotation_alone() {
+        let file = workflow_file(WORKFLOW_WITH_ANNOTATED_INPUT);
+
+        let result = update_with_annotations(
+            &GithubActionsUpdater::new(),
+            &mise_annotated_updater(),
+            file.path(),
+            &actions_registry(),
+            UpdateOptions::new(false, false).with_langs(vec![Lang::Actions]),
+        )
+        .await
+        .unwrap();
+
+        let content = fs::read_to_string(file.path()).unwrap();
+        assert!(
+            content.contains("version: 2025.8.18 # upd: github-releases jdx/mise"),
+            "an annotation moved under `--lang actions`: {content}"
+        );
+        assert!(
+            content.contains("actions/checkout@v5"),
+            "actions write missing: {content}"
+        );
+        assert_eq!(
+            result
+                .updated
+                .iter()
+                .map(|(pkg, ..)| pkg.as_str())
+                .collect::<Vec<_>>(),
+            vec!["actions/checkout"],
+        );
+    }
+
+    /// A source's own lang reaches its annotations inside this file, without
+    /// naming either `annotated` or the file's own type.
+    #[tokio::test]
+    async fn a_sources_own_lang_reaches_its_annotation_in_a_workflow() {
+        let file = workflow_file(WORKFLOW_WITH_ANNOTATED_INPUT);
+
+        let result = update_with_annotations(
+            &GithubActionsUpdater::new(),
+            &mise_annotated_updater(),
+            file.path(),
+            &actions_registry(),
+            UpdateOptions::new(false, false).with_langs(vec![Lang::GithubReleases]),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            result
+                .updated
+                .iter()
+                .map(|(pkg, ..)| pkg.as_str())
+                .collect::<Vec<_>>(),
+            vec!["jdx/mise"],
+        );
+        // Negative control: a lang no annotation in this file names, and which
+        // is not the file's own, writes nothing at all.
+        let other = workflow_file(WORKFLOW_WITH_ANNOTATED_INPUT);
+        let none = update_with_annotations(
+            &GithubActionsUpdater::new(),
+            &mise_annotated_updater(),
+            other.path(),
+            &actions_registry(),
+            UpdateOptions::new(false, false).with_langs(vec![Lang::Python]),
+        )
+        .await
+        .unwrap();
+        assert!(none.updated.is_empty(), "updated: {:?}", none.updated);
+        assert_eq!(
+            fs::read_to_string(other.path()).unwrap(),
+            WORKFLOW_WITH_ANNOTATED_INPUT,
         );
     }
 }

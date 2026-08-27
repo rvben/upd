@@ -11,7 +11,7 @@ mod pyproject;
 mod requirements;
 mod terraform;
 
-pub use annotated::{AnnotatedUpdater, ParseWarnings, RegistrySet};
+pub use annotated::{AnnotatedUpdater, ParseWarnings, RegistrySet, selection_reaches_annotations};
 pub use cargo_toml::CargoTomlUpdater;
 pub use csproj::CsprojUpdater;
 pub use gemfile::GemfileUpdater;
@@ -933,6 +933,22 @@ impl FileType {
         }
     }
 
+    /// Whether this recognized type is also read for `upd:` annotations.
+    ///
+    /// A type answering yes here runs through [`update_with_annotations`]
+    /// instead of its own updater alone, so it holds two kinds of dependency:
+    /// the ones its own grammar describes, and annotated ones belonging to any
+    /// ecosystem. `--lang` therefore cannot be answered from
+    /// [`FileType::lang`] alone for these, and `file_type_selected` asks this
+    /// before turning a file away.
+    ///
+    /// Adding a type to the composed dispatch in `main.rs` means adding it
+    /// here; `github_actions_is_scanned_for_annotations` holds the two together
+    /// for the one type that composes today.
+    pub fn scans_annotations(&self) -> bool {
+        matches!(self, FileType::GithubActions)
+    }
+
     /// Canonical, stable identifier for this file type (used by JSON output).
     pub fn as_str(&self) -> &'static str {
         match self {
@@ -1158,6 +1174,13 @@ pub trait OwnsLines: Send + Sync {
     /// annotation pass with a warning rather than silently skipped, and a
     /// false claim therefore costs a diagnostic rather than a wrong write.
     fn owns_line(&self, line: &str) -> bool;
+
+    /// The `--lang` selector this updater answers to.
+    ///
+    /// Its file is admitted by a selection naming only annotations, so this is
+    /// what tells [`update_with_annotations`] to leave the file's own
+    /// dependencies alone on such a run.
+    fn lang(&self) -> Lang;
 }
 
 /// Run a recognized file's own updater over `path`, then the annotation pass
@@ -1186,7 +1209,15 @@ pub async fn update_with_annotations<P>(
 where
     P: Updater + OwnsLines,
 {
-    let mut result = primary.update(path, registry, options.clone()).await?;
+    // `--lang annotated`, or any single ecosystem, admits this file for the sake
+    // of its annotations alone. The primary pass is declined here rather than at
+    // the walk, because turning the file away there would take the annotations
+    // with it. An empty selection means everything, as everywhere else.
+    let mut result = if options.langs.is_empty() || options.langs.contains(&primary.lang()) {
+        primary.update(path, registry, options.clone()).await?
+    } else {
+        UpdateResult::default()
+    };
 
     // Recorded as an error rather than propagated: the primary pass may already
     // have written to the file, and returning `Err` here would drop everything
@@ -1550,6 +1581,27 @@ pub fn discover_files_with(
     kept
 }
 
+/// Apply `--lang` to a discovered file.
+///
+/// A file is opened when the selection names its own ecosystem, and also when
+/// the selection can only be answered by looking inside it. Two shapes qualify
+/// for the second: [`FileType::Annotated`] is nothing but annotations, so
+/// turning it away here would leave every annotated line unread whatever it
+/// names; and a type that [`FileType::scans_annotations`] carries annotations
+/// beside the dependencies its own grammar describes.
+///
+/// This is only the outer half of the decision. Admitting a file says nothing
+/// about which of its dependencies get written: `lang_selected` filters the
+/// annotations line by line, and [`update_with_annotations`] skips the file's
+/// own updater when the selection does not name it. A file never opened,
+/// though, reports nothing at all - which is why the gate here is the loose one.
+fn file_type_selected(file_type: FileType, langs: &[Lang]) -> bool {
+    langs.is_empty()
+        || langs.contains(&file_type.lang())
+        || file_type == FileType::Annotated
+        || (file_type.scans_annotations() && selection_reaches_annotations(langs))
+}
+
 fn walk_dependency_files(
     paths: &[PathBuf],
     langs: &[Lang],
@@ -1562,9 +1614,7 @@ fn walk_dependency_files(
     for path in paths {
         if path.is_file() {
             if let Some(file_type) = FileType::detect_with_annotated(path, true)
-                && (langs.is_empty()
-                    || langs.contains(&file_type.lang())
-                    || file_type == FileType::Annotated)
+                && file_type_selected(file_type, langs)
             {
                 result.files.push((path.clone(), file_type));
             }
@@ -1617,9 +1667,7 @@ fn walk_dependency_files(
                 glob_matches(include_set, entry_path, paths).then_some(FileType::Annotated)
             });
             if let Some(file_type) = file_type
-                && (langs.is_empty()
-                    || langs.contains(&file_type.lang())
-                    || file_type == FileType::Annotated)
+                && file_type_selected(file_type, langs)
             {
                 result.files.push((entry_path.to_path_buf(), file_type));
             } else if detected.is_none()
@@ -1644,6 +1692,74 @@ mod tests {
     /// whether an update may move it.
     fn floor_text(constraint: &str) -> Option<(&str, bool)> {
         specifier_floor(constraint, 0).map(|f| (&constraint[f.range], f.raisable))
+    }
+
+    /// The plain case, and the one every other rule is an exception to: a
+    /// selection admits the files of the ecosystems it names, and no others.
+    #[test]
+    fn a_selection_admits_the_file_types_it_names() {
+        assert!(file_type_selected(FileType::CargoToml, &[Lang::Rust]));
+        assert!(!file_type_selected(FileType::CargoToml, &[Lang::Python]));
+        // Empty means everything.
+        assert!(file_type_selected(FileType::CargoToml, &[]));
+        assert!(file_type_selected(FileType::GithubActions, &[]));
+    }
+
+    /// An annotated file declares its ecosystems line by line, so the file name
+    /// answers nothing and only reading it can. It is admitted whatever the
+    /// selection, and `lang_selected` then decides each line.
+    #[test]
+    fn an_annotated_file_is_admitted_by_every_selection() {
+        for langs in [
+            vec![Lang::Python],
+            vec![Lang::Actions],
+            vec![Lang::Terraform],
+            vec![Lang::Annotated],
+        ] {
+            assert!(
+                file_type_selected(FileType::Annotated, &langs),
+                "turned away by {langs:?}"
+            );
+        }
+    }
+
+    /// The defect this predicate exists for: a workflow carries annotations
+    /// beside its own dependencies, so a selection naming only annotations has
+    /// to open it. Before this, `upd -l annotated` on a tree of workflows found
+    /// no dependency files at all and said so with exit 0.
+    #[test]
+    fn a_workflow_is_admitted_by_a_selection_that_only_reaches_annotations() {
+        assert!(file_type_selected(
+            FileType::GithubActions,
+            &[Lang::Annotated]
+        ));
+        // A source's own lang, which is what an annotation names in practice.
+        assert!(file_type_selected(
+            FileType::GithubActions,
+            &[Lang::GithubReleases]
+        ));
+        assert!(file_type_selected(FileType::GithubActions, &[Lang::Python]));
+        // The file's own lang still admits it, on its own account.
+        assert!(file_type_selected(
+            FileType::GithubActions,
+            &[Lang::Actions]
+        ));
+
+        // Negative control: a lang no annotation can name and that is not this
+        // file's own. Without one of these the assertions above would hold for
+        // a predicate that simply returned true.
+        assert!(!file_type_selected(
+            FileType::GithubActions,
+            &[Lang::Terraform]
+        ));
+        assert!(!file_type_selected(
+            FileType::GithubActions,
+            &[Lang::PreCommit]
+        ));
+
+        // And a type that composes no annotation pass is unaffected: reaching
+        // annotations is not a reason to open a `Cargo.toml`.
+        assert!(!file_type_selected(FileType::CargoToml, &[Lang::Annotated]));
     }
 
     #[test]
@@ -2487,13 +2603,28 @@ mod tests {
         fs::write(workflows_dir.join("ci.yml"), "name: CI").unwrap();
         fs::write(temp.path().join("package.json"), "{}").unwrap();
 
-        let files = discover_files(&[temp.path().to_path_buf()], &[Lang::Node]);
-        assert_eq!(files.len(), 1);
-        assert_eq!(files[0].1, FileType::PackageJson);
-
         let files = discover_files(&[temp.path().to_path_buf()], &[Lang::Actions]);
         assert_eq!(files.len(), 1);
         assert_eq!(files[0].1, FileType::GithubActions);
+
+        // A lang reaching neither the workflow's own dependencies nor anything
+        // an annotation could name leaves it out.
+        let files = discover_files(&[temp.path().to_path_buf()], &[Lang::PreCommit]);
+        assert!(files.is_empty(), "{files:?}");
+
+        // `node` is a lang an annotation can name, so the workflow is opened
+        // for the annotations it may carry, as `package.json` is for its own
+        // dependencies. Which lines are then written is decided per line, and
+        // the `uses:` refs are not among them.
+        let mut files = discover_files(&[temp.path().to_path_buf()], &[Lang::Node]);
+        files.sort_by_key(|(_, file_type)| file_type.as_str());
+        assert_eq!(
+            files
+                .iter()
+                .map(|(_, file_type)| *file_type)
+                .collect::<Vec<_>>(),
+            vec![FileType::GithubActions, FileType::PackageJson],
+        );
     }
 
     #[test]

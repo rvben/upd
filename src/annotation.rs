@@ -30,6 +30,23 @@ pub enum AnnotationSource {
 }
 
 impl AnnotationSource {
+    /// Every source an annotation may name.
+    ///
+    /// Callers that ask a question about annotations in general (which
+    /// `--lang` selections can reach one, which registries a run needs) walk
+    /// this rather than restating the list, so a new source reaches them by
+    /// being added here. `from_token` is the parser's own list and
+    /// `every_source_round_trips_through_its_token` holds the two together.
+    pub const ALL: [Self; 7] = [
+        Self::PyPi,
+        Self::Npm,
+        Self::Crates,
+        Self::Go,
+        Self::RubyGems,
+        Self::NuGet,
+        Self::GitHubReleases,
+    ];
+
     /// The canonical `<source>` token, as it should be written in an annotation.
     pub fn token(self) -> &'static str {
         match self {
@@ -353,6 +370,42 @@ pub fn is_prerelease_token(token: &str, lang: Lang) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `ALL` is what every question about annotations in general is answered
+    /// from, so a source missing from it is a silent under-answer rather than a
+    /// compile error. `from_token` is the parser's own list: a source it accepts
+    /// must appear in `ALL`, and every member must round-trip.
+    #[test]
+    fn every_source_round_trips_through_its_token() {
+        for source in AnnotationSource::ALL {
+            assert_eq!(
+                AnnotationSource::from_token(source.token()),
+                Some(source),
+                "{} does not round-trip through its own token",
+                source.token()
+            );
+        }
+
+        // The other direction: nothing the parser accepts is absent from `ALL`.
+        // Written as a token list rather than derived, so adding a source to the
+        // parser without adding it here fails instead of agreeing with itself.
+        for token in [
+            "pypi",
+            "npm",
+            "crates",
+            "go",
+            "rubygems",
+            "nuget",
+            "github-releases",
+        ] {
+            let source = AnnotationSource::from_token(token)
+                .unwrap_or_else(|| panic!("the parser no longer accepts {token:?}"));
+            assert!(
+                AnnotationSource::ALL.contains(&source),
+                "{token:?} parses but is missing from AnnotationSource::ALL"
+            );
+        }
+    }
 
     fn found(line: &str) -> Annotation {
         match parse_line(line) {

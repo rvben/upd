@@ -36,6 +36,32 @@ jobs:
           version: 2025.8.18 # upd: github-releases jdx/mise
 ";
 
+/// The same workflow with plain version refs in place of SHA pins, paired with
+/// [`PINS`]. A `[pin]` resolves a `uses:` ref without a lookup, so whether the
+/// actions pass ran is legible in the file itself rather than resting on the
+/// network being unreachable.
+const WORKFLOW_WITH_VERSION_REFS: &str = "\
+name: CI
+on: push
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: jdx/mise-action@v2
+        with:
+          version: 2025.8.18 # upd: github-releases jdx/mise
+";
+
+/// A pin for every name in [`WORKFLOW_WITH_VERSION_REFS`], so each pass has
+/// something it would visibly write if it ran, and no run needs the network.
+const PINS: &str = "\
+[pin]
+\"jdx/mise\" = \"2026.8.14\"
+\"actions/checkout\" = \"v9.9.9\"
+\"jdx/mise-action\" = \"v9.9.9\"
+";
+
 /// Write `body` to `.github/workflows/ci.yml`, with `updrc` as `.updrc.toml`
 /// beside it.
 fn fixture(body: &str, updrc: &str) -> TempDir {
@@ -50,6 +76,13 @@ fn fixture(body: &str, updrc: &str) -> TempDir {
 /// Run the binary over the fixture workflow, isolated from the host so no
 /// user-level config or credential can change the outcome.
 fn run(dir: &TempDir, args: &[&str]) -> std::process::Output {
+    run_at(dir, ".github/workflows/ci.yml", args)
+}
+
+/// The same, over an explicit `target`. A directory goes through the walk and a
+/// file through the explicit-file branch, and `--lang` is applied separately in
+/// each, so a discovery test has to say which it means.
+fn run_at(dir: &TempDir, target: &str, args: &[&str]) -> std::process::Output {
     let home = dir.path().join("home");
     let xdg_config = dir.path().join("xdg-config");
     std::fs::create_dir_all(&home).expect("fixture HOME created");
@@ -57,7 +90,7 @@ fn run(dir: &TempDir, args: &[&str]) -> std::process::Output {
 
     Command::new(env!("CARGO_BIN_EXE_upd"))
         .env_clear()
-        .arg(".github/workflows/ci.yml")
+        .arg(target)
         .args(args)
         .env("HOME", home)
         .env("XDG_CONFIG_HOME", xdg_config)
@@ -214,4 +247,172 @@ jobs:
     // The positive control: the actions pass still examined the ref, so
     // "no warnings" is not two passes that both did nothing.
     assert_eq!(report["summary"]["not_examined"], 1, "{report:#}");
+}
+
+/// `--lang` is answered in two places, and only the inner one used to know
+/// about annotations. A workflow was admitted for `actions` and nothing else,
+/// so `upd -l annotated` over a tree of workflows reported "No dependency files
+/// found." and exited 0 - the shape of answer that reads as "nothing to do".
+///
+/// Discovery is the half these cover, which the in-process tests cannot reach.
+#[test]
+fn a_directory_walk_finds_a_workflow_for_a_selection_of_annotations_alone() {
+    let dir = fixture(WORKFLOW_WITH_VERSION_REFS, PINS);
+
+    let output = run_at(
+        &dir,
+        ".",
+        &[
+            "--apply",
+            "--no-cache",
+            "-l",
+            "annotated",
+            "--output",
+            "json",
+        ],
+    );
+    let report = json_of(&output);
+    assert!(
+        output.status.success(),
+        "{}\n{report:#}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    assert!(
+        workflow_text(&dir).contains("version: 2026.8.14 # upd: github-releases jdx/mise"),
+        "`-l annotated` did not reach the annotation:\n{}",
+        workflow_text(&dir)
+    );
+    assert_eq!(
+        report["files"][0]["file_type"], "github_actions",
+        "{report:#}"
+    );
+    // The file's own dependencies are not what was asked for. Both refs are
+    // pinned in the config, so had the actions pass run they would read `v9`
+    // here: this is an assertion about the run, not about the network.
+    assert!(
+        workflow_text(&dir).contains("actions/checkout@v4"),
+        "a `uses:` ref moved under `-l annotated`:\n{}",
+        workflow_text(&dir)
+    );
+    assert!(
+        workflow_text(&dir).contains("jdx/mise-action@v2"),
+        "a `uses:` ref moved under `-l annotated`:\n{}",
+        workflow_text(&dir)
+    );
+    assert_eq!(report["summary"]["errors"], 0, "{report:#}");
+}
+
+/// The same through the explicit-file branch, which applies `--lang` separately
+/// from the walk, and with a source's own lang rather than `annotated`. This is
+/// the spelling a user reaches for first: the annotation says
+/// `github-releases`, so that is what they select.
+#[test]
+fn an_explicit_workflow_is_reached_by_the_annotations_own_source_lang() {
+    let dir = fixture(WORKFLOW_WITH_VERSION_REFS, PINS);
+
+    let output = run(
+        &dir,
+        &[
+            "--apply",
+            "--no-cache",
+            "-l",
+            "github-releases",
+            "--output",
+            "json",
+        ],
+    );
+    let report = json_of(&output);
+    assert!(
+        output.status.success(),
+        "{}\n{report:#}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    assert!(
+        workflow_text(&dir).contains("version: 2026.8.14 # upd: github-releases jdx/mise"),
+        "`-l github-releases` did not reach the annotation:\n{}",
+        workflow_text(&dir)
+    );
+    // Pinned in the config, so this stays `v2` only because the actions pass
+    // did not run.
+    assert!(
+        workflow_text(&dir).contains("jdx/mise-action@v2"),
+        "a `uses:` ref moved under `-l github-releases`:\n{}",
+        workflow_text(&dir)
+    );
+}
+
+/// The negative control for both tests above. A selection naming neither the
+/// file's own ecosystem nor anything an annotation can carry still turns the
+/// workflow away - otherwise "admitted for its annotations" would just be
+/// "admitted", and `--lang` would have stopped meaning anything here.
+#[test]
+fn a_selection_reaching_neither_the_workflow_nor_its_annotations_finds_nothing() {
+    let dir = fixture(WORKFLOW, "[pin]\n\"jdx/mise\" = \"2026.8.14\"\n");
+    let before = workflow_text(&dir);
+
+    let output = run_at(
+        &dir,
+        ".",
+        &[
+            "--apply",
+            "--no-cache",
+            "-l",
+            "terraform",
+            "--output",
+            "json",
+        ],
+    );
+    let report = json_of(&output);
+    assert!(
+        output.status.success(),
+        "{}\n{report:#}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    assert!(
+        report["files"].as_array().is_none_or(Vec::is_empty),
+        "{report:#}"
+    );
+    assert_eq!(workflow_text(&dir), before);
+}
+
+/// `-l actions` keeps meaning what it always did: the file's own dependencies
+/// and not the annotations beside them. Without this, widening the file gate
+/// would have quietly widened what `-l actions` writes.
+#[test]
+fn the_files_own_lang_still_leaves_the_annotation_alone() {
+    let dir = fixture(WORKFLOW, "[pin]\n\"jdx/mise\" = \"2026.8.14\"\n");
+
+    let output = run(
+        &dir,
+        &[
+            "--apply",
+            "--no-cache",
+            "--no-update-action-shas",
+            "-l",
+            "actions",
+            "--output",
+            "json",
+        ],
+    );
+    let report = json_of(&output);
+    assert!(
+        output.status.success(),
+        "{}\n{report:#}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    assert!(
+        workflow_text(&dir).contains("version: 2025.8.18 # upd: github-releases jdx/mise"),
+        "the annotation was resolved under `-l actions`:\n{}",
+        workflow_text(&dir)
+    );
+    // The positive control: the actions pass really did run over this file, so
+    // the untouched annotation is not a run that examined nothing.
+    let skipped = report["files"][0]["skipped"]
+        .as_array()
+        .expect("skipped[] is an array");
+    assert_eq!(skipped.len(), 2, "{report:#}");
 }
