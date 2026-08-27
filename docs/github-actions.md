@@ -252,6 +252,34 @@ Configuration pins and package filters use an action's `owner/repo` name. For
 example, `packages: actions/checkout` selects checkout references, subdirectory
 actions, and reusable workflows from that repository.
 
+## Annotated versions in a workflow
+
+Not every version in a workflow is a `uses:` ref. A tool version passed to an
+action through a `with:` input is a real pin, and nothing in the Actions grammar
+can see it: the input is an opaque string to `upd`, and the action's own repo
+says nothing about which release of the tool it will install. Left alone, such a
+version floats or goes stale silently.
+
+An [`upd:` annotation](ecosystems.md#annotated-files) declares its source, and a
+workflow is the one recognized file type that is scanned for annotations as well
+as by its own updater:
+
+```yaml
+- uses: jdx/mise-action@v4
+  with:
+    version: 2026.8.14 # upd: github-releases jdx/mise
+```
+
+Both passes run over the file in one invocation and their findings are merged
+into one report, each entry naming the package it belongs to. A `uses:` line
+belongs to the Actions updater, so an annotation written there is refused with a
+warning rather than acted on: the ref already resolves against the action's own
+repository, and a second source for one value is a mistake worth naming. Every
+other line is free.
+
+Annotated entries are updates like any other. They obey `ignore`, `pin`,
+cooldown, and `max-bump`, and they keep the line's own precision.
+
 ## Safety and lifecycle
 
 The reusable workflow:

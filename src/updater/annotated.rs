@@ -3,8 +3,8 @@
 //! the grammar and the text surgery live in `crate::annotation`.
 
 use super::{
-    CooldownOutcome, FileType, ParsedDependency, PendingVersion, UpdateOptions, UpdateResult,
-    Updater, apply_cooldown, downgrade_warning, read_file_safe, write_file_atomic,
+    CooldownOutcome, FileType, OwnsLines, ParsedDependency, PendingVersion, UpdateOptions,
+    UpdateResult, Updater, apply_cooldown, downgrade_warning, read_file_safe, write_file_atomic,
 };
 use crate::align::compare_versions;
 use crate::annotation::{
@@ -91,6 +91,19 @@ impl RegistrySet {
         }
     }
 
+    /// One source, backed by whatever registry the caller supplies.
+    ///
+    /// `entries` is private to this module, so tests in other modules cannot
+    /// build the struct literally. Test-only on purpose: a partially filled set
+    /// in production is the silent misconfiguration `resolving` exists to make
+    /// impossible.
+    #[cfg(test)]
+    pub(crate) fn with_single(source: AnnotationSource, registry: Arc<dyn Registry>) -> Self {
+        Self {
+            entries: HashMap::from([(source, registry)]),
+        }
+    }
+
     /// Fallible in both constructions, so there is one signature rather than
     /// two. On a parse-only set every lookup is `Err`; on a resolving set every
     /// v1 source is `Ok`. Never a silent `None`: an `Option` here would make a
@@ -159,13 +172,32 @@ fn choose_write_value(current: &str, resolved: &str, full_precision: bool) -> St
 
 /// Read every annotated line in `content`. Refusals are collected rather than
 /// returned as an error: one bad line must not blind upd to the rest of a file.
-fn scan_annotated(content: &str) -> AnnotatedScan {
+///
+/// `owner` is present only when this file also has an updater of its own, and
+/// reports the lines that updater rewrites. See [`OwnsLines`].
+fn scan_annotated(content: &str, owner: Option<&dyn OwnsLines>) -> AnnotatedScan {
     let mut lines: Vec<AnnotatedLine> = Vec::new();
     let mut refusals: Vec<String> = Vec::new();
     let mut unsupported_sources: HashSet<String> = HashSet::new();
 
     for (line_idx, raw) in content.lines().enumerate() {
-        let annotation = match parse_line(raw) {
+        let outcome = parse_line(raw);
+
+        // Checked before the outcome is read, so a marker on an owned line is
+        // reported as the collision it is rather than as whatever else might
+        // be wrong with it. Refused rather than skipped: an annotation that
+        // does nothing and says nothing is the exact failure this pass exists
+        // to remove.
+        if !matches!(outcome, ParseOutcome::None) && owner.is_some_and(|owner| owner.owns_line(raw))
+        {
+            refusals.push(format!(
+                "line {}: annotation ignored, this line's version is already resolved by the file's own updater",
+                line_idx + 1
+            ));
+            continue;
+        }
+
+        let annotation = match outcome {
             ParseOutcome::None => continue,
             ParseOutcome::Malformed(reason) => {
                 if let Some(source) = reason
@@ -271,6 +303,21 @@ impl AnnotatedUpdater {
             warnings,
         }
     }
+
+    /// The annotation pass over a file that already has an updater of its own.
+    ///
+    /// `owner` reports which lines belong to that updater; annotations on them
+    /// are refused rather than acted on, so the two passes never write the same
+    /// line in one run. Composed by [`super::update_with_annotations`], which
+    /// is the only intended caller.
+    pub async fn update_alongside(
+        &self,
+        path: &Path,
+        options: UpdateOptions,
+        owner: &dyn OwnsLines,
+    ) -> Result<UpdateResult> {
+        self.run(path, options, Some(owner)).await
+    }
 }
 
 #[async_trait::async_trait]
@@ -281,7 +328,7 @@ impl Updater for AnnotatedUpdater {
 
     fn parse_dependencies(&self, path: &Path) -> Result<Vec<ParsedDependency>> {
         let content = read_file_safe(path)?;
-        let scan = scan_annotated(&content);
+        let scan = scan_annotated(&content, None);
         if self.warnings == ParseWarnings::Print {
             for refusal in &scan.refusals {
                 eprintln!("{}: Warning: {}", path.display(), refusal);
@@ -308,9 +355,24 @@ impl Updater for AnnotatedUpdater {
         _registry: &dyn Registry,
         options: UpdateOptions,
     ) -> Result<UpdateResult> {
+        self.run(path, options, None).await
+    }
+}
+
+impl AnnotatedUpdater {
+    /// The body shared by both entry points.
+    ///
+    /// `owner` is `None` when this updater is the file's only one, and `Some`
+    /// when the annotation pass is running beside a file type's own parser.
+    async fn run(
+        &self,
+        path: &Path,
+        options: UpdateOptions,
+        owner: Option<&dyn OwnsLines>,
+    ) -> Result<UpdateResult> {
         let content = read_file_safe(path)?;
         let mut result = UpdateResult::default();
-        let scan = scan_annotated(&content);
+        let scan = scan_annotated(&content, owner);
 
         // Parse-time refusals are recorded unconditionally, ahead of every gate.
         // `--package other` must not hide a malformed annotation.
@@ -744,6 +806,7 @@ mod tests {
     fn scans_one_annotated_line_and_ignores_everything_else() {
         let scan = scan_annotated(
             "# a comment\nBAO_VERSION ?= 2.6.1  # upd: pypi openbao-cli\nPLAIN = 1.0.0\n",
+            None,
         );
         assert!(scan.refusals.is_empty(), "{:?}", scan.refusals);
         assert_eq!(scan.lines.len(), 1);
@@ -755,7 +818,7 @@ mod tests {
 
     #[test]
     fn a_line_with_no_version_is_refused_by_line_number() {
-        let scan = scan_annotated("TOOL ?= latest  # upd: pypi ruff\n");
+        let scan = scan_annotated("TOOL ?= latest  # upd: pypi ruff\n", None);
         assert!(scan.lines.is_empty());
         assert_eq!(
             scan.refusals,
@@ -767,7 +830,7 @@ mod tests {
     fn a_line_with_two_distinct_versions_is_refused_with_both_values() {
         // `:` is not a version-field byte, so the code portion splits into
         // fields that yield two different version values.
-        let scan = scan_annotated("IMG ?= app:1.2.3 helper:2.0.0  # upd: pypi x\n");
+        let scan = scan_annotated("IMG ?= app:1.2.3 helper:2.0.0  # upd: pypi x\n", None);
         assert!(scan.lines.is_empty());
         assert_eq!(
             scan.refusals,
@@ -781,7 +844,10 @@ mod tests {
         // `app-1.2.3` is not a candidate; delimit each occurrence with `/`
         // instead, as in `FOO := 1.2.3` plus
         // `FOO_URL := .../1.2.3/...`.
-        let scan = scan_annotated("VERSION := 1.2.3 URL := .../1.2.3/tarball  # upd: pypi app\n");
+        let scan = scan_annotated(
+            "VERSION := 1.2.3 URL := .../1.2.3/tarball  # upd: pypi app\n",
+            None,
+        );
         assert!(scan.refusals.is_empty(), "{:?}", scan.refusals);
         assert_eq!(scan.lines.len(), 1);
         assert_eq!(scan.lines[0].spans.len(), 2);
@@ -792,6 +858,7 @@ mod tests {
     fn conflicting_sources_drop_both_lines_with_one_warning() {
         let scan = scan_annotated(
             "A ?= 1.0.0  # upd: pypi widget\nB ?= 2.0.0  # upd: npm widget\nC ?= 3.0.0  # upd: pypi other\n",
+            None,
         );
         assert_eq!(
             scan.refusals,
@@ -805,6 +872,7 @@ mod tests {
     fn unsupported_sources_are_deduplicated_after_normalization() {
         let scan = scan_annotated(
             "A ?= 1.0.0  # upd: Cargo first\nB ?= 2.0.0  # upd: cargo second\nC ?= 3.0.0  # upd: Helm third\n",
+            None,
         );
 
         assert!(scan.lines.is_empty());
@@ -819,8 +887,10 @@ mod tests {
 
     #[test]
     fn two_lines_under_one_source_are_not_a_conflict() {
-        let scan =
-            scan_annotated("A ?= 1.0.0  # upd: pypi widget\nB ?= 1.0.0  # upd: pypi widget\n");
+        let scan = scan_annotated(
+            "A ?= 1.0.0  # upd: pypi widget\nB ?= 1.0.0  # upd: pypi widget\n",
+            None,
+        );
         assert!(scan.refusals.is_empty(), "{:?}", scan.refusals);
         assert_eq!(scan.lines.len(), 2);
     }

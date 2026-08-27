@@ -1,5 +1,5 @@
 use super::{
-    FileType, ParsedDependency, SkipStatus, UpdateOptions, UpdateResult, Updater,
+    FileType, OwnsLines, ParsedDependency, SkipStatus, UpdateOptions, UpdateResult, Updater,
     downgrade_warning, read_file_safe, write_file_atomic,
 };
 use crate::align::compare_versions;
@@ -465,6 +465,19 @@ impl GithubActionsUpdater {
         }
 
         deps
+    }
+}
+
+impl OwnsLines for GithubActionsUpdater {
+    /// A `uses:` reference is this updater's own. Its version is part of the
+    /// ref and resolves against the action's repository, so an annotation on
+    /// that line would name a second source for one value.
+    ///
+    /// Every other line is free for an annotation, which is the point: a
+    /// version passed to an action through a `with:` input is a real pin that
+    /// nothing in this updater's grammar can see.
+    fn owns_line(&self, line: &str) -> bool {
+        self.uses_re.is_match(line)
     }
 }
 
@@ -3496,6 +3509,255 @@ mod sha_pin_annotation_tests {
         assert!(
             content.contains(&format!("actions/checkout@{BARE_SHA}\n")),
             "content: {content}"
+        );
+    }
+}
+
+/// A workflow can pin a version this updater's grammar has no concept of: a
+/// tool version passed to an action through a `with:` input. These cover the
+/// annotation pass running beside this one over the same file, and the
+/// boundary between them.
+#[cfg(test)]
+mod annotated_composition_tests {
+    use super::*;
+    use crate::annotation::AnnotationSource;
+    use crate::registry::MockRegistry;
+    use crate::updater::{AnnotatedUpdater, RegistrySet, update_with_annotations};
+    use std::fs;
+    use std::io::Write;
+    use std::sync::Arc;
+    use tempfile::NamedTempFile;
+
+    /// A workflow pinning a tool version through a `with:` input. The `uses:`
+    /// refs belong to the actions updater; `version:` belongs to nothing until
+    /// the annotation declares a source for it.
+    const WORKFLOW_WITH_ANNOTATED_INPUT: &str = "\
+name: CI
+on: push
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: jdx/mise-action@v4
+        with:
+          version: 2025.8.18 # upd: github-releases jdx/mise
+          install: false
+";
+
+    fn actions_registry() -> MockRegistry {
+        MockRegistry::new("github-releases")
+            .with_version("actions/checkout", "v5.0.0")
+            // Resolves to the major already written, so this ref stays put and
+            // any change to the `version:` line below is unambiguously the
+            // annotation pass's doing.
+            .with_version("jdx/mise-action", "v4.0.0")
+    }
+
+    fn mise_annotated_updater() -> AnnotatedUpdater {
+        AnnotatedUpdater::new(RegistrySet::with_single(
+            AnnotationSource::GitHubReleases,
+            Arc::new(MockRegistry::new("github-releases").with_version("jdx/mise", "2026.8.14")),
+        ))
+    }
+
+    fn workflow_file(content: &str) -> NamedTempFile {
+        let mut file = NamedTempFile::new().unwrap();
+        write!(file, "{content}").unwrap();
+        file.flush().unwrap();
+        file
+    }
+
+    #[test]
+    fn owns_line_claims_uses_refs_and_nothing_else() {
+        let updater = GithubActionsUpdater::new();
+        assert!(updater.owns_line("      - uses: actions/checkout@v4"));
+        assert!(updater.owns_line(r#"      - uses: "actions/checkout@v4""#));
+        assert!(!updater.owns_line("          version: 2025.8.18 # upd: github-releases jdx/mise"));
+        assert!(!updater.owns_line("          install: false"));
+    }
+
+    /// The headline: a version the actions grammar cannot see is updated from
+    /// its annotation, in the same run that updates the `uses:` refs around it.
+    #[tokio::test]
+    async fn an_annotated_with_input_is_updated_beside_the_uses_refs() {
+        let file = workflow_file(WORKFLOW_WITH_ANNOTATED_INPUT);
+
+        let result = update_with_annotations(
+            &GithubActionsUpdater::new(),
+            &mise_annotated_updater(),
+            file.path(),
+            &actions_registry(),
+            UpdateOptions::new(false, false),
+        )
+        .await
+        .unwrap();
+
+        let content = fs::read_to_string(file.path()).unwrap();
+        assert!(
+            content.contains("version: 2026.8.14 # upd: github-releases jdx/mise"),
+            "annotated input not rewritten: {content}"
+        );
+        // The actions pass's own write survives the second pass re-reading and
+        // rewriting the file.
+        assert!(
+            content.contains("actions/checkout@v5"),
+            "actions write lost: {content}"
+        );
+        assert!(result.errors.is_empty(), "errors: {:?}", result.errors);
+        assert!(
+            result.warnings.is_empty(),
+            "warnings: {:?}",
+            result.warnings
+        );
+
+        assert!(
+            result.updated.contains(&(
+                "jdx/mise".to_string(),
+                "2025.8.18".to_string(),
+                "2026.8.14".to_string(),
+                Some(10),
+            )),
+            "annotated update missing from the merged report: {:?}",
+            result.updated
+        );
+        assert!(
+            result
+                .updated
+                .iter()
+                .any(|(pkg, ..)| pkg == "actions/checkout"),
+            "actions update missing from the merged report: {:?}",
+            result.updated
+        );
+    }
+
+    /// Both passes can read a `uses:` line, so exactly one of them may write it.
+    /// The annotation loses, and says so: a silently ignored annotation is the
+    /// failure this whole path exists to remove.
+    #[tokio::test]
+    async fn an_annotation_on_a_uses_line_is_refused_rather_than_applied_twice() {
+        let file = workflow_file(
+            "\
+name: CI
+on: push
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4 # upd: github-releases jdx/mise
+",
+        );
+
+        let result = update_with_annotations(
+            &GithubActionsUpdater::new(),
+            &mise_annotated_updater(),
+            file.path(),
+            &actions_registry(),
+            UpdateOptions::new(false, false),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            result.warnings,
+            vec![
+                "line 7: annotation ignored, this line's version is already resolved by the file's own updater"
+                    .to_string()
+            ]
+        );
+        // One write, by the actions pass. The annotation named a different
+        // package, so a second write would have been visible as `2026.8.14`.
+        assert_eq!(
+            result.updated,
+            vec![(
+                "actions/checkout".to_string(),
+                "v4".to_string(),
+                "v5".to_string(),
+                Some(7),
+            )]
+        );
+        let content = fs::read_to_string(file.path()).unwrap();
+        assert!(
+            content.contains("actions/checkout@v5 # upd: github-releases jdx/mise"),
+            "content: {content}"
+        );
+    }
+
+    /// The regression guard. Composing the two passes must be inert for every
+    /// workflow that carries no annotation, which is nearly all of them.
+    #[tokio::test]
+    async fn a_workflow_without_annotations_is_byte_identical_either_way() {
+        const PLAIN: &str = "\
+name: CI
+on: push
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: jdx/mise-action@v4
+        with:
+          version: 2025.8.18
+";
+        let alone = workflow_file(PLAIN);
+        let composed = workflow_file(PLAIN);
+
+        let alone_result = GithubActionsUpdater::new()
+            .update(
+                alone.path(),
+                &actions_registry(),
+                UpdateOptions::new(false, false),
+            )
+            .await
+            .unwrap();
+
+        let composed_result = update_with_annotations(
+            &GithubActionsUpdater::new(),
+            &mise_annotated_updater(),
+            composed.path(),
+            &actions_registry(),
+            UpdateOptions::new(false, false),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            fs::read_to_string(alone.path()).unwrap(),
+            fs::read_to_string(composed.path()).unwrap(),
+        );
+        assert_eq!(alone_result.updated, composed_result.updated);
+        assert_eq!(alone_result.unchanged, composed_result.unchanged);
+        assert!(composed_result.warnings.is_empty());
+        // Positive control: this fixture is one the actions pass really does
+        // rewrite, so "identical" is not two untouched files.
+        assert_eq!(alone_result.updated.len(), 1);
+    }
+
+    /// A dry run reports the annotated update without writing it, the same as
+    /// it does for a `uses:` ref.
+    #[tokio::test]
+    async fn a_dry_run_reports_the_annotated_update_without_writing() {
+        let file = workflow_file(WORKFLOW_WITH_ANNOTATED_INPUT);
+
+        let result = update_with_annotations(
+            &GithubActionsUpdater::new(),
+            &mise_annotated_updater(),
+            file.path(),
+            &actions_registry(),
+            UpdateOptions::new(true, false),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            fs::read_to_string(file.path()).unwrap(),
+            WORKFLOW_WITH_ANNOTATED_INPUT,
+            "a dry run wrote to the file"
+        );
+        assert!(
+            result.updated.iter().any(|(pkg, ..)| pkg == "jdx/mise"),
+            "annotated update not reported: {:?}",
+            result.updated
         );
     }
 }

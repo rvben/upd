@@ -225,6 +225,11 @@ An include never changes a recognized manifest's parser: for example, a
 matching `main.tf` remains Terraform. Use `--verbose` to diagnose an `upd:`
 marker in an otherwise undiscovered UTF-8 text file up to 1 MiB.
 
+A GitHub Actions workflow is the exception: it keeps its Actions updater and is
+scanned for annotations as well, so a tool version passed to an action through a
+`with:` input can be updated beside the `uses:` refs around it. See
+[GitHub Actions](docs/github-actions.md#annotated-versions-in-a-workflow).
+
 ## Version Precision
 
 By default, `upd` preserves version precision from the original file:

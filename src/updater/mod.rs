@@ -1143,6 +1143,62 @@ pub trait Updater: Send + Sync {
     fn parse_dependencies(&self, path: &Path) -> Result<Vec<ParsedDependency>>;
 }
 
+/// A recognized file's updater declaring which of its lines it rewrites itself.
+///
+/// Implementing this is what makes a file type eligible for
+/// [`update_with_annotations`]. Both updaters then run over the same file in
+/// one invocation, and this predicate is the boundary between them: a line the
+/// file's own parser understands is never also rewritten from an `upd:`
+/// annotation, so no line is written twice in a single run.
+pub trait OwnsLines: Send + Sync {
+    /// Whether this line carries a version this updater resolves itself.
+    ///
+    /// Answered from the line alone, without the surrounding file structure,
+    /// so it is deliberately conservative. A line it claims is refused by the
+    /// annotation pass with a warning rather than silently skipped, and a
+    /// false claim therefore costs a diagnostic rather than a wrong write.
+    fn owns_line(&self, line: &str) -> bool;
+}
+
+/// Run a recognized file's own updater over `path`, then the annotation pass
+/// over the same file, and merge the two reports into one.
+///
+/// A file `upd` recognizes never reaches the annotated updater on its own.
+/// `FileType::detect_with_annotated` gives a real detected type precedence, so
+/// `FileType::Annotated` names only a file no other updater claimed - the rule
+/// that keeps `main.tf` Terraform. Correct as far as it goes, but it also means
+/// a version pinned in a recognized file that the file's own parser has no
+/// concept of, such as a tool version passed to an action through a `with:`
+/// input, is invisible to `upd` with no way to opt in. Composing the two passes
+/// is that opt-in, and `OwnsLines` keeps them from colliding.
+///
+/// Order matters. The primary updater runs first and, outside a dry run, has
+/// already written its changes by the time the annotation pass re-reads the
+/// file, so the second pass sees the first pass's output rather than a stale
+/// buffer.
+pub async fn update_with_annotations<P>(
+    primary: &P,
+    annotated: &AnnotatedUpdater,
+    path: &Path,
+    registry: &dyn Registry,
+    options: UpdateOptions,
+) -> Result<UpdateResult>
+where
+    P: Updater + OwnsLines,
+{
+    let mut result = primary.update(path, registry, options.clone()).await?;
+
+    // Recorded as an error rather than propagated: the primary pass may already
+    // have written to the file, and returning `Err` here would drop everything
+    // it reported along with the record of that write.
+    match annotated.update_alongside(path, options, primary).await {
+        Ok(annotated_result) => result.merge(annotated_result),
+        Err(e) => result.errors.push(e.to_string()),
+    }
+
+    Ok(result)
+}
+
 /// Outcome of applying the cooldown layer to a resolved `(current -> latest)`
 /// transition. See `apply_cooldown`.
 pub enum CooldownOutcome {

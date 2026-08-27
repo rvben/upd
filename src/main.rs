@@ -40,7 +40,7 @@ use upd::updater::{
     GoModUpdater, Lang, MiseUpdater, PackageJsonUpdater, ParseWarnings, PreCommitUpdater,
     PyProjectUpdater, RegistrySet, RequirementsUpdater, SkipStatus, TerraformUpdater,
     UpdateOptions, UpdateResult, Updater, classify_bump, discover_files_with, ecosystem_key,
-    read_file_safe, write_file_atomic,
+    read_file_safe, update_with_annotations, write_file_atomic,
 };
 use upd::version::{compare_versions, match_version_precision};
 
@@ -1461,9 +1461,14 @@ async fn run_update(cli: &Cli) -> Result<()> {
                             .await
                     }
                     FileType::GithubActions => {
-                        github_actions_updater
-                            .update(&path, github_releases.as_ref(), update_options.clone())
-                            .await
+                        update_with_annotations(
+                            github_actions_updater.as_ref(),
+                            annotated_updater.as_ref(),
+                            &path,
+                            github_releases.as_ref(),
+                            update_options.clone(),
+                        )
+                        .await
                     }
                     FileType::PreCommitConfig => {
                         pre_commit_updater
@@ -2606,9 +2611,14 @@ async fn run_interactive_update(
                     .await
             }
             FileType::GithubActions => {
-                github_actions_updater
-                    .update(path, github_releases.as_ref(), dry_run_options.clone())
-                    .await
+                update_with_annotations(
+                    github_actions_updater.as_ref(),
+                    annotated_updater.as_ref(),
+                    path,
+                    github_releases.as_ref(),
+                    dry_run_options.clone(),
+                )
+                .await
             }
             FileType::PreCommitConfig => {
                 pre_commit_updater

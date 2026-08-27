@@ -105,6 +105,10 @@ NODE_VERSION := 22.11.0  # upd: npm node
   `include = ["ansible/roles/*/vars/*.yml", "docker-compose.yml"]`
 - `include` does not reinterpret a recognized file type (`main.tf` remains
   Terraform), and `exclude` takes precedence when both match
+- A GitHub Actions workflow is the exception: it keeps its own updater and is
+  scanned for annotations as well, so a tool version passed to an action through
+  a `with:` input can be updated. See
+  [GitHub Actions](github-actions.md#annotated-versions-in-a-workflow)
 - The version on the line is found and rewritten in place, keeping a leading
   `v` and the line's own precision (`v2.60` becomes `v2.65`, not `v2.65.4`)
 - One package name may not appear under two different sources in the same file
