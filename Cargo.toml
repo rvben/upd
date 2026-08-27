@@ -1,6 +1,6 @@
 [package]
 name = "upd"
-version = "0.8.2"
+version = "0.8.3"
 edition = "2024"
 rust-version = "1.95.0"
 description = "Local-first dependency updates for polyglot repositories, including Python, Node.js, Rust, Go, Ruby, .NET, Terraform, GitHub Actions, pre-commit, and Mise"
