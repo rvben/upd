@@ -70,4 +70,4 @@ Summary: 2 vulnerable package(s), 3 total vulnerability/ies
 
 - [Stability](stability.md#stable-exit-codes) for the exit-code contract, including `6`
 - [Stability](stability.md#commands-run-by---lock) for what `--lock` runs per ecosystem
-- [GitHub Actions](github-actions.md#automated-pull-requests) for scheduled update pull requests
+- [GitHub pull requests](github-actions.md#quick-start) for scheduled dependency updates
