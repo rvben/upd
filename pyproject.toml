@@ -5,7 +5,7 @@ build-backend = "maturin"
 [project]
 name = "upd"
 dynamic = ["version"]
-description = "A fast dependency updater for Python, Node.js, Rust, Go, Ruby, Terraform, GitHub Actions, pre-commit, and Mise projects"
+description = "Local-first dependency updates for polyglot repositories, including Python, Node.js, Rust, Go, Ruby, .NET, Terraform, GitHub Actions, pre-commit, and Mise"
 readme = "README.md"
 license = { text = "MIT" }
 authors = [{ name = "Ruben Jongejan", email = "ruben.jongejan@gmail.com" }]
@@ -26,6 +26,9 @@ requires-python = ">=3.8"
 Homepage = "https://github.com/rvben/upd"
 Repository = "https://github.com/rvben/upd"
 Documentation = "https://github.com/rvben/upd#readme"
+Changelog = "https://github.com/rvben/upd/blob/main/CHANGELOG.md"
+Issues = "https://github.com/rvben/upd/issues"
+Security = "https://github.com/rvben/upd/security/policy"
 
 [tool.maturin]
 bindings = "bin"
