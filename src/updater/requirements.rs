@@ -49,9 +49,11 @@ impl RequirementsUpdater {
         .expect("Invalid regex");
 
         // Match the full constraint including additional constraints after commas
-        // E.g., ">=2.8.0,<9" or ">=1.0.0,!=1.5.0,<2.0.0"
+        // E.g., ">=2.8.0,<9" or ">=1.0.0,!=1.5.0,<2.0.0". PEP 508 allows
+        // whitespace between an operator and its version, so ">= 2.0, < 3" is
+        // the same set of clauses; each version runs to the next separator.
         let constraint_re = Regex::new(
-            r"^([a-zA-Z0-9][-a-zA-Z0-9._]*)(\[[^\]]+\])?\s*((?:==|>=|<=|~=|!=|>|<)[^\s#;]+(?:\s*,\s*(?:==|>=|<=|~=|!=|>|<)[^\s#;,]+)*)",
+            r"^([a-zA-Z0-9][-a-zA-Z0-9._]*)(\[[^\]]+\])?\s*((?:==|>=|<=|~=|!=|>|<)\s*[^\s#;,]+(?:\s*,\s*(?:==|>=|<=|~=|!=|>|<)\s*[^\s#;,]+)*)",
         )
         .expect("Invalid regex");
 
@@ -1324,6 +1326,73 @@ hda-common>=1.0.908
         let contents = std::fs::read_to_string(file.path()).unwrap();
         assert!(contents.contains("urllib3>2.0"));
         assert!(contents.contains("chardet>4.0,<6.0"));
+    }
+
+    /// PEP 508 lets whitespace separate an operator from its version, and
+    /// `django <= 5.0` is a ceiling like any other. Reading the operator without
+    /// the version behind it turned every spaced bound into a specifier upd
+    /// could not read, and a valid file into exit 2.
+    #[tokio::test]
+    async fn a_spaced_bound_is_read_as_the_bound_it_is() {
+        let mut file = NamedTempFile::new().unwrap();
+        writeln!(file, "django <= 5.0").unwrap();
+        writeln!(file, "flask < 3.0").unwrap();
+        writeln!(file, "pkg != 1.5.0").unwrap();
+
+        let registry = MockRegistry::new("PyPI")
+            .with_version("django", "6.1.0")
+            .with_version("flask", "2.3.0")
+            .with_version("pkg", "2.0.0");
+
+        let result = RequirementsUpdater::new()
+            .update(file.path(), &registry, UpdateOptions::new(false, false))
+            .await
+            .unwrap();
+
+        assert!(result.errors.is_empty(), "{:?}", result.errors);
+        assert_eq!(result.updated.len(), 0);
+        assert_eq!(result.unchanged, 2, "flask and pkg admit their newest");
+        assert_eq!(
+            result.warnings,
+            vec!["django: 6.1.0 is available, but '<= 5.0' is a range upd does not rewrite"]
+        );
+
+        let contents = std::fs::read_to_string(file.path()).unwrap();
+        assert!(contents.contains("django <= 5.0"));
+        assert!(contents.contains("flask < 3.0"));
+        assert!(contents.contains("pkg != 1.5.0"));
+    }
+
+    /// A spaced range is still a range. Reading `requests >= 2.0, < 2.20` as a
+    /// bare `>=` dropped the ceiling from the lookup, and the run wrote
+    /// `requests >= 2.34, < 2.20`: a floor above its own ceiling, which nothing
+    /// can install.
+    #[tokio::test]
+    async fn a_spaced_range_keeps_its_ceiling() {
+        let mut file = NamedTempFile::new().unwrap();
+        writeln!(file, "requests >= 2.0, < 2.20").unwrap();
+
+        let registry = MockRegistry::new("PyPI")
+            .with_version("requests", "2.34.0")
+            .with_constrained("requests", ">= 2.0, < 2.20", "2.19.1");
+
+        let result = RequirementsUpdater::new()
+            .update(file.path(), &registry, UpdateOptions::new(false, false))
+            .await
+            .unwrap();
+
+        assert!(result.errors.is_empty(), "{:?}", result.errors);
+        assert!(result.warnings.is_empty(), "{:?}", result.warnings);
+        assert_eq!(result.updated.len(), 1);
+        assert_eq!(result.updated[0].0, "requests");
+        assert_eq!(result.updated[0].1, "2.0");
+        assert_eq!(
+            result.updated[0].2, "2.19",
+            "the newest release the range admits"
+        );
+
+        let contents = std::fs::read_to_string(file.path()).unwrap();
+        assert!(contents.contains("requests >= 2.19, < 2.20"), "{contents}");
     }
 
     /// An exclusion names a release to avoid. Writing the newest release into it
