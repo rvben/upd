@@ -239,6 +239,7 @@ fn reusable_workflow_has_a_provider_neutral_least_privilege_boundary() {
     assert!(WORKFLOW.contains("permission-pull-requests: write"));
     assert!(WORKFLOW.contains("client-id: ${{ inputs.app-client-id }}"));
     assert!(WORKFLOW.contains("gh auth setup-git"));
+    assert!(!WORKFLOW.contains("AUTHORIZATION: bearer"));
 
     let verify = WORKFLOW
         .find("name: Verify and stage the proposal")

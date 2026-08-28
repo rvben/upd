@@ -664,7 +664,7 @@ jobs:
               echo "Closed obsolete security remediation pull request: $pr_url" >> "$summary_file"
             fi
             if [[ -n "$expected_remote_sha" ]]; then
-              git -c http.extraheader="AUTHORIZATION: bearer $GH_TOKEN" push \
+              git push \
                 --force-with-lease="refs/heads/${BRANCH}:${expected_remote_sha}" \
                 origin ":refs/heads/${BRANCH}"
               echo "Removed obsolete automation branch: $BRANCH" >> "$summary_file"
@@ -695,7 +695,7 @@ jobs:
           if [[ "$proposal_unchanged" != true ]]; then
             git commit --message "$COMMIT_MESSAGE"
             commit_sha="$(git rev-parse HEAD)"
-            git -c http.extraheader="AUTHORIZATION: bearer $GH_TOKEN" push \
+            git push \
               --force-with-lease="refs/heads/${BRANCH}:${expected_remote_sha}" \
               origin "HEAD:refs/heads/${BRANCH}"
           else
