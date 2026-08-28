@@ -112,6 +112,7 @@ set -euo pipefail
 printf '%s\n' "$*" >> "$GH_STATE_DIR/log"
 state="$GH_STATE_DIR/pr-state"
 case "${1:-}:${2:-}" in
+  auth:setup-git) ;;
   pr:list)
     case "$(cat "$state" 2>/dev/null || true)" in
       open) printf '%s\n' '[{"number":7,"url":"https://github.example.test/project/pull/7"}]' ;;
@@ -236,6 +237,8 @@ fn reusable_workflow_has_a_provider_neutral_least_privilege_boundary() {
     assert!(WORKFLOW.contains("persist-credentials: false"));
     assert!(WORKFLOW.contains("permission-contents: write"));
     assert!(WORKFLOW.contains("permission-pull-requests: write"));
+    assert!(WORKFLOW.contains("client-id: ${{ inputs.app-client-id }}"));
+    assert!(WORKFLOW.contains("gh auth setup-git"));
 
     let verify = WORKFLOW
         .find("name: Verify and stage the proposal")
@@ -279,7 +282,7 @@ fn repository_caller_is_thin_scoped_and_safe_by_default() {
     assert!(CALLER.contains("validation-command: make check"));
     assert!(CALLER.contains("default: false"));
     assert!(CALLER.contains("UPD_SECURITY_REMEDIATION_ENABLED"));
-    assert!(CALLER.contains("app-id: ${{ vars.UPD_APP_ID }}"));
+    assert!(CALLER.contains("app-client-id: ${{ vars.UPD_APP_CLIENT_ID }}"));
     assert!(CALLER.contains("app-private-key: ${{ secrets.UPD_APP_PRIVATE_KEY }}"));
     assert!(WORKFLOW.contains("group: upd-dependency-writes-${{ github.repository }}"));
     assert!(UPDATE_WORKFLOW.contains("group: upd-dependency-writes-${{ github.repository }}"));

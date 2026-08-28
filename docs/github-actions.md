@@ -163,7 +163,7 @@ jobs:
       langs: rust
       allowed-paths: Cargo.toml Cargo.lock
       validation-command: cargo test --locked
-      app-id: ${{ vars.UPD_APP_ID }}
+      app-client-id: ${{ vars.UPD_APP_CLIENT_ID }}
     secrets:
       app-private-key: ${{ secrets.UPD_APP_PRIVATE_KEY }}
 ```
@@ -209,7 +209,8 @@ branch.
 | Input | Default | Purpose |
 |-------|---------|---------|
 | `publish` | `false` | Publish or clean up the rolling pull request; false performs a credential-free dry run |
-| `app-id` | empty | GitHub App identifier; required when publishing |
+| `app-client-id` | empty | GitHub App Client ID; preferred when publishing |
+| `app-id` | empty | Legacy GitHub App ID for backward compatibility |
 | `runner` | `ubuntu-24.04` | Linux runner label |
 | `upd-version` | current verified manifest | Exact released `upd` version |
 | `upd-sha256` | manifest checksum | Archive digest; required for a version outside the release manifest |
@@ -223,9 +224,11 @@ branch.
 | `commit-message` | `fix(deps): remediate vulnerable dependencies with upd` | Generated Conventional Commit message |
 | `pull-request-title` | same as commit | Rolling pull-request title |
 
-The only remediation secret is `app-private-key`, paired with `app-id`. The App
-needs Contents and Pull requests read/write for ordinary dependency files; the
-workflow requests only those permissions for its installation token.
+The only remediation secret is `app-private-key`, paired with
+`app-client-id`. The legacy `app-id` input remains available for existing
+callers. The App needs Contents and Pull requests read/write for ordinary
+dependency files; the workflow requests only those permissions for its
+installation token.
 
 ## Inputs
 

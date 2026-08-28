@@ -55,13 +55,17 @@ on:
         description: Pull-request title
         type: string
         default: "fix(deps): remediate vulnerable dependencies with upd"
+      app-client-id:
+        description: GitHub App Client ID; preferred when publish is true
+        type: string
+        default: ""
       app-id:
-        description: GitHub App identifier; required when publish is true
+        description: Legacy GitHub App ID; use app-client-id for new callers
         type: string
         default: ""
     secrets:
       app-private-key:
-        description: Private key of the GitHub App named by app-id
+        description: Private key of the GitHub App named by app-client-id or app-id
         required: false
     outputs:
       disposition:
@@ -558,18 +562,34 @@ jobs:
 
       - name: Require GitHub App credentials
         env:
+          APP_CLIENT_ID: ${{ inputs.app-client-id }}
           APP_ID: ${{ inputs.app-id }}
           APP_PRIVATE_KEY: ${{ secrets.app-private-key }}
         shell: bash
         run: |
           set -euo pipefail
-          if [[ -z "$APP_ID" || -z "$APP_PRIVATE_KEY" ]]; then
-            echo "Publishing requires app-id and app-private-key; no token fallback is permitted" >&2
+          if [[ -z "$APP_CLIENT_ID" && -z "$APP_ID" ]]; then
+            echo "Publishing requires app-client-id (preferred) or app-id; no token fallback is permitted" >&2
+            exit 4
+          fi
+          if [[ -z "$APP_PRIVATE_KEY" ]]; then
+            echo "Publishing requires app-private-key; no token fallback is permitted" >&2
             exit 4
           fi
 
       - name: Mint a least-privilege installation token
         id: app-token
+        if: inputs.app-client-id != ''
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          client-id: ${{ inputs.app-client-id }}
+          private-key: ${{ secrets.app-private-key }}
+          permission-contents: write
+          permission-pull-requests: write
+
+      - name: Mint a least-privilege installation token with legacy App ID
+        id: legacy-app-token
+        if: inputs.app-client-id == '' && inputs.app-id != ''
         uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
         with:
           app-id: ${{ inputs.app-id }}
@@ -586,13 +606,18 @@ jobs:
           BRANCH: ${{ inputs.branch }}
           COMMIT_MESSAGE: ${{ inputs.commit-message }}
           DISPOSITION: ${{ needs.generate.outputs.disposition }}
-          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          GH_TOKEN: ${{ steps.app-token.outputs.token || steps.legacy-app-token.outputs.token }}
           PR_TITLE: ${{ inputs.pull-request-title }}
         shell: bash
         run: |
           set -euo pipefail
           output_file="$GITHUB_OUTPUT"
           summary_file="$GITHUB_STEP_SUMMARY"
+
+          # Configure Git's credential helper from the masked, short-lived App
+          # token. Unlike persisting checkout credentials, this happens only
+          # after the proposal has passed the artifact trust boundary.
+          gh auth setup-git
 
           git fetch --no-tags origin \
             "+refs/heads/${BASE_BRANCH}:refs/remotes/origin/${BASE_BRANCH}"
