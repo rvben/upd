@@ -1,0 +1,13 @@
+timestamp_utc=2026-08-28T08:54:25Z
+os=Darwin
+kernel_release=25.5.0
+architecture=arm64
+runs=5
+warmup=1
+upd 0.8.3
+uppd 1.6.0
+pinact 4.1.1
+actions-up/1.18.0 darwin-arm64 node-v26.7.0
+taze/21.1.0 darwin-arm64 node-v26.7.0
+ratchet 0.12.0 (9ca118155b0f79464185703a50da367e111107cd, darwin/arm64)
+hyperfine 1.20.0

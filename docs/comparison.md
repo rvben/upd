@@ -4,7 +4,7 @@ This page positions `upd` among dependency discovery, update, package-management
 and pinning tools. It is a dated technical snapshot, not a claim that every tool
 solves the same problem.
 
-**Snapshot date:** 2026-08-27. **upd version:** 0.8.2.
+**Snapshot date:** 2026-08-28. **upd version:** 0.8.3.
 
 The versions below are part of the comparison. Features added after those
 versions are not represented until this page is refreshed.
@@ -47,9 +47,9 @@ extra workflow, not dependency checking.
 
 | Tool | Version | Primary job | Manifest constraints | Lockfiles and transitive dependencies | `pyproject.toml` / `uv.lock` | pre-commit / `prek.toml` | GitHub Actions versions / SHAs | Other ecosystems |
 |---|---:|---|---|---|---|---|---|---|
-| **upd** | 0.8.2 | Local multi-ecosystem checker and updater | Native; format-preserving lower-bound and pin updates | Delegates lock refresh; reads supported locks for transitive security audit and fixes | Native manifest / audit + delegated refresh | Native / out of scope | Native tags and verified SHA comments | npm, Cargo, Go, RubyGems, NuGet, Terraform, Mise/asdf, annotated pins |
-| [Renovate](https://github.com/renovatebot/renovate/tree/44.46.6) | 44.46.6 | Repository automation and update PRs | Native across many managers | Native lock maintenance, including transitive lock updates | Native PEP 621, Poetry, and uv managers | Native beta manager / out of scope | Native tags and digest pinning | Broad package, container, infrastructure, and CI coverage |
-| [uv](https://github.com/astral-sh/uv/tree/0.12.6) | 0.12.6 | Python package and project manager | Native project dependency management; ordinary lock upgrades stay within constraints | Native universal resolution and `uv.lock` updates | Native / native | Out of scope | Out of scope | Python only |
+| **upd** | 0.8.3 | Local multi-ecosystem checker and updater | Native; format-preserving lower-bound and pin updates | Delegates lock refresh; reads supported locks for transitive security audit and fixes | Native manifest / audit + delegated refresh | Native / out of scope | Native tags and verified SHA comments | npm, Cargo, Go, RubyGems, NuGet, Terraform, Mise/asdf, annotated pins |
+| [Renovate](https://github.com/renovatebot/renovate/tree/44.49.0) | 44.49.0 | Repository automation and update PRs | Native across many managers | Native lock maintenance, including transitive lock updates | Native PEP 621, Poetry, and uv managers | Native beta manager / out of scope | Native tags and digest pinning | Broad package, container, infrastructure, and CI coverage |
+| [uv](https://github.com/astral-sh/uv/tree/0.12.7) | 0.12.7 | Python package and project manager | Native project dependency management; ordinary lock upgrades stay within constraints | Native universal resolution and `uv.lock` updates | Native / native | Out of scope | Out of scope | Python only |
 | [prek](https://github.com/j178/prek/tree/v0.5.0) | 0.5.0 | Git hook manager and pre-commit replacement | Out of scope except hook revisions | Hook environments, not project dependency lockfiles | Out of scope | Native update/check for both formats | Out of scope | Hook runtimes and repositories |
 | [pinact](https://github.com/suzuki-shunsuke/pinact/tree/v4.1.1) | 4.1.1 | Pin and update GitHub Actions | Out of scope | Out of scope | Out of scope | Out of scope | Native tags, SHAs, verification, and minimum age | GitHub/Gitea/Forgejo workflow and composite-action files |
 | [actions-up](https://github.com/azat-io/actions-up/tree/v1.18.0) | 1.18.0 | Interactive GitHub Actions updater | Out of scope | Out of scope | Out of scope | Out of scope | Native tags and SHA pinning | GitHub Actions only |
@@ -108,38 +108,39 @@ ordinary latest-version update pass.
 Benchmarks are grouped by equivalent workload. A dash means the tool is outside
 that workload, not that it failed.
 
-The committed harness lives in [`benchmarks/`](../benchmarks/README.md). It
-restores every fixture before every measured command, pins tool versions, uses
-non-interactive commands, and records raw Hyperfine JSON. Registry and GitHub
-requests are live, so the numbers are a reproducible procedure and a dated
-observation rather than a permanent speed guarantee.
+The committed harness lives in [`benchmarks/`](../benchmarks/README.md). Before
+timing, it rejects outputs that do not perform every intended update or leave
+parseable files. It then restores every fixture before every measured command,
+pins tool versions, uses non-interactive commands, and records raw Hyperfine
+JSON. Registry and GitHub requests are live, so the numbers are a reproducible
+procedure and a dated observation rather than a permanent speed guarantee.
 
 ### Results
 
 The synthetic dataset contains 18 dependency references across two files: 12
 Python requirements and 6 GitHub Actions, totaling 49 lines and 980 bytes.
 These are five-run means from the environment and commands recorded in the
-[detailed 2026-08-27 report](../benchmarks/results/2026-08-27.md); standard
+[detailed 2026-08-28 report](../benchmarks/results/2026-08-28.md); standard
 deviations, ranges, limitations, and raw JSON are available there.
 
 | Workload | Tool | Check mean | Update mean |
 |---|---|---:|---:|
-| Python manifest | **upd** | 263.1 ms | 330.2 ms |
-| Python manifest | uppd | 407.8 ms | 360.2 ms |
-| GitHub Actions | **upd** | 847.9 ms | 896.6 ms |
-| GitHub Actions | pinact | 4,884.7 ms | 4,387.8 ms |
-| GitHub Actions | actions-up | 4,044.7 ms | 3,909.5 ms |
-| GitHub Actions | taze | 564.4 ms | 565.8 ms |
-| GitHub Actions | ratchet | 1,183.1 ms | 1,016.0 ms |
+| Python manifest | **upd** | **134.7 ms** | **138.7 ms** |
+| Python manifest | uppd | 269.7 ms | 250.8 ms |
+| GitHub Actions | **upd** | **758.7 ms** | 746.3 ms |
+| GitHub Actions | pinact | 4,132.8 ms | 4,105.4 ms |
+| GitHub Actions | actions-up | 3,529.7 ms | 3,864.0 ms |
+| GitHub Actions | taze | 1,019.0 ms | **566.3 ms** |
+| GitHub Actions | ratchet | 1,029.1 ms | 1,066.8 ms |
 
 What this particular run shows:
 
-- In the Python-manifest cohort, `upd` had a roughly 36% lower check mean than
-  `uppd`; update means were close, with `upd` roughly 8% lower.
-- In the GitHub Actions cohort, `taze` recorded the lowest means. `upd` was
-  faster than the three tools in this cohort that wrote SHA-pinned output, but
-  those output policies are different enough that latency should not be the
-  only selection criterion.
+- In the Python-manifest cohort, `upd` recorded a 50% lower check mean and a 45%
+  lower update mean than `uppd` on this five-run sample.
+- In the GitHub Actions cohort, `upd` recorded the lowest check mean; taze
+  recorded the lowest update mean, with `upd` second. Both preserve tag style.
+  The other tools write SHA-pinned output, so latency is not the only selection
+  criterion.
 
 The benchmark contains two cohorts:
 
@@ -147,6 +148,8 @@ The benchmark contains two cohorts:
    exact direct requirements in `pyproject.toml`. uv, PDM, uvu, and uv-upx are
    excluded because the comparable command also resolves a lockfile, installs
    an environment, requires interaction, or intentionally skips exact pins.
+   `uppd` uses its separate-output mode because its default in-place command
+   produced malformed TOML for this fixture on the recorded environment.
 2. **GitHub Actions release checks:** `upd`, pinact, actions-up, taze, and ratchet
    inspect the same workflow references. Update output styles differ—tag
    preservation versus SHA pinning—so results are reported as a cohort, not a
