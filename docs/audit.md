@@ -57,14 +57,33 @@ Summary: 2 vulnerable package(s), 3 total vulnerability/ies
 - name: Check for vulnerabilities
   run: upd audit   # non-zero exit (6) fails the build when vulnerabilities are found
 
-# Upload SARIF results to GitHub Code Scanning
+# Capture the audit status so SARIF is uploaded even when findings make upd exit 6
 - name: Audit dependencies (SARIF)
-  run: upd audit --format sarif > results.sarif
+  id: audit
+  shell: bash
+  run: |
+    set +e
+    upd audit --format sarif > results.sarif
+    audit_exit=$?
+    set -e
+    test -s results.sarif
+    echo "exit-code=$audit_exit" >> "$GITHUB_OUTPUT"
 - name: Upload to Code Scanning
-  uses: github/codeql-action/upload-sarif@v3
+  if: always()
+  uses: github/codeql-action/upload-sarif@v4
   with:
     sarif_file: results.sarif
+- name: Enforce audit result
+  if: always()
+  env:
+    AUDIT_EXIT: ${{ steps.audit.outputs.exit-code }}
+  run: test "$AUDIT_EXIT" = 0
 ```
+
+Grant the job `contents: read` and `security-events: write`. In production,
+pin third-party Actions to an immutable commit SHA, as this repository does in
+its own security workflow. Fork pull requests receive a read-only token, so
+their SARIF upload step should be skipped while the audit itself still runs.
 
 ## See also
 

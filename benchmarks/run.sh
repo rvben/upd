@@ -65,7 +65,7 @@ if [[ ${BENCH_VERIFY:-1} == 1 ]]; then
 fi
 
 printf -v q_upd '%q' "$upd_bin"
-printf -v q_python_fixture '%q' "$benchmark_dir/fixtures/python/pyproject.toml"
+printf -v q_python_fixture '%q' "$benchmark_dir/fixtures/vendor/python/pyproject.toml"
 printf -v q_python_work '%q' "$work_dir/python/pyproject.toml"
 printf -v q_actions_fixture '%q' "$benchmark_dir/fixtures/actions"
 printf -v q_actions_work '%q' "$work_dir/actions"

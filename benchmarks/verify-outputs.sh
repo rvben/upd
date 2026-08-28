@@ -94,7 +94,7 @@ verify_action_result() {
   echo "$tool: verified 6 GitHub Actions updates; workflow structure retained"
 }
 
-python_fixture="$benchmark_dir/fixtures/python/pyproject.toml"
+python_fixture="$benchmark_dir/fixtures/vendor/python/pyproject.toml"
 for tool in upd uppd; do
   destination_dir="$work_dir/python-$tool"
   mkdir -p "$destination_dir"

@@ -13,13 +13,17 @@ and GitHub release discovery rather than repository traversal.
 
 | Fixture | Dependencies | Lines | Size |
 |---|---:|---:|---:|
-| [`fixtures/python/pyproject.toml`](fixtures/python/pyproject.toml) | 12 Python requirements | 18 | 361 bytes |
+| [`fixtures/vendor/python/pyproject.toml`](fixtures/vendor/python/pyproject.toml) | 12 Python requirements | 18 | 361 bytes |
 | [`fixtures/actions/.github/workflows/ci.yml`](fixtures/actions/.github/workflows/ci.yml) | 6 GitHub Actions | 31 | 619 bytes |
 | **Total** | **18 references** | **49** | **980 bytes** |
 
 ### Python manifest constraints
 
 The fixture contains twelve exact direct requirements in project dependencies.
+It lives below a `vendor/` path so GitHub's dependency graph does not mistake
+its deliberately obsolete inputs for shipped dependencies. Repository-wide
+`upd` scans exclude the same path through `.updrc.toml`; the benchmark passes
+the manifest explicitly so the fixture remains fully exercised.
 The check benchmark discovers newer PyPI releases without writing. The update
 benchmark starts from the same pristine `pyproject.toml` for every run and
 writes newer exact constraints. `uppd` uses its documented separate-output mode

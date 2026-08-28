@@ -1,0 +1,4 @@
+# Synthetic manifests exercise intentionally stale dependency versions. Keep them
+# out of repository-wide update and security scans; benchmark scripts pass the
+# fixture paths explicitly, which intentionally bypasses this exclusion.
+exclude = ["benchmarks/fixtures/vendor/**"]
