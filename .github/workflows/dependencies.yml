@@ -20,4 +20,3 @@ jobs:
       fail-on-blocked: false
       branch: deps/upd
       commit-message: "chore(deps): update Rust dependencies with upd"
-      pull-request-title: "chore(deps): update Rust dependencies with upd"

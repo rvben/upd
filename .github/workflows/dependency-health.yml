@@ -72,9 +72,9 @@ on:
         type: string
         default: "ci(deps): update dependencies with upd"
       pull-request-title:
-        description: Pull-request title
+        description: Pull-request title override; empty derives a concise title from the update evidence
         type: string
-        default: "ci(deps): update dependencies with upd"
+        default: ""
       auto-merge:
         description: Ask GitHub to merge after all repository checks pass
         type: boolean
@@ -173,9 +173,9 @@ on:
         type: string
         default: "ci(deps): update dependencies with upd"
       pull-request-title:
-        description: Pull-request title
+        description: Pull-request title override; empty derives a concise title from the update evidence
         type: string
-        default: "ci(deps): update dependencies with upd"
+        default: ""
       auto-merge:
         description: Merge after all repository checks pass
         type: boolean
@@ -457,9 +457,158 @@ jobs:
             exit 2
           fi
 
+      - name: Build provider-neutral review presentation
+        env:
+          AUTO_MERGE: ${{ inputs.auto-merge }}
+          CHANGED: ${{ steps.update.outputs.changed }}
+          LOCK: ${{ inputs.lock }}
+          MAX_BUMP: ${{ inputs.max-bump }}
+          MIN_AGE: ${{ inputs.min-age }}
+          PRESENTATION: ${{ runner.temp }}/upd-presentation.json
+          REPORT: ${{ runner.temp }}/upd-report.json
+          VALIDATION_CONFIGURED: ${{ inputs.validation-command != '' }}
+        run: |
+          set -euo pipefail
+          mapfile -t changed_paths < <(git diff --cached --name-only)
+          changed_paths_json="$(printf '%s\n' "${changed_paths[@]}" | jq --raw-input --slurp 'split("\n") | map(select(length > 0))')"
+          jq \
+            --arg min_age "$MIN_AGE" \
+            --arg max_bump "$MAX_BUMP" \
+            --argjson auto_merge "$AUTO_MERGE" \
+            --argjson changed "$CHANGED" \
+            --argjson changed_paths "$changed_paths_json" \
+            --argjson lock "$LOCK" \
+            --argjson validation_configured "$VALIDATION_CONFIGURED" '
+            def clean($limit):
+              if . == null then "" else tostring end
+              | gsub("[\\x00-\\x1f\\x7f\u202a-\u202e\u2066-\u2069]"; " ")
+              | gsub("[[:space:]]+"; " ")
+              | sub("^ "; "") | sub(" $"; "")
+              | .[0:$limit];
+            def update_rows:
+              [.files[]? as $file
+               | $file.updates[]?
+               | select(.status == null or .status == "applied" or .status == "pending_relock")
+               | {
+                   package: (.package // "unknown dependency" | clean(160)),
+                   current: (.current // "unknown" | clean(160)),
+                   latest: (.latest // "unknown" | clean(160)),
+                   bump: (.bump // "unknown" | clean(32)),
+                   path: ($file.path // "unknown file" | clean(160)),
+                   status: (.status // "applied" | clean(32))
+                 }]
+              | unique_by([.package, .current, .latest, .path, .status])
+              | sort_by([.package, .path, .current, .latest]);
+            def annotation_rows:
+              [.files[]? as $file | $file.annotations[]? | {
+                package: (.package // "unknown dependency" | clean(160)),
+                version: (.version // "unknown" | clean(160)),
+                path: ($file.path // "unknown file" | clean(160))
+              }] | unique_by([.package, .version, .path]) | sort_by([.package, .path]);
+            def policy_rows:
+              [.files[]? as $file |
+                (($file.held_back // [])[] | {
+                  kind: "cooldown", package: (.package // "unknown dependency" | clean(160)),
+                  selected: (.chosen // .current // "unknown" | clean(160)),
+                  available: (.skipped_latest // "unknown" | clean(160)),
+                  path: ($file.path // "unknown file" | clean(160))
+                }),
+                (($file.skipped_by_cooldown // [])[] | {
+                  kind: "cooldown", package: (.package // "unknown dependency" | clean(160)),
+                  selected: (.current // "unknown" | clean(160)),
+                  available: (.skipped_latest // "unknown" | clean(160)),
+                  path: ($file.path // "unknown file" | clean(160))
+                }),
+                (($file.capped // [])[] | {
+                  kind: "bump ceiling", package: (.package // "unknown dependency" | clean(160)),
+                  selected: (.current // "unknown" | clean(160)),
+                  available: (.available // "unknown" | clean(160)),
+                  path: ($file.path // "unknown file" | clean(160))
+                })]
+              | unique_by([.kind, .package, .selected, .available, .path])
+              | sort_by([.kind, .package, .path]);
+            def blocked_rows:
+              ([.files[]? as $file | ($file.skipped // [])[]
+                | select(.status == "blocked")
+                | {
+                    package: (.package // "unknown dependency" | clean(160)),
+                    current: (.current // "unknown" | clean(160)),
+                    reason: (.message // .reason // "blocked by a safety condition" | clean(240)),
+                    path: ($file.path // "unknown file" | clean(160))
+                  }]
+               +
+               [.files[]? as $file | $file.updates[]?
+                | select(.status == "unfixable" or .status == "skipped")
+                | {
+                    package: (.package // "unknown dependency" | clean(160)),
+                    current: (.current // "unknown" | clean(160)),
+                    reason: (.error // "upd could not apply this update safely" | clean(240)),
+                    path: ($file.path // "unknown file" | clean(160))
+                  }])
+              | unique_by([.package, .current, .reason, .path])
+              | sort_by([.package, .path, .reason]);
+            . as $report
+            | (update_rows) as $updates
+            | (annotation_rows) as $annotations
+            | (policy_rows) as $policy_holds
+            | (blocked_rows) as $blocked
+            | {
+                schema: 1,
+                state: (if $changed then "ready" elif ($blocked | length) > 0 then "blocked_no_change" else "clean" end),
+                changed: $changed,
+                updates: $updates,
+                annotations: $annotations,
+                policy_holds: $policy_holds,
+                blocked: $blocked,
+                changed_paths: ($changed_paths | map(clean(160)) | unique | sort),
+                counts: {
+                  updates: ($updates | length),
+                  updates_major: ([$updates[] | select((.bump | ascii_downcase) == "major")] | length),
+                  updates_minor: ([$updates[] | select((.bump | ascii_downcase) == "minor")] | length),
+                  updates_patch: ([$updates[] | select((.bump | ascii_downcase) == "patch")] | length),
+                  annotations: ($annotations | length),
+                  files_changed: ($changed_paths | length),
+                  policy_holds: ($policy_holds | length),
+                  blocked: ($blocked | length),
+                  warnings: ($report.summary.warnings // 0),
+                  not_examined: ($report.summary.not_examined // 0)
+                },
+                policy: {
+                  min_age: (if $min_age == "" then "repository configuration" else ($min_age | clean(80)) end),
+                  max_bump: (if $max_bump == "" then "repository configuration" else ($max_bump | clean(32)) end),
+                  lockfile_regeneration: $lock
+                },
+                validation: {repository_command_configured: $validation_configured, proposal_integrity_passed: true},
+                auto_merge_requested: $auto_merge
+              }
+            | (.changed_paths as $paths
+               | (($paths | length) > 0 and all($paths[]; startswith(".github/workflows/")))) as $workflow_only
+            | (if $workflow_only then "ci(deps)" else "chore(deps)" end) as $title_prefix
+            | .title = (
+                if .counts.updates == 1 then
+                  if ((.updates[0].package | test("^[A-Za-z0-9@][A-Za-z0-9._@/+-]{0,79}$")) and
+                      (.updates[0].latest | test("^[A-Za-z0-9][A-Za-z0-9._:+-]{0,79}$"))) then
+                    "\($title_prefix): update \(.updates[0].package) to \(.updates[0].latest)"
+                  else
+                    "\($title_prefix): update dependency"
+                  end
+                elif .counts.updates > 1 then
+                  "\($title_prefix): update \(.counts.updates) dependencies"
+                elif .counts.annotations == 1 then
+                  "\($title_prefix): annotate dependency metadata"
+                elif .counts.annotations > 1 then
+                  "\($title_prefix): annotate \(.counts.annotations) dependency declarations"
+                else
+                  "\($title_prefix): refresh dependency metadata"
+                end
+                | clean(72)
+              )
+          ' "$REPORT" > "$PRESENTATION"
+
       - name: Publish dependency summary
         env:
           FAIL_ON_BLOCKED: ${{ inputs.fail-on-blocked }}
+          PRESENTATION: ${{ runner.temp }}/upd-presentation.json
           REPORT: ${{ runner.temp }}/upd-report.json
         run: |
           set -euo pipefail
@@ -467,19 +616,13 @@ jobs:
             echo "## upd dependency health"
             echo
             jq --raw-output '
-              "- Updates: \(.summary.updates_total)\n" +
-              "- Files changed: \(.summary.files_with_changes)\n" +
-              "- Held back by cooldown: \(.summary.held_back // 0)\n" +
-              "- Held back by bump policy: \(.summary.capped // 0)\n" +
-              "- Blocked: \(.summary.skipped // 0)\n" +
-              "- Warnings: \(.summary.warnings)"
-            ' "$REPORT"
-            echo
-            jq --raw-output '
-              .files[] |
-              .skipped[]? |
-              "- Blocked `\(.package)`: \(.message) (`\(.reason)`)"
-            ' "$REPORT"
+              "- Applied updates: \(.counts.updates)\n" +
+              "- Files changed: \(.counts.files_changed)\n" +
+              "- Held back by policy: \(.counts.policy_holds)\n" +
+              "- Blocked or unfixable: \(.counts.blocked)\n" +
+              "- Not examined: \(.counts.not_examined)\n" +
+              "- Warnings: \(.counts.warnings)"
+            ' "$PRESENTATION"
           } >> "$GITHUB_STEP_SUMMARY"
 
           blocked="$(jq --raw-output '.summary.skipped // 0' "$REPORT")"
@@ -493,7 +636,9 @@ jobs:
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: upd-report
-          path: ${{ runner.temp }}/upd-report.json
+          path: |
+            ${{ runner.temp }}/upd-report.json
+            ${{ runner.temp }}/upd-presentation.json
           if-no-files-found: ignore
           retention-days: 7
 
@@ -506,12 +651,15 @@ jobs:
           GH_TOKEN: ${{ steps.app-token.outputs.token || secrets.pull-request-token || github.token }}
           COMMIT_MESSAGE: ${{ inputs.commit-message }}
           EXPECTED_REMOTE_SHA: ${{ steps.branch.outputs.expected-remote-sha }}
-          LOCK: ${{ inputs.lock }}
           MERGE_METHOD: ${{ inputs.merge-method }}
+          PRESENTATION: ${{ runner.temp }}/upd-presentation.json
           PR_TITLE: ${{ inputs.pull-request-title }}
-          REPORT: ${{ runner.temp }}/upd-report.json
         run: |
           set -euo pipefail
+          pr_title="$PR_TITLE"
+          if [[ -z "$pr_title" ]]; then
+            pr_title="$(jq --raw-output '.title' "$PRESENTATION")"
+          fi
 
           find_open_prs() {
             gh pr list --head "$BRANCH" --base "$BASE_BRANCH" --state open \
@@ -556,34 +704,101 @@ jobs:
             origin "HEAD:refs/heads/${BRANCH}"
 
           body_file="$RUNNER_TEMP/upd-pr-description.md"
-          {
-            echo "Automated, policy-constrained dependency updates generated by [upd](https://github.com/rvben/upd)."
-            echo
+          jq --raw-output '
+            def md:
+              tostring | @html
+              | gsub("`"; "&#96;") | gsub("\\*"; "&#42;") | gsub("_"; "&#95;")
+              | gsub("\\["; "&#91;") | gsub("\\]"; "&#93;") | gsub("\\|"; "&#124;")
+              | gsub("\\\\"; "&#92;");
+            def code: "<code>\(. | md)</code>";
+            def plural($count; $one; $many): if $count == 1 then $one else $many end;
+            def scope:
+              if .counts.files_changed == 0 then "No repository files changed"
+              elif .counts.files_changed <= 3 then (.changed_paths | map(code) | join(", "))
+              else "\(.changed_paths[:3] | map(code) | join(", ")) and \(.counts.files_changed - 3) more"
+              end;
+            def result_summary:
+              if .counts.updates > 0 then
+                "\(.counts.updates) policy-approved dependency \(plural(.counts.updates; "update"; "updates"))"
+              else
+                "\(.counts.annotations) dependency metadata \(plural(.counts.annotations; "annotation"; "annotations"))"
+              end;
+            def header:
+              if .counts.blocked > 0 then
+                "> [!WARNING]\n> **Ready for review, with follow-up.** upd applied \(result_summary) across \(.counts.files_changed) \(plural(.counts.files_changed; "file"; "files")); \(.counts.blocked) additional \(plural(.counts.blocked; "dependency needs"; "dependencies need")) attention."
+              else
+                "> [!IMPORTANT]\n> **Ready for review.** upd applied \(result_summary) across \(.counts.files_changed) \(plural(.counts.files_changed; "file"; "files")), within the repository\u2019s update policy."
+              end;
+            def overview:
+              "| | |\n|---|---|\n" +
+              "| **Result** | \(result_summary | md) |\n" +
+              "| **Change mix** | \(.counts.updates_major) major · \(.counts.updates_minor) minor · \(.counts.updates_patch) patch |\n" +
+              "| **Scope** | \(scope) |\n" +
+              "| **Policy** | Freshness: \(.policy.min_age | code) · maximum bump: \(.policy.max_bump | code) · lockfile regeneration: \(if .policy.lockfile_regeneration then "on" else "off" end) |\n" +
+              "| **Validation** | \(if .validation.repository_command_configured then "Repository command passed" else "No repository-specific command configured" end) · proposal integrity passed |\n" +
+              "| **Merge** | \(if .auto_merge_requested then "Auto-merge requested · repository requirements still control readiness" else "Auto-merge off · repository checks still control readiness" end) |";
+            def changes:
+              "### What changed\n\n" +
+              (if .counts.updates > 0 then
+                 "| Dependency | Before | After | Change | File |\n|---|---:|---:|---|---|\n" +
+                 (.updates[:24] | map("| \(.package | code) | \(.current | code) | \(.latest | code) | \(.bump | md) | \(.path | code) |") | join("\n")) +
+                 (if .counts.updates > 24 then "\n\n_\(.counts.updates - 24) more updates are preserved in the evidence artifact._" else "" end)
+               else
+                 "upd added or refreshed dependency metadata without changing selected versions."
+               end) +
+              (if .counts.annotations > 0 then
+                 "\n\n<details>\n<summary><strong>Dependency metadata (\(.counts.annotations))</strong></summary>\n\n" +
+                 "| Dependency | Version | File |\n|---|---:|---|\n" +
+                 (.annotations[:20] | map("| \(.package | code) | \(.version | code) | \(.path | code) |") | join("\n")) +
+                 "\n\n</details>"
+               else "" end);
+            def held:
+              if .counts.policy_holds == 0 then ""
+              else
+                "\n\n<details>\n<summary><strong>Held back by policy (\(.counts.policy_holds))</strong></summary>\n\n" +
+                "These releases were intentionally excluded from this proposal.\n\n" +
+                "| Dependency | Selected | Available | Policy | File |\n|---|---:|---:|---|---|\n" +
+                (.policy_holds[:20] | map("| \(.package | code) | \(.selected | code) | \(.available | code) | \(.kind | md) | \(.path | code) |") | join("\n")) +
+                (if .counts.policy_holds > 20 then "\n\n_\(.counts.policy_holds - 20) more policy decisions are preserved in the evidence artifact._" else "" end) +
+                "\n\n</details>"
+              end;
+            def blocked:
+              if .counts.blocked == 0 then ""
+              else
+                "\n\n### Needs attention\n\n" +
+                "> [!WARNING]\n> These dependencies were not changed because upd could not do so safely.\n\n" +
+                "| Dependency | Current | Reason | File |\n|---|---:|---|---|\n" +
+                (.blocked[:12] | map("| \(.package | code) | \(.current | code) | \(.reason | md) | \(.path | code) |") | join("\n")) +
+                (if .counts.blocked > 12 then "\n\n_\(.counts.blocked - 12) more blocked decisions are preserved in the evidence artifact._" else "" end)
+              end;
+            def evidence:
+              "<details>\n<summary><strong>Run evidence</strong></summary>\n\n" +
+              "- Applied updates: \(.counts.updates)\n" +
+              "- Change mix: \(.counts.updates_major) major, \(.counts.updates_minor) minor, \(.counts.updates_patch) patch\n" +
+              "- Dependency annotations: \(.counts.annotations)\n" +
+              "- Held back by policy: \(.counts.policy_holds)\n" +
+              "- Blocked: \(.counts.blocked)\n" +
+              "- Not examined: \(.counts.not_examined)\n" +
+              "- Warnings: \(.counts.warnings)\n" +
+              "- Full update report and presentation model retained in the workflow artifact\n\n" +
+              "</details>";
+            header + "\n\n" + overview + "\n\n" + changes + held + blocked + "\n\n" + evidence +
+            "\n\n> [!NOTE]\n> This rolling proposal was rebuilt from the latest default branch. Review the repository checks below before merging." +
+            "\n\n---\nGenerated by [upd](https://github.com/rvben/upd)."
+          ' "$PRESENTATION" > "$body_file"
+
+          if [[ "$(wc -c < "$body_file")" -gt 32768 ]]; then
             jq --raw-output '
-              "- Updates: \(.summary.updates_total)\n" +
-              "- Files changed: \(.summary.files_with_changes)\n" +
-              "- Held back by cooldown: \(.summary.held_back // 0)\n" +
-              "- Held back by bump policy: \(.summary.capped // 0)\n" +
-              "- Blocked: \(.summary.skipped // 0)\n" +
-              "- Warnings: \(.summary.warnings)"
-            ' "$REPORT"
-            echo "- Lockfile regeneration: $LOCK"
-            echo
-            echo "### Applied updates"
-            echo
-            jq --raw-output '
-              .files[] as $file |
-              $file.updates[]? |
-              select(.status == null or .status == "applied" or .status == "pending_relock") |
-              "- `\(.package)` \(.current) → \(.latest) (\(.bump), `\($file.path)`)"
-            ' "$REPORT"
-            echo
-            echo "This rolling proposal is rebuilt from the latest default branch on every run."
-          } > "$body_file"
+              "## Dependency updates ready for review\n\n" +
+              "upd produced \(.counts.updates) policy-approved dependency update(s) across \(.counts.files_changed) file(s). " +
+              "The detailed presentation exceeded the configured body budget, so full evidence is retained in the workflow artifact.\n\n" +
+              "> [!NOTE]\n> Review the repository checks below before merging."
+            ' "$PRESENTATION" > "$body_file"
+          fi
 
           if [[ "$(jq 'length' <<< "$pr_list")" -eq 0 ]]; then
             gh pr create --base "$BASE_BRANCH" --head "$BRANCH" \
-              --title "$PR_TITLE" --body-file "$body_file" >/dev/null
+              --title "$pr_title" --body-file "$body_file" >/dev/null
             pr_list="$(find_open_prs)"
             require_unambiguous_pr "$pr_list"
             if [[ "$(jq 'length' <<< "$pr_list")" -ne 1 ]]; then
@@ -592,7 +807,7 @@ jobs:
             fi
           else
             pr_number="$(jq --raw-output '.[0].number' <<< "$pr_list")"
-            gh pr edit "$pr_number" --title "$PR_TITLE" --body-file "$body_file" >/dev/null
+            gh pr edit "$pr_number" --title "$pr_title" --body-file "$body_file" >/dev/null
           fi
 
           pr_number="$(jq --raw-output '.[0].number' <<< "$pr_list")"

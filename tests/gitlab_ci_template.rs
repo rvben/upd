@@ -95,8 +95,12 @@ impl Fixture {
 set -euo pipefail
 if [ "${FAKE_UPD_CHANGE}" = "true" ]; then
   printf '%s\n' "${FAKE_UPD_CONTENT}" > dependency.txt
+fi
+if [ -n "${FAKE_UPD_REPORT:-}" ]; then
+  printf '%s\n' "$FAKE_UPD_REPORT"
+elif [ "${FAKE_UPD_CHANGE}" = "true" ]; then
   cat <<JSON
-{"command":"update","mode":"applied","files":[{"path":"dependency.txt","file_type":"test","lang":"test","updates":[{"package":"example","current":"1.0.0","latest":"2.0.0","bump":"major"}],"pinned":[],"ignored":[],"errors":[],"warnings":[]}],"summary":{"files_scanned":1,"files_with_changes":1,"updates_total":1,"updates_major":1,"updates_minor":0,"updates_patch":0,"pinned":0,"ignored":0,"errors":0,"warnings":0}}
+{"command":"update","mode":"applied","files":[{"path":"dependency.txt","file_type":"test","lang":"test","updates":[{"package":"example","current":"1.0.0","latest":"1.1.0","bump":"minor"}],"pinned":[],"ignored":[],"errors":[],"warnings":[]}],"summary":{"files_scanned":1,"files_with_changes":1,"updates_total":1,"updates_major":0,"updates_minor":1,"updates_patch":0,"pinned":0,"ignored":0,"errors":0,"warnings":0}}
 JSON
 else
   cat <<JSON
@@ -120,6 +124,17 @@ fi
     }
 
     fn run_template(&self, server: &MockServer, change: bool, content: &str, auto_merge: bool) {
+        self.run_template_with_report(server, change, content, auto_merge, "");
+    }
+
+    fn run_template_with_report(
+        &self,
+        server: &MockServer,
+        change: bool,
+        content: &str,
+        auto_merge: bool,
+        report: &str,
+    ) {
         let output = Command::new("bash")
             .arg("-c")
             .arg(embedded_script())
@@ -144,13 +159,14 @@ fi
             .env("UPD_VALIDATION_COMMAND", "")
             .env("UPD_BRANCH", BRANCH)
             .env("UPD_COMMIT_MESSAGE", "chore(deps): test update")
-            .env("UPD_MR_TITLE", "chore(deps): test update")
+            .env("UPD_MR_TITLE", "")
             .env("UPD_GIT_NAME", "upd test")
             .env("UPD_GIT_EMAIL", "upd-test@example.com")
             .env("UPD_AUTO_MERGE", auto_merge.to_string())
             .env("UPD_EXECUTABLE", &self.updater)
             .env("FAKE_UPD_CHANGE", change.to_string())
             .env("FAKE_UPD_CONTENT", content)
+            .env("FAKE_UPD_REPORT", report)
             .output()
             .expect("template starts");
         assert!(
@@ -186,6 +202,17 @@ fi
             .trim()
             .parse()
             .unwrap()
+    }
+
+    fn presentation(&self) -> serde_json::Value {
+        serde_json::from_str(
+            &fs::read_to_string(self.checkout.join(".upd-ci/upd-presentation.json")).unwrap(),
+        )
+        .unwrap()
+    }
+
+    fn description(&self) -> String {
+        fs::read_to_string(self.checkout.join(".upd-ci/upd-mr-description.md")).unwrap()
     }
 }
 
@@ -231,6 +258,61 @@ async fn template_creates_a_single_commit_rolling_merge_request() {
 
     assert_eq!(fixture.branch_file().as_deref(), Some("new\n"));
     assert_eq!(fixture.branch_commit_count(), 1);
+    assert_eq!(fixture.presentation()["schema"], 1);
+    assert_eq!(fixture.presentation()["state"], "ready");
+    let description = fixture.description();
+    assert!(description.contains("**Ready for review.**"));
+    assert!(description.contains("<code>example</code>"));
+    assert!(description.contains("<code>1.0.0</code>"));
+    assert!(description.contains("<code>1.1.0</code>"));
+    assert!(description.contains("Freshness: <code>7d</code>"));
+    assert!(!description.contains("[!IMPORTANT]"));
+    assert!(description.len() <= 32 * 1024);
+}
+
+#[tokio::test]
+async fn gitlab_presentation_matches_the_contract_and_escapes_untrusted_text() {
+    let server = MockServer::start().await;
+    let fixture = Fixture::new();
+    list_mock(json!([])).mount(&server).await;
+    Mock::given(method("POST"))
+        .and(path("/api/v4/projects/1/merge_requests"))
+        .respond_with(ResponseTemplate::new(201).set_body_json(mr_response(7, false)))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let report = r#"{
+      "command":"update","mode":"applied",
+      "files":[{
+        "path":"dependency.txt","file_type":"test","lang":"test",
+        "updates":[{"package":"bad|pkg</code>","current":"1.0.0`","latest":"1.1.0","bump":"minor","status":"applied"}],
+        "annotations":[{"package":"annotated","version":"2.0.0"}],
+        "held_back":[{"package":"fresh_pkg","current":"1.0.0","chosen":"1.0.1","skipped_latest":"1.1.0"}],
+        "capped":[{"package":"major_pkg","current":"1.0.0","available":"2.0.0"}],
+        "skipped":[{"package":"blocked<script>","current":"3.0.0","status":"blocked","reason":"missing-version-comment","message":"Add *trusted* metadata | before updating \u202ethis pin"}],
+        "errors":[],"warnings":[]
+      }],
+      "summary":{"files_scanned":1,"files_with_changes":1,"updates_total":1,"errors":0,"warnings":2,"not_examined":1}
+    }"#;
+    fixture.run_template_with_report(&server, true, "new", false, report);
+
+    let presentation = fixture.presentation();
+    assert_eq!(presentation["title"], "chore(deps): update dependency");
+    assert_eq!(presentation["counts"]["policy_holds"], 2);
+    assert_eq!(presentation["counts"]["blocked"], 1);
+    assert_eq!(presentation["counts"]["annotations"], 1);
+    let description = fixture.description();
+    assert!(description.contains("**Ready for review, with follow-up.**"));
+    assert!(description.contains("Held back by policy (2)"));
+    assert!(description.contains("### Needs attention"));
+    assert!(description.contains("bad&#124;pkg&lt;/code&gt;"));
+    assert!(description.contains("blocked&lt;script&gt;"));
+    assert!(description.contains("&#42;trusted&#42;"));
+    assert!(!description.contains("<script>"));
+    assert!(!description.contains("*trusted*"));
+    assert!(!description.contains('\u{202e}'));
+    assert!(!description.contains("[!IMPORTANT]"));
+    assert!(description.len() <= 32 * 1024);
 }
 
 #[tokio::test]

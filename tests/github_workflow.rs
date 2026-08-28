@@ -12,6 +12,7 @@ use tempfile::TempDir;
 const WORKFLOW: &str = include_str!("../.github/workflows/dependency-health.yml");
 const RUST_WORKFLOW: &str = include_str!("../.github/workflows/dependencies.yml");
 const ACTIONS_WORKFLOW: &str = include_str!("../.github/workflows/upd.yml");
+const GITLAB_TEMPLATE: &str = include_str!("../ci/gitlab-dependency-update.yml");
 const BRANCH: &str = "automation/upd-github-actions";
 
 fn workflow_script(name: &str) -> String {
@@ -152,6 +153,21 @@ esac
     }
 
     fn run_publish(&self, changed: bool, content: &str, auto_merge: bool) {
+        let report = if changed {
+            r#"{"files":[{"path":"dependency.txt","updates":[{"package":"example","current":"1.0.0","latest":"1.1.0","bump":"minor"}]}],"summary":{"updates_total":1,"files_with_changes":1,"held_back":0,"capped":0,"skipped":0,"warnings":0}}"#
+        } else {
+            r#"{"files":[],"summary":{"updates_total":0,"files_with_changes":0,"held_back":0,"capped":0,"skipped":0,"warnings":0}}"#
+        };
+        self.run_publish_with_report(changed, content, auto_merge, report);
+    }
+
+    fn run_publish_with_report(
+        &self,
+        changed: bool,
+        content: &str,
+        auto_merge: bool,
+        report_json: &str,
+    ) {
         git(
             &self.checkout,
             &[
@@ -196,15 +212,8 @@ esac
         }
 
         let report = self.runner_temp.join("upd-report.json");
-        fs::write(
-            &report,
-            if changed {
-                r#"{"files":[{"path":"dependency.txt","updates":[{"package":"example","current":"1.0.0","latest":"2.0.0","bump":"major"}]}],"summary":{"updates_total":1,"files_with_changes":1,"held_back":0,"capped":0,"skipped":0,"warnings":0}}"#
-            } else {
-                r#"{"files":[],"summary":{"updates_total":0,"files_with_changes":0,"held_back":0,"capped":0,"skipped":0,"warnings":0}}"#
-            },
-        )
-        .unwrap();
+        fs::write(&report, report_json).unwrap();
+        let presentation = self.runner_temp.join("upd-presentation.json");
         let output_file = self.runner_temp.join("github-output");
         let summary_file = self.runner_temp.join("github-summary");
         fs::write(&output_file, "").unwrap();
@@ -215,6 +224,29 @@ esac
             self.fake_bin.display(),
             std::env::var("PATH").unwrap()
         );
+        let presentation_output = Command::new("bash")
+            .arg("-c")
+            .arg(workflow_script(
+                "Build provider-neutral review presentation",
+            ))
+            .current_dir(&self.checkout)
+            .env("AUTO_MERGE", auto_merge.to_string())
+            .env("CHANGED", changed.to_string())
+            .env("LOCK", "false")
+            .env("MAX_BUMP", "minor")
+            .env("MIN_AGE", "7d")
+            .env("PRESENTATION", &presentation)
+            .env("REPORT", &report)
+            .env("VALIDATION_CONFIGURED", "true")
+            .output()
+            .expect("presentation script starts");
+        assert!(
+            presentation_output.status.success(),
+            "presentation failed\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&presentation_output.stdout),
+            String::from_utf8_lossy(&presentation_output.stderr)
+        );
+
         let output = Command::new("bash")
             .arg("-c")
             .arg(workflow_script("Publish rolling pull request"))
@@ -228,11 +260,10 @@ esac
             .env("GH_STATE_DIR", &self.state)
             .env("GITHUB_OUTPUT", output_file)
             .env("GITHUB_STEP_SUMMARY", summary_file)
-            .env("LOCK", "false")
             .env("MERGE_METHOD", "squash")
             .env("PATH", path)
-            .env("PR_TITLE", "chore(deps): test update")
-            .env("REPORT", report)
+            .env("PRESENTATION", presentation)
+            .env("PR_TITLE", "")
             .env("RUNNER_TEMP", &self.runner_temp)
             .output()
             .expect("publish script starts");
@@ -273,6 +304,17 @@ esac
 
     fn log(&self) -> String {
         fs::read_to_string(self.state.join("log")).unwrap_or_default()
+    }
+
+    fn presentation(&self) -> serde_json::Value {
+        serde_json::from_str(
+            &fs::read_to_string(self.runner_temp.join("upd-presentation.json")).unwrap(),
+        )
+        .unwrap()
+    }
+
+    fn body(&self) -> String {
+        fs::read_to_string(self.runner_temp.join("upd-pr-description.md")).unwrap()
     }
 }
 
@@ -384,6 +426,146 @@ fn workflow_creates_a_single_commit_rolling_pull_request() {
     assert_eq!(fixture.branch_file().as_deref(), Some("new\n"));
     assert_eq!(fixture.branch_commit_count(), 1);
     assert!(fixture.log().contains("pr create --base main"));
+    assert!(
+        fixture
+            .log()
+            .contains("--title chore(deps): update example to 1.1.0")
+    );
+    assert_eq!(fixture.presentation()["schema"], 1);
+    assert_eq!(fixture.presentation()["state"], "ready");
+    let body = fixture.body();
+    assert!(body.contains("**Ready for review.**"));
+    assert!(body.contains("<code>example</code>"));
+    assert!(body.contains("<code>1.0.0</code>"));
+    assert!(body.contains("<code>1.1.0</code>"));
+    assert!(body.contains("Freshness: <code>7d</code>"));
+    assert!(body.contains("maximum bump: <code>minor</code>"));
+    assert!(body.len() <= 32 * 1024);
+}
+
+#[test]
+fn github_presentation_explains_policy_holds_and_escapes_untrusted_text() {
+    let fixture = Fixture::new();
+    let report = r#"{
+      "files": [{
+        "path": "dependency.txt",
+        "updates": [{
+          "package": "bad|pkg</code>", "current": "1.0.0`", "latest": "1.1.0",
+          "bump": "minor", "status": "applied"
+        }],
+        "annotations": [{"package":"annotated","version":"2.0.0"}],
+        "held_back": [{"package":"fresh_pkg","current":"1.0.0","chosen":"1.0.1","skipped_latest":"1.1.0"}],
+        "skipped_by_cooldown": [],
+        "capped": [{"package":"major_pkg","current":"1.0.0","available":"2.0.0"}],
+        "skipped": [{
+          "package":"blocked<script>", "current":"3.0.0", "status":"blocked",
+          "reason":"missing-version-comment",
+          "message":"Add *trusted* metadata | before updating \u202ethis pin"
+        }]
+      }],
+      "summary": {"updates_total":1,"files_with_changes":1,"warnings":2,"not_examined":1}
+    }"#;
+    fixture.run_publish_with_report(true, "new", false, report);
+
+    let presentation = fixture.presentation();
+    assert_eq!(presentation["title"], "chore(deps): update dependency");
+    assert_eq!(presentation["counts"]["policy_holds"], 2);
+    assert_eq!(presentation["counts"]["blocked"], 1);
+    assert_eq!(presentation["counts"]["annotations"], 1);
+    let body = fixture.body();
+    assert!(body.contains("**Ready for review, with follow-up.**"));
+    assert!(body.contains("Held back by policy (2)"));
+    assert!(body.contains("### Needs attention"));
+    assert!(body.contains("bad&#124;pkg&lt;/code&gt;"));
+    assert!(body.contains("blocked&lt;script&gt;"));
+    assert!(body.contains("&#42;trusted&#42;"));
+    assert!(!body.contains("<script>"));
+    assert!(!body.contains("*trusted*"));
+    assert!(!body.contains('\u{202e}'));
+    assert!(body.len() <= 32 * 1024);
+}
+
+#[test]
+fn github_presentation_stays_within_the_review_budget_for_large_updates() {
+    let fixture = Fixture::new();
+    let updates = (0..80)
+        .map(|index| {
+            serde_json::json!({
+                "package": format!("package-{index}-{}", "x".repeat(120)),
+                "current": "1.0.0",
+                "latest": "1.1.0",
+                "bump": "minor"
+            })
+        })
+        .collect::<Vec<_>>();
+    let held = (0..40)
+        .map(|index| {
+            serde_json::json!({
+                "package": format!("fresh-{index}-{}", "y".repeat(120)),
+                "current": "1.0.0",
+                "chosen": "1.0.1",
+                "skipped_latest": "1.1.0"
+            })
+        })
+        .collect::<Vec<_>>();
+    let blocked = (0..30)
+        .map(|index| {
+            serde_json::json!({
+                "package": format!("blocked-{index}"),
+                "current": "1.0.0",
+                "status": "blocked",
+                "reason": "fixture",
+                "message": "z".repeat(400)
+            })
+        })
+        .collect::<Vec<_>>();
+    let report = serde_json::json!({
+        "files": [{
+            "path": "dependency.txt",
+            "updates": updates,
+            "held_back": held,
+            "skipped": blocked
+        }],
+        "summary": {"updates_total":80,"files_with_changes":1,"warnings":0}
+    });
+    fixture.run_publish_with_report(true, "new", false, &report.to_string());
+
+    let body = fixture.body();
+    assert!(body.len() <= 32 * 1024, "body was {} bytes", body.len());
+    assert!(
+        fixture
+            .log()
+            .contains("--title chore(deps): update 80 dependencies")
+    );
+}
+
+#[test]
+fn normal_update_presentation_contract_is_shared_across_providers() {
+    for source in [WORKFLOW, GITLAB_TEMPLATE] {
+        for field in [
+            "schema: 1",
+            "state:",
+            "updates:",
+            "updates_major:",
+            "updates_minor:",
+            "updates_patch:",
+            "annotations:",
+            "policy_holds:",
+            "blocked:",
+            "changed_paths:",
+            "counts:",
+            "policy:",
+            "validation:",
+            "auto_merge_requested:",
+        ] {
+            assert!(source.contains(field), "missing presentation field {field}");
+        }
+        assert!(source.contains("\\($title_prefix): update \\(.counts.updates) dependencies"));
+        assert!(source.contains("wc -c"));
+        assert!(source.contains("32768"));
+    }
+    assert!(WORKFLOW.contains("> [!IMPORTANT]"));
+    assert!(!GITLAB_TEMPLATE.contains("> [!IMPORTANT]"));
 }
 
 #[test]
@@ -417,6 +599,7 @@ fn workflow_closes_an_obsolete_pr_and_lease_deletes_its_branch() {
 
     assert_eq!(fixture.branch_file(), None);
     assert!(fixture.log().contains("pr close 7 --comment"));
+    assert_eq!(fixture.presentation()["state"], "clean");
 }
 
 #[test]

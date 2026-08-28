@@ -265,7 +265,7 @@ installation token.
 | `fail-on-blocked` | `false` | Fail when a safety condition blocks an update |
 | `branch` | `automation/upd-github-actions` | Automation-owned rolling branch |
 | `commit-message` | `ci(deps): update dependencies with upd` | Generated commit message |
-| `pull-request-title` | `ci(deps): update dependencies with upd` | Pull-request title |
+| `pull-request-title` | derived from update evidence | Optional pull-request title override |
 | `auto-merge` | `false` | Ask GitHub to merge after repository checks pass |
 | `merge-method` | `squash` | Auto-merge strategy: `squash`, `merge`, or `rebase` |
 
@@ -436,6 +436,32 @@ automation-owned. Later successful runs replace them.
 
 The reusable workflow exposes `changed` and `pull-request-url` outputs for caller
 jobs.
+
+## Pull-request review experience
+
+The workflow derives a concise title from the machine-readable update report.
+A single update becomes a title such as
+`chore(deps): update serde to 1.0.228`; multi-package proposals report the exact
+number of updated dependencies. Set `pull-request-title` only when a repository
+needs a fixed override.
+
+The pull-request body is built from a bounded, provider-neutral presentation
+model. It leads with review status and then shows:
+
+- exact versions and changed files;
+- the freshness cooldown, bump ceiling, and lockfile policy used for selection;
+- repository-validation and proposal-integrity results;
+- releases intentionally held back by policy, separately from dependencies upd
+  could not change safely; and
+- auto-merge intent without claiming the pull request is ready to merge before
+  repository checks complete.
+
+Untrusted registry and manifest text is stripped of control characters and
+escaped before rendering. Tables and detail sections have row and text budgets;
+the complete update report and presentation JSON remain available in the
+workflow artifact when the human-facing body is truncated. GitHub rendering uses
+native alert blocks, while the GitLab template renders the same contract using
+GitLab-compatible Markdown.
 
 ## Auto-merge
 

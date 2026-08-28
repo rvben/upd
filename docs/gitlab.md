@@ -102,7 +102,7 @@ but must leave the repository clean; dependency updates belong exclusively to
 | `validation_command` | empty | Check updates before publishing |
 | `branch` | `automation/upd-dependencies` | Automation-owned rolling branch |
 | `commit_message` | `chore(deps): update dependencies with upd` | Generated commit message |
-| `mr_title` | `chore(deps): update dependencies with upd` | Merge-request title |
+| `mr_title` | derived from update evidence | Optional merge-request title override |
 | `auto_merge` | `false` | Ask GitLab to merge after project checks pass |
 
 Input types and formats are checked while GitLab creates the pipeline. When
@@ -138,6 +138,24 @@ The template:
 
 Treat the configured branch, generated commit, title, and description as
 automation-owned. A later successful run replaces them.
+
+## Merge-request review experience
+
+The template derives a concise title from the machine-readable update report.
+A single update becomes a title such as
+`chore(deps): update serde to 1.0.228`; multi-package proposals report the exact
+number of updated dependencies. Set `mr_title` only when a project needs a fixed
+override.
+
+GitLab and GitHub share the same bounded presentation schema. The merge request
+leads with review status, exact version and file changes, active update policy,
+validation evidence, policy-held releases, and dependencies that need manual
+attention. GitLab uses project-native Markdown rather than GitHub alert syntax.
+
+Registry and manifest text is stripped of control characters and escaped before
+rendering. The complete update report, presentation JSON, and rendered merge
+request description are retained under the `.upd-ci` pipeline artifact even when
+the description reaches its display budget.
 
 ## Auto-merge
 
