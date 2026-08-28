@@ -141,7 +141,8 @@ leave the repository clean; dependency changes belong exclusively to `upd`.
 The separate `dependency-remediation.yml` reusable workflow turns a complete
 OSV audit into a narrowly scoped security proposal. It is intentionally not a
 mode of the ordinary updater: security fixes ignore freshness cooldowns and
-bump ceilings, use different failure semantics, and are never auto-merged.
+bump ceilings, use different failure semantics, and keep auto-merge off unless
+the caller explicitly opts in after configuring repository protections.
 
 ```yaml
 name: Daily dependency security remediation
@@ -204,6 +205,16 @@ read-only audit remains the sole SARIF publisher; uploading SARIF from an
 uncommitted remediation workspace could misattribute results to the default
 branch.
 
+The pull request presents a separate, bounded review model derived from that
+evidence. It correlates overlapping OSV aliases into underlying vulnerabilities,
+prefers a CVE and then a GHSA as the human-facing identifier, preserves every
+package occurrence, and distinguishes raw advisory-record counts from correlated
+issues. The generated title names a single issue and package when possible. The
+body leads with review status, impact, file scope, exact version changes, and the
+post-fix result; full JSON reports and the patch remain available in the workflow
+artifact. Advisory-controlled text is stripped of control characters and escaped
+before it reaches GitHub-flavored Markdown.
+
 ### Remediation inputs
 
 | Input | Default | Purpose |
@@ -222,7 +233,9 @@ branch.
 | `validation-command` | required | Validate the complete proposed tree |
 | `branch` | `security/upd` | Automation-owned rolling branch |
 | `commit-message` | `fix(deps): remediate vulnerable dependencies with upd` | Generated Conventional Commit message |
-| `pull-request-title` | same as commit | Rolling pull-request title |
+| `pull-request-title` | derived from audit evidence | Optional rolling pull-request title override |
+| `auto-merge` | `false` | Ask GitHub to auto-merge only a complete, clean remediation |
+| `merge-method` | `squash` | Auto-merge strategy: `squash`, `merge`, or `rebase` |
 
 The only remediation secret is `app-private-key`, paired with
 `app-client-id`. The legacy `app-id` input remains available for existing
@@ -442,6 +455,29 @@ uses administrator bypass. Turning `auto-merge` off disables auto-merge if this
 workflow previously enabled it.
 
 The repository must allow the chosen merge method and have auto-merge enabled.
+
+For security remediation, opt-in auto-merge has additional fail-closed rules:
+
+- only the `clean_changed` disposition can request it;
+- a partial remediation always leaves auto-merge off, even when the caller asks;
+- the request is bound to the exact validated commit with
+  `--match-head-commit`;
+- disabling the input removes a stale auto-merge request from the rolling pull
+  request; and
+- administrator bypass is never used.
+
+Configure a branch protection rule or ruleset with stable required check names
+before enabling this input. Without a required repository condition to wait for,
+GitHub may merge an eligible pull request immediately. The safe rollout order is:
+
+1. Require the repository's stable CI and specification checks on the default
+   branch.
+2. Enable repository auto-merge and confirm the selected merge method is
+   allowed.
+3. Run one published remediation with `auto-merge: false` and inspect all
+   checks.
+4. Set `auto-merge: true`, then verify a fresh canary waits for the required
+   checks and uses the exact generated head commit.
 
 ## Migrating off Dependabot
 

@@ -163,6 +163,16 @@ esac
     }
 
     fn run_publish(&self, disposition: &str, base_sha: &str) -> Output {
+        self.run_publish_with_auto_merge(disposition, base_sha, false, "squash")
+    }
+
+    fn run_publish_with_auto_merge(
+        &self,
+        disposition: &str,
+        base_sha: &str,
+        auto_merge: bool,
+        merge_method: &str,
+    ) -> Output {
         let path = format!(
             "{}:{}",
             self.fake_bin.display(),
@@ -176,6 +186,7 @@ esac
             .env("BASE_SHA", base_sha)
             .env("BODY_FILE", &self.body)
             .env("BRANCH", BRANCH)
+            .env("AUTO_MERGE", auto_merge.to_string())
             .env(
                 "COMMIT_MESSAGE",
                 "fix(deps): remediate vulnerable dependencies with upd",
@@ -186,6 +197,7 @@ esac
             .env("GITHUB_OUTPUT", &self.output)
             .env("GITHUB_REPOSITORY", "owner/project")
             .env("GITHUB_STEP_SUMMARY", &self.summary)
+            .env("MERGE_METHOD", merge_method)
             .env("PATH", path)
             .env(
                 "PR_TITLE",
@@ -272,6 +284,10 @@ fn remediation_requires_structured_results_and_a_fresh_post_fix_audit() {
     assert!(WORKFLOW.contains("before_untracked="));
     assert!(WORKFLOW.contains("partial_changed"));
     assert!(WORKFLOW.contains("residual_no_change"));
+    assert!(WORKFLOW.contains("AUTO_MERGE"));
+    assert!(WORKFLOW.contains("$DISPOSITION\" == clean_changed"));
+    assert!(WORKFLOW.contains("--match-head-commit \"$commit_sha\""));
+    assert!(!WORKFLOW.contains("gh pr merge \"$pr_number\" --admin"));
     assert!(!WORKFLOW.contains("upload-sarif"));
 }
 
@@ -321,7 +337,27 @@ fn classifier_builds_valid_metadata_patch_and_pull_request_body() {
     fs::write(
         report_dir.join("pre-fix.json"),
         r#"{
-  "summary": {"vulnerabilities": 2, "vulnerable_packages": 1},
+  "summary": {"packages_checked": 211, "vulnerabilities": 2, "vulnerable_packages": 1},
+  "vulnerabilities": [
+    {
+      "package": "quinn-proto",
+      "version": "0.11.14",
+      "ecosystem": "crates.io",
+      "id": "GHSA-4w2j-m93h-cj5j",
+      "aliases": ["CVE-2026-25800"],
+      "severity": "High",
+      "summary": "Remote memory exhaustion from unbounded stream reassembly"
+    },
+    {
+      "package": "quinn-proto",
+      "version": "0.11.14",
+      "ecosystem": "crates.io",
+      "id": "RUSTSEC-2026-0185",
+      "aliases": ["CVE-2026-25800", "GHSA-4w2j-m93h-cj5j"],
+      "severity": "High",
+      "summary": "Remote memory exhaustion from unbounded stream reassembly"
+    }
+  ],
   "fixes": [{
     "package": "quinn-proto",
     "from_version": "0.11.14",
@@ -343,6 +379,7 @@ fn classifier_builds_valid_metadata_patch_and_pull_request_body() {
         .arg(workflow_script("Classify the validated result"))
         .current_dir(&fixture.checkout)
         .env("ALLOWED_PATHS", "Cargo.toml")
+        .env("AUTO_MERGE", "false")
         .env("GITHUB_OUTPUT", &fixture.output)
         .env("GITHUB_STEP_SUMMARY", &fixture.summary)
         .env("REPORT_DIR", &report_dir)
@@ -359,16 +396,270 @@ fn classifier_builds_valid_metadata_patch_and_pull_request_body() {
             .unwrap();
     assert_eq!(metadata["disposition"], "clean_changed");
     assert_eq!(metadata["residual_advisory_records"], 0);
+    assert_eq!(
+        metadata["pull_request_title"],
+        "fix(security): resolve CVE-2026-25800 in quinn-proto"
+    );
     assert!(
         !fs::read(report_dir.join("proposal.patch"))
             .unwrap()
             .is_empty()
     );
+    let presentation: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(report_dir.join("presentation.json")).unwrap())
+            .unwrap();
+    assert_eq!(presentation["raw_advisory_records_before"], 2);
+    assert_eq!(presentation["underlying_vulnerabilities_before"], 1);
+    assert_eq!(presentation["issues"][0]["id"], "CVE-2026-25800");
+    assert_eq!(
+        presentation["issues"][0]["occurrences"]
+            .as_array()
+            .unwrap()
+            .len(),
+        2
+    );
     let body = fs::read_to_string(report_dir.join("pull-request.md")).unwrap();
-    assert!(body.contains("Before: 2 OSV advisory record(s) across 1 package(s)"));
-    assert!(body.contains("Applied or satisfied fixes: 1"));
-    assert!(body.contains("`quinn-proto` 0.11.14 → 0.11.15 (`Cargo.lock`)"));
-    assert!(body.contains("After: 0 OSV advisory record(s)"));
+    assert!(body.contains("**Ready for review.**"));
+    assert!(body.contains("resolved 1 High-severity vulnerability in 1 package"));
+    assert!(body.contains("[CVE-2026-25800](https://nvd.nist.gov/vuln/detail/CVE-2026-25800)"));
+    assert!(body.contains("<code>quinn-proto</code>"));
+    assert!(body.contains("<code>0.11.14</code>"));
+    assert!(body.contains("<code>0.11.15</code>"));
+    assert!(
+        body.contains("Before: 2 OSV advisory records, correlated to 1 underlying vulnerability")
+    );
+    assert!(body.contains("After: 0 OSV advisory records"));
+    assert!(body.contains("Auto-merge off"));
+    assert!(body.len() <= 32 * 1024);
+}
+
+#[test]
+fn publisher_enables_auto_merge_only_for_a_clean_exact_head() {
+    let fixture = Fixture::new();
+    let base = fixture.base_sha();
+    fixture.stage_change("1.0.1");
+    let output = fixture.run_publish_with_auto_merge("clean_changed", &base, true, "squash");
+    assert!(
+        output.status.success(),
+        "publisher failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let commit_sha = String::from_utf8(
+        git(
+            &fixture.checkout,
+            &["rev-parse", &format!("refs/remotes/origin/{BRANCH}")],
+        )
+        .stdout,
+    )
+    .unwrap();
+    let expected = format!(
+        "pr merge 7 --repo owner/project --auto --squash --match-head-commit {}",
+        commit_sha.trim()
+    );
+    assert!(fixture.log().contains(&expected), "log:\n{}", fixture.log());
+    assert!(!fixture.log().contains("--admin"));
+}
+
+#[test]
+fn publisher_refuses_auto_merge_for_partial_remediation() {
+    let fixture = Fixture::new();
+    let base = fixture.base_sha();
+    fixture.stage_change("1.0.1");
+    let output = fixture.run_publish_with_auto_merge("partial_changed", &base, true, "squash");
+    assert!(
+        output.status.success(),
+        "publisher failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(!fixture.log().contains("--auto"), "log:\n{}", fixture.log());
+}
+
+#[test]
+fn presentation_neutralizes_untrusted_markdown_and_control_characters() {
+    let fixture = Fixture::new();
+    fixture.stage_change("1.0.1");
+    let report_dir = fixture.state.join("hostile-reports");
+    fs::create_dir(&report_dir).unwrap();
+    fs::write(
+        report_dir.join("pre-fix.json"),
+        "{\n\
+          \"summary\": {\"packages_checked\": 1, \"vulnerabilities\": 1, \"vulnerable_packages\": 1},\n\
+          \"vulnerabilities\": [{\n\
+            \"package\": \"bad|pkg</code>\",\n\
+            \"version\": \"1.0.0`\",\n\
+            \"ecosystem\": \"npm\",\n\
+            \"id\": \"GHSA-aaaa-bbbb-cccc\",\n\
+            \"aliases\": [\"CVE-2026-99999\"],\n\
+            \"severity\": \"High\",\n\
+            \"summary\": \"<script>alert(1)</script> *urgent* [click](https://evil.invalid) \u{202e}spoof\"\n\
+          }],\n\
+          \"fixes\": [{\n\
+            \"package\": \"bad|pkg</code>\", \"from_version\": \"1.0.0`\",\n\
+            \"to_version\": \"1.0.1\", \"path\": \"Cargo.toml|oops\", \"status\": \"applied\"\n\
+          }]\n\
+        }",
+    )
+    .unwrap();
+    fs::write(
+        report_dir.join("post-fix.json"),
+        r#"{"summary":{"vulnerabilities":0},"vulnerabilities":[]}"#,
+    )
+    .unwrap();
+
+    let output = Command::new("bash")
+        .arg("-c")
+        .arg(workflow_script("Classify the validated result"))
+        .current_dir(&fixture.checkout)
+        .env("ALLOWED_PATHS", "Cargo.toml")
+        .env("AUTO_MERGE", "false")
+        .env("GITHUB_OUTPUT", &fixture.output)
+        .env("GITHUB_STEP_SUMMARY", &fixture.summary)
+        .env("REPORT_DIR", &report_dir)
+        .output()
+        .expect("classifier script starts");
+    assert!(
+        output.status.success(),
+        "classifier failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let body = fs::read_to_string(report_dir.join("pull-request.md")).unwrap();
+    assert!(!body.contains("<script>"));
+    assert!(!body.contains("*urgent*"));
+    assert!(!body.contains("[click](https://evil.invalid)"));
+    assert!(!body.contains('\u{202e}'));
+    assert!(body.contains("&lt;script&gt;alert(1)&lt;/script&gt;"));
+    assert!(body.contains("&#42;urgent&#42;"));
+    assert!(body.contains("bad&#124;pkg&lt;/code&gt;"));
+
+    let metadata: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(report_dir.join("metadata.json")).unwrap())
+            .unwrap();
+    assert_eq!(
+        metadata["pull_request_title"],
+        "fix(security): resolve CVE-2026-99999"
+    );
+}
+
+#[test]
+fn presentation_describes_partial_results_without_overclaiming() {
+    let fixture = Fixture::new();
+    fixture.stage_change("1.0.1");
+    let report_dir = fixture.state.join("partial-reports");
+    fs::create_dir(&report_dir).unwrap();
+    let vulnerability = r#"{
+      "package":"example", "version":"1.0.0", "ecosystem":"npm",
+      "id":"GHSA-aaaa-bbbb-cccc", "aliases":["CVE-2026-12345"],
+      "severity":"Critical", "summary":"A critical test vulnerability"
+    }"#;
+    fs::write(
+        report_dir.join("pre-fix.json"),
+        format!(
+            r#"{{"summary":{{"packages_checked":1,"vulnerabilities":1,"vulnerable_packages":1}},"vulnerabilities":[{vulnerability}],"fixes":[{{"package":"example","from_version":"1.0.0","to_version":"1.0.1","path":"Cargo.toml","status":"applied"}}]}}"#
+        ),
+    )
+    .unwrap();
+    fs::write(
+        report_dir.join("post-fix.json"),
+        format!(r#"{{"summary":{{"vulnerabilities":1}},"vulnerabilities":[{vulnerability}]}}"#),
+    )
+    .unwrap();
+
+    let output = Command::new("bash")
+        .arg("-c")
+        .arg(workflow_script("Classify the validated result"))
+        .current_dir(&fixture.checkout)
+        .env("ALLOWED_PATHS", "Cargo.toml")
+        .env("AUTO_MERGE", "true")
+        .env("GITHUB_OUTPUT", &fixture.output)
+        .env("GITHUB_STEP_SUMMARY", &fixture.summary)
+        .env("REPORT_DIR", &report_dir)
+        .output()
+        .expect("classifier script starts");
+    assert!(output.status.success());
+
+    let body = fs::read_to_string(report_dir.join("pull-request.md")).unwrap();
+    assert!(body.contains("**Partial fix ready for review.**"));
+    assert!(body.contains("This is not a complete remediation."));
+    assert!(body.contains("### Still needs attention"));
+    assert!(body.contains("Auto-merge off"));
+    assert!(!body.contains("fresh audit clean"));
+    assert!(!body.contains("found no remaining advisory records"));
+}
+
+#[test]
+fn configuration_rejects_an_unknown_merge_method() {
+    let fixture = Fixture::new();
+    let output = Command::new("bash")
+        .arg("-c")
+        .arg(workflow_script("Validate configuration"))
+        .current_dir(&fixture.checkout)
+        .env("ALLOWED_PATHS", "Cargo.toml")
+        .env("BASE_BRANCH", "main")
+        .env("BRANCH", BRANCH)
+        .env("MERGE_METHOD", "octopus")
+        .env("VALIDATION_COMMAND", "cargo test")
+        .output()
+        .expect("configuration script starts");
+    assert_eq!(output.status.code(), Some(4));
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .contains("merge-method must be squash, merge, or rebase")
+    );
+}
+
+#[test]
+fn presentation_keeps_no_change_states_truthful() {
+    for (name, pre, post, expected_disposition, expected_copy) in [
+        (
+            "clean",
+            r#"{"summary":{"packages_checked":9,"vulnerabilities":0,"vulnerable_packages":0},"vulnerabilities":[],"fixes":[]}"#,
+            r#"{"summary":{"vulnerabilities":0},"vulnerabilities":[]}"#,
+            "clean_no_change",
+            "**No remediation needed.**",
+        ),
+        (
+            "residual",
+            r#"{"summary":{"packages_checked":9,"vulnerabilities":1,"vulnerable_packages":1},"vulnerabilities":[{"package":"example","version":"1.0.0","ecosystem":"npm","id":"GHSA-aaaa-bbbb-cccc","severity":"High","summary":"Test vulnerability"}],"fixes":[]}"#,
+            r#"{"summary":{"vulnerabilities":1},"vulnerabilities":[{"package":"example","version":"1.0.0","ecosystem":"npm","id":"GHSA-aaaa-bbbb-cccc","severity":"High","summary":"Test vulnerability"}]}"#,
+            "residual_no_change",
+            "**No safe automated fix available.**",
+        ),
+    ] {
+        let fixture = Fixture::new();
+        let report_dir = fixture.state.join(format!("{name}-no-change-reports"));
+        fs::create_dir(&report_dir).unwrap();
+        fs::write(report_dir.join("pre-fix.json"), pre).unwrap();
+        fs::write(report_dir.join("post-fix.json"), post).unwrap();
+
+        let output = Command::new("bash")
+            .arg("-c")
+            .arg(workflow_script("Classify the validated result"))
+            .current_dir(&fixture.checkout)
+            .env("ALLOWED_PATHS", "Cargo.toml")
+            .env("AUTO_MERGE", "false")
+            .env("GITHUB_OUTPUT", &fixture.output)
+            .env("GITHUB_STEP_SUMMARY", &fixture.summary)
+            .env("REPORT_DIR", &report_dir)
+            .output()
+            .expect("classifier script starts");
+        assert!(
+            output.status.success(),
+            "classifier failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        let presentation: serde_json::Value = serde_json::from_str(
+            &fs::read_to_string(report_dir.join("presentation.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(presentation["disposition"], expected_disposition);
+        let body = fs::read_to_string(report_dir.join("pull-request.md")).unwrap();
+        assert!(body.contains(expected_copy), "body:\n{body}");
+        assert!(!body.contains("**Ready for review.**"), "body:\n{body}");
+        assert!(!body.contains("Complete remediation; fresh audit clean") || name == "clean");
+    }
 }
 
 #[test]

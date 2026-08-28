@@ -52,9 +52,17 @@ on:
         type: string
         default: "fix(deps): remediate vulnerable dependencies with upd"
       pull-request-title:
-        description: Pull-request title
+        description: Pull-request title override; empty derives a concise title from audit evidence
         type: string
-        default: "fix(deps): remediate vulnerable dependencies with upd"
+        default: ""
+      auto-merge:
+        description: Ask GitHub to merge a complete remediation after repository requirements pass
+        type: boolean
+        default: false
+      merge-method:
+        description: Auto-merge strategy when auto-merge is enabled
+        type: string
+        default: squash
       app-client-id:
         description: GitHub App Client ID; preferred when publish is true
         type: string
@@ -109,6 +117,7 @@ jobs:
           ALLOWED_PATHS: ${{ inputs.allowed-paths }}
           BASE_BRANCH: ${{ github.event.repository.default_branch }}
           BRANCH: ${{ inputs.branch }}
+          MERGE_METHOD: ${{ inputs.merge-method }}
           VALIDATION_COMMAND: ${{ inputs.validation-command }}
         shell: bash
         run: |
@@ -129,6 +138,10 @@ jobs:
             echo "The automation branch must differ from the default branch" >&2
             exit 4
           fi
+          case "$MERGE_METHOD" in
+            squash|merge|rebase) ;;
+            *) echo "merge-method must be squash, merge, or rebase" >&2; exit 4 ;;
+          esac
           read -r -a allowed <<< "$ALLOWED_PATHS"
           for path in "${allowed[@]}"; do
             if [[ "$path" == /* || "$path" == . || "$path" == .. || "$path" == ../* || "$path" == */../* || "$path" == */.. ]]; then
@@ -357,6 +370,7 @@ jobs:
         id: classify
         env:
           ALLOWED_PATHS: ${{ inputs.allowed-paths }}
+          AUTO_MERGE: ${{ inputs.auto-merge }}
           REPORT_DIR: ${{ runner.temp }}/upd-security-remediation
         shell: bash
         run: |
@@ -388,11 +402,132 @@ jobs:
             literal_allowed+=(":(literal)$path")
           done
           git diff --binary HEAD -- "${literal_allowed[@]}" > "$REPORT_DIR/proposal.patch"
+          mapfile -t changed_paths < <(git diff --name-only HEAD)
+          changed_paths_json="$(printf '%s\n' "${changed_paths[@]}" | jq --raw-input --slurp 'split("\n") | map(select(length > 0))')"
           patch_sha="$(sha256sum "$REPORT_DIR/proposal.patch" | cut -d ' ' -f 1)"
+
+          # Correlate OSV aliases into underlying issues before presenting the
+          # result. Raw reports remain the canonical evidence; this bounded,
+          # provider-neutral model exists solely to make review decisions fast.
+          jq \
+            --arg disposition "$disposition" \
+            --argjson auto_merge "$AUTO_MERGE" \
+            --argjson changed_paths "$changed_paths_json" \
+            --slurpfile post "$REPORT_DIR/post-fix.json" '
+            def clean($limit):
+              if . == null then "" else tostring end
+              | gsub("[\\x00-\\x1f\\x7f\u202a-\u202e\u2066-\u2069]"; " ")
+              | gsub("[[:space:]]+"; " ")
+              | sub("^ "; "") | sub(" $"; "")
+              | .[0:$limit];
+            def ids:
+              [(.id? // empty), (.aliases[]? // empty)]
+              | map(select(type == "string") | clean(80) | ascii_upcase | select(length > 0))
+              | unique;
+            def overlaps($left; $right):
+              any($left[]; . as $id | $right | index($id) != null);
+            def groups:
+              reduce .[] as $record ([];
+                ($record | ids) as $record_ids
+                | ([.[] | select(overlaps(.ids; $record_ids))]) as $matched
+                | ([.[] | select(overlaps(.ids; $record_ids) | not)]) as $rest
+                | $rest + [{
+                    ids: (($record_ids + ($matched | map(.ids) | add // [])) | unique),
+                    records: (([$record] + ($matched | map(.records) | add // [])))
+                  }]
+              );
+            def preferred_id:
+              .ids as $all
+              | (([$all[] | select(test("^CVE-[0-9]{4}-[0-9]{4,}$"))] | sort | .[0]) //
+                 ([$all[] | select(test("^GHSA-[0-9A-Z-]+$"))] | sort | .[0]) //
+                 ($all | sort | .[0]) // "OSV advisory");
+            def severity_rank:
+              ascii_downcase as $severity
+              | if $severity == "critical" then 0
+                elif $severity == "high" then 1
+                elif $severity == "medium" or $severity == "moderate" then 2
+                elif $severity == "low" then 3
+                else 4 end;
+            def issue:
+              . as $group
+              | ($group | preferred_id) as $id
+              | ([.records[] | (.severity // "Unknown" | clean(24))]
+                 | sort_by(severity_rank) | .[0] // "Unknown") as $severity
+              | ([.records[] | .summary? | select(type == "string") | clean(240) | select(length > 0)]
+                 | unique | sort_by([length, .]) | reverse | .[0] // "Dependency vulnerability reported by OSV.") as $summary
+              | {
+                  id: $id,
+                  severity: $severity,
+                  summary: $summary,
+                  aliases: ($group.ids | map(select(. != $id)) | sort),
+                  occurrences: ([.records[] | {
+                    package: (.package // "unknown package" | clean(160)),
+                    version: (.version // "unknown version" | clean(160)),
+                    ecosystem: (.ecosystem // "unknown ecosystem" | clean(80)),
+                    advisory_id: (.id // "unknown advisory" | clean(80))
+                  }] | unique_by([.package, .version, .ecosystem, .advisory_id]) | sort_by([.package, .version, .advisory_id]))
+                };
+            def issue_groups: groups | map(issue) | sort_by([.id, .severity]);
+            . as $pre
+            | ($pre.vulnerabilities // [] | issue_groups) as $issues
+            | ($post[0].vulnerabilities // [] | issue_groups) as $remaining
+            | ([($pre.fixes // [])[]
+                | select(.status == "applied" or .status == "already_satisfied")
+                | {
+                    package: (.package // "unknown package" | clean(160)),
+                    from_version: (.from_version // "unknown" | clean(160)),
+                    to_version: (.to_version // "resolved lockfile floor" | clean(160)),
+                    path: (.path // "lockfile" | clean(160)),
+                    status: .status
+                  }] | unique_by([.package, .from_version, .to_version, .path, .status])
+                     | sort_by([.package, .path, .from_version, .to_version])) as $fixes
+            | ($issues | map(.occurrences[].package) | unique | sort) as $packages
+            | ($issues | map(.severity) | sort_by(severity_rank) | .[0] // "Unknown") as $highest_severity
+            | {
+                schema: 1,
+                disposition: $disposition,
+                auto_merge_requested: $auto_merge,
+                raw_advisory_records_before: ($pre.summary.vulnerabilities // 0),
+                raw_advisory_records_after: ($post[0].summary.vulnerabilities // 0),
+                packages_checked: ($pre.summary.packages_checked // 0),
+                vulnerable_packages_before: ($pre.summary.vulnerable_packages // ($packages | length)),
+                underlying_vulnerabilities_before: ($issues | length),
+                underlying_vulnerabilities_after: ($remaining | length),
+                highest_severity_before: $highest_severity,
+                packages: $packages,
+                changed_paths: $changed_paths,
+                issues: $issues,
+                remaining_issues: $remaining,
+                fixes: $fixes
+              }
+            | .pull_request_title = (
+                if .underlying_vulnerabilities_before == 0 then
+                  "chore(security): confirm dependency graph is clean"
+                elif .underlying_vulnerabilities_before == 1 then
+                  if ((.issues[0].id | test("^[A-Z0-9][A-Z0-9._:+-]{0,79}$")) and
+                      (.packages | length) == 1 and
+                      (.packages[0] | test("^[A-Za-z0-9@][A-Za-z0-9._@/+-]{0,79}$"))) then
+                    "fix(security): resolve \(.issues[0].id) in \(.packages[0])"
+                  elif (.issues[0].id | test("^[A-Z0-9][A-Z0-9._:+-]{0,79}$")) then
+                    "fix(security): resolve \(.issues[0].id)"
+                  else
+                    "fix(security): resolve dependency vulnerability"
+                  end
+                elif ((.packages | length) == 1 and
+                      (.packages[0] | test("^[A-Za-z0-9@][A-Za-z0-9._@/+-]{0,79}$"))) then
+                  "fix(security): resolve \(.underlying_vulnerabilities_before) vulnerabilities in \(.packages[0])"
+                else
+                  "fix(security): resolve \(.underlying_vulnerabilities_before) vulnerabilities across \(.packages | length) packages"
+                end
+                | clean(72)
+              )
+          ' "$REPORT_DIR/pre-fix.json" > "$REPORT_DIR/presentation.json"
+
           jq --null-input \
             --arg base_sha "$base_sha" \
             --arg disposition "$disposition" \
             --arg patch_sha256 "$patch_sha" \
+            --arg pull_request_title "$(jq --raw-output '.pull_request_title' "$REPORT_DIR/presentation.json")" \
             --argjson changed "$changed" \
             --argjson residual "$residual" \
             '{
@@ -401,52 +536,101 @@ jobs:
               changed: $changed,
               disposition: $disposition,
               residual_advisory_records: $residual,
-              patch_sha256: $patch_sha256
+              patch_sha256: $patch_sha256,
+              pull_request_title: $pull_request_title
             }' > "$REPORT_DIR/metadata.json"
 
-          {
-            echo "Automated vulnerability remediation generated by [upd](https://github.com/rvben/upd)."
-            echo
-            if [[ "$disposition" == partial_changed ]]; then
-              echo "> **Partial remediation:** validated fixes are included, but the post-fix audit still reports $residual OSV advisory record(s). This pull request is not a complete remediation."
-              echo
-            fi
-            echo "### Audit result"
-            echo
+          jq --raw-output '
+            def md:
+              tostring | @html
+              | gsub("`"; "&#96;") | gsub("\\*"; "&#42;") | gsub("_"; "&#95;")
+              | gsub("\\["; "&#91;") | gsub("\\]"; "&#93;") | gsub("\\|"; "&#124;")
+              | gsub("\\\\"; "&#92;");
+            def code: "<code>\(. | md)</code>";
+            def plural($count; $one; $many): if $count == 1 then $one else $many end;
+            def issue_url:
+              .id as $id
+              | if ($id | test("^CVE-[0-9]{4}-[0-9]{4,}$")) then
+                  "https://nvd.nist.gov/vuln/detail/\($id | @uri)"
+                elif ($id | test("^GHSA-[0-9A-Z-]+$")) then
+                  "https://github.com/advisories/\($id | @uri)"
+                else
+                  "https://osv.dev/vulnerability/\($id | @uri)"
+                end;
+            def issue_line:
+              "**[\(.id | md)](\(. | issue_url)) · \(.severity | md)**  \n\(.summary | md)";
+            def path_scope:
+              if (.changed_paths | length) == 0 then "No repository files changed"
+              elif (.changed_paths | length) <= 3 then (.changed_paths | map(code) | join(", "))
+              else "\(.changed_paths[:3] | map(code) | join(", ")) and \(.changed_paths | length - 3) more"
+              end;
+            def header:
+              if .disposition == "clean_no_change" then
+                "> [!NOTE]\n> **No remediation needed.** A complete, fresh audit found no remaining advisory records and upd made no repository changes."
+              elif .disposition == "residual_no_change" then
+                "> [!WARNING]\n> **No safe automated fix available.** A complete, fresh audit still found \(.raw_advisory_records_after) OSV advisory \(plural(.raw_advisory_records_after; "record"; "records")), and upd made no repository changes."
+              elif .disposition == "partial_changed" then
+                "> [!WARNING]\n> **Partial fix ready for review.** upd applied validated dependency changes, but a fresh audit still found \(.raw_advisory_records_after) OSV advisory \(plural(.raw_advisory_records_after; "record"; "records")). This is not a complete remediation."
+              else
+                (.highest_severity_before // "Unknown") as $highest
+                | (if ($highest | ascii_downcase) == "unknown" then "" else $highest end) as $severity
+                | (if .underlying_vulnerabilities_before == 1 and $severity != "" then
+                     "1 \($severity)-severity vulnerability"
+                   elif $severity != "" then
+                     "\(.underlying_vulnerabilities_before) vulnerabilities (highest severity: \($severity))"
+                   else
+                     "\(.underlying_vulnerabilities_before) \(plural(.underlying_vulnerabilities_before; "vulnerability"; "vulnerabilities"))"
+                   end) as $finding_summary
+                | "> [!IMPORTANT]\n> **Ready for review.** upd resolved \($finding_summary) in \(.packages | length) \(plural((.packages | length); "package"; "packages")). A fresh audit found no remaining advisory records."
+              end;
+            def overview:
+              "| | |\n|---|---|\n" +
+              "| **Result** | \(if .disposition == "partial_changed" then "Partial remediation; manual follow-up required" elif .disposition == "residual_no_change" then "Finding remains; no safe automated change" elif .disposition == "clean_no_change" then "Already clean; no repository change" else "Complete remediation; fresh audit clean" end) |\n" +
+              "| **Scope** | \(path_scope) |\n" +
+              "| **Validation** | Repository command passed · diff check passed · fresh uncached audit complete |\n" +
+              "| **Merge** | \(if (.auto_merge_requested and .disposition == "clean_changed") then "Auto-merge requested · repository requirements still control readiness" else "Auto-merge off · repository checks still control readiness" end) |";
+            def why:
+              "### Why this matters\n\n" +
+              (if (.issues | length) == 0 then "No advisory details were present in the complete audit."
+               else (.issues[:5] | map(issue_line) | join("\n\n")) end) +
+              (if (.issues | length) > 5 then "\n\n_\(.issues | length - 5) more underlying vulnerabilities are preserved in the evidence artifact._" else "" end);
+            def changes:
+              "### What changed\n\n" +
+              (if (.fixes | length) == 0 then
+                 "upd produced a validated dependency-graph change; exact patch details are preserved in the evidence artifact."
+               else
+                 "| Package | Before | After | File |\n|---|---:|---:|---|\n" +
+                 (.fixes[:20] | map("| \(.package | code) | \(.from_version | code) | \(.to_version | code) | \(.path | code) |") | join("\n")) +
+                 (if (.fixes | length) > 20 then "\n\n_\(.fixes | length - 20) more changes are preserved in the evidence artifact._" else "" end)
+               end);
+            def remaining:
+              if (.remaining_issues | length) == 0 then ""
+              else
+                "\n\n### Still needs attention\n\n" +
+                (.remaining_issues[:10] | map(issue_line) | join("\n\n")) +
+                (if (.remaining_issues | length) > 10 then "\n\n_\(.remaining_issues | length - 10) more remaining vulnerabilities are preserved in the evidence artifact._" else "" end)
+              end;
+            def evidence:
+              "<details>\n<summary><strong>Audit evidence</strong></summary>\n\n" +
+              "- Packages checked: \(.packages_checked)\n" +
+              "- Before: \(.raw_advisory_records_before) OSV advisory \(plural(.raw_advisory_records_before; "record"; "records")), correlated to \(.underlying_vulnerabilities_before) underlying \(plural(.underlying_vulnerabilities_before; "vulnerability"; "vulnerabilities"))\n" +
+              "- After: \(.raw_advisory_records_after) OSV advisory \(plural(.raw_advisory_records_after; "record"; "records"))\n" +
+              "- Changed-path allowlist enforced\n" +
+              "- Full JSON reports, presentation model, metadata, and patch retained in the workflow artifact\n\n" +
+              "</details>";
+            header + "\n\n" + overview + "\n\n" + why + "\n\n" + changes + remaining + "\n\n" + evidence +
+            "\n\n> [!NOTE]\n> upd\u2019s own validation passed. Review the repository checks on this pull request before merging." +
+            "\n\n---\nGenerated by [upd](https://github.com/rvben/upd) from a complete, uncached OSV audit."
+          ' "$REPORT_DIR/presentation.json" > "$REPORT_DIR/pull-request.md"
+
+          if [[ "$(wc -c < "$REPORT_DIR/pull-request.md")" -gt 32768 ]]; then
             jq --raw-output '
-              "- Before: \(.summary.vulnerabilities) OSV advisory record(s) across \(.summary.vulnerable_packages) package(s)\n" +
-              "- Applied or satisfied fixes: \([.fixes[]? | select(.status == "applied" or .status == "already_satisfied")] | length)\n" +
-              "- Unfixable outcomes: \([.fixes[]? | select(.status == "unfixable")] | length)"
-            ' "$REPORT_DIR/pre-fix.json"
-            echo "- After: $residual OSV advisory record(s)"
-            echo
-            echo "### Applied fixes"
-            echo
-            jq --raw-output '
-              .fixes[]? |
-              select(.status == "applied" or .status == "already_satisfied") |
-              "- `\(.package)` \(.from_version) → \(.to_version // "resolved lockfile floor") (`\(.path // "lockfile")`)"
-            ' "$REPORT_DIR/pre-fix.json"
-            if [[ "$residual" -gt 0 ]]; then
-              echo
-              echo "### Remaining findings"
-              echo
-              jq --raw-output '
-                .vulnerabilities[]? |
-                "- `\(.id)` in `\(.package)@\(.version)`" +
-                (if .fixed_version then " (fixed in \(.fixed_version))" else " (no published fixed version)" end)
-              ' "$REPORT_DIR/post-fix.json"
-            fi
-            echo
-            echo "### Validation"
-            echo
-            echo "- Repository validation command completed successfully"
-            echo "- \`git diff --check\`"
-            echo "- Fresh uncached post-fix \`upd audit\`"
-            echo "- Changed-path allowlist enforced"
-            echo
-            echo "Auto-merge is intentionally disabled."
-          } > "$REPORT_DIR/pull-request.md"
+              "## Security remediation ready for review\n\n" +
+              "upd produced a validated remediation for \(.underlying_vulnerabilities_before) underlying vulnerability record group(s). " +
+              "The detailed presentation exceeded GitHub\u2019s configured body budget, so the full evidence is retained in the workflow artifact.\n\n" +
+              "> [!NOTE]\n> Review the repository checks on this pull request before merging."
+            ' "$REPORT_DIR/presentation.json" > "$REPORT_DIR/pull-request.md"
+          fi
 
           {
             echo "base-sha=$base_sha"
@@ -608,11 +792,17 @@ jobs:
           DISPOSITION: ${{ needs.generate.outputs.disposition }}
           GH_TOKEN: ${{ steps.app-token.outputs.token || steps.legacy-app-token.outputs.token }}
           PR_TITLE: ${{ inputs.pull-request-title }}
+          AUTO_MERGE: ${{ inputs.auto-merge }}
+          MERGE_METHOD: ${{ inputs.merge-method }}
         shell: bash
         run: |
           set -euo pipefail
           output_file="$GITHUB_OUTPUT"
           summary_file="$GITHUB_STEP_SUMMARY"
+          pr_title="$PR_TITLE"
+          if [[ -z "$pr_title" ]]; then
+            pr_title="$(jq --raw-output '.pull_request_title' "$(dirname "$BODY_FILE")/metadata.json")"
+          fi
 
           # Configure Git's credential helper from the masked, short-lived App
           # token. Unlike persisting checkout credentials, this happens only
@@ -707,7 +897,7 @@ jobs:
               --repo "$GITHUB_REPOSITORY" \
               --base "$BASE_BRANCH" \
               --head "$BRANCH" \
-              --title "$PR_TITLE" \
+              --title "$pr_title" \
               --body-file "$BODY_FILE" >/dev/null
             pr_list="$(find_open_prs)"
             require_unambiguous_pr "$pr_list"
@@ -719,7 +909,7 @@ jobs:
             pr_number="$(jq --raw-output '.[0].number' <<< "$pr_list")"
             gh pr edit "$pr_number" \
               --repo "$GITHUB_REPOSITORY" \
-              --title "$PR_TITLE" \
+              --title "$pr_title" \
               --body-file "$BODY_FILE" >/dev/null
           fi
 
@@ -729,10 +919,17 @@ jobs:
             echo "GitHub returned an invalid pull-request response" >&2
             exit 2
           fi
-          if [[ "$(gh pr view "$pr_number" --repo "$GITHUB_REPOSITORY" \
+          if [[ "$AUTO_MERGE" == true && "$DISPOSITION" == clean_changed ]]; then
+            gh pr merge "$pr_number" \
+              --repo "$GITHUB_REPOSITORY" \
+              --auto \
+              "--${MERGE_METHOD}" \
+              --match-head-commit "$commit_sha"
+            echo "Requested GitHub auto-merge for $pr_url after repository requirements pass" >> "$summary_file"
+          elif [[ "$(gh pr view "$pr_number" --repo "$GITHUB_REPOSITORY" \
             --json autoMergeRequest --jq '.autoMergeRequest != null')" == true ]]; then
-            gh pr merge "$pr_number" --repo "$GITHUB_REPOSITORY" --disable-auto
-            echo "Disabled auto-merge for $pr_url" >> "$summary_file"
+              gh pr merge "$pr_number" --repo "$GITHUB_REPOSITORY" --disable-auto
+              echo "Disabled auto-merge for $pr_url" >> "$summary_file"
           fi
 
           echo "url=$pr_url" >> "$output_file"
