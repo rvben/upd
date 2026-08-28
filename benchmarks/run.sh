@@ -60,6 +60,10 @@ trap cleanup EXIT
 
 mkdir -p "$result_dir" "$work_dir/python" "$work_dir/actions"
 
+if [[ ${BENCH_VERIFY:-1} == 1 ]]; then
+  UPD_BIN="$upd_bin" "$benchmark_dir/verify-outputs.sh" | tee "$result_dir/verification.txt"
+fi
+
 printf -v q_upd '%q' "$upd_bin"
 printf -v q_python_fixture '%q' "$benchmark_dir/fixtures/python/pyproject.toml"
 printf -v q_python_work '%q' "$work_dir/python/pyproject.toml"
@@ -68,7 +72,7 @@ printf -v q_actions_work '%q' "$work_dir/actions"
 printf -v q_actions_file '%q' "$work_dir/actions/.github/workflows/ci.yml"
 printf -v q_ratchet_check_output '%q' "$work_dir/ratchet-check-output.yml"
 
-python_prepare="cp $q_python_fixture $q_python_work"
+python_prepare="cp $q_python_fixture $q_python_work; rm -f -- $work_dir/python/updated.toml"
 actions_prepare="rm -rf -- $q_actions_work && cp -R $q_actions_fixture $q_actions_work"
 
 common=(
@@ -93,7 +97,7 @@ hyperfine \
   --command-name upd \
   "$q_upd --apply --no-cache --format json --lang python $q_python_work >/dev/null" \
   --command-name uppd \
-  "(cd $work_dir/python && uppd >/dev/null)"
+  "(cd $work_dir/python && uppd --outfile updated.toml >/dev/null)"
 
 hyperfine \
   "${common[@]}" \

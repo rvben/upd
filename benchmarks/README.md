@@ -22,7 +22,10 @@ and GitHub release discovery rather than repository traversal.
 The fixture contains twelve exact direct requirements in project dependencies.
 The check benchmark discovers newer PyPI releases without writing. The update
 benchmark starts from the same pristine `pyproject.toml` for every run and
-writes newer exact constraints.
+writes newer exact constraints. `uppd` uses its documented separate-output mode
+because version 1.6.0 appends an extra closing bracket when overwriting this
+fixture in place; the verifier rejects that malformed default output rather
+than timing it as success.
 
 Compared tools:
 
@@ -77,6 +80,12 @@ The installer reads [`versions.env`](versions.env), uses a generic HTTP user
 agent, verifies the published pinact SHA-256 and ratchet SHA-512 checksums, and
 keeps Python/npm tool environments out of the timed commands.
 
+Before timing, [`verify-outputs.sh`](verify-outputs.sh) runs every update command
+once and checks the result: both Python tools must raise all 12 exact constraints
+and leave parseable TOML; every Actions tool must change all 6 references while
+retaining the workflow structure. The verification transcript is stored beside
+the raw timing data.
+
 ## Run
 
 ```bash
@@ -89,6 +98,7 @@ Optional controls:
 BENCH_RUNS=10 BENCH_WARMUP=2 ./benchmarks/run.sh
 BENCH_RESULT_DIR=/tmp/upd-benchmark-results ./benchmarks/run.sh
 UPD_BIN=/path/to/upd ./benchmarks/run.sh
+BENCH_VERIFY=0 ./benchmarks/run.sh # timing only; skips output verification
 ```
 
 The default is one warm-up followed by five measured runs. Raw Hyperfine JSON
@@ -100,6 +110,8 @@ JSON can be committed when refreshing the published results.
 
 - Hyperfine restores the relevant fixture before every command, including each
   warm-up.
+- `uppd` writes `updated.toml`; `upd` updates the restored fixture in place. Both
+  results must pass the same TOML and 12-change verification.
 - Tool installation and package-manager startup are excluded; CLI startup,
   parsing, registry/API work, comparison, and writing are included.
 - `upd --no-cache` disables its 24-hour semantic version cache. Other tools are
@@ -109,8 +121,9 @@ JSON can be committed when refreshing the published results.
 - Registry and GitHub API responses are live. DNS, TLS, CDN latency, upstream
   rate limits, and server-side caches remain sources of variance. Treat results
   as observations of the recorded environment, not universal constants.
-- Update output is verified manually before publishing a result: every tool must
-  change the intended dependencies and leave parseable TOML/YAML.
+- Update output is verified automatically before timing. This catches commands
+  that exit successfully without performing the intended workload; the reviewed
+  dated summary still records any output-policy differences.
 - Commands that intentionally signal pending updates with exit code `1` are
   wrapped with an exact status assertion. An unexpected success or any error
   status stops Hyperfine instead of measuring an error path.
