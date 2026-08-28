@@ -411,8 +411,8 @@ jobs:
             echo
             jq --raw-output '
               "- Before: \(.summary.vulnerabilities) OSV advisory record(s) across \(.summary.vulnerable_packages) package(s)\n" +
-              "- Applied or satisfied fixes: \([.fixes[]? | select(.status == \"applied\" or .status == \"already_satisfied\")] | length)\n" +
-              "- Unfixable outcomes: \([.fixes[]? | select(.status == \"unfixable\")] | length)"
+              "- Applied or satisfied fixes: \([.fixes[]? | select(.status == "applied" or .status == "already_satisfied")] | length)\n" +
+              "- Unfixable outcomes: \([.fixes[]? | select(.status == "unfixable")] | length)"
             ' "$REPORT_DIR/pre-fix.json"
             echo "- After: $residual OSV advisory record(s)"
             echo
@@ -421,7 +421,7 @@ jobs:
             jq --raw-output '
               .fixes[]? |
               select(.status == "applied" or .status == "already_satisfied") |
-              "- `\(.package)` \(.from_version) → \(.to_version // \"resolved lockfile floor\") (`\(.path // \"lockfile\")`)"
+              "- `\(.package)` \(.from_version) → \(.to_version // "resolved lockfile floor") (`\(.path // "lockfile")`)"
             ' "$REPORT_DIR/pre-fix.json"
             if [[ "$residual" -gt 0 ]]; then
               echo

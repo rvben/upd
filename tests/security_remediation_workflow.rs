@@ -309,6 +309,65 @@ fn validation_cannot_hide_a_mutation_in_the_git_index() {
 }
 
 #[test]
+fn classifier_builds_valid_metadata_patch_and_pull_request_body() {
+    let fixture = Fixture::new();
+    fixture.stage_change("1.0.1");
+    let report_dir = fixture.state.join("reports");
+    fs::create_dir(&report_dir).unwrap();
+    fs::write(
+        report_dir.join("pre-fix.json"),
+        r#"{
+  "summary": {"vulnerabilities": 2, "vulnerable_packages": 1},
+  "fixes": [{
+    "package": "quinn-proto",
+    "from_version": "0.11.14",
+    "to_version": "0.11.15",
+    "path": "Cargo.lock",
+    "status": "applied"
+  }]
+}"#,
+    )
+    .unwrap();
+    fs::write(
+        report_dir.join("post-fix.json"),
+        r#"{"summary":{"vulnerabilities":0},"vulnerabilities":[]}"#,
+    )
+    .unwrap();
+
+    let output = Command::new("bash")
+        .arg("-c")
+        .arg(workflow_script("Classify the validated result"))
+        .current_dir(&fixture.checkout)
+        .env("ALLOWED_PATHS", "Cargo.toml")
+        .env("GITHUB_OUTPUT", &fixture.output)
+        .env("GITHUB_STEP_SUMMARY", &fixture.summary)
+        .env("REPORT_DIR", &report_dir)
+        .output()
+        .expect("classifier script starts");
+
+    assert!(
+        output.status.success(),
+        "classifier failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let metadata: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(report_dir.join("metadata.json")).unwrap())
+            .unwrap();
+    assert_eq!(metadata["disposition"], "clean_changed");
+    assert_eq!(metadata["residual_advisory_records"], 0);
+    assert!(
+        !fs::read(report_dir.join("proposal.patch"))
+            .unwrap()
+            .is_empty()
+    );
+    let body = fs::read_to_string(report_dir.join("pull-request.md")).unwrap();
+    assert!(body.contains("Before: 2 OSV advisory record(s) across 1 package(s)"));
+    assert!(body.contains("Applied or satisfied fixes: 1"));
+    assert!(body.contains("`quinn-proto` 0.11.14 → 0.11.15 (`Cargo.lock`)"));
+    assert!(body.contains("After: 0 OSV advisory record(s)"));
+}
+
+#[test]
 fn publisher_creates_one_commit_and_is_idempotent() {
     let fixture = Fixture::new();
     let base = fixture.base_sha();
