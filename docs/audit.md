@@ -89,4 +89,5 @@ their SARIF upload step should be skipped while the audit itself still runs.
 
 - [Stability](stability.md#stable-exit-codes) for the exit-code contract, including `6`
 - [Stability](stability.md#commands-run-by---lock) for what `--lock` runs per ecosystem
-- [GitHub pull requests](github-actions.md#quick-start) for scheduled dependency updates
+- [GitHub security remediation](github-actions.md#security-remediation-pull-requests) for validated, rolling vulnerability-fix pull requests
+- [GitHub pull requests](github-actions.md#quick-start) for scheduled dependency freshness updates

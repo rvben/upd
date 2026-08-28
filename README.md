@@ -203,6 +203,11 @@ upd audit          # Scan for known vulnerabilities (exit 6 if found)
 upd schema         # Machine-readable interface description
 ```
 
+For repositories replacing dependency bots, `upd` also provides separate
+reusable GitHub workflows for policy-constrained freshness updates and
+validated security-remediation pull requests. See
+[GitHub dependency pull requests](docs/github-actions.md).
+
 ## Example Output
 
 ```text

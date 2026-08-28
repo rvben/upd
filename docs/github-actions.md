@@ -136,6 +136,97 @@ Choose an appropriate GitHub-hosted or self-hosted Linux runner, or install tool
 with `prepare-command`. Preparation may initialize tools and caches but must
 leave the repository clean; dependency changes belong exclusively to `upd`.
 
+## Security remediation pull requests
+
+The separate `dependency-remediation.yml` reusable workflow turns a complete
+OSV audit into a narrowly scoped security proposal. It is intentionally not a
+mode of the ordinary updater: security fixes ignore freshness cooldowns and
+bump ceilings, use different failure semantics, and are never auto-merged.
+
+```yaml
+name: Daily dependency security remediation
+
+on:
+  schedule:
+    - cron: "47 7 * * *"
+  workflow_dispatch:
+
+permissions:
+  actions: read
+  contents: read
+
+jobs:
+  remediate:
+    uses: rvben/upd/.github/workflows/dependency-remediation.yml@<FULL_COMMIT_SHA>
+    with:
+      publish: true
+      langs: rust
+      allowed-paths: Cargo.toml Cargo.lock
+      validation-command: cargo test --locked
+      app-id: ${{ vars.UPD_APP_ID }}
+    secrets:
+      app-private-key: ${{ secrets.UPD_APP_PRIVATE_KEY }}
+```
+
+`allowed-paths` is a required, whitespace-separated list of exact
+repository-relative files. It is a publication boundary, not a discovery
+filter: `paths` and `langs` decide what `upd` audits, while `allowed-paths`
+prevents a package manager, validation command, or malformed proposal from
+publishing any other file. Paths containing whitespace are therefore not
+supported by this workflow.
+
+The workflow has two jobs separated by an artifact boundary. The first job has
+read-only repository access, applies available fixes, regenerates lockfiles,
+runs the caller's validation command, and performs a fresh uncached audit of
+the proposed tree. The second job independently verifies the patch and only
+then mints the short-lived App token used for Git and pull-request operations.
+Project code and package managers never run with that token available.
+
+Publishing deliberately has no `GITHUB_TOKEN` or personal-token fallback. A
+pull request created with `GITHUB_TOKEN` does not start ordinary
+`pull_request` workflows, which would leave a security proposal without the CI
+signal it exists to obtain. Set `publish: false` for a credential-free dry run.
+
+The post-fix audit controls the lifecycle:
+
+| Result | Behavior |
+|--------|----------|
+| Complete and clean, with changes | Create or refresh the one-commit rolling security PR |
+| Complete and clean, without changes | Close and lease-delete only the obsolete remediation PR and branch |
+| Complete with residual findings and safe changes | Publish the partial fix, list residual findings, then fail visibly |
+| Residual findings without a safe change | Preserve remote state and fail |
+| Incomplete audit, invalid report, unexpected path, or failed validation | Preserve remote state and fail before credentials are minted |
+
+Pre-fix and post-fix JSON reports are retained for 14 days. Their vulnerability
+counts are described as OSV advisory records rather than unique CVEs because
+different database aliases can describe the same underlying issue. The normal
+read-only audit remains the sole SARIF publisher; uploading SARIF from an
+uncommitted remediation workspace could misattribute results to the default
+branch.
+
+### Remediation inputs
+
+| Input | Default | Purpose |
+|-------|---------|---------|
+| `publish` | `false` | Publish or clean up the rolling pull request; false performs a credential-free dry run |
+| `app-id` | empty | GitHub App identifier; required when publishing |
+| `runner` | `ubuntu-24.04` | Linux runner label |
+| `upd-version` | current verified manifest | Exact released `upd` version |
+| `upd-sha256` | manifest checksum | Archive digest; required for a version outside the release manifest |
+| `upd-target` | detected | Linux release target |
+| `paths` | `.` | Whitespace-separated audit roots |
+| `langs` | all auditable ecosystems | Comma-separated ecosystem filter |
+| `allowed-paths` | required | Exact files a validated patch may contain |
+| `prepare-command` | empty | Prepare ecosystem tooling without changing tracked files |
+| `validation-command` | required | Validate the complete proposed tree |
+| `branch` | `security/upd` | Automation-owned rolling branch |
+| `commit-message` | `fix(deps): remediate vulnerable dependencies with upd` | Generated Conventional Commit message |
+| `pull-request-title` | same as commit | Rolling pull-request title |
+
+The only remediation secret is `app-private-key`, paired with `app-id`. The App
+needs Contents and Pull requests read/write for ordinary dependency files; the
+workflow requests only those permissions for its installation token.
+
 ## Inputs
 
 | Input | Default | Purpose |

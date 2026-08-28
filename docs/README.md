@@ -8,7 +8,7 @@ than read.
 |------|---------------|
 | [Ecosystems](ecosystems.md) | Every file `upd` discovers, per ecosystem, plus annotated version pins in files it does not otherwise understand |
 | [Comparison](comparison.md) | Dated feature matrix and reproducible, workload-based benchmarks against related tools |
-| [GitHub pull requests](github-actions.md) | General rolling dependency PRs, immutable Action SHA pins, validation, and opt-in auto-merge |
+| [GitHub pull requests](github-actions.md) | Rolling freshness and security-remediation PRs, immutable Action SHA pins, validation, and credentials |
 | [GitLab merge requests](gitlab.md) | Scheduled rolling dependency MRs, token setup, validation, and opt-in native auto-merge |
 | [Configuration](configuration.md) | `.updrc.toml` discovery and keys, cooldown, caching, environment variables |
 | [Private registries](private-registries.md) | Credential detection for PyPI, npm, Cargo, Go, and GitHub |
