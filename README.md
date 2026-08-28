@@ -31,7 +31,8 @@ uvx upd
 ```
 
 That first run is a dry run: it reports what would change and leaves every file
-untouched. Review the plan, then apply it with `uvx upd --apply`.
+untouched. No repository onboarding or hosted account is required. Review the
+plan, then apply it with `uvx upd --apply`.
 
 <p align="center">
   <img src="https://raw.githubusercontent.com/rvben/upd/main/assets/terminal-demo.svg" alt="upd previewing six dependency updates across four files without changing them" width="1000">
@@ -64,6 +65,33 @@ bot. It can delegate lockfile refreshes to the package managers already in your
 project and can run inside your own GitHub or GitLab automation. See the
 [decision guide and dated benchmarks](https://github.com/rvben/upd/blob/main/docs/comparison.md)
 for an exact comparison with adjacent tools.
+
+## Where upd fits
+
+Choose by the job rather than treating every dependency tool as interchangeable:
+
+| If you need to… | Start with… |
+|---|---|
+| Preview and edit versions across a mixed-language repository from one local command | **upd** |
+| Resolve, lock, install, and manage a Python environment | [uv](https://github.com/astral-sh/uv) or [PDM](https://github.com/pdm-project/pdm) |
+| Continuously create update branches and PRs across the broadest manager catalog | [Renovate](https://github.com/renovatebot/renovate) or Dependabot |
+| Enforce immutable GitHub Actions references as a dedicated policy | [pinact](https://github.com/suzuki-shunsuke/pinact) or [ratchet](https://github.com/sethvargo/ratchet) |
+
+### Dated performance evidence
+
+On the committed 18-reference fixture, the verified 2026-08-28 run recorded:
+
+| Workload | upd mean | Same-workload cohort |
+|---|---:|---:|
+| Check 12 Python constraints | **134.7 ms** | uppd: 269.7 ms |
+| Update 12 Python constraints | **138.7 ms** | uppd: 250.8 ms |
+| Check 6 GitHub Actions | **758.7 ms** | taze: 1,019.0 ms; ratchet: 1,029.1 ms |
+| Update 6 GitHub Actions | 746.3 ms | **taze: 566.3 ms**; ratchet: 1,066.8 ms |
+
+Lower is better. These are five-run live-network observations, not universal
+speed claims. Every timed update was first verified to change all intended
+references and leave a parseable result. See the
+[full matrix, methodology, variance, commands, and raw JSON](https://github.com/rvben/upd/blob/main/docs/comparison.md).
 
 ## Features
 
