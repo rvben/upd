@@ -148,7 +148,9 @@ jobs:
           set -euo pipefail
           make check
           actionlint .github/workflows/dependency-health.yml \
+            .github/workflows/dependency-remediation.yml \
             .github/workflows/dependencies.yml \
+            .github/workflows/remediate-dependencies.yml \
             .github/workflows/release.yml \
             .github/workflows/sync-release-pins.yml \
             .github/workflows/upd.yml

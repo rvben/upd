@@ -195,7 +195,7 @@ permissions:
   pull-requests: write
 
 concurrency:
-  group: upd-dependencies-${{ github.repository }}
+  group: upd-dependency-writes-${{ github.repository }}
   cancel-in-progress: false
 
 jobs:

@@ -1,0 +1,758 @@
+name: Security remediation with upd
+
+on:
+  workflow_call:
+    inputs:
+      runner:
+        description: Linux runner label
+        type: string
+        default: ubuntu-24.04
+      publish:
+        description: Publish or clean up the rolling remediation pull request
+        type: boolean
+        default: false
+      upd-version:
+        description: Exact released upd version; empty follows the verified release manifest
+        type: string
+        default: ""
+      upd-sha256:
+        description: Archive digest; required for a version absent from the release manifest
+        type: string
+        default: ""
+      upd-target:
+        description: Release target; detected for supported Linux runners when empty
+        type: string
+        default: ""
+      paths:
+        description: Whitespace-separated repository paths passed to upd
+        type: string
+        default: "."
+      langs:
+        description: Comma-separated ecosystem filter; empty audits every supported ecosystem
+        type: string
+        default: ""
+      allowed-paths:
+        description: Whitespace-separated exact paths the remediation may change
+        required: true
+        type: string
+      prepare-command:
+        description: Command that installs or prepares repository-specific tooling
+        type: string
+        default: ""
+      validation-command:
+        description: Command that validates the complete remediation proposal
+        required: true
+        type: string
+      branch:
+        description: Automation-owned rolling security branch
+        type: string
+        default: security/upd
+      commit-message:
+        description: Conventional Commit message for the generated commit
+        type: string
+        default: "fix(deps): remediate vulnerable dependencies with upd"
+      pull-request-title:
+        description: Pull-request title
+        type: string
+        default: "fix(deps): remediate vulnerable dependencies with upd"
+      app-id:
+        description: GitHub App identifier; required when publish is true
+        type: string
+        default: ""
+    secrets:
+      app-private-key:
+        description: Private key of the GitHub App named by app-id
+        required: false
+    outputs:
+      disposition:
+        description: clean_changed, clean_no_change, partial_changed, or residual_no_change
+        value: ${{ jobs.generate.outputs.disposition }}
+      pull-request-url:
+        description: Created or updated pull-request URL
+        value: ${{ jobs.publish.outputs.pull-request-url }}
+      residual-advisory-records:
+        description: Raw OSV advisory records remaining after remediation
+        value: ${{ jobs.generate.outputs.residual }}
+
+permissions:
+  actions: read
+  contents: read
+
+concurrency:
+  group: upd-dependency-writes-${{ github.repository }}
+  cancel-in-progress: false
+
+jobs:
+  generate:
+    name: Generate and validate remediation
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: 30
+    outputs:
+      base-sha: ${{ steps.classify.outputs.base-sha }}
+      changed: ${{ steps.classify.outputs.changed }}
+      disposition: ${{ steps.classify.outputs.disposition }}
+      residual: ${{ steps.classify.outputs.residual }}
+    steps:
+      - name: Check out the trusted default branch
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Validate configuration
+        env:
+          ALLOWED_PATHS: ${{ inputs.allowed-paths }}
+          BASE_BRANCH: ${{ github.event.repository.default_branch }}
+          BRANCH: ${{ inputs.branch }}
+          VALIDATION_COMMAND: ${{ inputs.validation-command }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ -z "$ALLOWED_PATHS" ]]; then
+            echo "allowed-paths must name every file remediation may change" >&2
+            exit 4
+          fi
+          if [[ -z "$VALIDATION_COMMAND" ]]; then
+            echo "validation-command must not be empty" >&2
+            exit 4
+          fi
+          if ! git check-ref-format --branch "$BRANCH" >/dev/null 2>&1; then
+            echo "Invalid automation branch: $BRANCH" >&2
+            exit 4
+          fi
+          if [[ "$BRANCH" == "$BASE_BRANCH" ]]; then
+            echo "The automation branch must differ from the default branch" >&2
+            exit 4
+          fi
+          read -r -a allowed <<< "$ALLOWED_PATHS"
+          for path in "${allowed[@]}"; do
+            if [[ "$path" == /* || "$path" == . || "$path" == .. || "$path" == ../* || "$path" == */../* || "$path" == */.. ]]; then
+              echo "allowed-paths entries must be normalized repository-relative files: $path" >&2
+              exit 4
+            fi
+          done
+
+      - name: Install verified upd release
+        env:
+          REQUESTED_SHA256: ${{ inputs.upd-sha256 }}
+          REQUESTED_TARGET: ${{ inputs.upd-target }}
+          REQUESTED_VERSION: ${{ inputs.upd-version }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="$REQUESTED_VERSION"
+          target="$REQUESTED_TARGET"
+          if [[ -z "$target" ]]; then
+            case "$(uname -m)" in
+              x86_64|amd64) target=x86_64-unknown-linux-gnu ;;
+              aarch64|arm64) target=aarch64-unknown-linux-gnu ;;
+              *) echo "Unsupported runner architecture: $(uname -m); set upd-target" >&2; exit 4 ;;
+            esac
+          fi
+
+          expected_sha="$REQUESTED_SHA256"
+          if [[ -z "$version" || -z "$expected_sha" ]]; then
+            manifest="$RUNNER_TEMP/upd-release-pins.json"
+            curl --silent --show-error --fail-with-body --location \
+              --retry 3 --retry-all-errors \
+              --output "$manifest" \
+              https://raw.githubusercontent.com/rvben/upd/main/release-pins.json
+
+            schema="$(jq --exit-status --raw-output '.schema' "$manifest")"
+            manifest_version="$(jq --exit-status --raw-output '.version' "$manifest")"
+            if [[ "$schema" != 1 || ! "$manifest_version" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+              echo "The canonical upd release manifest is invalid" >&2
+              exit 2
+            fi
+            if [[ -z "$version" ]]; then
+              version="$manifest_version"
+            fi
+            if [[ -z "$expected_sha" ]]; then
+              if [[ "$version" != "$manifest_version" ]]; then
+                echo "Set upd-sha256 when selecting $version; the release manifest pins $manifest_version" >&2
+                exit 4
+              fi
+              expected_asset="upd-${version}-${target}.tar.gz"
+              manifest_asset="$(jq --exit-status --raw-output --arg target "$target" '.assets[$target].name' "$manifest")"
+              expected_sha="$(jq --exit-status --raw-output --arg target "$target" '.assets[$target].sha256' "$manifest")"
+              if [[ "$manifest_asset" != "$expected_asset" ]]; then
+                echo "The release manifest does not contain the expected asset for $target" >&2
+                exit 2
+              fi
+            fi
+          fi
+          if [[ ! "$version" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([+-][0-9A-Za-z.-]+)?$ ]]; then
+            echo "Resolved upd version is invalid" >&2
+            exit 2
+          fi
+          if [[ ! "$expected_sha" =~ ^[0-9a-fA-F]{64}$ ]]; then
+            echo "upd-sha256 must be a 64-character hexadecimal digest" >&2
+            exit 4
+          fi
+
+          install_dir="$RUNNER_TEMP/upd-bin"
+          mkdir -p "$install_dir"
+          asset="upd-${version}-${target}.tar.gz"
+          curl --silent --show-error --fail-with-body --location \
+            --retry 3 --retry-all-errors \
+            --output "$install_dir/$asset" \
+            "https://github.com/rvben/upd/releases/download/${version}/${asset}"
+          actual_sha="$(sha256sum "$install_dir/$asset" | cut -d ' ' -f 1)"
+          if [[ "${actual_sha,,}" != "${expected_sha,,}" ]]; then
+            echo "Checksum verification failed for $asset" >&2
+            exit 2
+          fi
+          tar --extract --gzip --file "$install_dir/$asset" --directory "$install_dir" upd
+          chmod 0755 "$install_dir/upd"
+          "$install_dir/upd" --version
+          echo "$install_dir" >> "$GITHUB_PATH"
+
+      - name: Prepare repository tooling
+        if: inputs.prepare-command != ''
+        env:
+          PREPARE_COMMAND: ${{ inputs.prepare-command }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          bash -euo pipefail -c "$PREPARE_COMMAND"
+          if [[ -n "$(git status --porcelain)" ]]; then
+            echo "The prepare command changed repository files" >&2
+            exit 2
+          fi
+
+      - name: Apply available security fixes
+        env:
+          LANGS: ${{ inputs.langs }}
+          PATHS: ${{ inputs.paths }}
+          REPORT_DIR: ${{ runner.temp }}/upd-security-remediation
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$REPORT_DIR"
+          report="$REPORT_DIR/pre-fix.json"
+          args=(audit --fix-audit --apply --lock --full-precision --no-cache --format json)
+          [[ -n "$LANGS" ]] && args+=(--lang "$LANGS")
+          read -r -a audit_paths <<< "${PATHS:-.}"
+
+          set +e
+          upd "${args[@]}" "${audit_paths[@]}" > "$report"
+          audit_exit=$?
+          set -e
+
+          if [[ ! -s "$report" ]] || ! jq --exit-status . "$report" >/dev/null; then
+            echo "upd did not produce a valid pre-fix JSON report" >&2
+            exit 2
+          fi
+          case "$audit_exit" in
+            0|6) ;;
+            *) echo "upd remediation failed with exit code $audit_exit" >&2; exit "$audit_exit" ;;
+          esac
+          if ! jq --exit-status '
+            .status == "complete" and
+            (.summary.errors // 0) == 0
+          ' "$report" >/dev/null; then
+            echo "The pre-fix audit was incomplete; refusing to publish partial evidence" >&2
+            exit 2
+          fi
+          if ! jq --exit-status '
+            [
+              .fixes[]? |
+              select(
+                .status == "failed" or
+                .status == "rolled_back" or
+                .status == "pending_relock" or
+                .status == "skipped"
+              )
+            ] | length == 0
+          ' "$report" >/dev/null; then
+            echo "upd reported an unsafe or incomplete fix outcome" >&2
+            exit 2
+          fi
+
+      - name: Constrain and validate the proposal
+        env:
+          ALLOWED_PATHS: ${{ inputs.allowed-paths }}
+          VALIDATION_COMMAND: ${{ inputs.validation-command }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          read -r -a allowed <<< "$ALLOWED_PATHS"
+          declare -A allowlist=()
+          for path in "${allowed[@]}"; do
+            allowlist["$path"]=1
+          done
+
+          mapfile -d '' untracked_paths < <(git ls-files --others --exclude-standard -z)
+          for path in "${untracked_paths[@]}"; do
+            if [[ -z "${allowlist[$path]:-}" ]]; then
+              echo "Unexpected untracked remediation path: $path" >&2
+              exit 2
+            fi
+            git add --intent-to-add -- "$path"
+          done
+
+          mapfile -d '' changed_paths < <(git diff --name-only -z HEAD)
+          if [[ -n "$(git diff --name-only --diff-filter=D HEAD)" ]]; then
+            echo "Security remediation may not delete files" >&2
+            exit 2
+          fi
+          for path in "${changed_paths[@]}"; do
+            if [[ -z "${allowlist[$path]:-}" ]]; then
+              echo "Unexpected remediation path: $path" >&2
+              exit 2
+            fi
+            mode="$(git ls-files --stage -- "$path" | awk 'NR == 1 { print $1 }')"
+            if [[ "$mode" != 100644 ]]; then
+              echo "Unexpected file mode for $path: ${mode:-missing}" >&2
+              exit 2
+            fi
+          done
+
+          git diff --check HEAD
+          before="$(git diff --binary HEAD | sha256sum | cut -d ' ' -f 1)"
+          before_untracked="$(git ls-files --others --exclude-standard -z | sha256sum | cut -d ' ' -f 1)"
+          bash -euo pipefail -c "$VALIDATION_COMMAND"
+          after="$(git diff --binary HEAD | sha256sum | cut -d ' ' -f 1)"
+          after_untracked="$(git ls-files --others --exclude-standard -z | sha256sum | cut -d ' ' -f 1)"
+          if [[ "$before" != "$after" || "$before_untracked" != "$after_untracked" ]]; then
+            echo "Validation changed the remediation proposal" >&2
+            exit 2
+          fi
+
+      - name: Audit the final proposed dependency graph
+        env:
+          LANGS: ${{ inputs.langs }}
+          PATHS: ${{ inputs.paths }}
+          REPORT_DIR: ${{ runner.temp }}/upd-security-remediation
+        shell: bash
+        run: |
+          set -euo pipefail
+          report="$REPORT_DIR/post-fix.json"
+          args=(audit --no-fail --no-cache --format json)
+          [[ -n "$LANGS" ]] && args+=(--lang "$LANGS")
+          read -r -a audit_paths <<< "${PATHS:-.}"
+
+          set +e
+          upd "${args[@]}" "${audit_paths[@]}" > "$report"
+          audit_exit=$?
+          set -e
+          if [[ "$audit_exit" -ne 0 ]]; then
+            echo "The post-fix audit failed with exit code $audit_exit" >&2
+            exit "$audit_exit"
+          fi
+          if [[ ! -s "$report" ]] || ! jq --exit-status '
+            .status == "complete" and
+            (.summary.errors // 0) == 0
+          ' "$report" >/dev/null; then
+            echo "The post-fix audit was incomplete" >&2
+            exit 2
+          fi
+
+      - name: Classify the validated result
+        id: classify
+        env:
+          ALLOWED_PATHS: ${{ inputs.allowed-paths }}
+          REPORT_DIR: ${{ runner.temp }}/upd-security-remediation
+        shell: bash
+        run: |
+          set -euo pipefail
+          base_sha="$(git rev-parse HEAD)"
+          changed=false
+          if ! git diff --quiet HEAD; then
+            changed=true
+          fi
+          residual="$(jq --raw-output '.summary.vulnerabilities // 0' "$REPORT_DIR/post-fix.json")"
+          if [[ ! "$residual" =~ ^[0-9]+$ ]]; then
+            echo "The post-fix vulnerability count is invalid" >&2
+            exit 2
+          fi
+
+          if [[ "$residual" -eq 0 && "$changed" == true ]]; then
+            disposition=clean_changed
+          elif [[ "$residual" -eq 0 ]]; then
+            disposition=clean_no_change
+          elif [[ "$changed" == true ]]; then
+            disposition=partial_changed
+          else
+            disposition=residual_no_change
+          fi
+
+          read -r -a allowed <<< "$ALLOWED_PATHS"
+          literal_allowed=()
+          for path in "${allowed[@]}"; do
+            literal_allowed+=(":(literal)$path")
+          done
+          git diff --binary HEAD -- "${literal_allowed[@]}" > "$REPORT_DIR/proposal.patch"
+          patch_sha="$(sha256sum "$REPORT_DIR/proposal.patch" | cut -d ' ' -f 1)"
+          jq --null-input \
+            --arg base_sha "$base_sha" \
+            --arg disposition "$disposition" \
+            --arg patch_sha256 "$patch_sha" \
+            --argjson changed "$changed" \
+            --argjson residual "$residual" \
+            '{
+              schema: 1,
+              base_sha: $base_sha,
+              changed: $changed,
+              disposition: $disposition,
+              residual_advisory_records: $residual,
+              patch_sha256: $patch_sha256
+            }' > "$REPORT_DIR/metadata.json"
+
+          {
+            echo "Automated vulnerability remediation generated by [upd](https://github.com/rvben/upd)."
+            echo
+            if [[ "$disposition" == partial_changed ]]; then
+              echo "> **Partial remediation:** validated fixes are included, but the post-fix audit still reports $residual OSV advisory record(s). This pull request is not a complete remediation."
+              echo
+            fi
+            echo "### Audit result"
+            echo
+            jq --raw-output '
+              "- Before: \(.summary.vulnerabilities) OSV advisory record(s) across \(.summary.vulnerable_packages) package(s)\n" +
+              "- Applied or satisfied fixes: \([.fixes[]? | select(.status == \"applied\" or .status == \"already_satisfied\")] | length)\n" +
+              "- Unfixable outcomes: \([.fixes[]? | select(.status == \"unfixable\")] | length)"
+            ' "$REPORT_DIR/pre-fix.json"
+            echo "- After: $residual OSV advisory record(s)"
+            echo
+            echo "### Applied fixes"
+            echo
+            jq --raw-output '
+              .fixes[]? |
+              select(.status == "applied" or .status == "already_satisfied") |
+              "- `\(.package)` \(.from_version) → \(.to_version // \"resolved lockfile floor\") (`\(.path // \"lockfile\")`)"
+            ' "$REPORT_DIR/pre-fix.json"
+            if [[ "$residual" -gt 0 ]]; then
+              echo
+              echo "### Remaining findings"
+              echo
+              jq --raw-output '
+                .vulnerabilities[]? |
+                "- `\(.id)` in `\(.package)@\(.version)`" +
+                (if .fixed_version then " (fixed in \(.fixed_version))" else " (no published fixed version)" end)
+              ' "$REPORT_DIR/post-fix.json"
+            fi
+            echo
+            echo "### Validation"
+            echo
+            echo "- Repository validation command completed successfully"
+            echo "- \`git diff --check\`"
+            echo "- Fresh uncached post-fix \`upd audit\`"
+            echo "- Changed-path allowlist enforced"
+            echo
+            echo "Auto-merge is intentionally disabled."
+          } > "$REPORT_DIR/pull-request.md"
+
+          {
+            echo "base-sha=$base_sha"
+            echo "changed=$changed"
+            echo "disposition=$disposition"
+            echo "residual=$residual"
+          } >> "$GITHUB_OUTPUT"
+          {
+            echo "## upd security remediation"
+            echo
+            echo "- Disposition: $disposition"
+            echo "- Changed: $changed"
+            echo "- Residual OSV advisory records: $residual"
+            echo "- Base: $base_sha"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Retain remediation evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: upd-security-remediation-${{ github.run_id }}
+          path: ${{ runner.temp }}/upd-security-remediation
+          if-no-files-found: warn
+          retention-days: 14
+
+  publish:
+    name: Publish rolling security pull request
+    needs: generate
+    if: >-
+      inputs.publish &&
+      needs.generate.result == 'success' &&
+      (needs.generate.outputs.disposition == 'clean_changed' ||
+       needs.generate.outputs.disposition == 'partial_changed' ||
+       needs.generate.outputs.disposition == 'clean_no_change')
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: 10
+    permissions:
+      actions: read
+      contents: read
+    outputs:
+      pull-request-url: ${{ steps.publish.outputs.url }}
+    steps:
+      - name: Check out the validated base without credentials
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.generate.outputs.base-sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Download the validated proposal
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: upd-security-remediation-${{ github.run_id }}
+          path: ${{ runner.temp }}/upd-security-remediation
+
+      - name: Verify and stage the proposal
+        env:
+          ALLOWED_PATHS: ${{ inputs.allowed-paths }}
+          BASE_SHA: ${{ needs.generate.outputs.base-sha }}
+          DISPOSITION: ${{ needs.generate.outputs.disposition }}
+          REPORT_DIR: ${{ runner.temp }}/upd-security-remediation
+        shell: bash
+        run: |
+          set -euo pipefail
+          jq --exit-status \
+            --arg base_sha "$BASE_SHA" \
+            --arg disposition "$DISPOSITION" '
+              .schema == 1 and
+              .base_sha == $base_sha and
+              .disposition == $disposition and
+              (.patch_sha256 | test("^[0-9a-f]{64}$"))
+            ' "$REPORT_DIR/metadata.json" >/dev/null
+          expected_patch_sha="$(jq --raw-output .patch_sha256 "$REPORT_DIR/metadata.json")"
+          actual_patch_sha="$(sha256sum "$REPORT_DIR/proposal.patch" | cut -d ' ' -f 1)"
+          if [[ "$actual_patch_sha" != "$expected_patch_sha" ]]; then
+            echo "The remediation patch digest does not match its metadata" >&2
+            exit 2
+          fi
+          if [[ "$(git rev-parse HEAD)" != "$BASE_SHA" ]]; then
+            echo "The publisher checkout does not match the validated base" >&2
+            exit 2
+          fi
+
+          if [[ "$DISPOSITION" == clean_changed || "$DISPOSITION" == partial_changed ]]; then
+            git apply --check "$REPORT_DIR/proposal.patch"
+            git apply --index "$REPORT_DIR/proposal.patch"
+            read -r -a allowed <<< "$ALLOWED_PATHS"
+            declare -A allowlist=()
+            for path in "${allowed[@]}"; do
+              allowlist["$path"]=1
+            done
+            mapfile -d '' paths < <(git diff --cached --name-only -z)
+            if [[ "${#paths[@]}" -eq 0 ]]; then
+              echo "The validated remediation patch is empty" >&2
+              exit 2
+            fi
+            for path in "${paths[@]}"; do
+              if [[ -z "${allowlist[$path]:-}" ]]; then
+                echo "Unexpected staged path: $path" >&2
+                exit 2
+              fi
+              mode="$(git ls-files --stage -- "$path" | awk 'NR == 1 { print $1 }')"
+              if [[ "$mode" != 100644 ]]; then
+                echo "Unexpected staged file mode for $path: ${mode:-missing}" >&2
+                exit 2
+              fi
+            done
+            git diff --cached --check
+          elif [[ -s "$REPORT_DIR/proposal.patch" ]]; then
+            echo "A clean no-change result unexpectedly contains a patch" >&2
+            exit 2
+          fi
+
+      - name: Require GitHub App credentials
+        env:
+          APP_ID: ${{ inputs.app-id }}
+          APP_PRIVATE_KEY: ${{ secrets.app-private-key }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ -z "$APP_ID" || -z "$APP_PRIVATE_KEY" ]]; then
+            echo "Publishing requires app-id and app-private-key; no token fallback is permitted" >&2
+            exit 4
+          fi
+
+      - name: Mint a least-privilege installation token
+        id: app-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ inputs.app-id }}
+          private-key: ${{ secrets.app-private-key }}
+          permission-contents: write
+          permission-pull-requests: write
+
+      - name: Publish the rolling security pull request
+        id: publish
+        env:
+          BASE_BRANCH: ${{ github.event.repository.default_branch }}
+          BASE_SHA: ${{ needs.generate.outputs.base-sha }}
+          BODY_FILE: ${{ runner.temp }}/upd-security-remediation/pull-request.md
+          BRANCH: ${{ inputs.branch }}
+          COMMIT_MESSAGE: ${{ inputs.commit-message }}
+          DISPOSITION: ${{ needs.generate.outputs.disposition }}
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          PR_TITLE: ${{ inputs.pull-request-title }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          output_file="$GITHUB_OUTPUT"
+          summary_file="$GITHUB_STEP_SUMMARY"
+
+          git fetch --no-tags origin \
+            "+refs/heads/${BASE_BRANCH}:refs/remotes/origin/${BASE_BRANCH}"
+          current_base_sha="$(git rev-parse "refs/remotes/origin/${BASE_BRANCH}")"
+          if [[ "$current_base_sha" != "$BASE_SHA" ]]; then
+            echo "The default branch advanced from $BASE_SHA to $current_base_sha; refusing a stale publication" >&2
+            exit 2
+          fi
+
+          expected_remote_sha=""
+          if git fetch --no-tags origin \
+            "+refs/heads/${BRANCH}:refs/remotes/origin/${BRANCH}"; then
+            expected_remote_sha="$(git rev-parse "refs/remotes/origin/${BRANCH}")"
+          fi
+
+          find_open_prs() {
+            gh pr list \
+              --repo "$GITHUB_REPOSITORY" \
+              --head "$BRANCH" \
+              --base "$BASE_BRANCH" \
+              --state open \
+              --limit 100 \
+              --json number,url
+          }
+          require_unambiguous_pr() {
+            local count
+            count="$(jq 'length' <<< "$1")"
+            if [[ "$count" -gt 1 ]]; then
+              echo "More than one open remediation pull request uses $BRANCH; refusing to choose one" >&2
+              exit 2
+            fi
+          }
+
+          pr_list="$(find_open_prs)"
+          require_unambiguous_pr "$pr_list"
+
+          if [[ "$DISPOSITION" == clean_no_change ]]; then
+            if [[ "$(jq 'length' <<< "$pr_list")" -eq 1 ]]; then
+              pr_number="$(jq --raw-output '.[0].number' <<< "$pr_list")"
+              pr_url="$(jq --raw-output '.[0].url' <<< "$pr_list")"
+              gh pr close "$pr_number" \
+                --repo "$GITHUB_REPOSITORY" \
+                --comment "Closing because a complete, uncached upd audit found no remaining vulnerabilities."
+              echo "Closed obsolete security remediation pull request: $pr_url" >> "$summary_file"
+            fi
+            if [[ -n "$expected_remote_sha" ]]; then
+              git -c http.extraheader="AUTHORIZATION: bearer $GH_TOKEN" push \
+                --force-with-lease="refs/heads/${BRANCH}:${expected_remote_sha}" \
+                origin ":refs/heads/${BRANCH}"
+              echo "Removed obsolete automation branch: $BRANCH" >> "$summary_file"
+            fi
+            echo "url=" >> "$output_file"
+            exit 0
+          fi
+
+          if git diff --cached --quiet; then
+            echo "$DISPOSITION requires a staged remediation proposal" >&2
+            exit 2
+          fi
+
+          git switch --detach "$BASE_SHA"
+          git config user.name "upd security automation"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          proposed_tree="$(git write-tree)"
+          proposal_unchanged=false
+          if [[ -n "$expected_remote_sha" ]]; then
+            remote_tree="$(git rev-parse "${expected_remote_sha}^{tree}")"
+            remote_parent="$(git rev-parse "${expected_remote_sha}^")"
+            if [[ "$remote_tree" == "$proposed_tree" && "$remote_parent" == "$BASE_SHA" ]]; then
+              proposal_unchanged=true
+              commit_sha="$expected_remote_sha"
+            fi
+          fi
+
+          if [[ "$proposal_unchanged" != true ]]; then
+            git commit --message "$COMMIT_MESSAGE"
+            commit_sha="$(git rev-parse HEAD)"
+            git -c http.extraheader="AUTHORIZATION: bearer $GH_TOKEN" push \
+              --force-with-lease="refs/heads/${BRANCH}:${expected_remote_sha}" \
+              origin "HEAD:refs/heads/${BRANCH}"
+          else
+            echo "The validated remediation proposal is unchanged; retaining $commit_sha" >> "$summary_file"
+          fi
+
+          if [[ "$(jq 'length' <<< "$pr_list")" -eq 0 ]]; then
+            gh pr create \
+              --repo "$GITHUB_REPOSITORY" \
+              --base "$BASE_BRANCH" \
+              --head "$BRANCH" \
+              --title "$PR_TITLE" \
+              --body-file "$BODY_FILE" >/dev/null
+            pr_list="$(find_open_prs)"
+            require_unambiguous_pr "$pr_list"
+            if [[ "$(jq 'length' <<< "$pr_list")" -ne 1 ]]; then
+              echo "GitHub did not return the newly created remediation pull request" >&2
+              exit 2
+            fi
+          else
+            pr_number="$(jq --raw-output '.[0].number' <<< "$pr_list")"
+            gh pr edit "$pr_number" \
+              --repo "$GITHUB_REPOSITORY" \
+              --title "$PR_TITLE" \
+              --body-file "$BODY_FILE" >/dev/null
+          fi
+
+          pr_number="$(jq --raw-output '.[0].number' <<< "$pr_list")"
+          pr_url="$(jq --raw-output '.[0].url' <<< "$pr_list")"
+          if [[ "$pr_number" == null || "$pr_url" == null ]]; then
+            echo "GitHub returned an invalid pull-request response" >&2
+            exit 2
+          fi
+          if [[ "$(gh pr view "$pr_number" --repo "$GITHUB_REPOSITORY" \
+            --json autoMergeRequest --jq '.autoMergeRequest != null')" == true ]]; then
+            gh pr merge "$pr_number" --repo "$GITHUB_REPOSITORY" --disable-auto
+            echo "Disabled auto-merge for $pr_url" >> "$summary_file"
+          fi
+
+          echo "url=$pr_url" >> "$output_file"
+          echo "Security remediation pull request: $pr_url" >> "$summary_file"
+          echo "Published commit: $commit_sha" >> "$summary_file"
+
+  enforce:
+    name: Enforce remediation outcome
+    if: always()
+    needs: [generate, publish]
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: 2
+    steps:
+      - name: Enforce safe completion
+        env:
+          DISPOSITION: ${{ needs.generate.outputs.disposition }}
+          GENERATE_RESULT: ${{ needs.generate.result }}
+          PUBLISH: ${{ inputs.publish }}
+          PUBLISH_RESULT: ${{ needs.publish.result }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "$GENERATE_RESULT" != success ]]; then
+            echo "Remediation generation or validation failed" >&2
+            exit 1
+          fi
+          case "$DISPOSITION" in
+            clean_changed|clean_no_change)
+              if [[ "$PUBLISH" == true && "$PUBLISH_RESULT" != success ]]; then
+                echo "Security pull-request publication failed or was skipped" >&2
+                exit 1
+              fi
+              exit 0
+              ;;
+            partial_changed)
+              if [[ "$PUBLISH" == true && "$PUBLISH_RESULT" != success ]]; then
+                echo "Partial remediation publication failed or was skipped" >&2
+              else
+                echo "Safe partial fixes were prepared, but vulnerabilities remain" >&2
+              fi
+              exit 1
+              ;;
+            residual_no_change)
+              echo "Vulnerabilities remain and upd could not produce a safe change" >&2
+              exit 1
+              ;;
+            *) echo "Unknown remediation disposition: $DISPOSITION" >&2; exit 2 ;;
+          esac
