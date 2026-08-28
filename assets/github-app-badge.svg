@@ -1,0 +1,10 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="200" height="200" viewBox="0 0 200 200" role="img" aria-labelledby="title desc">
+  <title id="title">upd Remediation</title>
+  <desc id="desc">The lowercase word upd, with the d stem becoming an upward arrow.</desc>
+  <g transform="translate(100 100) scale(.285) translate(-519.5 -491.5)" fill="#D15228">
+    <path d="M240 417h16q9 0 9 9v113q0 34 34 34h15q34 0 34-34V426q0-9 9-9h16q9 0 9 9v169q0 9-9 9h-16q-9 0-9-9v-7q-15 17-43 17h-6q-68 0-68-66V426q0-9 9-9Z"/>
+    <path fill-rule="evenodd" d="M423 417h16q8 0 8 8v11q17-19 46-19h7q62 0 62 66v56q0 66-62 66h-7q-29 0-46-19v91q0 9-9 9h-15q-9 0-9-9V426q0-9 9-9Zm59 30q-35 0-35 36v56q0 34 35 34h16q32 0 32-34v-56q0-36-32-36h-16Z"/>
+    <path fill-rule="evenodd" d="M725 313h14q9 0 9 9v273q0 9-9 9h-14q-9 0-9-9v-7q-15 17-43 17h-12q-69 0-69-66v-56q0-66 69-66h12q28 0 43 17V322q0-9 9-9Zm-64 134q-37 0-37 36v56q0 34 37 34h18q37 0 37-34v-56q0-36-37-36h-18Z"/>
+    <path d="m672 379 60-66 60 66" fill="none" stroke="#D15228" stroke-width="32" stroke-linecap="round" stroke-linejoin="round"/>
+  </g>
+</svg>
