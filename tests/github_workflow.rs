@@ -1106,7 +1106,9 @@ fn workflow_defaults_are_reproducible_and_safe() {
 
 #[test]
 fn repository_dependency_jobs_share_the_hardened_workflow() {
-    assert!(RUST_WORKFLOW.contains("uses: ./.github/workflows/dependency-health.yml"));
+    assert!(RUST_WORKFLOW.contains(
+        "uses: rvben/upd/.github/workflows/dependency-health.yml@1a8c9cd6e0e5f21251f89b2bd9f9fcbff776030d"
+    ));
     assert!(RUST_WORKFLOW.contains("langs: rust"));
     assert!(RUST_WORKFLOW.contains("lock: true"));
     assert!(RUST_WORKFLOW.contains("branch: deps/upd"));
@@ -1115,7 +1117,9 @@ fn repository_dependency_jobs_share_the_hardened_workflow() {
     assert!(!RUST_WORKFLOW.contains("git push"));
     assert!(!RUST_WORKFLOW.contains("upd-version:"));
 
-    assert!(ACTIONS_WORKFLOW.contains("uses: ./.github/workflows/dependency-health.yml"));
+    assert!(ACTIONS_WORKFLOW.contains(
+        "uses: rvben/upd/.github/workflows/dependency-health.yml@1a8c9cd6e0e5f21251f89b2bd9f9fcbff776030d"
+    ));
     assert!(!ACTIONS_WORKFLOW.contains("broker-url:"));
     assert!(!ACTIONS_WORKFLOW.contains("UPD_BROKER_URL"));
     assert!(!ACTIONS_WORKFLOW.contains("upd-version:"));

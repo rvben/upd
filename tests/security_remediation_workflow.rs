@@ -303,7 +303,9 @@ fn remediation_requires_structured_results_and_a_fresh_post_fix_audit() {
 
 #[test]
 fn repository_caller_is_thin_scoped_and_safe_by_default() {
-    assert!(CALLER.contains("uses: ./.github/workflows/dependency-remediation.yml"));
+    assert!(CALLER.contains(
+        "uses: rvben/upd/.github/workflows/dependency-remediation.yml@1a8c9cd6e0e5f21251f89b2bd9f9fcbff776030d"
+    ));
     assert!(CALLER.contains("langs: rust"));
     assert!(CALLER.contains("allowed-paths: Cargo.toml Cargo.lock"));
     assert!(CALLER.contains("validation-command: make check"));
