@@ -5,6 +5,24 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.8.4](https://github.com/rvben/upd/compare/v0.8.3...v0.8.4) - 2026-08-29
+
+### Added
+
+- **automation**: deliver review-ready dependency proposals ([849e945](https://github.com/rvben/upd/commit/849e9459c9a4ce475d4fb5ecb62fba281fcaa117))
+- **automation**: improve dependency update reviews ([84109ea](https://github.com/rvben/upd/commit/84109eaf36c739dc11af0452c6218abb7e47a8e3))
+- **actions**: improve security remediation reviews ([d4830e9](https://github.com/rvben/upd/commit/d4830e9a8b6dca102fd2d30147b387b39e30bf11))
+- **brand**: add GitHub App badge ([1d0d2ca](https://github.com/rvben/upd/commit/1d0d2ca880ba15c9db903a3da28ecf1aa2c01b2a))
+- **actions**: add secure dependency remediation ([ddda7ee](https://github.com/rvben/upd/commit/ddda7eeff343877ff18214f953af35f20b0d56c6))
+
+### Fixed
+
+- **update**: read a spaced bound as the bound it is ([918def0](https://github.com/rvben/upd/commit/918def0fee12c78f87a11d84ad74e936f3c71784))
+- **actions**: use App credentials for git pushes ([04b96d4](https://github.com/rvben/upd/commit/04b96d425833bb3ab3bd134b78256e7e8ac3a67c))
+- **actions**: authenticate remediation publishing ([94b5046](https://github.com/rvben/upd/commit/94b504618ad6cd5eb9cf3558bfa0f6593666ea41))
+- **actions**: generate valid remediation PR body ([c4d663a](https://github.com/rvben/upd/commit/c4d663a21961188f4ef7962416cecd519b4df69b))
+- **deps**: update vulnerable Rust dependencies ([2270522](https://github.com/rvben/upd/commit/2270522ec7fb0f6abc6f2bf831a260a402990eb2))
+
 ## [0.8.3](https://github.com/rvben/upd/compare/v0.8.2...v0.8.3) - 2026-08-27
 
 ## [0.8.2](https://github.com/rvben/upd/compare/v0.8.1...v0.8.2) - 2026-08-27
