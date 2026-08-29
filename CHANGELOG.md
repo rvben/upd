@@ -7,9 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.5](https://github.com/rvben/upd/compare/v0.8.4...v0.8.5) - 2026-08-30
+
+### Added
+
+- **config**: add a versioned opt-in policy for scheduled security remediation ([5513ede](https://github.com/rvben/upd/commit/5513edefc15ec6a9425edc90868902f312deeb18))
+
 ### Changed
 
-- **actions**: replace caller-held GitHub App keys with the OIDC-authenticated hosted token broker
+- **actions**: embed the hosted broker endpoint in reusable workflows ([1d9075c](https://github.com/rvben/upd/commit/1d9075c8c5c2b15242cecc85367edbdebc7d7178))
+- **actions**: replace caller-held GitHub App keys with the OIDC-authenticated hosted token broker ([355b6dc](https://github.com/rvben/upd/commit/355b6dc049f271e8ca9157f1d6595470d4c49066))
 
 ## [0.8.4](https://github.com/rvben/upd/compare/v0.8.3...v0.8.4) - 2026-08-29
 
