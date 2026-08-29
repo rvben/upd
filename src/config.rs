@@ -28,6 +28,15 @@
 //! # Leave SHA-pinned GitHub Actions alone; updating them is the default
 //! update_action_shas = false
 //!
+//! # Repository automation
+//!
+//! Scheduled write automation is opt-in:
+//!
+//! ```toml
+//! [automation]
+//! security_remediation = true
+//! ```
+//!
 //! # Pin packages to specific versions or constraints - top-level table
 //! [pin]
 //! requests = "2.28.0"  # Pin to exact version
@@ -72,7 +81,18 @@ const KNOWN_KEYS: &[&str] = &[
     "pin",
     "cooldown",
     "update_action_shas",
+    "automation",
 ];
+
+/// Repository-level policy for unattended automation.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct AutomationConfig {
+    /// Whether scheduled security remediation may publish or clean up its
+    /// rolling pull request. `None` is distinct from an explicit `false` so
+    /// configuration merging can preserve a parent policy.
+    #[serde(default)]
+    pub security_remediation: Option<bool>,
+}
 
 /// Raw cooldown config as written in the TOML file. Parsed into a
 /// `crate::cooldown::CooldownPolicy` at runtime via `UpdConfig::to_cooldown_policy`.
@@ -127,6 +147,10 @@ pub struct UpdConfig {
     /// whatever is written here.
     #[serde(default)]
     pub update_action_shas: Option<bool>,
+
+    /// Opt-in policy for unattended repository automation.
+    #[serde(default)]
+    pub automation: AutomationConfig,
 }
 
 impl UpdConfig {
@@ -290,6 +314,20 @@ impl UpdConfig {
             }
         }
 
+        if let toml::Value::Table(table) = &raw
+            && let Some(toml::Value::Table(automation)) = table.get("automation")
+        {
+            for key in automation.keys() {
+                if key != "security_remediation" {
+                    warnings.push(format!(
+                        "unknown key `{}` in [automation] in config file {}; valid keys are: \
+                         security_remediation. Run `upd --show-config` for the expected schema.",
+                        key, source_label
+                    ));
+                }
+            }
+        }
+
         // Parse into typed struct (uses the already-validated TOML)
         let config: Self = raw
             .try_into()
@@ -346,6 +384,11 @@ exclude = [
 # npm = "14d"
 # pypi = "14d"
 # "crates.io" = "3d"
+
+# automation: opt-in policy for unattended repository writes. Scheduled
+# security remediation remains disabled when this key is absent or false.
+[automation]
+security_remediation = false
 "#
     }
 
@@ -427,6 +470,7 @@ exclude = [
             || !self.exclude.is_empty()
             || !self.pin.is_empty()
             || self.cooldown.is_some()
+            || self.automation.security_remediation.is_some()
     }
 
     /// Merge another configuration into this one (other takes precedence)
@@ -461,6 +505,15 @@ exclude = [
         if other.update_action_shas.is_some() {
             self.update_action_shas = other.update_action_shas;
         }
+        // Child automation choices override parent choices only when stated.
+        if other.automation.security_remediation.is_some() {
+            self.automation.security_remediation = other.automation.security_remediation;
+        }
+    }
+
+    /// Whether scheduled security remediation is explicitly enabled.
+    pub fn security_remediation_enabled(&self) -> bool {
+        self.automation.security_remediation.unwrap_or(false)
     }
 }
 
@@ -587,6 +640,11 @@ impl EffectiveConfig<'_> {
             "update_action_shas: {}\n",
             self.update_action_shas
         ));
+        out.push_str("automation:\n");
+        out.push_str(&format!(
+            "  security_remediation: {}\n",
+            self.config.security_remediation_enabled()
+        ));
         out.push_str(&render_cooldown_for_show_config(self.cooldown));
 
         out
@@ -619,6 +677,9 @@ impl EffectiveConfig<'_> {
             "exclude": self.config.exclude,
             "pin": pin,
             "update_action_shas": self.update_action_shas,
+            "automation": {
+                "security_remediation": self.config.security_remediation_enabled(),
+            },
             "cooldown": {
                 "default_seconds": self.cooldown.default.num_seconds(),
                 "min_age_override_seconds": self.cooldown
@@ -1337,6 +1398,67 @@ update_action_shas = true
             "update_action_shas is a known key; got: {warnings:?}"
         );
         assert_eq!(config.update_action_shas, Some(true));
+    }
+
+    #[test]
+    fn test_security_remediation_is_explicit_and_disabled_by_default() {
+        let (absent, warnings) =
+            UpdConfig::parse_with_warnings("ignore = []", "test.toml").unwrap();
+        assert!(warnings.is_empty());
+        assert_eq!(absent.automation.security_remediation, None);
+        assert!(!absent.security_remediation_enabled());
+
+        let content = "[automation]\nsecurity_remediation = true\n";
+        let (enabled, warnings) = UpdConfig::parse_with_warnings(content, "test.toml").unwrap();
+        assert!(warnings.is_empty());
+        assert_eq!(enabled.automation.security_remediation, Some(true));
+        assert!(enabled.security_remediation_enabled());
+        assert!(enabled.has_config());
+    }
+
+    #[test]
+    fn test_merge_security_remediation_only_when_child_states_one() {
+        let mut base = UpdConfig {
+            automation: AutomationConfig {
+                security_remediation: Some(true),
+            },
+            ..Default::default()
+        };
+        base.merge(UpdConfig::default());
+        assert!(base.security_remediation_enabled());
+
+        base.merge(UpdConfig {
+            automation: AutomationConfig {
+                security_remediation: Some(false),
+            },
+            ..Default::default()
+        });
+        assert!(!base.security_remediation_enabled());
+    }
+
+    #[test]
+    fn test_unknown_automation_key_warns_without_dropping_known_policy() {
+        let content = r#"
+[automation]
+security_remediation = true
+security_remedation = false
+"#;
+        let (config, warnings) = UpdConfig::parse_with_warnings(content, "test.toml").unwrap();
+        assert!(config.security_remediation_enabled());
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("security_remedation"));
+        assert!(warnings[0].contains("[automation]"));
+    }
+
+    #[test]
+    fn test_security_remediation_rejects_non_boolean_values() {
+        let result = UpdConfig::parse_with_warnings(
+            "[automation]\nsecurity_remediation = \"yes\"\n",
+            "test.toml",
+        );
+        let error = result.expect_err("a string must not enable write automation");
+        assert!(error.contains("Invalid TOML"));
+        assert!(error.contains("security_remediation"));
     }
 
     /// Absent and `false` are different answers: absent leaves the built-in

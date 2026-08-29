@@ -495,6 +495,9 @@ ignore = ["left-pad"]
 include = ["ansible/roles/*/vars/*.yml"]
 exclude = ["**/vendor/**"]
 
+[automation]
+security_remediation = true
+
 [pin]
 "sigstore/cosign-installer" = "v4.1.2"
 
@@ -526,6 +529,7 @@ fn show_config_reports_resolved_settings() {
         "sigstore/cosign-installer",
         "14d",
         "3d",
+        "security_remediation: true",
     ] {
         assert!(
             stdout.contains(needle),
@@ -622,6 +626,7 @@ fn show_config_json_reports_resolved_settings() {
     assert_eq!(json["cooldown"]["default_seconds"], 14 * 86_400);
     assert_eq!(json["cooldown"]["ecosystem_seconds"]["npm"], 3 * 86_400);
     assert_eq!(json["update_action_shas"], true);
+    assert_eq!(json["automation"]["security_remediation"], true);
     assert!(
         json["config_file"]
             .as_str()
@@ -644,6 +649,10 @@ fn show_config_json_reports_null_when_no_config_file() {
         json["config_file"].is_null(),
         "config_file must be null with no config file; got {}",
         json["config_file"]
+    );
+    assert_eq!(
+        json["automation"]["security_remediation"], false,
+        "scheduled write automation must default to disabled"
     );
 }
 

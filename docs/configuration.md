@@ -44,6 +44,12 @@ exclude = ["**/archive/**"]
 # is the default; --update-action-shas still wins when given.
 update_action_shas = false
 
+# Allow the scheduled GitHub security-remediation workflow to maintain its
+# rolling pull request. This is false when omitted. Manual dry runs remain
+# available either way.
+[automation]
+security_remediation = true
+
 # Pin packages to specific versions (bypasses registry lookup)
 [pin]
 flask = "2.3.0"
@@ -59,6 +65,7 @@ django = "4.2.0"
 | `exclude` | `string[]` | Path globs removed from discovery; takes precedence over `include` |
 | `pin` | `table` | Map of package names to pinned versions |
 | `update_action_shas` | `bool` | Whether SHA-pinned GitHub Actions are checked and updated. Defaults to `true`; `--update-action-shas` and `--no-update-action-shas` override it |
+| `automation.security_remediation` | `bool` | Allow scheduled security remediation to publish or clean up its rolling pull request. Defaults to `false` |
 
 Package matching is PEP 503-normalized, so `"Oven-SH/bun"` and `"oven-sh/bun"`
 are one key, as are `"foo-bar"` and `"foo_bar"`.
