@@ -12,6 +12,7 @@ use tempfile::TempDir;
 const WORKFLOW: &str = include_str!("../.github/workflows/dependency-remediation.yml");
 const CALLER: &str = include_str!("../.github/workflows/remediate-dependencies.yml");
 const UPDATE_WORKFLOW: &str = include_str!("../.github/workflows/dependency-health.yml");
+const CONFIG: &str = include_str!("../.updrc.toml");
 const BRANCH: &str = "security/upd";
 
 fn workflow_script(name: &str) -> String {
@@ -307,13 +308,79 @@ fn repository_caller_is_thin_scoped_and_safe_by_default() {
     assert!(CALLER.contains("allowed-paths: Cargo.toml Cargo.lock"));
     assert!(CALLER.contains("validation-command: make check"));
     assert!(CALLER.contains("default: false"));
-    assert!(CALLER.contains("UPD_SECURITY_REMEDIATION_ENABLED"));
+    assert!(CONFIG.contains("[automation]"));
+    assert!(CONFIG.contains("security_remediation = true"));
+    assert!(!CALLER.contains("UPD_SECURITY_REMEDIATION_ENABLED"));
     assert!(CALLER.contains("id-token: write"));
     assert!(!CALLER.contains("broker-url:"));
     assert!(!CALLER.contains("UPD_BROKER_URL"));
     assert!(!CALLER.contains("UPD_APP_PRIVATE_KEY"));
     assert!(WORKFLOW.contains("group: upd-dependency-writes-${{ github.repository }}"));
     assert!(UPDATE_WORKFLOW.contains("group: upd-dependency-writes-${{ github.repository }}"));
+    assert!(WORKFLOW.contains("name: Resolve repository automation policy"));
+    assert!(WORKFLOW.contains(".automation.security_remediation"));
+    assert!(WORKFLOW.contains("needs.generate.outputs.should-run == 'true'"));
+    assert!(WORKFLOW.contains("if [[ \"$SHOULD_RUN\" == false ]]"));
+}
+
+fn run_policy(event_name: &str, config: Option<&str>) -> (Output, String) {
+    let fixture = TempDir::new().unwrap();
+    let bin_dir = fixture.path().join("upd-bin");
+    fs::create_dir(&bin_dir).unwrap();
+    let binary = bin_dir.join("upd");
+    fs::copy(env!("CARGO_BIN_EXE_upd"), &binary).unwrap();
+    let mut permissions = fs::metadata(&binary).unwrap().permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&binary, permissions).unwrap();
+    if let Some(config) = config {
+        fs::write(fixture.path().join(".updrc.toml"), config).unwrap();
+    }
+    let output_file = fixture.path().join("outputs");
+    let summary_file = fixture.path().join("summary");
+    let output = Command::new("bash")
+        .arg("-c")
+        .arg(workflow_script("Resolve repository automation policy"))
+        .current_dir(fixture.path())
+        .env("EVENT_NAME", event_name)
+        .env("GITHUB_OUTPUT", &output_file)
+        .env("GITHUB_STEP_SUMMARY", summary_file)
+        .env("RUNNER_TEMP", fixture.path())
+        .output()
+        .unwrap();
+    let outputs = fs::read_to_string(output_file).unwrap_or_default();
+    (output, outputs)
+}
+
+#[test]
+fn scheduled_remediation_requires_configured_opt_in() {
+    let (disabled, outputs) = run_policy("schedule", None);
+    assert!(disabled.status.success(), "{disabled:?}");
+    assert_eq!(outputs, "should-run=false\n");
+
+    let (enabled, outputs) = run_policy(
+        "schedule",
+        Some("[automation]\nsecurity_remediation = true\n"),
+    );
+    assert!(enabled.status.success(), "{enabled:?}");
+    assert_eq!(outputs, "should-run=true\n");
+}
+
+#[test]
+fn manual_remediation_remains_available_without_scheduled_opt_in() {
+    let (output, outputs) = run_policy("workflow_dispatch", None);
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(outputs, "should-run=true\n");
+}
+
+#[test]
+fn invalid_remediation_policy_fails_closed() {
+    let (output, outputs) = run_policy(
+        "schedule",
+        Some("[automation]\nsecurity_remediation = \"yes\"\n"),
+    );
+    assert!(!output.status.success());
+    assert!(outputs.is_empty());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("Invalid TOML"));
 }
 
 #[test]

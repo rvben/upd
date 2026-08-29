@@ -4,7 +4,7 @@
 //!
 //! # Schema
 //!
-//! All configuration fields are top-level keys:
+//! Configuration starts with top-level keys and tables:
 //!
 //! ```toml
 //! # Packages to ignore (never update or align) - top-level array
@@ -32,10 +32,8 @@
 //!
 //! Scheduled write automation is opt-in:
 //!
-//! ```toml
 //! [automation]
 //! security_remediation = true
-//! ```
 //!
 //! # Pin packages to specific versions or constraints - top-level table
 //! [pin]

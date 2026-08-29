@@ -96,6 +96,7 @@ jobs:
       changed: ${{ steps.classify.outputs.changed }}
       disposition: ${{ steps.classify.outputs.disposition }}
       residual: ${{ steps.classify.outputs.residual }}
+      should-run: ${{ steps.policy.outputs.should-run }}
     steps:
       - name: Check out the trusted default branch
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -217,8 +218,32 @@ jobs:
           "$install_dir/upd" --version
           echo "$install_dir" >> "$GITHUB_PATH"
 
+      - name: Resolve repository automation policy
+        id: policy
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          config="$RUNNER_TEMP/upd-effective-config.json"
+          "$RUNNER_TEMP/upd-bin/upd" --show-config --format json > "$config"
+          enabled="$(jq --raw-output '
+            if (.automation.security_remediation | type) == "boolean" then
+              .automation.security_remediation
+            else
+              error("effective config lacks a Boolean automation.security_remediation")
+            end
+          ' "$config")"
+          if [[ "$EVENT_NAME" == schedule && "$enabled" != true ]]; then
+            echo "should-run=false" >> "$GITHUB_OUTPUT"
+            echo "Scheduled security remediation is disabled in .updrc.toml." \
+              >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          echo "should-run=true" >> "$GITHUB_OUTPUT"
+
       - name: Prepare repository tooling
-        if: inputs.prepare-command != ''
+        if: steps.policy.outputs.should-run == 'true' && inputs.prepare-command != ''
         env:
           PREPARE_COMMAND: ${{ inputs.prepare-command }}
         shell: bash
@@ -231,6 +256,7 @@ jobs:
           fi
 
       - name: Apply available security fixes
+        if: steps.policy.outputs.should-run == 'true'
         env:
           LANGS: ${{ inputs.langs }}
           PATHS: ${{ inputs.paths }}
@@ -280,6 +306,7 @@ jobs:
           fi
 
       - name: Constrain and validate the proposal
+        if: steps.policy.outputs.should-run == 'true'
         env:
           ALLOWED_PATHS: ${{ inputs.allowed-paths }}
           VALIDATION_COMMAND: ${{ inputs.validation-command }}
@@ -330,6 +357,7 @@ jobs:
           fi
 
       - name: Audit the final proposed dependency graph
+        if: steps.policy.outputs.should-run == 'true'
         env:
           LANGS: ${{ inputs.langs }}
           PATHS: ${{ inputs.paths }}
@@ -359,6 +387,7 @@ jobs:
           fi
 
       - name: Classify the validated result
+        if: steps.policy.outputs.should-run == 'true'
         id: classify
         env:
           ALLOWED_PATHS: ${{ inputs.allowed-paths }}
@@ -640,7 +669,7 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Retain remediation evidence
-        if: always()
+        if: always() && steps.policy.outputs.should-run == 'true'
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: upd-security-remediation-${{ github.run_id }}
@@ -654,6 +683,7 @@ jobs:
     if: >-
       inputs.publish &&
       needs.generate.result == 'success' &&
+      needs.generate.outputs.should-run == 'true' &&
       (needs.generate.outputs.disposition == 'clean_changed' ||
        needs.generate.outputs.disposition == 'partial_changed' ||
        needs.generate.outputs.disposition == 'clean_no_change')
@@ -963,9 +993,14 @@ jobs:
           GENERATE_RESULT: ${{ needs.generate.result }}
           PUBLISH: ${{ inputs.publish }}
           PUBLISH_RESULT: ${{ needs.publish.result }}
+          SHOULD_RUN: ${{ needs.generate.outputs.should-run }}
         shell: bash
         run: |
           set -euo pipefail
+          if [[ "$SHOULD_RUN" == false ]]; then
+            echo "Scheduled security remediation is disabled by repository policy."
+            exit 0
+          fi
           if [[ "$GENERATE_RESULT" != success ]]; then
             echo "Remediation generation or validation failed" >&2
             exit 1

@@ -155,6 +155,21 @@ mode of the ordinary updater: security fixes ignore freshness cooldowns and
 bump ceilings, use different failure semantics, and keep auto-merge off unless
 the caller explicitly opts in after configuring repository protections.
 
+Scheduled remediation is opt-in policy stored with the repository. Add this to
+the root `.updrc.toml` on the trusted default branch:
+
+```toml
+[automation]
+security_remediation = true
+```
+
+When the setting is absent or `false`, scheduled runs stop after resolving the
+verified UPD release and effective configuration: they do not audit, mint a
+token, change a branch, or touch a pull request. An explicit
+`workflow_dispatch` remains available for dry runs and one-off publication, so
+temporarily pausing the schedule does not remove operator control. Invalid
+configuration fails closed.
+
 ```yaml
 name: Daily dependency security remediation
 
@@ -229,7 +244,7 @@ before it reaches GitHub-flavored Markdown.
 
 | Input | Default | Purpose |
 |-------|---------|---------|
-| `publish` | `false` | Publish or clean up the rolling pull request; false performs a credential-free dry run |
+| `publish` | `false` | Publish or clean up the rolling pull request; false performs a credential-free dry run. Scheduled runs also require `automation.security_remediation = true` |
 | `runner` | `ubuntu-24.04` | Linux runner label |
 | `upd-version` | current verified manifest | Exact released `upd` version |
 | `upd-sha256` | manifest checksum | Archive digest; required for a version outside the release manifest |
