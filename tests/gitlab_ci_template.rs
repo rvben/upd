@@ -96,8 +96,8 @@ set -euo pipefail
 if [ "${FAKE_UPD_CHANGE}" = "true" ]; then
   printf '%s\n' "${FAKE_UPD_CONTENT}" > dependency.txt
 fi
-if [ -n "${FAKE_UPD_REPORT:-}" ]; then
-  printf '%s\n' "$FAKE_UPD_REPORT"
+if [ -s "${FAKE_UPD_REPORT_FILE:-}" ]; then
+  cat "$FAKE_UPD_REPORT_FILE"
 elif [ "${FAKE_UPD_CHANGE}" = "true" ]; then
   cat <<JSON
 {"command":"update","mode":"applied","files":[{"path":"dependency.txt","file_type":"test","lang":"test","updates":[{"package":"example","current":"1.0.0","latest":"1.1.0","bump":"minor"}],"pinned":[],"ignored":[],"errors":[],"warnings":[]}],"summary":{"files_scanned":1,"files_with_changes":1,"updates_total":1,"updates_major":0,"updates_minor":1,"updates_patch":0,"pinned":0,"ignored":0,"errors":0,"warnings":0}}
@@ -135,6 +135,8 @@ fi
         auto_merge: bool,
         report: &str,
     ) {
+        let report_file = self._temp.path().join("fake-upd-report.json");
+        fs::write(&report_file, report).expect("fixture report");
         let output = Command::new("bash")
             .arg("-c")
             .arg(embedded_script())
@@ -166,7 +168,7 @@ fi
             .env("UPD_EXECUTABLE", &self.updater)
             .env("FAKE_UPD_CHANGE", change.to_string())
             .env("FAKE_UPD_CONTENT", content)
-            .env("FAKE_UPD_REPORT", report)
+            .env("FAKE_UPD_REPORT_FILE", report_file)
             .output()
             .expect("template starts");
         assert!(
