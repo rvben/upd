@@ -261,11 +261,16 @@ async fn template_creates_a_single_commit_rolling_merge_request() {
     assert_eq!(fixture.presentation()["schema"], 1);
     assert_eq!(fixture.presentation()["state"], "ready");
     let description = fixture.description();
-    assert!(description.contains("**Ready for review.**"));
+    assert!(description.contains("**A tidy upgrade, already prepared.**"));
+    assert!(description.contains("84109eaf36c739dc11af0452c6218abb7e47a8e3/assets/logo-wide.svg"));
+    assert!(description.contains("**1 moved forward** · **1 worth a look**"));
+    assert!(description.contains("### Worth a look"));
+    assert!(description.contains("### What upd verified"));
+    assert!(description.contains("<summary><strong>Proof and provenance</strong></summary>"));
     assert!(description.contains("<code>example</code>"));
     assert!(description.contains("<code>1.0.0</code>"));
     assert!(description.contains("<code>1.1.0</code>"));
-    assert!(description.contains("Freshness: <code>7d</code>"));
+    assert!(description.contains("Freshness <code>7d</code>"));
     assert!(!description.contains("[!IMPORTANT]"));
     assert!(description.len() <= 32 * 1024);
 }
@@ -297,13 +302,13 @@ async fn gitlab_presentation_matches_the_contract_and_escapes_untrusted_text() {
     fixture.run_template_with_report(&server, true, "new", false, report);
 
     let presentation = fixture.presentation();
-    assert_eq!(presentation["title"], "chore(deps): update dependency");
+    assert_eq!(presentation["title"], "chore(deps): refresh dependency");
     assert_eq!(presentation["counts"]["policy_holds"], 2);
     assert_eq!(presentation["counts"]["blocked"], 1);
     assert_eq!(presentation["counts"]["annotations"], 1);
     let description = fixture.description();
-    assert!(description.contains("**Ready for review, with follow-up.**"));
-    assert!(description.contains("Held back by policy (2)"));
+    assert!(description.contains("**A careful upgrade, with follow-up.**"));
+    assert!(description.contains("Saved for a deliberate upgrade (2)"));
     assert!(description.contains("### Needs attention"));
     assert!(description.contains("bad&#124;pkg&lt;/code&gt;"));
     assert!(description.contains("blocked&lt;script&gt;"));
@@ -313,6 +318,136 @@ async fn gitlab_presentation_matches_the_contract_and_escapes_untrusted_text() {
     assert!(!description.contains('\u{202e}'));
     assert!(!description.contains("[!IMPORTANT]"));
     assert!(description.len() <= 32 * 1024);
+}
+
+#[tokio::test]
+async fn gitlab_presentation_prioritizes_review_worthy_updates() {
+    let server = MockServer::start().await;
+    let fixture = Fixture::new();
+    list_mock(json!([])).mount(&server).await;
+    Mock::given(method("POST"))
+        .and(path("/api/v4/projects/1/merge_requests"))
+        .respond_with(ResponseTemplate::new(201).set_body_json(mr_response(7, false)))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let report = r#"{
+      "command":"update","mode":"applied",
+      "files":[{
+        "path":"dependency.txt","file_type":"test","lang":"test",
+        "updates":[
+          {"package":"quiet-one","current":"1.0.0","latest":"1.0.1","bump":"patch","status":"applied"},
+          {"package":"review-one","current":"1.0.0","latest":"1.1.0","bump":"minor","status":"applied"},
+          {"package":"quiet-two","current":"2.0.0","latest":"2.0.1","bump":"patch","status":"applied"},
+          {"package":"review-two","current":"3.0.0","latest":"4.0.0","bump":"major","status":"applied"}
+        ],
+        "capped":[{"package":"later","current":"1.0.0","available":"2.0.0"}],
+        "errors":[],"warnings":[]
+      }],
+      "summary":{"files_scanned":1,"files_with_changes":1,"updates_total":4,"errors":0,"warnings":0}
+    }"#;
+    fixture.run_template_with_report(&server, true, "new", false, report);
+
+    let presentation = fixture.presentation();
+    assert_eq!(presentation["counts"]["updates_review_worthy"], 2);
+    assert_eq!(presentation["counts"]["updates_quiet"], 2);
+    let description = fixture.description();
+    assert!(description.contains(
+        "**4 moved forward** · **2 worth a look** · **2 quiet patches** · **1 saved for later**"
+    ));
+    let worth = description.find("### Worth a look").unwrap();
+    let review_one = description.find("<code>review-one</code>").unwrap();
+    let quiet = description.find("Quiet patch updates (2)").unwrap();
+    let quiet_one = description.find("<code>quiet-one</code>").unwrap();
+    assert!(worth < review_one && review_one < quiet && quiet < quiet_one);
+    assert!(description.contains("Includes 1 major-version jump."));
+}
+
+#[tokio::test]
+async fn gitlab_presentation_keeps_unvalidated_patch_updates_truthful() {
+    let server = MockServer::start().await;
+    let fixture = Fixture::new();
+    list_mock(json!([])).mount(&server).await;
+    Mock::given(method("POST"))
+        .and(path("/api/v4/projects/1/merge_requests"))
+        .respond_with(ResponseTemplate::new(201).set_body_json(mr_response(7, false)))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let report = r#"{
+      "command":"update","mode":"applied",
+      "files":[{"path":"dependency.txt","file_type":"test","lang":"test",
+        "updates":[{"package":"example","current":"1.0.0","latest":"1.0.1","bump":"patch","status":"applied"}],
+        "errors":[],"warnings":[]}],
+      "summary":{"files_scanned":1,"files_with_changes":1,"updates_total":1,"errors":0,"warnings":0}
+    }"#;
+    fixture.run_template_with_report(&server, true, "new", false, report);
+
+    let description = fixture.description();
+    assert!(description.contains("### What changed"));
+    assert!(!description.contains("### Worth a look"));
+    assert!(!description.contains("Quiet patch updates"));
+    assert!(description.contains("### What upd verified"));
+    assert!(description.contains("No project-specific command was configured"));
+    assert!(!description.contains("### Why this is a comfortable review"));
+}
+
+#[tokio::test]
+async fn gitlab_large_body_fallback_preserves_risk_state() {
+    let server = MockServer::start().await;
+    let fixture = Fixture::new();
+    list_mock(json!([])).mount(&server).await;
+    Mock::given(method("POST"))
+        .and(path("/api/v4/projects/1/merge_requests"))
+        .respond_with(ResponseTemplate::new(201).set_body_json(mr_response(7, false)))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let updates = (0..80)
+        .map(|index| {
+            json!({
+                "package": format!("package-{index}-{}", "x".repeat(1200)),
+                "current": format!("1.0.0-{}", "c".repeat(1200)),
+                "latest": format!("1.1.0-{}", "l".repeat(1200)),
+                "bump": if index < 40 { "minor" } else { "patch" }, "status": "applied"
+            })
+        })
+        .collect::<Vec<_>>();
+    let held = (0..40)
+        .map(|index| {
+            json!({
+                "package": format!("held-{index}-{}", "y".repeat(1200)),
+                "current": format!("1.0.0-{}", "c".repeat(1200)),
+                "chosen": format!("1.0.1-{}", "s".repeat(1200)),
+                "skipped_latest": format!("1.1.0-{}", "a".repeat(1200))
+            })
+        })
+        .collect::<Vec<_>>();
+    let blocked = (0..30)
+        .map(|index| {
+            json!({
+                "package": format!("blocked-{index}"),
+                "current": format!("1.0.0-{}", "c".repeat(1200)),
+                "status": "blocked", "message": "z".repeat(1200)
+            })
+        })
+        .collect::<Vec<_>>();
+    let report = json!({
+        "command":"update", "mode":"applied",
+        "files":[{"path":format!("dependency-{}.txt", "p".repeat(1200)),"file_type":"test","lang":"test",
+          "updates":updates,"held_back":held,"skipped":blocked,"errors":[],"warnings":[]}],
+        "summary":{"files_scanned":1,"files_with_changes":1,"updates_total":80,"errors":0,"warnings":0}
+    });
+    fixture.run_template_with_report(&server, true, "new", false, &report.to_string());
+
+    let description = fixture.description();
+    assert!(description.len() <= 32 * 1024);
+    assert!(description.contains("**A careful upgrade, with follow-up.**"));
+    assert!(description.contains("Saved for a deliberate upgrade: 40"));
+    assert!(description.contains("Needs attention: 30"));
+    assert!(description.contains("Major-version jumps: 0"));
+    assert!(description.contains("no project-specific command was configured"));
+    assert!(!description.contains("**A tidy upgrade, already prepared.**"));
 }
 
 #[tokio::test]

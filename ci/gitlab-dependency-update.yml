@@ -397,6 +397,8 @@ spec:
               updates_major: ([$updates[] | select((.bump | ascii_downcase) == "major")] | length),
               updates_minor: ([$updates[] | select((.bump | ascii_downcase) == "minor")] | length),
               updates_patch: ([$updates[] | select((.bump | ascii_downcase) == "patch")] | length),
+              updates_review_worthy: ([$updates[] | select((.bump | ascii_downcase) != "patch")] | length),
+              updates_quiet: ([$updates[] | select((.bump | ascii_downcase) == "patch")] | length),
               annotations: ($annotations | length),
               files_changed: ($changed_paths | length),
               policy_holds: ($policy_holds | length),
@@ -422,12 +424,12 @@ spec:
             if .counts.updates == 1 then
               if ((.updates[0].package | test("^[A-Za-z0-9@][A-Za-z0-9._@/+-]{0,79}$")) and
                   (.updates[0].latest | test("^[A-Za-z0-9][A-Za-z0-9._:+-]{0,79}$"))) then
-                "\($title_prefix): update \(.updates[0].package) to \(.updates[0].latest)"
+                "\($title_prefix): refresh \(.updates[0].package) to \(.updates[0].latest)"
               else
-                "\($title_prefix): update dependency"
+                "\($title_prefix): refresh dependency"
               end
             elif .counts.updates > 1 then
-              "\($title_prefix): update \(.counts.updates) dependencies"
+              "\($title_prefix): refresh \(.counts.updates) dependencies"
             elif .counts.annotations == 1 then
               "\($title_prefix): annotate dependency metadata"
             elif .counts.annotations > 1 then
@@ -510,33 +512,59 @@ spec:
           end;
         def result_summary:
           if .counts.updates > 0 then
-            "\(.counts.updates) policy-approved dependency \(plural(.counts.updates; "update"; "updates"))"
+            "\(.counts.updates) dependency \(plural(.counts.updates; "update"; "updates"))"
           else
             "\(.counts.annotations) dependency metadata \(plural(.counts.annotations; "annotation"; "annotations"))"
           end;
+        def review_updates: [.updates[] | select((.bump | ascii_downcase) != "patch")];
+        def quiet_updates: [.updates[] | select((.bump | ascii_downcase) == "patch")];
+        def validation_phrase:
+          if .validation.repository_command_configured then
+            "passed project validation and proposal-integrity checks"
+          else
+            "passed proposal-integrity checks"
+          end;
+        def version_boundary:
+          if .counts.updates_major == 0 then "No major-version jumps."
+          else "Includes \(.counts.updates_major) major-version \(plural(.counts.updates_major; "jump"; "jumps"))."
+          end;
+        def brand:
+          "<p><a href=\"https://github.com/rvben/upd\"><img src=\"https://raw.githubusercontent.com/rvben/upd/84109eaf36c739dc11af0452c6218abb7e47a8e3/assets/logo-wide.svg\" alt=\"upd\" width=\"96\"></a></p>";
         def header:
           if .counts.blocked > 0 then
-            "> **Ready for review, with follow-up.** upd applied \(result_summary) across \(.counts.files_changed) \(plural(.counts.files_changed; "file"; "files")); \(.counts.blocked) additional \(plural(.counts.blocked; "dependency needs"; "dependencies need")) attention."
+            "> **A careful upgrade, with follow-up.** upd prepared \(result_summary) across \(.counts.files_changed) \(plural(.counts.files_changed; "file"; "files")) and \(validation_phrase). It stopped short of \(.counts.blocked) \(plural(.counts.blocked; "dependency"; "dependencies")) it could not change safely."
           else
-            "> **Ready for review.** upd applied \(result_summary) across \(.counts.files_changed) \(plural(.counts.files_changed; "file"; "files")), within the project\u2019s update policy."
+            "> **A tidy upgrade, already prepared.** upd moved \(result_summary) forward across \(.counts.files_changed) \(plural(.counts.files_changed; "file"; "files")) and \(validation_phrase). \(version_boundary)"
           end;
-        def overview:
-          "| | |\n|---|---|\n" +
-          "| **Result** | \(result_summary | md) |\n" +
-          "| **Change mix** | \(.counts.updates_major) major · \(.counts.updates_minor) minor · \(.counts.updates_patch) patch |\n" +
-          "| **Scope** | \(scope) |\n" +
-          "| **Policy** | Freshness: \(.policy.min_age | code) · maximum bump: \(.policy.max_bump | code) · lockfile regeneration: \(if .policy.lockfile_regeneration then "on" else "off" end) |\n" +
-          "| **Validation** | \(if .validation.repository_command_configured then "Project command passed" else "No project-specific command configured" end) · proposal integrity passed |\n" +
-          "| **Merge** | \(if .auto_merge_requested then "Auto-merge requested · project requirements still control readiness" else "Auto-merge off · project pipeline still controls readiness" end) |";
+        def facts:
+          (["\(.counts.updates) moved forward"]
+           + (if .counts.updates_review_worthy > 0 then ["\(.counts.updates_review_worthy) worth a look"] else [] end)
+           + (if .counts.updates_quiet > 0 then ["\(.counts.updates_quiet) quiet \(plural(.counts.updates_quiet; "patch"; "patches"))"] else [] end)
+           + (if .counts.policy_holds > 0 then ["\(.counts.policy_holds) saved for later"] else [] end))
+          | map("**\(.)**") | join(" · ");
         def changes:
-          "### What changed\n\n" +
-          (if .counts.updates > 0 then
-             "| Dependency | Before | After | Change | File |\n|---|---:|---:|---|---|\n" +
-             (.updates[:24] | map("| \(.package | code) | \(.current | code) | \(.latest | code) | \(.bump | md) | \(.path | code) |") | join("\n")) +
-             (if .counts.updates > 24 then "\n\n_\(.counts.updates - 24) more updates are preserved in the pipeline artifact._" else "" end)
-           else
-             "upd added or refreshed dependency metadata without changing selected versions."
-           end) +
+          (review_updates) as $review
+          | (quiet_updates) as $quiet
+          | (if ($review | length) > 0 then
+               "### Worth a look\n\nYour attention is best spent on these non-patch updates.\n\n" +
+               "| Dependency | Before | After | Change | File |\n|---|---:|---:|---|---|\n" +
+               ($review[:12] | map("| \(.package | code) | \(.current | code) | \(.latest | code) | \(.bump | md) | \(.path | code) |") | join("\n")) +
+               (if ($review | length) > 12 then "\n\n_\(($review | length) - 12) more review-worthy updates are preserved in the pipeline artifact._" else "" end)
+             elif .counts.updates > 0 then
+               "### What changed\n\n" +
+               "| Dependency | Before | After | Change | File |\n|---|---:|---:|---|---|\n" +
+               (.updates[:12] | map("| \(.package | code) | \(.current | code) | \(.latest | code) | \(.bump | md) | \(.path | code) |") | join("\n")) +
+               (if .counts.updates > 12 then "\n\n_\(.counts.updates - 12) more updates are preserved in the pipeline artifact._" else "" end)
+             else
+               "### What changed\n\nupd added or refreshed dependency metadata without changing selected versions."
+             end) +
+          (if (($review | length) > 0 and ($quiet | length) > 0) then
+             "\n\n<details>\n<summary><strong>Quiet patch updates (\($quiet | length))</strong></summary>\n\n" +
+             "| Dependency | Before | After | File |\n|---|---:|---:|---|\n" +
+             ($quiet[:20] | map("| \(.package | code) | \(.current | code) | \(.latest | code) | \(.path | code) |") | join("\n")) +
+             (if ($quiet | length) > 20 then "\n\n_\(($quiet | length) - 20) more patch updates are preserved in the pipeline artifact._" else "" end) +
+             "\n\n</details>"
+           else "" end) +
           (if .counts.annotations > 0 then
              "\n\n<details>\n<summary><strong>Dependency metadata (\(.counts.annotations))</strong></summary>\n\n" +
              "| Dependency | Version | File |\n|---|---:|---|\n" +
@@ -546,8 +574,8 @@ spec:
         def held:
           if .counts.policy_holds == 0 then ""
           else
-            "\n\n<details>\n<summary><strong>Held back by policy (\(.counts.policy_holds))</strong></summary>\n\n" +
-            "These releases were intentionally excluded from this proposal.\n\n" +
+            "\n\n<details>\n<summary><strong>Saved for a deliberate upgrade (\(.counts.policy_holds))</strong></summary>\n\n" +
+            "upd left these releases unchanged because they sit outside this project\u2019s current update policy.\n\n" +
             "| Dependency | Selected | Available | Policy | File |\n|---|---:|---:|---|---|\n" +
             (.policy_holds[:20] | map("| \(.package | code) | \(.selected | code) | \(.available | code) | \(.kind | md) | \(.path | code) |") | join("\n")) +
             (if .counts.policy_holds > 20 then "\n\n_\(.counts.policy_holds - 20) more policy decisions are preserved in the pipeline artifact._" else "" end) +
@@ -563,7 +591,7 @@ spec:
             (if .counts.blocked > 12 then "\n\n_\(.counts.blocked - 12) more blocked decisions are preserved in the pipeline artifact._" else "" end)
           end;
         def evidence:
-          "<details>\n<summary><strong>Run evidence</strong></summary>\n\n" +
+          "<details>\n<summary><strong>Proof and provenance</strong></summary>\n\n" +
           "- Applied updates: \(.counts.updates)\n" +
           "- Change mix: \(.counts.updates_major) major, \(.counts.updates_minor) minor, \(.counts.updates_patch) patch\n" +
           "- Dependency annotations: \(.counts.annotations)\n" +
@@ -571,18 +599,40 @@ spec:
           "- Blocked: \(.counts.blocked)\n" +
           "- Not examined: \(.counts.not_examined)\n" +
           "- Warnings: \(.counts.warnings)\n" +
+          "- Auto-merge: \(if .auto_merge_requested then "requested; project requirements still control readiness" else "off" end)\n" +
           "- Full update report and presentation model retained in the pipeline artifact\n\n" +
           "</details>";
-        header + "\n\n" + overview + "\n\n" + changes + held + blocked + "\n\n" + evidence +
-        "\n\n> This rolling proposal was rebuilt from the latest default branch. Review the project pipeline before merging." +
-        "\n\n---\nGenerated by [upd](https://github.com/rvben/upd)."
+        def confidence:
+          "### \(if (.counts.blocked == 0 and .counts.updates_major == 0 and .validation.repository_command_configured) then "Why this is a comfortable review" else "What upd verified" end)\n\n" +
+          "- **Validation:** \(if .validation.repository_command_configured then "Project validation passed" else "No project-specific command was configured" end); proposal integrity passed.\n" +
+          "- **Scope:** \(scope).\n" +
+          "- **Version boundary:** \(version_boundary)\n" +
+          "- **Policy:** Freshness \(.policy.min_age | code); maximum bump \(.policy.max_bump | code); lockfile regeneration \(if .policy.lockfile_regeneration then "on" else "off" end).";
+        brand + "\n\n" + header + "\n\n" + facts + "\n\n" + changes + "\n\n" + confidence + held + blocked + "\n\n" + evidence +
+        "\n\n> Rebuilt from the latest default branch. The project pipeline remains the final merge boundary." +
+        "\n\n---\nPrepared by [upd](https://github.com/rvben/upd)."
       ' "$presentation" > "$description"
 
       if [ "$(wc -c < "$description")" -gt 32768 ]; then
         jq --raw-output '
-          "## Dependency updates ready for review\n\n" +
-          "upd produced \(.counts.updates) policy-approved dependency update(s) across \(.counts.files_changed) file(s). " +
-          "The detailed presentation exceeded the configured body budget, so full evidence is retained in the pipeline artifact.\n\n" +
+          def plural($count; $one; $many): if $count == 1 then $one else $many end;
+          def fallback_header:
+            if .counts.blocked > 0 then
+              "> **A careful upgrade, with follow-up.** upd prepared \(.counts.updates) dependency \(plural(.counts.updates; "update"; "updates")); \(.counts.blocked) \(plural(.counts.blocked; "dependency needs"; "dependencies need")) attention."
+            elif .counts.updates_major > 0 then
+              "> **A substantial upgrade, prepared for review.** upd moved \(.counts.updates) dependencies forward, including \(.counts.updates_major) major-version \(plural(.counts.updates_major; "jump"; "jumps"))."
+            elif .validation.repository_command_configured then
+              "> **A tidy upgrade, already prepared.** upd moved \(.counts.updates) dependency \(plural(.counts.updates; "update"; "updates")) forward across \(.counts.files_changed) \(plural(.counts.files_changed; "file"; "files"))."
+            else
+              "> **A dependency upgrade, prepared for review.** upd moved \(.counts.updates) dependency \(plural(.counts.updates; "update"; "updates")) forward across \(.counts.files_changed) \(plural(.counts.files_changed; "file"; "files"))."
+            end;
+          "<p><a href=\"https://github.com/rvben/upd\"><img src=\"https://raw.githubusercontent.com/rvben/upd/84109eaf36c739dc11af0452c6218abb7e47a8e3/assets/logo-wide.svg\" alt=\"upd\" width=\"96\"></a></p>\n\n" +
+          fallback_header + "\n\n" +
+          "- Major-version jumps: \(.counts.updates_major)\n" +
+          "- Saved for a deliberate upgrade: \(.counts.policy_holds)\n" +
+          "- Needs attention: \(.counts.blocked)\n" +
+          "- Validation: \(if .validation.repository_command_configured then "project validation and proposal integrity passed" else "proposal integrity passed; no project-specific command was configured" end)\n\n" +
+          "The detailed presentation exceeded the configured body budget, so complete decisions and evidence are retained in the pipeline artifact.\n\n" +
           "> Review the project pipeline before merging."
         ' "$presentation" > "$description"
       fi

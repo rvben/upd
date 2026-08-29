@@ -5,8 +5,8 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: write
-  pull-requests: write
+  contents: read
+  pull-requests: read
 
 jobs:
   update:
@@ -20,3 +20,6 @@ jobs:
       fail-on-blocked: false
       branch: deps/upd
       commit-message: "chore(deps): update Rust dependencies with upd"
+      app-client-id: ${{ vars.UPD_APP_CLIENT_ID }}
+    secrets:
+      app-private-key: ${{ secrets.UPD_APP_PRIVATE_KEY }}

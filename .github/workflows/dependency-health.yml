@@ -83,16 +83,20 @@ on:
         description: Auto-merge method (squash, merge, or rebase)
         type: string
         default: squash
+      app-client-id:
+        description: GitHub App Client ID; preferred over the legacy numeric App ID
+        type: string
+        default: ""
       app-id:
-        description: GitHub App identifier; the recommended credential, minted per run
+        description: Legacy numeric GitHub App ID; use app-client-id for new installations
         type: string
         default: ""
     secrets:
       app-private-key:
-        description: Private key of the App named by app-id
+        description: Private key paired with app-client-id or legacy app-id
         required: false
       pull-request-token:
-        description: Fine-grained PAT; an alternative to app-id for a single repository
+        description: Fine-grained PAT; a single-repository alternative to a GitHub App
         required: false
     outputs:
       changed:
@@ -100,7 +104,7 @@ on:
         value: ${{ jobs.update.outputs.changed }}
       pull-request-url:
         description: Created or updated pull-request URL
-        value: ${{ jobs.update.outputs.pull-request-url }}
+        value: ${{ jobs.publish.outputs.pull-request-url }}
   workflow_dispatch:
     inputs:
       runner:
@@ -185,14 +189,18 @@ on:
         type: choice
         options: [squash, merge, rebase]
         default: squash
+      app-client-id:
+        description: GitHub App Client ID
+        type: string
+        default: ""
       app-id:
-        description: GitHub App identifier
+        description: Legacy numeric GitHub App ID
         type: string
         default: ""
 
 permissions:
-  contents: write
-  pull-requests: write
+  contents: read
+  pull-requests: read
 
 concurrency:
   group: upd-dependency-writes-${{ github.repository }}
@@ -204,27 +212,15 @@ jobs:
     timeout-minutes: 30
     outputs:
       changed: ${{ steps.update.outputs.changed }}
-      pull-request-url: ${{ steps.publish.outputs.url }}
+      base-sha: ${{ steps.branch.outputs.base-sha }}
     env:
       BASE_BRANCH: ${{ github.event.repository.default_branch }}
     steps:
-      # An installation token is minted per run and expires within the hour, so
-      # the repository stores a key rather than a credential that can be
-      # replayed. It is also the only one of the three that GitHub lets write
-      # `.github/workflows`, which `langs: actions` exists to update.
-      - name: Mint installation token
-        id: app-token
-        if: inputs.app-id != ''
-        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
-        with:
-          app-id: ${{ inputs.app-id }}
-          private-key: ${{ secrets.app-private-key }}
-
       - name: Check out repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
-          token: ${{ steps.app-token.outputs.token || secrets.pull-request-token || github.token }}
+          persist-credentials: false
 
       - name: Validate configuration
         env:
@@ -333,18 +329,21 @@ jobs:
         id: branch
         env:
           BRANCH: ${{ inputs.branch }}
+          READ_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          git fetch --no-tags origin \
+          askpass="$RUNNER_TEMP/upd-read-askpass"
+          # shellcheck disable=SC2016
+          printf '%s\n' \
+            '#!/usr/bin/env bash' \
+            'case "$1" in *Username*) printf "%s\\n" x-access-token ;; *) printf "%s\\n" "$READ_TOKEN" ;; esac' \
+            > "$askpass"
+          chmod 0700 "$askpass"
+          trap 'rm -f "$askpass"' EXIT
+          GIT_ASKPASS="$askpass" GIT_TERMINAL_PROMPT=0 git fetch --no-tags origin \
             "+refs/heads/${BASE_BRANCH}:refs/remotes/origin/${BASE_BRANCH}"
-          if git fetch --no-tags origin \
-            "+refs/heads/${BRANCH}:refs/remotes/origin/${BRANCH}"; then
-            expected_remote_sha="$(git rev-parse "refs/remotes/origin/${BRANCH}")"
-          else
-            expected_remote_sha=""
-          fi
           git switch --force-create "$BRANCH" "refs/remotes/origin/${BASE_BRANCH}"
-          echo "expected-remote-sha=$expected_remote_sha" >> "$GITHUB_OUTPUT"
+          echo "base-sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
 
       - name: Prepare repository tooling
         if: inputs.prepare-command != ''
@@ -363,7 +362,7 @@ jobs:
         env:
           # Unauthenticated GitHub API calls are throttled to 60 an hour, which
           # upd reports as lookup errors rather than as up-to-date actions.
-          GITHUB_TOKEN: ${{ steps.app-token.outputs.token || secrets.pull-request-token || github.token }}
+          GITHUB_TOKEN: ${{ github.token }}
           LOCK: ${{ inputs.lock }}
           MAX_BUMP: ${{ inputs.max-bump }}
           MIN_AGE: ${{ inputs.min-age }}
@@ -396,42 +395,6 @@ jobs:
           else
             echo "changed=true" >> "$GITHUB_OUTPUT"
           fi
-
-      # GitHub refuses a push that creates or updates a file under
-      # .github/workflows unless the pushing credential carries the `workflows`
-      # permission, and GITHUB_TOKEN cannot be granted it: the `permissions:`
-      # block has no key for it. The push is the last thing this job does, so
-      # without this check every run does all of its work and then dies on a git
-      # error that names the restriction but not the remedy. Checked only when
-      # a workflow file actually changed, because a repository that updates
-      # other ecosystems never needs the stronger credential.
-      - name: Require a credential that may write workflow files
-        if: steps.update.outputs.changed == 'true'
-        env:
-          HAS_ELEVATED_TOKEN: ${{ steps.app-token.outputs.token != '' || secrets.pull-request-token != '' }}
-        run: |
-          set -euo pipefail
-          if [[ "$HAS_ELEVATED_TOKEN" == true ]]; then
-            exit 0
-          fi
-          if ! git diff --cached --name-only --diff-filter=ACMR -- \
-            '.github/workflows/*.yml' '.github/workflows/*.yaml' | grep --quiet .; then
-            exit 0
-          fi
-          {
-            echo "This run updates a workflow file, which GITHUB_TOKEN may not push."
-            echo
-            echo "Supply a credential that carries the workflows permission:"
-            echo "  - a GitHub App, via the app-id input and the app-private-key secret"
-            echo "  - or a fine-grained PAT with Workflows write, via pull-request-token"
-            echo
-            echo "Changed workflow files:"
-            git diff --cached --name-only --diff-filter=ACMR -- \
-              '.github/workflows/*.yml' '.github/workflows/*.yaml' | sed 's/^/  - /'
-            echo
-            echo "See https://github.com/rvben/upd/blob/main/docs/github-actions.md"
-          } | tee -a "$GITHUB_STEP_SUMMARY" >&2
-          exit 4
 
       - name: Validate changed workflow syntax
         if: steps.update.outputs.changed == 'true' && inputs.validate-actions
@@ -566,6 +529,8 @@ jobs:
                   updates_major: ([$updates[] | select((.bump | ascii_downcase) == "major")] | length),
                   updates_minor: ([$updates[] | select((.bump | ascii_downcase) == "minor")] | length),
                   updates_patch: ([$updates[] | select((.bump | ascii_downcase) == "patch")] | length),
+                  updates_review_worthy: ([$updates[] | select((.bump | ascii_downcase) != "patch")] | length),
+                  updates_quiet: ([$updates[] | select((.bump | ascii_downcase) == "patch")] | length),
                   annotations: ($annotations | length),
                   files_changed: ($changed_paths | length),
                   policy_holds: ($policy_holds | length),
@@ -588,12 +553,12 @@ jobs:
                 if .counts.updates == 1 then
                   if ((.updates[0].package | test("^[A-Za-z0-9@][A-Za-z0-9._@/+-]{0,79}$")) and
                       (.updates[0].latest | test("^[A-Za-z0-9][A-Za-z0-9._:+-]{0,79}$"))) then
-                    "\($title_prefix): update \(.updates[0].package) to \(.updates[0].latest)"
+                    "\($title_prefix): refresh \(.updates[0].package) to \(.updates[0].latest)"
                   else
-                    "\($title_prefix): update dependency"
+                    "\($title_prefix): refresh dependency"
                   end
                 elif .counts.updates > 1 then
-                  "\($title_prefix): update \(.counts.updates) dependencies"
+                  "\($title_prefix): refresh \(.counts.updates) dependencies"
                 elif .counts.annotations == 1 then
                   "\($title_prefix): annotate dependency metadata"
                 elif .counts.annotations > 1 then
@@ -604,6 +569,28 @@ jobs:
                 | clean(72)
               )
           ' "$REPORT" > "$PRESENTATION"
+
+      - name: Package validated proposal
+        if: steps.update.outputs.changed == 'true'
+        env:
+          BASE_SHA: ${{ steps.branch.outputs.base-sha }}
+          COMMIT_MESSAGE: ${{ inputs.commit-message }}
+        run: |
+          set -euo pipefail
+          git config user.name "upd automation"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit --message "$COMMIT_MESSAGE"
+          read -r proposal_sha parent_sha extra_parent < <(git rev-list --parents -n 1 HEAD)
+          if [[ "$proposal_sha" != "$(git rev-parse HEAD)" || "$parent_sha" != "$BASE_SHA" || -n "${extra_parent:-}" ]]; then
+            echo "The validated proposal is not a single commit on the prepared base" >&2
+            exit 2
+          fi
+          bundle="$RUNNER_TEMP/upd-proposal.bundle"
+          git bundle create "$bundle" HEAD "^$BASE_SHA"
+          (
+            cd "$RUNNER_TEMP"
+            sha256sum upd-proposal.bundle > upd-proposal.bundle.sha256
+          )
 
       - name: Publish dependency summary
         env:
@@ -642,15 +629,193 @@ jobs:
           if-no-files-found: ignore
           retention-days: 7
 
+      - name: Transfer validated proposal to isolated publisher
+        if: steps.update.outputs.changed == 'true'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: upd-proposal
+          path: |
+            ${{ runner.temp }}/upd-proposal.bundle
+            ${{ runner.temp }}/upd-proposal.bundle.sha256
+          if-no-files-found: error
+          retention-days: 1
+
+  publish:
+    needs: update
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: 10
+    outputs:
+      pull-request-url: ${{ steps.publish.outputs.url }}
+    env:
+      BASE_BRANCH: ${{ github.event.repository.default_branch }}
+    steps:
+      # This job never executes checked-out repository code. The validated
+      # commit crosses a job boundary as a checksummed Git bundle before any
+      # write credential is minted.
+      - name: Check out prepared base for isolated publication
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.update.outputs.base-sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Download review evidence
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: upd-report
+          path: ${{ runner.temp }}
+
+      - name: Download validated proposal
+        if: needs.update.outputs.changed == 'true'
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: upd-proposal
+          path: ${{ runner.temp }}
+
+      - name: Restore validated proposal
+        if: needs.update.outputs.changed == 'true'
+        env:
+          BASE_SHA: ${{ needs.update.outputs.base-sha }}
+          BRANCH: ${{ inputs.branch }}
+        run: |
+          set -euo pipefail
+          (
+            cd "$RUNNER_TEMP"
+            sha256sum --check upd-proposal.bundle.sha256
+          )
+          bundle="$RUNNER_TEMP/upd-proposal.bundle"
+          git bundle verify "$bundle"
+          git fetch "$bundle" HEAD
+          proposal_sha="$(git rev-parse FETCH_HEAD)"
+          read -r verified_sha parent_sha extra_parent < <(git rev-list --parents -n 1 "$proposal_sha")
+          if [[ "$verified_sha" != "$proposal_sha" || "$parent_sha" != "$BASE_SHA" || -n "${extra_parent:-}" ]]; then
+            echo "The transferred proposal is not a single commit on the prepared base" >&2
+            exit 2
+          fi
+          git switch --force-create "$BRANCH" "$proposal_sha"
+
+      - name: Inspect publication state
+        id: publication-state
+        env:
+          BRANCH: ${{ inputs.branch }}
+          GH_TOKEN: ${{ github.token }}
+          READ_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          pr_count="$(gh pr list --head "$BRANCH" --base "$BASE_BRANCH" --state open \
+            --limit 100 --json number | jq 'length')"
+          if [[ "$pr_count" -gt 1 ]]; then
+            echo "More than one open upd pull request uses $BRANCH; refusing to choose one" >&2
+            exit 2
+          fi
+          askpass="$RUNNER_TEMP/upd-read-askpass"
+          # shellcheck disable=SC2016
+          printf '%s\n' \
+            '#!/usr/bin/env bash' \
+            'case "$1" in *Username*) printf "%s\\n" x-access-token ;; *) printf "%s\\n" "$READ_TOKEN" ;; esac' \
+            > "$askpass"
+          chmod 0700 "$askpass"
+          trap 'rm -f "$askpass"' EXIT
+          remote_sha="$(GIT_ASKPASS="$askpass" GIT_TERMINAL_PROMPT=0 \
+            git ls-remote --heads origin "refs/heads/$BRANCH" | cut -f 1)"
+          cleanup_required=false
+          if [[ "$pr_count" -eq 1 || -n "$remote_sha" ]]; then
+            cleanup_required=true
+          fi
+          echo "cleanup-required=$cleanup_required" >> "$GITHUB_OUTPUT"
+          echo "expected-remote-sha=$remote_sha" >> "$GITHUB_OUTPUT"
+
+      # Publication is isolated from every repository-controlled command. A
+      # write token is minted only when a proposal or stale state needs a write,
+      # and workflow scope is requested only for a workflow-file proposal.
+      - name: Require a check-triggering publishing credential
+        id: credential-needs
+        if: needs.update.outputs.changed == 'true' || steps.publication-state.outputs.cleanup-required == 'true'
+        env:
+          BASE_SHA: ${{ needs.update.outputs.base-sha }}
+          CHANGED: ${{ needs.update.outputs.changed }}
+          HAS_APP_CREDENTIAL: ${{ (inputs.app-client-id != '' || inputs.app-id != '') && secrets.app-private-key != '' }}
+          HAS_PAT: ${{ secrets.pull-request-token != '' }}
+        run: |
+          set -euo pipefail
+          workflow_files_changed=false
+          if [[ "$CHANGED" == true ]] &&
+            git diff --name-only --diff-filter=ACMR "$BASE_SHA" HEAD -- \
+              '.github/workflows/*.yml' '.github/workflows/*.yaml' | grep --quiet .; then
+            workflow_files_changed=true
+          fi
+          echo "publication-required=true" >> "$GITHUB_OUTPUT"
+          echo "workflow-files-changed=$workflow_files_changed" >> "$GITHUB_OUTPUT"
+          if [[ "$HAS_APP_CREDENTIAL" == true || "$HAS_PAT" == true ]]; then
+            exit 0
+          fi
+          {
+            echo "Publishing dependency updates requires an independent GitHub App or PAT credential."
+            echo
+            echo "This keeps publication separate from GITHUB_TOKEN event-recursion and approval behavior."
+            echo "Supply one of:"
+            echo "  - a GitHub App, via app-client-id (preferred) or app-id plus app-private-key"
+            if [[ "$workflow_files_changed" == true ]]; then
+              echo "  - or a fine-grained PAT with Contents, Pull requests, and Workflows write"
+            else
+              echo "  - or a fine-grained PAT with Contents and Pull requests write"
+            fi
+            echo
+            echo "See https://github.com/rvben/upd/blob/main/docs/github-actions.md"
+          } | tee -a "$GITHUB_STEP_SUMMARY" >&2
+          exit 4
+
+      - name: Mint publication token
+        id: app-token
+        if: steps.credential-needs.outputs.publication-required == 'true' && inputs.app-client-id != '' && steps.credential-needs.outputs.workflow-files-changed != 'true'
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          client-id: ${{ inputs.app-client-id }}
+          private-key: ${{ secrets.app-private-key }}
+          permission-contents: write
+          permission-pull-requests: write
+
+      - name: Mint workflow publication token
+        id: app-workflow-token
+        if: steps.credential-needs.outputs.publication-required == 'true' && inputs.app-client-id != '' && steps.credential-needs.outputs.workflow-files-changed == 'true'
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          client-id: ${{ inputs.app-client-id }}
+          private-key: ${{ secrets.app-private-key }}
+          permission-contents: write
+          permission-pull-requests: write
+          permission-workflows: write
+
+      - name: Mint publication token with legacy App ID
+        id: legacy-app-token
+        if: steps.credential-needs.outputs.publication-required == 'true' && inputs.app-client-id == '' && inputs.app-id != '' && steps.credential-needs.outputs.workflow-files-changed != 'true'
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ inputs.app-id }}
+          private-key: ${{ secrets.app-private-key }}
+          permission-contents: write
+          permission-pull-requests: write
+
+      - name: Mint workflow publication token with legacy App ID
+        id: legacy-app-workflow-token
+        if: steps.credential-needs.outputs.publication-required == 'true' && inputs.app-client-id == '' && inputs.app-id != '' && steps.credential-needs.outputs.workflow-files-changed == 'true'
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ inputs.app-id }}
+          private-key: ${{ secrets.app-private-key }}
+          permission-contents: write
+          permission-pull-requests: write
+          permission-workflows: write
+
       - name: Publish rolling pull request
         id: publish
         env:
           AUTO_MERGE: ${{ inputs.auto-merge }}
           BRANCH: ${{ inputs.branch }}
-          CHANGED: ${{ steps.update.outputs.changed }}
-          GH_TOKEN: ${{ steps.app-token.outputs.token || secrets.pull-request-token || github.token }}
-          COMMIT_MESSAGE: ${{ inputs.commit-message }}
-          EXPECTED_REMOTE_SHA: ${{ steps.branch.outputs.expected-remote-sha }}
+          CHANGED: ${{ needs.update.outputs.changed }}
+          GH_TOKEN: ${{ steps.app-token.outputs.token || steps.app-workflow-token.outputs.token || steps.legacy-app-token.outputs.token || steps.legacy-app-workflow-token.outputs.token || (steps.credential-needs.outputs.publication-required == 'true' && secrets.pull-request-token) || github.token }}
+          HAS_PUBLISHING_TOKEN: ${{ steps.app-token.outputs.token != '' || steps.app-workflow-token.outputs.token != '' || steps.legacy-app-token.outputs.token != '' || steps.legacy-app-workflow-token.outputs.token != '' || (steps.credential-needs.outputs.publication-required == 'true' && secrets.pull-request-token != '') }}
+          EXPECTED_REMOTE_SHA: ${{ steps.publication-state.outputs.expected-remote-sha }}
           MERGE_METHOD: ${{ inputs.merge-method }}
           PRESENTATION: ${{ runner.temp }}/upd-presentation.json
           PR_TITLE: ${{ inputs.pull-request-title }}
@@ -673,11 +838,28 @@ jobs:
               exit 2
             fi
           }
+          git_push() {
+            local askpass
+            askpass="$RUNNER_TEMP/upd-write-askpass"
+            # shellcheck disable=SC2016
+            printf '%s\n' \
+              '#!/usr/bin/env bash' \
+              'case "$1" in *Username*) printf "%s\\n" x-access-token ;; *) printf "%s\\n" "$GH_TOKEN" ;; esac' \
+              > "$askpass"
+            chmod 0700 "$askpass"
+            GIT_ASKPASS="$askpass" GIT_TERMINAL_PROMPT=0 git push "$@"
+            rm -f "$askpass"
+          }
 
           pr_list="$(find_open_prs)"
           require_unambiguous_pr "$pr_list"
 
           if [[ "$CHANGED" != true ]]; then
+            if [[ "$HAS_PUBLISHING_TOKEN" != true &&
+                  ("$(jq 'length' <<< "$pr_list")" -eq 1 || -n "$EXPECTED_REMOTE_SHA") ]]; then
+              echo "Cleaning up an obsolete upd pull request requires the configured App or PAT" >&2
+              exit 4
+            fi
             if [[ "$(jq 'length' <<< "$pr_list")" -eq 1 ]]; then
               pr_number="$(jq --raw-output '.[0].number' <<< "$pr_list")"
               pr_url="$(jq --raw-output '.[0].url' <<< "$pr_list")"
@@ -685,7 +867,7 @@ jobs:
               echo "Closed obsolete pull request: $pr_url" >> "$GITHUB_STEP_SUMMARY"
             fi
             if [[ -n "$EXPECTED_REMOTE_SHA" ]]; then
-              git push \
+              git_push \
                 --force-with-lease="refs/heads/${BRANCH}:${EXPECTED_REMOTE_SHA}" \
                 origin ":refs/heads/${BRANCH}"
               echo "Removed obsolete automation branch: $BRANCH" >> "$GITHUB_STEP_SUMMARY"
@@ -695,11 +877,8 @@ jobs:
             exit 0
           fi
 
-          git config user.name "upd automation"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git commit --message "$COMMIT_MESSAGE"
           commit_sha="$(git rev-parse HEAD)"
-          git push \
+          git_push \
             --force-with-lease="refs/heads/${BRANCH}:${EXPECTED_REMOTE_SHA}" \
             origin "HEAD:refs/heads/${BRANCH}"
 
@@ -719,33 +898,59 @@ jobs:
               end;
             def result_summary:
               if .counts.updates > 0 then
-                "\(.counts.updates) policy-approved dependency \(plural(.counts.updates; "update"; "updates"))"
+                "\(.counts.updates) dependency \(plural(.counts.updates; "update"; "updates"))"
               else
                 "\(.counts.annotations) dependency metadata \(plural(.counts.annotations; "annotation"; "annotations"))"
               end;
+            def review_updates: [.updates[] | select((.bump | ascii_downcase) != "patch")];
+            def quiet_updates: [.updates[] | select((.bump | ascii_downcase) == "patch")];
+            def validation_phrase:
+              if .validation.repository_command_configured then
+                "passed repository validation and proposal-integrity checks"
+              else
+                "passed proposal-integrity checks"
+              end;
+            def version_boundary:
+              if .counts.updates_major == 0 then "No major-version jumps."
+              else "Includes \(.counts.updates_major) major-version \(plural(.counts.updates_major; "jump"; "jumps"))."
+              end;
+            def brand:
+              "<p><a href=\"https://github.com/rvben/upd\"><img src=\"https://raw.githubusercontent.com/rvben/upd/84109eaf36c739dc11af0452c6218abb7e47a8e3/assets/logo-wide.svg\" alt=\"upd\" width=\"96\"></a></p>";
             def header:
               if .counts.blocked > 0 then
-                "> [!WARNING]\n> **Ready for review, with follow-up.** upd applied \(result_summary) across \(.counts.files_changed) \(plural(.counts.files_changed; "file"; "files")); \(.counts.blocked) additional \(plural(.counts.blocked; "dependency needs"; "dependencies need")) attention."
+                "> [!WARNING]\n> **A careful upgrade, with follow-up.** upd prepared \(result_summary) across \(.counts.files_changed) \(plural(.counts.files_changed; "file"; "files")) and \(validation_phrase). It stopped short of \(.counts.blocked) \(plural(.counts.blocked; "dependency"; "dependencies")) it could not change safely."
               else
-                "> [!IMPORTANT]\n> **Ready for review.** upd applied \(result_summary) across \(.counts.files_changed) \(plural(.counts.files_changed; "file"; "files")), within the repository\u2019s update policy."
+                "> [!IMPORTANT]\n> **A tidy upgrade, already prepared.** upd moved \(result_summary) forward across \(.counts.files_changed) \(plural(.counts.files_changed; "file"; "files")) and \(validation_phrase). \(version_boundary)"
               end;
-            def overview:
-              "| | |\n|---|---|\n" +
-              "| **Result** | \(result_summary | md) |\n" +
-              "| **Change mix** | \(.counts.updates_major) major · \(.counts.updates_minor) minor · \(.counts.updates_patch) patch |\n" +
-              "| **Scope** | \(scope) |\n" +
-              "| **Policy** | Freshness: \(.policy.min_age | code) · maximum bump: \(.policy.max_bump | code) · lockfile regeneration: \(if .policy.lockfile_regeneration then "on" else "off" end) |\n" +
-              "| **Validation** | \(if .validation.repository_command_configured then "Repository command passed" else "No repository-specific command configured" end) · proposal integrity passed |\n" +
-              "| **Merge** | \(if .auto_merge_requested then "Auto-merge requested · repository requirements still control readiness" else "Auto-merge off · repository checks still control readiness" end) |";
+            def facts:
+              (["\(.counts.updates) moved forward"]
+               + (if .counts.updates_review_worthy > 0 then ["\(.counts.updates_review_worthy) worth a look"] else [] end)
+               + (if .counts.updates_quiet > 0 then ["\(.counts.updates_quiet) quiet \(plural(.counts.updates_quiet; "patch"; "patches"))"] else [] end)
+               + (if .counts.policy_holds > 0 then ["\(.counts.policy_holds) saved for later"] else [] end))
+              | map("**\(.)**") | join(" · ");
             def changes:
-              "### What changed\n\n" +
-              (if .counts.updates > 0 then
-                 "| Dependency | Before | After | Change | File |\n|---|---:|---:|---|---|\n" +
-                 (.updates[:24] | map("| \(.package | code) | \(.current | code) | \(.latest | code) | \(.bump | md) | \(.path | code) |") | join("\n")) +
-                 (if .counts.updates > 24 then "\n\n_\(.counts.updates - 24) more updates are preserved in the evidence artifact._" else "" end)
-               else
-                 "upd added or refreshed dependency metadata without changing selected versions."
-               end) +
+              (review_updates) as $review
+              | (quiet_updates) as $quiet
+              | (if ($review | length) > 0 then
+                   "### Worth a look\n\nYour attention is best spent on these non-patch updates.\n\n" +
+                   "| Dependency | Before | After | Change | File |\n|---|---:|---:|---|---|\n" +
+                   ($review[:12] | map("| \(.package | code) | \(.current | code) | \(.latest | code) | \(.bump | md) | \(.path | code) |") | join("\n")) +
+                   (if ($review | length) > 12 then "\n\n_\(($review | length) - 12) more review-worthy updates are preserved in the evidence artifact._" else "" end)
+                 elif .counts.updates > 0 then
+                   "### What changed\n\n" +
+                   "| Dependency | Before | After | Change | File |\n|---|---:|---:|---|---|\n" +
+                   (.updates[:12] | map("| \(.package | code) | \(.current | code) | \(.latest | code) | \(.bump | md) | \(.path | code) |") | join("\n")) +
+                   (if .counts.updates > 12 then "\n\n_\(.counts.updates - 12) more updates are preserved in the evidence artifact._" else "" end)
+                 else
+                   "### What changed\n\nupd added or refreshed dependency metadata without changing selected versions."
+                 end) +
+              (if (($review | length) > 0 and ($quiet | length) > 0) then
+                 "\n\n<details>\n<summary><strong>Quiet patch updates (\($quiet | length))</strong></summary>\n\n" +
+                 "| Dependency | Before | After | File |\n|---|---:|---:|---|\n" +
+                 ($quiet[:20] | map("| \(.package | code) | \(.current | code) | \(.latest | code) | \(.path | code) |") | join("\n")) +
+                 (if ($quiet | length) > 20 then "\n\n_\(($quiet | length) - 20) more patch updates are preserved in the evidence artifact._" else "" end) +
+                 "\n\n</details>"
+               else "" end) +
               (if .counts.annotations > 0 then
                  "\n\n<details>\n<summary><strong>Dependency metadata (\(.counts.annotations))</strong></summary>\n\n" +
                  "| Dependency | Version | File |\n|---|---:|---|\n" +
@@ -755,8 +960,8 @@ jobs:
             def held:
               if .counts.policy_holds == 0 then ""
               else
-                "\n\n<details>\n<summary><strong>Held back by policy (\(.counts.policy_holds))</strong></summary>\n\n" +
-                "These releases were intentionally excluded from this proposal.\n\n" +
+                "\n\n<details>\n<summary><strong>Saved for a deliberate upgrade (\(.counts.policy_holds))</strong></summary>\n\n" +
+                "upd left these releases unchanged because they sit outside this repository\u2019s current update policy.\n\n" +
                 "| Dependency | Selected | Available | Policy | File |\n|---|---:|---:|---|---|\n" +
                 (.policy_holds[:20] | map("| \(.package | code) | \(.selected | code) | \(.available | code) | \(.kind | md) | \(.path | code) |") | join("\n")) +
                 (if .counts.policy_holds > 20 then "\n\n_\(.counts.policy_holds - 20) more policy decisions are preserved in the evidence artifact._" else "" end) +
@@ -772,7 +977,7 @@ jobs:
                 (if .counts.blocked > 12 then "\n\n_\(.counts.blocked - 12) more blocked decisions are preserved in the evidence artifact._" else "" end)
               end;
             def evidence:
-              "<details>\n<summary><strong>Run evidence</strong></summary>\n\n" +
+              "<details>\n<summary><strong>Proof and provenance</strong></summary>\n\n" +
               "- Applied updates: \(.counts.updates)\n" +
               "- Change mix: \(.counts.updates_major) major, \(.counts.updates_minor) minor, \(.counts.updates_patch) patch\n" +
               "- Dependency annotations: \(.counts.annotations)\n" +
@@ -780,18 +985,40 @@ jobs:
               "- Blocked: \(.counts.blocked)\n" +
               "- Not examined: \(.counts.not_examined)\n" +
               "- Warnings: \(.counts.warnings)\n" +
+              "- Auto-merge: \(if .auto_merge_requested then "requested; repository requirements still control readiness" else "off" end)\n" +
               "- Full update report and presentation model retained in the workflow artifact\n\n" +
               "</details>";
-            header + "\n\n" + overview + "\n\n" + changes + held + blocked + "\n\n" + evidence +
-            "\n\n> [!NOTE]\n> This rolling proposal was rebuilt from the latest default branch. Review the repository checks below before merging." +
-            "\n\n---\nGenerated by [upd](https://github.com/rvben/upd)."
+            def confidence:
+              "### \(if (.counts.blocked == 0 and .counts.updates_major == 0 and .validation.repository_command_configured) then "Why this is a comfortable review" else "What upd verified" end)\n\n" +
+              "- **Validation:** \(if .validation.repository_command_configured then "Repository validation passed" else "No repository-specific command was configured" end); proposal integrity passed.\n" +
+              "- **Scope:** \(scope).\n" +
+              "- **Version boundary:** \(version_boundary)\n" +
+              "- **Policy:** Freshness \(.policy.min_age | code); maximum bump \(.policy.max_bump | code); lockfile regeneration \(if .policy.lockfile_regeneration then "on" else "off" end).";
+            brand + "\n\n" + header + "\n\n" + facts + "\n\n" + changes + "\n\n" + confidence + held + blocked + "\n\n" + evidence +
+            "\n\n> [!NOTE]\n> Rebuilt from the latest default branch. GitHub checks below remain the final merge boundary." +
+            "\n\n---\nPrepared by [upd](https://github.com/rvben/upd)."
           ' "$PRESENTATION" > "$body_file"
 
           if [[ "$(wc -c < "$body_file")" -gt 32768 ]]; then
             jq --raw-output '
-              "## Dependency updates ready for review\n\n" +
-              "upd produced \(.counts.updates) policy-approved dependency update(s) across \(.counts.files_changed) file(s). " +
-              "The detailed presentation exceeded the configured body budget, so full evidence is retained in the workflow artifact.\n\n" +
+              def plural($count; $one; $many): if $count == 1 then $one else $many end;
+              def fallback_header:
+                if .counts.blocked > 0 then
+                  "> [!WARNING]\n> **A careful upgrade, with follow-up.** upd prepared \(.counts.updates) dependency \(plural(.counts.updates; "update"; "updates")); \(.counts.blocked) \(plural(.counts.blocked; "dependency needs"; "dependencies need")) attention."
+                elif .counts.updates_major > 0 then
+                  "> [!WARNING]\n> **A substantial upgrade, prepared for review.** upd moved \(.counts.updates) dependencies forward, including \(.counts.updates_major) major-version \(plural(.counts.updates_major; "jump"; "jumps"))."
+                elif .validation.repository_command_configured then
+                  "> [!IMPORTANT]\n> **A tidy upgrade, already prepared.** upd moved \(.counts.updates) dependency \(plural(.counts.updates; "update"; "updates")) forward across \(.counts.files_changed) \(plural(.counts.files_changed; "file"; "files"))."
+                else
+                  "> [!IMPORTANT]\n> **A dependency upgrade, prepared for review.** upd moved \(.counts.updates) dependency \(plural(.counts.updates; "update"; "updates")) forward across \(.counts.files_changed) \(plural(.counts.files_changed; "file"; "files"))."
+                end;
+              "<p><a href=\"https://github.com/rvben/upd\"><img src=\"https://raw.githubusercontent.com/rvben/upd/84109eaf36c739dc11af0452c6218abb7e47a8e3/assets/logo-wide.svg\" alt=\"upd\" width=\"96\"></a></p>\n\n" +
+              fallback_header + "\n\n" +
+              "- Major-version jumps: \(.counts.updates_major)\n" +
+              "- Saved for a deliberate upgrade: \(.counts.policy_holds)\n" +
+              "- Needs attention: \(.counts.blocked)\n" +
+              "- Validation: \(if .validation.repository_command_configured then "repository validation and proposal integrity passed" else "proposal integrity passed; no repository-specific command was configured" end)\n\n" +
+              "The detailed presentation exceeded the configured body budget, so complete decisions and evidence are retained in the workflow artifact.\n\n" +
               "> [!NOTE]\n> Review the repository checks below before merging."
             ' "$PRESENTATION" > "$body_file"
           fi

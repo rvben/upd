@@ -20,14 +20,14 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: write
-  pull-requests: write
+  contents: read
+  pull-requests: read
 
 jobs:
   update:
     uses: rvben/upd/.github/workflows/dependency-health.yml@<FULL_COMMIT_SHA>
     with:
-      app-id: ${{ vars.UPD_APP_ID }}
+      app-client-id: ${{ vars.UPD_APP_CLIENT_ID }}
       min-age: 7d
       max-bump: minor
       validation-command: make test
@@ -49,14 +49,14 @@ workflow changes are the ones `GITHUB_TOKEN` is forbidden to push.
 
 ## Credentials
 
-The workflow accepts three credentials and uses the first one supplied: a
-GitHub App, a fine-grained personal access token, or the caller's
-`GITHUB_TOKEN`. The caller must always grant `contents: write` and
-`pull-requests: write`, because a reusable workflow cannot elevate permissions
-withheld by its caller.
+The workflow accepts a GitHub App or a fine-grained personal access token. The
+caller grants `contents: read` and `pull-requests: read` to the per-run
+`GITHUB_TOKEN`. Publication uses the independent App or PAT credential instead,
+so the caller does not grant write access to repository-controlled commands.
 
-`GITHUB_TOKEN` is the fallback rather than the recommendation, because two of
-its limits are load-bearing here:
+`GITHUB_TOKEN` is used only for read access while preparing and inspecting a
+proposal. It is intentionally not used for publication because two boundaries
+are load-bearing here:
 
 - **It may not write `.github/workflows`.** GitHub rejects a push that creates
   or updates a workflow file unless the pushing credential carries the
@@ -65,18 +65,24 @@ its limits are load-bearing here:
   workflow files and nothing else, so with `GITHUB_TOKEN` such a run does all of
   its work and then fails at the push. The workflow detects this before the push
   and fails with the remedy instead.
-- **Its pull requests do not start checks.** GitHub does not run
-  `on: pull_request` workflows for a pull request opened with `GITHUB_TOKEN`, so
-  the proposal arrives with no CI signal and required checks never report.
+- **Its event behavior is not an independent publication signal.** GitHub's
+  recursion protection and the repository's approval policy can suppress or
+  hold workflows associated with `GITHUB_TOKEN` activity. An App or PAT keeps
+  PR publication independent so checks can start according to repository
+  policy.
 
-`GITHUB_TOKEN` is sufficient only when the run never touches a workflow file,
-that is, when `langs` is set to ecosystems other than `actions`.
+When an eligible update exists without an App or PAT, the workflow may build and
+validate a local proposal artifact, but it fails before any external write. This
+prevents a pull request from arriving without the checks that decide whether it
+is safe to merge.
 
 ### GitHub App (recommended)
 
-An installation token is minted for the run and expires within the hour, so the
-repository stores a signing key rather than a credential that can be replayed,
-and the same App serves an entire fleet through one installation.
+The App private key is a sensitive, long-lived credential that can mint new
+installation tokens and must be protected accordingly. The workflow exposes it
+only to GitHub's token-minting action in the isolated publication job; the
+resulting installation token is short-lived. One App can serve an entire fleet
+through its installations.
 
 1. Create an App (a personal account App is enough) with these **repository**
    permissions: Contents `read and write`, Pull requests `read and write`,
@@ -84,20 +90,24 @@ and the same App serves an entire fleet through one installation.
    no subscription to events.
 2. Install it on the repositories that run this workflow.
 3. Generate a private key, and store the downloaded `.pem` contents as the
-   `UPD_APP_PRIVATE_KEY` secret. The App ID is not sensitive; a repository or
-   organization variable such as `UPD_APP_ID` is the right home for it.
+   `UPD_APP_PRIVATE_KEY` secret. The Client ID is not sensitive; a repository
+   or organization variable such as `UPD_APP_CLIENT_ID` is the right home for
+   it.
 
-Pass `app-id` as an input and `app-private-key` as a secret. The workflow mints
-the token itself: an installation token passed in from the caller would travel
-through a job output, and job outputs are not masked in logs.
+Pass `app-client-id` as an input and `app-private-key` as a secret. The legacy
+numeric `app-id` input remains available for existing installations. The
+workflow mints the token itself: an installation token passed in from the
+caller would travel through a job output, and job outputs are not masked in
+logs.
 
 ### Fine-grained personal access token
 
-A single-repository alternative when an App is not available. Grant it the same
-three repository permissions (Contents, Pull requests, and Workflows, each read
-and write) and pass it as the `pull-request-token` secret. It is scoped to the
-account that issued it, expires on a calendar rather than per run, and must be
-rotated by hand, which is why the App is preferred for more than one repository.
+A single-repository alternative when an App is not available. Grant Contents
+and Pull requests write; add Workflows write only when the selected update scope
+can change `.github/workflows`. Pass it as the `pull-request-token` secret. It
+is scoped to the account that issued it, expires on a calendar rather than per
+run, and must be rotated by hand, which is why the App is preferred for more
+than one repository.
 
 ```yaml
 jobs:
@@ -118,7 +128,7 @@ jobs:
   update:
     uses: rvben/upd/.github/workflows/dependency-health.yml@<FULL_COMMIT_SHA>
     with:
-      app-id: ${{ vars.UPD_APP_ID }}
+      app-client-id: ${{ vars.UPD_APP_CLIENT_ID }}
       runner: ubuntu-24.04
       langs: ""
       lock: true
@@ -247,7 +257,8 @@ installation token.
 
 | Input | Default | Purpose |
 |-------|---------|---------|
-| `app-id` | empty | GitHub App identifier; the workflow mints an installation token per run |
+| `app-client-id` | empty | GitHub App Client ID; preferred for new installations |
+| `app-id` | empty | Legacy numeric GitHub App ID for backward compatibility |
 | `runner` | `ubuntu-24.04` | Linux runner label |
 | `upd-version` | current verified manifest | Exact released `upd` version; empty follows the canonical release manifest |
 | `upd-sha256` | manifest checksum | Exact archive checksum; required when the selected version is absent from the manifest |
@@ -273,11 +284,12 @@ installation token.
 
 | Secret | Purpose |
 |--------|---------|
-| `app-private-key` | Private key of the App named by `app-id` |
-| `pull-request-token` | Fine-grained personal access token; the single-repository alternative to `app-id` |
+| `app-private-key` | Private key paired with `app-client-id` or legacy `app-id` |
+| `pull-request-token` | Fine-grained personal access token; the single-repository alternative to a GitHub App |
 
-Supplying neither falls back to the caller's `GITHUB_TOKEN`, which cannot
-publish workflow-file changes. See [Credentials](#credentials).
+Supplying neither lets upd prepare and validate the proposal, then fails before
+publication so it cannot create a pull request whose checks never start. See
+[Credentials](#credentials).
 
 For a fully static installation, provide the published archive version and
 digest together:
@@ -418,8 +430,14 @@ The reusable workflow:
 
 - installs an exact `upd` release after verifying a trusted SHA-256;
 - serializes runs per repository;
-- refuses a run that changed a workflow file without a credential permitted to
-  push one, naming the remedy rather than failing at the push;
+- refuses to publish any changed proposal without an App or PAT whose pull
+  requests can start checks automatically;
+- transfers the validated one-commit proposal across an artifact boundary into
+  a separate publication job that never executes repository code;
+- keeps the publication credential out of checkout, preparation, package
+  managers, validation, and process command lines;
+- requests the App's Workflows write permission only when the proposal actually
+  changes a workflow file;
 - validates the automation ref and keeps it distinct from the default branch;
 - starts from the latest default branch on every run;
 - updates or deletes the branch with an explicit `--force-with-lease` expectation;
@@ -441,18 +459,20 @@ jobs.
 
 The workflow derives a concise title from the machine-readable update report.
 A single update becomes a title such as
-`chore(deps): update serde to 1.0.228`; multi-package proposals report the exact
+`chore(deps): refresh serde to 1.0.228`; multi-package proposals report the exact
 number of updated dependencies. Set `pull-request-title` only when a repository
 needs a fixed override.
 
 The pull-request body is built from a bounded, provider-neutral presentation
-model. It leads with review status and then shows:
+model. It leads with the prepared outcome and then shows:
 
+- non-patch updates that deserve attention before quiet patch maintenance;
 - exact versions and changed files;
 - the freshness cooldown, bump ceiling, and lockfile policy used for selection;
 - repository-validation and proposal-integrity results;
-- releases intentionally held back by policy, separately from dependencies upd
-  could not change safely; and
+- releases saved for a deliberate upgrade, separately from dependencies upd
+  could not change safely;
+- complete proof and provenance behind progressive disclosure; and
 - auto-merge intent without claiming the pull request is ready to merge before
   repository checks complete.
 

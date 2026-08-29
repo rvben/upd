@@ -168,6 +168,42 @@ esac
         auto_merge: bool,
         report_json: &str,
     ) {
+        self.run_publish_with_report_and_validation(
+            changed,
+            content,
+            auto_merge,
+            report_json,
+            true,
+        );
+    }
+
+    fn run_publish_with_report_and_validation(
+        &self,
+        changed: bool,
+        content: &str,
+        auto_merge: bool,
+        report_json: &str,
+        validation_configured: bool,
+    ) {
+        self.run_publish_with_report_validation_and_credential(
+            changed,
+            content,
+            auto_merge,
+            report_json,
+            validation_configured,
+            true,
+        );
+    }
+
+    fn run_publish_with_report_validation_and_credential(
+        &self,
+        changed: bool,
+        content: &str,
+        auto_merge: bool,
+        report_json: &str,
+        validation_configured: bool,
+        has_publishing_token: bool,
+    ) {
         git(
             &self.checkout,
             &[
@@ -237,7 +273,7 @@ esac
             .env("MIN_AGE", "7d")
             .env("PRESENTATION", &presentation)
             .env("REPORT", &report)
-            .env("VALIDATION_CONFIGURED", "true")
+            .env("VALIDATION_CONFIGURED", validation_configured.to_string())
             .output()
             .expect("presentation script starts");
         assert!(
@@ -247,6 +283,13 @@ esac
             String::from_utf8_lossy(&presentation_output.stderr)
         );
 
+        if changed {
+            git(
+                &self.checkout,
+                &["commit", "-m", "chore(deps): test update"],
+            );
+        }
+
         let output = Command::new("bash")
             .arg("-c")
             .arg(workflow_script("Publish rolling pull request"))
@@ -255,11 +298,12 @@ esac
             .env("BASE_BRANCH", "main")
             .env("BRANCH", BRANCH)
             .env("CHANGED", changed.to_string())
-            .env("COMMIT_MESSAGE", "chore(deps): test update")
             .env("EXPECTED_REMOTE_SHA", expected_remote_sha)
             .env("GH_STATE_DIR", &self.state)
             .env("GITHUB_OUTPUT", output_file)
             .env("GITHUB_STEP_SUMMARY", summary_file)
+            .env("GH_TOKEN", "test-publication-token")
+            .env("HAS_PUBLISHING_TOKEN", has_publishing_token.to_string())
             .env("MERGE_METHOD", "squash")
             .env("PATH", path)
             .env("PRESENTATION", presentation)
@@ -267,12 +311,22 @@ esac
             .env("RUNNER_TEMP", &self.runner_temp)
             .output()
             .expect("publish script starts");
-        assert!(
-            output.status.success(),
-            "publish failed\nstdout:\n{}\nstderr:\n{}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        );
+        if has_publishing_token {
+            assert!(
+                output.status.success(),
+                "publish failed\nstdout:\n{}\nstderr:\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        } else {
+            assert_eq!(
+                output.status.code(),
+                Some(4),
+                "credential-less stale cleanup did not fail safely\nstdout:\n{}\nstderr:\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
     }
 
     fn branch_file(&self) -> Option<String> {
@@ -429,18 +483,43 @@ fn workflow_creates_a_single_commit_rolling_pull_request() {
     assert!(
         fixture
             .log()
-            .contains("--title chore(deps): update example to 1.1.0")
+            .contains("--title chore(deps): refresh example to 1.1.0")
     );
     assert_eq!(fixture.presentation()["schema"], 1);
     assert_eq!(fixture.presentation()["state"], "ready");
     let body = fixture.body();
-    assert!(body.contains("**Ready for review.**"));
+    assert!(body.contains("**A tidy upgrade, already prepared.**"));
+    assert!(body.contains("84109eaf36c739dc11af0452c6218abb7e47a8e3/assets/logo-wide.svg"));
+    assert!(body.contains("**1 moved forward** · **1 worth a look**"));
+    assert!(body.contains("### Worth a look"));
+    assert!(body.contains("### Why this is a comfortable review"));
+    assert!(body.contains("<summary><strong>Proof and provenance</strong></summary>"));
     assert!(body.contains("<code>example</code>"));
     assert!(body.contains("<code>1.0.0</code>"));
     assert!(body.contains("<code>1.1.0</code>"));
-    assert!(body.contains("Freshness: <code>7d</code>"));
-    assert!(body.contains("maximum bump: <code>minor</code>"));
+    assert!(body.contains("Freshness <code>7d</code>"));
+    assert!(body.contains("maximum bump <code>minor</code>"));
     assert!(body.len() <= 32 * 1024);
+}
+
+#[test]
+fn github_presentation_keeps_unvalidated_patch_updates_truthful() {
+    let fixture = Fixture::new();
+    let report = r#"{
+      "files": [{"path":"dependency.txt","updates":[{
+        "package":"example","current":"1.0.0","latest":"1.0.1","bump":"patch"
+      }]}],
+      "summary":{"updates_total":1,"files_with_changes":1,"warnings":0}
+    }"#;
+    fixture.run_publish_with_report_and_validation(true, "new", false, report, false);
+
+    let body = fixture.body();
+    assert!(body.contains("### What changed"));
+    assert!(!body.contains("### Worth a look"));
+    assert!(!body.contains("Quiet patch updates"));
+    assert!(body.contains("### What upd verified"));
+    assert!(body.contains("No repository-specific command was configured"));
+    assert!(!body.contains("### Why this is a comfortable review"));
 }
 
 #[test]
@@ -468,13 +547,13 @@ fn github_presentation_explains_policy_holds_and_escapes_untrusted_text() {
     fixture.run_publish_with_report(true, "new", false, report);
 
     let presentation = fixture.presentation();
-    assert_eq!(presentation["title"], "chore(deps): update dependency");
+    assert_eq!(presentation["title"], "chore(deps): refresh dependency");
     assert_eq!(presentation["counts"]["policy_holds"], 2);
     assert_eq!(presentation["counts"]["blocked"], 1);
     assert_eq!(presentation["counts"]["annotations"], 1);
     let body = fixture.body();
-    assert!(body.contains("**Ready for review, with follow-up.**"));
-    assert!(body.contains("Held back by policy (2)"));
+    assert!(body.contains("**A careful upgrade, with follow-up.**"));
+    assert!(body.contains("Saved for a deliberate upgrade (2)"));
     assert!(body.contains("### Needs attention"));
     assert!(body.contains("bad&#124;pkg&lt;/code&gt;"));
     assert!(body.contains("blocked&lt;script&gt;"));
@@ -491,20 +570,20 @@ fn github_presentation_stays_within_the_review_budget_for_large_updates() {
     let updates = (0..80)
         .map(|index| {
             serde_json::json!({
-                "package": format!("package-{index}-{}", "x".repeat(120)),
-                "current": "1.0.0",
-                "latest": "1.1.0",
-                "bump": "minor"
+                "package": format!("package-{index}-{}", "x".repeat(1200)),
+                "current": format!("1.0.0-{}", "c".repeat(1200)),
+                "latest": format!("1.1.0-{}", "l".repeat(1200)),
+                "bump": if index < 40 { "minor" } else { "patch" }
             })
         })
         .collect::<Vec<_>>();
     let held = (0..40)
         .map(|index| {
             serde_json::json!({
-                "package": format!("fresh-{index}-{}", "y".repeat(120)),
-                "current": "1.0.0",
-                "chosen": "1.0.1",
-                "skipped_latest": "1.1.0"
+                "package": format!("fresh-{index}-{}", "y".repeat(1200)),
+                "current": format!("1.0.0-{}", "c".repeat(1200)),
+                "chosen": format!("1.0.1-{}", "s".repeat(1200)),
+                "skipped_latest": format!("1.1.0-{}", "a".repeat(1200))
             })
         })
         .collect::<Vec<_>>();
@@ -512,16 +591,16 @@ fn github_presentation_stays_within_the_review_budget_for_large_updates() {
         .map(|index| {
             serde_json::json!({
                 "package": format!("blocked-{index}"),
-                "current": "1.0.0",
+                "current": format!("1.0.0-{}", "c".repeat(1200)),
                 "status": "blocked",
                 "reason": "fixture",
-                "message": "z".repeat(400)
+                "message": "z".repeat(1200)
             })
         })
         .collect::<Vec<_>>();
     let report = serde_json::json!({
         "files": [{
-            "path": "dependency.txt",
+            "path": format!("dependency-{}.txt", "p".repeat(1200)),
             "updates": updates,
             "held_back": held,
             "skipped": blocked
@@ -532,10 +611,19 @@ fn github_presentation_stays_within_the_review_budget_for_large_updates() {
 
     let body = fixture.body();
     assert!(body.len() <= 32 * 1024, "body was {} bytes", body.len());
+    assert!(body.contains("**A careful upgrade, with follow-up.**"));
+    assert!(
+        body.contains("Saved for a deliberate upgrade: 40"),
+        "unexpected large-update body:\n{body}"
+    );
+    assert!(body.contains("Needs attention: 30"));
+    assert!(body.contains("Major-version jumps: 0"));
+    assert!(body.contains("repository validation and proposal integrity passed"));
+    assert!(!body.contains("**A tidy upgrade, already prepared.**"));
     assert!(
         fixture
             .log()
-            .contains("--title chore(deps): update 80 dependencies")
+            .contains("--title chore(deps): refresh 80 dependencies")
     );
 }
 
@@ -549,6 +637,8 @@ fn normal_update_presentation_contract_is_shared_across_providers() {
             "updates_major:",
             "updates_minor:",
             "updates_patch:",
+            "updates_review_worthy:",
+            "updates_quiet:",
             "annotations:",
             "policy_holds:",
             "blocked:",
@@ -560,12 +650,273 @@ fn normal_update_presentation_contract_is_shared_across_providers() {
         ] {
             assert!(source.contains(field), "missing presentation field {field}");
         }
-        assert!(source.contains("\\($title_prefix): update \\(.counts.updates) dependencies"));
+        assert!(source.contains("\\($title_prefix): refresh \\(.counts.updates) dependencies"));
         assert!(source.contains("wc -c"));
         assert!(source.contains("32768"));
     }
     assert!(WORKFLOW.contains("> [!IMPORTANT]"));
     assert!(!GITLAB_TEMPLATE.contains("> [!IMPORTANT]"));
+}
+
+#[test]
+fn github_presentation_prioritizes_review_worthy_updates() {
+    let fixture = Fixture::new();
+    let report = r#"{
+      "files": [{
+        "path": "dependency.txt",
+        "updates": [
+          {"package":"quiet-one","current":"1.0.0","latest":"1.0.1","bump":"patch"},
+          {"package":"review-one","current":"1.0.0","latest":"1.1.0","bump":"minor"},
+          {"package":"quiet-two","current":"2.0.0","latest":"2.0.1","bump":"patch"},
+          {"package":"review-two","current":"3.0.0","latest":"4.0.0","bump":"major"}
+        ],
+        "capped": [{"package":"later","current":"1.0.0","available":"2.0.0"}]
+      }],
+      "summary": {"updates_total":4,"files_with_changes":1,"warnings":0}
+    }"#;
+    fixture.run_publish_with_report(true, "new", false, report);
+
+    let presentation = fixture.presentation();
+    assert_eq!(presentation["counts"]["updates_review_worthy"], 2);
+    assert_eq!(presentation["counts"]["updates_quiet"], 2);
+    let body = fixture.body();
+    assert!(body.contains(
+        "**4 moved forward** · **2 worth a look** · **2 quiet patches** · **1 saved for later**"
+    ));
+    let worth = body.find("### Worth a look").unwrap();
+    let review_one = body.find("<code>review-one</code>").unwrap();
+    let quiet = body.find("Quiet patch updates (2)").unwrap();
+    let quiet_one = body.find("<code>quiet-one</code>").unwrap();
+    assert!(worth < review_one && review_one < quiet && quiet < quiet_one);
+    assert!(body.contains("Includes 1 major-version jump."));
+}
+
+#[test]
+fn workflow_requires_a_check_triggering_publishing_credential() {
+    let temp = tempfile::tempdir().unwrap();
+    let summary = temp.path().join("summary");
+    let output = temp.path().join("output");
+    let script = workflow_script("Require a check-triggering publishing credential");
+
+    let missing = Command::new("bash")
+        .arg("-c")
+        .arg(&script)
+        .env("BASE_SHA", "unused")
+        .env("CHANGED", "false")
+        .env("HAS_APP_CREDENTIAL", "false")
+        .env("HAS_PAT", "false")
+        .env("GITHUB_OUTPUT", &output)
+        .env("GITHUB_STEP_SUMMARY", &summary)
+        .output()
+        .unwrap();
+    assert_eq!(missing.status.code(), Some(4));
+    assert!(String::from_utf8_lossy(&missing.stderr).contains("independent GitHub App or PAT"));
+
+    let configured = Command::new("bash")
+        .arg("-c")
+        .arg(&script)
+        .env("BASE_SHA", "unused")
+        .env("CHANGED", "false")
+        .env("HAS_APP_CREDENTIAL", "true")
+        .env("HAS_PAT", "false")
+        .env("GITHUB_OUTPUT", &output)
+        .env("GITHUB_STEP_SUMMARY", &summary)
+        .output()
+        .unwrap();
+    assert!(configured.status.success());
+}
+
+#[test]
+fn workflow_change_detection_limits_workflow_permission_to_workflow_proposals() {
+    let temp = tempfile::tempdir().unwrap();
+    let repo = temp.path().join("repo");
+    fs::create_dir(&repo).unwrap();
+    git(&repo, &["init"]);
+    git(&repo, &["config", "user.name", "Test User"]);
+    git(&repo, &["config", "user.email", "test@example.com"]);
+    fs::write(repo.join("dependency.txt"), "old\n").unwrap();
+    git(&repo, &["add", "dependency.txt"]);
+    git(&repo, &["commit", "-m", "test: base"]);
+    let base = String::from_utf8(git(&repo, &["rev-parse", "HEAD"]).stdout)
+        .unwrap()
+        .trim()
+        .to_string();
+    fs::write(repo.join("dependency.txt"), "new\n").unwrap();
+    git(&repo, &["add", "dependency.txt"]);
+    git(&repo, &["commit", "-m", "test: ordinary proposal"]);
+    let ordinary_output = temp.path().join("ordinary-output");
+    let ordinary = Command::new("bash")
+        .arg("-c")
+        .arg(workflow_script(
+            "Require a check-triggering publishing credential",
+        ))
+        .current_dir(&repo)
+        .env("BASE_SHA", &base)
+        .env("CHANGED", "true")
+        .env("HAS_APP_CREDENTIAL", "true")
+        .env("HAS_PAT", "false")
+        .env("GITHUB_OUTPUT", &ordinary_output)
+        .env("GITHUB_STEP_SUMMARY", temp.path().join("ordinary-summary"))
+        .output()
+        .unwrap();
+    assert!(ordinary.status.success());
+    assert!(
+        fs::read_to_string(ordinary_output)
+            .unwrap()
+            .contains("workflow-files-changed=false")
+    );
+    let workflow_base = String::from_utf8(git(&repo, &["rev-parse", "HEAD"]).stdout)
+        .unwrap()
+        .trim()
+        .to_string();
+    fs::create_dir_all(repo.join(".github/workflows")).unwrap();
+    fs::write(repo.join(".github/workflows/check.yml"), "name: Check\n").unwrap();
+    git(&repo, &["add", ".github/workflows/check.yml"]);
+    git(&repo, &["commit", "-m", "test: workflow proposal"]);
+
+    let output = temp.path().join("output");
+    let summary = temp.path().join("summary");
+    let result = Command::new("bash")
+        .arg("-c")
+        .arg(workflow_script(
+            "Require a check-triggering publishing credential",
+        ))
+        .current_dir(&repo)
+        .env("BASE_SHA", workflow_base)
+        .env("CHANGED", "true")
+        .env("HAS_APP_CREDENTIAL", "true")
+        .env("HAS_PAT", "false")
+        .env("GITHUB_OUTPUT", &output)
+        .env("GITHUB_STEP_SUMMARY", &summary)
+        .output()
+        .unwrap();
+    assert!(result.status.success());
+    assert!(
+        fs::read_to_string(output)
+            .unwrap()
+            .contains("workflow-files-changed=true")
+    );
+}
+
+#[test]
+fn validated_proposal_crosses_the_job_boundary_as_one_commit() {
+    let fixture = Fixture::new();
+    let base = String::from_utf8(git(&fixture.checkout, &["rev-parse", "HEAD"]).stdout)
+        .unwrap()
+        .trim()
+        .to_string();
+    fs::write(fixture.checkout.join("dependency.txt"), "new\n").unwrap();
+    git(&fixture.checkout, &["add", "dependency.txt"]);
+
+    let package = Command::new("bash")
+        .arg("-c")
+        .arg(workflow_script("Package validated proposal"))
+        .current_dir(&fixture.checkout)
+        .env("BASE_SHA", &base)
+        .env("COMMIT_MESSAGE", "chore(deps): test boundary")
+        .env("RUNNER_TEMP", &fixture.runner_temp)
+        .output()
+        .unwrap();
+    assert!(
+        package.status.success(),
+        "package failed: {}",
+        String::from_utf8_lossy(&package.stderr)
+    );
+
+    git(&fixture.checkout, &["reset", "--hard", &base]);
+    let restore = Command::new("bash")
+        .arg("-c")
+        .arg(workflow_script("Restore validated proposal"))
+        .current_dir(&fixture.checkout)
+        .env("BASE_SHA", &base)
+        .env("BRANCH", BRANCH)
+        .env("RUNNER_TEMP", &fixture.runner_temp)
+        .output()
+        .unwrap();
+    assert!(
+        restore.status.success(),
+        "restore failed: {}",
+        String::from_utf8_lossy(&restore.stderr)
+    );
+    assert_eq!(
+        fs::read_to_string(fixture.checkout.join("dependency.txt")).unwrap(),
+        "new\n"
+    );
+    assert_eq!(
+        String::from_utf8(git(&fixture.checkout, &["rev-parse", "HEAD^"]).stdout)
+            .unwrap()
+            .trim(),
+        base
+    );
+}
+
+#[test]
+fn isolated_publisher_rejects_a_merge_commit_bundle() {
+    let fixture = Fixture::new();
+    let base = String::from_utf8(git(&fixture.checkout, &["rev-parse", "HEAD"]).stdout)
+        .unwrap()
+        .trim()
+        .to_string();
+    git(
+        &fixture.checkout,
+        &["switch", "--create", "malicious-side", &base],
+    );
+    fs::write(
+        fixture.checkout.join("injected.txt"),
+        "unexpected history\n",
+    )
+    .unwrap();
+    git(&fixture.checkout, &["add", "injected.txt"]);
+    git(&fixture.checkout, &["commit", "-m", "test: second parent"]);
+    git(&fixture.checkout, &["switch", "--detach", &base]);
+    git(
+        &fixture.checkout,
+        &[
+            "merge",
+            "--no-ff",
+            "malicious-side",
+            "-m",
+            "test: merge proposal",
+        ],
+    );
+
+    let bundle = fixture.runner_temp.join("upd-proposal.bundle");
+    let exclusion = format!("^{base}");
+    git(
+        &fixture.checkout,
+        &[
+            "bundle",
+            "create",
+            bundle.to_str().unwrap(),
+            "HEAD",
+            &exclusion,
+        ],
+    );
+    let checksum = run(Command::new("sha256sum")
+        .current_dir(&fixture.runner_temp)
+        .arg("upd-proposal.bundle"));
+    fs::write(
+        fixture.runner_temp.join("upd-proposal.bundle.sha256"),
+        checksum.stdout,
+    )
+    .unwrap();
+    git(&fixture.checkout, &["reset", "--hard", &base]);
+
+    let restore = Command::new("bash")
+        .arg("-c")
+        .arg(workflow_script("Restore validated proposal"))
+        .current_dir(&fixture.checkout)
+        .env("BASE_SHA", &base)
+        .env("BRANCH", BRANCH)
+        .env("RUNNER_TEMP", &fixture.runner_temp)
+        .output()
+        .unwrap();
+    assert_eq!(restore.status.code(), Some(2));
+    assert!(
+        String::from_utf8_lossy(&restore.stderr)
+            .contains("not a single commit on the prepared base")
+    );
+    assert!(!fixture.checkout.join("injected.txt").exists());
 }
 
 #[test]
@@ -603,6 +954,24 @@ fn workflow_closes_an_obsolete_pr_and_lease_deletes_its_branch() {
 }
 
 #[test]
+fn credential_less_cleanup_preserves_the_existing_pr_and_branch() {
+    let fixture = Fixture::new();
+    fixture.run_publish(true, "new", false);
+    let clean_report = r#"{"files":[],"summary":{"updates_total":0,"files_with_changes":0,"held_back":0,"capped":0,"skipped":0,"warnings":0}}"#;
+    fixture.run_publish_with_report_validation_and_credential(
+        false,
+        "unused",
+        false,
+        clean_report,
+        true,
+        false,
+    );
+
+    assert_eq!(fixture.branch_file().as_deref(), Some("new\n"));
+    assert!(!fixture.log().contains("pr close 7"));
+}
+
+#[test]
 fn workflow_defaults_are_reproducible_and_safe() {
     assert!(
         WORKFLOW.contains("https://raw.githubusercontent.com/rvben/upd/main/release-pins.json")
@@ -613,10 +982,31 @@ fn workflow_defaults_are_reproducible_and_safe() {
     assert!(WORKFLOW.contains("--retry 3 --retry-all-errors"));
     assert!(WORKFLOW.contains("actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1"));
     assert!(WORKFLOW.contains("actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a"));
+    assert!(
+        WORKFLOW.contains("actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c")
+    );
     assert!(WORKFLOW.contains("--force-with-lease="));
+    assert!(WORKFLOW.contains("persist-credentials: false"));
+    assert!(WORKFLOW.contains("GIT_ASKPASS=\"$askpass\""));
+    assert!(!WORKFLOW.contains("http.extraheader"));
+    assert!(!WORKFLOW.contains("AUTHORIZATION: basic"));
+    assert!(WORKFLOW.contains("  publish:\n    needs: update"));
+    assert!(WORKFLOW.contains("never executes checked-out repository code"));
+    assert!(WORKFLOW.contains("GITHUB_TOKEN: ${{ github.token }}"));
+    assert!(WORKFLOW.contains("permission-workflows: write"));
+    let validation = WORKFLOW
+        .find("Verify validation did not mutate the proposal")
+        .unwrap();
+    let publication_token = WORKFLOW.find("Mint publication token").unwrap();
+    assert!(validation < publication_token);
     assert!(!WORKFLOW.contains("default: latest"));
     assert!(!WORKFLOW.contains("default: v0."));
     assert!(!WORKFLOW.contains("git push --force "));
+    for caller in [RUST_WORKFLOW, ACTIONS_WORKFLOW] {
+        assert!(caller.contains("contents: read"));
+        assert!(caller.contains("pull-requests: read"));
+        assert!(!caller.contains("contents: write"));
+    }
 }
 
 #[test]
@@ -625,9 +1015,13 @@ fn repository_dependency_jobs_share_the_hardened_workflow() {
     assert!(RUST_WORKFLOW.contains("langs: rust"));
     assert!(RUST_WORKFLOW.contains("lock: true"));
     assert!(RUST_WORKFLOW.contains("branch: deps/upd"));
+    assert!(RUST_WORKFLOW.contains("app-client-id: ${{ vars.UPD_APP_CLIENT_ID }}"));
+    assert!(RUST_WORKFLOW.contains("app-private-key: ${{ secrets.UPD_APP_PRIVATE_KEY }}"));
     assert!(!RUST_WORKFLOW.contains("git push"));
     assert!(!RUST_WORKFLOW.contains("upd-version:"));
 
     assert!(ACTIONS_WORKFLOW.contains("uses: ./.github/workflows/dependency-health.yml"));
+    assert!(ACTIONS_WORKFLOW.contains("app-client-id: ${{ vars.UPD_APP_CLIENT_ID }}"));
+    assert!(ACTIONS_WORKFLOW.contains("app-private-key: ${{ secrets.UPD_APP_PRIVATE_KEY }}"));
     assert!(!ACTIONS_WORKFLOW.contains("upd-version:"));
 }
