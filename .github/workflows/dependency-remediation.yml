@@ -63,14 +63,6 @@ on:
         description: Auto-merge strategy when auto-merge is enabled
         type: string
         default: squash
-      broker-url:
-        description: HTTPS endpoint of the upd installation-token broker
-        type: string
-        default: ""
-      broker-audience:
-        description: OIDC audience expected by the upd token broker
-        type: string
-        default: upd-token-broker
     outputs:
       disposition:
         description: clean_changed, clean_no_change, partial_changed, or residual_no_change
@@ -85,6 +77,10 @@ on:
 permissions:
   actions: read
   contents: read
+
+env:
+  UPD_HOSTED_BROKER_AUDIENCE: upd-token-broker
+  UPD_HOSTED_BROKER_URL: https://upd-token-broker-6e5p6y25aa-ez.a.run.app/v1/token
 
 concurrency:
   group: upd-dependency-writes-${{ github.repository }}
@@ -741,27 +737,27 @@ jobs:
             exit 2
           fi
 
-      - name: Require hosted broker configuration
+      - name: Validate hosted broker configuration
         env:
-          BROKER_AUDIENCE: ${{ inputs.broker-audience }}
-          BROKER_URL: ${{ inputs.broker-url }}
+          BROKER_AUDIENCE: ${{ env.UPD_HOSTED_BROKER_AUDIENCE }}
+          BROKER_URL: ${{ env.UPD_HOSTED_BROKER_URL }}
         shell: bash
         run: |
           set -euo pipefail
           if [[ "$BROKER_URL" != https://* ]]; then
-            echo "Publishing requires an HTTPS broker-url; no token fallback is permitted" >&2
+            echo "The hosted broker URL must use HTTPS; no token fallback is permitted" >&2
             exit 4
           fi
           if [[ -z "$BROKER_AUDIENCE" ]]; then
-            echo "Publishing requires broker-audience; no token fallback is permitted" >&2
+            echo "The hosted broker audience must not be empty; no token fallback is permitted" >&2
             exit 4
           fi
 
       - name: Request a least-privilege installation token
         id: broker-token
         env:
-          BROKER_AUDIENCE: ${{ inputs.broker-audience }}
-          BROKER_URL: ${{ inputs.broker-url }}
+          BROKER_AUDIENCE: ${{ env.UPD_HOSTED_BROKER_AUDIENCE }}
+          BROKER_URL: ${{ env.UPD_HOSTED_BROKER_URL }}
         shell: bash
         run: |
           set -euo pipefail

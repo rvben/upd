@@ -83,14 +83,6 @@ on:
         description: Auto-merge method (squash, merge, or rebase)
         type: string
         default: squash
-      broker-url:
-        description: HTTPS endpoint of the upd installation-token broker
-        type: string
-        default: ""
-      broker-audience:
-        description: OIDC audience expected by the upd token broker
-        type: string
-        default: upd-token-broker
     secrets:
       pull-request-token:
         description: Fine-grained PAT; a single-repository alternative to a GitHub App
@@ -105,6 +97,10 @@ on:
 permissions:
   contents: read
   pull-requests: read
+
+env:
+  UPD_HOSTED_BROKER_AUDIENCE: upd-token-broker
+  UPD_HOSTED_BROKER_URL: https://upd-token-broker-6e5p6y25aa-ez.a.run.app/v1/token
 
 concurrency:
   group: upd-dependency-writes-${{ github.repository }}
@@ -636,13 +632,12 @@ jobs:
       # Publication is isolated from every repository-controlled command. A
       # write token is minted only when a proposal or stale state needs a write,
       # and workflow scope is requested only for a workflow-file proposal.
-      - name: Require a check-triggering publishing credential
+      - name: Select a check-triggering publishing credential
         id: credential-needs
         if: needs.update.outputs.changed == 'true' || steps.publication-state.outputs.cleanup-required == 'true'
         env:
           BASE_SHA: ${{ needs.update.outputs.base-sha }}
           CHANGED: ${{ needs.update.outputs.changed }}
-          HAS_BROKER: ${{ inputs.broker-url != '' }}
           HAS_PAT: ${{ secrets.pull-request-token != '' }}
         run: |
           set -euo pipefail
@@ -658,39 +653,21 @@ jobs:
             echo "use-broker=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
-          if [[ "$HAS_BROKER" == true ]]; then
-            echo "use-broker=true" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-          {
-            echo "Publishing dependency updates requires the hosted token broker or an independent PAT credential."
-            echo
-            echo "This keeps publication separate from GITHUB_TOKEN event-recursion and approval behavior."
-            echo "Supply one of:"
-            echo "  - the hosted GitHub App, via the non-secret broker-url input"
-            if [[ "$workflow_files_changed" == true ]]; then
-              echo "  - or a fine-grained PAT with Contents, Pull requests, and Workflows write"
-            else
-              echo "  - or a fine-grained PAT with Contents and Pull requests write"
-            fi
-            echo
-            echo "See https://github.com/rvben/upd/blob/main/docs/github-actions.md"
-          } | tee -a "$GITHUB_STEP_SUMMARY" >&2
-          exit 4
+          echo "use-broker=true" >> "$GITHUB_OUTPUT"
 
       - name: Request publication token
         id: broker-token
         if: steps.credential-needs.outputs.publication-required == 'true' && steps.credential-needs.outputs.use-broker == 'true'
         env:
-          BROKER_AUDIENCE: ${{ inputs.broker-audience }}
-          BROKER_URL: ${{ inputs.broker-url }}
+          BROKER_AUDIENCE: ${{ env.UPD_HOSTED_BROKER_AUDIENCE }}
+          BROKER_URL: ${{ env.UPD_HOSTED_BROKER_URL }}
           WORKFLOW_FILES_CHANGED: ${{ steps.credential-needs.outputs.workflow-files-changed }}
         shell: bash
         run: |
           set -euo pipefail
           set +x
           if [[ "$BROKER_URL" != https://* || -z "$BROKER_AUDIENCE" ]]; then
-            echo "broker-url must be HTTPS and broker-audience must not be empty" >&2
+            echo "The hosted broker URL must be HTTPS and its audience must not be empty" >&2
             exit 4
           fi
           umask 077

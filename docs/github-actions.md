@@ -28,7 +28,6 @@ jobs:
   update:
     uses: rvben/upd/.github/workflows/dependency-health.yml@<FULL_COMMIT_SHA>
     with:
-      broker-url: ${{ vars.UPD_BROKER_URL }}
       min-age: 7d
       max-bump: minor
       validation-command: make test
@@ -48,11 +47,12 @@ default `langs: actions`, the only files this workflow changes are the ones
 
 ## Credentials
 
-The workflow accepts a hosted GitHub App token broker or a fine-grained personal
-access token. The caller grants `contents: read`, `pull-requests: read`, and
-`id-token: write`. Publication uses the independent App installation token or
-PAT instead, so the caller does not grant repository write access to commands
-that run against the checked-out project.
+The workflow uses upd's hosted GitHub App token broker by default and accepts a
+fine-grained personal access token as a single-repository alternative. The
+caller grants `contents: read`, `pull-requests: read`, and `id-token: write`.
+Publication uses the independent App installation token or PAT instead, so the
+caller does not grant repository write access to commands that run against the
+checked-out project.
 
 `GITHUB_TOKEN` is used only for read access while preparing and inspecting a
 proposal. It is intentionally not used for publication because two boundaries
@@ -71,10 +71,10 @@ are load-bearing here:
   PR publication independent so checks can start according to repository
   policy.
 
-When an eligible update exists without broker access or a PAT, the workflow may
-build and validate a local proposal artifact, but it fails before any external
-write. This prevents a pull request from arriving without the checks that decide
-whether it is safe to merge.
+When an eligible update exists but the App is not installed and no PAT is
+provided, the workflow may build and validate a local proposal artifact, but it
+fails before any external write. This prevents a pull request from arriving
+without the checks that decide whether it is safe to merge.
 
 ### Hosted GitHub App broker (recommended)
 
@@ -84,15 +84,19 @@ short-lived GitHub OIDC token for a repository-scoped, short-lived installation
 token. The broker validates the stable repository identity, owner, reusable
 workflow revision, event, ref, and requested permissions before minting it.
 
-Broker access is allowlisted. For an authorized repository:
+For a repository using the hosted service:
 
-1. Set `UPD_BROKER_URL` to the HTTPS token endpoint as a repository or
-   organization Actions variable.
+1. Install the upd GitHub App for the repository.
 2. Grant the caller `id-token: write`; this permits OIDC token issuance but does
    not grant repository write access.
-3. Pass `broker-url: ${{ vars.UPD_BROKER_URL }}`. The default
-   `broker-audience` is `upd-token-broker`; change it only when the operator
-   provides a different audience.
+3. Pin the reusable workflow to a reviewed full commit SHA.
+
+The hosted endpoint and OIDC audience are constants inside that pinned workflow,
+so a consumer repository cannot redirect its identity token through a mutable
+Actions variable. No broker URL, App client ID, or private key is configured in
+the consuming repository. A self-hosted operator should fork the reusable
+workflow and replace both hosted constants in the reviewed fork; the official
+workflow deliberately has no runtime endpoint override.
 
 The reusable workflow requests and immediately masks both credentials. Neither
 the App key nor an installation token is stored as a caller secret. Invoke the
@@ -128,7 +132,6 @@ jobs:
   update:
     uses: rvben/upd/.github/workflows/dependency-health.yml@<FULL_COMMIT_SHA>
     with:
-      broker-url: ${{ vars.UPD_BROKER_URL }}
       runner: ubuntu-24.04
       langs: ""
       lock: true
@@ -173,7 +176,6 @@ jobs:
       langs: rust
       allowed-paths: Cargo.toml Cargo.lock
       validation-command: cargo test --locked
-      broker-url: ${{ vars.UPD_BROKER_URL }}
 ```
 
 `allowed-paths` is a required, whitespace-separated list of exact
@@ -228,8 +230,6 @@ before it reaches GitHub-flavored Markdown.
 | Input | Default | Purpose |
 |-------|---------|---------|
 | `publish` | `false` | Publish or clean up the rolling pull request; false performs a credential-free dry run |
-| `broker-url` | empty | HTTPS endpoint of the authorized installation-token broker |
-| `broker-audience` | `upd-token-broker` | Audience requested in the GitHub OIDC token |
 | `runner` | `ubuntu-24.04` | Linux runner label |
 | `upd-version` | current verified manifest | Exact released `upd` version |
 | `upd-sha256` | manifest checksum | Archive digest; required for a version outside the release manifest |
@@ -253,8 +253,6 @@ only Contents and Pull requests write for the target repository.
 
 | Input | Default | Purpose |
 |-------|---------|---------|
-| `broker-url` | empty | HTTPS endpoint of the authorized installation-token broker |
-| `broker-audience` | `upd-token-broker` | Audience requested in the GitHub OIDC token |
 | `runner` | `ubuntu-24.04` | Linux runner label |
 | `upd-version` | current verified manifest | Exact released `upd` version; empty follows the canonical release manifest |
 | `upd-sha256` | manifest checksum | Exact archive checksum; required when the selected version is absent from the manifest |
@@ -282,9 +280,9 @@ only Contents and Pull requests write for the target repository.
 |--------|---------|
 | `pull-request-token` | Fine-grained personal access token; the single-repository alternative to a GitHub App |
 
-Supplying neither a broker URL nor `pull-request-token` lets upd prepare and
-validate the proposal, then fails before publication so it cannot create a pull
-request whose checks never start. See [Credentials](#credentials).
+If the hosted App is not installed and no `pull-request-token` is supplied, upd
+can prepare and validate the proposal but fails before publication. See
+[Credentials](#credentials).
 
 For a fully static installation, provide the published archive version and
 digest together:

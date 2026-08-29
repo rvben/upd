@@ -692,35 +692,18 @@ fn github_presentation_prioritizes_review_worthy_updates() {
 }
 
 #[test]
-fn workflow_requires_a_check_triggering_publishing_credential() {
+fn workflow_defaults_to_the_hosted_broker_and_allows_a_pat_override() {
     let temp = tempfile::tempdir().unwrap();
-    let summary = temp.path().join("summary");
     let output = temp.path().join("output");
-    let script = workflow_script("Require a check-triggering publishing credential");
-
-    let missing = Command::new("bash")
-        .arg("-c")
-        .arg(&script)
-        .env("BASE_SHA", "unused")
-        .env("CHANGED", "false")
-        .env("HAS_BROKER", "false")
-        .env("HAS_PAT", "false")
-        .env("GITHUB_OUTPUT", &output)
-        .env("GITHUB_STEP_SUMMARY", &summary)
-        .output()
-        .unwrap();
-    assert_eq!(missing.status.code(), Some(4));
-    assert!(String::from_utf8_lossy(&missing.stderr).contains("hosted token broker"));
+    let script = workflow_script("Select a check-triggering publishing credential");
 
     let configured = Command::new("bash")
         .arg("-c")
         .arg(&script)
         .env("BASE_SHA", "unused")
         .env("CHANGED", "false")
-        .env("HAS_BROKER", "true")
         .env("HAS_PAT", "false")
         .env("GITHUB_OUTPUT", &output)
-        .env("GITHUB_STEP_SUMMARY", &summary)
         .output()
         .unwrap();
     assert!(configured.status.success());
@@ -736,10 +719,8 @@ fn workflow_requires_a_check_triggering_publishing_credential() {
         .arg(&script)
         .env("BASE_SHA", "unused")
         .env("CHANGED", "false")
-        .env("HAS_BROKER", "true")
         .env("HAS_PAT", "true")
         .env("GITHUB_OUTPUT", &pat_output)
-        .env("GITHUB_STEP_SUMMARY", &summary)
         .output()
         .unwrap();
     assert!(pat_configured.status.success());
@@ -850,7 +831,7 @@ fn workflow_change_detection_limits_workflow_permission_to_workflow_proposals() 
     let ordinary = Command::new("bash")
         .arg("-c")
         .arg(workflow_script(
-            "Require a check-triggering publishing credential",
+            "Select a check-triggering publishing credential",
         ))
         .current_dir(&repo)
         .env("BASE_SHA", &base)
@@ -881,7 +862,7 @@ fn workflow_change_detection_limits_workflow_permission_to_workflow_proposals() 
     let result = Command::new("bash")
         .arg("-c")
         .arg(workflow_script(
-            "Require a check-triggering publishing credential",
+            "Select a check-triggering publishing credential",
         ))
         .current_dir(&repo)
         .env("BASE_SHA", workflow_base)
@@ -1098,6 +1079,12 @@ fn workflow_defaults_are_reproducible_and_safe() {
     assert!(WORKFLOW.contains("GITHUB_TOKEN: ${{ github.token }}"));
     assert!(WORKFLOW.contains(r#"{workflows: "write"}"#));
     assert!(WORKFLOW.contains("ACTIONS_ID_TOKEN_REQUEST_TOKEN"));
+    assert!(WORKFLOW.contains(
+        "UPD_HOSTED_BROKER_URL: https://upd-token-broker-6e5p6y25aa-ez.a.run.app/v1/token"
+    ));
+    assert!(WORKFLOW.contains("UPD_HOSTED_BROKER_AUDIENCE: upd-token-broker"));
+    assert!(!WORKFLOW.contains("inputs.broker-url"));
+    assert!(!WORKFLOW.contains("inputs.broker-audience"));
     assert!(!WORKFLOW.contains("app-private-key"));
     assert!(!WORKFLOW.contains("create-github-app-token"));
     let validation = WORKFLOW
@@ -1123,11 +1110,13 @@ fn repository_dependency_jobs_share_the_hardened_workflow() {
     assert!(RUST_WORKFLOW.contains("langs: rust"));
     assert!(RUST_WORKFLOW.contains("lock: true"));
     assert!(RUST_WORKFLOW.contains("branch: deps/upd"));
-    assert!(RUST_WORKFLOW.contains("broker-url: ${{ vars.UPD_BROKER_URL }}"));
+    assert!(!RUST_WORKFLOW.contains("broker-url:"));
+    assert!(!RUST_WORKFLOW.contains("UPD_BROKER_URL"));
     assert!(!RUST_WORKFLOW.contains("git push"));
     assert!(!RUST_WORKFLOW.contains("upd-version:"));
 
     assert!(ACTIONS_WORKFLOW.contains("uses: ./.github/workflows/dependency-health.yml"));
-    assert!(ACTIONS_WORKFLOW.contains("broker-url: ${{ vars.UPD_BROKER_URL }}"));
+    assert!(!ACTIONS_WORKFLOW.contains("broker-url:"));
+    assert!(!ACTIONS_WORKFLOW.contains("UPD_BROKER_URL"));
     assert!(!ACTIONS_WORKFLOW.contains("upd-version:"));
 }

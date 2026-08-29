@@ -18,4 +18,3 @@ jobs:
       max-bump: minor
       validation-command: make check
       fail-on-blocked: false
-      broker-url: ${{ vars.UPD_BROKER_URL }}

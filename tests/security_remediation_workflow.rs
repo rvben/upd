@@ -248,7 +248,12 @@ fn reusable_workflow_has_a_provider_neutral_least_privilege_boundary() {
     assert!(!WORKFLOW.contains("pull-request-token"));
     assert!(WORKFLOW.contains("persist-credentials: false"));
     assert!(WORKFLOW.contains("id-token: write"));
-    assert!(WORKFLOW.contains("broker-url:"));
+    assert!(WORKFLOW.contains(
+        "UPD_HOSTED_BROKER_URL: https://upd-token-broker-6e5p6y25aa-ez.a.run.app/v1/token"
+    ));
+    assert!(WORKFLOW.contains("UPD_HOSTED_BROKER_AUDIENCE: upd-token-broker"));
+    assert!(!WORKFLOW.contains("inputs.broker-url"));
+    assert!(!WORKFLOW.contains("inputs.broker-audience"));
     assert!(WORKFLOW.contains("ACTIONS_ID_TOKEN_REQUEST_TOKEN"));
     assert!(WORKFLOW.contains(r#"contents: "write""#));
     assert!(WORKFLOW.contains(r#"pull_requests: "write""#));
@@ -261,7 +266,7 @@ fn reusable_workflow_has_a_provider_neutral_least_privilege_boundary() {
         .find("name: Verify and stage the proposal")
         .unwrap();
     let require = WORKFLOW
-        .find("name: Require hosted broker configuration")
+        .find("name: Validate hosted broker configuration")
         .unwrap();
     let mint = WORKFLOW
         .find("name: Request a least-privilege installation token")
@@ -304,7 +309,8 @@ fn repository_caller_is_thin_scoped_and_safe_by_default() {
     assert!(CALLER.contains("default: false"));
     assert!(CALLER.contains("UPD_SECURITY_REMEDIATION_ENABLED"));
     assert!(CALLER.contains("id-token: write"));
-    assert!(CALLER.contains("broker-url: ${{ vars.UPD_BROKER_URL }}"));
+    assert!(!CALLER.contains("broker-url:"));
+    assert!(!CALLER.contains("UPD_BROKER_URL"));
     assert!(!CALLER.contains("UPD_APP_PRIVATE_KEY"));
     assert!(WORKFLOW.contains("group: upd-dependency-writes-${{ github.repository }}"));
     assert!(UPDATE_WORKFLOW.contains("group: upd-dependency-writes-${{ github.repository }}"));

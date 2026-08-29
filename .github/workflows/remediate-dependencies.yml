@@ -31,4 +31,3 @@ jobs:
       validation-command: make check
       branch: security/upd
       commit-message: "fix(deps): remediate vulnerable Rust dependencies with upd"
-      broker-url: ${{ vars.UPD_BROKER_URL }}
