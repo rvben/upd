@@ -83,18 +83,15 @@ on:
         description: Auto-merge method (squash, merge, or rebase)
         type: string
         default: squash
-      app-client-id:
-        description: GitHub App Client ID; preferred over the legacy numeric App ID
+      broker-url:
+        description: HTTPS endpoint of the upd installation-token broker
         type: string
         default: ""
-      app-id:
-        description: Legacy numeric GitHub App ID; use app-client-id for new installations
+      broker-audience:
+        description: OIDC audience expected by the upd token broker
         type: string
-        default: ""
+        default: upd-token-broker
     secrets:
-      app-private-key:
-        description: Private key paired with app-client-id or legacy app-id
-        required: false
       pull-request-token:
         description: Fine-grained PAT; a single-repository alternative to a GitHub App
         required: false
@@ -105,99 +102,6 @@ on:
       pull-request-url:
         description: Created or updated pull-request URL
         value: ${{ jobs.publish.outputs.pull-request-url }}
-  workflow_dispatch:
-    inputs:
-      runner:
-        description: Linux runner label
-        type: string
-        default: ubuntu-24.04
-      upd-version:
-        description: Exact released upd version; empty follows the verified release manifest
-        type: string
-        default: ""
-      upd-sha256:
-        description: Archive digest for a version absent from the release manifest
-        type: string
-        default: ""
-      upd-target:
-        description: Release target; detected when empty
-        type: string
-        default: ""
-      paths:
-        description: Whitespace-separated repository paths
-        type: string
-        default: "."
-      langs:
-        description: Comma-separated ecosystem filter
-        type: string
-        default: actions
-      packages:
-        description: Comma-separated package filter
-        type: string
-        default: ""
-      min-age:
-        description: Minimum eligible release age
-        type: string
-        default: 7d
-      max-bump:
-        description: Highest applied bump
-        type: choice
-        options: [patch, minor, major]
-        default: minor
-      lock:
-        description: Regenerate lockfiles
-        type: boolean
-        default: false
-      update-action-shas:
-        description: Verify and update immutable Action SHA pins
-        type: boolean
-        default: true
-      prepare-command:
-        description: Prepare repository-specific tooling
-        type: string
-        default: ""
-      validation-command:
-        description: Additional repository validation
-        type: string
-        default: ""
-      validate-actions:
-        description: Run actionlint when workflow files change
-        type: boolean
-        default: true
-      fail-on-blocked:
-        description: Fail when an update is blocked
-        type: boolean
-        default: false
-      branch:
-        description: Automation-owned rolling branch
-        type: string
-        default: automation/upd-github-actions
-      commit-message:
-        description: Generated commit message
-        type: string
-        default: "ci(deps): update dependencies with upd"
-      pull-request-title:
-        description: Pull-request title override; empty derives a concise title from the update evidence
-        type: string
-        default: ""
-      auto-merge:
-        description: Merge after all repository checks pass
-        type: boolean
-        default: false
-      merge-method:
-        description: Auto-merge method
-        type: choice
-        options: [squash, merge, rebase]
-        default: squash
-      app-client-id:
-        description: GitHub App Client ID
-        type: string
-        default: ""
-      app-id:
-        description: Legacy numeric GitHub App ID
-        type: string
-        default: ""
-
 permissions:
   contents: read
   pull-requests: read
@@ -644,6 +548,10 @@ jobs:
     needs: update
     runs-on: ${{ inputs.runner }}
     timeout-minutes: 10
+    permissions:
+      contents: read
+      id-token: write
+      pull-requests: read
     outputs:
       pull-request-url: ${{ steps.publish.outputs.url }}
     env:
@@ -734,7 +642,7 @@ jobs:
         env:
           BASE_SHA: ${{ needs.update.outputs.base-sha }}
           CHANGED: ${{ needs.update.outputs.changed }}
-          HAS_APP_CREDENTIAL: ${{ (inputs.app-client-id != '' || inputs.app-id != '') && secrets.app-private-key != '' }}
+          HAS_BROKER: ${{ inputs.broker-url != '' }}
           HAS_PAT: ${{ secrets.pull-request-token != '' }}
         run: |
           set -euo pipefail
@@ -746,15 +654,20 @@ jobs:
           fi
           echo "publication-required=true" >> "$GITHUB_OUTPUT"
           echo "workflow-files-changed=$workflow_files_changed" >> "$GITHUB_OUTPUT"
-          if [[ "$HAS_APP_CREDENTIAL" == true || "$HAS_PAT" == true ]]; then
+          if [[ "$HAS_PAT" == true ]]; then
+            echo "use-broker=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if [[ "$HAS_BROKER" == true ]]; then
+            echo "use-broker=true" >> "$GITHUB_OUTPUT"
             exit 0
           fi
           {
-            echo "Publishing dependency updates requires an independent GitHub App or PAT credential."
+            echo "Publishing dependency updates requires the hosted token broker or an independent PAT credential."
             echo
             echo "This keeps publication separate from GITHUB_TOKEN event-recursion and approval behavior."
             echo "Supply one of:"
-            echo "  - a GitHub App, via app-client-id (preferred) or app-id plus app-private-key"
+            echo "  - the hosted GitHub App, via the non-secret broker-url input"
             if [[ "$workflow_files_changed" == true ]]; then
               echo "  - or a fine-grained PAT with Contents, Pull requests, and Workflows write"
             else
@@ -765,47 +678,55 @@ jobs:
           } | tee -a "$GITHUB_STEP_SUMMARY" >&2
           exit 4
 
-      - name: Mint publication token
-        id: app-token
-        if: steps.credential-needs.outputs.publication-required == 'true' && inputs.app-client-id != '' && steps.credential-needs.outputs.workflow-files-changed != 'true'
-        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
-        with:
-          client-id: ${{ inputs.app-client-id }}
-          private-key: ${{ secrets.app-private-key }}
-          permission-contents: write
-          permission-pull-requests: write
-
-      - name: Mint workflow publication token
-        id: app-workflow-token
-        if: steps.credential-needs.outputs.publication-required == 'true' && inputs.app-client-id != '' && steps.credential-needs.outputs.workflow-files-changed == 'true'
-        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
-        with:
-          client-id: ${{ inputs.app-client-id }}
-          private-key: ${{ secrets.app-private-key }}
-          permission-contents: write
-          permission-pull-requests: write
-          permission-workflows: write
-
-      - name: Mint publication token with legacy App ID
-        id: legacy-app-token
-        if: steps.credential-needs.outputs.publication-required == 'true' && inputs.app-client-id == '' && inputs.app-id != '' && steps.credential-needs.outputs.workflow-files-changed != 'true'
-        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
-        with:
-          app-id: ${{ inputs.app-id }}
-          private-key: ${{ secrets.app-private-key }}
-          permission-contents: write
-          permission-pull-requests: write
-
-      - name: Mint workflow publication token with legacy App ID
-        id: legacy-app-workflow-token
-        if: steps.credential-needs.outputs.publication-required == 'true' && inputs.app-client-id == '' && inputs.app-id != '' && steps.credential-needs.outputs.workflow-files-changed == 'true'
-        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
-        with:
-          app-id: ${{ inputs.app-id }}
-          private-key: ${{ secrets.app-private-key }}
-          permission-contents: write
-          permission-pull-requests: write
-          permission-workflows: write
+      - name: Request publication token
+        id: broker-token
+        if: steps.credential-needs.outputs.publication-required == 'true' && steps.credential-needs.outputs.use-broker == 'true'
+        env:
+          BROKER_AUDIENCE: ${{ inputs.broker-audience }}
+          BROKER_URL: ${{ inputs.broker-url }}
+          WORKFLOW_FILES_CHANGED: ${{ steps.credential-needs.outputs.workflow-files-changed }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          set +x
+          if [[ "$BROKER_URL" != https://* || -z "$BROKER_AUDIENCE" ]]; then
+            echo "broker-url must be HTTPS and broker-audience must not be empty" >&2
+            exit 4
+          fi
+          umask 077
+          oidc_response="$RUNNER_TEMP/upd-oidc-response.json"
+          broker_request="$RUNNER_TEMP/upd-broker-request.json"
+          broker_response="$RUNNER_TEMP/upd-broker-response.json"
+          trap 'rm -f "$oidc_response" "$broker_request" "$broker_response"' EXIT
+          curl --silent --show-error --fail --get \
+            --header "Authorization: Bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+            --data-urlencode "audience=$BROKER_AUDIENCE" \
+            --output "$oidc_response" \
+            "$ACTIONS_ID_TOKEN_REQUEST_URL"
+          oidc_token="$(jq --exit-status --raw-output '.value | strings | select(length > 0)' "$oidc_response")"
+          echo "::add-mask::$oidc_token"
+          permissions="$(jq --compact-output --null-input \
+            --arg changed "$WORKFLOW_FILES_CHANGED" \
+            '{contents: "write", pull_requests: "write"} +
+             (if $changed == "true" then {workflows: "write"} else {} end)')"
+          jq --null-input \
+            --arg oidc_token "$oidc_token" \
+            --argjson permissions "$permissions" \
+            '{oidc_token: $oidc_token, permissions: $permissions}' > "$broker_request"
+          status="$(curl --silent --show-error \
+            --request POST \
+            --header 'Content-Type: application/json' \
+            --data-binary "@$broker_request" \
+            --output "$broker_response" \
+            --write-out '%{http_code}' \
+            "$BROKER_URL")"
+          if [[ "$status" != 200 ]]; then
+            echo "The upd token broker rejected the request (HTTP $status)" >&2
+            exit 4
+          fi
+          token="$(jq --exit-status --raw-output '.token | strings | select(length > 0)' "$broker_response")"
+          echo "::add-mask::$token"
+          echo "token=$token" >> "$GITHUB_OUTPUT"
 
       - name: Publish rolling pull request
         id: publish
@@ -813,8 +734,8 @@ jobs:
           AUTO_MERGE: ${{ inputs.auto-merge }}
           BRANCH: ${{ inputs.branch }}
           CHANGED: ${{ needs.update.outputs.changed }}
-          GH_TOKEN: ${{ steps.app-token.outputs.token || steps.app-workflow-token.outputs.token || steps.legacy-app-token.outputs.token || steps.legacy-app-workflow-token.outputs.token || (steps.credential-needs.outputs.publication-required == 'true' && secrets.pull-request-token) || github.token }}
-          HAS_PUBLISHING_TOKEN: ${{ steps.app-token.outputs.token != '' || steps.app-workflow-token.outputs.token != '' || steps.legacy-app-token.outputs.token != '' || steps.legacy-app-workflow-token.outputs.token != '' || (steps.credential-needs.outputs.publication-required == 'true' && secrets.pull-request-token != '') }}
+          GH_TOKEN: ${{ steps.broker-token.outputs.token || (steps.credential-needs.outputs.publication-required == 'true' && secrets.pull-request-token) || github.token }}
+          HAS_PUBLISHING_TOKEN: ${{ steps.broker-token.outputs.token != '' || (steps.credential-needs.outputs.publication-required == 'true' && secrets.pull-request-token != '') }}
           EXPECTED_REMOTE_SHA: ${{ steps.publication-state.outputs.expected-remote-sha }}
           MERGE_METHOD: ${{ inputs.merge-method }}
           PRESENTATION: ${{ runner.temp }}/upd-presentation.json

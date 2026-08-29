@@ -247,9 +247,13 @@ fn reusable_workflow_has_a_provider_neutral_least_privilege_boundary() {
     assert!(!WORKFLOW.contains("github.token"));
     assert!(!WORKFLOW.contains("pull-request-token"));
     assert!(WORKFLOW.contains("persist-credentials: false"));
-    assert!(WORKFLOW.contains("permission-contents: write"));
-    assert!(WORKFLOW.contains("permission-pull-requests: write"));
-    assert!(WORKFLOW.contains("client-id: ${{ inputs.app-client-id }}"));
+    assert!(WORKFLOW.contains("id-token: write"));
+    assert!(WORKFLOW.contains("broker-url:"));
+    assert!(WORKFLOW.contains("ACTIONS_ID_TOKEN_REQUEST_TOKEN"));
+    assert!(WORKFLOW.contains(r#"contents: "write""#));
+    assert!(WORKFLOW.contains(r#"pull_requests: "write""#));
+    assert!(!WORKFLOW.contains("app-private-key"));
+    assert!(!WORKFLOW.contains("create-github-app-token"));
     assert!(WORKFLOW.contains("gh auth setup-git"));
     assert!(!WORKFLOW.contains("AUTHORIZATION: bearer"));
 
@@ -257,10 +261,10 @@ fn reusable_workflow_has_a_provider_neutral_least_privilege_boundary() {
         .find("name: Verify and stage the proposal")
         .unwrap();
     let require = WORKFLOW
-        .find("name: Require GitHub App credentials")
+        .find("name: Require hosted broker configuration")
         .unwrap();
     let mint = WORKFLOW
-        .find("name: Mint a least-privilege installation token")
+        .find("name: Request a least-privilege installation token")
         .unwrap();
     let publish = WORKFLOW
         .find("name: Publish the rolling security pull request")
@@ -299,8 +303,9 @@ fn repository_caller_is_thin_scoped_and_safe_by_default() {
     assert!(CALLER.contains("validation-command: make check"));
     assert!(CALLER.contains("default: false"));
     assert!(CALLER.contains("UPD_SECURITY_REMEDIATION_ENABLED"));
-    assert!(CALLER.contains("app-client-id: ${{ vars.UPD_APP_CLIENT_ID }}"));
-    assert!(CALLER.contains("app-private-key: ${{ secrets.UPD_APP_PRIVATE_KEY }}"));
+    assert!(CALLER.contains("id-token: write"));
+    assert!(CALLER.contains("broker-url: ${{ vars.UPD_BROKER_URL }}"));
+    assert!(!CALLER.contains("UPD_APP_PRIVATE_KEY"));
     assert!(WORKFLOW.contains("group: upd-dependency-writes-${{ github.repository }}"));
     assert!(UPDATE_WORKFLOW.contains("group: upd-dependency-writes-${{ github.repository }}"));
 }

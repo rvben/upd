@@ -63,18 +63,14 @@ on:
         description: Auto-merge strategy when auto-merge is enabled
         type: string
         default: squash
-      app-client-id:
-        description: GitHub App Client ID; preferred when publish is true
+      broker-url:
+        description: HTTPS endpoint of the upd installation-token broker
         type: string
         default: ""
-      app-id:
-        description: Legacy GitHub App ID; use app-client-id for new callers
+      broker-audience:
+        description: OIDC audience expected by the upd token broker
         type: string
-        default: ""
-    secrets:
-      app-private-key:
-        description: Private key of the GitHub App named by app-client-id or app-id
-        required: false
+        default: upd-token-broker
     outputs:
       disposition:
         description: clean_changed, clean_no_change, partial_changed, or residual_no_change
@@ -670,6 +666,7 @@ jobs:
     permissions:
       actions: read
       contents: read
+      id-token: write
     outputs:
       pull-request-url: ${{ steps.publish.outputs.url }}
     steps:
@@ -744,42 +741,63 @@ jobs:
             exit 2
           fi
 
-      - name: Require GitHub App credentials
+      - name: Require hosted broker configuration
         env:
-          APP_CLIENT_ID: ${{ inputs.app-client-id }}
-          APP_ID: ${{ inputs.app-id }}
-          APP_PRIVATE_KEY: ${{ secrets.app-private-key }}
+          BROKER_AUDIENCE: ${{ inputs.broker-audience }}
+          BROKER_URL: ${{ inputs.broker-url }}
         shell: bash
         run: |
           set -euo pipefail
-          if [[ -z "$APP_CLIENT_ID" && -z "$APP_ID" ]]; then
-            echo "Publishing requires app-client-id (preferred) or app-id; no token fallback is permitted" >&2
+          if [[ "$BROKER_URL" != https://* ]]; then
+            echo "Publishing requires an HTTPS broker-url; no token fallback is permitted" >&2
             exit 4
           fi
-          if [[ -z "$APP_PRIVATE_KEY" ]]; then
-            echo "Publishing requires app-private-key; no token fallback is permitted" >&2
+          if [[ -z "$BROKER_AUDIENCE" ]]; then
+            echo "Publishing requires broker-audience; no token fallback is permitted" >&2
             exit 4
           fi
 
-      - name: Mint a least-privilege installation token
-        id: app-token
-        if: inputs.app-client-id != ''
-        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
-        with:
-          client-id: ${{ inputs.app-client-id }}
-          private-key: ${{ secrets.app-private-key }}
-          permission-contents: write
-          permission-pull-requests: write
-
-      - name: Mint a least-privilege installation token with legacy App ID
-        id: legacy-app-token
-        if: inputs.app-client-id == '' && inputs.app-id != ''
-        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
-        with:
-          app-id: ${{ inputs.app-id }}
-          private-key: ${{ secrets.app-private-key }}
-          permission-contents: write
-          permission-pull-requests: write
+      - name: Request a least-privilege installation token
+        id: broker-token
+        env:
+          BROKER_AUDIENCE: ${{ inputs.broker-audience }}
+          BROKER_URL: ${{ inputs.broker-url }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          set +x
+          umask 077
+          oidc_response="$RUNNER_TEMP/upd-oidc-response.json"
+          broker_request="$RUNNER_TEMP/upd-broker-request.json"
+          broker_response="$RUNNER_TEMP/upd-broker-response.json"
+          trap 'rm -f "$oidc_response" "$broker_request" "$broker_response"' EXIT
+          curl --silent --show-error --fail --get \
+            --header "Authorization: Bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+            --data-urlencode "audience=$BROKER_AUDIENCE" \
+            --output "$oidc_response" \
+            "$ACTIONS_ID_TOKEN_REQUEST_URL"
+          oidc_token="$(jq --exit-status --raw-output '.value | strings | select(length > 0)' "$oidc_response")"
+          echo "::add-mask::$oidc_token"
+          jq --null-input \
+            --arg oidc_token "$oidc_token" \
+            '{
+              oidc_token: $oidc_token,
+              permissions: {contents: "write", pull_requests: "write"}
+            }' > "$broker_request"
+          status="$(curl --silent --show-error \
+            --request POST \
+            --header 'Content-Type: application/json' \
+            --data-binary "@$broker_request" \
+            --output "$broker_response" \
+            --write-out '%{http_code}' \
+            "$BROKER_URL")"
+          if [[ "$status" != 200 ]]; then
+            echo "The upd token broker rejected the request (HTTP $status)" >&2
+            exit 4
+          fi
+          token="$(jq --exit-status --raw-output '.token | strings | select(length > 0)' "$broker_response")"
+          echo "::add-mask::$token"
+          echo "token=$token" >> "$GITHUB_OUTPUT"
 
       - name: Publish the rolling security pull request
         id: publish
@@ -790,7 +808,7 @@ jobs:
           BRANCH: ${{ inputs.branch }}
           COMMIT_MESSAGE: ${{ inputs.commit-message }}
           DISPOSITION: ${{ needs.generate.outputs.disposition }}
-          GH_TOKEN: ${{ steps.app-token.outputs.token || steps.legacy-app-token.outputs.token }}
+          GH_TOKEN: ${{ steps.broker-token.outputs.token }}
           PR_TITLE: ${{ inputs.pull-request-title }}
           AUTO_MERGE: ${{ inputs.auto-merge }}
           MERGE_METHOD: ${{ inputs.merge-method }}

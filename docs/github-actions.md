@@ -21,18 +21,17 @@ on:
 
 permissions:
   contents: read
+  id-token: write
   pull-requests: read
 
 jobs:
   update:
     uses: rvben/upd/.github/workflows/dependency-health.yml@<FULL_COMMIT_SHA>
     with:
-      app-client-id: ${{ vars.UPD_APP_CLIENT_ID }}
+      broker-url: ${{ vars.UPD_BROKER_URL }}
       min-age: 7d
       max-bump: minor
       validation-command: make test
-    secrets:
-      app-private-key: ${{ secrets.UPD_APP_PRIVATE_KEY }}
 ```
 
 Replace `<FULL_COMMIT_SHA>` with a revision containing the reusable workflow.
@@ -43,16 +42,17 @@ and its default install resolves the current release from upd's canonical
 the binary version as well as the workflow code, set both `upd-version` and
 `upd-sha256` explicitly.
 
-Setting up the App is described under [Credentials](#credentials) below. It is
-worth doing once: with the default `langs: actions`, the only files this
-workflow changes are the ones `GITHUB_TOKEN` is forbidden to push.
+Broker access is described under [Credentials](#credentials) below. With the
+default `langs: actions`, the only files this workflow changes are the ones
+`GITHUB_TOKEN` is forbidden to push.
 
 ## Credentials
 
-The workflow accepts a GitHub App or a fine-grained personal access token. The
-caller grants `contents: read` and `pull-requests: read` to the per-run
-`GITHUB_TOKEN`. Publication uses the independent App or PAT credential instead,
-so the caller does not grant write access to repository-controlled commands.
+The workflow accepts a hosted GitHub App token broker or a fine-grained personal
+access token. The caller grants `contents: read`, `pull-requests: read`, and
+`id-token: write`. Publication uses the independent App installation token or
+PAT instead, so the caller does not grant repository write access to commands
+that run against the checked-out project.
 
 `GITHUB_TOKEN` is used only for read access while preparing and inspecting a
 proposal. It is intentionally not used for publication because two boundaries
@@ -71,34 +71,34 @@ are load-bearing here:
   PR publication independent so checks can start according to repository
   policy.
 
-When an eligible update exists without an App or PAT, the workflow may build and
-validate a local proposal artifact, but it fails before any external write. This
-prevents a pull request from arriving without the checks that decide whether it
-is safe to merge.
+When an eligible update exists without broker access or a PAT, the workflow may
+build and validate a local proposal artifact, but it fails before any external
+write. This prevents a pull request from arriving without the checks that decide
+whether it is safe to merge.
 
-### GitHub App (recommended)
+### Hosted GitHub App broker (recommended)
 
-The App private key is a sensitive, long-lived credential that can mint new
-installation tokens and must be protected accordingly. The workflow exposes it
-only to GitHub's token-minting action in the isolated publication job; the
-resulting installation token is short-lived. One App can serve an entire fleet
-through its installations.
+The broker keeps the App private key out of GitHub Actions and signs only inside
+managed HSM-backed infrastructure. The isolated publication job exchanges a
+short-lived GitHub OIDC token for a repository-scoped, short-lived installation
+token. The broker validates the stable repository identity, owner, reusable
+workflow revision, event, ref, and requested permissions before minting it.
 
-1. Create an App (a personal account App is enough) with these **repository**
-   permissions: Contents `read and write`, Pull requests `read and write`,
-   Workflows `read and write`. It needs no account permissions, no webhook, and
-   no subscription to events.
-2. Install it on the repositories that run this workflow.
-3. Generate a private key, and store the downloaded `.pem` contents as the
-   `UPD_APP_PRIVATE_KEY` secret. The Client ID is not sensitive; a repository
-   or organization variable such as `UPD_APP_CLIENT_ID` is the right home for
-   it.
+Broker access is allowlisted. For an authorized repository:
 
-Pass `app-client-id` as an input and `app-private-key` as a secret. The legacy
-numeric `app-id` input remains available for existing installations. The
-workflow mints the token itself: an installation token passed in from the
-caller would travel through a job output, and job outputs are not masked in
-logs.
+1. Set `UPD_BROKER_URL` to the HTTPS token endpoint as a repository or
+   organization Actions variable.
+2. Grant the caller `id-token: write`; this permits OIDC token issuance but does
+   not grant repository write access.
+3. Pass `broker-url: ${{ vars.UPD_BROKER_URL }}`. The default
+   `broker-audience` is `upd-token-broker`; change it only when the operator
+   provides a different audience.
+
+The reusable workflow requests and immediately masks both credentials. Neither
+the App key nor an installation token is stored as a caller secret. Invoke the
+reusable workflow through a thin caller such as the quick-start example; direct
+dispatch is deliberately not part of the reusable workflow's authorization
+contract.
 
 ### Fine-grained personal access token
 
@@ -128,14 +128,12 @@ jobs:
   update:
     uses: rvben/upd/.github/workflows/dependency-health.yml@<FULL_COMMIT_SHA>
     with:
-      app-client-id: ${{ vars.UPD_APP_CLIENT_ID }}
+      broker-url: ${{ vars.UPD_BROKER_URL }}
       runner: ubuntu-24.04
       langs: ""
       lock: true
       prepare-command: corepack enable
       validation-command: make test
-    secrets:
-      app-private-key: ${{ secrets.UPD_APP_PRIVATE_KEY }}
 ```
 
 An empty `langs` includes Actions, so this configuration also needs a
@@ -165,6 +163,7 @@ on:
 permissions:
   actions: read
   contents: read
+  id-token: write
 
 jobs:
   remediate:
@@ -174,9 +173,7 @@ jobs:
       langs: rust
       allowed-paths: Cargo.toml Cargo.lock
       validation-command: cargo test --locked
-      app-client-id: ${{ vars.UPD_APP_CLIENT_ID }}
-    secrets:
-      app-private-key: ${{ secrets.UPD_APP_PRIVATE_KEY }}
+      broker-url: ${{ vars.UPD_BROKER_URL }}
 ```
 
 `allowed-paths` is a required, whitespace-separated list of exact
@@ -190,13 +187,14 @@ The workflow has two jobs separated by an artifact boundary. The first job has
 read-only repository access, applies available fixes, regenerates lockfiles,
 runs the caller's validation command, and performs a fresh uncached audit of
 the proposed tree. The second job independently verifies the patch and only
-then mints the short-lived App token used for Git and pull-request operations.
+then requests the short-lived App token used for Git and pull-request operations.
 Project code and package managers never run with that token available.
 
 Publishing deliberately has no `GITHUB_TOKEN` or personal-token fallback. A
 pull request created with `GITHUB_TOKEN` does not start ordinary
 `pull_request` workflows, which would leave a security proposal without the CI
-signal it exists to obtain. Set `publish: false` for a credential-free dry run.
+signal it exists to obtain. Broker authorization is therefore required when
+`publish: true`; set `publish: false` for a credential-free dry run.
 
 The post-fix audit controls the lifecycle:
 
@@ -230,8 +228,8 @@ before it reaches GitHub-flavored Markdown.
 | Input | Default | Purpose |
 |-------|---------|---------|
 | `publish` | `false` | Publish or clean up the rolling pull request; false performs a credential-free dry run |
-| `app-client-id` | empty | GitHub App Client ID; preferred when publishing |
-| `app-id` | empty | Legacy GitHub App ID for backward compatibility |
+| `broker-url` | empty | HTTPS endpoint of the authorized installation-token broker |
+| `broker-audience` | `upd-token-broker` | Audience requested in the GitHub OIDC token |
 | `runner` | `ubuntu-24.04` | Linux runner label |
 | `upd-version` | current verified manifest | Exact released `upd` version |
 | `upd-sha256` | manifest checksum | Archive digest; required for a version outside the release manifest |
@@ -247,18 +245,16 @@ before it reaches GitHub-flavored Markdown.
 | `auto-merge` | `false` | Ask GitHub to auto-merge only a complete, clean remediation |
 | `merge-method` | `squash` | Auto-merge strategy: `squash`, `merge`, or `rebase` |
 
-The only remediation secret is `app-private-key`, paired with
-`app-client-id`. The legacy `app-id` input remains available for existing
-callers. The App needs Contents and Pull requests read/write for ordinary
-dependency files; the workflow requests only those permissions for its
-installation token.
+Remediation accepts no publishing secret or PAT fallback. The broker issues an
+installation token only after authorizing the caller's OIDC claims and requests
+only Contents and Pull requests write for the target repository.
 
 ## Inputs
 
 | Input | Default | Purpose |
 |-------|---------|---------|
-| `app-client-id` | empty | GitHub App Client ID; preferred for new installations |
-| `app-id` | empty | Legacy numeric GitHub App ID for backward compatibility |
+| `broker-url` | empty | HTTPS endpoint of the authorized installation-token broker |
+| `broker-audience` | `upd-token-broker` | Audience requested in the GitHub OIDC token |
 | `runner` | `ubuntu-24.04` | Linux runner label |
 | `upd-version` | current verified manifest | Exact released `upd` version; empty follows the canonical release manifest |
 | `upd-sha256` | manifest checksum | Exact archive checksum; required when the selected version is absent from the manifest |
@@ -284,12 +280,11 @@ installation token.
 
 | Secret | Purpose |
 |--------|---------|
-| `app-private-key` | Private key paired with `app-client-id` or legacy `app-id` |
 | `pull-request-token` | Fine-grained personal access token; the single-repository alternative to a GitHub App |
 
-Supplying neither lets upd prepare and validate the proposal, then fails before
-publication so it cannot create a pull request whose checks never start. See
-[Credentials](#credentials).
+Supplying neither a broker URL nor `pull-request-token` lets upd prepare and
+validate the proposal, then fails before publication so it cannot create a pull
+request whose checks never start. See [Credentials](#credentials).
 
 For a fully static installation, provide the published archive version and
 digest together:

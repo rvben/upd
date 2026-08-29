@@ -703,27 +703,129 @@ fn workflow_requires_a_check_triggering_publishing_credential() {
         .arg(&script)
         .env("BASE_SHA", "unused")
         .env("CHANGED", "false")
-        .env("HAS_APP_CREDENTIAL", "false")
+        .env("HAS_BROKER", "false")
         .env("HAS_PAT", "false")
         .env("GITHUB_OUTPUT", &output)
         .env("GITHUB_STEP_SUMMARY", &summary)
         .output()
         .unwrap();
     assert_eq!(missing.status.code(), Some(4));
-    assert!(String::from_utf8_lossy(&missing.stderr).contains("independent GitHub App or PAT"));
+    assert!(String::from_utf8_lossy(&missing.stderr).contains("hosted token broker"));
 
     let configured = Command::new("bash")
         .arg("-c")
         .arg(&script)
         .env("BASE_SHA", "unused")
         .env("CHANGED", "false")
-        .env("HAS_APP_CREDENTIAL", "true")
+        .env("HAS_BROKER", "true")
         .env("HAS_PAT", "false")
         .env("GITHUB_OUTPUT", &output)
         .env("GITHUB_STEP_SUMMARY", &summary)
         .output()
         .unwrap();
     assert!(configured.status.success());
+    assert!(
+        fs::read_to_string(&output)
+            .unwrap()
+            .contains("use-broker=true")
+    );
+
+    let pat_output = temp.path().join("pat-output");
+    let pat_configured = Command::new("bash")
+        .arg("-c")
+        .arg(&script)
+        .env("BASE_SHA", "unused")
+        .env("CHANGED", "false")
+        .env("HAS_BROKER", "true")
+        .env("HAS_PAT", "true")
+        .env("GITHUB_OUTPUT", &pat_output)
+        .env("GITHUB_STEP_SUMMARY", &summary)
+        .output()
+        .unwrap();
+    assert!(pat_configured.status.success());
+    assert!(
+        fs::read_to_string(pat_output)
+            .unwrap()
+            .contains("use-broker=false")
+    );
+}
+
+#[test]
+fn workflow_requests_and_masks_a_scoped_broker_token() {
+    let temp = tempfile::tempdir().unwrap();
+    let fake_bin = temp.path().join("bin");
+    let runner_temp = temp.path().join("runner");
+    fs::create_dir(&fake_bin).unwrap();
+    fs::create_dir(&runner_temp).unwrap();
+    write_executable(
+        &fake_bin.join("curl"),
+        r#"#!/usr/bin/env bash
+set -euo pipefail
+output=""
+request=""
+url=""
+while [[ "$#" -gt 0 ]]; do
+  case "$1" in
+    --output) output="$2"; shift 2 ;;
+    --data-binary) request="${2#@}"; shift 2 ;;
+    --header|--data-urlencode|--request|--write-out) shift 2 ;;
+    --silent|--show-error|--fail|--get) shift ;;
+    *) url="$1"; shift ;;
+  esac
+done
+if [[ "$url" == https://oidc.example.test/* ]]; then
+  printf '%s\n' '{"value":"signed-oidc-secret"}' > "$output"
+else
+  cp "$request" "$BROKER_CAPTURE"
+  printf '%s\n' '{"token":"installation-secret","expires_at":"2026-08-29T12:00:00Z"}' > "$output"
+  printf '200'
+fi
+"#,
+    );
+    let output = temp.path().join("github-output");
+    let capture = temp.path().join("broker-request");
+    let path = format!(
+        "{}:{}",
+        fake_bin.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+
+    let result = Command::new("bash")
+        .arg("-c")
+        .arg(workflow_script("Request publication token"))
+        .env("ACTIONS_ID_TOKEN_REQUEST_TOKEN", "oidc-request-secret")
+        .env(
+            "ACTIONS_ID_TOKEN_REQUEST_URL",
+            "https://oidc.example.test/token?request=1",
+        )
+        .env("BROKER_AUDIENCE", "upd-token-broker")
+        .env("BROKER_CAPTURE", &capture)
+        .env("BROKER_URL", "https://broker.example.test/v1/token")
+        .env("GITHUB_OUTPUT", &output)
+        .env("PATH", path)
+        .env("RUNNER_TEMP", &runner_temp)
+        .env("WORKFLOW_FILES_CHANGED", "true")
+        .output()
+        .unwrap();
+
+    assert!(
+        result.status.success(),
+        "stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&result.stdout),
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let stdout = String::from_utf8(result.stdout).unwrap();
+    assert!(stdout.contains("::add-mask::signed-oidc-secret"));
+    assert!(stdout.contains("::add-mask::installation-secret"));
+    assert_eq!(
+        fs::read_to_string(output).unwrap(),
+        "token=installation-secret\n"
+    );
+    let request: serde_json::Value = serde_json::from_slice(&fs::read(capture).unwrap()).unwrap();
+    assert_eq!(request["oidc_token"], "signed-oidc-secret");
+    assert_eq!(request["permissions"]["contents"], "write");
+    assert_eq!(request["permissions"]["pull_requests"], "write");
+    assert_eq!(request["permissions"]["workflows"], "write");
 }
 
 #[test]
@@ -753,7 +855,7 @@ fn workflow_change_detection_limits_workflow_permission_to_workflow_proposals() 
         .current_dir(&repo)
         .env("BASE_SHA", &base)
         .env("CHANGED", "true")
-        .env("HAS_APP_CREDENTIAL", "true")
+        .env("HAS_BROKER", "true")
         .env("HAS_PAT", "false")
         .env("GITHUB_OUTPUT", &ordinary_output)
         .env("GITHUB_STEP_SUMMARY", temp.path().join("ordinary-summary"))
@@ -784,7 +886,7 @@ fn workflow_change_detection_limits_workflow_permission_to_workflow_proposals() 
         .current_dir(&repo)
         .env("BASE_SHA", workflow_base)
         .env("CHANGED", "true")
-        .env("HAS_APP_CREDENTIAL", "true")
+        .env("HAS_BROKER", "true")
         .env("HAS_PAT", "false")
         .env("GITHUB_OUTPUT", &output)
         .env("GITHUB_STEP_SUMMARY", &summary)
@@ -973,6 +1075,7 @@ fn credential_less_cleanup_preserves_the_existing_pr_and_branch() {
 
 #[test]
 fn workflow_defaults_are_reproducible_and_safe() {
+    assert!(!WORKFLOW.contains("  workflow_dispatch:"));
     assert!(
         WORKFLOW.contains("https://raw.githubusercontent.com/rvben/upd/main/release-pins.json")
     );
@@ -993,11 +1096,14 @@ fn workflow_defaults_are_reproducible_and_safe() {
     assert!(WORKFLOW.contains("  publish:\n    needs: update"));
     assert!(WORKFLOW.contains("never executes checked-out repository code"));
     assert!(WORKFLOW.contains("GITHUB_TOKEN: ${{ github.token }}"));
-    assert!(WORKFLOW.contains("permission-workflows: write"));
+    assert!(WORKFLOW.contains(r#"{workflows: "write"}"#));
+    assert!(WORKFLOW.contains("ACTIONS_ID_TOKEN_REQUEST_TOKEN"));
+    assert!(!WORKFLOW.contains("app-private-key"));
+    assert!(!WORKFLOW.contains("create-github-app-token"));
     let validation = WORKFLOW
         .find("Verify validation did not mutate the proposal")
         .unwrap();
-    let publication_token = WORKFLOW.find("Mint publication token").unwrap();
+    let publication_token = WORKFLOW.find("Request publication token").unwrap();
     assert!(validation < publication_token);
     assert!(!WORKFLOW.contains("default: latest"));
     assert!(!WORKFLOW.contains("default: v0."));
@@ -1005,7 +1111,9 @@ fn workflow_defaults_are_reproducible_and_safe() {
     for caller in [RUST_WORKFLOW, ACTIONS_WORKFLOW] {
         assert!(caller.contains("contents: read"));
         assert!(caller.contains("pull-requests: read"));
+        assert!(caller.contains("id-token: write"));
         assert!(!caller.contains("contents: write"));
+        assert!(!caller.contains("UPD_APP_PRIVATE_KEY"));
     }
 }
 
@@ -1015,13 +1123,11 @@ fn repository_dependency_jobs_share_the_hardened_workflow() {
     assert!(RUST_WORKFLOW.contains("langs: rust"));
     assert!(RUST_WORKFLOW.contains("lock: true"));
     assert!(RUST_WORKFLOW.contains("branch: deps/upd"));
-    assert!(RUST_WORKFLOW.contains("app-client-id: ${{ vars.UPD_APP_CLIENT_ID }}"));
-    assert!(RUST_WORKFLOW.contains("app-private-key: ${{ secrets.UPD_APP_PRIVATE_KEY }}"));
+    assert!(RUST_WORKFLOW.contains("broker-url: ${{ vars.UPD_BROKER_URL }}"));
     assert!(!RUST_WORKFLOW.contains("git push"));
     assert!(!RUST_WORKFLOW.contains("upd-version:"));
 
     assert!(ACTIONS_WORKFLOW.contains("uses: ./.github/workflows/dependency-health.yml"));
-    assert!(ACTIONS_WORKFLOW.contains("app-client-id: ${{ vars.UPD_APP_CLIENT_ID }}"));
-    assert!(ACTIONS_WORKFLOW.contains("app-private-key: ${{ secrets.UPD_APP_PRIVATE_KEY }}"));
+    assert!(ACTIONS_WORKFLOW.contains("broker-url: ${{ vars.UPD_BROKER_URL }}"));
     assert!(!ACTIONS_WORKFLOW.contains("upd-version:"));
 }

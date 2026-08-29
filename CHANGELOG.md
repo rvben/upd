@@ -5,6 +5,12 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+
+- **actions**: replace caller-held GitHub App keys with the OIDC-authenticated hosted token broker
+
 ## [0.8.4](https://github.com/rvben/upd/compare/v0.8.3...v0.8.4) - 2026-08-29
 
 ### Added

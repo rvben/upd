@@ -7,6 +7,7 @@ on:
 
 permissions:
   contents: read
+  id-token: write
   pull-requests: read
 
 jobs:
@@ -17,6 +18,4 @@ jobs:
       max-bump: minor
       validation-command: make check
       fail-on-blocked: false
-      app-client-id: ${{ vars.UPD_APP_CLIENT_ID }}
-    secrets:
-      app-private-key: ${{ secrets.UPD_APP_PRIVATE_KEY }}
+      broker-url: ${{ vars.UPD_BROKER_URL }}

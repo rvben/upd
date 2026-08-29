@@ -13,6 +13,7 @@ on:
 permissions:
   actions: read
   contents: read
+  id-token: write
 
 jobs:
   remediate:
@@ -30,6 +31,4 @@ jobs:
       validation-command: make check
       branch: security/upd
       commit-message: "fix(deps): remediate vulnerable Rust dependencies with upd"
-      app-client-id: ${{ vars.UPD_APP_CLIENT_ID }}
-    secrets:
-      app-private-key: ${{ secrets.UPD_APP_PRIVATE_KEY }}
+      broker-url: ${{ vars.UPD_BROKER_URL }}
