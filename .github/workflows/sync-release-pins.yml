@@ -21,7 +21,6 @@ on:
 permissions:
   attestations: read
   contents: write
-  pull-requests: write
 
 concurrency:
   group: release-pins-${{ github.repository }}
@@ -29,7 +28,7 @@ concurrency:
 
 jobs:
   synchronize:
-    name: Verify, propose, and merge release pins
+    name: Verify and publish release pins
     runs-on: ubuntu-latest
     timeout-minutes: 30
     env:
@@ -156,54 +155,23 @@ jobs:
             .github/workflows/upd.yml
           git diff --check
 
-      - name: Publish version-specific pull request
+      - name: Publish verified pins to main
         if: steps.synchronize.outputs.changed == 'true'
-        id: pull-request
         run: |
           set -euo pipefail
-          branch="automation/release-pins-${VERSION}"
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git switch --create "$branch"
           git add \
             release-pins.json \
             ci/gitlab-dependency-update.yml \
             docs/github-actions.md \
             docs/gitlab.md
           git commit -m "chore(release): refresh integration pins for ${VERSION}"
-
-          expected_remote_sha="$(git ls-remote --heads origin "refs/heads/${branch}" | cut -f1)"
-          git push origin "HEAD:refs/heads/${branch}" \
-            "--force-with-lease=refs/heads/${branch}:${expected_remote_sha}"
-
-          pull_requests="$(gh pr list \
-            --state open \
-            --base main \
-            --head "$branch" \
-            --json number,url)"
-          count="$(jq length <<< "$pull_requests")"
-          if [[ "$count" == 0 ]]; then
-            url="$(gh pr create \
-              --base main \
-              --head "$branch" \
-              --title "chore(release): refresh integration pins for ${VERSION}" \
-              --body "Synchronizes the GitHub and GitLab integration defaults with the verified ${VERSION} release artifacts.")"
-            number="$(gh pr view "$url" --json number --jq .number)"
-          elif [[ "$count" == 1 ]]; then
-            number="$(jq --raw-output '.[0].number' <<< "$pull_requests")"
-            url="$(jq --raw-output '.[0].url' <<< "$pull_requests")"
-          else
-            echo "multiple open release-pin pull requests found for $branch" >&2
-            exit 2
-          fi
-
-          head_commit="$(git rev-parse HEAD)"
-          gh pr merge "$number" \
-            --squash \
-            --delete-branch \
-            --match-head-commit "$head_commit"
-          echo "url=$url" >> "$GITHUB_OUTPUT"
-          echo "Merged release-pin pull request: $url" >> "$GITHUB_STEP_SUMMARY"
+          expected_main_sha="$(git rev-parse refs/remotes/origin/main)"
+          git push origin HEAD:refs/heads/main \
+            "--force-with-lease=refs/heads/main:${expected_main_sha}"
+          echo "Published verified release pins directly to main." \
+            >> "$GITHUB_STEP_SUMMARY"
 
       - name: Verify main contains the requested pins
         run: |

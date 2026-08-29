@@ -133,8 +133,8 @@ fn release_pin_publication_keeps_its_recovery_and_integrity_guards() {
     assert!(RELEASE_WORKFLOW.contains("uses: ./.github/workflows/sync-release-pins.yml"));
     assert!(SYNC_WORKFLOW.contains("git merge-base --is-ancestor"));
     assert!(SYNC_WORKFLOW.contains("gh attestation verify"));
-    assert!(SYNC_WORKFLOW.contains("--force-with-lease="));
-    assert!(SYNC_WORKFLOW.contains("--match-head-commit"));
+    assert!(SYNC_WORKFLOW.contains("--force-with-lease=refs/heads/main:${expected_main_sha}"));
+    assert!(SYNC_WORKFLOW.contains("HEAD:refs/heads/main"));
     let staged = SYNC_WORKFLOW
         .split_once("          git add \\\n")
         .unwrap()
@@ -144,6 +144,8 @@ fn release_pin_publication_keeps_its_recovery_and_integrity_guards() {
         .0;
     assert!(!staged.contains(".github/workflows/"));
     assert!(!SYNC_WORKFLOW.contains("git push --force "));
+    assert!(!SYNC_WORKFLOW.contains("gh pr "));
+    assert!(!SYNC_WORKFLOW.contains("pull-requests: write"));
     assert!(!VERSHIP_CONFIG.contains("post-push"));
 }
 

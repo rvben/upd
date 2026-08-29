@@ -397,7 +397,6 @@ jobs:
     permissions:
       attestations: read
       contents: write
-      pull-requests: write
     uses: ./.github/workflows/sync-release-pins.yml
     with:
       version: ${{ needs.metadata.outputs.tag }}
