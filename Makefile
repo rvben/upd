@@ -9,12 +9,14 @@ release:
 	cargo build --release
 
 # Run all tests
+# Several registry tests intentionally exercise process-global credential and
+# index environment variables, so they must not race each other.
 test:
-	cargo test
+	cargo test -- --test-threads=1
 
 # Run tests with output
 test-verbose:
-	cargo test -- --nocapture
+	cargo test -- --nocapture --test-threads=1
 
 # Run clippy lints
 lint:
