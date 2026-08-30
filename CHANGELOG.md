@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.6](https://github.com/rvben/upd/compare/v0.8.5...v0.8.6) - 2026-08-30
+
+### Fixed
+
+- **automation**: clarify blocked dependency guidance ([771db8b](https://github.com/rvben/upd/commit/771db8b52068ef2e4c302c8e916f121fa30d98cb))
+- **actions**: pin self-hosted reusable workflows ([2f18db0](https://github.com/rvben/upd/commit/2f18db0ad2001c77b8b553c6abb55cf553162450))
+
 ## [0.8.5](https://github.com/rvben/upd/compare/v0.8.4...v0.8.5) - 2026-08-30
 
 ### Added
@@ -783,22 +790,3 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Async HTTP requests with `reqwest`
 - Concurrent dependency lookups
 - Release binary with LTO optimization
-
-[0.0.18]: https://github.com/rvben/upd/releases/tag/v0.0.18
-[0.0.17]: https://github.com/rvben/upd/releases/tag/v0.0.17
-[0.0.16]: https://github.com/rvben/upd/releases/tag/v0.0.16
-[0.0.15]: https://github.com/rvben/upd/releases/tag/v0.0.15
-[0.0.14]: https://github.com/rvben/upd/releases/tag/v0.0.14
-[0.0.13]: https://github.com/rvben/upd/releases/tag/v0.0.13
-[0.0.12]: https://github.com/rvben/upd/releases/tag/v0.0.12
-[0.0.11]: https://github.com/rvben/upd/releases/tag/v0.0.11
-[0.0.10]: https://github.com/rvben/upd/releases/tag/v0.0.10
-[0.0.9]: https://github.com/rvben/upd/releases/tag/v0.0.9
-[0.0.8]: https://github.com/rvben/upd/releases/tag/v0.0.8
-[0.0.7]: https://github.com/rvben/upd/releases/tag/v0.0.7
-[0.0.6]: https://github.com/rvben/upd/releases/tag/v0.0.6
-[0.0.5]: https://github.com/rvben/upd/releases/tag/v0.0.5
-[0.0.4]: https://github.com/rvben/upd/releases/tag/v0.0.4
-[0.0.3]: https://github.com/rvben/upd/releases/tag/v0.0.3
-[0.0.2]: https://github.com/rvben/upd/releases/tag/v0.0.2
-[0.0.1]: https://github.com/rvben/upd/releases/tag/v0.0.1
