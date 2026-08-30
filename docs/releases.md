@@ -23,11 +23,11 @@ The workflow validates that the tag matches the package version, builds and
 attests every platform archive, publishes crates.io, PyPI, and the GitHub
 release, and verifies the release artifacts. It then generates
 `release-pins.json` from the exact archive bytes and checksum sidecars. A
-version-specific pull request updates the manifest, GitLab component, and
-documentation together. GitHub workflows resolve their default binary from the
-manifest, so the release bot never needs permission to rewrite executable
-workflow files. The pull request is merged only after the generated tree passes
-`make check` and workflow validation.
+verified, force-with-lease-protected commit updates the manifest, GitLab
+component, and documentation together on `main`. GitHub workflows resolve their
+default binary from the manifest, so the release bot never needs permission to
+rewrite executable workflow files. The workflow publishes the commit only
+after the generated tree passes `make check` and workflow validation.
 
 ## Retry release-pin synchronization
 
@@ -35,8 +35,8 @@ Publishing and pin synchronization are separate recovery domains. If packages
 or release assets were published successfully but the pin job failed, do not
 create another release. Run **Synchronize release pins** manually with the
 existing `vX.Y.Z` tag. The job is idempotent, refuses downgrades, verifies that
-the tag is an ancestor of `main`, and safely updates its version-specific
-automation branch with force-with-lease.
+the tag is an ancestor of `main`, and safely updates `main` with
+force-with-lease.
 
 If the release failed before any release, artifact, package, checksum, or
 attestation became public, follow the repository's failed-release policy and
