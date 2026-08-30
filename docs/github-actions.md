@@ -304,9 +304,9 @@ digest together:
 
 ```yaml
 with:
-  upd-version: v0.8.5
+  upd-version: v0.8.6
   upd-target: x86_64-unknown-linux-gnu
-  upd-sha256: 667ebb6db8eda7f1ca645b76d526ca5c546e2081ef237ec4ba7ba53cb60630f8
+  upd-sha256: 3e53714fce8323a381d1ecc1452712639beda7d75000d95b94de1b54b1524e8e
 ```
 
 GitHub-hosted runner images are maintained over time rather than immutable. Use
