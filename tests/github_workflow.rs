@@ -553,6 +553,7 @@ fn github_presentation_explains_policy_holds_and_escapes_untrusted_text() {
     assert_eq!(presentation["counts"]["annotations"], 1);
     let body = fixture.body();
     assert!(body.contains("**A careful upgrade, with follow-up.**"));
+    assert!(body.contains("**1 needs attention**"));
     assert!(body.contains("Saved for a deliberate upgrade (2)"));
     assert!(body.contains("### Needs attention"));
     assert!(body.contains("bad&#124;pkg&lt;/code&gt;"));

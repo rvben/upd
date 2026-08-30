@@ -310,6 +310,7 @@ async fn gitlab_presentation_matches_the_contract_and_escapes_untrusted_text() {
     assert_eq!(presentation["counts"]["annotations"], 1);
     let description = fixture.description();
     assert!(description.contains("**A careful upgrade, with follow-up.**"));
+    assert!(description.contains("**1 needs attention**"));
     assert!(description.contains("Saved for a deliberate upgrade (2)"));
     assert!(description.contains("### Needs attention"));
     assert!(description.contains("bad&#124;pkg&lt;/code&gt;"));

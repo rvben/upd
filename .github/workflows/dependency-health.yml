@@ -824,7 +824,8 @@ jobs:
               (["\(.counts.updates) moved forward"]
                + (if .counts.updates_review_worthy > 0 then ["\(.counts.updates_review_worthy) worth a look"] else [] end)
                + (if .counts.updates_quiet > 0 then ["\(.counts.updates_quiet) quiet \(plural(.counts.updates_quiet; "patch"; "patches"))"] else [] end)
-               + (if .counts.policy_holds > 0 then ["\(.counts.policy_holds) saved for later"] else [] end))
+               + (if .counts.policy_holds > 0 then ["\(.counts.policy_holds) saved for later"] else [] end)
+               + (if .counts.blocked > 0 then ["\(.counts.blocked) \(plural(.counts.blocked; "needs"; "need")) attention"] else [] end))
               | map("**\(.)**") | join(" · ");
             def changes:
               (review_updates) as $review

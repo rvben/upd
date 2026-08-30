@@ -64,6 +64,18 @@ jobs:
       - uses: actions/checkout@11bd719 # v4.2.2
 ";
 
+/// A full pin whose trailing prose prevents upd from safely treating it as a
+/// release annotation. This is rejected before any registry lookup.
+const SHA_WITH_TRAILING_PROSE_WORKFLOW: &str = "\
+name: CI
+on: push
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: rvben/clispec@1111111111111111111111111111111111111111 # pinned by policy
+";
+
 /// Write `body` to `.github/workflows/ci.yml` under a fresh fixture directory.
 fn fixture(body: &str) -> TempDir {
     let dir = TempDir::new().unwrap();
@@ -221,6 +233,23 @@ fn sha_pins_are_checked_by_default() {
     let entry = only_skipped(&report);
     assert_eq!(entry["status"], "blocked", "report: {report:#}");
     assert_eq!(entry["reason"], "short-sha", "report: {report:#}");
+}
+
+#[test]
+fn blocked_sha_guidance_does_not_invent_a_release_version() {
+    let dir = fixture(SHA_WITH_TRAILING_PROSE_WORKFLOW);
+    let report = json_of(&run(&dir, &["--dry-run", "--no-cache", "--output", "json"]));
+
+    let entry = only_skipped(&report);
+    let message = entry["message"].as_str().expect("blocked pin has guidance");
+    assert!(
+        message.contains("the exact release tag for this commit"),
+        "guidance must tell the maintainer what evidence to add: {report:#}"
+    );
+    assert!(
+        !message.contains("v4.2.2"),
+        "guidance must not suggest another dependency's version: {report:#}"
+    );
 }
 
 /// `update_action_shas = false` in `.updrc.toml` turns the default off for the

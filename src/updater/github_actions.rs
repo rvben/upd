@@ -90,20 +90,21 @@ impl RecoveryFailure {
     }
 
     fn message(&self) -> String {
-        let remedy = "add a concrete version comment such as `# v4.2.2` to make this SHA pin safely updateable";
+        let annotate = "add the exact release tag for this commit as its version comment to make this SHA pin safely updateable";
+        let repin = "pin the action to a commit with a concrete release tag and add that exact tag as its version comment";
         match self {
             Self::Untagged => {
                 format!(
-                    "no tag names this commit, so the release it belongs to cannot be read back from the repository; {remedy}"
+                    "no tag names this commit, so the release it belongs to cannot be read back from the repository; {repin}"
                 )
             }
             Self::FloatingOnly(tags) => {
                 format!(
-                    "this commit is named only by {}, which cannot say which release it is; {remedy}",
+                    "this commit is named only by {}, which cannot say which release it is; {repin}",
                     tags.join(", ")
                 )
             }
-            Self::Unsupported | Self::Failed(_) => remedy.to_string(),
+            Self::Unsupported | Self::Failed(_) => annotate.to_string(),
         }
     }
 }
@@ -595,7 +596,7 @@ impl Updater for GithubActionsUpdater {
                             current: version_ref.to_string(),
                             status: SkipStatus::Blocked,
                             reason: "missing-version-comment",
-                            message: "replace the trailing text with a concrete version comment such as `# v4.2.2` to make this SHA pin safely updateable".to_string(),
+                            message: "replace the trailing text with the exact release tag for this commit as its version comment to make this SHA pin safely updateable".to_string(),
                             line_number: Some(line_idx + 1),
                         });
                         continue;
