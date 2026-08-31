@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.7](https://github.com/rvben/upd/compare/v0.8.6...v0.8.7) - 2026-08-31
+
+### Added
+
+- **actions**: make dependency PRs email-safe ([33275fd](https://github.com/rvben/upd/commit/33275fdaad1cac619ed1b6176a58834835c66662))
+
 ## [0.8.6](https://github.com/rvben/upd/compare/v0.8.5...v0.8.6) - 2026-08-30
 
 ### Fixed
