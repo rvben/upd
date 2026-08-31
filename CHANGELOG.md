@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.1](https://github.com/rvben/upd/compare/v0.9.0...v0.9.1) - 2026-08-31
+
 ### Added
 
 - **docker**: authenticate private GHCR tag lookups with repository-scoped GitHub Actions credentials
