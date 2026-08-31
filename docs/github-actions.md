@@ -472,24 +472,25 @@ number of updated dependencies. Set `pull-request-title` only when a repository
 needs a fixed override.
 
 The pull-request body is built from a bounded, provider-neutral presentation
-model. It leads with the prepared outcome and then shows:
+model and deliberately uses an email-safe subset of Markdown. The same compact
+summary remains legible in GitHub and in GitHub notification email. It shows:
 
-- non-patch updates that deserve attention before quiet patch maintenance;
-- exact versions and changed files;
-- the freshness cooldown, bump ceiling, and lockfile policy used for selection;
+- the update count and major/minor/patch mix;
+- up to three non-patch updates that deserve attention, with exact versions;
+- counts for releases held by policy and dependencies upd could not change
+  safely;
 - repository-validation and proposal-integrity results;
-- releases saved for a deliberate upgrade, separately from dependencies upd
-  could not change safely;
-- complete proof and provenance behind progressive disclosure; and
 - auto-merge intent without claiming the pull request is ready to merge before
-  repository checks complete.
+  repository checks complete; and
+- one link to download the workflow artifact containing the complete update
+  report and presentation model.
 
 Untrusted registry and manifest text is stripped of control characters and
-escaped before rendering. Tables and detail sections have row and text budgets;
-the complete update report and presentation JSON remain available in the
-workflow artifact when the human-facing body is truncated. GitHub rendering uses
-native alert blocks, while the GitLab template renders the same contract using
-GitLab-compatible Markdown.
+escaped before rendering. The body avoids tables and disclosure sections so it
+does not turn into an unreadable notification. The complete update report and
+presentation JSON remain available in the workflow artifact for seven days.
+The GitLab template continues to render the same provider-neutral presentation
+model with GitLab-compatible Markdown.
 
 ## Auto-merge
 

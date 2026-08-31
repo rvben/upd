@@ -300,6 +300,7 @@ esac
             .env("CHANGED", changed.to_string())
             .env("EXPECTED_REMOTE_SHA", expected_remote_sha)
             .env("GH_STATE_DIR", &self.state)
+            .env("GITHUB_REPOSITORY", "rvben/yamldap")
             .env("GITHUB_OUTPUT", output_file)
             .env("GITHUB_STEP_SUMMARY", summary_file)
             .env("GH_TOKEN", "test-publication-token")
@@ -308,6 +309,10 @@ esac
             .env("PATH", path)
             .env("PRESENTATION", presentation)
             .env("PR_TITLE", "")
+            .env(
+                "REPORT_URL",
+                "https://github.example.test/rvben/yamldap/actions/runs/4242/artifacts/73",
+            )
             .env("RUNNER_TEMP", &self.runner_temp)
             .output()
             .expect("publish script starts");
@@ -488,17 +493,14 @@ fn workflow_creates_a_single_commit_rolling_pull_request() {
     assert_eq!(fixture.presentation()["schema"], 1);
     assert_eq!(fixture.presentation()["state"], "ready");
     let body = fixture.body();
-    assert!(body.contains("**A tidy upgrade, already prepared.**"));
+    assert!(body.contains("## 1 dependency update is ready for review"));
     assert!(body.contains("84109eaf36c739dc11af0452c6218abb7e47a8e3/assets/logo-wide.svg"));
-    assert!(body.contains("**1 moved forward** · **1 worth a look**"));
-    assert!(body.contains("### Worth a look"));
-    assert!(body.contains("### Why this is a comfortable review"));
-    assert!(body.contains("<summary><strong>Proof and provenance</strong></summary>"));
-    assert!(body.contains("<code>example</code>"));
-    assert!(body.contains("<code>1.0.0</code>"));
-    assert!(body.contains("<code>1.1.0</code>"));
-    assert!(body.contains("Freshness <code>7d</code>"));
-    assert!(body.contains("maximum bump <code>minor</code>"));
+    assert!(body.contains("**1 minor · no patches · no majors**"));
+    assert!(body.contains("### Worth your attention"));
+    assert!(body.contains("<code>example 1.0.0 → 1.1.0</code>"));
+    assert!(body.contains("**Validation passed.**"));
+    assert!(body.contains("[Open the complete update report →]"));
+    assert!(!body.contains("<details>"));
     assert!(body.len() <= 32 * 1024);
 }
 
@@ -516,10 +518,10 @@ fn github_presentation_keeps_unvalidated_patch_updates_truthful() {
     let body = fixture.body();
     assert!(body.contains("### What changed"));
     assert!(!body.contains("### Worth a look"));
-    assert!(!body.contains("Quiet patch updates"));
-    assert!(body.contains("### What upd verified"));
-    assert!(body.contains("No repository-specific command was configured"));
-    assert!(!body.contains("### Why this is a comfortable review"));
+    assert!(body.contains(
+        "**Proposal integrity passed.** No repository-specific validation command was configured."
+    ));
+    assert!(!body.contains("<details>"));
 }
 
 #[test]
@@ -552,16 +554,13 @@ fn github_presentation_explains_policy_holds_and_escapes_untrusted_text() {
     assert_eq!(presentation["counts"]["blocked"], 1);
     assert_eq!(presentation["counts"]["annotations"], 1);
     let body = fixture.body();
-    assert!(body.contains("**A careful upgrade, with follow-up.**"));
-    assert!(body.contains("**1 needs attention**"));
-    assert!(body.contains("Saved for a deliberate upgrade (2)"));
-    assert!(body.contains("### Needs attention"));
+    assert!(body.contains("2 additional updates remain held by repository policy."));
+    assert!(body.contains("**Needs attention:** 1 dependency could not be changed safely."));
     assert!(body.contains("bad&#124;pkg&lt;/code&gt;"));
-    assert!(body.contains("blocked&lt;script&gt;"));
-    assert!(body.contains("&#42;trusted&#42;"));
     assert!(!body.contains("<script>"));
     assert!(!body.contains("*trusted*"));
     assert!(!body.contains('\u{202e}'));
+    assert!(!body.contains("<details>"));
     assert!(body.len() <= 32 * 1024);
 }
 
@@ -612,15 +611,13 @@ fn github_presentation_stays_within_the_review_budget_for_large_updates() {
 
     let body = fixture.body();
     assert!(body.len() <= 32 * 1024, "body was {} bytes", body.len());
-    assert!(body.contains("**A careful upgrade, with follow-up.**"));
-    assert!(
-        body.contains("Saved for a deliberate upgrade: 40"),
-        "unexpected large-update body:\n{body}"
-    );
-    assert!(body.contains("Needs attention: 30"));
-    assert!(body.contains("Major-version jumps: 0"));
-    assert!(body.contains("repository validation and proposal integrity passed"));
-    assert!(!body.contains("**A tidy upgrade, already prepared.**"));
+    assert!(body.contains("## 80 dependency updates are ready for review"));
+    assert!(body.contains("**40 minor · 40 patches · no majors**"));
+    assert!(body.contains("40 additional updates remain held by repository policy."));
+    assert!(body.contains("**Needs attention:** 30 dependencies could not be changed safely."));
+    assert!(body.contains("and 37 more review-worthy updates"));
+    assert!(body.contains("**Validation passed.**"));
+    assert!(!body.contains("<details>"));
     assert!(
         fixture
             .log()
@@ -652,10 +649,13 @@ fn normal_update_presentation_contract_is_shared_across_providers() {
             assert!(source.contains(field), "missing presentation field {field}");
         }
         assert!(source.contains("\\($title_prefix): refresh \\(.counts.updates) dependencies"));
-        assert!(source.contains("wc -c"));
-        assert!(source.contains("32768"));
     }
-    assert!(WORKFLOW.contains("> [!IMPORTANT]"));
+    assert!(WORKFLOW.contains("[Open the complete update report →]"));
+    assert!(WORKFLOW.contains("steps.report.outputs.artifact-url"));
+    assert!(WORKFLOW.contains("REPORT_URL"));
+    assert!(!WORKFLOW.contains("| Dependency | Before | After"));
+    assert!(GITLAB_TEMPLATE.contains("wc -c"));
+    assert!(GITLAB_TEMPLATE.contains("32768"));
     assert!(!GITLAB_TEMPLATE.contains("> [!IMPORTANT]"));
 }
 
@@ -681,15 +681,83 @@ fn github_presentation_prioritizes_review_worthy_updates() {
     assert_eq!(presentation["counts"]["updates_review_worthy"], 2);
     assert_eq!(presentation["counts"]["updates_quiet"], 2);
     let body = fixture.body();
+    assert!(body.contains("**1 minor · 2 patches · 1 major**"));
+    assert!(body.contains("1 additional update remains held by repository policy."));
+    let worth = body.find("### Worth your attention").unwrap();
+    let review_one = body.find("<code>review-one 1.0.0 → 1.1.0</code>").unwrap();
+    let review_two = body.find("<code>review-two 3.0.0 → 4.0.0</code>").unwrap();
+    assert!(worth < review_one && review_one < review_two);
+    assert!(!body.contains("<code>quiet-one "));
+    assert!(!body.contains("<details>"));
+}
+
+#[test]
+fn github_presentation_is_a_compact_email_safe_summary_with_an_evidence_link() {
+    let fixture = Fixture::new();
+    let updates = [
+        ("tokio", "1.40.0", "1.53.0", "minor"),
+        ("tempfile", "3.10.0", "3.27.0", "minor"),
+        ("clap", "4.5.0", "4.6.0", "minor"),
+        ("zeta", "1.0.200", "1.1.0", "minor"),
+        ("zstd", "0.1.40", "0.2.0", "minor"),
+        ("zulu", "2.5.0", "2.6.0", "minor"),
+        ("anyhow", "1.0.80", "1.0.81", "patch"),
+    ]
+    .into_iter()
+    .map(|(package, current, latest, bump)| {
+        serde_json::json!({
+            "package": package,
+            "current": current,
+            "latest": latest,
+            "bump": bump,
+        })
+    })
+    .collect::<Vec<_>>();
+    let held = (0..12)
+        .map(|index| {
+            serde_json::json!({
+                "package": format!("held-{index}"),
+                "current": "1.0.0",
+                "chosen": "1.0.1",
+                "skipped_latest": "2.0.0",
+            })
+        })
+        .collect::<Vec<_>>();
+    let report = serde_json::json!({
+        "files": [{
+            "path": "dependency.txt",
+            "updates": updates,
+            "held_back": held,
+        }],
+        "summary": {
+            "updates_total": 7,
+            "files_with_changes": 1,
+            "warnings": 0,
+        },
+    });
+
+    fixture.run_publish_with_report(true, "new", false, &report.to_string());
+
+    let body = fixture.body();
+    assert!(body.contains("## 7 dependency updates are ready for review"));
+    assert!(
+        body.contains("`rvben/yamldap` · Prepared from the latest `main` · Auto-merge is off.")
+    );
+    assert!(body.contains("**6 minor · 1 patch · no majors**"));
+    assert!(body.contains("12 additional updates remain held by repository policy."));
+    assert!(body.contains("### Worth your attention"));
+    assert!(body.contains("<code>tokio 1.40.0 → 1.53.0</code>"));
+    assert!(body.contains("<code>tempfile 3.10.0 → 3.27.0</code>"));
+    assert!(body.contains("<code>clap 4.5.0 → 4.6.0</code>"));
+    assert!(body.contains("and 3 more review-worthy updates"));
     assert!(body.contains(
-        "**4 moved forward** · **2 worth a look** · **2 quiet patches** · **1 saved for later**"
+        "**Validation passed.** Repository checks and proposal-integrity verification completed successfully."
     ));
-    let worth = body.find("### Worth a look").unwrap();
-    let review_one = body.find("<code>review-one</code>").unwrap();
-    let quiet = body.find("Quiet patch updates (2)").unwrap();
-    let quiet_one = body.find("<code>quiet-one</code>").unwrap();
-    assert!(worth < review_one && review_one < quiet && quiet < quiet_one);
-    assert!(body.contains("Includes 1 major-version jump."));
+    assert!(body.contains(
+        "[Open the complete update report →](https://github.example.test/rvben/yamldap/actions/runs/4242/artifacts/73)"
+    ));
+    assert!(!body.contains("| Dependency |"));
+    assert!(!body.contains("<details>"));
 }
 
 #[test]
