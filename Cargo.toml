@@ -34,36 +34,36 @@ path = "src/bin/upd-cli.rs"
 
 [dependencies]
 # CLI
-clap = { version = "4.6.1", features = ["derive"] }
+clap = { version = "4.6.6", features = ["derive"] }
 
 # Async runtime + HTTP
-tokio = { version = "1.52.3", features = ["full"] }
+tokio = { version = "1.53.1", features = ["full"] }
 reqwest = { version = "0.13.4", default-features = false, features = ["json", "gzip", "native-tls-vendored"] }
 
 # Serialization
-serde = { version = "1.0.228", features = ["derive"] }
-serde_json = "1.0.150"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
 toml = "1.1"
-toml_edit = "0.25.12"
+toml_edit = "0.25.13+spec-1.1.0"
 
 # Version parsing
 pep440_rs = "0.7.3"
 semver = "1.0.28"
 
 # File handling
-ignore = "0.4.26"
-globset = "0.4.18"
+ignore = "0.4.33"
+globset = "0.4.20"
 directories = "6.0.0"
 
 # Error handling
-anyhow = "1.0.102"
-thiserror = "2.0.18"
+anyhow = "1.0.104"
+thiserror = "2.0.20"
 
 # Misc
-regex = "1.12.4"
+regex = "1.13.1"
 colored = "3.1.1"
-async-trait = "0.1.89"
-futures = "0.3.32"
+async-trait = "0.1.92"
+futures = "0.3.34"
 url = "2.5"
 chrono = { version = "0.4", default-features = false, features = ["serde", "clock"] }
 
