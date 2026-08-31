@@ -482,13 +482,16 @@ summary remains legible in GitHub and in GitHub notification email. It shows:
 - repository-validation and proposal-integrity results;
 - auto-merge intent without claiming the pull request is ready to merge before
   repository checks complete; and
-- one link to download the workflow artifact containing the complete update
-  report and presentation model.
+- one link to a complete, human-readable report rendered on the GitHub workflow
+  run summary.
 
 Untrusted registry and manifest text is stripped of control characters and
 escaped before rendering. The body avoids tables and disclosure sections so it
-does not turn into an unreadable notification. The complete update report and
-presentation JSON remain available in the workflow artifact for seven days.
+does not turn into an unreadable notification. The rendered report lists every
+applied update, policy hold, blocked item, changed file, and validation result.
+Its final section labels the separate ZIP download explicitly as a
+machine-readable JSON archive. The report and presentation JSON remain
+available in that workflow artifact for seven days.
 The GitLab template continues to render the same provider-neutral presentation
 model with GitLab-compatible Markdown.
 

@@ -283,6 +283,27 @@ esac
             String::from_utf8_lossy(&presentation_output.stderr)
         );
 
+        let summary_output = Command::new("bash")
+            .arg("-c")
+            .arg(workflow_script("Publish dependency summary"))
+            .current_dir(&self.checkout)
+            .env(
+                "ARTIFACT_URL",
+                "https://github.example.test/rvben/yamldap/actions/runs/4242/artifacts/73",
+            )
+            .env("FAIL_ON_BLOCKED", "false")
+            .env("GITHUB_STEP_SUMMARY", &summary_file)
+            .env("PRESENTATION", &presentation)
+            .env("REPORT", &report)
+            .output()
+            .expect("summary script starts");
+        assert!(
+            summary_output.status.success(),
+            "summary failed\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&summary_output.stdout),
+            String::from_utf8_lossy(&summary_output.stderr)
+        );
+
         if changed {
             git(
                 &self.checkout,
@@ -311,7 +332,7 @@ esac
             .env("PR_TITLE", "")
             .env(
                 "REPORT_URL",
-                "https://github.example.test/rvben/yamldap/actions/runs/4242/artifacts/73",
+                "https://github.example.test/rvben/yamldap/actions/runs/4242",
             )
             .env("RUNNER_TEMP", &self.runner_temp)
             .output()
@@ -374,6 +395,10 @@ esac
 
     fn body(&self) -> String {
         fs::read_to_string(self.runner_temp.join("upd-pr-description.md")).unwrap()
+    }
+
+    fn summary(&self) -> String {
+        fs::read_to_string(self.runner_temp.join("github-summary")).unwrap()
     }
 }
 
@@ -499,7 +524,7 @@ fn workflow_creates_a_single_commit_rolling_pull_request() {
     assert!(body.contains("### Worth your attention"));
     assert!(body.contains("<code>example 1.0.0 → 1.1.0</code>"));
     assert!(body.contains("**Validation passed.**"));
-    assert!(body.contains("[Open the complete update report →]"));
+    assert!(body.contains("[View the full update report →]"));
     assert!(!body.contains("<details>"));
     assert!(body.len() <= 32 * 1024);
 }
@@ -562,6 +587,12 @@ fn github_presentation_explains_policy_holds_and_escapes_untrusted_text() {
     assert!(!body.contains('\u{202e}'));
     assert!(!body.contains("<details>"));
     assert!(body.len() <= 32 * 1024);
+
+    let summary = fixture.summary();
+    assert!(summary.contains("bad&#124;pkg&lt;/code&gt;"));
+    assert!(!summary.contains("<script>"));
+    assert!(!summary.contains("*trusted*"));
+    assert!(!summary.contains('\u{202e}'));
 }
 
 #[test]
@@ -650,7 +681,7 @@ fn normal_update_presentation_contract_is_shared_across_providers() {
         }
         assert!(source.contains("\\($title_prefix): refresh \\(.counts.updates) dependencies"));
     }
-    assert!(WORKFLOW.contains("[Open the complete update report →]"));
+    assert!(WORKFLOW.contains("[View the full update report →]"));
     assert!(WORKFLOW.contains("steps.report.outputs.artifact-url"));
     assert!(WORKFLOW.contains("REPORT_URL"));
     assert!(!WORKFLOW.contains("| Dependency | Before | After"));
@@ -754,10 +785,23 @@ fn github_presentation_is_a_compact_email_safe_summary_with_an_evidence_link() {
         "**Validation passed.** Repository checks and proposal-integrity verification completed successfully."
     ));
     assert!(body.contains(
-        "[Open the complete update report →](https://github.example.test/rvben/yamldap/actions/runs/4242/artifacts/73)"
+        "[View the full update report →](https://github.example.test/rvben/yamldap/actions/runs/4242)"
     ));
     assert!(!body.contains("| Dependency |"));
     assert!(!body.contains("<details>"));
+
+    let summary = fixture.summary();
+    assert!(summary.contains("## upd dependency report"));
+    assert!(summary.contains("### Applied updates (7)"));
+    assert!(summary.contains("<code>tokio</code>"));
+    assert!(summary.contains("<code>anyhow</code>"));
+    assert!(summary.contains("### Held by repository policy (12)"));
+    assert!(summary.contains("<code>held-11</code>"));
+    assert!(summary.contains("### Validation"));
+    assert!(summary.contains("Repository validation passed"));
+    assert!(summary.contains(
+        "[Download machine-readable JSON archive](https://github.example.test/rvben/yamldap/actions/runs/4242/artifacts/73)"
+    ));
 }
 
 #[test]

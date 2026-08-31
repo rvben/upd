@@ -113,7 +113,7 @@ jobs:
     outputs:
       changed: ${{ steps.update.outputs.changed }}
       base-sha: ${{ steps.branch.outputs.base-sha }}
-      report-url: ${{ steps.report.outputs.artifact-url }}
+      report-url: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
     env:
       BASE_BRANCH: ${{ github.event.repository.default_branch }}
     steps:
@@ -493,32 +493,6 @@ jobs:
             sha256sum upd-proposal.bundle > upd-proposal.bundle.sha256
           )
 
-      - name: Publish dependency summary
-        env:
-          FAIL_ON_BLOCKED: ${{ inputs.fail-on-blocked }}
-          PRESENTATION: ${{ runner.temp }}/upd-presentation.json
-          REPORT: ${{ runner.temp }}/upd-report.json
-        run: |
-          set -euo pipefail
-          {
-            echo "## upd dependency health"
-            echo
-            jq --raw-output '
-              "- Applied updates: \(.counts.updates)\n" +
-              "- Files changed: \(.counts.files_changed)\n" +
-              "- Held back by policy: \(.counts.policy_holds)\n" +
-              "- Blocked or unfixable: \(.counts.blocked)\n" +
-              "- Not examined: \(.counts.not_examined)\n" +
-              "- Warnings: \(.counts.warnings)"
-            ' "$PRESENTATION"
-          } >> "$GITHUB_STEP_SUMMARY"
-
-          blocked="$(jq --raw-output '.summary.skipped // 0' "$REPORT")"
-          if [[ "$FAIL_ON_BLOCKED" == true && "$blocked" -gt 0 ]]; then
-            echo "Blocked updates require attention" >&2
-            exit 1
-          fi
-
       - name: Retain machine-readable report
         id: report
         if: always()
@@ -530,6 +504,107 @@ jobs:
             ${{ runner.temp }}/upd-presentation.json
           if-no-files-found: error
           retention-days: 7
+
+      - name: Publish dependency summary
+        env:
+          ARTIFACT_URL: ${{ steps.report.outputs.artifact-url }}
+          FAIL_ON_BLOCKED: ${{ inputs.fail-on-blocked }}
+          PRESENTATION: ${{ runner.temp }}/upd-presentation.json
+          REPORT: ${{ runner.temp }}/upd-report.json
+        run: |
+          set -euo pipefail
+          jq --raw-output --arg artifact_url "$ARTIFACT_URL" '
+            def html:
+              tostring | @html
+              | gsub("`"; "&#96;") | gsub("\\*"; "&#42;") | gsub("_"; "&#95;")
+              | gsub("\\["; "&#91;") | gsub("\\]"; "&#93;") | gsub("\\|"; "&#124;")
+              | gsub("\\\\"; "&#92;");
+            def code: "<code>\(. | html)</code>";
+            def plural($count; $one; $many): if $count == 1 then $one else $many end;
+            def overview:
+              if .state == "ready" then
+                "**Ready for review.** \(.counts.updates) \(plural(.counts.updates; "update"; "updates")) across " +
+                "\(.counts.files_changed) changed \(plural(.counts.files_changed; "file"; "files")); " +
+                "\(.counts.policy_holds) held by policy and \(.counts.blocked) blocked."
+              elif .state == "blocked_no_change" then
+                "**Needs attention.** No proposal was created; \(.counts.blocked) " +
+                "\(plural(.counts.blocked; "dependency was"; "dependencies were")) blocked."
+              else
+                "**No update proposal was needed.** Repository dependencies are within the configured policy."
+              end;
+            def update_section:
+              if (.updates | length) == 0 then ""
+              else
+                "\n\n### Applied updates (\(.updates | length))\n\n" +
+                "| Dependency | Change | Kind | Source |\n" +
+                "| --- | --- | --- | --- |\n" +
+                (.updates | map(
+                  "| \(.package | code) | \((.current + " → " + .latest) | code) | " +
+                  "\(.bump | html) | \(.path | code) |"
+                ) | join("\n"))
+              end;
+            def annotation_section:
+              if (.annotations | length) == 0 then ""
+              else
+                "\n\n### Metadata annotations (\(.annotations | length))\n\n" +
+                "| Dependency | Version | Source |\n" +
+                "| --- | --- | --- |\n" +
+                (.annotations | map(
+                  "| \(.package | code) | \(.version | code) | \(.path | code) |"
+                ) | join("\n"))
+              end;
+            def hold_section:
+              if (.policy_holds | length) == 0 then ""
+              else
+                "\n\n### Held by repository policy (\(.policy_holds | length))\n\n" +
+                "| Dependency | Selected | Available | Policy | Source |\n" +
+                "| --- | --- | --- | --- | --- |\n" +
+                (.policy_holds | map(
+                  "| \(.package | code) | \(.selected | code) | \(.available | code) | " +
+                  "\(.kind | html) | \(.path | code) |"
+                ) | join("\n"))
+              end;
+            def blocked_section:
+              if (.blocked | length) == 0 then ""
+              else
+                "\n\n### Could not update safely (\(.blocked | length))\n\n" +
+                "| Dependency | Current | Reason | Source |\n" +
+                "| --- | --- | --- | --- |\n" +
+                (.blocked | map(
+                  "| \(.package | code) | \(.current | code) | \(.reason | html) | \(.path | code) |"
+                ) | join("\n"))
+              end;
+            def changed_files_section:
+              if (.changed_paths | length) == 0 then ""
+              else
+                "\n\n### Changed files (\(.changed_paths | length))\n\n" +
+                (.changed_paths | map("- \(. | code)") | join("\n"))
+              end;
+            def validation_section:
+              "\n\n### Validation\n\n" +
+              (if .validation.repository_command_configured then
+                 "- **Repository validation passed.** The configured command completed successfully."
+               else
+                 "- **Repository validation was not configured.**"
+               end) +
+              "\n- **Proposal integrity passed.** Validation did not mutate the prepared change.";
+            def policy_section:
+              "\n\n### Applied policy\n\n" +
+              "- Minimum release age: \(.policy.min_age | code)\n" +
+              "- Maximum version bump: \(.policy.max_bump | code)\n" +
+              "- Lockfile regeneration: \(if .policy.lockfile_regeneration then "enabled" else "disabled" end)";
+            "## upd dependency report\n\n" + overview +
+            update_section + annotation_section + hold_section + blocked_section +
+            changed_files_section + validation_section + policy_section +
+            "\n\n### Machine-readable evidence\n\n" +
+            "[Download machine-readable JSON archive](\($artifact_url)) · retained for 7 days"
+          ' "$PRESENTATION" >> "$GITHUB_STEP_SUMMARY"
+
+          blocked="$(jq --raw-output '.summary.skipped // 0' "$REPORT")"
+          if [[ "$FAIL_ON_BLOCKED" == true && "$blocked" -gt 0 ]]; then
+            echo "Blocked updates require attention" >&2
+            exit 1
+          fi
 
       - name: Transfer validated proposal to isolated publisher
         if: steps.update.outputs.changed == 'true'
@@ -851,7 +926,7 @@ jobs:
             "\n\n`\($repository)` · Prepared from the latest `\($base_branch)` · \(merge_intent)" +
             "\n\n" + summary + policy_note + attention +
             "\n\n" + validation +
-            "\n\n[Open the complete update report →](\($report_url))"
+            "\n\n[View the full update report →](\($report_url))"
           ' "$PRESENTATION" > "$body_file"
 
           if [[ "$(jq 'length' <<< "$pr_list")" -eq 0 ]]; then
