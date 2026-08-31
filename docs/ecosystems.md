@@ -52,6 +52,29 @@ An explicitly passed file path bypasses discovery entirely, which is how
   up to date when the range admits the newest release, a warning when the
   release has outgrown it, an error when the notation cannot be read
 
+## Docker / OCI images
+
+- `Dockerfile` and `Dockerfile.*` (`FROM` references, including multi-stage files)
+- `compose.yml`, `compose.yaml`, `docker-compose.yml`, `docker-compose.yaml`, and
+  their named variants such as `compose.production.yml`
+- Updates numeric tag channels while preserving their shape and suffix:
+  `alpine:3.22` can move to `3.23`, and `rust:1.90-alpine` stays on the
+  `*-alpine` channel
+- Supports Docker Hub shorthand, explicit registries and ports, quoted Compose
+  values, and defaults such as `${APP_IMAGE:-ghcr.io/acme/app:1.2.3}`
+- Queries Docker Hub and public OCI Distribution-compatible registries. Anonymous
+  bearer-token challenges are handled automatically, and Docker Hub lookups fall
+  back to its OCI registry when the richer tag endpoint is unavailable
+- Reports floating tags such as `latest`, runtime-only variables, and digest
+  pins explicitly instead of guessing or claiming they are current
+- Preserves comments, quoting, line endings, and every byte outside the tag
+
+Docker image tags are mutable registry labels, not package releases. `upd`
+therefore follows the exact numeric channel already chosen in the file and does
+not cross between suffixes, precision levels, or `v`-prefixed and unprefixed
+tags. Updating `tag@sha256:digest` safely also requires resolving and verifying
+the replacement manifest digest, so digest pins are blocked in this release.
+
 ## Terraform / OpenTofu
 
 - `.tf` files (HCL format)

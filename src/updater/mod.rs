@@ -1,6 +1,7 @@
 mod annotated;
 mod cargo_toml;
 mod csproj;
+mod docker;
 mod gemfile;
 mod github_actions;
 mod go_mod;
@@ -14,6 +15,7 @@ mod terraform;
 pub use annotated::{AnnotatedUpdater, ParseWarnings, RegistrySet, selection_reaches_annotations};
 pub use cargo_toml::CargoTomlUpdater;
 pub use csproj::CsprojUpdater;
+pub use docker::DockerUpdater;
 pub use gemfile::GemfileUpdater;
 pub use github_actions::GithubActionsUpdater;
 pub use go_mod::GoModUpdater;
@@ -893,6 +895,7 @@ pub enum Lang {
     PreCommit,
     Mise,
     Terraform,
+    Docker,
     GithubReleases,
     Annotated,
 }
@@ -911,6 +914,7 @@ impl Lang {
             Lang::PreCommit => "pre_commit",
             Lang::Mise => "mise",
             Lang::Terraform => "terraform",
+            Lang::Docker => "docker",
             Lang::GithubReleases => "github_releases",
             Lang::Annotated => "annotated",
         }
@@ -932,6 +936,8 @@ pub enum FileType {
     MiseToml,
     ToolVersions,
     TerraformTf,
+    Dockerfile,
+    DockerCompose,
     /// A file whose dependencies declare their own ecosystem in a trailing
     /// comment. Unlike every other variant, the file name does not decide the
     /// registry; each annotated line does.
@@ -952,6 +958,7 @@ impl FileType {
             FileType::PreCommitConfig => Lang::PreCommit,
             FileType::MiseToml | FileType::ToolVersions => Lang::Mise,
             FileType::TerraformTf => Lang::Terraform,
+            FileType::Dockerfile | FileType::DockerCompose => Lang::Docker,
             FileType::Annotated => Lang::Annotated,
         }
     }
@@ -987,6 +994,8 @@ impl FileType {
             FileType::MiseToml => "mise_toml",
             FileType::ToolVersions => "tool_versions",
             FileType::TerraformTf => "terraform_tf",
+            FileType::Dockerfile => "dockerfile",
+            FileType::DockerCompose => "docker_compose",
             FileType::Annotated => "annotated",
         }
     }
@@ -1009,6 +1018,7 @@ pub fn ecosystem_key(file_type: FileType) -> Option<&'static str> {
         | FileType::ToolVersions => "github-releases",
         FileType::Csproj => "nuget",
         FileType::TerraformTf => "terraform",
+        FileType::Dockerfile | FileType::DockerCompose => "docker",
         // An annotated file has no ecosystem of its own. Every entry carries
         // its own, which is what `UpdateResult::entry_ecosystem` is for.
         FileType::Annotated => return None,
@@ -1065,6 +1075,22 @@ impl FileType {
 
         if file_name == ".tool-versions" {
             return Some(FileType::ToolVersions);
+        }
+
+        if file_name == "Dockerfile" || file_name.starts_with("Dockerfile.") {
+            return Some(FileType::Dockerfile);
+        }
+
+        if matches!(
+            file_name.to_ascii_lowercase().as_str(),
+            "compose.yml" | "compose.yaml" | "docker-compose.yml" | "docker-compose.yaml"
+        ) || ((file_name.to_ascii_lowercase().starts_with("compose.")
+            || file_name
+                .to_ascii_lowercase()
+                .starts_with("docker-compose."))
+            && (file_name.ends_with(".yml") || file_name.ends_with(".yaml")))
+        {
+            return Some(FileType::DockerCompose);
         }
 
         // GitHub Actions workflows: *.yml or *.yaml inside .github/workflows/
@@ -1124,9 +1150,8 @@ impl FileType {
     }
 
     /// File names a directory walk opens looking for version annotations.
-    /// Deliberately small, and in v1 the only set: no Markdown (it would
-    /// rewrite this project's own README and every fixture in this repo), no
-    /// `Dockerfile*` (those names are reserved for Docker support), no YAML.
+    /// Deliberately small: no Markdown (it would rewrite this project's own
+    /// README and every fixture in this repo) and no arbitrary YAML.
     const ANNOTATED_FILE_NAMES: &'static [&'static str] = &[
         "Makefile",
         "makefile",
@@ -1969,6 +1994,7 @@ mod tests {
         use clap::ValueEnum;
         assert_eq!(Lang::GithubReleases.as_str(), "github_releases");
         assert_eq!(Lang::Annotated.as_str(), "annotated");
+        assert_eq!(Lang::Docker.as_str(), "docker");
         assert_eq!(
             Lang::GithubReleases.to_possible_value().unwrap().get_name(),
             "github-releases"
@@ -2003,18 +2029,12 @@ mod tests {
         }
     }
 
-    /// The negative control for the set above. `Dockerfile` is reserved for
-    /// Docker support and Markdown would rewrite this project's own README, so
-    /// neither is in the set.
+    /// The negative control for the annotated set. Docker files are claimed by
+    /// the dedicated Docker updater; Markdown and other arbitrary files remain
+    /// outside discovery.
     #[test]
     fn detect_with_annotated_leaves_unlisted_names_alone() {
-        for name in [
-            "README.md",
-            "Dockerfile",
-            "Dockerfile.ci",
-            "notes.txt",
-            "build.zsh",
-        ] {
+        for name in ["README.md", "notes.txt", "build.zsh"] {
             let path = PathBuf::from("/repo").join(name);
             assert_eq!(
                 FileType::detect_with_annotated(&path, false),
@@ -2022,6 +2042,14 @@ mod tests {
                 "{name} must not be claimed by a walk"
             );
         }
+        assert_eq!(
+            FileType::detect_with_annotated(Path::new("/repo/Dockerfile"), false),
+            Some(FileType::Dockerfile)
+        );
+        assert_eq!(
+            FileType::detect_with_annotated(Path::new("/repo/Dockerfile.ci"), false),
+            Some(FileType::Dockerfile)
+        );
     }
 
     /// An earlier rule always wins, which holds by construction because
@@ -2135,12 +2163,9 @@ mod tests {
                 .any(|(p, ft)| p.file_name().unwrap() == "Makefile" && *ft == FileType::Annotated),
             "{found:?}"
         );
-        assert!(
-            !found
-                .iter()
-                .any(|(p, _)| p.file_name().unwrap() == "Dockerfile"),
-            "Dockerfile is reserved for the Docker design: {found:?}"
-        );
+        assert!(found.iter().any(|(p, ft)| {
+            p.file_name().unwrap() == "Dockerfile" && *ft == FileType::Dockerfile
+        }));
     }
 
     #[test]
@@ -2343,6 +2368,7 @@ mod tests {
             Lang::PreCommit,
             Lang::Mise,
             Lang::Terraform,
+            Lang::Docker,
         ];
         let mut seen = std::collections::HashSet::new();
         for lang in variants {
@@ -2555,6 +2581,8 @@ mod tests {
         assert_eq!(FileType::PreCommitConfig.lang(), Lang::PreCommit);
         assert_eq!(FileType::MiseToml.lang(), Lang::Mise);
         assert_eq!(FileType::ToolVersions.lang(), Lang::Mise);
+        assert_eq!(FileType::Dockerfile.lang(), Lang::Docker);
+        assert_eq!(FileType::DockerCompose.lang(), Lang::Docker);
     }
 
     #[test]
@@ -3019,7 +3047,7 @@ mod tests {
         );
         let discovered: std::collections::HashMap<_, _> = files.into_iter().collect();
 
-        assert_eq!(discovered.get(&compose), Some(&FileType::Annotated));
+        assert_eq!(discovered.get(&compose), Some(&FileType::DockerCompose));
         assert_eq!(discovered.get(&gitlab), Some(&FileType::Annotated));
     }
 
@@ -3193,6 +3221,8 @@ mod tests {
         FileType::MiseToml,
         FileType::ToolVersions,
         FileType::TerraformTf,
+        FileType::Dockerfile,
+        FileType::DockerCompose,
         FileType::Annotated,
     ];
 
@@ -3212,6 +3242,8 @@ mod tests {
                 | FileType::MiseToml
                 | FileType::ToolVersions
                 | FileType::TerraformTf
+                | FileType::Dockerfile
+                | FileType::DockerCompose
                 | FileType::Annotated => {}
             }
         }

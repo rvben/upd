@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **docker**: update numeric image tags in Dockerfiles and Compose files through Docker Hub and public OCI registries
+
 ## [0.8.8](https://github.com/rvben/upd/compare/v0.8.7...v0.8.8) - 2026-08-31
 
 ### Fixed

@@ -32,16 +32,16 @@ use upd::lockscan;
 use upd::normalize::pep503_normalize;
 use upd::path_display::display_path;
 use upd::registry::{
-    CratesIoRegistry, GitHubReleasesRegistry, GoProxyRegistry, MultiPyPiRegistry, NpmRegistry,
-    NuGetRegistry, PyPiRegistry, RubyGemsRegistry, TerraformRegistry,
+    CratesIoRegistry, DockerRegistry, GitHubReleasesRegistry, GoProxyRegistry, MultiPyPiRegistry,
+    NpmRegistry, NuGetRegistry, PyPiRegistry, RubyGemsRegistry, TerraformRegistry,
 };
 use upd::updater::{
     ActionShaUpdate, AnnotatedUpdater, BumpFilter, BumpKind, CargoTomlUpdater, CsprojUpdater,
-    DEFAULT_UPDATE_ACTION_SHAS, DiscoverOptions, FileType, GemfileUpdater, GithubActionsUpdater,
-    GoModUpdater, Lang, MiseUpdater, PackageJsonUpdater, ParseWarnings, PreCommitUpdater,
-    PyProjectUpdater, RegistrySet, RequirementsUpdater, SkipStatus, TerraformUpdater,
-    UpdateOptions, UpdateResult, Updater, classify_bump, discover_files_with, ecosystem_key,
-    read_file_safe, update_with_annotations, write_file_atomic,
+    DEFAULT_UPDATE_ACTION_SHAS, DiscoverOptions, DockerUpdater, FileType, GemfileUpdater,
+    GithubActionsUpdater, GoModUpdater, Lang, MiseUpdater, PackageJsonUpdater, ParseWarnings,
+    PreCommitUpdater, PyProjectUpdater, RegistrySet, RequirementsUpdater, SkipStatus,
+    TerraformUpdater, UpdateOptions, UpdateResult, Updater, classify_bump, discover_files_with,
+    ecosystem_key, read_file_safe, update_with_annotations, write_file_atomic,
 };
 use upd::version::{compare_versions, match_version_precision};
 
@@ -1302,6 +1302,9 @@ async fn run_update(cli: &Cli) -> Result<()> {
     let github_releases =
         CachedRegistry::new(github_releases_registry, Arc::clone(&cache), cache_enabled);
 
+    let docker_registry = DockerRegistry::new();
+    let docker = CachedRegistry::new(docker_registry, Arc::clone(&cache), cache_enabled);
+
     // Create updaters wrapped in Arc for parallel processing
     let requirements_updater = Arc::new(RequirementsUpdater::new());
     let pyproject_updater = Arc::new(PyProjectUpdater::new());
@@ -1314,6 +1317,7 @@ async fn run_update(cli: &Cli) -> Result<()> {
     let mise_updater = Arc::new(MiseUpdater::new());
     let terraform_updater = Arc::new(TerraformUpdater::new());
     let csproj_updater = Arc::new(CsprojUpdater::new());
+    let docker_updater = Arc::new(DockerUpdater::new());
 
     // Wrap registries in Arc for parallel processing
     let pypi = Arc::new(pypi);
@@ -1324,6 +1328,7 @@ async fn run_update(cli: &Cli) -> Result<()> {
     let terraform = Arc::new(terraform);
     let nuget = Arc::new(nuget);
     let github_releases = Arc::new(github_releases);
+    let docker = Arc::new(docker);
 
     // Built last: it holds the cached registries, so it cannot exist before
     // them. Terraform is absent because no v1 annotation source names it.
@@ -1353,6 +1358,7 @@ async fn run_update(cli: &Cli) -> Result<()> {
             &terraform,
             &nuget,
             &github_releases,
+            &docker,
             &requirements_updater,
             &pyproject_updater,
             &package_json_updater,
@@ -1364,6 +1370,7 @@ async fn run_update(cli: &Cli) -> Result<()> {
             &mise_updater,
             &terraform_updater,
             &csproj_updater,
+            &docker_updater,
             &annotated_updater,
             &cache,
             cache_enabled,
@@ -1422,6 +1429,7 @@ async fn run_update(cli: &Cli) -> Result<()> {
             let terraform = Arc::clone(&terraform);
             let nuget = Arc::clone(&nuget);
             let github_releases = Arc::clone(&github_releases);
+            let docker = Arc::clone(&docker);
             let requirements_updater = Arc::clone(&requirements_updater);
             let pyproject_updater = Arc::clone(&pyproject_updater);
             let package_json_updater = Arc::clone(&package_json_updater);
@@ -1433,6 +1441,7 @@ async fn run_update(cli: &Cli) -> Result<()> {
             let mise_updater = Arc::clone(&mise_updater);
             let csproj_updater = Arc::clone(&csproj_updater);
             let terraform_updater = Arc::clone(&terraform_updater);
+            let docker_updater = Arc::clone(&docker_updater);
             let annotated_updater = Arc::clone(&annotated_updater);
 
             async move {
@@ -1495,6 +1504,11 @@ async fn run_update(cli: &Cli) -> Result<()> {
                     FileType::TerraformTf => {
                         terraform_updater
                             .update(&path, terraform.as_ref(), update_options.clone())
+                            .await
+                    }
+                    FileType::Dockerfile | FileType::DockerCompose => {
+                        docker_updater
+                            .update(&path, docker.as_ref(), update_options.clone())
                             .await
                     }
                     FileType::Annotated => {
@@ -2504,6 +2518,7 @@ async fn run_interactive_update(
     terraform: &Arc<CachedRegistry<TerraformRegistry>>,
     nuget: &Arc<CachedRegistry<NuGetRegistry>>,
     github_releases: &Arc<CachedRegistry<GitHubReleasesRegistry>>,
+    docker: &Arc<CachedRegistry<DockerRegistry>>,
     requirements_updater: &Arc<RequirementsUpdater>,
     pyproject_updater: &Arc<PyProjectUpdater>,
     package_json_updater: &Arc<PackageJsonUpdater>,
@@ -2515,6 +2530,7 @@ async fn run_interactive_update(
     mise_updater: &Arc<MiseUpdater>,
     terraform_updater: &Arc<TerraformUpdater>,
     csproj_updater: &Arc<CsprojUpdater>,
+    docker_updater: &Arc<DockerUpdater>,
     annotated_updater: &Arc<AnnotatedUpdater>,
     cache: &Arc<std::sync::Mutex<Cache>>,
     cache_enabled: bool,
@@ -2639,6 +2655,11 @@ async fn run_interactive_update(
             FileType::TerraformTf => {
                 terraform_updater
                     .update(path, terraform.as_ref(), dry_run_options.clone())
+                    .await
+            }
+            FileType::Dockerfile | FileType::DockerCompose => {
+                docker_updater
+                    .update(path, docker.as_ref(), dry_run_options.clone())
                     .await
             }
             FileType::Annotated => {
@@ -3295,12 +3316,13 @@ pub(crate) fn build_audit_packages(
         .collect();
 
     for ((name, lang), occurrences) in packages {
-        // OSV doesn't cover GitHub Actions, pre-commit hooks, mise tools, Terraform,
-        // GitHub releases, or annotated pins; skip
+        // OSV doesn't cover GitHub Actions, pre-commit hooks, mise tools, Docker,
+        // Terraform, GitHub releases, or annotated pins; skip
         if *lang == Lang::Actions
             || *lang == Lang::PreCommit
             || *lang == Lang::Mise
             || *lang == Lang::Terraform
+            || *lang == Lang::Docker
             || *lang == Lang::GithubReleases
             || *lang == Lang::Annotated
         {
@@ -3318,6 +3340,7 @@ pub(crate) fn build_audit_packages(
             | Lang::PreCommit
             | Lang::Mise
             | Lang::Terraform
+            | Lang::Docker
             | Lang::GithubReleases
             | Lang::Annotated => {
                 unreachable!("filtered above")
@@ -3898,6 +3921,7 @@ fn build_sarif_occurrences(
             || *lang == Lang::PreCommit
             || *lang == Lang::Mise
             || *lang == Lang::Terraform
+            || *lang == Lang::Docker
             || *lang == Lang::GithubReleases
             || *lang == Lang::Annotated
         {
@@ -3915,6 +3939,7 @@ fn build_sarif_occurrences(
             | Lang::PreCommit
             | Lang::Mise
             | Lang::Terraform
+            | Lang::Docker
             | Lang::GithubReleases
             | Lang::Annotated => {
                 unreachable!("filtered above")
@@ -4057,6 +4082,7 @@ fn print_alignment(alignment: &PackageAlignment, _dry_run: bool) {
         Lang::PreCommit => " (pre-commit)",
         Lang::Mise => " (mise)",
         Lang::Terraform => " (terraform)",
+        Lang::Docker => " (docker)",
         Lang::GithubReleases => " (github-releases)",
         Lang::Annotated => " (annotated)",
     };
@@ -4196,7 +4222,7 @@ impl AppliedVersionUpdates {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct TextDocument {
     lines: Vec<String>,
     line_endings: Vec<&'static str>,
@@ -4273,6 +4299,23 @@ fn apply_version_updates(
             FileType::Csproj => apply_csproj_version(&mut document, update, &target_version),
             FileType::TerraformTf => {
                 apply_terraform_version(&mut document, update, &target_version)
+            }
+            FileType::Dockerfile | FileType::DockerCompose => {
+                let current = document.clone().into_content();
+                let updater = DockerUpdater::new();
+                if let Some(updated) = updater.apply_approved_update(
+                    &current,
+                    file_type,
+                    update.package,
+                    update.old_version,
+                    &target_version,
+                    update.line_num,
+                ) {
+                    document = TextDocument::from_content(&updated);
+                    true
+                } else {
+                    false
+                }
             }
             FileType::Annotated => apply_annotated_version(&mut document, update, &target_version),
         };

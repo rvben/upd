@@ -14,7 +14,7 @@ fn build_schema() -> Value {
         "clispec": "0.3",
         "name": "upd",
         "version": env!("CARGO_PKG_VERSION"),
-        "description": "A fast dependency updater for Python, Node.js, Rust, Go, Ruby, .NET, Terraform, GitHub Actions, pre-commit, and Mise/asdf projects",
+        "description": "A fast dependency updater for Python, Node.js, Rust, Go, Ruby, .NET, Docker, Terraform, GitHub Actions, pre-commit, and Mise/asdf projects",
         "output": {"tty": "text", "piped": "json"},
         "global_args": [
             {
@@ -69,7 +69,7 @@ fn build_schema() -> Value {
                 "short": "-l",
                 "description": "Filter by language/ecosystem (repeatable or comma-separated)",
                 "type": "string[]",
-                "enum": ["python", "node", "rust", "go", "ruby", "dotnet", "actions", "pre-commit", "mise", "terraform", "github-releases", "annotated"]
+                "enum": ["python", "node", "rust", "go", "ruby", "dotnet", "actions", "pre-commit", "mise", "terraform", "docker", "github-releases", "annotated"]
             },
             {
                 "name": "limit",

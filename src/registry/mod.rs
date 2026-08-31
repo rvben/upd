@@ -1,4 +1,5 @@
 mod crates_io;
+mod docker;
 mod github_releases;
 mod go_proxy;
 mod index_chain;
@@ -12,6 +13,7 @@ mod terraform;
 mod utils;
 
 pub use crates_io::{CargoConfig, CargoCredentials, CratesIoRegistry, read_cargo_config};
+pub use docker::DockerRegistry;
 pub use github_releases::GitHubReleasesRegistry;
 pub use go_proxy::{GoCredentials, GoPrivateConfig, GoProxyRegistry, read_go_private_config};
 pub use index_chain::{DeclaredIndex, IndexChain, IndexSource};

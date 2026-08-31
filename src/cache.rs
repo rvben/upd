@@ -29,6 +29,8 @@ pub struct Cache {
     terraform: HashMap<String, CacheEntry>,
     #[serde(default)]
     nuget: HashMap<String, CacheEntry>,
+    #[serde(default)]
+    docker: HashMap<String, CacheEntry>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -101,6 +103,7 @@ impl Cache {
             "rubygems" => &self.rubygems,
             "terraform" => &self.terraform,
             "nuget" => &self.nuget,
+            "docker" => &self.docker,
             _ => return None,
         };
 
@@ -123,6 +126,7 @@ impl Cache {
             "rubygems" => &mut self.rubygems,
             "terraform" => &mut self.terraform,
             "nuget" => &mut self.nuget,
+            "docker" => &mut self.docker,
             _ => return,
         };
 
@@ -188,6 +192,8 @@ impl Cache {
         self.terraform
             .retain(|_, entry| !Self::is_expired(entry.fetched_at));
         self.nuget
+            .retain(|_, entry| !Self::is_expired(entry.fetched_at));
+        self.docker
             .retain(|_, entry| !Self::is_expired(entry.fetched_at));
     }
 }

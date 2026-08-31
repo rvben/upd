@@ -4,7 +4,7 @@
 //! used across multiple dependency files and update all occurrences to that version.
 
 use crate::updater::{
-    AnnotatedUpdater, CargoTomlUpdater, CsprojUpdater, FileType, GemfileUpdater,
+    AnnotatedUpdater, CargoTomlUpdater, CsprojUpdater, DockerUpdater, FileType, GemfileUpdater,
     GithubActionsUpdater, GoModUpdater, Lang, MiseUpdater, PackageJsonUpdater, ParseWarnings,
     ParsedDependency, PreCommitUpdater, PyProjectUpdater, RequirementsUpdater, TerraformUpdater,
     Updater,
@@ -97,6 +97,7 @@ fn get_updater(file_type: FileType, warnings: ParseWarnings) -> Box<dyn Updater>
         FileType::PreCommitConfig => Box::new(PreCommitUpdater::new()),
         FileType::MiseToml | FileType::ToolVersions => Box::new(MiseUpdater::new()),
         FileType::TerraformTf => Box::new(TerraformUpdater::new()),
+        FileType::Dockerfile | FileType::DockerCompose => Box::new(DockerUpdater::new()),
         FileType::Annotated => Box::new(AnnotatedUpdater::new_parse_only(warnings)),
     }
 }
@@ -212,6 +213,12 @@ pub(crate) fn is_stable_version(version: &str, lang: Lang) -> bool {
                 && !v.contains(".beta")
                 && !v.contains(".alpha")
         }
+        Lang::Docker => {
+            let tag = version.to_ascii_lowercase();
+            !["-alpha", "-beta", "-rc", "-pre"]
+                .iter()
+                .any(|marker| tag.contains(marker))
+        }
         Lang::Actions
         | Lang::PreCommit
         | Lang::Mise
@@ -239,7 +246,8 @@ pub(crate) fn compare_versions(a: &str, b: &str, lang: Lang) -> std::cmp::Orderi
         | Lang::Mise
         | Lang::Terraform
         | Lang::GithubReleases
-        | Lang::Annotated => {
+        | Lang::Annotated
+        | Lang::Docker => {
             let clean_a = a.trim_start_matches('v');
             let clean_b = b.trim_start_matches('v');
             compare_semver(clean_a, clean_b)

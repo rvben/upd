@@ -108,6 +108,7 @@ default = "7d"           # applies to every ecosystem unless overridden
 npm = "14d"              # stricter for npm
 pypi = "14d"
 "crates.io" = "3d"
+docker = "7d"
 ```
 
 Duration syntax: `<integer><unit>` where unit is `s`, `m`, `h`, `d`, `w`.
@@ -132,9 +133,10 @@ package.json: Skipped express (only newer version 4.19.0 released 1d ago, cooldo
 ```
 
 **Supported ecosystems:** PyPI, npm, crates.io, Go modules, RubyGems,
-GitHub releases (covers GitHub Actions, pre-commit, Mise). NuGet and
-Terraform Registry do not expose per-version publish dates we can
-consume today; cooldown is reported as unavailable for those files.
+GitHub releases (covers GitHub Actions, pre-commit, Mise), and Docker Hub.
+NuGet, Terraform Registry, and generic OCI tag listings do not expose
+per-version publish dates we can consume today; cooldown is reported as
+unavailable for those files.
 
 ## Caching
 

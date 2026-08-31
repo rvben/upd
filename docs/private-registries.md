@@ -1,7 +1,8 @@
 # Private registries
 
-`upd` supports private package registries for all ecosystems. Credentials are
-automatically detected from environment variables and configuration files.
+`upd` supports authenticated private package registries for the package
+ecosystems listed below. Credentials are automatically detected from
+environment variables and configuration files.
 
 Run `upd --verbose` to see when authenticated access is being used:
 
@@ -11,6 +12,11 @@ upd --verbose
 # Output: Using authenticated npm access
 # Output: Using authenticated GitHub access
 ```
+
+Docker image updates currently support public Docker Hub and public OCI
+registries, including their anonymous bearer-token challenge. A registry that
+requires user credentials is reported as unsupported instead of silently
+falling back or leaking credentials to an untrusted endpoint.
 
 ## PyPI / private Python index
 
