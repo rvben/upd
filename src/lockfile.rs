@@ -55,7 +55,7 @@ impl RegenOutcome {
 
 /// Lockfile variants supported by `upd --lock`. See `command()` for the
 /// concrete invocation used per variant.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum LockfileType {
     PoetryLock,
     UvLock,

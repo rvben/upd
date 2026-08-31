@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **docker**: authenticate private GHCR tag lookups with repository-scoped GitHub Actions credentials
+
+### Fixed
+
+- **lockfiles**: isolate targeted regeneration when several ecosystems share a directory
+
 ## [0.9.0](https://github.com/rvben/upd/compare/v0.8.8...v0.9.0) - 2026-08-31
 
 ### Added

@@ -62,9 +62,11 @@ An explicitly passed file path bypasses discovery entirely, which is how
   `*-alpine` channel
 - Supports Docker Hub shorthand, explicit registries and ports, quoted Compose
   values, and defaults such as `${APP_IMAGE:-ghcr.io/acme/app:1.2.3}`
-- Queries Docker Hub and public OCI Distribution-compatible registries. Anonymous
-  bearer-token challenges are handled automatically, and Docker Hub lookups fall
-  back to its OCI registry when the richer tag endpoint is unavailable
+- Queries Docker Hub and OCI Distribution-compatible registries. Anonymous
+  bearer-token challenges are handled automatically, private GHCR images can
+  use GitHub Actions' repository token with `packages: read`, and Docker Hub
+  lookups fall back to its OCI registry when the richer tag endpoint is
+  unavailable
 - Reports floating tags such as `latest`, runtime-only variables, and digest
   pins explicitly instead of guessing or claiming they are current
 - Preserves comments, quoting, line endings, and every byte outside the tag

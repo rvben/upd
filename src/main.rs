@@ -27,7 +27,9 @@ use upd::fix::{
     route_fix_targets,
 };
 use upd::interactive::{PendingUpdate, prompt_all};
-use upd::lockfile::{LockfileRegenResult, RegenOutcome, regenerate_lockfiles};
+use upd::lockfile::{
+    LockfileRegenResult, LockfileType, RegenOutcome, detect_lockfiles, regenerate_lockfiles,
+};
 use upd::lockscan;
 use upd::normalize::pep503_normalize;
 use upd::path_display::display_path;
@@ -770,6 +772,92 @@ fn collect_selected_changes_for_file(
 
 fn file_has_manifest_changes(result: &UpdateResult) -> bool {
     !result.updated.is_empty() || !result.pinned.is_empty() || !result.annotations.is_empty()
+}
+
+type ChangedByLockfile = HashMap<(PathBuf, LockfileType), Vec<String>>;
+
+/// Record changed package names against only the lockfiles owned by their
+/// manifest. Several ecosystems can coexist in one directory (for example a
+/// Rust/Python extension with a Dockerfile), so directory-level grouping would
+/// feed image names into `cargo update -p` or skip a sibling ecosystem.
+fn record_lockfile_changes(
+    changed_by_lockfile: &mut ChangedByLockfile,
+    manifest_path: &Path,
+    package_names: impl IntoIterator<Item = String>,
+) {
+    let Some(dir) = manifest_path.parent() else {
+        return;
+    };
+    let lockfiles = detect_lockfiles(manifest_path);
+    if lockfiles.is_empty() {
+        return;
+    }
+    let names: Vec<String> = package_names.into_iter().collect();
+    for lockfile in lockfiles {
+        let entry = changed_by_lockfile
+            .entry((dir.to_path_buf(), lockfile))
+            .or_default();
+        for name in &names {
+            if !entry.contains(name) {
+                entry.push(name.clone());
+            }
+        }
+    }
+}
+
+fn lockfile_changes_for(
+    changed_by_lockfile: &ChangedByLockfile,
+    manifest_path: &Path,
+) -> Vec<String> {
+    let Some(dir) = manifest_path.parent() else {
+        return Vec::new();
+    };
+    let mut names = Vec::new();
+    for lockfile in detect_lockfiles(manifest_path) {
+        if let Some(changed) = changed_by_lockfile.get(&(dir.to_path_buf(), lockfile)) {
+            for name in changed {
+                if !names.contains(name) {
+                    names.push(name.clone());
+                }
+            }
+        }
+    }
+    names
+}
+
+fn regenerate_changed_lockfiles(
+    updated_files: &[PathBuf],
+    changed_by_lockfile: &ChangedByLockfile,
+    verbose: bool,
+) -> Vec<(PathBuf, LockfileRegenResult)> {
+    let mut processed_lockfiles: HashSet<(PathBuf, LockfileType)> = HashSet::new();
+    let mut results = Vec::new();
+
+    for path in updated_files {
+        let Some(dir) = path.parent() else {
+            continue;
+        };
+        let lockfiles = detect_lockfiles(path);
+        if lockfiles.is_empty() {
+            results.push((path.clone(), regenerate_lockfiles(path, &[], verbose)));
+            continue;
+        }
+        if lockfiles
+            .iter()
+            .all(|lockfile| processed_lockfiles.contains(&(dir.to_path_buf(), *lockfile)))
+        {
+            continue;
+        }
+        processed_lockfiles.extend(
+            lockfiles
+                .iter()
+                .map(|lockfile| (dir.to_path_buf(), *lockfile)),
+        );
+        let changed = lockfile_changes_for(changed_by_lockfile, path);
+        results.push((path.clone(), regenerate_lockfiles(path, &changed, verbose)));
+    }
+
+    results
 }
 
 fn has_checkable_manifest_changes(result: &UpdateResult, filter: UpdateFilter) -> bool {
@@ -2124,12 +2212,9 @@ async fn run_update(cli: &Cli) -> Result<()> {
 
     // Regenerate lockfiles if requested and at least one manifest changed.
     if cli.lock && !dry_run && !updated_files.is_empty() {
-        // Group changed package names by the directory of their manifest file.
-        // Each directory gets its own targeted-command invocation so we never
-        // pull in transitive churn from sibling subprojects. Both registry
-        // updates and config pins modify the manifest, so both contribute -
-        // otherwise pin-only changes would silently degrade to a broad refresh.
-        let mut changed_by_dir: HashMap<PathBuf, Vec<String>> = HashMap::new();
+        // Group changed package names by the lockfile their manifest owns.
+        // This keeps unrelated ecosystems in the same directory isolated.
+        let mut changed_by_lockfile = ChangedByLockfile::new();
         for scanned_file in &scanned {
             if scanned_file.file_type == FileType::Annotated {
                 continue;
@@ -2137,36 +2222,23 @@ async fn run_update(cli: &Cli) -> Result<()> {
             if scanned_file.result.updated.is_empty() && scanned_file.result.pinned.is_empty() {
                 continue;
             }
-            let Some(dir) = scanned_file.path.parent() else {
-                continue;
-            };
-            let entry = changed_by_dir.entry(dir.to_path_buf()).or_default();
-            for (name, _, _, _) in scanned_file
-                .result
-                .updated
-                .iter()
-                .chain(scanned_file.result.pinned.iter())
-            {
-                if !entry.iter().any(|n| n == name) {
-                    entry.push(name.clone());
-                }
-            }
+            record_lockfile_changes(
+                &mut changed_by_lockfile,
+                &scanned_file.path,
+                scanned_file
+                    .result
+                    .updated
+                    .iter()
+                    .chain(scanned_file.result.pinned.iter())
+                    .map(|(name, _, _, _)| name.clone()),
+            );
         }
 
-        let empty: Vec<String> = Vec::new();
-        let mut processed_dirs: HashSet<PathBuf> = HashSet::new();
-        let mut regen_results: Vec<(PathBuf, LockfileRegenResult)> = Vec::new();
-
-        for path in &updated_files {
-            if let Some(dir) = path.parent() {
-                let dir_path = dir.to_path_buf();
-                if processed_dirs.insert(dir_path.clone()) {
-                    let changed = changed_by_dir.get(&dir_path).unwrap_or(&empty);
-                    let result = regenerate_lockfiles(path, changed, verbose && text_mode);
-                    regen_results.push((path.clone(), result));
-                }
-            }
-        }
+        let regen_results = regenerate_changed_lockfiles(
+            &updated_files,
+            &changed_by_lockfile,
+            verbose && text_mode,
+        );
 
         // Determine whether any lockfiles will actually be regenerated so
         // the header is only printed when there is real work to do.
@@ -2865,7 +2937,7 @@ async fn run_interactive_update(
     let mut applied_updates = 0;
     let mut applied_pins = 0;
     let mut updated_files: Vec<std::path::PathBuf> = Vec::new();
-    let mut changed_by_dir: HashMap<PathBuf, Vec<String>> = HashMap::new();
+    let mut changed_by_lockfile = ChangedByLockfile::new();
 
     for scanned_file in scanned_results {
         let selected_changes =
@@ -2926,18 +2998,14 @@ async fn run_interactive_update(
                 None => format!("{}:", file_str),
             };
 
-            // Record which packages changed per manifest directory so the
-            // lockfile regeneration step can issue targeted commands. Registry
-            // updates and config pins both modify the manifest, so both must
-            // contribute - otherwise a pin-only run would silently emit a
-            // broad refresh (e.g. `cargo update --workspace`).
-            if scanned_file.file_type != FileType::Annotated
-                && let Some(dir) = scanned_file.path.parent()
-            {
-                let entry = changed_by_dir.entry(dir.to_path_buf()).or_default();
-                if !entry.iter().any(|n| n == &change.package) {
-                    entry.push(change.package.clone());
-                }
+            // Registry updates and config pins both contribute to the targeted
+            // lockfile refresh, but only for the lockfile this manifest owns.
+            if scanned_file.file_type != FileType::Annotated {
+                record_lockfile_changes(
+                    &mut changed_by_lockfile,
+                    &scanned_file.path,
+                    [change.package.clone()],
+                );
             }
 
             match change.kind {
@@ -2974,20 +3042,8 @@ async fn run_interactive_update(
 
     // Regenerate lockfiles if requested and files were updated
     if cli.lock && !updated_files.is_empty() {
-        let empty: Vec<String> = Vec::new();
-        let mut processed_dirs: HashSet<std::path::PathBuf> = HashSet::new();
-        let mut regen_results: Vec<(PathBuf, LockfileRegenResult)> = Vec::new();
-
-        for path in &updated_files {
-            if let Some(dir) = path.parent() {
-                let dir_path = dir.to_path_buf();
-                if processed_dirs.insert(dir_path.clone()) {
-                    let changed = changed_by_dir.get(&dir_path).unwrap_or(&empty);
-                    let result = regenerate_lockfiles(path, changed, cli.verbose);
-                    regen_results.push((path.clone(), result));
-                }
-            }
-        }
+        let regen_results =
+            regenerate_changed_lockfiles(&updated_files, &changed_by_lockfile, cli.verbose);
 
         // Only print the header when at least one lockfile will be regenerated.
         let has_work = regen_results.iter().any(|(_, r)| !r.no_lockfiles);
@@ -7250,6 +7306,23 @@ serde = "1.0.1"
             Some(tmp.path().to_path_buf()),
             "find_vcs_root with a file path must check the file's parent"
         );
+    }
+
+    #[test]
+    fn lockfile_changes_do_not_cross_ecosystems_in_one_directory() {
+        let tmp = tempdir().unwrap();
+        let cargo_manifest = tmp.path().join("Cargo.toml");
+        let dockerfile = tmp.path().join("Dockerfile");
+        std::fs::write(&cargo_manifest, "[dependencies]\nserde = \"1\"\n").unwrap();
+        std::fs::write(tmp.path().join("Cargo.lock"), "version = 4\n").unwrap();
+        std::fs::write(&dockerfile, "FROM rust:1.90-alpine\n").unwrap();
+
+        let mut changed = ChangedByLockfile::new();
+        record_lockfile_changes(&mut changed, &cargo_manifest, ["serde".to_string()]);
+        record_lockfile_changes(&mut changed, &dockerfile, ["rust".to_string()]);
+
+        assert_eq!(lockfile_changes_for(&changed, &cargo_manifest), ["serde"]);
+        assert!(lockfile_changes_for(&changed, &dockerfile).is_empty());
     }
 }
 

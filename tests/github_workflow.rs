@@ -1190,6 +1190,7 @@ fn workflow_defaults_are_reproducible_and_safe() {
     assert!(WORKFLOW.contains("  publish:\n    needs: update"));
     assert!(WORKFLOW.contains("never executes checked-out repository code"));
     assert!(WORKFLOW.contains("GITHUB_TOKEN: ${{ github.token }}"));
+    assert!(WORKFLOW.contains("packages: read"));
     assert!(WORKFLOW.contains(r#"{workflows: "write"}"#));
     assert!(WORKFLOW.contains("ACTIONS_ID_TOKEN_REQUEST_TOKEN"));
     assert!(WORKFLOW.contains(
@@ -1210,6 +1211,7 @@ fn workflow_defaults_are_reproducible_and_safe() {
     assert!(!WORKFLOW.contains("git push --force "));
     for caller in [RUST_WORKFLOW, ACTIONS_WORKFLOW] {
         assert!(caller.contains("contents: read"));
+        assert!(caller.contains("packages: read"));
         assert!(caller.contains("pull-requests: read"));
         assert!(caller.contains("id-token: write"));
         assert!(!caller.contains("contents: write"));

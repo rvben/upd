@@ -13,9 +13,11 @@ upd --verbose
 # Output: Using authenticated GitHub access
 ```
 
-Docker image updates currently support public Docker Hub and public OCI
-registries, including their anonymous bearer-token challenge. A registry that
-requires user credentials is reported as unsupported instead of silently
+Docker image updates support public Docker Hub and OCI registries, including
+their anonymous bearer-token challenge. In GitHub Actions, private GHCR images
+can use `GITHUB_ACTOR` and a `GITHUB_TOKEN` with `packages: read`. Those
+credentials are sent only to the exact `https://ghcr.io/token` endpoint. Other
+private container registries are reported as unsupported instead of silently
 falling back or leaking credentials to an untrusted endpoint.
 
 ## PyPI / private Python index

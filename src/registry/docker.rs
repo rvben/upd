@@ -93,6 +93,7 @@ pub struct DockerRegistry {
     client: Client,
     docker_hub_api: String,
     oci_base_override: Option<String>,
+    github_credentials: Option<(String, String)>,
 }
 
 impl DockerRegistry {
@@ -119,6 +120,10 @@ impl DockerRegistry {
             client,
             docker_hub_api,
             oci_base_override,
+            github_credentials: std::env::var("GITHUB_ACTOR")
+                .ok()
+                .zip(std::env::var("GITHUB_TOKEN").ok())
+                .filter(|(actor, token)| !actor.is_empty() && !token.is_empty()),
         }
     }
 
@@ -275,6 +280,28 @@ impl DockerRegistry {
         Ok(Some(next))
     }
 
+    fn may_send_github_credentials(location: &ImageLocation, token_url: &url::Url) -> bool {
+        location.registry == "ghcr.io"
+            && token_url.scheme() == "https"
+            && token_url.host_str() == Some("ghcr.io")
+            && token_url.port_or_known_default() == Some(443)
+            && token_url.path() == "/token"
+    }
+
+    fn token_request(
+        &self,
+        location: &ImageLocation,
+        token_url: url::Url,
+    ) -> reqwest::RequestBuilder {
+        let mut request = self.client.get(token_url.clone());
+        if Self::may_send_github_credentials(location, &token_url)
+            && let Some((actor, token)) = &self.github_credentials
+        {
+            request = request.basic_auth(actor, Some(token));
+        }
+        request
+    }
+
     async fn oci_tags(&self, location: &ImageLocation) -> Result<Vec<VersionMeta>> {
         let base = self
             .oci_base_override
@@ -322,7 +349,7 @@ impl DockerRegistry {
                     .query_pairs_mut()
                     .append_pair("service", &challenge.1)
                     .append_pair("scope", &challenge.2);
-                let token_response = self.client.get(token_url).send().await?;
+                let token_response = self.token_request(location, token_url).send().await?;
                 if !token_response.status().is_success() {
                     return Err(anyhow!(
                         "Failed to authenticate to registry '{}': HTTP {}",
@@ -543,6 +570,33 @@ mod tests {
         )
         .unwrap_err();
         assert!(error.to_string().contains("changed origin"));
+    }
+
+    #[test]
+    fn github_credentials_only_reach_the_exact_ghcr_token_endpoint() {
+        let location = DockerRegistry::image_location("ghcr.io/rvben/upd").unwrap();
+        let mut registry = DockerRegistry::new();
+        registry.github_credentials = Some(("actor".into(), "token".into()));
+        let ghcr =
+            url::Url::parse("https://ghcr.io/token?scope=repository:rvben/upd:pull").unwrap();
+        let request = registry.token_request(&location, ghcr).build().unwrap();
+        assert_eq!(
+            request.headers().get(AUTHORIZATION).unwrap(),
+            "Basic YWN0b3I6dG9rZW4="
+        );
+        let attacker = registry
+            .token_request(
+                &location,
+                url::Url::parse("https://attacker.example/token").unwrap(),
+            )
+            .build()
+            .unwrap();
+        assert!(attacker.headers().get(AUTHORIZATION).is_none());
+        let wrong_path = registry
+            .token_request(&location, url::Url::parse("https://ghcr.io/other").unwrap())
+            .build()
+            .unwrap();
+        assert!(wrong_path.headers().get(AUTHORIZATION).is_none());
     }
 
     #[tokio::test]

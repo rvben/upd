@@ -22,11 +22,12 @@ on:
 permissions:
   contents: read
   id-token: write
+  packages: read
   pull-requests: read
 
 jobs:
   update:
-    uses: rvben/upd/.github/workflows/dependency-health.yml@<FULL_COMMIT_SHA>
+    uses: rvben/upd/.github/workflows/dependency-health.yml@<FULL_COMMIT_SHA> # vX.Y.Z
     with:
       min-age: 7d
       max-bump: minor
@@ -49,7 +50,10 @@ default `langs: actions`, the only files this workflow changes are the ones
 
 The workflow uses upd's hosted GitHub App token broker by default and accepts a
 fine-grained personal access token as a single-repository alternative. The
-caller grants `contents: read`, `pull-requests: read`, and `id-token: write`.
+caller grants `contents: read`, `packages: read`, `pull-requests: read`, and
+`id-token: write`. Package read access lets Docker updates authenticate to
+private GHCR images linked to the repository; credentials are sent only to
+GHCR's exact HTTPS token endpoint.
 Publication uses the independent App installation token or PAT instead, so the
 caller does not grant repository write access to commands that run against the
 checked-out project.
