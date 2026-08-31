@@ -77,6 +77,14 @@ impl PackageJsonUpdater {
     }
 }
 
+fn parse_package_json(content: &str) -> Result<Value> {
+    if content.trim().is_empty() {
+        return Ok(Value::Object(Default::default()));
+    }
+
+    Ok(serde_json::from_str(content)?)
+}
+
 impl PackageJsonLineIndex {
     fn record_entries(
         lines_by_section: &mut HashMap<String, HashMap<String, usize>>,
@@ -222,7 +230,7 @@ impl Updater for PackageJsonUpdater {
         options: UpdateOptions,
     ) -> Result<UpdateResult> {
         let content = read_file_safe(path)?;
-        let json: Value = serde_json::from_str(&content)?;
+        let json = parse_package_json(&content)?;
         let mut result = UpdateResult::default();
         let mut new_content = content.clone();
         let line_index = PackageJsonLineIndex::from_content(&content);
@@ -830,7 +838,7 @@ impl Updater for PackageJsonUpdater {
 
     fn parse_dependencies(&self, path: &Path) -> Result<Vec<ParsedDependency>> {
         let content = read_file_safe(path)?;
-        let json: Value = serde_json::from_str(&content)?;
+        let json = parse_package_json(&content)?;
         let mut deps = Vec::new();
         let line_index = PackageJsonLineIndex::from_content(&content);
 
@@ -936,6 +944,39 @@ mod tests {
             updater.extract_version_info("1.0.0"),
             ("".to_string(), "1.0.0".to_string())
         );
+    }
+
+    #[tokio::test]
+    async fn test_empty_package_json_is_treated_as_having_no_dependencies() {
+        let file = NamedTempFile::with_suffix(".json").unwrap();
+        let registry = MockRegistry::new("npm");
+        let updater = PackageJsonUpdater::new();
+
+        let result = updater
+            .update(file.path(), &registry, UpdateOptions::new(true, false))
+            .await
+            .unwrap();
+
+        assert!(result.updated.is_empty());
+        assert!(result.errors.is_empty());
+        assert!(updater.parse_dependencies(file.path()).unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_whitespace_only_package_json_is_treated_as_having_no_dependencies() {
+        let mut file = NamedTempFile::with_suffix(".json").unwrap();
+        write!(file, "  \n\t").unwrap();
+        let registry = MockRegistry::new("npm");
+        let updater = PackageJsonUpdater::new();
+
+        let result = updater
+            .update(file.path(), &registry, UpdateOptions::new(true, false))
+            .await
+            .unwrap();
+
+        assert!(result.updated.is_empty());
+        assert!(result.errors.is_empty());
+        assert!(updater.parse_dependencies(file.path()).unwrap().is_empty());
     }
 
     #[tokio::test]
