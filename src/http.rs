@@ -112,9 +112,18 @@ where
     let Some(p) = resolve_ca_path(env) else {
         return Ok(Vec::new());
     };
-    let bytes = read(&p).with_context(|| format!("failed to read CA bundle at {}", p.display()))?;
-    parse_pem_bundle(&bytes)
-        .with_context(|| format!("failed to parse CA bundle at {}", p.display()))
+    let bytes = read(&p).with_context(|| {
+        format!(
+            "failed to read CA bundle at {}",
+            crate::path_display::display_path(&p)
+        )
+    })?;
+    parse_pem_bundle(&bytes).with_context(|| {
+        format!(
+            "failed to parse CA bundle at {}",
+            crate::path_display::display_path(&p)
+        )
+    })
 }
 
 /// Initialize TLS options. Called from the entry point of every networked

@@ -10,11 +10,11 @@ use std::path::Path;
 /// non-registry code and are excluded; entries with no `source` at all are
 /// excluded defensively rather than guessed.
 pub fn scan_uv_lock(path: &Path) -> Result<LockScan> {
-    let content =
-        std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+    let content = std::fs::read_to_string(path)
+        .with_context(|| format!("reading {}", crate::path_display::display_path(path)))?;
     let doc: toml::Table = content
         .parse()
-        .with_context(|| format!("parsing {}", path.display()))?;
+        .with_context(|| format!("parsing {}", crate::path_display::display_path(path)))?;
 
     let mut scan = LockScan::default();
     let Some(packages) = doc.get("package").and_then(|p| p.as_array()) else {

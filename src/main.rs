@@ -30,6 +30,7 @@ use upd::interactive::{PendingUpdate, prompt_all};
 use upd::lockfile::{LockfileRegenResult, RegenOutcome, regenerate_lockfiles};
 use upd::lockscan;
 use upd::normalize::pep503_normalize;
+use upd::path_display::display_path;
 use upd::registry::{
     CratesIoRegistry, GitHubReleasesRegistry, GoProxyRegistry, MultiPyPiRegistry, NpmRegistry,
     NuGetRegistry, PyPiRegistry, RubyGemsRegistry, TerraformRegistry,
@@ -279,7 +280,7 @@ fn log_update_config_usage(resolved: &ResolvedUpdateConfig) {
 
     println!(
         "{}",
-        format!("Using config from: {}", resolved.path.display()).cyan()
+        format!("Using config from: {}", display_path(&resolved.path)).cyan()
     );
 
     if !resolved.config.ignore.is_empty() {
@@ -612,7 +613,7 @@ fn floor_file_type_and_lang(path: &Path) -> (&'static str, &'static str) {
 fn empty_floor_report(path: &Path) -> upd::output::UpdateFileReport {
     let (file_type, lang) = floor_file_type_and_lang(path);
     upd::output::UpdateFileReport {
-        path: path.display().to_string(),
+        path: display_path(path),
         file_type,
         lang,
         updates: Vec::new(),
@@ -666,7 +667,7 @@ fn lock_only_interactive_note(package: &str) -> String {
 /// interactive path and the aborted-scan flush cannot drift from the
 /// non-interactive renderer.
 fn format_warning_line(path: &Path, warning: &str) -> String {
-    let location = format!("{}:", path.display());
+    let location = format!("{}:", display_path(path));
     format!(
         "{} {} {}",
         location.blue().underline(),
@@ -676,7 +677,7 @@ fn format_warning_line(path: &Path, warning: &str) -> String {
 }
 
 fn format_error_line(path: &Path, error: &str) -> String {
-    let location = format!("{}:", path.display());
+    let location = format!("{}:", display_path(path));
     format!(
         "{} {} {}",
         location.blue().underline(),
@@ -846,7 +847,7 @@ fn go_mod_coverage_warnings(files: &[(std::path::PathBuf, FileType)]) -> Vec<Str
         if !modern {
             warnings.push(format!(
                 "{}: go.mod predates go 1.17 module graph pruning: transitive coverage may be incomplete; run 'go mod tidy' with a modern toolchain",
-                path.display()
+                display_path(path)
             ));
         }
     }
@@ -1032,7 +1033,7 @@ async fn run() -> Result<()> {
     let invalid: Vec<_> = cli.paths.iter().filter(|p| !p.exists()).collect();
     if !invalid.is_empty() {
         for path in &invalid {
-            let arg = path.display().to_string();
+            let arg = display_path(path);
             let mut msg = format!("'{arg}' is not a known subcommand or existing path");
             if let Some(suggestion) = suggest_subcommand(&arg) {
                 msg.push_str(&format!(". Did you mean '{suggestion}'?"));
@@ -1517,7 +1518,7 @@ async fn run_update(cli: &Cli) -> Result<()> {
 
     for (path, file_type, result) in results {
         if verbose && text_mode {
-            println!("{}", format!("Processed: {}", path.display()).cyan());
+            println!("{}", format!("Processed: {}", display_path(&path)).cyan());
         }
 
         match result {
@@ -1531,7 +1532,7 @@ async fn run_update(cli: &Cli) -> Result<()> {
                 if text_mode && !cli.quiet {
                     let cooldown_policy = file_cooldowns.get(&path).and_then(|p| p.as_ref());
                     print_file_result(
-                        &path.display().to_string(),
+                        &display_path(&path),
                         file_type,
                         &file_result,
                         dry_run,
@@ -1548,7 +1549,7 @@ async fn run_update(cli: &Cli) -> Result<()> {
                 total_result.merge(file_result);
             }
             Err(e) => {
-                let msg = format!("Error processing {}: {}", path.display(), e);
+                let msg = format!("Error processing {}: {}", display_path(&path), e);
                 eprintln!("{}", msg.red());
                 // Surface the outer error in both the aggregate and the per-file
                 // record so JSON output captures it and the exit-code logic can
@@ -1783,7 +1784,7 @@ async fn run_update(cli: &Cli) -> Result<()> {
                     // error would only bump summary.errors, invisible in files[].
                     floor_errors.entry(report_path.clone()).or_default().push(
                         upd::output::ErrorEntry::with_file(
-                            report_path.display().to_string(),
+                            display_path(report_path),
                             "registry",
                             msg,
                         ),
@@ -1987,13 +1988,7 @@ async fn run_update(cli: &Cli) -> Result<()> {
             if text_mode && !cli.quiet {
                 println!(
                     "{}",
-                    format_capped_line(
-                        &path.display().to_string(),
-                        None,
-                        &package,
-                        &current,
-                        &available,
-                    )
+                    format_capped_line(&display_path(&path), None, &package, &current, &available,)
                 );
             }
             floor_capped
@@ -2582,7 +2577,7 @@ async fn run_interactive_update(
         );
 
         if cli.verbose {
-            eprintln!("{}", format!("Scanning: {}", path.display()).cyan());
+            eprintln!("{}", format!("Scanning: {}", display_path(path)).cyan());
         }
 
         let result = match file_type {
@@ -2666,24 +2661,21 @@ async fn run_interactive_update(
                 // prompt for: gating it on "nothing else to do" would hide it
                 // in exactly the busy repository that needs it most.
                 if !cli.quiet {
-                    for line in format_capped_lines(&path.display().to_string(), &file_result) {
+                    let displayed_path = display_path(path);
+                    for line in format_capped_lines(&displayed_path, &file_result) {
                         println!("{}", line);
                     }
                     // Reported here for the same reason, and left unwritten:
                     // the accept/reject flow carries version transitions, and
                     // an annotation is not one. A run without --interactive
                     // writes them.
-                    for line in
-                        format_annotation_lines(&path.display().to_string(), &file_result, true)
-                    {
+                    for line in format_annotation_lines(&displayed_path, &file_result, true) {
                         println!("{}", line);
                     }
                     // And again for the same reason: a blocked pin is a
                     // dependency that could not be checked at all, so there is
                     // nothing to accept or reject, but it must not go unsaid.
-                    for line in
-                        format_skipped_lines(&path.display().to_string(), &file_result, cli.verbose)
-                    {
+                    for line in format_skipped_lines(&displayed_path, &file_result, cli.verbose) {
                         println!("{}", line);
                     }
                 }
@@ -2698,7 +2690,7 @@ async fn run_interactive_update(
                     }
 
                     pending_updates.push(PendingUpdate::new(
-                        path.display().to_string(),
+                        display_path(path),
                         *line_num,
                         package.clone(),
                         old_version.clone(),
@@ -2721,7 +2713,7 @@ async fn run_interactive_update(
             Err(e) => {
                 eprintln!(
                     "{}",
-                    format!("Error processing {}: {}", path.display(), e).red()
+                    format!("Error processing {}: {}", display_path(path), e).red()
                 );
                 unscannable_files += 1;
             }
@@ -2889,7 +2881,13 @@ async fn run_interactive_update(
             scanned_file.file_type,
             cli.full_precision,
         )
-        .map_err(|e| anyhow::anyhow!("Failed to rewrite {}: {}", scanned_file.path.display(), e))?;
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "Failed to rewrite {}: {}",
+                display_path(&scanned_file.path),
+                e
+            )
+        })?;
 
         if rewritten.content == content {
             continue;
@@ -2900,7 +2898,7 @@ async fn run_interactive_update(
             updated_files.push(scanned_file.path.clone());
         }
 
-        let file_str = scanned_file.path.display().to_string();
+        let file_str = display_path(&scanned_file.path);
         for change in selected_changes {
             let location = match change.line_num {
                 Some(n) => format!("{}:{}:", file_str, n),
@@ -3781,7 +3779,7 @@ fn emit_audit_json(
 /// they don't touch a version pin at a known line the way manifest edits do.
 fn print_fix_outcome(outcome: &AppliedFix) {
     let target = &outcome.target;
-    let path = target.path.display();
+    let path = display_path(&target.path);
     match (target.kind, outcome.status) {
         (FixKind::ManifestEdit, FixStatus::Planned) => {
             println!(
@@ -3885,30 +3883,6 @@ fn emit_audit_sarif(
     Ok(())
 }
 
-/// Express `path` as a relative URI under `cwd` when possible.
-///
-/// Tries a plain `strip_prefix` against the invocation cwd first, then falls
-/// back to the canonicalized forms of both sides (macOS symlinks `/var` to
-/// `/private/var`, so a pass without canonicalization can miss).
-fn relativize_for_sarif(
-    path: &std::path::Path,
-    cwd: Option<&std::path::Path>,
-    cwd_canonical: Option<&std::path::Path>,
-) -> String {
-    if let Some(cwd) = cwd
-        && let Ok(rel) = path.strip_prefix(cwd)
-    {
-        return rel.display().to_string();
-    }
-    if let Some(cwd_canon) = cwd_canonical
-        && let Ok(canon_path) = path.canonicalize()
-        && let Ok(rel) = canon_path.strip_prefix(cwd_canon)
-    {
-        return rel.display().to_string();
-    }
-    path.display().to_string()
-}
-
 /// Build the occurrence map required by SARIF output from the scanned package data.
 ///
 /// Returns a map keyed by `(package_name, version, ecosystem_str)` with values
@@ -3918,9 +3892,6 @@ fn build_sarif_occurrences(
     lock_packages: &[lockscan::LockedPackage],
 ) -> upd::output::SarifOccurrenceMap {
     let mut map: upd::output::SarifOccurrenceMap = HashMap::new();
-    let cwd = std::env::current_dir().ok();
-    let cwd_canonical = cwd.as_ref().and_then(|c| c.canonicalize().ok());
-
     for ((_, lang), occurrences) in packages {
         // Only ecosystems that OSV covers and that will appear in the audit result.
         if *lang == Lang::Actions
@@ -3956,8 +3927,7 @@ fn build_sarif_occurrences(
                 occ.version.clone(),
                 ecosystem.as_str().to_string(),
             );
-            let uri =
-                relativize_for_sarif(&occ.file_path, cwd.as_deref(), cwd_canonical.as_deref());
+            let uri = display_path(&occ.file_path);
             map.entry(key).or_default().push((uri, occ.line_number));
         }
     }
@@ -3971,7 +3941,7 @@ fn build_sarif_occurrences(
             lp.version.clone(),
             lp.ecosystem.as_str().to_string(),
         );
-        let uri = relativize_for_sarif(&lp.lockfile_path, cwd.as_deref(), cwd_canonical.as_deref());
+        let uri = display_path(&lp.lockfile_path);
         map.entry(key).or_default().push((uri, lp.line_number));
     }
 
@@ -4099,9 +4069,10 @@ fn print_alignment(alignment: &PackageAlignment, _dry_run: bool) {
     println!("    → {} (highest)", alignment.highest_version.green());
 
     for occurrence in &alignment.occurrences {
+        let path = display_path(&occurrence.file_path);
         let location = match occurrence.line_number {
-            Some(n) => format!("{}:{}", occurrence.file_path.display(), n),
-            None => occurrence.file_path.display().to_string(),
+            Some(n) => format!("{path}:{n}"),
+            None => path,
         };
 
         if occurrence.has_upper_bound {
@@ -4166,7 +4137,7 @@ fn apply_alignments(alignments: &[&PackageAlignment], full_precision: bool) -> R
     for (path, (file_type, updates)) in updates_by_file {
         let content = read_file_safe(path)?;
         let applied_updates = apply_version_updates(&content, &updates, file_type, full_precision)
-            .map_err(|e| anyhow::anyhow!("Failed to rewrite {}: {}", path.display(), e))?;
+            .map_err(|e| anyhow::anyhow!("Failed to rewrite {}: {}", display_path(path), e))?;
 
         if applied_updates.content != content {
             write_file_atomic(path, &applied_updates.content)?;

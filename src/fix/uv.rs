@@ -43,7 +43,7 @@ pub fn write_uv_constraint_floor(
     let content = read_file_safe(pyproject)?;
     let mut doc: DocumentMut = content
         .parse()
-        .with_context(|| format!("parsing {}", pyproject.display()))?;
+        .with_context(|| format!("parsing {}", crate::path_display::display_path(pyproject)))?;
     let unfixable_shape = || {
         FloorWriteOutcome::Unfixable(format!(
             "existing [tool.uv] constraint-dependencies has an unexpected shape; refusing to rewrite it - add {package}>={floor} manually"

@@ -41,17 +41,17 @@ fn index_key_lines(content: &str) -> HashMap<String, usize> {
 /// (npm v5/v6, `dependencies` tree) is not parsed: it produces a coverage
 /// warning instead of silently missing the transitive tree.
 pub fn scan_npm_lock(path: &Path) -> Result<LockScan> {
-    let content =
-        std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
-    let doc: serde_json::Value =
-        serde_json::from_str(&content).with_context(|| format!("parsing {}", path.display()))?;
+    let content = std::fs::read_to_string(path)
+        .with_context(|| format!("reading {}", crate::path_display::display_path(path)))?;
+    let doc: serde_json::Value = serde_json::from_str(&content)
+        .with_context(|| format!("parsing {}", crate::path_display::display_path(path)))?;
 
     let mut scan = LockScan::default();
     let version = doc.get("lockfileVersion").and_then(|v| v.as_u64());
     if version == Some(1) {
         scan.warnings.push(format!(
             "{}: legacy package-lock.json (lockfileVersion 1): transitive dependencies not scanned; regenerate with npm >= 7",
-            path.display()
+            crate::path_display::display_path(path)
         ));
         return Ok(scan);
     }

@@ -343,7 +343,11 @@ impl Updater for AnnotatedUpdater {
         let scan = scan_annotated(&content, None);
         if self.warnings == ParseWarnings::Print {
             for refusal in &scan.refusals {
-                eprintln!("{}: Warning: {}", path.display(), refusal);
+                eprintln!(
+                    "{}: Warning: {}",
+                    crate::path_display::display_path(path),
+                    refusal
+                );
             }
         }
         Ok(scan

@@ -169,7 +169,7 @@ pub fn discover_locks(files: &[(PathBuf, FileType)], scan_roots: &[PathBuf]) -> 
             if kind == LockKind::Npm && has_workspaces_field(manifest) {
                 discovery.warnings.push(format!(
                     "{}: npm workspaces are not yet supported for lock scanning: transitive dependencies of this lockfile are not audited",
-                    lock.display()
+                    crate::path_display::display_path(&lock)
                 ));
                 continue;
             }
@@ -180,8 +180,8 @@ pub fn discover_locks(files: &[(PathBuf, FileType)], scan_roots: &[PathBuf]) -> 
                 if let Some(missing) = members.iter().find(|m| !discovered.contains(m.as_path())) {
                     discovery.warnings.push(format!(
                         "{}: workspace membership incomplete ({} not in the discovered set): lockfile not scanned (no workspace member gets lock-based transitive coverage until this is resolved)",
-                        lock.display(),
-                        missing.display()
+                        crate::path_display::display_path(&lock),
+                        crate::path_display::display_path(missing)
                     ));
                     continue;
                 }
@@ -278,8 +278,8 @@ pub fn discover_locks(files: &[(PathBuf, FileType)], scan_roots: &[PathBuf]) -> 
             {
                 discovery.warnings.push(format!(
                     "{}: workspace root lockfile {} exists outside the scanned paths: transitive dependencies not audited",
-                    manifest.display(),
-                    lock_here.display()
+                    crate::path_display::display_path(manifest),
+                    crate::path_display::display_path(&lock_here)
                 ));
                 break;
             }

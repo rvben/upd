@@ -36,10 +36,18 @@ pub(crate) fn split_npm_alias(spec: &str) -> Option<(&str, &str)> {
 /// DEPENDENCY_SECTIONS): dependencies, devDependencies, peerDependencies,
 /// optionalDependencies. Non-string specs are skipped.
 pub fn npm_direct_deps(package_json: &Path) -> Result<Vec<DirectDep>> {
-    let content = std::fs::read_to_string(package_json)
-        .with_context(|| format!("reading {}", package_json.display()))?;
-    let doc: serde_json::Value = serde_json::from_str(&content)
-        .with_context(|| format!("parsing {}", package_json.display()))?;
+    let content = std::fs::read_to_string(package_json).with_context(|| {
+        format!(
+            "reading {}",
+            crate::path_display::display_path(package_json)
+        )
+    })?;
+    let doc: serde_json::Value = serde_json::from_str(&content).with_context(|| {
+        format!(
+            "parsing {}",
+            crate::path_display::display_path(package_json)
+        )
+    })?;
     let mut deps = Vec::new();
     for section in [
         "dependencies",
@@ -74,10 +82,10 @@ pub fn npm_direct_deps(package_json: &Path) -> Result<Vec<DirectDep>> {
 /// both the TOML key and the real package name.
 pub fn cargo_direct_deps(cargo_toml: &Path) -> Result<Vec<DirectDep>> {
     let content = std::fs::read_to_string(cargo_toml)
-        .with_context(|| format!("reading {}", cargo_toml.display()))?;
+        .with_context(|| format!("reading {}", crate::path_display::display_path(cargo_toml)))?;
     let doc: toml::Table = content
         .parse()
-        .with_context(|| format!("parsing {}", cargo_toml.display()))?;
+        .with_context(|| format!("parsing {}", crate::path_display::display_path(cargo_toml)))?;
 
     fn parse_table(table: &toml::Table, deps: &mut Vec<DirectDep>) {
         for (key, item) in table {

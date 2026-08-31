@@ -1139,7 +1139,7 @@ impl Updater for PyProjectUpdater {
         let mut doc: DocumentMut = content.parse().map_err(|e: toml_edit::TomlError| {
             anyhow!(
                 "Failed to parse {}:\n  {}",
-                path.display(),
+                crate::path_display::display_path(path),
                 e.to_string().replace('\n', "\n  ")
             )
         })?;
@@ -1256,7 +1256,7 @@ impl Updater for PyProjectUpdater {
         let doc: DocumentMut = content.parse().map_err(|e: toml_edit::TomlError| {
             anyhow!(
                 "Failed to parse {}:\n  {}",
-                path.display(),
+                crate::path_display::display_path(path),
                 e.to_string().replace('\n', "\n  ")
             )
         })?;

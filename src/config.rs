@@ -195,7 +195,7 @@ impl UpdConfig {
                 eprintln!(
                     "{} failed to parse {}: {}",
                     "error:".red(),
-                    path.display(),
+                    crate::path_display::display_path(path),
                     e
                 );
                 None
@@ -220,7 +220,10 @@ impl UpdConfig {
     pub fn load_with_warnings(path: &Path) -> Result<(Self, Vec<String>), String> {
         // Check if file exists
         if !path.exists() {
-            return Err(format!("Config file not found: {}", path.display()));
+            return Err(format!(
+                "Config file not found: {}",
+                crate::path_display::display_path(path)
+            ));
         }
 
         // Check file size to prevent DoS
@@ -247,14 +250,19 @@ impl UpdConfig {
             if e.kind() == std::io::ErrorKind::PermissionDenied {
                 format!(
                     "Permission denied reading config file: {}. Check file permissions.",
-                    path.display()
+                    crate::path_display::display_path(path)
                 )
             } else {
-                format!("Failed to read config file {}: {}", path.display(), e)
+                format!(
+                    "Failed to read config file {}: {}",
+                    crate::path_display::display_path(path),
+                    e
+                )
             }
         })?;
 
-        Self::parse_with_warnings(&content, path.to_string_lossy().as_ref())
+        let source_label = crate::path_display::display_path(path);
+        Self::parse_with_warnings(&content, &source_label)
     }
 
     /// Parse config TOML content, collecting warnings for unknown top-level keys.
@@ -614,7 +622,11 @@ impl EffectiveConfig<'_> {
                 } else {
                     " (discovered)"
                 };
-                out.push_str(&format!("config file: {}{}\n", path.display(), origin));
+                out.push_str(&format!(
+                    "config file: {}{}\n",
+                    crate::path_display::display_path(path),
+                    origin
+                ));
             }
             None => out.push_str("config file: (none found; built-in defaults)\n"),
         }
@@ -668,7 +680,7 @@ impl EffectiveConfig<'_> {
         }
 
         serde_json::json!({
-            "config_file": self.source.map(|p| p.display().to_string()),
+            "config_file": self.source.map(crate::path_display::display_path),
             "config_file_explicit": self.explicit,
             "ignore": self.config.ignore,
             "include": self.config.include,

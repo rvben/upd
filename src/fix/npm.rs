@@ -101,10 +101,17 @@ pub fn write_npm_override_floor(
     dry_run: bool,
 ) -> Result<FloorWriteOutcome> {
     let content = read_file_safe(package_json)?;
-    let doc: serde_json::Value = serde_json::from_str(&content)
-        .with_context(|| format!("parsing {}", package_json.display()))?;
+    let doc: serde_json::Value = serde_json::from_str(&content).with_context(|| {
+        format!(
+            "parsing {}",
+            crate::path_display::display_path(package_json)
+        )
+    })?;
     if !doc.is_object() {
-        bail!("{}: root is not a JSON object", package_json.display());
+        bail!(
+            "{}: root is not a JSON object",
+            crate::path_display::display_path(package_json)
+        );
     }
     let desired = match form {
         NpmOverrideForm::Range => format!(">={floor}"),
@@ -176,7 +183,7 @@ pub fn write_npm_override_floor(
                 .with_context(|| {
                     format!(
                         "could not locate top-level override entry for {package} in {}",
-                        package_json.display()
+                        crate::path_display::display_path(package_json)
                     )
                 })?;
             format!(

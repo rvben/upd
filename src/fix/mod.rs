@@ -226,7 +226,7 @@ fn route_manifest_covered(
                 reason: format!(
                     "declared as npm alias \"{}\" in {}; upd cannot rewrite alias specs - update it manually to \"{}\": \"npm:{}@>={}\"",
                     owner.dependency_key,
-                    owner.manifest.display(),
+                    crate::path_display::display_path(&owner.manifest),
                     owner.dependency_key,
                     pkg.name,
                     to_version
@@ -323,7 +323,7 @@ fn route_manifest_covered_owner(
             reason: format!(
                 "could not re-derive the manifest requirement for \"{}\" in {}",
                 owner.dependency_key,
-                owner.manifest.display()
+                crate::path_display::display_path(&owner.manifest)
             ),
             no_fixed_version: false,
         });

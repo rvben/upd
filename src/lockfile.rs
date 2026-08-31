@@ -699,7 +699,7 @@ pub(crate) fn cargo_update_precise(
             format!(
                 "Running `cargo {}` in {}...",
                 args.join(" "),
-                lock_dir.display()
+                crate::path_display::display_path(lock_dir)
             )
             .cyan()
         );

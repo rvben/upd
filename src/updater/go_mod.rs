@@ -150,7 +150,7 @@ impl Updater for GoModUpdater {
         if has_meaningful_content && !has_module_directive {
             result.warnings.push(format!(
                 "{}: no `module` directive found; not a valid go.mod (skipped)",
-                path.display()
+                crate::path_display::display_path(path)
             ));
             return Ok(result);
         }

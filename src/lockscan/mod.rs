@@ -90,7 +90,7 @@ pub fn scan_locks(files: &[(PathBuf, FileType)], scan_roots: &[PathBuf]) -> Lock
             }
             Err(e) => result.warnings.push(format!(
                 "{}: could not scan lockfile: {e:#}",
-                lock.path.display()
+                crate::path_display::display_path(&lock.path)
             )),
         }
         result.locks.push(lock);

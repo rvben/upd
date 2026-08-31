@@ -65,6 +65,78 @@ fn parse_error_goes_to_stderr_not_stdout() {
         !stdout.to_lowercase().contains("error"),
         "error text must NOT appear on stdout; stdout: {stdout}"
     );
+    assert!(
+        stderr.contains("package.json") && !stderr.contains(&path_str),
+        "error paths inside cwd must be relative; stderr: {stderr}"
+    );
+}
+
+/// Findings use cwd-relative paths even when the scan root was passed as an
+/// absolute path. The same presentation rule applies to text and JSON output.
+#[test]
+fn findings_use_relative_paths_in_text_and_json() {
+    let tmp = tempfile::tempdir().unwrap();
+    let project = tmp.path().join("projects/web");
+    fs::create_dir_all(&project).unwrap();
+    fs::write(
+        project.join("package.json"),
+        r#"{"dependencies":{"react":"17.0.0"}}"#,
+    )
+    .unwrap();
+    fs::write(
+        tmp.path().join(".updrc.toml"),
+        "[pin]\nreact = \"18.0.0\"\n",
+    )
+    .unwrap();
+    let path_str = tmp.path().to_str().unwrap().to_string();
+
+    let (stdout, stderr, code) = run(
+        &["--dry-run", "--no-cache", "--output", "text", &path_str],
+        tmp.path(),
+    );
+    assert_eq!(code, 1, "pinned update must be pending; stderr: {stderr}");
+    assert!(
+        stdout.contains("projects/web/package.json:"),
+        "text finding must use a relative path; stdout: {stdout}"
+    );
+    assert!(
+        !stdout.contains(&path_str),
+        "text finding must not contain the absolute scan root; stdout: {stdout}"
+    );
+
+    let (stdout, stderr, code) = run(
+        &["--dry-run", "--no-cache", "--format", "json", &path_str],
+        tmp.path(),
+    );
+    assert_eq!(code, 1, "pinned update must be pending; stderr: {stderr}");
+    let report: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(report["files"][0]["path"], "projects/web/package.json");
+}
+
+/// A blank package.json is an empty manifest, not a parse failure.
+#[test]
+fn empty_package_json_does_not_print_an_error_line() {
+    let tmp = tempfile::tempdir().unwrap();
+    fs::write(tmp.path().join("package.json"), b"").unwrap();
+    let path_str = tmp.path().to_str().unwrap().to_string();
+
+    let (stdout, stderr, code) = run(
+        &["--dry-run", "--no-cache", "--output", "text", &path_str],
+        tmp.path(),
+    );
+
+    assert_eq!(
+        code, 0,
+        "empty package.json must not fail; stderr: {stderr}"
+    );
+    assert!(
+        !stderr.to_lowercase().contains("error"),
+        "empty package.json must not print an error line; stderr: {stderr}"
+    );
+    assert!(
+        stdout.contains("Scanned 1 file(s)"),
+        "empty package.json must still be counted as scanned; stdout: {stdout}"
+    );
 }
 
 /// In text mode without --quiet, the summary line appears on stdout.

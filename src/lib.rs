@@ -13,6 +13,7 @@ pub mod lockscan;
 pub mod normalize;
 pub mod npm_range;
 pub mod output;
+pub mod path_display;
 pub mod registry;
 pub mod schema;
 pub mod updater;

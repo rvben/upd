@@ -28,6 +28,7 @@ pub use terraform::TerraformUpdater;
 use crate::annotation::AnnotationSource;
 use crate::config::UpdConfig;
 use crate::cooldown::CooldownPolicy;
+use crate::path_display::display_path;
 use crate::registry::{Registry, VersionQuery};
 use anyhow::{Result, anyhow};
 use chrono::{DateTime, Utc};
@@ -1585,17 +1586,17 @@ pub fn discover_files_with(
                 .chain(unrestricted.skipped_markers.iter())
             {
                 if !after_gitignore_set.contains(path.as_path()) {
-                    eprintln!("skipping {}: gitignored", path.display());
+                    eprintln!("skipping {}: gitignored", display_path(path));
                 }
             }
         }
         for path in &excluded {
-            eprintln!("skipping {}: excluded by config", path.display());
+            eprintln!("skipping {}: excluded by config", display_path(path));
         }
         for path in &after_gitignore.skipped_markers {
             eprintln!(
                 "skipping {}: contains an `upd:` marker but is not a discovery candidate (add an `include` glob to .updrc.toml)",
-                path.display()
+                display_path(path)
             );
         }
     }

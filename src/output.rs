@@ -9,6 +9,7 @@ use crate::align::{PackageAlignment, PackageOccurrence};
 use crate::annotation::AnnotationSource;
 use crate::audit::{AuditResult, Vulnerability};
 use crate::cooldown::CooldownPolicy;
+use crate::path_display::display_path;
 use crate::updater::{FileType, UpdateResult, ecosystem_key};
 use chrono::Duration;
 use serde::Serialize;
@@ -440,7 +441,7 @@ pub fn build_fix_entries(
             from_version: outcome.target.from_version.clone(),
             to_version: Some(outcome.target.to_version.clone()),
             method: Some(outcome.target.kind.method()),
-            path: Some(outcome.target.path.display().to_string()),
+            path: Some(display_path(&outcome.target.path)),
             status: outcome.status.as_str(),
             error: outcome.error.clone(),
         })
@@ -451,7 +452,7 @@ pub fn build_fix_entries(
         from_version: u.from_version.clone(),
         to_version: u.to_version.clone(),
         method: u.method,
-        path: u.path.as_ref().map(|p| p.display().to_string()),
+        path: u.path.as_deref().map(display_path),
         status: "unfixable",
         error: Some(u.reason.clone()),
     }));
@@ -617,7 +618,7 @@ pub fn build_update_file_report(
         })
         .collect();
 
-    let path_str = path.display().to_string();
+    let path_str = display_path(path);
     let errors = result
         .errors
         .iter()
@@ -661,7 +662,7 @@ pub fn build_align_package(alignment: &PackageAlignment) -> AlignPackage {
 fn occurrence_to_json(o: &PackageOccurrence, highest: &str) -> AlignOccurrence {
     let misaligned = !o.has_upper_bound && o.version != highest;
     AlignOccurrence {
-        path: o.file_path.display().to_string(),
+        path: display_path(&o.file_path),
         file_type: o.file_type.as_str(),
         version: o.version.clone(),
         line: o.line_number,
