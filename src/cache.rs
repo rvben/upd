@@ -1,4 +1,4 @@
-use crate::registry::{Registry, TagsAtCommit, VersionMeta};
+use crate::registry::{Registry, TagsAtCommit, VersionMeta, VersionQuery};
 use anyhow::Result;
 use async_trait::async_trait;
 use directories::ProjectDirs;
@@ -198,6 +198,9 @@ pub struct CachedRegistry<R> {
     inner: R,
     cache: Arc<Mutex<Cache>>,
     enabled: bool,
+    namespace: Option<String>,
+    refresh_locks: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    revalidated: Mutex<HashMap<String, String>>,
 }
 
 impl<R: Registry> CachedRegistry<R> {
@@ -206,7 +209,38 @@ impl<R: Registry> CachedRegistry<R> {
             inner,
             cache,
             enabled,
+            namespace: None,
+            refresh_locks: Mutex::new(HashMap::new()),
+            revalidated: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// Use a registry-configuration-specific cache namespace.
+    ///
+    /// Registries in the same ecosystem can serve different releases for the
+    /// same package. Keeping their entries separate prevents a result fetched
+    /// from one private index (or index chain) being reused for another.
+    pub fn with_namespace(
+        inner: R,
+        cache: Arc<Mutex<Cache>>,
+        enabled: bool,
+        namespace: impl Into<String>,
+    ) -> Self {
+        Self {
+            inner,
+            cache,
+            enabled,
+            namespace: Some(namespace.into()),
+            refresh_locks: Mutex::new(HashMap::new()),
+            revalidated: Mutex::new(HashMap::new()),
+        }
+    }
+
+    fn scoped_key(&self, key: &str) -> String {
+        self.namespace.as_ref().map_or_else(
+            || key.to_string(),
+            |namespace| format!("{namespace}\u{1f}{key}"),
+        )
     }
 
     /// Get from cache (returns None if disabled, expired, or missing)
@@ -214,7 +248,8 @@ impl<R: Registry> CachedRegistry<R> {
         if !self.enabled {
             return None;
         }
-        self.cache.lock().ok()?.get(self.inner.name(), package)
+        let key = self.scoped_key(package);
+        self.cache.lock().ok()?.get(self.inner.name(), &key)
     }
 
     /// Set in cache (no-op if disabled). Does NOT save to disk - caller saves once at end.
@@ -222,9 +257,22 @@ impl<R: Registry> CachedRegistry<R> {
         if !self.enabled {
             return;
         }
+        let key = self.scoped_key(package);
         if let Ok(mut cache) = self.cache.lock() {
-            cache.set(self.inner.name(), package, version.to_string());
+            cache.set(self.inner.name(), &key, version.to_string());
         }
+    }
+
+    fn refresh_lock(&self, key: &str) -> Arc<tokio::sync::Mutex<()>> {
+        let mut locks = self
+            .refresh_locks
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        Arc::clone(
+            locks
+                .entry(key.to_string())
+                .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(()))),
+        )
     }
 }
 
@@ -268,6 +316,71 @@ impl<R: Registry> Registry for CachedRegistry<R> {
             .get_latest_version_matching(package, constraints)
             .await?;
         self.cache_set(&cache_key, &version);
+        Ok(version)
+    }
+
+    async fn revalidate_version(
+        &self,
+        package: &str,
+        query: VersionQuery<'_>,
+        stale_version: &str,
+    ) -> Result<String> {
+        if !self.enabled {
+            return self
+                .inner
+                .revalidate_version(package, query, stale_version)
+                .await;
+        }
+
+        let cache_key = query.cache_key(package);
+        let refresh_key = format!("{}\u{1f}{stale_version}", self.scoped_key(&cache_key));
+        if let Some(version) = self
+            .revalidated
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&refresh_key)
+            .cloned()
+        {
+            return Ok(version);
+        }
+
+        // File updates run concurrently. Serialise this exceptional refresh so
+        // one stale package appearing in many manifests produces one live
+        // request, then let every waiter reuse its answer.
+        let refresh_lock = self.refresh_lock(&refresh_key);
+        let _guard = refresh_lock.lock().await;
+
+        if let Some(version) = self
+            .revalidated
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&refresh_key)
+            .cloned()
+        {
+            return Ok(version);
+        }
+
+        // Another ordinary lookup may have replaced the stale entry while this
+        // task waited. That answer is already live enough for this run.
+        if let Some(version) = self.cache_get(&cache_key)
+            && version != stale_version
+        {
+            self.revalidated
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .insert(refresh_key, version.clone());
+            return Ok(version);
+        }
+
+        let version = self
+            .inner
+            .revalidate_version(package, query, stale_version)
+            .await?;
+        self.cache_set(&cache_key, &version);
+        self.revalidated
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(refresh_key, version.clone());
         Ok(version)
     }
 
@@ -599,6 +712,112 @@ mod tests {
         // Should return cached value without hitting registry
         let version = cached.get_latest_version("requests").await.unwrap();
         assert_eq!(version, "2.31.0");
+    }
+
+    #[tokio::test]
+    async fn cache_namespaces_separate_same_named_registries() {
+        use crate::registry::MockRegistry;
+
+        let cache = Arc::new(Mutex::new(Cache::default()));
+        let first = CachedRegistry::with_namespace(
+            MockRegistry::new("pypi").with_version("shared-name", "1.0.0"),
+            Arc::clone(&cache),
+            true,
+            "private-a",
+        );
+        let second = CachedRegistry::with_namespace(
+            MockRegistry::new("pypi").with_version("shared-name", "2.0.0"),
+            Arc::clone(&cache),
+            true,
+            "private-b",
+        );
+
+        assert_eq!(
+            first.get_latest_version("shared-name").await.unwrap(),
+            "1.0.0"
+        );
+        assert_eq!(
+            second.get_latest_version("shared-name").await.unwrap(),
+            "2.0.0",
+            "a package answer from one index must not leak into another"
+        );
+    }
+
+    #[tokio::test]
+    async fn concurrent_revalidation_fetches_once_and_replaces_stale_entry() {
+        use crate::registry::{
+            TagsAtCommit, no_ref_names, no_version_metadata, ref_resolution_unsupported,
+            tags_at_commit_unsupported,
+        };
+        use futures::future::join_all;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct CountingRegistry {
+            calls: Arc<AtomicUsize>,
+        }
+
+        #[async_trait]
+        impl Registry for CountingRegistry {
+            async fn get_latest_version(&self, _package: &str) -> Result<String> {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                Ok("1.1.2".to_string())
+            }
+
+            async fn list_versions(&self, _package: &str) -> Result<Vec<VersionMeta>> {
+                no_version_metadata()
+            }
+
+            async fn list_ref_names(&self, _package: &str) -> Result<Vec<String>> {
+                no_ref_names()
+            }
+
+            async fn resolve_ref_to_commit(
+                &self,
+                package: &str,
+                reference: &str,
+            ) -> Result<String> {
+                Err(ref_resolution_unsupported(self.name(), package, reference))
+            }
+
+            async fn tags_at_commit(&self, _package: &str, _commit: &str) -> Result<TagsAtCommit> {
+                tags_at_commit_unsupported()
+            }
+
+            fn name(&self) -> &'static str {
+                "pypi"
+            }
+        }
+
+        let cache = Arc::new(Mutex::new(Cache::default()));
+        cache
+            .lock()
+            .unwrap()
+            .set("pypi", "private-package", "1.1.0".to_string());
+        let calls = Arc::new(AtomicUsize::new(0));
+        let cached = CachedRegistry::new(
+            CountingRegistry {
+                calls: Arc::clone(&calls),
+            },
+            Arc::clone(&cache),
+            true,
+        );
+
+        let results =
+            join_all((0..18).map(|_| {
+                cached.revalidate_version("private-package", VersionQuery::Stable, "1.1.0")
+            }))
+            .await;
+
+        assert!(
+            results
+                .iter()
+                .all(|result| matches!(result, Ok(version) if version == "1.1.2"))
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            cache.lock().unwrap().get("pypi", "private-package"),
+            Some("1.1.2".to_string())
+        );
     }
 
     #[tokio::test]

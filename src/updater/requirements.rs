@@ -1,10 +1,10 @@
 use super::{
     FileType, ParsedDependency, PendingVersion, UpdateOptions, UpdateResult, Updater,
-    downgrade_warning, pep440_admits, read_file_safe, specifier_floor, unpinnable_error,
-    unreadable_error, unrewritable_warning, write_file_atomic,
+    downgrade_warning, pep440_admits, python_version_with_revalidation, read_file_safe,
+    specifier_floor, unpinnable_error, unreadable_error, unrewritable_warning, write_file_atomic,
 };
 use crate::align::compare_versions;
-use crate::registry::{DeclaredIndex, IndexChain, Registry};
+use crate::registry::{DeclaredIndex, IndexChain, Registry, VersionQuery};
 use crate::updater::Lang;
 use crate::version::{is_prerelease_pep440, match_version_precision};
 use anyhow::Result;
@@ -358,15 +358,29 @@ impl Updater for RequirementsUpdater {
                     // it would answer that with itself.
                     effective_registry.get_latest_version(&parsed.package).await
                 } else if is_prerelease_pep440(&parsed.first_version) {
-                    effective_registry
-                        .get_latest_version_including_prereleases(&parsed.package)
-                        .await
+                    python_version_with_revalidation(
+                        effective_registry,
+                        &parsed.package,
+                        &parsed.first_version,
+                        VersionQuery::IncludingPrereleases,
+                    )
+                    .await
                 } else if Self::is_simple_constraint(&parsed.full_constraint) {
-                    effective_registry.get_latest_version(&parsed.package).await
+                    python_version_with_revalidation(
+                        effective_registry,
+                        &parsed.package,
+                        &parsed.first_version,
+                        VersionQuery::Stable,
+                    )
+                    .await
                 } else {
-                    effective_registry
-                        .get_latest_version_matching(&parsed.package, &parsed.full_constraint)
-                        .await
+                    python_version_with_revalidation(
+                        effective_registry,
+                        &parsed.package,
+                        &parsed.first_version,
+                        VersionQuery::Matching(&parsed.full_constraint),
+                    )
+                    .await
                 }
             })
             .collect();
@@ -783,7 +797,7 @@ requests==2.28.0
             r#"
 --extra-index-url https://nexus.example.com/repository/private/simple
 requests==2.28.0
-hda-common>=1.0.908
+private-package>=1.0.908
 "#,
         );
         assert_eq!(
@@ -807,7 +821,7 @@ hda-common>=1.0.908
         for p in [
             "/simple/requests/",
             "/pypi/requests/json",
-            "/simple/hda-common/",
+            "/simple/private-package/",
         ] {
             Mock::given(method("GET"))
                 .and(path(p))
@@ -816,7 +830,7 @@ hda-common>=1.0.908
                 .await;
         }
         Mock::given(method("GET"))
-            .and(path("/pypi/hda-common/json"))
+            .and(path("/pypi/private-package/json"))
             .respond_with(
                 ResponseTemplate::new(200)
                     .set_body_string(r#"{"releases": {"1.0.909": [{"yanked": false}]}}"#),
@@ -827,7 +841,7 @@ hda-common>=1.0.908
         let mut file = NamedTempFile::with_suffix(".txt").unwrap();
         write!(
             file,
-            "--extra-index-url {}/simple/\nrequests==2.28.0\nhda-common==1.0.908\n",
+            "--extra-index-url {}/simple/\nrequests==2.28.0\nprivate-package==1.0.908\n",
             private.uri()
         )
         .unwrap();
@@ -848,7 +862,51 @@ hda-common>=1.0.908
         updated.sort();
         assert_eq!(
             updated,
-            vec![("hda-common", "1.0.909"), ("requests", "2.32.0")]
+            vec![("private-package", "1.0.909"), ("requests", "2.32.0")]
+        );
+    }
+
+    #[tokio::test]
+    async fn stale_cached_latest_below_current_is_revalidated() {
+        use crate::cache::{Cache, CachedRegistry};
+        use std::sync::Mutex;
+
+        let mut file = NamedTempFile::with_suffix(".txt").unwrap();
+        writeln!(file, "private-package==1.1.1").unwrap();
+
+        let cache = Arc::new(Mutex::new(Cache::default()));
+        cache
+            .lock()
+            .unwrap()
+            .set("pypi", "private-package", "1.1.0".to_string());
+        let registry = CachedRegistry::new(
+            MockRegistry::new("pypi").with_version("private-package", "1.1.2"),
+            Arc::clone(&cache),
+            true,
+        );
+
+        let result = RequirementsUpdater::new()
+            .update(file.path(), &registry, UpdateOptions::new(true, false))
+            .await
+            .unwrap();
+
+        assert!(
+            result.warnings.is_empty(),
+            "warnings: {:?}",
+            result.warnings
+        );
+        assert_eq!(
+            result.updated,
+            vec![(
+                "private-package".to_string(),
+                "1.1.1".to_string(),
+                "1.1.2".to_string(),
+                Some(1),
+            )]
+        );
+        assert_eq!(
+            cache.lock().unwrap().get("pypi", "private-package"),
+            Some("1.1.2".to_string())
         );
     }
 

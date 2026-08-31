@@ -1233,7 +1233,13 @@ async fn run_update(cli: &Cli) -> Result<()> {
         MultiPyPiRegistry::from_primary_and_extras(primary, extra_urls)
     };
 
-    let pypi = CachedRegistry::new(pypi_registry, Arc::clone(&cache), cache_enabled);
+    let pypi_cache_namespace = pypi_registry.cache_namespace();
+    let pypi = CachedRegistry::with_namespace(
+        pypi_registry,
+        Arc::clone(&cache),
+        cache_enabled,
+        pypi_cache_namespace,
+    );
 
     // Create npm registry with optional credentials
     let npm_registry = {

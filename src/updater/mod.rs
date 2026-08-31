@@ -28,7 +28,7 @@ pub use terraform::TerraformUpdater;
 use crate::annotation::AnnotationSource;
 use crate::config::UpdConfig;
 use crate::cooldown::CooldownPolicy;
-use crate::registry::Registry;
+use crate::registry::{Registry, VersionQuery};
 use anyhow::{Result, anyhow};
 use chrono::{DateTime, Utc};
 use ignore::WalkBuilder;
@@ -65,6 +65,28 @@ pub fn read_file_safe(path: &Path) -> Result<String> {
 /// which makes it easy to grep logs and assert in tests.
 pub(crate) fn downgrade_warning(pkg: &str, latest: &str, current: &str) -> String {
     format!("skipping {pkg}: latest \"{latest}\" is not greater than current \"{current}\"")
+}
+
+/// Run a Python latest-version query and distrust an answer below the version
+/// already present in the manifest.
+///
+/// A lower cached value cannot safely establish what is latest. Revalidating
+/// through the registry preserves its index-selection rules, and cache
+/// decorators collapse concurrent retries for duplicate manifests into one
+/// live request. If the live answer is still lower, callers retain their normal
+/// downgrade warning rather than assuming the manifest version exists.
+pub(crate) async fn python_version_with_revalidation(
+    registry: &dyn Registry,
+    package: &str,
+    current: &str,
+    query: VersionQuery<'_>,
+) -> Result<String> {
+    let latest = query.run(registry, package).await?;
+    if crate::align::compare_versions(&latest, current, Lang::Python) == std::cmp::Ordering::Less {
+        registry.revalidate_version(package, query, &latest).await
+    } else {
+        Ok(latest)
+    }
 }
 
 /// One clause of a version specifier: an operator and the version it bounds.

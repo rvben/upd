@@ -150,10 +150,10 @@ const DRY_RUN_JSON: &[&str] = &["--dry-run", "--no-cache", "--output", "json"];
 async fn declared_uv_index_is_layered_over_the_default_index() {
     let default = MockServer::start().await;
     serve(&default, "requests", &["2.28.0", "2.32.0"]).await;
-    missing(&default, "hda-common").await;
+    missing(&default, "private-package").await;
 
     let private = MockServer::start().await;
-    serve(&private, "hda-common", &["1.0.908", "1.0.909"]).await;
+    serve(&private, "private-package", &["1.0.908", "1.0.909"]).await;
     missing(&private, "requests").await;
 
     let dir = TempDir::new().unwrap();
@@ -165,7 +165,7 @@ name = "demo"
 version = "0.1.0"
 dependencies = [
     "requests>=2.28.0",
-    "hda-common>=1.0.908",
+    "private-package>=1.0.908",
 ]
 
 [[tool.uv.index]]
@@ -190,7 +190,7 @@ publish-url = "{}/"
     assert_eq!(
         planned_updates(&report),
         vec![
-            ("hda-common".to_string(), "1.0.909".to_string()),
+            ("private-package".to_string(), "1.0.909".to_string()),
             ("requests".to_string(), "2.32.0".to_string()),
         ]
     );
@@ -204,10 +204,10 @@ publish-url = "{}/"
 async fn uv_default_true_replaces_the_default_index() {
     let default = MockServer::start().await;
     never_asked(&default, "requests").await;
-    never_asked(&default, "hda-common").await;
+    never_asked(&default, "private-package").await;
 
     let private = MockServer::start().await;
-    serve(&private, "hda-common", &["1.0.908", "1.0.909"]).await;
+    serve(&private, "private-package", &["1.0.908", "1.0.909"]).await;
     missing(&private, "requests").await;
 
     let dir = TempDir::new().unwrap();
@@ -218,7 +218,7 @@ async fn uv_default_true_replaces_the_default_index() {
 name = "demo"
 dependencies = [
     "requests>=2.28.0",
-    "hda-common>=1.0.908",
+    "private-package>=1.0.908",
 ]
 
 [[tool.uv.index]]
@@ -235,7 +235,7 @@ default = true
 
     assert_eq!(
         planned_updates(&report),
-        vec![("hda-common".to_string(), "1.0.909".to_string())]
+        vec![("private-package".to_string(), "1.0.909".to_string())]
     );
     assert_eq!(error_count(&report), 1, "requests is not on the only index");
     assert_eq!(output.status.code(), Some(2), "a failed lookup exits 2");

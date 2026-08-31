@@ -1,10 +1,10 @@
 use super::{
     FileType, ParsedDependency, UpdateOptions, UpdateResult, Updater, downgrade_warning,
-    pep440_admits, read_file_safe, specifier_floor, unpinnable_error, unreadable_error,
-    unrewritable_warning, write_file_atomic,
+    pep440_admits, python_version_with_revalidation, read_file_safe, specifier_floor,
+    unpinnable_error, unreadable_error, unrewritable_warning, write_file_atomic,
 };
 use crate::align::compare_versions;
-use crate::registry::{DeclaredIndex, IndexChain, Registry};
+use crate::registry::{DeclaredIndex, IndexChain, Registry, VersionQuery};
 use crate::updater::Lang;
 use crate::version::{is_prerelease_pep440, is_stable_pep440, match_version_precision};
 use anyhow::{Result, anyhow};
@@ -527,15 +527,29 @@ impl PyProjectUpdater {
                     // it would answer that with itself.
                     registry.get_latest_version(&parsed.package).await
                 } else if !is_stable_pep440(&parsed.version) {
-                    registry
-                        .get_latest_version_including_prereleases(&parsed.package)
-                        .await
+                    python_version_with_revalidation(
+                        registry,
+                        &parsed.package,
+                        &parsed.version,
+                        VersionQuery::IncludingPrereleases,
+                    )
+                    .await
                 } else if Self::is_simple_constraint(&parsed.full_constraint) {
-                    registry.get_latest_version(&parsed.package).await
+                    python_version_with_revalidation(
+                        registry,
+                        &parsed.package,
+                        &parsed.version,
+                        VersionQuery::Stable,
+                    )
+                    .await
                 } else {
-                    registry
-                        .get_latest_version_matching(&parsed.package, &parsed.full_constraint)
-                        .await
+                    python_version_with_revalidation(
+                        registry,
+                        &parsed.package,
+                        &parsed.version,
+                        VersionQuery::Matching(&parsed.full_constraint),
+                    )
+                    .await
                 }
             })
             .collect();
@@ -791,9 +805,16 @@ impl PyProjectUpdater {
             .iter()
             .map(|(key, _, version, _)| async {
                 if is_stable_pep440(version) {
-                    registry.get_latest_version(key).await
+                    python_version_with_revalidation(registry, key, version, VersionQuery::Stable)
+                        .await
                 } else {
-                    registry.get_latest_version_including_prereleases(key).await
+                    python_version_with_revalidation(
+                        registry,
+                        key,
+                        version,
+                        VersionQuery::IncludingPrereleases,
+                    )
+                    .await
                 }
             })
             .collect();
@@ -1539,6 +1560,47 @@ dependencies = [
         let contents = std::fs::read_to_string(file.path()).unwrap();
         assert!(contents.contains("requests>=2.31.0"));
         assert!(contents.contains("flask>=3.0.0"));
+    }
+
+    #[tokio::test]
+    async fn stale_cached_latest_below_pyproject_current_is_revalidated() {
+        use crate::cache::{Cache, CachedRegistry};
+        use std::sync::Mutex;
+
+        let mut file = NamedTempFile::with_suffix(".toml").unwrap();
+        write!(
+            file,
+            r#"[project]
+name = "myproject"
+dependencies = ["private-package==1.1.1"]
+"#
+        )
+        .unwrap();
+
+        let cache = Arc::new(Mutex::new(Cache::default()));
+        cache
+            .lock()
+            .unwrap()
+            .set("pypi", "private-package", "1.1.0".to_string());
+        let registry = CachedRegistry::new(
+            MockRegistry::new("pypi").with_version("private-package", "1.1.2"),
+            Arc::clone(&cache),
+            true,
+        );
+
+        let result = PyProjectUpdater::new()
+            .update(file.path(), &registry, UpdateOptions::new(true, false))
+            .await
+            .unwrap();
+
+        assert!(
+            result.warnings.is_empty(),
+            "warnings: {:?}",
+            result.warnings
+        );
+        assert_eq!(result.updated[0].0, "private-package");
+        assert_eq!(result.updated[0].1, "1.1.1");
+        assert_eq!(result.updated[0].2, "1.1.2");
     }
 
     #[tokio::test]
@@ -2427,12 +2489,12 @@ url = "https://pdm.pypi.com/simple"
                 .await;
         }
         Mock::given(method("GET"))
-            .and(path("/simple/hda-common/"))
+            .and(path("/simple/private-package/"))
             .respond_with(ResponseTemplate::new(404))
             .mount(&private)
             .await;
         Mock::given(method("GET"))
-            .and(path("/pypi/hda-common/json"))
+            .and(path("/pypi/private-package/json"))
             .respond_with(
                 ResponseTemplate::new(200)
                     .set_body_string(r#"{"releases": {"1.0.909": [{"yanked": false}]}}"#),
@@ -2447,7 +2509,7 @@ url = "https://pdm.pypi.com/simple"
 name = "demo"
 dependencies = [
     "requests>=2.28.0",
-    "hda-common>=1.0.908",
+    "private-package>=1.0.908",
 ]
 
 [[tool.uv.index]]
@@ -2474,7 +2536,7 @@ url = "{}/simple/"
         updated.sort();
         assert_eq!(
             updated,
-            vec![("hda-common", "1.0.909"), ("requests", "2.32.0")]
+            vec![("private-package", "1.0.909"), ("requests", "2.32.0")]
         );
     }
 

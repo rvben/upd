@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **cache**: isolate Python index chains and revalidate cached releases older than the manifest
+
 ## [0.8.7](https://github.com/rvben/upd/compare/v0.8.6...v0.8.7) - 2026-08-31
 
 ### Added

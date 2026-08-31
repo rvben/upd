@@ -21,7 +21,7 @@ use anyhow::{Result, anyhow};
 use async_trait::async_trait;
 use globset::{Glob, GlobSet, GlobSetBuilder};
 
-use super::{PyPiRegistry, Registry, VersionMeta};
+use super::{PyPiRegistry, Registry, VersionMeta, VersionQuery};
 use crate::normalize::pep503_normalize;
 
 /// Where one link of the chain sends its queries.
@@ -280,6 +280,34 @@ impl<'a> IndexChain<'a> {
         }
         Err(last_error.unwrap_or_else(|| anyhow!("No versions found for package '{}'", package)))
     }
+
+    async fn first_match_revalidated(
+        &self,
+        package: &str,
+        query: VersionQuery<'_>,
+        stale_version: &str,
+    ) -> Result<String> {
+        let links = self.links_for(package);
+        if links.is_empty() {
+            return Err(anyhow!(
+                "No package index is configured for '{}': the manifest excludes the default index and declares no other",
+                package
+            ));
+        }
+
+        let mut last_error = None;
+        for link in links {
+            match link
+                .registry()
+                .revalidate_version(package, query, stale_version)
+                .await
+            {
+                Ok(version) => return Ok(version),
+                Err(error) => last_error = Some(error),
+            }
+        }
+        Err(last_error.unwrap_or_else(|| anyhow!("No versions found for package '{}'", package)))
+    }
 }
 
 #[async_trait]
@@ -299,6 +327,16 @@ impl Registry for IndexChain<'_> {
         constraints: &str,
     ) -> Result<String> {
         self.first_match(package, Query::Matching(constraints))
+            .await
+    }
+
+    async fn revalidate_version(
+        &self,
+        package: &str,
+        query: VersionQuery<'_>,
+        stale_version: &str,
+    ) -> Result<String> {
+        self.first_match_revalidated(package, query, stale_version)
             .await
     }
 

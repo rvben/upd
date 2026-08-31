@@ -202,6 +202,43 @@ pub struct VersionMeta {
     pub prerelease: bool,
 }
 
+/// The shape of a latest-version lookup.
+///
+/// This is also passed to [`Registry::revalidate_version`] so cache decorators
+/// can refresh exactly the entry that produced a suspect answer.
+#[derive(Debug, Clone, Copy)]
+pub enum VersionQuery<'a> {
+    Stable,
+    IncludingPrereleases,
+    Matching(&'a str),
+}
+
+impl VersionQuery<'_> {
+    pub async fn run<R: Registry + ?Sized>(self, registry: &R, package: &str) -> Result<String> {
+        match self {
+            Self::Stable => registry.get_latest_version(package).await,
+            Self::IncludingPrereleases => {
+                registry
+                    .get_latest_version_including_prereleases(package)
+                    .await
+            }
+            Self::Matching(constraints) => {
+                registry
+                    .get_latest_version_matching(package, constraints)
+                    .await
+            }
+        }
+    }
+
+    pub(crate) fn cache_key(self, package: &str) -> String {
+        match self {
+            Self::Stable => package.to_string(),
+            Self::IncludingPrereleases => format!("{package}:prerelease"),
+            Self::Matching(constraints) => format!("{package}:match:{constraints}"),
+        }
+    }
+}
+
 /// The answer from a registry that has no Git-ref concept at all.
 ///
 /// Distinct from an `Err`, which says the question could not be answered.
@@ -292,6 +329,22 @@ pub trait Registry: Send + Sync {
         // Default: ignore constraints and return latest
         let _ = constraints;
         self.get_latest_version(package).await
+    }
+
+    /// Repeat a latest-version lookup after `stale_version` proved unusable.
+    ///
+    /// Leaf registries already perform live requests, so their default is the
+    /// corresponding ordinary lookup. Cache and index decorators override this
+    /// method: caches bypass only the stale entry, while index chains preserve
+    /// the source-selection rules of the original query.
+    async fn revalidate_version(
+        &self,
+        package: &str,
+        query: VersionQuery<'_>,
+        stale_version: &str,
+    ) -> Result<String> {
+        let _ = stale_version;
+        query.run(self, package).await
     }
 
     /// List recent versions with metadata, most recent ~50 in any order.

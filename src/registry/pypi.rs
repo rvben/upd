@@ -1,7 +1,7 @@
 #[cfg(test)]
 use super::utils::read_netrc_credentials_from_path;
 use super::utils::{base64_encode, read_netrc_credentials, read_pip_config};
-use super::{Registry, VersionMeta, http_error_message};
+use super::{Registry, VersionMeta, VersionQuery, http_error_message};
 use anyhow::{Result, anyhow};
 use async_trait::async_trait;
 use pep440_rs::{Version, VersionSpecifiers};
@@ -9,6 +9,7 @@ use reqwest::header::{AUTHORIZATION, HeaderMap, HeaderValue};
 use reqwest::{Client, Response};
 use serde::Deserialize;
 use std::collections::HashMap;
+use std::hash::{DefaultHasher, Hash, Hasher};
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -243,6 +244,19 @@ impl PyPiRegistry {
     /// Get the index URL this registry is configured for
     pub fn index_url(&self) -> &str {
         &self.index_url
+    }
+
+    fn cache_identity(&self) -> String {
+        let Ok(mut url) = url::Url::parse(&self.index_url) else {
+            // Only the hash of this value is persisted. Invalid registry URLs
+            // will fail at lookup time, but still must not share cache entries.
+            return self.index_url.clone();
+        };
+        let _ = url.set_username("");
+        let _ = url.set_password(None);
+        url.set_query(None);
+        url.set_fragment(None);
+        url.to_string()
     }
 
     /// Detect credentials from environment variables or netrc
@@ -748,6 +762,18 @@ impl MultiPyPiRegistry {
     pub fn registries(&self) -> &[Arc<PyPiRegistry>] {
         &self.registries
     }
+
+    /// Opaque identity of the ordered index chain used to namespace cached
+    /// package answers. Authentication material and query strings are removed
+    /// before hashing, so the on-disk cache contains neither credentials nor
+    /// private registry URLs.
+    pub fn cache_namespace(&self) -> String {
+        let mut hasher = DefaultHasher::new();
+        for registry in &self.registries {
+            registry.cache_identity().hash(&mut hasher);
+        }
+        format!("indexes-{:016x}", hasher.finish())
+    }
 }
 
 #[async_trait]
@@ -824,6 +850,29 @@ impl Registry for MultiPyPiRegistry {
                 constraints
             )
         }))
+    }
+
+    async fn revalidate_version(
+        &self,
+        package: &str,
+        query: VersionQuery<'_>,
+        stale_version: &str,
+    ) -> Result<String> {
+        if self.registries.is_empty() {
+            return Err(anyhow!("No registries configured"));
+        }
+
+        let mut last_error = None;
+        for registry in &self.registries {
+            match registry
+                .revalidate_version(package, query, stale_version)
+                .await
+            {
+                Ok(version) => return Ok(version),
+                Err(error) => last_error = Some(error),
+            }
+        }
+        Err(last_error.unwrap_or_else(|| anyhow!("No versions found for package '{}'", package)))
     }
 
     /// Query indexes in order and return the first non-empty result, so that
@@ -1007,6 +1056,28 @@ mod tests {
     use serial_test::serial;
     use std::io::Write;
     use tempfile::NamedTempFile;
+
+    #[test]
+    fn cache_namespace_tracks_index_chain_without_credentials() {
+        let first = MultiPyPiRegistry::from_primary_and_extras(
+            PyPiRegistry::from_url("https://alice:secret@packages.example/simple"),
+            vec!["https://pypi.org/simple".to_string()],
+        );
+        let same_indexes_different_credentials = MultiPyPiRegistry::from_primary_and_extras(
+            PyPiRegistry::from_url("https://bob:different@packages.example/simple"),
+            vec!["https://pypi.org/simple".to_string()],
+        );
+        let reversed = MultiPyPiRegistry::from_primary_and_extras(
+            PyPiRegistry::from_url("https://pypi.org/simple"),
+            vec!["https://packages.example/simple".to_string()],
+        );
+
+        assert_eq!(
+            first.cache_namespace(),
+            same_indexes_different_credentials.cache_namespace()
+        );
+        assert_ne!(first.cache_namespace(), reversed.cache_namespace());
+    }
 
     #[test]
     fn test_stable_version_detection() {
