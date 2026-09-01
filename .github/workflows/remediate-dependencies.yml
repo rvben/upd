@@ -17,7 +17,7 @@ permissions:
 
 jobs:
   remediate:
-    uses: rvben/upd/.github/workflows/dependency-remediation.yml@1a8c9cd6e0e5f21251f89b2bd9f9fcbff776030d
+    uses: rvben/upd/.github/workflows/dependency-remediation.yml@1a8c9cd6e0e5f21251f89b2bd9f9fcbff776030d # v0.8.5
     with:
       publish: >-
         ${{ github.event_name == 'schedule' ||
