@@ -7,8 +7,8 @@ use crate::fix::npm::write_npm_override_floor;
 use crate::fix::uv::write_uv_constraint_floor;
 use crate::fix::{FixKind, FixTarget, FloorWriteOutcome, NpmOverrideForm};
 use crate::lockfile::{
-    LockfileType, RegenOutcome, cargo_update_precise, detect_lockfiles, regenerate_lockfile,
-    regenerate_lockfiles,
+    LockfileType, RegenOutcome, cargo_update_precise, containing_dir, detect_lockfiles,
+    regenerate_lockfile, regenerate_lockfiles,
 };
 use crate::lockscan::cargo::scan_cargo_lock;
 use crate::lockscan::npm::scan_npm_lock;
@@ -666,7 +666,7 @@ fn apply_cargo_precise_group(
 
     let lock = lockfile.unwrap_or(path);
     let snapshot = Snapshot::capture(std::slice::from_ref(&lock));
-    let lock_dir = lock.parent().unwrap_or(Path::new(".")).to_path_buf();
+    let lock_dir = containing_dir(&lock).to_path_buf();
 
     let mut items: Vec<(FixTarget, Provisional)> = Vec::new();
     for target in targets {

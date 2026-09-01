@@ -192,9 +192,24 @@ fn is_dotnet_manifest(name: &std::ffi::OsStr) -> bool {
         || name == "Directory.Build.props"
 }
 
+/// The directory containing `path`, safe to use as a working directory.
+///
+/// `Path::parent` returns `Some("")` for a bare file name such as
+/// `Cargo.toml`, so an `unwrap_or(".")` fallback never fires and the empty
+/// path leaks through. `Command::current_dir("")` then fails with the same
+/// "No such file or directory" error a missing binary produces, which
+/// misreports a perfectly runnable tool as absent. Map the empty parent to
+/// `.` alongside the absent one.
+pub(crate) fn containing_dir(path: &Path) -> &Path {
+    match path.parent() {
+        Some(dir) if !dir.as_os_str().is_empty() => dir,
+        _ => Path::new("."),
+    }
+}
+
 /// Detect lockfiles in the directory containing the given manifest file
 pub fn detect_lockfiles(manifest_path: &Path) -> Vec<LockfileType> {
-    let dir = manifest_path.parent().unwrap_or(Path::new("."));
+    let dir = containing_dir(manifest_path);
     let mut lockfiles = Vec::new();
 
     // Check for Python lockfiles (only if manifest is pyproject.toml)
@@ -317,7 +332,7 @@ pub(crate) fn regenerate_lockfile(
     changed: &[String],
     verbose: bool,
 ) -> RegenOutcome {
-    let dir = manifest_path.parent().unwrap_or(Path::new("."));
+    let dir = containing_dir(manifest_path);
     let (cmd, args) = match lockfile_type {
         LockfileType::CargoLock => {
             let specs = cargo_update_specs(manifest_path, changed);
@@ -622,7 +637,7 @@ fn locked_entries_to_update<'a>(requirements: &[String], locked: &'a LockedCrate
 /// edge. Every other name stays bare, and so does one whose entry cannot be
 /// singled out, leaving cargo to report the ambiguity itself.
 fn cargo_update_specs(manifest_path: &Path, changed: &[String]) -> Vec<String> {
-    let dir = manifest_path.parent().unwrap_or(Path::new("."));
+    let dir = containing_dir(manifest_path);
     let manifest = std::fs::read_to_string(manifest_path)
         .ok()
         .and_then(|text| text.parse::<toml::Table>().ok());
@@ -1584,6 +1599,33 @@ thiserror = "0.9.1"
             !tool_available("__upd_nonexistent_tool_abc123__"),
             "a nonsense binary name should not be found on PATH"
         );
+    }
+
+    // --- containing_dir ---
+
+    #[test]
+    fn containing_dir_maps_bare_file_name_to_current_dir() {
+        // Path::parent yields Some("") here; the empty path is not a usable
+        // working directory and must come back as ".".
+        assert_eq!(containing_dir(Path::new("Cargo.toml")), Path::new("."));
+    }
+
+    #[test]
+    fn containing_dir_keeps_real_parents() {
+        assert_eq!(
+            containing_dir(Path::new("a/b/Cargo.toml")),
+            Path::new("a/b")
+        );
+        assert_eq!(containing_dir(Path::new("./Cargo.toml")), Path::new("."));
+        assert_eq!(
+            containing_dir(Path::new("/tmp/Cargo.toml")),
+            Path::new("/tmp")
+        );
+    }
+
+    #[test]
+    fn containing_dir_maps_parentless_paths_to_current_dir() {
+        assert_eq!(containing_dir(Path::new("/")), Path::new("."));
     }
 
     // --- regenerate_lockfiles no-lockfile detection ---
