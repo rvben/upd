@@ -10,8 +10,7 @@ use std::process::{Command, Output};
 use tempfile::TempDir;
 
 const WORKFLOW: &str = include_str!("../.github/workflows/dependency-health.yml");
-const RUST_WORKFLOW: &str = include_str!("../.github/workflows/dependencies.yml");
-const ACTIONS_WORKFLOW: &str = include_str!("../.github/workflows/upd.yml");
+const DEPENDENCIES_WORKFLOW: &str = include_str!("../.github/workflows/dependencies.yml");
 const GITLAB_TEMPLATE: &str = include_str!("../ci/gitlab-dependency-update.yml");
 const BRANCH: &str = "automation/upd-github-actions";
 
@@ -1290,33 +1289,24 @@ fn workflow_defaults_are_reproducible_and_safe() {
     assert!(!WORKFLOW.contains("default: latest"));
     assert!(!WORKFLOW.contains("default: v0."));
     assert!(!WORKFLOW.contains("git push --force "));
-    for caller in [RUST_WORKFLOW, ACTIONS_WORKFLOW] {
-        assert!(caller.contains("contents: read"));
-        assert!(caller.contains("packages: read"));
-        assert!(caller.contains("pull-requests: read"));
-        assert!(caller.contains("id-token: write"));
-        assert!(!caller.contains("contents: write"));
-        assert!(!caller.contains("UPD_APP_PRIVATE_KEY"));
-    }
+    assert!(DEPENDENCIES_WORKFLOW.contains("contents: read"));
+    assert!(DEPENDENCIES_WORKFLOW.contains("packages: read"));
+    assert!(DEPENDENCIES_WORKFLOW.contains("pull-requests: read"));
+    assert!(DEPENDENCIES_WORKFLOW.contains("id-token: write"));
+    assert!(!DEPENDENCIES_WORKFLOW.contains("contents: write"));
+    assert!(!DEPENDENCIES_WORKFLOW.contains("UPD_APP_PRIVATE_KEY"));
 }
 
 #[test]
 fn repository_dependency_jobs_share_the_hardened_workflow() {
-    assert!(RUST_WORKFLOW.contains(
+    assert!(DEPENDENCIES_WORKFLOW.contains(
         "uses: rvben/upd/.github/workflows/dependency-health.yml@1a8c9cd6e0e5f21251f89b2bd9f9fcbff776030d"
     ));
-    assert!(RUST_WORKFLOW.contains("langs: rust"));
-    assert!(RUST_WORKFLOW.contains("lock: true"));
-    assert!(RUST_WORKFLOW.contains("branch: deps/upd"));
-    assert!(!RUST_WORKFLOW.contains("broker-url:"));
-    assert!(!RUST_WORKFLOW.contains("UPD_BROKER_URL"));
-    assert!(!RUST_WORKFLOW.contains("git push"));
-    assert!(!RUST_WORKFLOW.contains("upd-version:"));
-
-    assert!(ACTIONS_WORKFLOW.contains(
-        "uses: rvben/upd/.github/workflows/dependency-health.yml@1a8c9cd6e0e5f21251f89b2bd9f9fcbff776030d"
-    ));
-    assert!(!ACTIONS_WORKFLOW.contains("broker-url:"));
-    assert!(!ACTIONS_WORKFLOW.contains("UPD_BROKER_URL"));
-    assert!(!ACTIONS_WORKFLOW.contains("upd-version:"));
+    assert!(DEPENDENCIES_WORKFLOW.contains("langs: rust,actions"));
+    assert!(DEPENDENCIES_WORKFLOW.contains("lock: true"));
+    assert!(DEPENDENCIES_WORKFLOW.contains("branch: deps/upd"));
+    assert!(!DEPENDENCIES_WORKFLOW.contains("broker-url:"));
+    assert!(!DEPENDENCIES_WORKFLOW.contains("UPD_BROKER_URL"));
+    assert!(!DEPENDENCIES_WORKFLOW.contains("git push"));
+    assert!(!DEPENDENCIES_WORKFLOW.contains("upd-version:"));
 }
