@@ -7,3 +7,11 @@ __pycache__/
 # Design and planning notes. docs/ otherwise holds published documentation.
 docs/superpowers/
 .superpowers/
+
+# Local design and review artifacts.
+/assets/literata-upd.woff2
+/marketing-launch-report.html
+/marketing-report.html
+/upd-pr-7-before-after-report.html
+/upd-pr-email-comparison.html
+/upd-pr-experience-plan.html
