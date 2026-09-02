@@ -277,6 +277,7 @@ spec:
       jq --exit-status . "$report" >/dev/null
       jq --raw-output '
         "upd: \(.summary.updates_total) update(s), " +
+        "\(.summary.normalized // 0) normalized specifier(s), " +
         "\(.summary.files_with_changes) changed file(s), " +
         "\(.summary.held_back // 0) held back, " +
         "\(.summary.capped // 0) capped, " +
@@ -336,8 +337,17 @@ spec:
             version: (.version // "unknown" | clean(160)),
             path: ($file.path // "unknown file" | clean(160))
           }] | unique_by([.package, .version, .path]) | sort_by([.package, .path]);
+        def normalized_rows:
+          [.files[]? as $file | $file.normalized[]? | {
+            package: (.package // "unknown dependency" | clean(160)),
+            previous: (if .previous_spec == null then "(no specifier)" else (.previous_spec | clean(160)) end),
+            new: (.new_spec // "unknown" | clean(160)),
+            version: (.version // "unknown" | clean(160)),
+            path: ($file.path // "unknown file" | clean(160)),
+            line: .line
+          }] | sort_by([.package, .path, .line]);
         def policy_rows:
-          [.files[]? as $file |
+          ([.files[]? as $file |
             (($file.held_back // [])[] | {
               kind: "cooldown", package: (.package // "unknown dependency" | clean(160)),
               selected: (.chosen // .current // "unknown" | clean(160)),
@@ -356,7 +366,14 @@ spec:
               available: (.available // "unknown" | clean(160)),
               path: ($file.path // "unknown file" | clean(160))
             })]
-          | unique_by([.kind, .package, .selected, .available, .path])
+          | unique_by([.kind, .package, .selected, .available, .path]))
+          + [.files[]? as $file |
+             ($file.normalized // [])[] | select(.skipped_latest != null) | {
+               kind: "cooldown", package: (.package // "unknown dependency" | clean(160)),
+               selected: (.version // "unknown" | clean(160)),
+               available: (.skipped_latest | clean(160)),
+               path: ($file.path // "unknown file" | clean(160))
+             }]
           | sort_by([.kind, .package, .path]);
         def blocked_rows:
           ([.files[]? as $file | ($file.skipped // [])[]
@@ -381,6 +398,7 @@ spec:
         . as $report
         | (update_rows) as $updates
         | (annotation_rows) as $annotations
+        | (normalized_rows) as $normalized
         | (policy_rows) as $policy_holds
         | (blocked_rows) as $blocked
         | {
@@ -389,6 +407,7 @@ spec:
             changed: $changed,
             updates: $updates,
             annotations: $annotations,
+            normalized: $normalized,
             policy_holds: $policy_holds,
             blocked: $blocked,
             changed_paths: ($changed_paths | map(clean(160)) | unique | sort),
@@ -400,6 +419,7 @@ spec:
               updates_review_worthy: ([$updates[] | select((.bump | ascii_downcase) != "patch")] | length),
               updates_quiet: ([$updates[] | select((.bump | ascii_downcase) == "patch")] | length),
               annotations: ($annotations | length),
+              normalized: ($normalized | length),
               files_changed: ($changed_paths | length),
               policy_holds: ($policy_holds | length),
               blocked: ($blocked | length),
@@ -421,15 +441,25 @@ spec:
            | (($paths | length) > 0 and all($paths[]; startswith(".github/workflows/")))) as $workflow_only
         | (if $workflow_only then "ci(deps)" else "chore(deps)" end) as $title_prefix
         | .title = (
-            if .counts.updates == 1 then
+            if .counts.updates == 1 and .counts.normalized == 0 then
               if ((.updates[0].package | test("^[A-Za-z0-9@][A-Za-z0-9._@/+-]{0,79}$")) and
                   (.updates[0].latest | test("^[A-Za-z0-9][A-Za-z0-9._:+-]{0,79}$"))) then
                 "\($title_prefix): refresh \(.updates[0].package) to \(.updates[0].latest)"
               else
                 "\($title_prefix): refresh dependency"
               end
+            elif .counts.updates > 0 and .counts.normalized > 0 then
+              "\($title_prefix): prepare \(.counts.updates + .counts.normalized) dependency changes"
             elif .counts.updates > 1 then
               "\($title_prefix): refresh \(.counts.updates) dependencies"
+            elif .counts.normalized == 1 then
+              if (.normalized[0].package | test("^[A-Za-z0-9@][A-Za-z0-9._@/+-]{0,79}$")) then
+                "\($title_prefix): normalize \(.normalized[0].package) specifier"
+              else
+                "\($title_prefix): normalize dependency specifier"
+              end
+            elif .counts.normalized > 1 then
+              "\($title_prefix): normalize \(.counts.normalized) dependency specifiers"
             elif .counts.annotations == 1 then
               "\($title_prefix): annotate dependency metadata"
             elif .counts.annotations > 1 then
@@ -511,11 +541,10 @@ spec:
           else "\(.changed_paths[:3] | map(code) | join(", ")) and \(.counts.files_changed - 3) more"
           end;
         def result_summary:
-          if .counts.updates > 0 then
-            "\(.counts.updates) dependency \(plural(.counts.updates; "update"; "updates"))"
-          else
-            "\(.counts.annotations) dependency metadata \(plural(.counts.annotations; "annotation"; "annotations"))"
-          end;
+          ([(if .counts.updates > 0 then "\(.counts.updates) dependency \(plural(.counts.updates; "update"; "updates"))" else empty end),
+            (if .counts.normalized > 0 then "\(.counts.normalized) normalized \(plural(.counts.normalized; "specifier"; "specifiers"))" else empty end)]
+           | if length > 0 then join(" and ")
+             else "\(.counts.annotations) dependency metadata \(plural(.counts.annotations; "annotation"; "annotations"))" end);
         def review_updates: [.updates[] | select((.bump | ascii_downcase) != "patch")];
         def quiet_updates: [.updates[] | select((.bump | ascii_downcase) == "patch")];
         def validation_phrase:
@@ -525,8 +554,15 @@ spec:
             "passed proposal-integrity checks"
           end;
         def version_boundary:
-          if .counts.updates_major == 0 then "No major-version jumps."
-          else "Includes \(.counts.updates_major) major-version \(plural(.counts.updates_major; "jump"; "jumps"))."
+          if .counts.updates == 0 and .counts.normalized > 0 then
+            "Normalized specifiers are replaced as a whole; see the Normalized specifiers section for the versions written."
+          else
+            (if .counts.updates_major == 0 then "No major-version jumps"
+             else "Includes \(.counts.updates_major) major-version \(plural(.counts.updates_major; "jump"; "jumps"))"
+             end)
+            + (if .counts.normalized > 0 then
+                 " among ordinary updates. Normalized specifiers are replaced as a whole; see the Normalized specifiers section for the versions written."
+               else "." end)
           end;
         def brand:
           "<p><a href=\"https://github.com/rvben/upd\"><img src=\"https://raw.githubusercontent.com/rvben/upd/84109eaf36c739dc11af0452c6218abb7e47a8e3/assets/logo-wide.svg\" alt=\"upd\" width=\"96\"></a></p>";
@@ -534,12 +570,13 @@ spec:
           if .counts.blocked > 0 then
             "> **A careful upgrade, with follow-up.** upd prepared \(result_summary) across \(.counts.files_changed) \(plural(.counts.files_changed; "file"; "files")) and \(validation_phrase). It stopped short of \(.counts.blocked) \(plural(.counts.blocked; "dependency"; "dependencies")) it could not change safely."
           else
-            "> **A tidy upgrade, already prepared.** upd moved \(result_summary) forward across \(.counts.files_changed) \(plural(.counts.files_changed; "file"; "files")) and \(validation_phrase). \(version_boundary)"
+            "> **A tidy upgrade, already prepared.** upd prepared \(result_summary) across \(.counts.files_changed) \(plural(.counts.files_changed; "file"; "files")) and \(validation_phrase). \(version_boundary)"
           end;
         def facts:
-          (["\(.counts.updates) moved forward"]
+          ((if .counts.updates > 0 then ["\(.counts.updates) moved forward"] else [] end)
            + (if .counts.updates_review_worthy > 0 then ["\(.counts.updates_review_worthy) worth a look"] else [] end)
            + (if .counts.updates_quiet > 0 then ["\(.counts.updates_quiet) quiet \(plural(.counts.updates_quiet; "patch"; "patches"))"] else [] end)
+           + (if .counts.normalized > 0 then ["\(.counts.normalized) normalized"] else [] end)
            + (if .counts.policy_holds > 0 then ["\(.counts.policy_holds) saved for later"] else [] end)
            + (if .counts.blocked > 0 then ["\(.counts.blocked) \(plural(.counts.blocked; "needs"; "need")) attention"] else [] end))
           | map("**\(.)**") | join(" · ");
@@ -556,6 +593,8 @@ spec:
                "| Dependency | Before | After | Change | File |\n|---|---:|---:|---|---|\n" +
                (.updates[:12] | map("| \(.package | code) | \(.current | code) | \(.latest | code) | \(.bump | md) | \(.path | code) |") | join("\n")) +
                (if .counts.updates > 12 then "\n\n_\(.counts.updates - 12) more updates are preserved in the pipeline artifact._" else "" end)
+             elif .counts.normalized > 0 then
+               "### What changed\n\nupd rewrote dependency specifiers into the configured shape. See the Normalized specifiers section for the versions written."
              else
                "### What changed\n\nupd added or refreshed dependency metadata without changing selected versions."
              end) +
@@ -565,6 +604,13 @@ spec:
              ($quiet[:20] | map("| \(.package | code) | \(.current | code) | \(.latest | code) | \(.path | code) |") | join("\n")) +
              (if ($quiet | length) > 20 then "\n\n_\(($quiet | length) - 20) more patch updates are preserved in the pipeline artifact._" else "" end) +
              "\n\n</details>"
+           else "" end) +
+          (if .counts.normalized > 0 then
+             "\n\n### Normalized specifiers\n\n" +
+             "Each specifier below was replaced as a whole, including any range or ceiling it carried.\n\n" +
+             "| Dependency | Before | After | Version | File |\n|---|---:|---:|---:|---|\n" +
+             (.normalized[:20] | map("| \(.package | code) | \(.previous | code) | \(.new | code) | \(.version | code) | \(.path | code) |") | join("\n")) +
+             (if .counts.normalized > 20 then "\n\n_\(.counts.normalized - 20) more normalized specifiers are preserved in the pipeline artifact._" else "" end)
            else "" end) +
           (if .counts.annotations > 0 then
              "\n\n<details>\n<summary><strong>Dependency metadata (\(.counts.annotations))</strong></summary>\n\n" +
@@ -595,6 +641,7 @@ spec:
           "<details>\n<summary><strong>Proof and provenance</strong></summary>\n\n" +
           "- Applied updates: \(.counts.updates)\n" +
           "- Change mix: \(.counts.updates_major) major, \(.counts.updates_minor) minor, \(.counts.updates_patch) patch\n" +
+          "- Normalized specifiers: \(.counts.normalized)\n" +
           "- Dependency annotations: \(.counts.annotations)\n" +
           "- Held back by policy: \(.counts.policy_holds)\n" +
           "- Blocked: \(.counts.blocked)\n" +
@@ -619,9 +666,11 @@ spec:
           def plural($count; $one; $many): if $count == 1 then $one else $many end;
           def fallback_header:
             if .counts.blocked > 0 then
-              "> **A careful upgrade, with follow-up.** upd prepared \(.counts.updates) dependency \(plural(.counts.updates; "update"; "updates")); \(.counts.blocked) \(plural(.counts.blocked; "dependency needs"; "dependencies need")) attention."
+              "> **A careful upgrade, with follow-up.** upd prepared \(.counts.updates + .counts.normalized) dependency \(plural(.counts.updates + .counts.normalized; "change"; "changes")); \(.counts.blocked) \(plural(.counts.blocked; "dependency needs"; "dependencies need")) attention."
             elif .counts.updates_major > 0 then
               "> **A substantial upgrade, prepared for review.** upd moved \(.counts.updates) dependencies forward, including \(.counts.updates_major) major-version \(plural(.counts.updates_major; "jump"; "jumps"))."
+            elif .counts.updates == 0 and .counts.normalized > 0 then
+              "> **A tidy normalization, already prepared.** upd normalized \(.counts.normalized) dependency \(plural(.counts.normalized; "specifier"; "specifiers")) across \(.counts.files_changed) \(plural(.counts.files_changed; "file"; "files"))."
             elif .validation.repository_command_configured then
               "> **A tidy upgrade, already prepared.** upd moved \(.counts.updates) dependency \(plural(.counts.updates; "update"; "updates")) forward across \(.counts.files_changed) \(plural(.counts.files_changed; "file"; "files"))."
             else
@@ -630,6 +679,7 @@ spec:
           "<p><a href=\"https://github.com/rvben/upd\"><img src=\"https://raw.githubusercontent.com/rvben/upd/84109eaf36c739dc11af0452c6218abb7e47a8e3/assets/logo-wide.svg\" alt=\"upd\" width=\"96\"></a></p>\n\n" +
           fallback_header + "\n\n" +
           "- Major-version jumps: \(.counts.updates_major)\n" +
+          "- Normalized specifiers: \(.counts.normalized)\n" +
           "- Saved for a deliberate upgrade: \(.counts.policy_holds)\n" +
           "- Needs attention: \(.counts.blocked)\n" +
           "- Validation: \(if .validation.repository_command_configured then "project validation and proposal integrity passed" else "proposal integrity passed; no project-specific command was configured" end)\n\n" +

@@ -67,7 +67,10 @@ fn classify_update_error(message: &str) -> &'static str {
         || lower.contains("ref not found")
     {
         "registry"
-    } else if lower.contains("parse") || lower.contains("invalid version") {
+    } else if lower.contains("parse")
+        || lower.contains("invalid version")
+        || lower.contains("cannot normalize")
+    {
         "parse"
     } else if lower.contains("permission denied") || lower.contains("failed to read") {
         "io"
@@ -96,6 +99,8 @@ pub struct UpdateFileReport {
     pub capped: Vec<CappedEntry>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub annotations: Vec<AnnotationEntry>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub normalized: Vec<NormalizedEntry>,
     pub errors: Vec<ErrorEntry>,
     pub warnings: Vec<String>,
 }
@@ -114,6 +119,24 @@ pub struct AnnotationEntry {
     pub version: String,
     /// The immutable reference the annotation describes.
     pub commit: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub line: Option<usize>,
+}
+
+/// A complete dependency specifier rewritten to a configured shape.
+#[derive(Debug, Serialize)]
+pub struct NormalizedEntry {
+    pub package: String,
+    /// Exact pyproject array containing this declaration.
+    pub section: String,
+    pub previous_spec: Option<String>,
+    pub new_spec: String,
+    pub version: String,
+    pub pinned: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub skipped_latest: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub skipped_published_at: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub line: Option<usize>,
 }
@@ -289,6 +312,9 @@ pub struct UpdateSummary {
     /// exits 1.
     #[serde(default, skip_serializing_if = "is_zero")]
     pub annotations: usize,
+    /// Specifiers rewritten to the configured `[normalize.pyproject]` shape.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub normalized: usize,
     /// Newer releases `upd` found but has no mechanism to write, each visible
     /// in `files[].updates[]` with `status: "unfixable"` and an `error` naming
     /// the reason. Never folded into the up-to-date tally: a release is
@@ -618,6 +644,25 @@ pub fn build_update_file_report(
         })
         .collect();
 
+    let normalized = result
+        .normalized
+        .iter()
+        .map(|entry| NormalizedEntry {
+            package: entry.package.clone(),
+            section: entry.section.clone(),
+            previous_spec: entry.previous_spec.clone(),
+            new_spec: entry.new_spec.clone(),
+            version: entry.version.clone(),
+            pinned: entry.pinned,
+            skipped_latest: entry
+                .held_back_from
+                .as_ref()
+                .map(|(version, _)| version.clone()),
+            skipped_published_at: entry.held_back_from.as_ref().map(|(_, at)| at.to_rfc3339()),
+            line: entry.line_number,
+        })
+        .collect();
+
     let path_str = display_path(path);
     let errors = result
         .errors
@@ -637,6 +682,7 @@ pub fn build_update_file_report(
         skipped,
         capped,
         annotations,
+        normalized,
         errors,
         warnings: result.warnings.clone(),
     }
@@ -992,7 +1038,7 @@ mod tests {
     use super::*;
     use crate::align::{PackageAlignment, PackageOccurrence};
     use crate::audit::{Ecosystem, Package, PackageAuditResult};
-    use crate::updater::{FileType, Lang, UpdateResult};
+    use crate::updater::{FileType, Lang, NormalizedSpec, UpdateResult};
     use std::path::PathBuf;
 
     fn stub_classify(old: &str, new: &str) -> &'static str {
@@ -1739,5 +1785,34 @@ mod tests {
             "empty aliases must be omitted"
         );
         assert!(json.get("source").is_none(), "empty source must be omitted");
+    }
+
+    #[test]
+    fn normalized_specs_have_a_distinct_json_channel() {
+        let mut result = UpdateResult::default();
+        result.normalized.push(NormalizedSpec {
+            package: "click".to_string(),
+            section: "project.dependencies".to_string(),
+            previous_spec: None,
+            new_spec: ">=8.2.1".to_string(),
+            version: "8.2.1".to_string(),
+            previous_version: None,
+            pinned: false,
+            held_back_from: None,
+            line_number: Some(4),
+        });
+        let report = build_update_file_report(
+            Path::new("pyproject.toml"),
+            FileType::PyProject,
+            &result,
+            None,
+            |_, _| "minor",
+        );
+        let json = serde_json::to_value(report).unwrap();
+        assert_eq!(json["normalized"][0]["package"], "click");
+        assert_eq!(json["normalized"][0]["section"], "project.dependencies");
+        assert!(json["normalized"][0]["previous_spec"].is_null());
+        assert_eq!(json["normalized"][0]["new_spec"], ">=8.2.1");
+        assert_eq!(json["normalized"][0]["line"], 4);
     }
 }

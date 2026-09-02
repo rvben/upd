@@ -1,18 +1,21 @@
 use super::{
-    FileType, ParsedDependency, UpdateOptions, UpdateResult, Updater, downgrade_warning,
-    pep440_admits, python_version_with_revalidation, read_file_safe, specifier_floor,
-    unpinnable_error, unreadable_error, unrewritable_warning, write_file_atomic,
+    FileType, ParsedDependency, UpdateOptions, UpdateResult, Updater, apply_cooldown_without_floor,
+    downgrade_warning, pep440_admits, python_version_with_revalidation, read_file_safe,
+    replace_string_value, specifier_floor, unpinnable_error, unreadable_error,
+    unrewritable_warning, write_file_atomic,
 };
 use crate::align::compare_versions;
+use crate::config::SpecifierOperator;
+use crate::normalize::pep503_normalize;
 use crate::registry::{DeclaredIndex, IndexChain, Registry, VersionQuery};
-use crate::updater::Lang;
+use crate::updater::{Lang, NormalizedSpec};
 use crate::version::{is_prerelease_pep440, is_stable_pep440, match_version_precision};
 use anyhow::{Result, anyhow};
 use futures::future::join_all;
 use regex::Regex;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
-use toml_edit::{DocumentMut, Formatted, Item, Value};
+use toml_edit::{Array, DocumentMut, Formatted, Item, TableLike, Value};
 
 /// Package indexes declared by a manifest: the query chain and the packages
 /// pinned to a named index (package name -> declared index name).
@@ -22,19 +25,19 @@ struct DeclaredIndexes {
     pins: HashMap<String, String>,
 }
 
-fn table_str<'t>(table: &'t toml_edit::Table, key: &str) -> Option<&'t str> {
+fn table_str<'t>(table: &'t dyn TableLike, key: &str) -> Option<&'t str> {
     match table.get(key) {
         Some(Item::Value(Value::String(s))) if !s.value().is_empty() => Some(s.value()),
         _ => None,
     }
 }
 
-fn table_bool(table: &toml_edit::Table, key: &str) -> bool {
+fn table_bool(table: &dyn TableLike, key: &str) -> bool {
     matches!(table.get(key), Some(Item::Value(Value::Boolean(b))) if *b.value())
 }
 
 /// The string entries of an array value; a missing key or a non-array is empty.
-fn table_str_array(table: &toml_edit::Table, key: &str) -> Vec<String> {
+fn table_str_array(table: &dyn TableLike, key: &str) -> Vec<String> {
     match table.get(key) {
         Some(Item::Value(Value::Array(items))) => items
             .iter()
@@ -46,6 +49,45 @@ fn table_str_array(table: &toml_edit::Table, key: &str) -> Vec<String> {
     }
 }
 
+fn table_entries<'t>(table: &'t dyn TableLike, key: &str) -> Vec<&'t dyn TableLike> {
+    match table.get(key) {
+        Some(Item::ArrayOfTables(tables)) => {
+            tables.iter().map(|entry| entry as &dyn TableLike).collect()
+        }
+        Some(Item::Value(Value::Array(values))) => values
+            .iter()
+            .filter_map(Value::as_inline_table)
+            .map(|entry| entry as &dyn TableLike)
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+fn item_at<'a>(doc: &'a DocumentMut, path: &[&str]) -> Option<&'a Item> {
+    let (first, rest) = path.split_first()?;
+    let mut item = doc.get(first)?;
+    for key in rest {
+        item = item.as_table_like()?.get(key)?;
+    }
+    Some(item)
+}
+
+fn array_at<'a>(doc: &'a mut DocumentMut, path: &[&str]) -> Option<&'a mut Array> {
+    let (first, rest) = path.split_first()?;
+    let mut item = doc.get_mut(first)?;
+    for key in rest {
+        item = item.as_table_like_mut()?.get_mut(key)?;
+    }
+    item.as_array_mut()
+}
+
+fn keys_at(doc: &DocumentMut, path: &[&str]) -> Vec<String> {
+    item_at(doc, path)
+        .and_then(Item::as_table_like)
+        .map(|table| table.iter().map(|(key, _)| key.to_string()).collect())
+        .unwrap_or_default()
+}
+
 pub struct PyProjectUpdater {
     // Regex to extract version from dependency string
     // Matches: package==1.0.0, package>=1.0.0, package[extra]>=1.0.0, etc.
@@ -53,11 +95,17 @@ pub struct PyProjectUpdater {
     // Regex to capture the full constraint including additional constraints after commas
     // E.g., ">=2.8.0,<9" or ">=1.0.0,!=1.5.0,<2.0.0"
     constraint_re: Regex,
+    /// A name with optional extras and marker but no version specifier.
+    bare_re: Regex,
+    /// PEP 508's parenthesized form, `foo (>=1, <2)`.
+    paren_re: Regex,
 }
 
 #[derive(Default)]
 struct PyProjectLineIndex {
     lines_by_section: HashMap<String, HashMap<String, usize>>,
+    /// Section -> exact dependency value -> physical lines, in document order.
+    lines_by_entry: HashMap<String, HashMap<String, Vec<usize>>>,
 }
 
 /// One PEP 508 dependency string, read.
@@ -72,10 +120,293 @@ struct ParsedDep {
     raisable: bool,
 }
 
+/// Parsed coordinates and semantics for one dependency normalization target.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct NormalizeTarget {
+    package: String,
+    name_end: usize,
+    spec_start: usize,
+    spec_end: usize,
+    previous_spec: Option<String>,
+    version: Option<String>,
+    single_clause: Option<(String, String)>,
+    /// Greatest inclusive lower bound that parses as a PEP 440 version.
+    anchor: Option<String>,
+    /// Version the ordinary shape-preserving path can act on.
+    interactive_version: Option<String>,
+}
+
+fn is_version_operand(operand: &str) -> bool {
+    operand.parse::<pep440_rs::Version>().is_ok()
+}
+
+pub(crate) fn has_local_label(version: &str) -> bool {
+    version
+        .parse::<pep440_rs::Version>()
+        .is_ok_and(|version| version.is_local())
+}
+
+struct ManifestContext<'a> {
+    line_index: &'a PyProjectLineIndex,
+    non_registry: HashSet<String>,
+}
+
+struct NormalizeSection<'a> {
+    path: &'a str,
+    operator: SpecifierOperator,
+}
+
+enum Rewrite {
+    Unchanged,
+    SameShape,
+    NewShape,
+}
+
+fn classify_rewrite(target: &NormalizeTarget, operator: &str, version: &str) -> Rewrite {
+    match &target.single_clause {
+        Some((existing_operator, existing_version))
+            if existing_operator == operator && existing_version == version =>
+        {
+            Rewrite::Unchanged
+        }
+        Some((existing_operator, _))
+            if existing_operator == operator && target.anchor.is_some() =>
+        {
+            Rewrite::SameShape
+        }
+        _ => Rewrite::NewShape,
+    }
+}
+
+fn section_operator(section_path: &str, options: &UpdateOptions) -> Option<SpecifierOperator> {
+    let pyproject = options.config.as_ref()?.normalize?.pyproject?;
+    if section_path == "project.dependencies" {
+        pyproject.dependencies
+    } else if section_path.starts_with("project.optional-dependencies.") {
+        pyproject.optional_dependencies
+    } else if section_path.starts_with("dependency-groups.") {
+        pyproject.dependency_groups
+    } else {
+        None
+    }
+}
+
+fn split_clause(clause: &str) -> Option<(String, String)> {
+    let op_len = if clause.starts_with("===") {
+        3
+    } else if ["==", ">=", "<=", "~=", "!="]
+        .iter()
+        .any(|op| clause.starts_with(op))
+    {
+        2
+    } else if clause.starts_with('>') || clause.starts_with('<') {
+        1
+    } else {
+        return None;
+    };
+    let operand = &clause[op_len..];
+    (!operand.is_empty()).then(|| (clause[..op_len].to_string(), operand.to_string()))
+}
+
+fn greatest_pep440_floor(clauses: &[String]) -> Option<String> {
+    clauses
+        .iter()
+        .filter_map(|clause| split_clause(clause))
+        .filter(|(operator, _)| crate::updater::operator_is_raisable(operator))
+        .filter_map(|(_, operand)| {
+            operand
+                .parse::<pep440_rs::Version>()
+                .ok()
+                .map(|parsed| (parsed, operand))
+        })
+        .max_by(|(a, _), (b, _)| a.cmp(b))
+        .map(|(_, operand)| operand)
+}
+
+fn specifier_target(
+    package: &str,
+    (name_end, spec_start): (usize, usize),
+    spec: &str,
+    spec_end: usize,
+) -> Option<NormalizeTarget> {
+    let clauses: Vec<String> = spec
+        .split(',')
+        .map(|clause| clause.chars().filter(|c| !c.is_whitespace()).collect())
+        .collect();
+    let parsed: Vec<(String, String)> = clauses
+        .iter()
+        .map(|clause| split_clause(clause))
+        .collect::<Option<_>>()?;
+    let single_clause = match parsed.as_slice() {
+        [only] => Some(only.clone()),
+        _ => None,
+    };
+    let anchor = greatest_pep440_floor(&clauses);
+    let interactive_version = match specifier_floor(spec, 0) {
+        Some(floor) if floor.raisable => Some(spec[floor.range].to_string()),
+        Some(_) => None,
+        None => parsed.first().and_then(|(operator, operand)| {
+            crate::updater::operator_is_raisable(operator).then(|| operand.clone())
+        }),
+    };
+    let version = anchor.clone().unwrap_or_else(|| parsed[0].1.clone());
+    Some(NormalizeTarget {
+        package: package.to_string(),
+        name_end,
+        spec_start,
+        spec_end,
+        previous_spec: Some(spec.to_string()),
+        version: Some(version),
+        single_clause: single_clause.filter(|(_, operand)| is_version_operand(operand)),
+        anchor,
+        interactive_version,
+    })
+}
+
+fn with_specifier(dep: &str, target: &NormalizeTarget, spec: &str) -> String {
+    let mut out = String::with_capacity(dep.len() + spec.len());
+    out.push_str(&dep[..target.name_end]);
+    out.push_str(dep[target.name_end..target.spec_start].trim_start());
+    out.push_str(spec);
+    out.push_str(&dep[target.spec_end..]);
+    out
+}
+
+fn name_bounds(caps: &regex::Captures<'_>) -> (usize, usize) {
+    let name_end = caps.get(1).unwrap().end();
+    (name_end, caps.get(2).map_or(name_end, |m| m.end()))
+}
+
+/// Registry-inapplicable dependencies declared through uv or Poetry sources.
+fn non_registry_sources(doc: &DocumentMut) -> HashSet<String> {
+    let mut names = HashSet::new();
+    let Some(tool) = doc.get("tool").and_then(Item::as_table_like) else {
+        return names;
+    };
+
+    if let Some(sources) = tool
+        .get("uv")
+        .and_then(Item::as_table_like)
+        .and_then(|uv| uv.get("sources"))
+        .and_then(Item::as_table_like)
+    {
+        for (package, source) in sources.iter() {
+            let non_index = match source {
+                // A list represents marker-qualified alternatives. Choosing one
+                // index's version for the shared PEP 621 declaration could make
+                // the other environment unresolvable, so leave it untouched.
+                Item::Value(Value::Array(_)) => true,
+                other => other.as_table_like().is_some_and(|table| {
+                    table.get("index").is_none() || table.get("marker").is_some()
+                }),
+            };
+            if non_index {
+                names.insert(pep503_normalize(package));
+            }
+        }
+    }
+
+    if let Some(deps) = tool
+        .get("poetry")
+        .and_then(Item::as_table_like)
+        .and_then(|poetry| poetry.get("dependencies"))
+        .and_then(Item::as_table_like)
+    {
+        const SOURCE_KEYS: [&str; 4] = ["path", "git", "url", "source"];
+        for (package, dep) in deps.iter() {
+            let sourced_elsewhere = match dep {
+                Item::Value(Value::Array(alternatives)) => alternatives.iter().any(|alt| {
+                    alt.as_inline_table()
+                        .is_none_or(|table| SOURCE_KEYS.iter().any(|key| table.get(key).is_some()))
+                }),
+                other => other
+                    .as_table_like()
+                    .is_some_and(|table| SOURCE_KEYS.iter().any(|key| table.get(key).is_some())),
+            };
+            if sourced_elsewhere {
+                names.insert(pep503_normalize(package));
+            }
+        }
+    }
+    names
+}
+
+/// Apply the shape-changing rewrites discovered by a dry-run scan.
+///
+/// Interactive mode applies ordinary version transitions through its generic
+/// writer. Bare and compound PEP 508 entries need the pyproject parser itself,
+/// because their whole specifier changes rather than one version token.
+pub fn apply_normalized_specs(content: &str, specs: &[NormalizedSpec]) -> Result<String> {
+    if specs.is_empty() {
+        return Ok(content.to_string());
+    }
+
+    let mut doc: DocumentMut = content.parse().map_err(|error: toml_edit::TomlError| {
+        anyhow!("failed to parse pyproject.toml while applying normalization: {error}")
+    })?;
+    let updater = PyProjectUpdater::new();
+    let mut applied = vec![false; specs.len()];
+
+    let mut rewrite_array = |section: &str, array: &mut toml_edit::Array| {
+        for value in array.iter_mut() {
+            let Some(dep) = value.as_str() else {
+                continue;
+            };
+            let Some(target) = updater.parse_normalizable(dep) else {
+                continue;
+            };
+            let Some((index, spec)) = specs.iter().enumerate().find(|(index, spec)| {
+                !applied[*index]
+                    && spec.section == section
+                    && pep503_normalize(&spec.package) == pep503_normalize(&target.package)
+                    && spec.previous_spec == target.previous_spec
+            }) else {
+                continue;
+            };
+            let rewritten = with_specifier(dep, &target, &spec.new_spec);
+            if let Value::String(formatted) = value {
+                replace_string_value(formatted, rewritten);
+                applied[index] = true;
+            }
+        }
+    };
+
+    if let Some(dependencies) = array_at(&mut doc, &["project", "dependencies"]) {
+        rewrite_array("project.dependencies", dependencies);
+    }
+    for group in keys_at(&doc, &["project", "optional-dependencies"]) {
+        if let Some(dependencies) = array_at(
+            &mut doc,
+            &["project", "optional-dependencies", group.as_str()],
+        ) {
+            rewrite_array(
+                &format!("project.optional-dependencies.{group}"),
+                dependencies,
+            );
+        }
+    }
+    for group in keys_at(&doc, &["dependency-groups"]) {
+        if let Some(dependencies) = array_at(&mut doc, &["dependency-groups", group.as_str()]) {
+            rewrite_array(&format!("dependency-groups.{group}"), dependencies);
+        }
+    }
+
+    if let Some(index) = applied.iter().position(|done| !done) {
+        let spec = &specs[index];
+        return Err(anyhow!(
+            "could not find '{}' with specifier {} while applying normalization",
+            spec.package,
+            spec.previous_spec.as_deref().unwrap_or("(unpinned)")
+        ));
+    }
+    Ok(doc.to_string())
+}
+
 #[derive(Clone)]
 struct ArraySectionState {
     section_path: String,
     depth: usize,
+    table_depth: usize,
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -84,10 +415,17 @@ struct ArrayBracketCounts {
     closing: usize,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum MultiLineString {
+    Outside,
+    Basic,
+    Literal,
+}
+
 impl PyProjectUpdater {
     pub fn new() -> Self {
         let version_re = Regex::new(
-            r"^([a-zA-Z0-9][-a-zA-Z0-9._]*)(\[[^\]]+\])?\s*(==|>=|<=|~=|!=|>|<)\s*([^\s,;]+)",
+            r"^([a-zA-Z0-9][-a-zA-Z0-9._]*)\s*(\[[^\]]+\])?\s*(==|>=|<=|~=|!=|>|<)\s*([^\s,;]+)",
         )
         .expect("Invalid regex");
 
@@ -96,13 +434,22 @@ impl PyProjectUpdater {
         // whitespace between an operator and its version, so ">= 2.0, < 3" is
         // the same set of clauses; each version runs to the next separator.
         let constraint_re = Regex::new(
-            r"^([a-zA-Z0-9][-a-zA-Z0-9._]*)(\[[^\]]+\])?\s*((?:==|>=|<=|~=|!=|>|<)\s*[^\s;,]+(?:\s*,\s*(?:==|>=|<=|~=|!=|>|<)\s*[^\s;,]+)*)",
+            r"^([a-zA-Z0-9][-a-zA-Z0-9._]*)\s*(\[[^\]]+\])?\s*((?:===|==|>=|<=|~=|!=|>|<)\s*[^\s;,]+(?:\s*,\s*(?:===|==|>=|<=|~=|!=|>|<)\s*[^\s;,]+)*)",
+        )
+        .expect("Invalid regex");
+
+        let bare_re = Regex::new(r"^([a-zA-Z0-9][-a-zA-Z0-9._]*)\s*(\[[^\]]+\])?\s*(;.*)?$")
+            .expect("Invalid regex");
+        let paren_re = Regex::new(
+            r"^([a-zA-Z0-9][-a-zA-Z0-9._]*)\s*(\[[^\]]+\])?\s*\(\s*([^)]*?)\s*(\))\s*(?:;.*)?$",
         )
         .expect("Invalid regex");
 
         Self {
             version_re,
             constraint_re,
+            bare_re,
+            paren_re,
         }
     }
 
@@ -184,6 +531,54 @@ impl PyProjectUpdater {
         }
     }
 
+    /// Parse every registry-shaped PEP 508 entry, including a bare name and
+    /// parenthesized specifier, and locate the complete specifier for replacement.
+    fn parse_normalizable(&self, dep: &str) -> Option<NormalizeTarget> {
+        let lead = dep.len() - dep.trim_start().len();
+        let trimmed = &dep[lead..];
+        let mut target = if let Some(caps) = self.constraint_re.captures(trimmed) {
+            let spec = caps.get(3).unwrap();
+            specifier_target(
+                caps.get(1).unwrap().as_str(),
+                name_bounds(&caps),
+                spec.as_str(),
+                spec.end(),
+            )?
+        } else if let Some(caps) = self.paren_re.captures(trimmed) {
+            let close = caps.get(4).unwrap().end();
+            let spec = caps.get(3).unwrap();
+            let mut target = specifier_target(
+                caps.get(1).unwrap().as_str(),
+                name_bounds(&caps),
+                spec.as_str(),
+                close,
+            )?;
+            let open = trimmed[..spec.start()].rfind('(')?;
+            target.previous_spec = Some(trimmed[open..close].to_string());
+            target.single_clause = None;
+            target.interactive_version = None;
+            target
+        } else {
+            let caps = self.bare_re.captures(trimmed)?;
+            let (name_end, spec_start) = name_bounds(&caps);
+            NormalizeTarget {
+                package: caps.get(1).unwrap().as_str().to_string(),
+                name_end,
+                spec_start,
+                spec_end: spec_start,
+                previous_spec: None,
+                version: None,
+                single_clause: None,
+                anchor: None,
+                interactive_version: None,
+            }
+        };
+        target.name_end += lead;
+        target.spec_start += lead;
+        target.spec_end += lead;
+        Some(target)
+    }
+
     fn assignment_parts(line: &str) -> Option<(String, &str)> {
         let trimmed = line.trim();
         if trimmed.is_empty() || trimmed.starts_with('#') || trimmed.starts_with('[') {
@@ -205,24 +600,23 @@ impl PyProjectUpdater {
     /// is consulted: uv, then Poetry, then PDM. A project that keeps a stale
     /// `[tool.poetry]` around after moving to uv is resolved by uv.
     fn declared_indexes(doc: &DocumentMut) -> DeclaredIndexes {
-        let tool = match doc.get("tool") {
-            Some(Item::Table(tool)) => tool,
-            _ => return DeclaredIndexes::default(),
+        let Some(tool) = doc.get("tool").and_then(Item::as_table_like) else {
+            return DeclaredIndexes::default();
         };
 
-        if let Some(Item::Table(uv)) = tool.get("uv") {
+        if let Some(uv) = tool.get("uv").and_then(Item::as_table_like) {
             let declared = Self::uv_indexes(uv);
             if !declared.chain.is_empty() {
                 return declared;
             }
         }
-        if let Some(Item::Table(poetry)) = tool.get("poetry") {
+        if let Some(poetry) = tool.get("poetry").and_then(Item::as_table_like) {
             let declared = Self::poetry_indexes(poetry);
             if !declared.chain.is_empty() {
                 return declared;
             }
         }
-        if let Some(Item::Table(pdm)) = tool.get("pdm") {
+        if let Some(pdm) = tool.get("pdm").and_then(Item::as_table_like) {
             let declared = Self::pdm_indexes(pdm);
             if !declared.chain.is_empty() {
                 return declared;
@@ -236,32 +630,30 @@ impl PyProjectUpdater {
     /// true` restricts an index to packages pinned to it through
     /// `[tool.uv.sources]`. The legacy `[tool.uv] index-url` and
     /// `extra-index-url` keys are the unnamed forms of the same two roles.
-    fn uv_indexes(uv: &toml_edit::Table) -> DeclaredIndexes {
+    fn uv_indexes(uv: &dyn TableLike) -> DeclaredIndexes {
         let mut before_default: Vec<DeclaredIndex> = Vec::new();
         let mut explicit: Vec<DeclaredIndex> = Vec::new();
         let mut default_index: Option<DeclaredIndex> = None;
         let mut default_replaced = false;
 
-        if let Some(Item::ArrayOfTables(indexes)) = uv.get("index") {
-            for index in indexes.iter() {
-                let Some(url) = table_str(index, "url") else {
-                    continue;
-                };
-                let name = table_str(index, "name");
-                let is_default = table_bool(index, "default");
-                let is_explicit = table_bool(index, "explicit");
-                let declared = DeclaredIndex::url(name, url);
+        for index in table_entries(uv, "index") {
+            let Some(url) = table_str(index, "url") else {
+                continue;
+            };
+            let name = table_str(index, "name");
+            let is_default = table_bool(index, "default");
+            let is_explicit = table_bool(index, "explicit");
+            let declared = DeclaredIndex::url(name, url);
 
-                if is_explicit {
-                    // A default+explicit index removes PyPI as the default and
-                    // is still only reachable through pins.
-                    default_replaced |= is_default;
-                    explicit.push(declared.explicit());
-                } else if is_default && default_index.is_none() {
-                    default_index = Some(declared);
-                } else {
-                    before_default.push(declared);
-                }
+            if is_explicit {
+                // A default+explicit index removes PyPI as the default and
+                // is still only reachable through pins.
+                default_replaced |= is_default;
+                explicit.push(declared.explicit());
+            } else if is_default && default_index.is_none() {
+                default_index = Some(declared);
+            } else {
+                before_default.push(declared);
             }
         }
 
@@ -305,7 +697,7 @@ impl PyProjectUpdater {
     /// `[tool.uv.sources]` entries of the form `pkg = { index = "name" }`, or a
     /// list of such tables (the first `index` entry wins; markers are not
     /// evaluated). Git, path and URL sources are not index pins.
-    fn uv_source_pins(uv: &toml_edit::Table) -> HashMap<String, String> {
+    fn uv_source_pins(uv: &dyn TableLike) -> HashMap<String, String> {
         let mut pins = HashMap::new();
         let Some(sources) = uv.get("sources").and_then(|s| s.as_table_like()) else {
             return pins;
@@ -340,16 +732,12 @@ impl PyProjectUpdater {
     /// `secondary = true`) follow PyPI. Explicit sources are only used for
     /// dependencies that name them, which the updater does not model, so they
     /// stay out of the chain.
-    fn poetry_indexes(poetry: &toml_edit::Table) -> DeclaredIndexes {
-        let Some(Item::ArrayOfTables(sources)) = poetry.get("source") else {
-            return DeclaredIndexes::default();
-        };
-
+    fn poetry_indexes(poetry: &dyn TableLike) -> DeclaredIndexes {
         let mut primary: Vec<DeclaredIndex> = Vec::new();
         let mut supplemental: Vec<DeclaredIndex> = Vec::new();
         let mut explicit: Vec<DeclaredIndex> = Vec::new();
 
-        for source in sources.iter() {
+        for source in table_entries(poetry, "source") {
             let name = table_str(source, "name");
             let declared = match table_str(source, "url") {
                 Some(url) => DeclaredIndex::url(name, url),
@@ -393,14 +781,10 @@ impl PyProjectUpdater {
     /// type `index` in declaration order. A source named `pypi` replaces the
     /// default and takes its declared position; `find_links` sources are not
     /// indexes.
-    fn pdm_indexes(pdm: &toml_edit::Table) -> DeclaredIndexes {
-        let Some(Item::ArrayOfTables(sources)) = pdm.get("source") else {
-            return DeclaredIndexes::default();
-        };
-
+    fn pdm_indexes(pdm: &dyn TableLike) -> DeclaredIndexes {
         let mut declared: Vec<DeclaredIndex> = Vec::new();
         let mut replaces_default = false;
-        for source in sources.iter() {
+        for source in table_entries(pdm, "source") {
             if table_str(source, "type").is_some_and(|t| t == "find_links") {
                 continue;
             }
@@ -435,10 +819,26 @@ impl PyProjectUpdater {
         array: &mut toml_edit::Array,
         registry: &dyn Registry,
         result: &mut UpdateResult,
-        line_index: &PyProjectLineIndex,
+        manifest: &ManifestContext<'_>,
         section_path: &str,
         options: &UpdateOptions,
     ) {
+        if let Some(operator) = section_operator(section_path, options) {
+            self.normalize_array_deps(
+                array,
+                registry,
+                result,
+                manifest,
+                options,
+                NormalizeSection {
+                    path: section_path,
+                    operator,
+                },
+            )
+            .await;
+            return;
+        }
+
         // First pass: collect all dependencies and separate by config status
         let mut ignored_deps: Vec<(String, String, Option<usize>)> = Vec::new();
         let mut pinned_deps: Vec<(usize, String, String, String, String, Option<usize>)> =
@@ -450,7 +850,7 @@ impl PyProjectUpdater {
                 && let Some(s) = item.as_str()
                 && let Some(parsed) = self.parse_dependency(s)
             {
-                let line_num = line_index.line_for(section_path, &parsed.package);
+                let line_num = manifest.line_index.line_for(section_path, &parsed.package);
 
                 if options.is_package_filtered_out(&parsed.package) {
                     result.unchanged += 1;
@@ -711,6 +1111,302 @@ impl PyProjectUpdater {
         }
     }
 
+    async fn normalize_array_deps(
+        &self,
+        array: &mut toml_edit::Array,
+        registry: &dyn Registry,
+        result: &mut UpdateResult,
+        manifest: &ManifestContext<'_>,
+        options: &UpdateOptions,
+        section: NormalizeSection<'_>,
+    ) {
+        let operator = section.operator.as_str();
+        let mut to_resolve: Vec<(usize, String, NormalizeTarget, Option<usize>)> = Vec::new();
+        let mut rewrites: Vec<(usize, String)> = Vec::new();
+        let mut occurrences: HashMap<String, usize> = HashMap::new();
+
+        for i in 0..array.len() {
+            let Some(dep) = array.get(i).and_then(Value::as_str) else {
+                continue;
+            };
+            let spans_lines = matches!(
+                array.get(i),
+                Some(Value::String(formatted))
+                    if formatted
+                        .as_repr()
+                        .and_then(|repr| repr.as_raw().as_str())
+                        .is_some_and(|raw| raw.contains('\n'))
+            );
+            let occurrence = if spans_lines {
+                None
+            } else {
+                Some(
+                    *occurrences
+                        .entry(dep.to_owned())
+                        .and_modify(|seen| *seen += 1)
+                        .or_insert(0),
+                )
+            };
+            let Some(target) = self.parse_normalizable(dep) else {
+                continue;
+            };
+            result.normalize_recognized.push(target.package.clone());
+            if manifest
+                .non_registry
+                .contains(&pep503_normalize(&target.package))
+            {
+                continue;
+            }
+            let line_num = occurrence.and_then(|occurrence| {
+                manifest
+                    .line_index
+                    .line_for_entry(section.path, dep, occurrence)
+            });
+
+            if options.is_package_filtered_out(&target.package) {
+                if target.version.is_some() {
+                    result.unchanged += 1;
+                }
+                continue;
+            }
+            if options.should_ignore(&target.package) {
+                if let Some(version) = target.version {
+                    result.ignored.push((target.package, version, line_num));
+                }
+                continue;
+            }
+
+            if let Some(pin) = options.get_pinned_version(&target.package) {
+                if !is_version_operand(pin) {
+                    result.errors.push(format!(
+                        "cannot normalize '{}': pin '{}' is not a version, and [normalize.pyproject] writes {}<version>",
+                        target.package, pin, operator
+                    ));
+                    continue;
+                }
+                if section.operator != SpecifierOperator::Exact && has_local_label(pin) {
+                    result.errors.push(format!(
+                        "cannot normalize '{}': pin '{}' carries a local label, which {} does not take",
+                        target.package, pin, operator
+                    ));
+                    continue;
+                }
+                let spec = format!("{operator}{pin}");
+                match classify_rewrite(&target, operator, pin) {
+                    Rewrite::Unchanged => result.unchanged += 1,
+                    Rewrite::SameShape => {
+                        let (_, existing) = target.single_clause.clone().unwrap();
+                        result.pinned.push((
+                            target.package.clone(),
+                            existing,
+                            pin.to_string(),
+                            line_num,
+                        ));
+                        rewrites.push((i, with_specifier(dep, &target, &spec)));
+                    }
+                    Rewrite::NewShape => {
+                        result.normalized.push(NormalizedSpec {
+                            package: target.package.clone(),
+                            section: section.path.to_string(),
+                            previous_spec: target.previous_spec.clone(),
+                            new_spec: spec.clone(),
+                            version: pin.to_string(),
+                            previous_version: target.interactive_version.clone(),
+                            pinned: true,
+                            held_back_from: None,
+                            line_number: line_num,
+                        });
+                        rewrites.push((i, with_specifier(dep, &target, &spec)));
+                    }
+                }
+                continue;
+            }
+
+            to_resolve.push((i, dep.to_string(), target, line_num));
+        }
+
+        let lookups: Vec<_> = to_resolve
+            .iter()
+            .map(|(_, _, target, _)| async {
+                match target.anchor.as_deref() {
+                    Some(anchor) if !is_stable_pep440(anchor) => {
+                        python_version_with_revalidation(
+                            registry,
+                            &target.package,
+                            anchor,
+                            VersionQuery::IncludingPrereleases,
+                        )
+                        .await
+                    }
+                    Some(anchor) => {
+                        python_version_with_revalidation(
+                            registry,
+                            &target.package,
+                            anchor,
+                            VersionQuery::Stable,
+                        )
+                        .await
+                    }
+                    _ => registry.get_latest_version(&target.package).await,
+                }
+            })
+            .collect();
+        let resolved = join_all(lookups).await;
+
+        for ((i, dep, target, line_num), lookup) in to_resolve.into_iter().zip(resolved) {
+            let latest = match lookup {
+                Ok(latest) => latest,
+                Err(error) => {
+                    result.errors.push(format!("{}: {}", target.package, error));
+                    continue;
+                }
+            };
+
+            if section.operator != SpecifierOperator::Exact && has_local_label(&latest) {
+                result.warnings.push(format!(
+                    "'{}': the newest release, {}, carries a local label, which {} does not take; left as written",
+                    target.package, latest, operator
+                ));
+                result.unchanged += 1;
+                continue;
+            }
+
+            let (outcome, note) = match target.anchor.as_deref() {
+                Some(anchor) => {
+                    crate::updater::apply_cooldown(
+                        registry,
+                        &target.package,
+                        anchor,
+                        &latest,
+                        None,
+                        is_prerelease_pep440(&latest),
+                        options,
+                    )
+                    .await
+                }
+                None => {
+                    apply_cooldown_without_floor(
+                        registry,
+                        &target.package,
+                        &latest,
+                        is_prerelease_pep440(&latest),
+                        options,
+                    )
+                    .await
+                }
+            };
+            if let Some(note) = note {
+                options.note_cooldown_unavailable(&note);
+            }
+            let (chosen, held_back) = match outcome {
+                crate::updater::CooldownOutcome::Unchanged(version) => (version, None),
+                crate::updater::CooldownOutcome::HeldBack {
+                    chosen,
+                    skipped_version,
+                    skipped_published_at,
+                } => (chosen, Some((skipped_version, skipped_published_at))),
+                crate::updater::CooldownOutcome::Skipped {
+                    skipped_version,
+                    skipped_published_at,
+                } => {
+                    if let Some(anchor) = target.anchor {
+                        result.skipped_by_cooldown.push((
+                            target.package,
+                            anchor,
+                            skipped_version,
+                            skipped_published_at,
+                        ));
+                    } else {
+                        result.warnings.push(format!(
+                            "'{}' names no release to keep ({}) and the newest one, {}, is inside the cooldown window; left as written",
+                            target.package,
+                            target.previous_spec.as_deref().unwrap_or("no specifier"),
+                            skipped_version
+                        ));
+                    }
+                    continue;
+                }
+            };
+
+            if section.operator != SpecifierOperator::Exact && has_local_label(&chosen) {
+                result.warnings.push(format!(
+                    "'{}': cooldown selects {}, which carries a local label that {} does not take; left as written",
+                    target.package, chosen, operator
+                ));
+                result.unchanged += 1;
+                continue;
+            }
+
+            if let Some(anchor) = &target.anchor {
+                if compare_versions(&chosen, anchor, Lang::Python) == std::cmp::Ordering::Less {
+                    result
+                        .warnings
+                        .push(downgrade_warning(&target.package, &chosen, anchor));
+                    result.unchanged += 1;
+                    continue;
+                }
+                if chosen != *anchor && !options.allows_bump(anchor, &chosen) {
+                    result.record_capped(&target.package, anchor, &chosen, line_num);
+                    continue;
+                }
+            }
+
+            let spec = format!("{operator}{chosen}");
+            match classify_rewrite(&target, operator, &chosen) {
+                Rewrite::Unchanged => {
+                    if let Some((skipped_version, _)) = &held_back {
+                        result.warnings.push(format!(
+                            "'{}' is left as written ({}): the newest release, {}, is inside the cooldown window",
+                            target.package,
+                            target.previous_spec.as_deref().unwrap_or("no specifier"),
+                            skipped_version
+                        ));
+                    }
+                    result.unchanged += 1;
+                }
+                Rewrite::SameShape => {
+                    let (_, existing) = target.single_clause.clone().unwrap();
+                    result.updated.push((
+                        target.package.clone(),
+                        existing.clone(),
+                        chosen.clone(),
+                        line_num,
+                    ));
+                    if let Some((skipped_version, skipped_published_at)) = held_back {
+                        result.held_back.push((
+                            target.package.clone(),
+                            existing,
+                            chosen,
+                            skipped_version,
+                            skipped_published_at,
+                        ));
+                    }
+                    rewrites.push((i, with_specifier(&dep, &target, &spec)));
+                }
+                Rewrite::NewShape => {
+                    result.normalized.push(NormalizedSpec {
+                        package: target.package.clone(),
+                        section: section.path.to_string(),
+                        previous_spec: target.previous_spec.clone(),
+                        new_spec: spec.clone(),
+                        version: chosen,
+                        previous_version: target.interactive_version.clone(),
+                        pinned: false,
+                        held_back_from: held_back,
+                        line_number: line_num,
+                    });
+                    rewrites.push((i, with_specifier(&dep, &target, &spec)));
+                }
+            }
+        }
+
+        for (i, rewritten) in rewrites {
+            if let Some(Value::String(formatted)) = array.get_mut(i) {
+                replace_string_value(formatted, rewritten);
+            }
+        }
+    }
+
     async fn update_poetry_deps(
         &self,
         deps_table: &mut toml_edit::Table,
@@ -939,23 +1635,75 @@ impl PyProjectUpdater {
 
 impl PyProjectLineIndex {
     fn record_dependency_literals(
-        lines_by_section: &mut HashMap<String, HashMap<String, usize>>,
+        index: &mut PyProjectLineIndex,
         section_path: &str,
         line: &str,
+        table_depth: &mut usize,
         literal_re: &Regex,
         updater: &PyProjectUpdater,
         line_num: usize,
     ) {
-        for caps in literal_re.captures_iter(line) {
-            let dep = caps.get(1).or_else(|| caps.get(2)).unwrap().as_str();
-            if let Some(parsed) = updater.parse_dependency(dep) {
-                lines_by_section
+        let code = Self::code_before_comment(line);
+        let mut scanned_to = 0;
+        for found in literal_re.find_iter(code) {
+            Self::count_table_braces(&code[scanned_to..found.start()], table_depth);
+            scanned_to = found.end();
+            if *table_depth > 0 {
+                continue;
+            }
+            let Some(dep) = found
+                .as_str()
+                .parse::<Value>()
+                .ok()
+                .and_then(|value| value.as_str().map(str::to_owned))
+            else {
+                continue;
+            };
+            index
+                .lines_by_entry
+                .entry(section_path.to_string())
+                .or_default()
+                .entry(dep.clone())
+                .or_default()
+                .push(line_num);
+            if let Some(parsed) = updater.parse_dependency(&dep) {
+                index
+                    .lines_by_section
                     .entry(section_path.to_string())
                     .or_default()
                     .entry(parsed.package)
                     .or_insert(line_num);
             }
         }
+        Self::count_table_braces(&code[scanned_to..], table_depth);
+    }
+
+    fn count_table_braces(code: &str, depth: &mut usize) {
+        for ch in code.chars() {
+            match ch {
+                '{' => *depth += 1,
+                '}' => *depth = depth.saturating_sub(1),
+                _ => {}
+            }
+        }
+    }
+
+    fn code_before_comment(line: &str) -> &str {
+        let mut in_basic = false;
+        let mut in_literal = false;
+        let mut chars = line.char_indices();
+        while let Some((index, ch)) = chars.next() {
+            match ch {
+                '#' if !in_basic && !in_literal => return &line[..index],
+                '"' if !in_literal => in_basic = !in_basic,
+                '\'' if !in_basic => in_literal = !in_literal,
+                '\\' if in_basic => {
+                    let _ = chars.next();
+                }
+                _ => {}
+            }
+        }
+        line
     }
 
     fn count_structural_array_brackets(line: &str) -> ArrayBracketCounts {
@@ -998,16 +1746,149 @@ impl PyProjectLineIndex {
         counts
     }
 
+    fn mask_multi_line_strings(
+        line: &str,
+        mut state: MultiLineString,
+    ) -> (String, MultiLineString) {
+        let mut masked = String::with_capacity(line.len());
+        let mut rest = line;
+        loop {
+            if state != MultiLineString::Outside {
+                let Some(end) = Self::multi_line_closer_at(rest, state) else {
+                    masked.extend(rest.chars().map(|_| ' '));
+                    return (masked, state);
+                };
+                let through = end + 3;
+                masked.extend(rest[..through].chars().map(|_| ' '));
+                rest = &rest[through..];
+                state = MultiLineString::Outside;
+                continue;
+            }
+
+            let Some((index, ch)) = rest
+                .char_indices()
+                .find(|&(_, ch)| matches!(ch, '#' | '"' | '\''))
+            else {
+                masked.push_str(rest);
+                return (masked, state);
+            };
+            let after = &rest[index..];
+            let opened = if after.starts_with("\"\"\"") {
+                Some(MultiLineString::Basic)
+            } else if after.starts_with("'''") {
+                Some(MultiLineString::Literal)
+            } else {
+                None
+            };
+            if let Some(opened) = opened {
+                if let Some(end) = Self::multi_line_closer_at(&after[3..], opened) {
+                    let through = index + 3 + end + 3;
+                    masked.push_str(&rest[..index]);
+                    Self::push_as_single_line_string(&mut masked, &rest[index..through], opened);
+                    rest = &rest[through..];
+                } else {
+                    masked.push_str(&rest[..index]);
+                    masked.extend(after.chars().map(|_| ' '));
+                    return (masked, opened);
+                }
+            } else if ch == '#' {
+                masked.push_str(rest);
+                return (masked, state);
+            } else {
+                let remainder = Self::after_single_line_string(&after[1..], ch);
+                let through = rest.len() - remainder.len();
+                masked.push_str(&rest[..through]);
+                rest = remainder;
+            }
+        }
+    }
+
+    fn multi_line_closer_at(rest: &str, state: MultiLineString) -> Option<usize> {
+        if state == MultiLineString::Literal {
+            let index = rest.find("'''")?;
+            return Some(Self::last_three_of_quote_run(rest, index, '\''));
+        }
+        let mut chars = rest.char_indices();
+        while let Some((index, ch)) = chars.next() {
+            match ch {
+                '\\' => {
+                    let _ = chars.next();
+                }
+                '"' if rest[index..].starts_with("\"\"\"") => {
+                    return Some(Self::last_three_of_quote_run(rest, index, '"'));
+                }
+                _ => {}
+            }
+        }
+        None
+    }
+
+    fn last_three_of_quote_run(rest: &str, index: usize, quote: char) -> usize {
+        let run = rest[index..].chars().take_while(|&ch| ch == quote).count();
+        index + run.min(5) - 3
+    }
+
+    fn after_single_line_string(body: &str, quote: char) -> &str {
+        let mut chars = body.char_indices();
+        while let Some((index, ch)) = chars.next() {
+            if ch == quote {
+                return &body[index + 1..];
+            }
+            if ch == '\\' && quote == '"' {
+                let _ = chars.next();
+            }
+        }
+        ""
+    }
+
+    fn push_as_single_line_string(masked: &mut String, source: &str, kind: MultiLineString) {
+        let content = &source[3..source.len() - 3];
+        let mut rendered = String::with_capacity(source.len());
+        rendered.push('"');
+        if kind == MultiLineString::Literal {
+            for ch in content.chars() {
+                if matches!(ch, '\\' | '"') {
+                    rendered.push('\\');
+                }
+                rendered.push(ch);
+            }
+        } else {
+            let mut chars = content.chars();
+            while let Some(ch) = chars.next() {
+                match ch {
+                    '\\' => {
+                        rendered.push(ch);
+                        if let Some(escaped) = chars.next() {
+                            rendered.push(escaped);
+                        }
+                    }
+                    '"' => rendered.push_str("\\\""),
+                    _ => rendered.push(ch),
+                }
+            }
+        }
+        rendered.push('"');
+        masked.push_str(&rendered);
+        for _ in rendered.chars().count()..source.chars().count() {
+            masked.push(' ');
+        }
+    }
+
     fn from_content(content: &str, updater: &PyProjectUpdater) -> Self {
         let section_re =
-            Regex::new(r#"^\s*\[([^\]]+)\]\s*$"#).expect("Invalid pyproject section regex");
+            Regex::new(r#"^\s*\[([^\]]+)\]\s*(?:#.*)?$"#).expect("Invalid pyproject section regex");
         let literal_re =
-            Regex::new(r#""([^"]+)"|'([^']+)'"#).expect("Invalid dependency literal regex");
-        let mut lines_by_section: HashMap<String, HashMap<String, usize>> = HashMap::new();
+            Regex::new(r#""(?:[^"\\]|\\.)+"|'[^']+'"#).expect("Invalid dependency literal regex");
+        let mut index = Self::default();
         let mut current_section: Option<String> = None;
         let mut current_array_section: Option<ArraySectionState> = None;
+        let mut multi_line = MultiLineString::Outside;
 
         for (line_idx, line) in content.lines().enumerate() {
+            let (masked, next_state) = Self::mask_multi_line_strings(line, multi_line);
+            multi_line = next_state;
+            let line = masked.as_str();
+
             if let Some(caps) = section_re.captures(line) {
                 current_section = Some(caps.get(1).unwrap().as_str().to_string());
                 current_array_section = None;
@@ -1016,9 +1897,10 @@ impl PyProjectLineIndex {
 
             if let Some(array_state) = current_array_section.as_mut() {
                 Self::record_dependency_literals(
-                    &mut lines_by_section,
+                    &mut index,
                     &array_state.section_path,
                     line,
+                    &mut array_state.table_depth,
                     &literal_re,
                     updater,
                     line_idx + 1,
@@ -1051,10 +1933,12 @@ impl PyProjectLineIndex {
                         }
 
                         let section_path = "project.dependencies".to_string();
+                        let mut table_depth = 0;
                         Self::record_dependency_literals(
-                            &mut lines_by_section,
+                            &mut index,
                             &section_path,
-                            line,
+                            value,
+                            &mut table_depth,
                             &literal_re,
                             updater,
                             line_idx + 1,
@@ -1065,6 +1949,7 @@ impl PyProjectLineIndex {
                             current_array_section = Some(ArraySectionState {
                                 section_path,
                                 depth,
+                                table_depth,
                             });
                         }
                     }
@@ -1077,10 +1962,12 @@ impl PyProjectLineIndex {
                         }
 
                         let section_path = format!("{}.{}", section, group);
+                        let mut table_depth = 0;
                         Self::record_dependency_literals(
-                            &mut lines_by_section,
+                            &mut index,
                             &section_path,
-                            line,
+                            value,
+                            &mut table_depth,
                             &literal_re,
                             updater,
                             line_idx + 1,
@@ -1091,6 +1978,7 @@ impl PyProjectLineIndex {
                             current_array_section = Some(ArraySectionState {
                                 section_path,
                                 depth,
+                                table_depth,
                             });
                         }
                     }
@@ -1100,7 +1988,8 @@ impl PyProjectLineIndex {
                         && key != "python"
                         && (value.starts_with('"') || value.starts_with('\''))
                     {
-                        lines_by_section
+                        index
+                            .lines_by_section
                             .entry(section.to_string())
                             .or_default()
                             .entry(key)
@@ -1111,13 +2000,21 @@ impl PyProjectLineIndex {
             }
         }
 
-        Self { lines_by_section }
+        index
     }
 
     fn line_for(&self, section_path: &str, package: &str) -> Option<usize> {
         self.lines_by_section
             .get(section_path)
             .and_then(|section_lines| section_lines.get(package).copied())
+    }
+
+    fn line_for_entry(&self, section_path: &str, entry: &str, occurrence: usize) -> Option<usize> {
+        self.lines_by_entry
+            .get(section_path)?
+            .get(entry)?
+            .get(occurrence)
+            .copied()
     }
 }
 
@@ -1146,6 +2043,10 @@ impl Updater for PyProjectUpdater {
 
         let mut result = UpdateResult::default();
         let line_index = PyProjectLineIndex::from_content(&content, self);
+        let manifest = ManifestContext {
+            line_index: &line_index,
+            non_registry: non_registry_sources(&doc),
+        };
 
         // Indexes the manifest declares (uv/Poetry/PDM) are layered over the
         // registry we were handed; only the tool's own replace-the-default rule
@@ -1157,57 +2058,49 @@ impl Updater for PyProjectUpdater {
             None => registry,
         };
 
-        // Update [project.dependencies]
-        if let Some(Item::Table(project)) = doc.get_mut("project") {
-            if let Some(Item::Value(Value::Array(deps))) = project.get_mut("dependencies") {
+        // Update project dependencies in section or inline-table spelling.
+        if let Some(deps) = array_at(&mut doc, &["project", "dependencies"]) {
+            self.update_array_deps(
+                deps,
+                effective_registry,
+                &mut result,
+                &manifest,
+                "project.dependencies",
+                &options,
+            )
+            .await;
+        }
+
+        for key in keys_at(&doc, &["project", "optional-dependencies"]) {
+            if let Some(deps) = array_at(
+                &mut doc,
+                &["project", "optional-dependencies", key.as_str()],
+            ) {
+                let section_path = format!("project.optional-dependencies.{key}");
                 self.update_array_deps(
                     deps,
                     effective_registry,
                     &mut result,
-                    &line_index,
-                    "project.dependencies",
+                    &manifest,
+                    &section_path,
                     &options,
                 )
                 .await;
             }
-
-            // Update [project.optional-dependencies.*]
-            if let Some(Item::Table(opt_deps)) = project.get_mut("optional-dependencies") {
-                // Collect keys first
-                let keys: Vec<String> = opt_deps.iter().map(|(k, _)| k.to_string()).collect();
-                for key in keys {
-                    if let Some(Item::Value(Value::Array(deps))) = opt_deps.get_mut(&key) {
-                        let section_path = format!("project.optional-dependencies.{}", key);
-                        self.update_array_deps(
-                            deps,
-                            effective_registry,
-                            &mut result,
-                            &line_index,
-                            &section_path,
-                            &options,
-                        )
-                        .await;
-                    }
-                }
-            }
         }
 
-        // Update [dependency-groups.*]
-        if let Some(Item::Table(groups)) = doc.get_mut("dependency-groups") {
-            let keys: Vec<String> = groups.iter().map(|(k, _)| k.to_string()).collect();
-            for key in keys {
-                if let Some(Item::Value(Value::Array(deps))) = groups.get_mut(&key) {
-                    let section_path = format!("dependency-groups.{}", key);
-                    self.update_array_deps(
-                        deps,
-                        effective_registry,
-                        &mut result,
-                        &line_index,
-                        &section_path,
-                        &options,
-                    )
-                    .await;
-                }
+        for key in keys_at(&doc, &["dependency-groups"]) {
+            if let Some(deps) = array_at(&mut doc, &["dependency-groups", key.as_str()]) {
+                let section_path = format!("dependency-groups.{key}");
+                self.update_array_deps(
+                    deps,
+                    effective_registry,
+                    &mut result,
+                    &manifest,
+                    &section_path,
+                    &options,
+                )
+                .await;
             }
         }
 
@@ -1240,7 +2133,11 @@ impl Updater for PyProjectUpdater {
             }
         }
 
-        if (!result.updated.is_empty() || !result.pinned.is_empty()) && !options.dry_run {
+        if (!result.updated.is_empty()
+            || !result.pinned.is_empty()
+            || !result.normalized.is_empty())
+            && !options.dry_run
+        {
             write_file_atomic(path, &doc.to_string())?;
         }
 
@@ -2146,6 +3043,25 @@ publish-url = "https://nexus.example.com/repository/private/"
     }
 
     #[test]
+    fn inline_tool_and_index_tables_have_the_same_registry_semantics() {
+        let d = declared(
+            r#"tool = { uv = { index = [
+  { name = "private", url = "https://private.example/simple" },
+  { name = "mirror", url = "https://mirror.example/simple", default = true },
+], sources = { internal = { index = "private" } } } }
+"#,
+        );
+        assert_eq!(
+            d.chain,
+            vec![
+                url("private", "https://private.example/simple"),
+                url("mirror", "https://mirror.example/simple"),
+            ]
+        );
+        assert_eq!(d.pins.get("internal").map(String::as_str), Some("private"));
+    }
+
+    #[test]
     fn uv_indexes_keep_declaration_order_with_default_last() {
         let d = declared(
             r#"
@@ -3017,5 +3933,474 @@ flask = "~2.0.0"
         // Prefixes should be preserved
         assert!(contents.contains("requests = \"^2.30.0\""));
         assert!(contents.contains("flask = \"~2.5.0\""));
+    }
+
+    fn normalization_config(
+        dependencies: Option<SpecifierOperator>,
+        optional_dependencies: Option<SpecifierOperator>,
+        dependency_groups: Option<SpecifierOperator>,
+    ) -> crate::config::UpdConfig {
+        crate::config::UpdConfig {
+            normalize: Some(crate::config::NormalizeConfig {
+                pyproject: Some(crate::config::PyprojectNormalize {
+                    dependencies,
+                    optional_dependencies,
+                    dependency_groups,
+                }),
+            }),
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn normalization_is_opt_in_and_section_specific() {
+        let content = r#"[project]
+name = "demo"
+dependencies = [
+  'requests[socks] ; python_version >= "3.11"', # keep me
+  "click>=7,<9",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0"]
+
+[dependency-groups]
+lint = ["ruff==0.12.0"]
+"#;
+        let registry = MockRegistry::new("PyPI")
+            .with_version("requests", "2.34.0")
+            .with_version("click", "8.2.1")
+            .with_version("pytest", "8.0")
+            .with_version("ruff", "0.12.0");
+
+        let mut unconfigured = NamedTempFile::with_suffix(".toml").unwrap();
+        write!(unconfigured, "{content}").unwrap();
+        let updater = PyProjectUpdater::new();
+        let result = updater
+            .update(
+                unconfigured.path(),
+                &registry,
+                UpdateOptions::new(false, true),
+            )
+            .await
+            .unwrap();
+        assert!(result.normalized.is_empty());
+        let shape_preserved = std::fs::read_to_string(unconfigured.path()).unwrap();
+        assert!(shape_preserved.contains(r#""click>=8.2.1,<9""#));
+        assert!(!shape_preserved.contains("click=="));
+
+        let mut configured = NamedTempFile::with_suffix(".toml").unwrap();
+        write!(configured, "{content}").unwrap();
+        let options = UpdateOptions::new(false, true).with_config(Arc::new(normalization_config(
+            Some(SpecifierOperator::Exact),
+            None,
+            None,
+        )));
+        let result = updater
+            .update(configured.path(), &registry, options)
+            .await
+            .unwrap();
+        let rewritten = std::fs::read_to_string(configured.path()).unwrap();
+        assert!(
+            rewritten
+                .contains(r#"'requests[socks]==2.34.0 ; python_version >= "3.11"', # keep me"#)
+        );
+        assert!(rewritten.contains(r#""click==8.2.1""#));
+        assert!(rewritten.contains(r#"dev = ["pytest>=8.0"]"#));
+        assert!(rewritten.contains(r#"lint = ["ruff==0.12.0"]"#));
+        assert_eq!(result.normalized.len(), 2);
+        assert_eq!(result.normalized[0].line_number, Some(4));
+    }
+
+    #[tokio::test]
+    async fn normalization_skips_direct_and_declared_non_registry_sources() {
+        let mut file = NamedTempFile::with_suffix(".toml").unwrap();
+        let content = r#"[project]
+name = "demo"
+dependencies = [
+  "local-package",
+  "conditional-package",
+  "marked-index-package",
+  "archive @ https://example.invalid/archive.whl",
+  "requests",
+]
+
+[tool.uv.sources]
+local-package = { path = "../local-package" }
+conditional-package = [
+  { index = "linux", marker = "sys_platform == 'linux'" },
+  { index = "other", marker = "sys_platform != 'linux'" },
+]
+marked-index-package = { index = "private", marker = "python_version < '3.12'" }
+"#;
+        write!(file, "{content}").unwrap();
+        let registry = MockRegistry::new("PyPI").with_version("requests", "2.34.0");
+        let options = UpdateOptions::new(false, true).with_config(Arc::new(normalization_config(
+            Some(SpecifierOperator::AtLeast),
+            None,
+            None,
+        )));
+        let result = PyProjectUpdater::new()
+            .update(file.path(), &registry, options)
+            .await
+            .unwrap();
+        let rewritten = std::fs::read_to_string(file.path()).unwrap();
+        assert!(rewritten.contains(r#""local-package""#));
+        assert!(rewritten.contains(r#""conditional-package""#));
+        assert!(rewritten.contains(r#""marked-index-package""#));
+        assert!(rewritten.contains(r#""archive @ https://example.invalid/archive.whl""#));
+        assert!(rewritten.contains(r#""requests>=2.34.0""#));
+        assert_eq!(result.normalized.len(), 1);
+        assert_eq!(
+            result.normalize_recognized,
+            vec![
+                "local-package",
+                "conditional-package",
+                "marked-index-package",
+                "requests"
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn normalization_updates_inline_spelled_project_sections() {
+        let mut file = NamedTempFile::with_suffix(".toml").unwrap();
+        file.write_all(
+            r#"project = { name = "demo", dependencies = ["click"], optional-dependencies = { dev = ["pytest>=7"] } }
+dependency-groups = { lint = ["ruff~=0.11"] }
+"#
+            .as_bytes(),
+        )
+        .unwrap();
+        let registry = MockRegistry::new("PyPI")
+            .with_version("click", "8.2.1")
+            .with_version("pytest", "8.4.0")
+            .with_version("ruff", "0.12.10");
+        let options = UpdateOptions::new(false, true).with_config(Arc::new(normalization_config(
+            Some(SpecifierOperator::AtLeast),
+            Some(SpecifierOperator::AtLeast),
+            Some(SpecifierOperator::Exact),
+        )));
+        let result = PyProjectUpdater::new()
+            .update(file.path(), &registry, options)
+            .await
+            .unwrap();
+        let rewritten = std::fs::read_to_string(file.path()).unwrap();
+        assert!(rewritten.contains(r#"dependencies = ["click>=8.2.1"]"#));
+        assert!(rewritten.contains(r#"dev = ["pytest>=8.4.0"]"#));
+        assert!(rewritten.contains(r#"lint = ["ruff==0.12.10"]"#));
+        assert_eq!(result.normalized.len(), 2);
+        assert_eq!(result.updated.len(), 1);
+    }
+
+    #[test]
+    fn interactive_normalization_replay_preserves_toml_spelling() {
+        let content = r#"[project]
+dependencies = ['click', "requests>=2,<3"]
+"#;
+        let specs = vec![
+            NormalizedSpec {
+                package: "click".to_string(),
+                section: "project.dependencies".to_string(),
+                previous_spec: None,
+                new_spec: ">=8.2.1".to_string(),
+                version: "8.2.1".to_string(),
+                previous_version: None,
+                pinned: false,
+                held_back_from: None,
+                line_number: Some(2),
+            },
+            NormalizedSpec {
+                package: "requests".to_string(),
+                section: "project.dependencies".to_string(),
+                previous_spec: Some(">=2,<3".to_string()),
+                new_spec: "==2.34.0".to_string(),
+                version: "2.34.0".to_string(),
+                previous_version: Some("2".to_string()),
+                pinned: false,
+                held_back_from: None,
+                line_number: Some(2),
+            },
+        ];
+        let rewritten = apply_normalized_specs(content, &specs).unwrap();
+        assert_eq!(
+            rewritten,
+            r#"[project]
+dependencies = ['click>=8.2.1', "requests==2.34.0"]
+"#
+        );
+    }
+
+    #[test]
+    fn interactive_normalization_replay_is_scoped_to_the_configured_section() {
+        let content = r#"[project]
+dependencies = ["click"]
+
+[dependency-groups]
+dev = ["click"]
+"#;
+        let specs = vec![NormalizedSpec {
+            package: "click".to_string(),
+            section: "dependency-groups.dev".to_string(),
+            previous_spec: None,
+            new_spec: "==8.2.1".to_string(),
+            version: "8.2.1".to_string(),
+            previous_version: None,
+            pinned: false,
+            held_back_from: None,
+            line_number: Some(5),
+        }];
+        let rewritten = apply_normalized_specs(content, &specs).unwrap();
+        assert!(rewritten.contains(r#"dependencies = ["click"]"#));
+        assert!(rewritten.contains(r#"dev = ["click==8.2.1"]"#));
+    }
+
+    #[test]
+    fn normalization_line_index_ignores_tables_and_multiline_string_content() {
+        let content = r#"[project]
+description = """
+[dependency-groups]
+fake = ["not-a-dependency"]
+"""
+dependencies = [
+  { include-group = "lint" },
+  "click; python_version == \"3.12\"",
+]
+
+[dependency-groups] # policy lives here
+dev = ["ruff"]
+"#;
+        let updater = PyProjectUpdater::new();
+        let index = PyProjectLineIndex::from_content(content, &updater);
+        assert_eq!(
+            index.line_for_entry(
+                "project.dependencies",
+                r#"click; python_version == "3.12""#,
+                0
+            ),
+            Some(8)
+        );
+        assert_eq!(
+            index.line_for_entry("project.dependencies", "lint", 0),
+            None
+        );
+        assert_eq!(
+            index.line_for_entry("dependency-groups.dev", "ruff", 0),
+            Some(12)
+        );
+        assert_eq!(
+            index.line_for_entry("dependency-groups.fake", "not-a-dependency", 0),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn dry_run_reports_normalization_without_writing() {
+        let content = "[project]\ndependencies = [\"click\"]\n";
+        let mut file = NamedTempFile::with_suffix(".toml").unwrap();
+        write!(file, "{content}").unwrap();
+        let options = UpdateOptions::new(true, false).with_config(Arc::new(normalization_config(
+            Some(SpecifierOperator::AtMost),
+            None,
+            None,
+        )));
+        let result = PyProjectUpdater::new()
+            .update(
+                file.path(),
+                &MockRegistry::new("PyPI").with_version("click", "8.2.1"),
+                options,
+            )
+            .await
+            .unwrap();
+        assert_eq!(std::fs::read_to_string(file.path()).unwrap(), content);
+        assert_eq!(result.normalized[0].new_spec, "<=8.2.1");
+    }
+
+    #[tokio::test]
+    async fn cooldown_leaves_an_unanchored_name_unchanged_when_every_release_is_fresh() {
+        let now = chrono::Utc::now();
+        let content = "[project]\ndependencies = [\"click\"]\n";
+        let mut file = NamedTempFile::with_suffix(".toml").unwrap();
+        write!(file, "{content}").unwrap();
+        let registry = MockRegistry::new("PyPI")
+            .with_version("click", "8.2.1")
+            .with_version_meta(
+                "click",
+                "8.2.1",
+                Some(now - chrono::Duration::days(1)),
+                false,
+                false,
+            );
+        let policy = crate::cooldown::CooldownPolicy {
+            default: chrono::Duration::days(7),
+            per_ecosystem: HashMap::new(),
+            force_override: None,
+        };
+        let options = UpdateOptions::new(false, false)
+            .with_config(Arc::new(normalization_config(
+                Some(SpecifierOperator::Exact),
+                None,
+                None,
+            )))
+            .with_cooldown_policy(policy, now);
+        let result = PyProjectUpdater::new()
+            .update(file.path(), &registry, options)
+            .await
+            .unwrap();
+        assert_eq!(std::fs::read_to_string(file.path()).unwrap(), content);
+        assert!(result.normalized.is_empty());
+        assert!(result.skipped_by_cooldown.is_empty());
+        assert_eq!(result.warnings.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn normalization_honors_pins_ignores_and_package_filters() {
+        let content = r#"[project]
+dependencies = ["requests>=2.0", "click", "rich"]
+"#;
+        let mut config = normalization_config(Some(SpecifierOperator::Exact), None, None);
+        config
+            .pin
+            .insert("requests".to_string(), "2.28.0".to_string());
+        config.ignore.push("click".to_string());
+        let mut file = NamedTempFile::with_suffix(".toml").unwrap();
+        write!(file, "{content}").unwrap();
+        let options = UpdateOptions::new(false, true)
+            .with_config(Arc::new(config))
+            .with_packages(vec!["requests".to_string(), "click".to_string()]);
+        let result = PyProjectUpdater::new()
+            .update(
+                file.path(),
+                &MockRegistry::new("PyPI").with_version("rich", "14.0.0"),
+                options,
+            )
+            .await
+            .unwrap();
+
+        let rewritten = std::fs::read_to_string(file.path()).unwrap();
+        assert!(rewritten.contains(r#""requests==2.28.0""#));
+        assert!(rewritten.contains(r#""click""#));
+        assert!(rewritten.contains(r#""rich""#));
+        assert_eq!(result.normalized.len(), 1);
+        assert!(result.normalized[0].pinned);
+        assert!(
+            result.ignored.is_empty(),
+            "bare ignored names carry no version"
+        );
+        assert!(result.errors.is_empty());
+    }
+
+    #[tokio::test]
+    async fn normalized_manifest_is_idempotent() {
+        let mut file = NamedTempFile::with_suffix(".toml").unwrap();
+        write!(
+            file,
+            "[project]\ndependencies = [\"click\", \"requests>=2,<3\"]\n"
+        )
+        .unwrap();
+        let config = Arc::new(normalization_config(
+            Some(SpecifierOperator::AtLeast),
+            None,
+            None,
+        ));
+        let registry = MockRegistry::new("PyPI")
+            .with_version("click", "8.2.1")
+            .with_version("requests", "2.34.0");
+        let updater = PyProjectUpdater::new();
+        let first = updater
+            .update(
+                file.path(),
+                &registry,
+                UpdateOptions::new(false, true).with_config(Arc::clone(&config)),
+            )
+            .await
+            .unwrap();
+        let once = std::fs::read_to_string(file.path()).unwrap();
+        let second = updater
+            .update(
+                file.path(),
+                &registry,
+                UpdateOptions::new(false, true).with_config(config),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(std::fs::read_to_string(file.path()).unwrap(), once);
+        assert_eq!(first.normalized.len(), 2);
+        assert!(second.normalized.is_empty());
+        assert!(second.updated.is_empty());
+        assert_eq!(second.unchanged, 2);
+    }
+
+    #[tokio::test]
+    async fn normalization_honors_bump_ceiling_but_can_shape_a_bare_name() {
+        let mut file = NamedTempFile::with_suffix(".toml").unwrap();
+        write!(
+            file,
+            "[project]\ndependencies = [\"requests>=2.0\", \"click\"]\n"
+        )
+        .unwrap();
+        let options = UpdateOptions::new(false, true)
+            .with_config(Arc::new(normalization_config(
+                Some(SpecifierOperator::Exact),
+                None,
+                None,
+            )))
+            .with_bump_filter(crate::updater::BumpFilter {
+                major: false,
+                minor: false,
+                patch: true,
+            });
+        let result = PyProjectUpdater::new()
+            .update(
+                file.path(),
+                &MockRegistry::new("PyPI")
+                    .with_version("requests", "2.34.0")
+                    .with_version("click", "8.2.1"),
+                options,
+            )
+            .await
+            .unwrap();
+
+        let rewritten = std::fs::read_to_string(file.path()).unwrap();
+        assert!(rewritten.contains(r#""requests>=2.0""#));
+        assert!(rewritten.contains(r#""click==8.2.1""#));
+        assert_eq!(result.capped.len(), 1);
+        assert_eq!(result.normalized.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn normalization_tracks_prereleases_and_refuses_registry_downgrades() {
+        let mut prerelease = NamedTempFile::with_suffix(".toml").unwrap();
+        write!(prerelease, "[project]\ndependencies = [\"foo==1.0b1\"]\n").unwrap();
+        let config = normalization_config(Some(SpecifierOperator::AtLeast), None, None);
+        let result = PyProjectUpdater::new()
+            .update(
+                prerelease.path(),
+                &MockRegistry::new("PyPI").with_prerelease("foo", "1.0.0", "1.1rc1"),
+                UpdateOptions::new(false, true).with_config(Arc::new(config)),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result.normalized[0].version, "1.1rc1");
+
+        let original = "[project]\ndependencies = [\"foo>=9.0\"]\n";
+        let mut behind = NamedTempFile::with_suffix(".toml").unwrap();
+        write!(behind, "{original}").unwrap();
+        let result = PyProjectUpdater::new()
+            .update(
+                behind.path(),
+                &MockRegistry::new("PyPI").with_version("foo", "8.0.0"),
+                UpdateOptions::new(false, true).with_config(Arc::new(normalization_config(
+                    Some(SpecifierOperator::Exact),
+                    None,
+                    None,
+                ))),
+            )
+            .await
+            .unwrap();
+        assert_eq!(std::fs::read_to_string(behind.path()).unwrap(), original);
+        assert!(result.normalized.is_empty());
+        assert_eq!(result.warnings.len(), 1);
     }
 }

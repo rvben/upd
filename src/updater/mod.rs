@@ -23,7 +23,7 @@ pub use mise::MiseUpdater;
 
 pub use package_json::PackageJsonUpdater;
 pub use pre_commit::PreCommitUpdater;
-pub use pyproject::PyProjectUpdater;
+pub use pyproject::{PyProjectUpdater, apply_normalized_specs};
 pub use requirements::RequirementsUpdater;
 pub use terraform::TerraformUpdater;
 
@@ -331,6 +331,39 @@ pub(crate) fn unpinnable_error(pkg: &str, pinned: &str, spec: &str) -> String {
 
 /// UTF-8 byte-order mark, as bytes.
 const UTF8_BOM_BYTES: [u8; 3] = [0xEF, 0xBB, 0xBF];
+
+/// Replace a TOML string while preserving comments, whitespace, and a
+/// single-line literal string's quote style when the new value permits it.
+pub(crate) fn replace_string_value(
+    formatted: &mut toml_edit::Formatted<String>,
+    new_value: String,
+) {
+    let decor = formatted.decor().clone();
+    let mut replacement = literal_string(formatted, &new_value)
+        .unwrap_or_else(|| toml_edit::Formatted::new(new_value));
+    *replacement.decor_mut() = decor;
+    *formatted = replacement;
+}
+
+fn literal_string(
+    original: &toml_edit::Formatted<String>,
+    new_value: &str,
+) -> Option<toml_edit::Formatted<String>> {
+    let raw = original.as_repr()?.as_raw().as_str()?;
+    if !raw.starts_with('\'') || raw.starts_with("'''") {
+        return None;
+    }
+    if new_value
+        .chars()
+        .any(|c| c == '\'' || (c.is_control() && c != '\t'))
+    {
+        return None;
+    }
+    match format!("'{new_value}'").parse::<toml_edit::Value>() {
+        Ok(toml_edit::Value::String(formatted)) => Some(formatted),
+        _ => None,
+    }
+}
 
 /// Re-apply the original file's byte-level encoding (UTF-8 BOM and dominant line
 /// ending) to rewritten `content`.
@@ -747,6 +780,12 @@ pub struct UpdateResult {
     /// Dependencies whose recorded identity was completed without their version
     /// changing.
     pub annotations: Vec<Annotation>,
+    /// Dependency specifiers rewritten to an explicitly configured shape.
+    pub normalized: Vec<NormalizedSpec>,
+    /// PEP 503-normalized names recognized by the normalization parser,
+    /// including entries which were deliberately left unchanged. Lockfile
+    /// routing uses this to avoid treating bare manifest entries as transitive.
+    pub normalize_recognized: Vec<String>,
 }
 
 /// An available update held back by the bump ceiling.
@@ -779,6 +818,29 @@ pub struct Annotation {
     pub version: String,
     /// The immutable reference the annotation describes.
     pub commit: String,
+    pub line_number: Option<usize>,
+}
+
+/// A dependency whose complete PEP 508 specifier was normalized.
+#[derive(Debug, Clone)]
+pub struct NormalizedSpec {
+    pub package: String,
+    /// Pyproject dependency array containing the entry, used to replay a dry-run rewrite
+    /// safely during interactive application.
+    pub section: String,
+    /// Existing specifier without the package name/extras, or `None` for a bare
+    /// dependency name.
+    pub previous_spec: Option<String>,
+    /// New complete specifier without the package name/extras.
+    pub new_spec: String,
+    /// Version anchoring `new_spec`.
+    pub version: String,
+    /// Existing lower-bound version, when the old specifier asserted one.
+    pub previous_version: Option<String>,
+    /// Whether the chosen version came from `[pin]`.
+    pub pinned: bool,
+    /// Newer release rejected by cooldown: (version, publication time).
+    pub held_back_from: Option<(String, DateTime<Utc>)>,
     pub line_number: Option<usize>,
 }
 
@@ -851,6 +913,8 @@ impl UpdateResult {
         self.skipped.extend(other.skipped);
         self.capped.extend(other.capped);
         self.annotations.extend(other.annotations);
+        self.normalized.extend(other.normalized);
+        self.normalize_recognized.extend(other.normalize_recognized);
     }
 
     /// Record an update that the bump ceiling refused to write.
@@ -1326,6 +1390,48 @@ pub async fn apply_cooldown(
     current_is_prerelease: bool,
     options: &UpdateOptions,
 ) -> (CooldownOutcome, Option<CooldownNote>) {
+    apply_cooldown_inner(
+        registry,
+        package,
+        Some(current),
+        latest,
+        constraints,
+        current_is_prerelease,
+        options,
+    )
+    .await
+}
+
+/// Apply cooldown to a dependency declaration that names no current release.
+/// Unlike a fabricated version floor, this keeps every real release eligible.
+pub(crate) async fn apply_cooldown_without_floor(
+    registry: &dyn Registry,
+    package: &str,
+    latest: &str,
+    current_is_prerelease: bool,
+    options: &UpdateOptions,
+) -> (CooldownOutcome, Option<CooldownNote>) {
+    apply_cooldown_inner(
+        registry,
+        package,
+        None,
+        latest,
+        None,
+        current_is_prerelease,
+        options,
+    )
+    .await
+}
+
+async fn apply_cooldown_inner(
+    registry: &dyn Registry,
+    package: &str,
+    current: Option<&str>,
+    latest: &str,
+    constraints: Option<&str>,
+    current_is_prerelease: bool,
+    options: &UpdateOptions,
+) -> (CooldownOutcome, Option<CooldownNote>) {
     let ecosystem = registry.name();
     let Some(policy) = options.cooldown_policy.as_ref() else {
         return (CooldownOutcome::Unchanged(latest.to_string()), None);
@@ -1340,7 +1446,9 @@ pub async fn apply_cooldown(
     // package can legitimately arrive here with `latest == current`. Passing
     // that pair to `select` leaves no newer candidates and produces a bogus
     // cooldown skip anchored to arbitrary registry metadata (often a prerelease).
-    if crate::version::compare::compare_versions(latest, current) != std::cmp::Ordering::Greater {
+    if current.is_some_and(|current| {
+        crate::version::compare::compare_versions(latest, current) != std::cmp::Ordering::Greater
+    }) {
         return (CooldownOutcome::Unchanged(latest.to_string()), None);
     }
     let now = options.cooldown_now.unwrap_or_else(Utc::now);
@@ -1373,16 +1481,20 @@ pub async fn apply_cooldown(
         }
     };
 
-    use crate::cooldown::{CooldownDecision, select};
-    match select(
-        &versions,
-        current,
-        latest,
-        constraints,
-        current_is_prerelease,
-        cooldown,
-        now,
-    ) {
+    use crate::cooldown::{CooldownDecision, select, select_without_floor};
+    let decision = match current {
+        Some(current) => select(
+            &versions,
+            current,
+            latest,
+            constraints,
+            current_is_prerelease,
+            cooldown,
+            now,
+        ),
+        None => select_without_floor(&versions, latest, current_is_prerelease, cooldown, now),
+    };
+    match decision {
         CooldownDecision::Use {
             version,
             held_back_from: None,

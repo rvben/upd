@@ -324,6 +324,52 @@ async fn gitlab_presentation_matches_the_contract_and_escapes_untrusted_text() {
 }
 
 #[tokio::test]
+async fn gitlab_presentation_reports_normalized_specifiers_as_changes() {
+    let server = MockServer::start().await;
+    let fixture = Fixture::new();
+    list_mock(json!([])).mount(&server).await;
+    Mock::given(method("POST"))
+        .and(path("/api/v4/projects/1/merge_requests"))
+        .respond_with(ResponseTemplate::new(201).set_body_json(mr_response(7, false)))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let report = r#"{
+      "command":"update","mode":"applied",
+      "files":[{
+        "path":"pyproject.toml","file_type":"pyproject","lang":"python",
+        "normalized":[
+          {"line":3,"package":"click","previous_spec":null,"new_spec":">=8.5.0","version":"8.5.0","pinned":false},
+          {"line":4,"package":"urllib3","previous_spec":"<= 2.0.0","new_spec":">=2.7.0","version":"2.7.0","pinned":false,"skipped_latest":"2.8.0"}
+        ],
+        "errors":[],"warnings":[]
+      }],
+      "summary":{"files_scanned":1,"files_with_changes":1,"updates_total":0,"normalized":2,"errors":0,"warnings":0}
+    }"#;
+    fixture.run_template_with_report(&server, true, "new", false, report);
+
+    let presentation = fixture.presentation();
+    assert_eq!(
+        presentation["title"],
+        "chore(deps): normalize 2 dependency specifiers"
+    );
+    assert_eq!(presentation["counts"]["normalized"], 2);
+    assert_eq!(presentation["counts"]["updates"], 0);
+    assert_eq!(presentation["counts"]["policy_holds"], 1);
+    assert_eq!(presentation["normalized"][0]["previous"], "(no specifier)");
+
+    let description = fixture.description();
+    assert!(description.contains("upd prepared 2 normalized specifiers"));
+    assert!(description.contains("**2 normalized**"));
+    assert!(!description.contains("**0 moved forward**"));
+    assert!(description.contains("### Normalized specifiers"));
+    assert!(description.contains("<code>&lt;= 2.0.0</code>"));
+    assert!(description.contains("<code>&gt;=2.7.0</code>"));
+    assert!(description.contains("Saved for a deliberate upgrade (1)"));
+    assert!(!description.contains("without changing selected versions"));
+}
+
+#[tokio::test]
 async fn gitlab_presentation_prioritizes_review_worthy_updates() {
     let server = MockServer::start().await;
     let fixture = Fixture::new();

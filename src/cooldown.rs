@@ -137,6 +137,47 @@ pub fn select(
     cooldown: Duration,
     now: DateTime<Utc>,
 ) -> CooldownDecision {
+    select_with_floor(
+        versions,
+        Some(current),
+        latest,
+        constraints,
+        current_is_prerelease,
+        cooldown,
+        now,
+    )
+}
+
+/// Select under cooldown when the declaration names no current-version floor.
+/// Every real registry version remains eligible, including PEP 440's minimum
+/// legal release (`0.dev0`).
+pub fn select_without_floor(
+    versions: &[VersionMeta],
+    latest: &str,
+    current_is_prerelease: bool,
+    cooldown: Duration,
+    now: DateTime<Utc>,
+) -> CooldownDecision {
+    select_with_floor(
+        versions,
+        None,
+        latest,
+        None,
+        current_is_prerelease,
+        cooldown,
+        now,
+    )
+}
+
+fn select_with_floor(
+    versions: &[VersionMeta],
+    current: Option<&str>,
+    latest: &str,
+    constraints: Option<&str>,
+    current_is_prerelease: bool,
+    cooldown: Duration,
+    now: DateTime<Utc>,
+) -> CooldownDecision {
     // Empty input => unsupported (nothing to decide on).
     if versions.is_empty() {
         return CooldownDecision::Unsupported;
@@ -177,7 +218,8 @@ pub fn select(
         None => false,
     };
 
-    // Filter: yanked, track, constraints, newer than current.
+    // Filter: yanked, track, constraints, and (when one exists) newer than
+    // the declaration's current-version floor.
     let mut candidates: Vec<&VersionMeta> = if constraint_unparseable {
         versions
             .iter()
@@ -191,7 +233,7 @@ pub fn select(
             .filter(|v| !v.yanked)
             .filter(|v| v.prerelease == current_is_prerelease)
             .filter(|v| satisfies_constraint(&v.version, constraints))
-            .filter(|v| is_newer(&v.version, current))
+            .filter(|v| current.is_none_or(|floor| is_newer(&v.version, floor)))
             .collect()
     };
 
@@ -610,6 +652,27 @@ mod tests {
                 assert!(held_back_from.is_none());
             }
             other => panic!("version at the exact boundary must be eligible, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_select_without_floor_keeps_minimum_pep440_release_eligible() {
+        let versions = vec![
+            meta("1.0.0", 1, false, false),
+            meta("0.dev0", 30, false, false),
+        ];
+        let decision =
+            select_without_floor(&versions, "1.0.0", false, Duration::days(7), fixed_now());
+
+        match decision {
+            CooldownDecision::Use {
+                version,
+                held_back_from,
+            } => {
+                assert_eq!(version, "0.dev0");
+                assert_eq!(held_back_from.unwrap().version, "1.0.0");
+            }
+            other => panic!("minimum release should be a cooldown fallback, got {other:?}"),
         }
     }
 

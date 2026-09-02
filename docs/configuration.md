@@ -66,6 +66,7 @@ django = "4.2.0"
 | `pin` | `table` | Map of package names to pinned versions |
 | `update_action_shas` | `bool` | Whether SHA-pinned GitHub Actions are checked and updated. Defaults to `true`; `--update-action-shas` and `--no-update-action-shas` override it |
 | `automation.security_remediation` | `bool` | Allow scheduled security remediation to publish or clean up its rolling pull request. Defaults to `false` |
+| `normalize` | `table` | Opt-in `pyproject.toml` specifier normalization, configured per section |
 
 Package matching is PEP 503-normalized, so `"Oven-SH/bun"` and `"oven-sh/bun"`
 are one key, as are `"foo-bar"` and `"foo_bar"`.
@@ -76,6 +77,42 @@ include glob matches it. Explicit file paths bypass both discovery globs, just
 as they bypass ignore-file filtering. Run with `--verbose` to report files that
 contain an `upd:` marker but are not discovery candidates; this diagnostic
 inspection is limited to UTF-8 text files up to 1 MiB.
+
+### Normalizing pyproject specifiers
+
+By default, `upd` moves a dependency's lower bound and preserves its other
+clauses. `[normalize.pyproject]` opts individual pyproject dependency sections
+into a single-clause policy at the release selected by the active policy:
+
+```toml
+# .updrc.toml for a library
+[normalize.pyproject]
+dependencies = "at-least"          # >=
+optional-dependencies = "at-least" # >=
+dependency-groups = "exact"        # ==
+```
+
+The accepted values are `exact` (`==`), `at-least` (`>=`), and `at-most`
+(`<=`). Omitted sections retain the default shape-preserving behavior. This is
+an explicit policy; `upd` does not infer it from another tool's project type.
+
+Normalization gives bare names a specifier and collapses ranges to one clause,
+using the selected release's full version precision. `at-most` writes an
+inclusive ceiling; it does not change how the release itself is selected. It preserves extras, markers,
+comments, array formatting, and literal-string quotes. Direct URL requirements,
+non-index `[tool.uv.sources]` dependencies, Poetry path/git/URL/source
+dependencies, and `[tool.poetry.dependencies]` tables are left untouched.
+
+The usual `ignore`, `[pin]`, `--package`, private-index, and cooldown policies
+still apply. A bump ceiling applies when the old specifier has an inclusive
+lower-bound version to classify; a bare or ceiling-only declaration has no
+current-version anchor and therefore no meaningful bump level. Ordered operators reject local-version labels;
+`exact` accepts them. Text output reports shape changes as `Would normalize` or
+`Normalized`; JSON places them in `files[].normalized[]` and counts them in
+`summary.normalized`. Dry runs and `--check` treat them as pending work.
+Interactive mode prompts for configured shape changes as well as ordinary
+version updates. Configured version-only pins retain their established
+automatic behavior.
 
 ### Seeing what was ignored or pinned
 

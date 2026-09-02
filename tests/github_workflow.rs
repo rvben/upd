@@ -657,6 +657,81 @@ fn github_presentation_stays_within_the_review_budget_for_large_updates() {
 }
 
 #[test]
+fn github_presentation_reports_normalized_specifiers_as_changes() {
+    let fixture = Fixture::new();
+    let report = r#"{
+      "files": [{
+        "path": "pyproject.toml",
+        "normalized": [
+          {"line":3,"package":"click","previous_spec":null,"new_spec":">=8.5.0","version":"8.5.0","pinned":false},
+          {"line":4,"package":"urllib3","previous_spec":"<= 2.0.0","new_spec":">=2.7.0","version":"2.7.0","pinned":false,"skipped_latest":"2.8.0"}
+        ]
+      }],
+      "summary": {"updates_total":0,"normalized":2,"files_with_changes":1,"warnings":0}
+    }"#;
+    fixture.run_publish_with_report(true, "new", false, report);
+
+    let presentation = fixture.presentation();
+    assert_eq!(
+        presentation["title"],
+        "chore(deps): normalize 2 dependency specifiers"
+    );
+    assert_eq!(presentation["counts"]["normalized"], 2);
+    assert_eq!(presentation["counts"]["updates"], 0);
+    assert_eq!(presentation["counts"]["policy_holds"], 1);
+    assert_eq!(presentation["normalized"][0]["previous"], "(no specifier)");
+    assert_eq!(presentation["policy_holds"][0]["package"], "urllib3");
+
+    let body = fixture.body();
+    assert!(body.contains("## 2 dependency changes are ready for review"));
+    assert!(body.contains("**2 normalized specifiers**"));
+    assert!(body.contains("### Specifiers normalized"));
+    assert!(body.contains("<code>click (no specifier) → &gt;=8.5.0</code>"));
+    assert!(body.contains("1 additional update remains held by repository policy."));
+    assert!(!body.contains("dependency metadata"));
+    assert!(
+        fixture
+            .log()
+            .contains("--title chore(deps): normalize 2 dependency specifiers")
+    );
+}
+
+#[test]
+fn github_presentation_titles_mixed_and_single_normalizations() {
+    let fixture = Fixture::new();
+    let report = r#"{
+      "files": [{
+        "path": "pyproject.toml",
+        "updates": [{"package":"requests","current":"2.0","latest":"2.34","bump":"minor"}],
+        "normalized": [{"line":3,"package":"click","previous_spec":null,"new_spec":">=8.5.0","version":"8.5.0","pinned":false}]
+      }],
+      "summary": {"updates_total":1,"normalized":1,"files_with_changes":1,"warnings":0}
+    }"#;
+    fixture.run_publish_with_report(true, "new", false, report);
+    assert_eq!(
+        fixture.presentation()["title"],
+        "chore(deps): prepare 2 dependency changes"
+    );
+    let body = fixture.body();
+    assert!(body.contains("**1 minor · no patches · no majors · 1 normalized**"));
+    assert!(body.contains("### Normalized specifiers"));
+
+    let fixture = Fixture::new();
+    let report = r#"{
+      "files": [{
+        "path": "pyproject.toml",
+        "normalized": [{"line":3,"package":"click","previous_spec":">= 8","new_spec":"==8.5.0","version":"8.5.0","pinned":true}]
+      }],
+      "summary": {"updates_total":0,"normalized":1,"files_with_changes":1,"warnings":0}
+    }"#;
+    fixture.run_publish_with_report(true, "new", false, report);
+    assert_eq!(
+        fixture.presentation()["title"],
+        "chore(deps): normalize click specifier"
+    );
+}
+
+#[test]
 fn normal_update_presentation_contract_is_shared_across_providers() {
     for source in [WORKFLOW, GITLAB_TEMPLATE] {
         for field in [
@@ -669,6 +744,7 @@ fn normal_update_presentation_contract_is_shared_across_providers() {
             "updates_review_worthy:",
             "updates_quiet:",
             "annotations:",
+            "normalized:",
             "policy_holds:",
             "blocked:",
             "changed_paths:",
@@ -680,11 +756,16 @@ fn normal_update_presentation_contract_is_shared_across_providers() {
             assert!(source.contains(field), "missing presentation field {field}");
         }
         assert!(source.contains("\\($title_prefix): refresh \\(.counts.updates) dependencies"));
+        assert!(
+            source.contains(
+                "\\($title_prefix): normalize \\(.counts.normalized) dependency specifiers"
+            )
+        );
     }
     assert!(WORKFLOW.contains("[View the full update report →]"));
     assert!(WORKFLOW.contains("steps.report.outputs.artifact-url"));
     assert!(WORKFLOW.contains("REPORT_URL"));
-    assert!(!WORKFLOW.contains("| Dependency | Before | After"));
+    assert!(WORKFLOW.contains("### Normalized specifiers"));
     assert!(GITLAB_TEMPLATE.contains("wc -c"));
     assert!(GITLAB_TEMPLATE.contains("32768"));
     assert!(!GITLAB_TEMPLATE.contains("> [!IMPORTANT]"));

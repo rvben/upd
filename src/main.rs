@@ -205,6 +205,7 @@ impl UpdateType {
 enum ChangeKind {
     RegistryUpdate,
     ConfigPin,
+    Normalization,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -216,6 +217,7 @@ struct PlannedChange {
     old_version: String,
     new_version: String,
     line_num: Option<usize>,
+    section: Option<String>,
 }
 
 impl PlannedChange {
@@ -232,6 +234,7 @@ impl PlannedChange {
             old_version: update.1.clone(),
             new_version: update.2.clone(),
             line_num: update.3,
+            section: None,
         }
     }
 
@@ -248,6 +251,27 @@ impl PlannedChange {
             old_version: pinned.1.clone(),
             new_version: pinned.2.clone(),
             line_num: pinned.3,
+            section: None,
+        }
+    }
+
+    fn from_normalized(
+        path: PathBuf,
+        file_type: FileType,
+        normalized: &upd::updater::NormalizedSpec,
+    ) -> Self {
+        Self {
+            kind: ChangeKind::Normalization,
+            path,
+            file_type,
+            package: normalized.package.clone(),
+            old_version: normalized
+                .previous_spec
+                .clone()
+                .unwrap_or_else(|| "(no specifier)".to_string()),
+            new_version: normalized.new_spec.clone(),
+            line_num: normalized.line_number,
+            section: Some(normalized.section.clone()),
         }
     }
 }
@@ -508,6 +532,29 @@ fn matches_manifest_occurrence(
     })
 }
 
+/// Whether normalization's broader PEP 508 parser recognized a declaration
+/// that the ordinary occurrence scanner cannot represent (notably a bare name
+/// or a parenthesized specifier).
+fn recognized_in_manifest(scanned: &[ScannedFileResult], norm: &str, ecosystem: Ecosystem) -> bool {
+    let lang = ecosystem_to_lang(ecosystem);
+    let matches = |name: &str| normalized_package_name(name, ecosystem) == norm;
+    scanned.iter().any(|file| {
+        file.file_type.lang() == lang
+            && (file
+                .result
+                .normalized
+                .iter()
+                .any(|entry| matches(&entry.package))
+                || file.result.updated.iter().any(|(name, ..)| matches(name))
+                || file.result.pinned.iter().any(|(name, ..)| matches(name))
+                || file
+                    .result
+                    .normalize_recognized
+                    .iter()
+                    .any(|name| matches(name)))
+    })
+}
+
 /// Whether `name` (as requested via `--package`) resolves only through a
 /// scanned lockfile: no manifest occurrence, but at least one lock-scanned
 /// package under the same normalized name (rule 2). Shared between the
@@ -626,6 +673,7 @@ fn empty_floor_report(path: &Path) -> upd::output::UpdateFileReport {
         skipped: Vec::new(),
         capped: Vec::new(),
         annotations: Vec::new(),
+        normalized: Vec::new(),
         errors: Vec::new(),
         warnings: Vec::new(),
     }
@@ -752,6 +800,28 @@ fn take_pinned_changes_for_file(
         .collect()
 }
 
+fn take_approved_normalizations_for_file(
+    scanned_file: &ScannedFileResult,
+    approved_change_counts: &mut HashMap<PlannedChange, usize>,
+) -> Vec<upd::updater::NormalizedSpec> {
+    let mut selected = Vec::new();
+    for normalized in &scanned_file.result.normalized {
+        let candidate = PlannedChange::from_normalized(
+            scanned_file.path.clone(),
+            scanned_file.file_type,
+            normalized,
+        );
+        if let Some(count) = approved_change_counts.get_mut(&candidate)
+            && *count > 0
+        {
+            *count -= 1;
+            selected.push(normalized.clone());
+        }
+    }
+    approved_change_counts.retain(|_, count| *count > 0);
+    selected
+}
+
 fn collect_selected_changes_for_file(
     scanned_file: &ScannedFileResult,
     approved_change_counts: &mut HashMap<PlannedChange, usize>,
@@ -771,7 +841,10 @@ fn collect_selected_changes_for_file(
 }
 
 fn file_has_manifest_changes(result: &UpdateResult) -> bool {
-    !result.updated.is_empty() || !result.pinned.is_empty() || !result.annotations.is_empty()
+    !result.updated.is_empty()
+        || !result.pinned.is_empty()
+        || !result.annotations.is_empty()
+        || !result.normalized.is_empty()
 }
 
 type ChangedByLockfile = HashMap<(PathBuf, LockfileType), Vec<String>>;
@@ -877,6 +950,7 @@ fn has_checkable_manifest_changes(result: &UpdateResult, filter: UpdateFilter) -
         || !result.pinned.is_empty()
         || !result.held_back.is_empty()
         || !result.annotations.is_empty()
+        || !result.normalized.is_empty()
 }
 
 fn has_interactive_changes(
@@ -886,6 +960,7 @@ fn has_interactive_changes(
     !pending_updates.is_empty()
         || scanned_results.iter().any(|scanned| {
             !scanned.result.pinned.is_empty()
+                || !scanned.result.normalized.is_empty()
                 || !scanned.result.errors.is_empty()
                 || !scanned.result.warnings.is_empty()
         })
@@ -1725,6 +1800,7 @@ async fn run_update(cli: &Cli) -> Result<()> {
                 .any(|p| normalized_package_name(p, locked.ecosystem) == norm);
             if !requested
                 || matches_manifest_occurrence(&manifest_packages, &norm, locked.ecosystem)
+                || recognized_in_manifest(&scanned, &norm, locked.ecosystem)
             {
                 continue;
             }
@@ -2219,7 +2295,10 @@ async fn run_update(cli: &Cli) -> Result<()> {
             if scanned_file.file_type == FileType::Annotated {
                 continue;
             }
-            if scanned_file.result.updated.is_empty() && scanned_file.result.pinned.is_empty() {
+            if scanned_file.result.updated.is_empty()
+                && scanned_file.result.pinned.is_empty()
+                && scanned_file.result.normalized.is_empty()
+            {
                 continue;
             }
             record_lockfile_changes(
@@ -2229,8 +2308,21 @@ async fn run_update(cli: &Cli) -> Result<()> {
                     .result
                     .updated
                     .iter()
-                    .chain(scanned_file.result.pinned.iter())
-                    .map(|(name, _, _, _)| name.clone()),
+                    .map(|(name, _, _, _)| name.clone())
+                    .chain(
+                        scanned_file
+                            .result
+                            .pinned
+                            .iter()
+                            .map(|(name, _, _, _)| name.clone()),
+                    )
+                    .chain(
+                        scanned_file
+                            .result
+                            .normalized
+                            .iter()
+                            .map(|entry| entry.package.clone()),
+                    ),
             );
         }
 
@@ -2554,6 +2646,7 @@ fn emit_update_json(input: UpdateReportInput<'_>, bounded: &BoundedOutputParams<
             .count(),
         capped: total_result.capped.len(),
         annotations: total_result.annotations.len(),
+        normalized: total_result.normalized.len(),
         unfixable: count_unfixable_floors(&floor_reports),
         skipped_floors: count_skipped_floors(&floor_reports),
     };
@@ -2797,6 +2890,29 @@ async fn run_interactive_update(
                     ));
                 }
 
+                for normalized in &file_result.normalized {
+                    let previous = normalized
+                        .previous_spec
+                        .clone()
+                        .unwrap_or_else(|| "(no specifier)".to_string());
+                    let is_major = normalized.previous_version.as_deref().is_some_and(|old| {
+                        classify_update(old, &normalized.version) == UpdateType::Major
+                    });
+                    pending_updates.push(PendingUpdate::new(
+                        display_path(path),
+                        normalized.line_number,
+                        normalized.package.clone(),
+                        previous,
+                        normalized.new_spec.clone(),
+                        is_major,
+                    ));
+                    planned_changes.push(PlannedChange::from_normalized(
+                        path.clone(),
+                        *file_type,
+                        normalized,
+                    ));
+                }
+
                 scanned_results.push(ScannedFileResult {
                     path: path.clone(),
                     file_type: *file_type,
@@ -2901,7 +3017,6 @@ async fn run_interactive_update(
         .iter()
         .map(|scanned| scanned.result.pinned.len())
         .sum();
-
     // Phase 2: Prompt user for each update
     let updates_with_decisions = if pending_updates.is_empty() {
         Vec::new()
@@ -2912,6 +3027,12 @@ async fn run_interactive_update(
     let mut approved_change_counts =
         build_approved_change_counts(&updates_with_decisions, &planned_changes);
     let approved_count = updates_with_decisions.iter().filter(|u| u.approved).count();
+    let approved_normalization_count = updates_with_decisions
+        .iter()
+        .zip(&planned_changes)
+        .filter(|(update, change)| update.approved && change.kind == ChangeKind::Normalization)
+        .count();
+    let approved_version_count = approved_count - approved_normalization_count;
 
     if approved_count == 0 && configured_pin_count == 0 {
         if !cli.quiet {
@@ -2921,11 +3042,17 @@ async fn run_interactive_update(
     }
 
     let mut apply_parts = Vec::new();
-    if approved_count > 0 {
-        apply_parts.push(format!("{} selected update(s)", approved_count));
+    if approved_version_count > 0 {
+        apply_parts.push(format!("{} selected update(s)", approved_version_count));
     }
     if configured_pin_count > 0 {
         apply_parts.push(format!("{} configured pin(s)", configured_pin_count));
+    }
+    if approved_normalization_count > 0 {
+        apply_parts.push(format!(
+            "{} selected normalization(s)",
+            approved_normalization_count
+        ));
     }
     if !cli.quiet {
         println!(
@@ -2936,13 +3063,16 @@ async fn run_interactive_update(
 
     let mut applied_updates = 0;
     let mut applied_pins = 0;
+    let mut applied_normalizations = 0;
     let mut updated_files: Vec<std::path::PathBuf> = Vec::new();
     let mut changed_by_lockfile = ChangedByLockfile::new();
 
     for scanned_file in scanned_results {
         let selected_changes =
             collect_selected_changes_for_file(&scanned_file, &mut approved_change_counts);
-        if selected_changes.is_empty() {
+        let selected_normalizations =
+            take_approved_normalizations_for_file(&scanned_file, &mut approved_change_counts);
+        if selected_changes.is_empty() && selected_normalizations.is_empty() {
             continue;
         }
 
@@ -2981,17 +3111,37 @@ async fn run_interactive_update(
                 e
             )
         })?;
+        let rewritten_content = if selected_normalizations.is_empty() {
+            rewritten.content
+        } else {
+            upd::updater::apply_normalized_specs(&rewritten.content, &selected_normalizations)?
+        };
 
-        if rewritten.content == content {
+        if rewritten_content == content {
             continue;
         }
 
-        write_file_atomic(&scanned_file.path, &rewritten.content)?;
+        write_file_atomic(&scanned_file.path, &rewritten_content)?;
         if scanned_file.file_type != FileType::Annotated {
             updated_files.push(scanned_file.path.clone());
         }
 
         let file_str = display_path(&scanned_file.path);
+        for normalized in &selected_normalizations {
+            if scanned_file.file_type != FileType::Annotated {
+                record_lockfile_changes(
+                    &mut changed_by_lockfile,
+                    &scanned_file.path,
+                    [normalized.package.clone()],
+                );
+            }
+            applied_normalizations += 1;
+        }
+        if !cli.quiet {
+            for line in format_normalized_lines(&file_str, &selected_normalizations, false) {
+                println!("{line}");
+            }
+        }
         for change in selected_changes {
             let location = match change.line_num {
                 Some(n) => format!("{}:{}:", file_str, n),
@@ -3036,6 +3186,7 @@ async fn run_interactive_update(
                         );
                     }
                 }
+                ChangeKind::Normalization => unreachable!("normalizations use their own writer"),
             }
         }
     }
@@ -3119,6 +3270,13 @@ async fn run_interactive_update(
                 "{} {} package(s) to configured versions",
                 "Pinned".cyan(),
                 applied_pins.to_string().cyan().bold()
+            );
+        }
+        if applied_normalizations > 0 {
+            println!(
+                "{} {} package(s) to the configured specifier shape",
+                "Normalized".cyan(),
+                applied_normalizations.to_string().cyan().bold()
             );
         }
     }
@@ -5159,6 +5317,46 @@ fn format_annotation_lines(path: &str, result: &UpdateResult, dry_run: bool) -> 
         .collect()
 }
 
+fn format_normalized_lines(
+    path: &str,
+    normalized: &[upd::updater::NormalizedSpec],
+    dry_run: bool,
+) -> Vec<String> {
+    let action = if dry_run {
+        "Would normalize"
+    } else {
+        "Normalized"
+    };
+    normalized
+        .iter()
+        .map(|entry| {
+            let location = match entry.line_number {
+                Some(n) => format!("{}:{}:", path, n),
+                None => format!("{}:", path),
+            };
+            let previous = entry.previous_spec.as_deref().unwrap_or("(no specifier)");
+            let mut line = format!(
+                "{} {} {} {} → {}",
+                location.blue().underline(),
+                action.cyan(),
+                entry.package.bold(),
+                previous.dimmed(),
+                entry.new_spec.cyan()
+            );
+            if entry.pinned {
+                line.push_str(&format!(" {}", "(pinned)".dimmed()));
+            }
+            if let Some((skipped, _)) = &entry.held_back_from {
+                line.push_str(&format!(
+                    " {}",
+                    format!("(held back from {skipped})").dimmed()
+                ));
+            }
+            line
+        })
+        .collect()
+}
+
 /// Every skipped pin for one file, rendered.
 ///
 /// A blocked pin needs attention on the line it is on, so it always prints. A
@@ -5230,6 +5428,7 @@ fn print_file_result(
         && result.skipped.is_empty()
         && result.capped.is_empty()
         && result.annotations.is_empty()
+        && result.normalized.is_empty()
     {
         return;
     }
@@ -5289,6 +5488,10 @@ fn print_file_result(
     // An annotation always prints, whatever the --filter: filters select a bump
     // level to write, and an annotation has no bump level to select on.
     for line in format_annotation_lines(path, result, dry_run) {
+        println!("{line}");
+    }
+
+    for line in format_normalized_lines(path, &result.normalized, dry_run) {
         println!("{line}");
     }
 
@@ -5474,6 +5677,7 @@ fn nothing_outstanding(
         && result.skipped.is_empty()
         && result.capped.is_empty()
         && result.annotations.is_empty()
+        && result.normalized.is_empty()
         && result.warnings.is_empty()
         && unfixable_floors == 0
         && skipped_floors == 0
@@ -5505,6 +5709,7 @@ fn print_summary(
     let not_examined_count = result.skipped.len() - blocked_count;
     let capped_count = result.capped.len();
     let annotation_count = result.annotations.len();
+    let normalized_count = result.normalized.len();
     // A warning is something that did not go the way the run intended: a
     // dependency upd found newer but will not rewrite, a version already ahead
     // of its registry.
@@ -5568,6 +5773,19 @@ fn print_summary(
                 "{} {} package(s) with the release their pinned commit belongs to",
                 annotate_action,
                 annotation_count.to_string().cyan().bold()
+            );
+        }
+
+        if normalized_count > 0 {
+            let normalize_action = if dry_run {
+                "Would normalize"
+            } else {
+                "Normalized"
+            };
+            println!(
+                "{} {} package(s) to the configured specifier shape",
+                normalize_action,
+                normalized_count.to_string().cyan().bold()
             );
         }
 
@@ -5667,7 +5885,7 @@ fn print_summary(
         );
     }
 
-    filtered_total
+    filtered_total + normalized_count
 }
 
 fn clean_cache() -> Result<()> {
@@ -6188,6 +6406,89 @@ mod tests {
         }];
 
         assert!(has_interactive_changes(&[], &scanned_results));
+    }
+
+    #[test]
+    fn normalized_specs_are_manifest_changes_and_interactive_work() {
+        let normalized = upd::updater::NormalizedSpec {
+            package: "click".into(),
+            section: "project.dependencies".into(),
+            previous_spec: None,
+            new_spec: ">=8.2.1".into(),
+            version: "8.2.1".into(),
+            previous_version: None,
+            pinned: false,
+            held_back_from: None,
+            line_number: Some(4),
+        };
+        let result = UpdateResult {
+            normalized: vec![normalized],
+            ..Default::default()
+        };
+        assert!(file_has_manifest_changes(&result));
+        assert!(has_checkable_manifest_changes(
+            &result,
+            UpdateFilter::from_cli(&[], None)
+        ));
+        assert!(has_interactive_changes(
+            &[],
+            &[ScannedFileResult {
+                path: PathBuf::from("pyproject.toml"),
+                file_type: FileType::PyProject,
+                result,
+            }]
+        ));
+    }
+
+    #[test]
+    fn interactive_normalization_selection_is_scoped_to_its_section() {
+        let make_spec = |section: &str| upd::updater::NormalizedSpec {
+            package: "click".into(),
+            section: section.into(),
+            previous_spec: None,
+            new_spec: "==8.2.1".into(),
+            version: "8.2.1".into(),
+            previous_version: None,
+            pinned: false,
+            held_back_from: None,
+            line_number: None,
+        };
+        let scanned = ScannedFileResult {
+            path: PathBuf::from("pyproject.toml"),
+            file_type: FileType::PyProject,
+            result: UpdateResult {
+                normalized: vec![
+                    make_spec("project.dependencies"),
+                    make_spec("dependency-groups.dev"),
+                ],
+                ..Default::default()
+            },
+        };
+        let plans: Vec<_> = scanned
+            .result
+            .normalized
+            .iter()
+            .map(|spec| {
+                PlannedChange::from_normalized(scanned.path.clone(), scanned.file_type, spec)
+            })
+            .collect();
+        let mut rejected = PendingUpdate::new(
+            "pyproject.toml".into(),
+            None,
+            "click".into(),
+            "(no specifier)".into(),
+            "==8.2.1".into(),
+            false,
+        );
+        let mut approved = rejected.clone();
+        rejected.approved = false;
+        approved.approved = true;
+        let mut counts = build_approved_change_counts(&[rejected, approved], &plans);
+
+        let selected = take_approved_normalizations_for_file(&scanned, &mut counts);
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].section, "dependency-groups.dev");
+        assert!(counts.is_empty());
     }
 
     /// A file that produced only diagnostics is not "up to date". Without this,

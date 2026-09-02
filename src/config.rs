@@ -39,6 +39,12 @@
 //! [pin]
 //! requests = "2.28.0"  # Pin to exact version
 //! django = ">=3.2,<4"  # Pin to version range
+//!
+//! # Rewrite whole specifiers to one shape, per pyproject section (opt-in):
+//! # exact (==), at-least (>=), or at-most (<=), at the policy-selected release
+//! [normalize.pyproject]
+//! dependencies = "at-least"
+//! dependency-groups = "exact"
 //! ```
 //!
 //! Unknown top-level keys produce a warning on stderr but do not stop execution.
@@ -80,6 +86,7 @@ const KNOWN_KEYS: &[&str] = &[
     "cooldown",
     "update_action_shas",
     "automation",
+    "normalize",
 ];
 
 /// Repository-level policy for unattended automation.
@@ -102,6 +109,66 @@ pub struct CooldownConfig {
     /// Per-ecosystem overrides, keyed by registry name.
     #[serde(default)]
     pub ecosystem: HashMap<String, String>,
+}
+
+/// The operator `[normalize.pyproject]` writes in front of the chosen version.
+/// Config uses descriptive words rather than punctuation so the resulting
+/// policy is clear when rendered by `--show-config`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum SpecifierOperator {
+    Exact,
+    AtLeast,
+    AtMost,
+}
+
+impl SpecifierOperator {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Exact => "==",
+            Self::AtLeast => ">=",
+            Self::AtMost => "<=",
+        }
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Exact => "exact",
+            Self::AtLeast => "at-least",
+            Self::AtMost => "at-most",
+        }
+    }
+}
+
+/// Per-section normalization for pyproject dependency locations: the project
+/// arrays and the standardized top-level dependency groups.
+/// An omitted section preserves every specifier in that section as written.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PyprojectNormalize {
+    #[serde(default)]
+    pub dependencies: Option<SpecifierOperator>,
+    #[serde(default, rename = "optional-dependencies")]
+    pub optional_dependencies: Option<SpecifierOperator>,
+    #[serde(default, rename = "dependency-groups")]
+    pub dependency_groups: Option<SpecifierOperator>,
+}
+
+impl PyprojectNormalize {
+    pub fn entries(&self) -> [(&'static str, Option<SpecifierOperator>); 3] {
+        [
+            ("dependencies", self.dependencies),
+            ("optional-dependencies", self.optional_dependencies),
+            ("dependency-groups", self.dependency_groups),
+        ]
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NormalizeConfig {
+    #[serde(default)]
+    pub pyproject: Option<PyprojectNormalize>,
 }
 
 /// Configuration loaded from .updrc.toml or upd.toml
@@ -149,6 +216,10 @@ pub struct UpdConfig {
     /// Opt-in policy for unattended repository automation.
     #[serde(default)]
     pub automation: AutomationConfig,
+
+    /// Opt-in specifier normalization. `None` preserves dependency shapes.
+    #[serde(default)]
+    pub normalize: Option<NormalizeConfig>,
 }
 
 impl UpdConfig {
@@ -391,6 +462,14 @@ exclude = [
 # pypi = "14d"
 # "crates.io" = "3d"
 
+# normalize: rewrite every registry-backed dependency in a selected
+# pyproject.toml section to one clause at the policy-selected release, in full precision.
+# Omitted sections preserve their existing operator and constraint shape.
+[normalize.pyproject]
+# dependencies = "at-least"
+# optional-dependencies = "at-least"
+# dependency-groups = "exact"
+
 # automation: opt-in policy for unattended repository writes. Scheduled
 # security remediation remains disabled when this key is absent or false.
 [automation]
@@ -457,16 +536,17 @@ security_remediation = false
     ///
     /// Matching is case-insensitive and PEP 503 separator-normalized, identical
     /// to `should_ignore`, so a `flask` pin applies to `Flask` in the manifest.
+    /// Surrounding whitespace in the configured value is ignored.
     pub fn get_pinned_version(&self, package: &str) -> Option<&str> {
         // Fast path: exact key hit (the common case).
         if let Some(v) = self.pin.get(package) {
-            return Some(v.as_str());
+            return Some(v.trim());
         }
         let target = normalize_package_name(package);
         self.pin
             .iter()
             .find(|(k, _)| normalize_package_name(k) == target)
-            .map(|(_, v)| v.as_str())
+            .map(|(_, v)| v.trim())
     }
 
     /// Check if any configuration is present
@@ -477,6 +557,7 @@ security_remediation = false
             || !self.pin.is_empty()
             || self.cooldown.is_some()
             || self.automation.security_remediation.is_some()
+            || self.normalize.is_some()
     }
 
     /// Merge another configuration into this one (other takes precedence)
@@ -514,6 +595,21 @@ security_remediation = false
         // Child automation choices override parent choices only when stated.
         if other.automation.security_remediation.is_some() {
             self.automation.security_remediation = other.automation.security_remediation;
+        }
+        if let Some(other_normalize) = other.normalize
+            && let Some(other_pyproject) = other_normalize.pyproject
+        {
+            let normalize = self.normalize.get_or_insert_default();
+            let pyproject = normalize.pyproject.get_or_insert_default();
+            if other_pyproject.dependencies.is_some() {
+                pyproject.dependencies = other_pyproject.dependencies;
+            }
+            if other_pyproject.optional_dependencies.is_some() {
+                pyproject.optional_dependencies = other_pyproject.optional_dependencies;
+            }
+            if other_pyproject.dependency_groups.is_some() {
+                pyproject.dependency_groups = other_pyproject.dependency_groups;
+            }
         }
     }
 
@@ -650,6 +746,16 @@ impl EffectiveConfig<'_> {
             "update_action_shas: {}\n",
             self.update_action_shas
         ));
+        match self.config.normalize.and_then(|n| n.pyproject) {
+            None => out.push_str("normalize: (off)\n"),
+            Some(pyproject) => {
+                out.push_str("normalize:\n  pyproject:\n");
+                for (section, operator) in pyproject.entries() {
+                    let shown = operator.map_or("(as written)", SpecifierOperator::name);
+                    out.push_str(&format!("    {section}: {shown}\n"));
+                }
+            }
+        }
         out.push_str("automation:\n");
         out.push_str(&format!(
             "  security_remediation: {}\n",
@@ -687,6 +793,18 @@ impl EffectiveConfig<'_> {
             "exclude": self.config.exclude,
             "pin": pin,
             "update_action_shas": self.update_action_shas,
+            "normalize": self.config.normalize.and_then(|n| n.pyproject).map(|pyproject| {
+                let mut sections = serde_json::Map::new();
+                for (section, operator) in pyproject.entries() {
+                    sections.insert(
+                        section.to_string(),
+                        operator.map_or(serde_json::Value::Null, |op| {
+                            serde_json::Value::String(op.name().to_string())
+                        }),
+                    );
+                }
+                serde_json::json!({ "pyproject": sections })
+            }),
             "automation": {
                 "security_remediation": self.config.security_remediation_enabled(),
             },
@@ -1501,6 +1619,119 @@ security_remedation = false
             ..Default::default()
         });
         assert_eq!(base.update_action_shas, Some(false));
+    }
+
+    #[test]
+    fn normalize_pyproject_is_opt_in_and_section_specific() {
+        let content = r#"
+[normalize.pyproject]
+dependencies = "at-least"
+optional-dependencies = "at-most"
+dependency-groups = "exact"
+"#;
+        let (config, warnings) = UpdConfig::parse_with_warnings(content, "test.toml").unwrap();
+        assert!(warnings.is_empty(), "{warnings:?}");
+        let policy = config.normalize.unwrap().pyproject.unwrap();
+        assert_eq!(policy.dependencies, Some(SpecifierOperator::AtLeast));
+        assert_eq!(
+            policy.optional_dependencies,
+            Some(SpecifierOperator::AtMost)
+        );
+        assert_eq!(policy.dependency_groups, Some(SpecifierOperator::Exact));
+
+        let (absent, _) = UpdConfig::parse_with_warnings("ignore = []", "test.toml").unwrap();
+        assert!(absent.normalize.is_none());
+    }
+
+    #[test]
+    fn normalize_rejects_operator_punctuation_and_unknown_sections() {
+        let operator_error = UpdConfig::parse_with_warnings(
+            "[normalize.pyproject]\ndependencies = \"==\"",
+            "test.toml",
+        )
+        .unwrap_err();
+        for accepted in ["exact", "at-least", "at-most"] {
+            assert!(operator_error.contains(accepted), "{operator_error}");
+        }
+
+        let key_error = UpdConfig::parse_with_warnings(
+            "[normalize.pyproject]\ndependency_groups = \"exact\"",
+            "test.toml",
+        )
+        .unwrap_err();
+        assert!(key_error.contains("dependency_groups"), "{key_error}");
+    }
+
+    #[test]
+    fn normalize_merges_and_counts_as_configuration() {
+        let parent = NormalizeConfig {
+            pyproject: Some(PyprojectNormalize {
+                dependencies: Some(SpecifierOperator::Exact),
+                ..Default::default()
+            }),
+        };
+        let mut config = UpdConfig {
+            normalize: Some(parent),
+            ..Default::default()
+        };
+        config.merge(UpdConfig::default());
+        assert_eq!(config.normalize, Some(parent));
+        assert!(config.has_config());
+
+        let child = NormalizeConfig {
+            pyproject: Some(PyprojectNormalize {
+                dependency_groups: Some(SpecifierOperator::AtLeast),
+                ..Default::default()
+            }),
+        };
+        config.merge(UpdConfig {
+            normalize: Some(child),
+            ..Default::default()
+        });
+        assert_eq!(
+            config.normalize,
+            Some(NormalizeConfig {
+                pyproject: Some(PyprojectNormalize {
+                    dependencies: Some(SpecifierOperator::Exact),
+                    dependency_groups: Some(SpecifierOperator::AtLeast),
+                    ..Default::default()
+                })
+            })
+        );
+    }
+
+    #[test]
+    fn show_config_renders_normalization_policy() {
+        let policy = crate::cooldown::CooldownPolicy {
+            default: chrono::Duration::zero(),
+            per_ecosystem: HashMap::new(),
+            force_override: None,
+        };
+        let config = UpdConfig {
+            normalize: Some(NormalizeConfig {
+                pyproject: Some(PyprojectNormalize {
+                    dependencies: Some(SpecifierOperator::AtLeast),
+                    dependency_groups: Some(SpecifierOperator::Exact),
+                    ..Default::default()
+                }),
+            }),
+            ..Default::default()
+        };
+        let effective = EffectiveConfig {
+            source: None,
+            explicit: false,
+            config: &config,
+            cooldown: &policy,
+            update_action_shas: true,
+        };
+        let text = effective.render_text();
+        assert!(text.contains("dependencies: at-least"), "{text}");
+        assert!(text.contains("dependency-groups: exact"), "{text}");
+        assert_eq!(
+            effective.to_json()["normalize"]["pyproject"]["dependencies"],
+            "at-least"
+        );
+        assert!(effective.to_json()["normalize"]["pyproject"]["optional-dependencies"].is_null());
     }
 
     #[test]

@@ -260,6 +260,12 @@ An npm spec that names no published version is left alone and reported nowhere:
 somewhere other than a release on the registry, so there is no version to
 compare and nothing an update could move.
 
+Specifier shape changes are opt-in. A `[normalize.pyproject]` table in
+`.updrc.toml` can independently make project dependencies, optional
+dependencies, or standardized dependency groups use `==`, `>=`, or `<=`; projects without
+that table retain the shape-preserving behavior above. See
+[the configuration guide](docs/configuration.md#normalizing-pyproject-specifiers).
+
 ### Bounds that are not floors
 
 Only an **inclusive** lower bound names the version a project is on, so only
