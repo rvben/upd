@@ -95,7 +95,7 @@ fn get_updater(file_type: FileType, warnings: ParseWarnings) -> Box<dyn Updater>
         FileType::Csproj => Box::new(CsprojUpdater::new()),
         FileType::GithubActions => Box::new(GithubActionsUpdater::new()),
         FileType::PreCommitConfig => Box::new(PreCommitUpdater::new()),
-        FileType::MiseToml | FileType::ToolVersions => Box::new(MiseUpdater::new()),
+        FileType::MiseToml | FileType::ToolVersions => Box::new(MiseUpdater::new_parse_only()),
         FileType::TerraformTf => Box::new(TerraformUpdater::new()),
         FileType::Dockerfile | FileType::DockerCompose => Box::new(DockerUpdater::new()),
         FileType::Annotated => Box::new(AnnotatedUpdater::new_parse_only(warnings)),
