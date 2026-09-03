@@ -105,10 +105,43 @@ pull-request workflow are covered in [GitHub Actions](github-actions.md).
 
 ## Mise / asdf
 
-- `.mise.toml` (`[tools]` section)
-- `.tool-versions` (space-delimited format)
-- Supports 24+ common dev tools: node, python, go, rust, zig, deno, bun, uv, ruff, terraform, kubectl, helm, and more
-- Skips `latest` versions and `cargo:*` tools
+- `.mise.toml`: `[tools]` and `[tools.<name>]`, with the version written as a
+  string (`rust = "1.91.1"`), an inline table (`uv = { version = "0.12.5" }`)
+  or an array (`node = ["20.11.0", "18.0.0"]`, first entry only)
+- `.tool-versions` (space-delimited format; first version on a line only)
+
+An entry that names its backend is checked against that backend's registry:
+
+| Prefix | Registry |
+| --- | --- |
+| `cargo:` | crates.io |
+| `npm:` | npm |
+| `pipx:` | PyPI |
+| `gem:` | RubyGems |
+| `dotnet:` | NuGet |
+| `go:` | Go module proxy |
+| `github:`, `ubi:`, `aqua:` | GitHub releases |
+
+`aqua:` names a package path whose first two segments are the GitHub repository,
+so `aqua:kubernetes/kubernetes/kubectl` is checked against
+`kubernetes/kubernetes`.
+
+An entry with no prefix is checked when it is one of 24+ common dev tools
+(node, python, go, rust, zig, deno, bun, uv, ruff, terraform, kubectl, helm,
+and more), whose registry `upd` knows without asking mise.
+
+Everything else is reported rather than dropped, because an unchecked pin is
+not an up-to-date one. `upd` counts these in the summary, names them under
+`--verbose`, and lists them in `skipped[]` in the JSON report with a reason:
+
+| Reason | Entry |
+| --- | --- |
+| `unsupported-backend` | a backend with no `upd` registry (`asdf:`, `vfox:`, `http:`, ...) |
+| `unknown-tool` | a bare name outside the table above; add a backend prefix to have it checked |
+| `symbolic-version` | `latest`, `lts`, `system`, `global`, `ref:*`, `prefix:*`, which mise resolves at install time |
+
+Ignore rules and pins in `.updrc.toml` match the key exactly as the file spells
+it, backend prefix included: `ignore = ["cargo:cargo-zigbuild"]`.
 
 ## Annotated files
 

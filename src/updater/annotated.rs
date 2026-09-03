@@ -104,6 +104,18 @@ impl RegistrySet {
         }
     }
 
+    /// Several sources, backed by whatever registries the caller supplies.
+    ///
+    /// Test-only for the same reason as `with_single`: a production set that
+    /// answers for some sources and not others is the silent misconfiguration
+    /// `resolving` exists to make impossible.
+    #[cfg(test)]
+    pub(crate) fn with_sources(entries: Vec<(AnnotationSource, Arc<dyn Registry>)>) -> Self {
+        Self {
+            entries: entries.into_iter().collect(),
+        }
+    }
+
     /// Fallible in both constructions, so there is one signature rather than
     /// two. On a parse-only set every lookup is `Err`; on a resolving set every
     /// v1 source is `Ok`. Never a silent `None`: an `Option` here would make a

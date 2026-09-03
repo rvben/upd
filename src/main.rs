@@ -43,8 +43,8 @@ use upd::updater::{
     DEFAULT_UPDATE_ACTION_SHAS, DiscoverOptions, DockerUpdater, FileType, GemfileUpdater,
     GithubActionsUpdater, GoModUpdater, Lang, MiseUpdater, PackageJsonUpdater, ParseWarnings,
     PreCommitUpdater, PyProjectUpdater, RegistrySet, RequirementsUpdater, SkipStatus,
-    TerraformUpdater, UpdateOptions, UpdateResult, Updater, classify_bump, discover_files_with,
-    ecosystem_key, read_file_safe, update_with_annotations, write_file_atomic,
+    SkippedUpdate, TerraformUpdater, UpdateOptions, UpdateResult, Updater, classify_bump,
+    discover_files_with, ecosystem_key, read_file_safe, update_with_annotations, write_file_atomic,
 };
 use upd::version::{compare_versions, match_version_precision};
 
@@ -1498,7 +1498,6 @@ async fn run_update(cli: &Cli) -> Result<()> {
     let github_actions_updater = Arc::new(GithubActionsUpdater::new());
     let pre_commit_updater = Arc::new(PreCommitUpdater::new());
     let gemfile_updater = Arc::new(GemfileUpdater::new());
-    let mise_updater = Arc::new(MiseUpdater::new());
     let terraform_updater = Arc::new(TerraformUpdater::new());
     let csproj_updater = Arc::new(CsprojUpdater::new());
     let docker_updater = Arc::new(DockerUpdater::new());
@@ -1514,17 +1513,22 @@ async fn run_update(cli: &Cli) -> Result<()> {
     let github_releases = Arc::new(github_releases);
     let docker = Arc::new(docker);
 
-    // Built last: it holds the cached registries, so it cannot exist before
-    // them. Terraform is absent because no v1 annotation source names it.
-    let annotated_updater = Arc::new(AnnotatedUpdater::new(RegistrySet::resolving(
-        &pypi,
-        &npm,
-        &crates_io,
-        &go_proxy,
-        &rubygems,
-        &nuget,
-        &github_releases,
-    )));
+    // Built last: they hold the cached registries, so they cannot exist before
+    // them. Terraform is absent because no v1 annotation source names it, and a
+    // mise entry cannot name it either.
+    let registry_set = || {
+        RegistrySet::resolving(
+            &pypi,
+            &npm,
+            &crates_io,
+            &go_proxy,
+            &rubygems,
+            &nuget,
+            &github_releases,
+        )
+    };
+    let annotated_updater = Arc::new(AnnotatedUpdater::new(registry_set()));
+    let mise_updater = Arc::new(MiseUpdater::new(registry_set()));
 
     // Interactive mode: first discover updates, then prompt, then apply approved ones
     if cli.interactive {
@@ -2996,11 +3000,15 @@ async fn run_interactive_update(
                 .count()
         })
         .sum();
-    let not_examined_total: usize = scanned_results
+    let not_examined_groups = not_examined_groups(
+        scanned_results
+            .iter()
+            .flat_map(|scanned| scanned.result.skipped.iter()),
+    );
+    let not_examined_total: usize = not_examined_groups
         .iter()
-        .map(|scanned| scanned.result.skipped.len())
-        .sum::<usize>()
-        - blocked_total;
+        .map(|(_, count)| count)
+        .sum::<usize>();
     if !cli.quiet {
         if blocked_total > 0 {
             println!(
@@ -3009,13 +3017,7 @@ async fn run_interactive_update(
                 blocked_total.to_string().yellow().bold()
             );
         }
-        if not_examined_total > 0 {
-            println!(
-                "{} {} SHA-pinned action(s), not checked while SHA updates are off",
-                "Skipped".dimmed(),
-                not_examined_total.to_string().dimmed()
-            );
-        }
+        print_not_examined_lines(&not_examined_groups);
     }
     if annotation_total > 0 && !cli.quiet {
         println!(
@@ -5393,6 +5395,49 @@ fn format_normalized_lines(
         .collect()
 }
 
+/// The summary phrase for a group of dependencies upd did not examine.
+///
+/// Keyed by the reason token the updater recorded, so a reason with no phrase
+/// here still gets an honest line rather than borrowing another reason's
+/// wording. `--verbose` names each dependency with its own message.
+fn not_examined_phrase(reason: &str) -> &'static str {
+    match reason {
+        "action-sha-updates-off" => "SHA-pinned action(s), not checked while SHA updates are off",
+        "unsupported-backend" => "tool(s) on a backend upd cannot query",
+        "unknown-tool" => "tool(s) upd knows no registry for",
+        "symbolic-version" => "tool version(s) mise resolves at install time",
+        _ => "dependency(ies) upd did not check",
+    }
+}
+
+/// How many dependencies went unexamined for each reason, in the order the
+/// reasons first appear, so a run that skips for two reasons reports both.
+fn not_examined_groups<'a>(
+    skipped: impl Iterator<Item = &'a SkippedUpdate>,
+) -> Vec<(&'static str, usize)> {
+    let mut groups: Vec<(&'static str, usize)> = Vec::new();
+    for skip in skipped.filter(|skip| skip.status == SkipStatus::NotExamined) {
+        let phrase = not_examined_phrase(skip.reason);
+        match groups.iter_mut().find(|(known, _)| *known == phrase) {
+            Some((_, count)) => *count += 1,
+            None => groups.push((phrase, 1)),
+        }
+    }
+    groups
+}
+
+/// Print one `Skipped` line per reason a dependency went unexamined.
+fn print_not_examined_lines(groups: &[(&'static str, usize)]) {
+    for (phrase, count) in groups {
+        println!(
+            "{} {} {}",
+            "Skipped".dimmed(),
+            count.to_string().dimmed(),
+            phrase
+        );
+    }
+}
+
 /// Every skipped pin for one file, rendered.
 ///
 /// A blocked pin needs attention on the line it is on, so it always prints. A
@@ -5742,7 +5787,6 @@ fn print_summary(
         .iter()
         .filter(|s| s.status == SkipStatus::Blocked)
         .count();
-    let not_examined_count = result.skipped.len() - blocked_count;
     let capped_count = result.capped.len();
     let annotation_count = result.annotations.len();
     let normalized_count = result.normalized.len();
@@ -5885,13 +5929,7 @@ fn print_summary(
             );
         }
 
-        if not_examined_count > 0 {
-            println!(
-                "{} {} SHA-pinned action(s), not checked while SHA updates are off",
-                "Skipped".dimmed(),
-                not_examined_count.to_string().dimmed()
-            );
-        }
+        print_not_examined_lines(&not_examined_groups(result.skipped.iter()));
 
         // Each warning already named its package on stderr. This line exists so
         // that stdout, which is where the tick would otherwise be, carries the
