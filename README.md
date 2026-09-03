@@ -101,7 +101,7 @@ references and leave a parseable result. See the
 - **Fast**: parallel registry requests, with a 24-hour version cache
 - **Constraint-aware**: respects `>=2.0,<3` (Python), `~> 7.1` (Ruby), and `^2.0.0` / `~2.0.0` (npm, Cargo)
 - **Format-preserving**: keeps formatting, comments, and structure
-- **Update filters**: `--only-bump`, `--max-bump`, `--package`, `--lang`, or approve one by one with `-i`
+- **Update filters**: `--only-bump`, `--max-bump`, `--package` (exact names or quoted globs such as `'shiny*'`), `--lang`, or approve one by one with `-i`
 - **Major warnings**: breaking changes are flagged with `(MAJOR)`
 - **Pre-release aware**: updates pre-releases to newer pre-releases
 - **Cooldown**: hold back releases younger than N days, against supply-chain attacks
@@ -160,6 +160,9 @@ upd -i
 # Only the packages you name
 upd -p requests,flask
 
+# Select a package family (quote globs so your shell passes them to upd)
+upd --package 'shiny*'
+
 # Cap the bump level (allow patch + minor, skip major). Updates above the
 # ceiling are reported as held back, never as up to date, and do not
 # change the exit code.
@@ -185,6 +188,13 @@ upd --show-config
 `upd --help` lists every flag; [Stability](https://github.com/rvben/upd/blob/main/docs/stability.md)
 documents the ones that are contractual, and `upd schema` emits the whole
 interface as JSON.
+
+`--package` accepts exact names and case-sensitive globs using `*`, `?`, and
+character classes such as `[ab]`. Wildcards can cross namespace separators, so
+patterns such as `'@scope/*'` and `'github.com/org/*'` work as expected. Quote
+globs on the command line to prevent shell expansion. A glob that matches no
+package produces a warning without changing the exit code; use repeated or
+comma-separated values instead of brace alternation.
 
 > **Dry-run by default**: `upd` without `--apply` only previews changes. Pass `--apply` to
 > write updates. `--check`, `--dry-run`, and `--interactive` do not require `--apply`.

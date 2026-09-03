@@ -278,7 +278,7 @@ only Contents and Pull requests write for the target repository.
 | `upd-target` | detected | Release target; Linux x86-64 and ARM64 GNU are detected |
 | `paths` | `.` | Whitespace-separated repository paths passed to `upd` |
 | `langs` | `actions` | Comma-separated ecosystem filter; empty enables every detected ecosystem |
-| `packages` | empty | Comma-separated package filter |
+| `packages` | empty | Comma-separated exact-name or case-sensitive glob filter |
 | `min-age` | `7d` | Minimum eligible release age; empty uses project configuration |
 | `max-bump` | `minor` | Highest applied bump; empty uses project configuration |
 | `lock` | `false` | Regenerate lockfiles using tools available on the runner |
@@ -381,7 +381,9 @@ eligible. Changed workflows are validated with `actionlint` before publication.
 
 Configuration pins and package filters use an action's `owner/repo` name. For
 example, `packages: actions/checkout` selects checkout references, subdirectory
-actions, and reusable workflows from that repository.
+actions, and reusable workflows from that repository. Package filters also
+accept case-sensitive globs, so `packages: actions/*` selects every action in
+that namespace.
 
 ## Annotated versions in a workflow
 

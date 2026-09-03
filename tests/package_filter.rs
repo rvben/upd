@@ -1,9 +1,9 @@
 //! Integration tests for the `--package` filter flag.
 //!
-//! The filter restricts update processing to packages whose name exactly
-//! matches one of the supplied names.  Non-matching packages are silently
-//! skipped (treated as up-to-date).  The filter applies to both mutate and
-//! `--dry-run`/`--check` paths.
+//! The filter restricts update processing to packages whose name matches one
+//! of the supplied exact names or glob patterns. Non-matching packages are
+//! silently skipped (treated as up-to-date). The filter applies to both mutate
+//! and `--dry-run`/`--check` paths.
 
 use std::fs;
 use std::path::Path;
@@ -128,29 +128,99 @@ fn comma_separated_package_filter_excludes_others() {
     );
 }
 
-/// With --package requests (the actual package name), the package is NOT skipped
-/// and upd will attempt to check/update it.  The exit code here depends on whether
-/// the registry says there's a newer version; since we run with --no-cache we would
-/// normally hit the network.  To avoid flakiness, we assert only that the exit code
-/// is NOT 2 (which would mean an unexpected error unrelated to the filter).
+/// With --package requests (the actual package name), the package is not
+/// skipped. Ignoring it through config makes that observable without relying
+/// on a live registry.
 #[test]
 fn package_filter_matching_name_does_not_skip() {
     let tmp = tempfile::tempdir().unwrap();
 
     fs::write(tmp.path().join("requirements.txt"), "requests==2.28.0\n").unwrap();
+    fs::write(tmp.path().join(".updrc.toml"), "ignore = [\"requests\"]\n").unwrap();
     let path_str = tmp.path().to_str().unwrap().to_string();
 
-    // "requests" matches the filter; upd will try to resolve its version.
-    // We don't assert a specific update count but we verify the filter
-    // itself does not erroneously skip it (the run must not exit 2 from a crash).
-    let (_stdout, _stderr, code) = run(
-        &["--package", "requests", "--dry-run", &path_str],
+    let (stdout, stderr, code) = run(
+        &[
+            "--package",
+            "requests",
+            "--output",
+            "json",
+            "--no-cache",
+            &path_str,
+        ],
         tmp.path(),
     );
-    assert_ne!(
-        code, 2,
-        "a network/parse error should not occur from the filter"
+    assert_eq!(code, 0, "stderr: {stderr}");
+    let report: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(report["files"][0]["ignored"][0]["package"], "requests");
+}
+
+/// A glob is evaluated by upd rather than passed to the registry as a literal
+/// package name. An ignored matching package gives us an observable result
+/// without any network access.
+#[test]
+fn package_glob_selects_matching_package() {
+    let tmp = tempfile::tempdir().unwrap();
+    fs::write(
+        tmp.path().join("requirements.txt"),
+        "shiny==1.0.0\nshinywidgets==1.0.0\nrequests==2.28.0\n",
+    )
+    .unwrap();
+    fs::write(
+        tmp.path().join(".updrc.toml"),
+        "ignore = [\"shiny\", \"shinywidgets\"]\n",
+    )
+    .unwrap();
+
+    let path_str = tmp.path().to_str().unwrap().to_string();
+    let (stdout, stderr, code) = run(
+        &[
+            "--package",
+            "shiny*",
+            "--output",
+            "json",
+            "--no-cache",
+            &path_str,
+        ],
+        tmp.path(),
     );
+    assert_eq!(code, 0, "stderr: {stderr}");
+
+    let report: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    let ignored = report["files"][0]["ignored"].as_array().unwrap();
+    let names: Vec<&str> = ignored
+        .iter()
+        .filter_map(|entry| entry["package"].as_str())
+        .collect();
+    assert_eq!(names, vec!["shiny", "shinywidgets"]);
+    assert!(!stdout.contains("requests"), "report: {report}");
+}
+
+#[test]
+fn unmatched_package_glob_is_a_json_warning_and_not_an_error() {
+    let tmp = tempfile::tempdir().unwrap();
+    fs::write(tmp.path().join("requirements.txt"), "requests==2.28.0\n").unwrap();
+    let path_str = tmp.path().to_str().unwrap().to_string();
+
+    let (stdout, stderr, code) = run(
+        &[
+            "--package",
+            "shiny*",
+            "--output",
+            "json",
+            "--no-cache",
+            &path_str,
+        ],
+        tmp.path(),
+    );
+    assert_eq!(code, 0, "stderr: {stderr}");
+
+    let report: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(
+        report["warnings"],
+        serde_json::json!(["package pattern 'shiny*' matched no packages"])
+    );
+    assert_eq!(report["summary"]["warnings"], 1);
 }
 
 // ── CLI unit tests (no binary needed) ─────────────────────────────────────
@@ -200,4 +270,26 @@ fn cli_parses_package_mixed_comma_and_repeated() {
         cli.packages,
         vec!["foo".to_string(), "bar".to_string(), "baz".to_string()]
     );
+}
+
+#[test]
+fn cli_parses_package_globs() {
+    use clap::Parser;
+    let cli =
+        upd::cli::Cli::try_parse_from(["upd", "--package", "shiny*,crate-?,lib[ab],@scope/*"])
+            .unwrap();
+    assert_eq!(
+        cli.packages,
+        vec!["shiny*", "crate-?", "lib[ab]", "@scope/*"]
+    );
+}
+
+#[test]
+fn cli_rejects_invalid_package_globs() {
+    use clap::Parser;
+    let error = match upd::cli::Cli::try_parse_from(["upd", "--package", "broken["]) {
+        Ok(_) => panic!("invalid glob unexpectedly parsed"),
+        Err(error) => error,
+    };
+    assert!(error.to_string().contains("invalid package pattern"));
 }

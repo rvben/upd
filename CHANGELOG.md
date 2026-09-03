@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **cli**: support case-sensitive glob patterns in `--package` filters
+
 ## [0.10.0](https://github.com/rvben/upd/compare/v0.9.2...v0.10.0) - 2026-09-02
 
 ### Added

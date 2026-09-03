@@ -94,7 +94,7 @@ but must leave the repository clean; dependency updates belong exclusively to
 | `upd_target` | detected | Release target; Linux x86-64 and ARM64 GNU are detected |
 | `paths` | `.` | Whitespace-separated repository paths passed to `upd` |
 | `langs` | empty | Comma-separated ecosystem filter |
-| `packages` | empty | Comma-separated package filter |
+| `packages` | empty | Comma-separated exact-name or case-sensitive glob filter |
 | `min_age` | `7d` | Minimum eligible release age; empty uses project configuration |
 | `max_bump` | `minor` | Highest applied bump; empty uses project configuration |
 | `lock` | `false` | Regenerate lockfiles; requires ecosystem tools in the image |

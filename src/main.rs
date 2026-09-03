@@ -32,6 +32,7 @@ use upd::lockfile::{
 };
 use upd::lockscan;
 use upd::normalize::pep503_normalize;
+use upd::package_filter::PackageFilter;
 use upd::path_display::display_path;
 use upd::registry::{
     CratesIoRegistry, DockerRegistry, GitHubReleasesRegistry, GoProxyRegistry, MultiPyPiRegistry,
@@ -456,7 +457,7 @@ fn build_update_options(
     full_precision: bool,
     update_action_shas: Option<bool>,
     config: Option<Arc<UpdConfig>>,
-    packages: &[String],
+    package_filter: &PackageFilter,
     langs: &[Lang],
     cooldown_policy: Option<&CooldownPolicy>,
     cooldown_notes: Arc<Mutex<BTreeMap<String, String>>>,
@@ -473,7 +474,7 @@ fn build_update_options(
     if let Some(config) = config {
         options = options.with_config(config);
     }
-    options = options.with_packages(packages.to_vec());
+    options = options.with_package_filter(package_filter.clone());
     options = options.with_langs(langs.to_vec());
     options = options.with_bump_filter(bump_filter);
     if let Some(policy) = cooldown_policy {
@@ -560,16 +561,27 @@ fn recognized_in_manifest(scanned: &[ScannedFileResult], norm: &str, ecosystem: 
 /// package under the same normalized name (rule 2). Shared between the
 /// non-interactive floor branch and the `--interactive` early-return note
 /// (rule 9).
-fn is_lock_only_name(
-    name: &str,
-    lock_packages: &[upd::lockscan::LockedPackage],
+fn is_lock_only_package(
+    locked: &upd::lockscan::LockedPackage,
     manifest_packages: &HashMap<(String, Lang), Vec<PackageOccurrence>>,
 ) -> bool {
-    lock_packages.iter().any(|lp| {
-        let norm = normalized_package_name(&lp.name, lp.ecosystem);
-        normalized_package_name(name, lp.ecosystem) == norm
-            && !matches_manifest_occurrence(manifest_packages, &norm, lp.ecosystem)
-    })
+    let norm = normalized_package_name(&locked.name, locked.ecosystem);
+    !matches_manifest_occurrence(manifest_packages, &norm, locked.ecosystem)
+}
+
+/// Match a concrete lockfile name while preserving the ecosystem-normalized
+/// exact-name behaviour the lock-only path had before package globs existed.
+/// Glob matching itself remains case-sensitive and operates on the name as it
+/// appears in the lockfile.
+fn package_filter_matches_locked(
+    package_filter: &PackageFilter,
+    locked: &upd::lockscan::LockedPackage,
+) -> bool {
+    package_filter.matches(&locked.name)
+        || package_filter.patterns().iter().any(|pattern| {
+            normalized_package_name(pattern, locked.ecosystem)
+                == normalized_package_name(&locked.name, locked.ecosystem)
+        })
 }
 
 /// The report/apply path a version floor targets for a given lock, mirroring
@@ -711,6 +723,14 @@ fn lock_only_interactive_note(package: &str) -> String {
     format!(
         "note: {package} is a lock-only dependency; version floors are not offered interactively - rerun without --interactive"
     )
+}
+
+fn unmatched_package_pattern_warnings(package_filter: &PackageFilter) -> Vec<String> {
+    package_filter
+        .unmatched_globs()
+        .into_iter()
+        .map(|pattern| format!("package pattern '{pattern}' matched no packages"))
+        .collect()
 }
 
 /// Render one file's warning the way `print_file_result` does, so the
@@ -1268,6 +1288,7 @@ fn effective_json_mode(cli: &Cli) -> bool {
 
 async fn run_update(cli: &Cli) -> Result<()> {
     let json_mode = effective_json_mode(cli);
+    let package_filter = PackageFilter::new(cli.packages.clone()).map_err(anyhow::Error::msg)?;
 
     // Reject --interactive with an explicit JSON output request. When output is
     // auto-detected as JSON (stdout piped), the TTY check inside
@@ -1328,7 +1349,7 @@ async fn run_update(cli: &Cli) -> Result<()> {
                     file_cooldowns: &HashMap::new(),
                     cooldown_notes: Vec::new(),
                     floor_reports: Vec::new(),
-                    lockscan_warnings: Vec::new(),
+                    run_warnings: Vec::new(),
                 },
                 &BoundedOutputParams::from_cli(cli),
             )?;
@@ -1509,6 +1530,7 @@ async fn run_update(cli: &Cli) -> Result<()> {
     if cli.interactive {
         return run_interactive_update(
             cli,
+            &package_filter,
             &files,
             &paths,
             &file_configs,
@@ -1549,7 +1571,7 @@ async fn run_update(cli: &Cli) -> Result<()> {
     // branch below needs the discovered (path, FileType) list again after
     // `files` is consumed by `.into_iter()` just below, but every other run
     // must not pay for a clone it never uses.
-    let discovered_files: Vec<(PathBuf, FileType)> = if cli.packages.is_empty() {
+    let discovered_files: Vec<(PathBuf, FileType)> = if package_filter.is_empty() {
         Vec::new()
     } else {
         files.clone()
@@ -1567,7 +1589,7 @@ async fn run_update(cli: &Cli) -> Result<()> {
                     cli.full_precision,
                     cli.action_sha_override(),
                     config,
-                    &cli.packages,
+                    &package_filter,
                     &cli.langs,
                     cooldown_policy,
                     Arc::clone(&cooldown_notes),
@@ -1752,14 +1774,14 @@ async fn run_update(cli: &Cli) -> Result<()> {
     // the lock's own mechanism (uv constraint, npm override, cargo
     // --precise); poetry has no floor mechanism and is reported unfixable.
     let mut floor_reports: Vec<upd::output::UpdateFileReport> = Vec::new();
-    let mut lockscan_warnings: Vec<String> = Vec::new();
+    let mut run_warnings: Vec<String> = Vec::new();
     let mut floor_has_planned = false;
 
-    if !cli.packages.is_empty() {
+    if !package_filter.is_empty() {
         let lock_scan = lockscan::scan_locks(&discovered_files, &paths);
-        lockscan_warnings = lock_scan.warnings.clone();
+        run_warnings = lock_scan.warnings.clone();
         if text_mode {
-            for warning in &lockscan_warnings {
+            for warning in &run_warnings {
                 eprintln!("{} {}", "Warning:".yellow(), warning);
             }
         }
@@ -1794,12 +1816,9 @@ async fn run_update(cli: &Cli) -> Result<()> {
         let mut lock_only: Vec<&upd::lockscan::LockedPackage> = Vec::new();
         for locked in &lock_scan.packages {
             let norm = normalized_package_name(&locked.name, locked.ecosystem);
-            let requested = cli
-                .packages
-                .iter()
-                .any(|p| normalized_package_name(p, locked.ecosystem) == norm);
+            let requested = package_filter_matches_locked(&package_filter, locked);
             if !requested
-                || matches_manifest_occurrence(&manifest_packages, &norm, locked.ecosystem)
+                || !is_lock_only_package(locked, &manifest_packages)
                 || recognized_in_manifest(&scanned, &norm, locked.ecosystem)
             {
                 continue;
@@ -1881,7 +1900,7 @@ async fn run_update(cli: &Cli) -> Result<()> {
                     cli.full_precision,
                     cli.action_sha_override(),
                     config,
-                    &cli.packages,
+                    &package_filter,
                     &cli.langs,
                     cooldown_policy.as_ref(),
                     Arc::clone(&cooldown_notes),
@@ -2286,6 +2305,14 @@ async fn run_update(cli: &Cli) -> Result<()> {
         floor_reports = grouped.into_values().collect();
     }
 
+    let package_pattern_warnings = unmatched_package_pattern_warnings(&package_filter);
+    if text_mode {
+        for warning in &package_pattern_warnings {
+            eprintln!("{} {}", "Warning:".yellow(), warning);
+        }
+    }
+    run_warnings.extend(package_pattern_warnings);
+
     // Regenerate lockfiles if requested and at least one manifest changed.
     if cli.lock && !dry_run && !updated_files.is_empty() {
         // Group changed package names by the lockfile their manifest owns.
@@ -2422,7 +2449,7 @@ async fn run_update(cli: &Cli) -> Result<()> {
                 file_cooldowns: &file_cooldowns,
                 cooldown_notes: notes_vec,
                 floor_reports,
-                lockscan_warnings,
+                run_warnings,
             },
             &BoundedOutputParams::from_cli(cli),
         )?;
@@ -2467,9 +2494,9 @@ struct UpdateReportInput<'a> {
     /// Version-floor file reports for lock-only `--package` targets (rule 6);
     /// empty when `--package` matched no lock-only names or was not given.
     floor_reports: Vec<upd::output::UpdateFileReport>,
-    /// Lockscan discovery/guard warnings surfaced by the version-floor branch
-    /// (rule 1); folded into `UpdateReport.warnings`.
-    lockscan_warnings: Vec<String>,
+    /// Run-level warnings that do not belong to one dependency file, including
+    /// lock discovery guards and unmatched package patterns.
+    run_warnings: Vec<String>,
 }
 
 /// Apply --limit, --offset, and --fields to a JSON document for bounded output.
@@ -2569,7 +2596,7 @@ fn emit_update_json(input: UpdateReportInput<'_>, bounded: &BoundedOutputParams<
         file_cooldowns,
         cooldown_notes,
         floor_reports,
-        lockscan_warnings,
+        run_warnings,
     } = input;
 
     let mut files: Vec<_> = scanned
@@ -2631,7 +2658,7 @@ fn emit_update_json(input: UpdateReportInput<'_>, bounded: &BoundedOutputParams<
         pinned: total_result.pinned.len(),
         ignored: total_result.ignored.len() + floor_ignored,
         errors: total_result.errors.len(),
-        warnings: total_result.warnings.len() + lockscan_warnings.len(),
+        warnings: total_result.warnings.len() + run_warnings.len(),
         held_back: total_result.held_back.len(),
         skipped_by_cooldown: total_result.skipped_by_cooldown.len(),
         skipped: total_result
@@ -2659,7 +2686,7 @@ fn emit_update_json(input: UpdateReportInput<'_>, bounded: &BoundedOutputParams<
         files,
         summary,
         cooldown_notes,
-        warnings: lockscan_warnings,
+        warnings: run_warnings,
     };
 
     let doc = serde_json::to_value(&report)?;
@@ -2671,6 +2698,7 @@ fn emit_update_json(input: UpdateReportInput<'_>, bounded: &BoundedOutputParams<
 #[allow(clippy::too_many_arguments)]
 async fn run_interactive_update(
     cli: &Cli,
+    package_filter: &PackageFilter,
     files: &[(std::path::PathBuf, FileType)],
     paths: &[PathBuf],
     file_configs: &HashMap<PathBuf, Option<Arc<UpdConfig>>>,
@@ -2724,13 +2752,17 @@ async fn run_interactive_update(
     // tell the user instead of silently doing nothing for that name. This
     // scan is best-effort: unlike the non-interactive floor branch, a
     // failure here must not abort the interactive session.
-    if !cli.packages.is_empty()
+    if !package_filter.is_empty()
         && let Ok(manifest_packages) = scan_packages(files, &cli.langs, ParseWarnings::Suppress)
     {
         let lock_scan = lockscan::scan_locks(files, paths);
-        for name in &cli.packages {
-            if is_lock_only_name(name, &lock_scan.packages, &manifest_packages) {
-                eprintln!("{}", lock_only_interactive_note(name));
+        let mut noted = HashSet::new();
+        for locked in &lock_scan.packages {
+            if package_filter_matches_locked(package_filter, locked)
+                && is_lock_only_package(locked, &manifest_packages)
+                && noted.insert(locked.name.clone())
+            {
+                eprintln!("{}", lock_only_interactive_note(&locked.name));
             }
         }
     }
@@ -2750,7 +2782,7 @@ async fn run_interactive_update(
             cli.full_precision,
             cli.action_sha_override(),
             file_configs.get(path).cloned().flatten(),
-            &cli.packages,
+            package_filter,
             &cli.langs,
             cooldown_policy,
             Arc::clone(&cooldown_notes),
@@ -2940,6 +2972,10 @@ async fn run_interactive_update(
             .iter()
             .map(|scanned| scanned.result.errors.len())
             .sum::<usize>();
+
+    for warning in unmatched_package_pattern_warnings(package_filter) {
+        eprintln!("{} {}", "Warning:".yellow(), warning);
+    }
 
     let annotation_total: usize = scanned_results
         .iter()
@@ -5949,18 +5985,17 @@ mod tests {
     /// lock-only (rule 2); a name occurring in the manifest is not, even
     /// when the same name also appears in the lockfile.
     #[test]
-    fn is_lock_only_name_detects_lock_only_and_manifest_matched() {
-        let locked = vec![upd::lockscan::LockedPackage {
+    fn is_lock_only_package_detects_lock_only_and_manifest_matched() {
+        let locked = upd::lockscan::LockedPackage {
             name: "lockonly".to_string(),
             version: "0.40.0".to_string(),
             ecosystem: Ecosystem::PyPI,
             lockfile_path: PathBuf::from("uv.lock"),
             line_number: None,
             locator: None,
-        }];
+        };
         let empty_manifest: HashMap<(String, Lang), Vec<PackageOccurrence>> = HashMap::new();
-        assert!(is_lock_only_name("lockonly", &locked, &empty_manifest));
-        assert!(!is_lock_only_name("unrelated", &locked, &empty_manifest));
+        assert!(is_lock_only_package(&locked, &empty_manifest));
 
         let mut manifest_with_occurrence: HashMap<(String, Lang), Vec<PackageOccurrence>> =
             HashMap::new();
@@ -5976,11 +6011,25 @@ mod tests {
                 is_bumpable: true,
             }],
         );
-        assert!(!is_lock_only_name(
-            "lockonly",
-            &locked,
-            &manifest_with_occurrence
-        ));
+        assert!(!is_lock_only_package(&locked, &manifest_with_occurrence));
+    }
+
+    #[test]
+    fn lock_filter_preserves_normalized_exact_names_but_not_glob_case() {
+        let locked = upd::lockscan::LockedPackage {
+            name: "typing-extensions".to_string(),
+            version: "4.0.0".to_string(),
+            ecosystem: Ecosystem::PyPI,
+            lockfile_path: PathBuf::from("uv.lock"),
+            line_number: None,
+            locator: None,
+        };
+
+        let exact = PackageFilter::new(vec!["Typing_Extensions".to_string()]).unwrap();
+        assert!(package_filter_matches_locked(&exact, &locked));
+
+        let glob = PackageFilter::new(vec!["Typing*".to_string()]).unwrap();
+        assert!(!package_filter_matches_locked(&glob, &locked));
     }
 
     /// Rule 9: the interactive early path's note names the package and
@@ -7830,6 +7879,7 @@ mod output_tests {
     }
 
     fn options_for(cli_flag: Option<bool>, config_key: Option<bool>) -> UpdateOptions {
+        let package_filter = PackageFilter::default();
         build_update_options(
             true,
             false,
@@ -7838,7 +7888,7 @@ mod output_tests {
                 update_action_shas: config_key,
                 ..Default::default()
             })),
-            &[],
+            &package_filter,
             &[],
             None,
             Arc::default(),

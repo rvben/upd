@@ -28,7 +28,7 @@ on:
         type: string
         default: actions
       packages:
-        description: Comma-separated package filter
+        description: Comma-separated exact-name or case-sensitive glob filter
         type: string
         default: ""
       min-age:

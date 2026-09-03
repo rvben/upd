@@ -343,9 +343,8 @@ pub struct UpdateReport {
     pub summary: UpdateSummary,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub cooldown_notes: Vec<String>,
-    /// Lockfile-discovery warnings (e.g. an ancestor lock outside the
-    /// scanned paths). Only populated when `--package` triggers lockfile
-    /// scanning for version floors.
+    /// Run-level selection or discovery warnings, such as an unmatched package
+    /// glob or an ancestor lockfile outside the scanned paths.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub warnings: Vec<String>,
 }

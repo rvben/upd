@@ -30,6 +30,7 @@ pub use terraform::TerraformUpdater;
 use crate::annotation::AnnotationSource;
 use crate::config::UpdConfig;
 use crate::cooldown::CooldownPolicy;
+use crate::package_filter::PackageFilter;
 use crate::path_display::display_path;
 use crate::registry::{Registry, VersionQuery};
 use anyhow::{Result, anyhow};
@@ -568,6 +569,9 @@ pub struct UpdateOptions {
     /// When non-empty, only packages whose name is in this set are processed.
     /// An empty set means "process all packages" (no filter active).
     pub packages: Vec<String>,
+    /// Compiled matcher for `packages`. Kept separate from the public vector
+    /// so existing callers can continue to inspect the supplied selectors.
+    package_filter: PackageFilter,
     /// Active cooldown policy, if configured. None => cooldown disabled.
     pub cooldown_policy: Option<Arc<CooldownPolicy>>,
     /// Wall-clock used for cooldown decisions. None => `Utc::now()` at call time.
@@ -616,6 +620,7 @@ impl UpdateOptions {
             full_precision,
             config: None,
             packages: Vec::new(),
+            package_filter: PackageFilter::default(),
             cooldown_policy: None,
             cooldown_now: None,
             cooldown_unavailable_notes: Arc::default(),
@@ -646,7 +651,16 @@ impl UpdateOptions {
 
     /// Restrict processing to the named packages.
     pub fn with_packages(mut self, packages: Vec<String>) -> Self {
+        self.package_filter = PackageFilter::new(packages.clone())
+            .expect("UpdateOptions::with_packages requires valid package glob patterns");
         self.packages = packages;
+        self
+    }
+
+    /// Restrict processing with a precompiled filter shared by all file jobs.
+    pub fn with_package_filter(mut self, filter: PackageFilter) -> Self {
+        self.packages = filter.patterns().to_vec();
+        self.package_filter = filter;
         self
     }
 
@@ -665,7 +679,16 @@ impl UpdateOptions {
     /// Returns `true` when this package should be skipped because a `--package`
     /// filter is active and the name is not in the allowed set.
     pub fn is_package_filtered_out(&self, package: &str) -> bool {
-        !self.packages.is_empty() && !self.packages.iter().any(|p| p == package)
+        // Keep direct mutation of the historically public `packages` field
+        // functional for library callers. The CLI and builder paths always
+        // take the compiled fast path.
+        if self.package_filter.patterns() == self.packages {
+            !self.package_filter.matches(package)
+        } else {
+            PackageFilter::new(self.packages.clone())
+                .map(|filter| !filter.matches(package))
+                .unwrap_or_else(|_| !self.packages.iter().any(|p| p == package))
+        }
     }
 
     /// Check if a package should be ignored

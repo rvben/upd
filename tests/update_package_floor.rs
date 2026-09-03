@@ -1,5 +1,5 @@
-//! Integration coverage for `upd update --package <name>` version floors:
-//! a requested name that matches no manifest occurrence but resolves via a
+//! Integration coverage for `upd update --package <selector>` version floors:
+//! a selected name that matches no manifest occurrence but resolves via a
 //! scanned lockfile is floored to the registry latest (or a config pin)
 //! through the lock's own mechanism, reusing the routing/apply machinery
 //! built for `audit --fix-audit`. This file exercises the full rule set.
@@ -178,7 +178,7 @@ fn collect_for_path(
 /// mocked registry latest in a dry run: exit 1, a `uv-constraint` `planned`
 /// entry on `pyproject.toml`, and the manifest itself untouched.
 #[tokio::test]
-async fn lock_only_package_floors_from_mocked_registry_dry_run() {
+async fn lock_only_package_glob_floors_from_mocked_registry_dry_run() {
     let server = wiremock::MockServer::start().await;
     mount_pypi_latest(&server, "lockonly", "0.49.1").await;
 
@@ -190,7 +190,7 @@ async fn lock_only_package_floors_from_mocked_registry_dry_run() {
         &[
             "update",
             "--package",
-            "lockonly",
+            "lock*",
             "--format",
             "json",
             "--no-cache",
@@ -233,7 +233,7 @@ async fn lock_only_package_floors_from_mocked_registry_dry_run() {
 /// direct dependency, and the floor disappears with no diagnostic - which is
 /// exactly the failure a forward guard is for.
 ///
-/// Two controls. `lock_only_package_floors_from_mocked_registry_dry_run` above
+/// Two controls. `lock_only_package_glob_floors_from_mocked_registry_dry_run` above
 /// is the same fixture WITHOUT the Makefile, so the annotation is the only
 /// variable between them. And the Makefile's own planned update is asserted
 /// here, which proves the annotated file was scanned at all - without it this

@@ -1,3 +1,4 @@
+use crate::package_filter::parse_package_pattern;
 use crate::updater::Lang;
 use clap::{Parser, Subcommand, ValueEnum};
 use std::path::PathBuf;
@@ -223,15 +224,17 @@ pub struct Cli {
     #[arg(long, global = true, value_name = "DURATION")]
     pub min_age: Option<String>,
 
-    /// Update only the named package(s), skipping all others.
+    /// Update only matching package(s), skipping all others.
     ///
-    /// Comma-separated or repeatable. Exact case-sensitive match.
+    /// Accepts case-sensitive globs (`*`, `?`, `[abc]`). Quote globs to keep
+    /// the shell from expanding them. Comma-separated or repeatable.
     #[arg(
         short = 'p',
         long = "package",
         value_name = "NAME",
         global = true,
-        value_delimiter = ','
+        value_delimiter = ',',
+        value_parser = parse_package_pattern
     )]
     pub packages: Vec<String>,
 

@@ -29,7 +29,7 @@ spec:
       description: Comma-separated ecosystem filter
       default: ""
     packages:
-      description: Comma-separated package filter
+      description: Comma-separated exact-name or case-sensitive glob filter
       default: ""
     min_age:
       description: Minimum eligible release age; empty uses repository configuration
