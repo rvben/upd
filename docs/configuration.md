@@ -33,8 +33,8 @@ ignore = [
 # Add otherwise-unknown files to discovery as annotated files. Patterns are
 # relative to the directory being scanned.
 include = [
-    "ansible/roles/*/vars/*.yml",
-    "docker-compose.yml",
+    "deploy/*.env",
+    "config/version.conf",
 ]
 
 # Drop matching files from discovery. Exclude takes precedence over include.

@@ -190,22 +190,22 @@ async fn an_annotated_makefile_is_updated_end_to_end() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn an_included_yaml_file_is_discovered_and_updated_end_to_end() {
+async fn an_included_env_file_is_discovered_and_updated_end_to_end() {
     let mock = MockServer::start().await;
     mount_pypi(&mock, "shinyhub", &["0.11.16", "0.12.6"]).await;
 
     let dir = TempDir::new().unwrap();
     std::fs::write(
         dir.path().join(".updrc.toml"),
-        "include = [\"ansible/roles/*/vars/*.yml\"]\n",
+        "include = [\"ansible/roles/*/vars/*.env\"]\n",
     )
     .unwrap();
     let vars = dir.path().join("ansible/roles/shinyhub/vars");
     std::fs::create_dir_all(&vars).unwrap();
-    let main_yml = vars.join("main.yml");
+    let main_env = vars.join("versions.env");
     std::fs::write(
-        &main_yml,
-        "---\nshinyhub_version: \"0.11.16\"  # upd: pypi shinyhub\n",
+        &main_env,
+        "SHINYHUB_VERSION=\"0.11.16\"  # upd: pypi shinyhub\n",
     )
     .unwrap();
 
@@ -217,8 +217,8 @@ async fn an_included_yaml_file_is_discovered_and_updated_end_to_end() {
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(output.status.success(), "upd failed:\n{stderr}");
     assert_eq!(
-        std::fs::read_to_string(&main_yml).unwrap(),
-        "---\nshinyhub_version: \"0.12.6\"  # upd: pypi shinyhub\n"
+        std::fs::read_to_string(&main_env).unwrap(),
+        "SHINYHUB_VERSION=\"0.12.6\"  # upd: pypi shinyhub\n"
     );
 
     let report = json_of(&output);
@@ -226,6 +226,53 @@ async fn an_included_yaml_file_is_discovered_and_updated_end_to_end() {
     assert_eq!(report["summary"]["updates_total"], 1);
     assert_eq!(report["files"][0]["file_type"], "annotated");
     assert_eq!(report["files"][0]["updates"][0]["package"], "shinyhub");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_annotated_yaml_file_is_discovered_beside_a_pyproject() {
+    let mock = MockServer::start().await;
+    mount_pypi(&mock, "shinyhub", &["0.12.11", "0.15.2"]).await;
+
+    let dir = TempDir::new().unwrap();
+    let vars = dir.path().join("vars.yml");
+    std::fs::write(
+        &vars,
+        "shinyhub_version: \"0.12.11\"  # upd: pypi shinyhub\n",
+    )
+    .unwrap();
+    let pyproject = dir.path().join("pyproject.toml");
+    std::fs::write(
+        &pyproject,
+        "[project]\nname = \"x\"\nversion = \"0.0.0\"\ndependencies = [\n    \"shinyhub==0.12.11\",\n]\n",
+    )
+    .unwrap();
+
+    let output = run(
+        &dir,
+        &mock.uri(),
+        &["update", "--apply", "--output", "json", "."],
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "upd failed:\n{stderr}");
+
+    assert_eq!(
+        std::fs::read_to_string(&vars).unwrap(),
+        "shinyhub_version: \"0.15.2\"  # upd: pypi shinyhub\n"
+    );
+    assert!(
+        std::fs::read_to_string(&pyproject)
+            .unwrap()
+            .contains("shinyhub==0.15.2")
+    );
+
+    let report = json_of(&output);
+    assert_eq!(report["summary"]["files_scanned"], 2);
+    assert_eq!(report["summary"]["updates_total"], 2);
+    assert_eq!(file_named(&report, "vars.yml")["file_type"], "annotated");
+    assert_eq!(
+        file_named(&report, "pyproject.toml")["file_type"],
+        "pyproject"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]

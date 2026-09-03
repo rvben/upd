@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **discovery**: find annotated dependency pins in YAML files during directory traversal
+
 ## [0.10.2](https://github.com/rvben/upd/compare/v0.10.1...v0.10.2) - 2026-09-03
 
 ### Fixed

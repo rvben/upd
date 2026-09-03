@@ -122,12 +122,13 @@ NODE_VERSION := 22.11.0  # upd: npm node
 
 - Syntax: `upd: <source> <package>` in a trailing `#` or `//` comment
 - Sources: `pypi`, `npm`, `crates`, `go`, `rubygems`, `nuget`, `github-releases`
-- Scanned by name: `Makefile`, `makefile`, `GNUmakefile`, `*.mk`, `justfile`,
-  `Justfile`, `*.sh`, `*.bash`. Any other file works when passed explicitly:
+- Otherwise-unrecognized files scanned by name: `Makefile`, `makefile`,
+  `GNUmakefile`, `*.mk`, `justfile`, `Justfile`, `*.sh`, `*.bash`, `*.yml`,
+  `*.yaml`. Any other file works when passed explicitly:
   `upd update path/to/versions.env`
 - The top-level `include` config key adds otherwise-unknown files to directory
   discovery as annotated files. Patterns are relative to the scanned directory:
-  `include = ["ansible/roles/*/vars/*.yml", "docker-compose.yml"]`
+  `include = ["deploy/*.env", "config/version.conf"]`
 - `include` does not reinterpret a recognized file type (`main.tf` remains
   Terraform), and `exclude` takes precedence when both match
 - A GitHub Actions workflow is the exception: it keeps its own updater and is

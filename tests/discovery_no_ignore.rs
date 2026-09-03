@@ -130,7 +130,7 @@ fn discovery_no_ignore_with_verbose_emits_no_skip_lines() {
 fn discovery_verbose_reports_marker_in_unknown_file() {
     let tmp = tempfile::tempdir().unwrap();
     fs::write(
-        tmp.path().join("deps.yml"),
+        tmp.path().join("deps.conf"),
         "version: 1.0.0  # upd: pypi example\n",
     )
     .unwrap();
@@ -139,7 +139,7 @@ fn discovery_verbose_reports_marker_in_unknown_file() {
     let (_stdout, stderr, _code) = run(&["--check", "--no-cache", "--verbose", path], tmp.path());
 
     assert!(
-        stderr.contains("deps.yml") && stderr.contains("upd:") && stderr.contains("include"),
+        stderr.contains("deps.conf") && stderr.contains("upd:") && stderr.contains("include"),
         "verbose mode must explain how to make the skipped annotation reachable; stderr:\n{stderr}"
     );
 }

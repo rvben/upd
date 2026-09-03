@@ -1237,8 +1237,8 @@ impl FileType {
     }
 
     /// File names a directory walk opens looking for version annotations.
-    /// Deliberately small: no Markdown (it would rewrite this project's own
-    /// README and every fixture in this repo) and no arbitrary YAML.
+    /// Deliberately small: no Markdown, because that could rewrite documentation
+    /// examples and fixtures that merely demonstrate annotation syntax.
     const ANNOTATED_FILE_NAMES: &'static [&'static str] = &[
         "Makefile",
         "makefile",
@@ -1248,7 +1248,8 @@ impl FileType {
     ];
 
     /// Extensions a directory walk opens, matched against the file name.
-    const ANNOTATED_FILE_EXTENSIONS: &'static [&'static str] = &[".mk", ".sh", ".bash"];
+    const ANNOTATED_FILE_EXTENSIONS: &'static [&'static str] =
+        &[".mk", ".sh", ".bash", ".yml", ".yaml"];
 
     /// `detect`, extended with the annotated set. Every earlier rule wins by
     /// construction. `explicit` is true for a file named directly on the
@@ -2154,6 +2155,8 @@ mod tests {
             "Justfile",
             "release.sh",
             "release.bash",
+            "vars.yml",
+            "vars.yaml",
         ] {
             let path = PathBuf::from("/repo/sub").join(name);
             assert_eq!(
@@ -3135,14 +3138,14 @@ mod tests {
         let root = temp.path();
         let vars = root.join("ansible/roles/shinyhub/vars");
         fs::create_dir_all(&vars).unwrap();
-        let main_yml = vars.join("main.yml");
+        let versions_env = vars.join("versions.env");
         fs::write(
-            &main_yml,
-            "shinyhub_version: \"0.11.16\"  # upd: pypi shinyhub\n",
+            &versions_env,
+            "SHINYHUB_VERSION=\"0.11.16\"  # upd: pypi shinyhub\n",
         )
         .unwrap();
 
-        let include = vec!["ansible/roles/*/vars/*.yml".to_string()];
+        let include = vec!["ansible/roles/*/vars/*.env".to_string()];
         let files = discover_files_with(
             &[root.to_path_buf()],
             &[],
@@ -3154,7 +3157,7 @@ mod tests {
             },
         );
 
-        assert_eq!(files, vec![(main_yml, FileType::Annotated)]);
+        assert_eq!(files, vec![(versions_env, FileType::Annotated)]);
     }
 
     #[test]

@@ -302,13 +302,14 @@ Files without a dependency-manifest format can carry a trailing annotation:
 shinyhub_version: "0.11.16"  # upd: pypi shinyhub
 ```
 
-Directory walks scan annotations in `Makefile`, `makefile`, `GNUmakefile`,
-`justfile`, `Justfile`, `*.mk`, `*.sh`, and `*.bash`. Any file passed explicitly
-is scanned as annotated. To add other files to normal repository discovery, use
-repository-relative globs in `.updrc.toml`:
+Directory walks scan annotations in otherwise-unrecognized `Makefile`,
+`makefile`, `GNUmakefile`, `justfile`, `Justfile`, `*.mk`, `*.sh`, `*.bash`,
+`*.yml`, and `*.yaml` files. Any file passed explicitly is scanned as annotated.
+To add other files to normal repository discovery, use repository-relative globs
+in `.updrc.toml`:
 
 ```toml
-include = ["ansible/roles/*/vars/*.yml", "docker-compose.yml"]
+include = ["deploy/*.env", "config/version.conf"]
 exclude = ["**/archive/**"] # exclude wins over include
 ```
 
