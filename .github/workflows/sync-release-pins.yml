@@ -151,8 +151,7 @@ jobs:
             .github/workflows/dependencies.yml \
             .github/workflows/remediate-dependencies.yml \
             .github/workflows/release.yml \
-            .github/workflows/sync-release-pins.yml \
-            .github/workflows/upd.yml
+            .github/workflows/sync-release-pins.yml
           git diff --check
 
       - name: Publish verified pins to main

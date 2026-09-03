@@ -147,6 +147,23 @@ fn release_pin_publication_keeps_its_recovery_and_integrity_guards() {
     assert!(!SYNC_WORKFLOW.contains("gh pr "));
     assert!(!SYNC_WORKFLOW.contains("pull-requests: write"));
     assert!(!VERSHIP_CONFIG.contains("post-push"));
+
+    let validation = SYNC_WORKFLOW
+        .split_once("      - name: Validate generated change\n")
+        .expect("release-pin workflow has a validation step")
+        .1
+        .split_once("      - name: Publish verified pins to main\n")
+        .expect("validation precedes publication")
+        .0;
+    for token in validation.split_whitespace() {
+        let path = token.trim_end_matches('\\');
+        if path.starts_with(".github/workflows/") {
+            assert!(
+                repo_root().join(path).is_file(),
+                "release-pin validation references missing workflow {path}"
+            );
+        }
+    }
 }
 
 #[test]
