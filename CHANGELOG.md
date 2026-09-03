@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.10.4](https://github.com/rvben/upd/compare/v0.10.3...v0.10.4) - 2026-09-04
+
+### Added
+
+- **mise**: check a tool against the backend its entry names ([b3e5875](https://github.com/rvben/upd/commit/b3e58755e490ae8de4373583451e1bcaf4536bc9))
+
+### Fixed
+
+- **python**: stop rewriting PEP 440 prefix matches into exact pins ([2baff2e](https://github.com/rvben/upd/commit/2baff2e92c83ce9907a7f0de18c39cc4e1e858d6))
+
 ## [0.10.3](https://github.com/rvben/upd/compare/v0.10.2...v0.10.3) - 2026-09-03
 
 ### Fixed
