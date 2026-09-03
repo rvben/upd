@@ -89,7 +89,7 @@ but must leave the repository clean; dependency updates belong exclusively to
 |-------|---------|---------|
 | `stage` | `test` | Existing pipeline stage for the job |
 | `image` | pinned Debian digest | Linux job image; Debian and Alpine bootstrapping are supported |
-| `upd_version` | `v0.10.2` | Exact released `upd` version |
+| `upd_version` | `v0.10.3` | Exact released `upd` version |
 | `upd_sha256` | built in for the default version | Exact archive checksum when changing the version or target |
 | `upd_target` | detected | Release target; Linux x86-64 and ARM64 GNU are detected |
 | `paths` | `.` | Whitespace-separated repository paths passed to `upd` |
@@ -112,9 +112,9 @@ changing `upd_version` or `upd_target`, also supply the published archive digest
 include:
   - remote: "https://raw.githubusercontent.com/rvben/upd/<FULL_COMMIT_SHA>/ci/gitlab-dependency-update.yml"
     inputs:
-      upd_version: "v0.10.2"
+      upd_version: "v0.10.3"
       upd_target: "x86_64-unknown-linux-gnu"
-      upd_sha256: "584b9f1f8543ffa445d83cd867f0abd827efa41847cc345698e9da3a612af362"
+      upd_sha256: "15e01a306e6ca348baad13669be12b0ed443f3a833d36fce61527f2737eb130d"
 ```
 
 The runner needs outbound HTTPS access to the pinned GitHub release artifact.
