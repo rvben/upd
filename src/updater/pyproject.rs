@@ -1,8 +1,8 @@
 use super::{
     FileType, ParsedDependency, UpdateOptions, UpdateResult, Updater, apply_cooldown_without_floor,
-    downgrade_warning, pep440_admits, python_version_with_revalidation, read_file_safe,
-    replace_string_value, specifier_floor, unpinnable_error, unreadable_error,
-    unrewritable_warning, write_file_atomic,
+    downgrade_warning, is_pep440_version, pep440_admits, pep440_floor,
+    python_version_with_revalidation, read_file_safe, replace_string_value, specifier_floor,
+    unpinnable_error, unreadable_error, unrewritable_warning, write_file_atomic,
 };
 use crate::align::compare_versions;
 use crate::config::SpecifierOperator;
@@ -136,10 +136,6 @@ struct NormalizeTarget {
     interactive_version: Option<String>,
 }
 
-fn is_version_operand(operand: &str) -> bool {
-    operand.parse::<pep440_rs::Version>().is_ok()
-}
-
 pub(crate) fn has_local_label(version: &str) -> bool {
     version
         .parse::<pep440_rs::Version>()
@@ -257,7 +253,7 @@ fn specifier_target(
         spec_end,
         previous_spec: Some(spec.to_string()),
         version: Some(version),
-        single_clause: single_clause.filter(|(_, operand)| is_version_operand(operand)),
+        single_clause: single_clause.filter(|(_, operand)| is_pep440_version(operand)),
         anchor,
         interactive_version,
     })
@@ -456,14 +452,16 @@ impl PyProjectUpdater {
     /// Where this dependency's floor version sits, and whether it is one an
     /// update may carry forward.
     ///
-    /// Falls back to the single-operator match for anything [`specifier_floor`]
+    /// Falls back to the single-operator match for anything [`pep440_floor`]
     /// cannot place, which keeps a dependency with no recognizable constraint
     /// reading as it always has. That fallback reads its own operator rather
     /// than assuming a floor, so `pkg<v2` is no more rewritable than `pkg<2`.
+    /// It never sees a prefix match: `6.*` is digit-led, so the clause reader
+    /// places it and answers for it.
     fn floor(&self, dep: &str) -> Option<super::SpecifierFloor> {
         let constraint = self.constraint_re.captures(dep).and_then(|c| c.get(3));
         constraint
-            .and_then(|m| specifier_floor(m.as_str(), m.start()))
+            .and_then(|m| pep440_floor(m.as_str(), m.start()))
             .or_else(|| {
                 let caps = self.version_re.captures(dep)?;
                 Some(super::SpecifierFloor {
@@ -1177,7 +1175,7 @@ impl PyProjectUpdater {
             }
 
             if let Some(pin) = options.get_pinned_version(&target.package) {
-                if !is_version_operand(pin) {
+                if !is_pep440_version(pin) {
                     result.errors.push(format!(
                         "cannot normalize '{}': pin '{}' is not a version, and [normalize.pyproject] writes {}<version>",
                         target.package, pin, operator
@@ -2175,7 +2173,10 @@ impl Updater for PyProjectUpdater {
                             version: parsed.version,
                             line_number: line_num,
                             has_upper_bound,
-                            is_bumpable: true,
+                            // Alignment writes the highest version it found over
+                            // every other occurrence, so a specifier with no floor
+                            // to raise is no more alignable than it is updatable.
+                            is_bumpable: parsed.raisable,
                         });
                     }
                 }
@@ -2200,7 +2201,7 @@ impl Updater for PyProjectUpdater {
                                     version: parsed.version,
                                     line_number: line_num,
                                     has_upper_bound,
-                                    is_bumpable: true,
+                                    is_bumpable: parsed.raisable,
                                 });
                             }
                         }
@@ -2229,12 +2230,17 @@ impl Updater for PyProjectUpdater {
                                 };
                             let line_num =
                                 line_index.line_for(&format!("tool.poetry.{}", section), key);
+                            // Poetry's own wildcard (`pkg = "*"`) and a
+                            // multi-clause requirement both arrive here as the
+                            // whole string, and neither names a release
+                            // alignment could carry to another file.
+                            let is_bumpable = is_pep440_version(&version);
                             deps.push(ParsedDependency {
                                 name: key.to_string(),
                                 version,
                                 line_number: line_num,
                                 has_upper_bound: false,
-                                is_bumpable: true,
+                                is_bumpable,
                             });
                         }
                     }
@@ -2328,6 +2334,11 @@ mod tests {
             "pkg>1.0.0,<2.0.0",
             "pkg!=1.5.0",
             "pkg<6,!=5.0",
+            // A prefix match holds a digit-led operand that is not a version:
+            // `6.*` names the whole 6 series, not a release to raise.
+            "pkg==6.*",
+            "pkg==6.0.*",
+            "pkg>=1.2.*",
         ] {
             assert!(!raisable(dep), "{dep}");
         }
@@ -2740,6 +2751,91 @@ dependencies = ["urllib3>2.0", "chardet>4.0,<6.0", "pkg!=1.5.0"]
         assert!(contents.contains(r#""urllib3>2.0""#));
         assert!(contents.contains(r#""chardet>4.0,<6.0""#));
         assert!(contents.contains(r#""pkg!=1.5.0""#));
+    }
+
+    /// `pyyaml==6.*` admits every 6.x release, so it names no one release to
+    /// carry forward. Rewriting it as though `6.*` were a version wrote `==6.0`,
+    /// the replacement being truncated to the operand's own component count: a
+    /// project resolving 6.0.3 was moved back to 6.0 by a run that reported an
+    /// update and exited 0.
+    #[tokio::test]
+    async fn a_prefix_match_is_reported_not_rewritten() {
+        let mut file = NamedTempFile::with_suffix(".toml").unwrap();
+        write!(
+            file,
+            r#"[project]
+name = "myproject"
+dependencies = ["pyyaml==6.*", "click==8.1.*"]
+"#
+        )
+        .unwrap();
+
+        let registry = MockRegistry::new("PyPI")
+            .with_version("pyyaml", "6.0.3")
+            .with_version("click", "8.3.0");
+
+        let result = PyProjectUpdater::new()
+            .update(file.path(), &registry, UpdateOptions::new(false, false))
+            .await
+            .unwrap();
+
+        assert_eq!(result.updated.len(), 0);
+        assert_eq!(result.unchanged, 1, "6.0.3 is one '==6.*' already admits");
+        assert_eq!(
+            result.warnings,
+            vec!["click: 8.3.0 is available, but '==8.1.*' is a range upd does not rewrite"]
+        );
+        assert!(result.errors.is_empty(), "{:?}", result.errors);
+
+        let contents = std::fs::read_to_string(file.path()).unwrap();
+        assert!(contents.contains(r#""pyyaml==6.*""#), "{contents}");
+        assert!(contents.contains(r#""click==8.1.*""#), "{contents}");
+    }
+
+    /// A pin names one release, and a prefix match has nowhere to put it: what
+    /// the rewrite wrote was `==6.0`, which is neither the pinned version nor
+    /// the range that was there before.
+    #[tokio::test]
+    async fn a_pin_a_prefix_match_cannot_hold_is_an_error() {
+        use crate::config::UpdConfig;
+        use std::collections::HashMap;
+
+        let mut file = NamedTempFile::with_suffix(".toml").unwrap();
+        write!(
+            file,
+            r#"[project]
+name = "myproject"
+dependencies = ["pyyaml==6.*"]
+"#
+        )
+        .unwrap();
+
+        let registry = MockRegistry::new("PyPI").with_version("pyyaml", "6.0.3");
+
+        let mut pin = HashMap::new();
+        pin.insert("pyyaml".to_string(), "6.0.1".to_string());
+        let config = UpdConfig {
+            pin,
+            ..Default::default()
+        };
+
+        let result = PyProjectUpdater::new()
+            .update(
+                file.path(),
+                &registry,
+                UpdateOptions::new(false, false).with_config(Arc::new(config)),
+            )
+            .await
+            .unwrap();
+
+        assert!(result.pinned.is_empty());
+        assert_eq!(
+            result.errors,
+            vec!["cannot pin 'pyyaml' to '6.0.1': '==6.*' has no lower bound that version fits"]
+        );
+
+        let contents = std::fs::read_to_string(file.path()).unwrap();
+        assert!(contents.contains(r#""pyyaml==6.*""#), "{contents}");
     }
 
     /// PEP 508 lets whitespace separate an operator from its version, and

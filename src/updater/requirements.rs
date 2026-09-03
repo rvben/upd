@@ -1,7 +1,8 @@
 use super::{
     FileType, ParsedDependency, PendingVersion, UpdateOptions, UpdateResult, Updater,
-    downgrade_warning, pep440_admits, python_version_with_revalidation, read_file_safe,
-    specifier_floor, unpinnable_error, unreadable_error, unrewritable_warning, write_file_atomic,
+    downgrade_warning, pep440_admits, pep440_floor, pep440_readable,
+    python_version_with_revalidation, read_file_safe, unpinnable_error, unreadable_error,
+    unrewritable_warning, write_file_atomic,
 };
 use crate::align::compare_versions;
 use crate::registry::{DeclaredIndex, IndexChain, Registry, VersionQuery};
@@ -210,10 +211,12 @@ impl RequirementsUpdater {
     /// Where this line's floor version sits, and whether it is one an update may
     /// carry forward.
     ///
-    /// Falls back to the single-operator match for anything [`specifier_floor`]
+    /// Falls back to the single-operator match for anything [`pep440_floor`]
     /// cannot place, which keeps a line with no recognizable constraint reading
     /// as it always has. That fallback reads its own operator rather than
-    /// assuming a floor, so `pkg<v2` is no more rewritable than `pkg<2`.
+    /// assuming a floor, so `pkg<v2` is no more rewritable than `pkg<2`. It
+    /// never sees a prefix match: `6.*` is digit-led, so the clause reader
+    /// places it and answers for it.
     fn floor(&self, line: &str) -> Option<super::SpecifierFloor> {
         let code_part = line.split('#').next().unwrap_or(line);
         let constraint = self
@@ -221,7 +224,7 @@ impl RequirementsUpdater {
             .captures(code_part)
             .and_then(|c| c.get(3));
         constraint
-            .and_then(|m| specifier_floor(m.as_str(), m.start()))
+            .and_then(|m| pep440_floor(m.as_str(), m.start()))
             .or_else(|| {
                 let caps = self.package_re.captures(code_part)?;
                 Some(super::SpecifierFloor {
@@ -329,7 +332,15 @@ impl Updater for RequirementsUpdater {
             // Reject version tokens that are not valid PEP 440 versions (e.g.
             // template placeholders like `%version%` or garbage like `abc`).
             // Updating such a line would silently destroy intentional content.
-            if parsed.first_version.parse::<Pep440Version>().is_err() {
+            //
+            // A prefix match reaches here with the same unreadable-looking
+            // token and is not the same case: `==6.*` is a specifier PEP 440
+            // reads, so the unraisable path below can say whether the newest
+            // release satisfies it. Skipping it here would report a line upd
+            // understands as one it cannot read.
+            if parsed.first_version.parse::<Pep440Version>().is_err()
+                && !pep440_readable(&parsed.full_constraint)
+            {
                 result.warnings.push(format!(
                     "skipping {}: current version \"{}\" is not a valid PEP 440 version",
                     parsed.package, parsed.first_version
@@ -623,7 +634,7 @@ impl Updater for RequirementsUpdater {
                     version: parsed.first_version,
                     line_number: Some(line_idx + 1),
                     has_upper_bound,
-                    is_bumpable: true,
+                    is_bumpable: parsed.raisable,
                 });
             }
         }
@@ -958,6 +969,11 @@ private-package>=1.0.908
             "pkg>1.0.0,<2.0.0",
             "pkg!=1.5.0",
             "pkg<6,!=5.0",
+            // A prefix match holds a digit-led operand that is not a version:
+            // `6.*` names the whole 6 series, not a release to raise.
+            "pkg==6.*",
+            "pkg==6.0.*",
+            "pkg>=1.2.*",
         ] {
             assert!(!raisable(line), "{line}");
         }
@@ -1513,6 +1529,81 @@ private-package>=1.0.908
 
         let contents = std::fs::read_to_string(file.path()).unwrap();
         assert!(contents.contains("django<6"));
+    }
+
+    /// `pyyaml==6.*` admits every 6.x release, so it names no one release to
+    /// carry forward, and the rewrite that treated `6.*` as a version wrote
+    /// `==6.0`: truncated to the operand's own component count, it moved a file
+    /// resolving 6.0.3 back to 6.0.
+    ///
+    /// The token is one PEP 440 reads perfectly well, so the answer is the same
+    /// one a ceiling gets, not the "not a valid PEP 440 version" a template
+    /// placeholder gets.
+    #[tokio::test]
+    async fn a_prefix_match_is_reported_not_rewritten() {
+        let mut file = NamedTempFile::new().unwrap();
+        writeln!(file, "pyyaml==6.*").unwrap();
+        writeln!(file, "click==8.1.*").unwrap();
+
+        let registry = MockRegistry::new("PyPI")
+            .with_version("pyyaml", "6.0.3")
+            .with_version("click", "8.3.0");
+
+        let result = RequirementsUpdater::new()
+            .update(file.path(), &registry, UpdateOptions::new(false, false))
+            .await
+            .unwrap();
+
+        assert_eq!(result.updated.len(), 0);
+        assert_eq!(result.unchanged, 1, "6.0.3 is one '==6.*' already admits");
+        assert_eq!(
+            result.warnings,
+            vec!["click: 8.3.0 is available, but '==8.1.*' is a range upd does not rewrite"]
+        );
+        assert!(result.errors.is_empty(), "{:?}", result.errors);
+
+        let contents = std::fs::read_to_string(file.path()).unwrap();
+        assert!(contents.contains("pyyaml==6.*"), "{contents}");
+        assert!(contents.contains("click==8.1.*"), "{contents}");
+    }
+
+    /// A pin names one release, and a prefix match has nowhere to put it. The
+    /// pin path answers before the file's own PEP 440 check, which is why it
+    /// wrote `==6.0` over a line the update path already refused to touch.
+    #[tokio::test]
+    async fn a_pin_a_prefix_match_cannot_hold_is_an_error() {
+        use crate::config::UpdConfig;
+        use std::collections::HashMap;
+
+        let mut file = NamedTempFile::new().unwrap();
+        writeln!(file, "pyyaml==6.*").unwrap();
+
+        let registry = MockRegistry::new("PyPI").with_version("pyyaml", "6.0.3");
+
+        let mut pin = HashMap::new();
+        pin.insert("pyyaml".to_string(), "6.0.1".to_string());
+        let config = UpdConfig {
+            pin,
+            ..Default::default()
+        };
+
+        let result = RequirementsUpdater::new()
+            .update(
+                file.path(),
+                &registry,
+                UpdateOptions::new(false, false).with_config(Arc::new(config)),
+            )
+            .await
+            .unwrap();
+
+        assert!(result.pinned.is_empty());
+        assert_eq!(
+            result.errors,
+            vec!["cannot pin 'pyyaml' to '6.0.1': '==6.*' has no lower bound that version fits"]
+        );
+
+        let contents = std::fs::read_to_string(file.path()).unwrap();
+        assert!(contents.contains("pyyaml==6.*"), "{contents}");
     }
 
     #[tokio::test]

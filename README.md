@@ -246,6 +246,7 @@ Output includes clickable `file:line:` locations (recognized by VS Code, iTerm2,
 | `~> 7.1` | Updates within 7.x range (Ruby pessimistic) |
 | `>=2.0` | Updates to any version >= 2.0 |
 | `==2.0.0` | Updates the exact pin to the latest version (e.g. `==2.0.0` → `==3.1.5`). To freeze a package, use `[pin]` or `ignore` in `.updrc.toml`. |
+| `==2.0.*` | Never rewritten. A PEP 440 prefix match names a series, not a release. See [Bounds that are not floors](#bounds-that-are-not-floors). |
 
 An update moves the **lower bound** and leaves every other clause where the
 author wrote it, so `>=1.0, <2.0` becomes `>=1.5.0, <2.0`. A constraint is an
@@ -293,6 +294,14 @@ of them is moved. They are checked against the registry and reported anyway:
 The last row is the point of the other two: a dependency nothing looked at must
 not be counted as up to date, and a constraint that has quietly frozen a
 dependency should say so rather than pass under a green tick.
+
+A PEP 440 prefix match reads the same way for the same reason. `==6.*` and
+`==6.0.*` name a series rather than a release, so there is no version in them to
+raise and nothing an update may write over them; they are checked and reported
+by the table above. `pyyaml==6.*` with 6.0.3 published is up to date, and
+`rich==13.7.*` with 15.0.0 published is a warning. `[pin]` and `upd align`
+answer the same way: neither writes a release into a specifier that has nowhere
+to hold one, and the pin reports an error rather than a rewrite.
 
 ## Annotated Version Pins
 

@@ -293,6 +293,45 @@ pub(crate) fn pep440_admits(constraint: &str, version: &str) -> Option<bool> {
     Some(specifiers.contains(&version))
 }
 
+/// Whether `operand` names a concrete PEP 440 release rather than a prefix match.
+///
+/// `6.0.3` is one, `6.*` is not. Both are legal where a specifier expects a
+/// version, and only the first names a release a rewrite can carry forward.
+pub(crate) fn is_pep440_version(operand: &str) -> bool {
+    operand.parse::<pep440_rs::Version>().is_ok()
+}
+
+/// Whether PEP 440's own parser reads `constraint` as a specifier set.
+///
+/// Separates a specifier upd must not rewrite (`==6.*`) from a token no parser
+/// can read (a `%version%` placeholder, `abc`): both hold a floor that is not a
+/// version, and only the first has a meaning left to report.
+pub(crate) fn pep440_readable(constraint: &str) -> bool {
+    use std::str::FromStr;
+    pep440_rs::VersionSpecifiers::from_str(constraint).is_ok()
+}
+
+/// [`specifier_floor`], with a PEP 440 prefix match reading as a floor no update
+/// may raise.
+///
+/// `==6.*` admits every 6.x release, so it names no one release to carry
+/// forward, and the digit-led clause reader cannot tell it from one that does:
+/// it hands back `6.*`, whose leading `6` is as much a version as any. A rewrite
+/// then lands on it truncated to the operand's own component count, so `==6.*`
+/// becomes `==6.0` and a project resolving 6.0.3 is moved back to 6.0 by a
+/// command that reports an update and exits 0.
+///
+/// The demotion applies to whichever clause [`floor_of`] picked, so a specifier
+/// pairing a prefix match with an ordinary bound (`==1.*,>=1.0`) can read as
+/// unraisable as a whole. That answer is reported rather than written:
+/// [`pep440_admits`] still says whether the newest release satisfies it.
+pub(crate) fn pep440_floor(constraint: &str, base: usize) -> Option<SpecifierFloor> {
+    let mut floor = specifier_floor(constraint, base)?;
+    let operand = &constraint[floor.range.start - base..floor.range.end - base];
+    floor.raisable = floor.raisable && is_pep440_version(operand);
+    Some(floor)
+}
+
 /// Whether `requirement` admits `version` under Cargo's reading of it.
 ///
 /// Cargo's partial bounds are not PEP 440's: `>1.0` there means `>=1.1.0`, so
@@ -1878,6 +1917,11 @@ mod tests {
         specifier_floor(constraint, 0).map(|f| (&constraint[f.range], f.raisable))
     }
 
+    /// The same, read the way every Python caller reads it.
+    fn pep440_floor_text(constraint: &str) -> Option<(&str, bool)> {
+        pep440_floor(constraint, 0).map(|f| (&constraint[f.range], f.raisable))
+    }
+
     /// The plain case, and the one every other rule is an exception to: a
     /// selection admits the files of the ecosystems it names, and no others.
     #[test]
@@ -2011,6 +2055,64 @@ mod tests {
         // Nothing that reads as a version at all.
         assert_eq!(floor_text(""), None);
         assert_eq!(floor_text("*"), None);
+    }
+
+    /// A prefix match is a specifier PEP 440 reads and a version it is not.
+    ///
+    /// Everything the Python updaters do with `==6.*` rests on that asymmetry:
+    /// the specifier is readable, so [`pep440_admits`] can say whether the
+    /// newest release satisfies it, while `6.*` names no release, so nothing
+    /// may be written over it. A token no parser reads at all answers
+    /// differently again, which is what keeps a `%version%` placeholder out of
+    /// the path a prefix match takes.
+    #[test]
+    fn a_prefix_match_is_a_readable_specifier_and_not_a_version() {
+        assert!(!is_pep440_version("6.*"));
+        assert!(!is_pep440_version("%version%"));
+        assert!(is_pep440_version("6.0.3"));
+
+        assert!(pep440_readable("==6.*"));
+        assert!(!pep440_readable("==%version%"));
+
+        assert_eq!(pep440_admits("==6.*", "6.0.3"), Some(true));
+        assert_eq!(pep440_admits("==6.*", "7.0"), Some(false));
+    }
+
+    /// A prefix match reads as a floor with a position and no permission to move.
+    ///
+    /// [`specifier_floor`] cannot tell `6.*` from a version, both being
+    /// digit-led, so every Python caller reads its floor through
+    /// [`pep440_floor`]. What a rewrite writes there is truncated to the
+    /// operand's own component count, so `==6.*` becomes `==6.0` and a project
+    /// resolving 6.0.3 is moved backwards by a run reporting an update.
+    #[test]
+    fn a_pep440_prefix_match_is_a_floor_no_update_may_raise() {
+        assert_eq!(pep440_floor_text("==6.*"), Some(("6.*", false)));
+        assert_eq!(pep440_floor_text("==6.0.*"), Some(("6.0.*", false)));
+        assert_eq!(pep440_floor_text(">=1.2.*"), Some(("1.2.*", false)));
+
+        // Reading a specifier and rewriting one are different questions, so an
+        // ordinary floor keeps both the position and the permission it had.
+        assert_eq!(pep440_floor_text("==6.0.3"), Some(("6.0.3", true)));
+        assert_eq!(
+            pep440_floor_text(">=1.34.0,<1.35.0"),
+            Some(("1.34.0", true))
+        );
+        assert_eq!(pep440_floor_text("~=0.0.77"), Some(("0.0.77", true)));
+        assert_eq!(pep440_floor_text("<6"), Some(("6", false)));
+        assert_eq!(pep440_floor_text("*"), None);
+    }
+
+    /// The demoted floor keeps the position it was found at, so a caller that
+    /// only reads a specifier still gets one, and the base arithmetic that
+    /// reaches back for the operand holds for a slice taken mid-line.
+    #[test]
+    fn a_prefix_match_floor_is_offset_by_its_base_like_any_other() {
+        let line = "pyyaml==6.*";
+        let base = "pyyaml".len();
+        let floor = pep440_floor(&line[base..], base).unwrap();
+        assert_eq!(&line[floor.range], "6.*");
+        assert!(!floor.raisable);
     }
 
     /// The range is a byte offset into the caller's own string, not into the

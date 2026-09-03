@@ -522,6 +522,112 @@ mod tests {
         );
     }
 
+    /// A PEP 440 prefix match names a series, not a release, so alignment must
+    /// neither carry another file's version into it nor take it as the version
+    /// to carry. `pyyaml==6.*` was reported as misaligned against a sibling
+    /// `pyyaml==6.0.3` and rewritten to `==6.0`, which resolves lower than the
+    /// range it replaced.
+    #[test]
+    fn test_scan_packages_marks_a_prefix_match_not_bumpable() {
+        use std::io::Write;
+        use tempfile::NamedTempFile;
+
+        // One prefix match per PEP 508 section a Python file offers, so no one
+        // of them can go back to being alignable unnoticed.
+        let mut toml = NamedTempFile::with_suffix(".toml").unwrap();
+        write!(
+            toml,
+            r#"[project]
+name = "demo"
+dependencies = ["pyyaml==6.*"]
+
+[project.optional-dependencies]
+dev = ["pyyaml==6.0.*"]
+"#
+        )
+        .unwrap();
+        let mut txt = NamedTempFile::with_suffix(".txt").unwrap();
+        writeln!(txt, "pyyaml==6.*").unwrap();
+        let mut anchor = NamedTempFile::with_suffix(".txt").unwrap();
+        writeln!(anchor, "pyyaml==6.0.3").unwrap();
+
+        let files = vec![
+            (toml.path().to_path_buf(), FileType::PyProject),
+            (txt.path().to_path_buf(), FileType::Requirements),
+            (anchor.path().to_path_buf(), FileType::Requirements),
+        ];
+        let packages = scan_packages(&files, &[], ParseWarnings::Suppress).unwrap();
+
+        let occurrences = packages
+            .get(&("pyyaml".to_string(), Lang::Python))
+            .expect("pyyaml not found by scan_packages");
+        let prefix_matches: Vec<&PackageOccurrence> = occurrences
+            .iter()
+            .filter(|o| o.version.ends_with('*'))
+            .collect();
+        assert_eq!(
+            prefix_matches.len(),
+            3,
+            "every prefix match must stay visible to the audit path: {occurrences:?}"
+        );
+        for occurrence in &prefix_matches {
+            assert!(
+                !occurrence.is_bumpable,
+                "a prefix match names no release alignment can raise: {occurrence:?}"
+            );
+        }
+
+        let alignment = PackageAlignment {
+            package_name: "pyyaml".to_string(),
+            highest_version: find_highest_version(occurrences, Lang::Python).unwrap(),
+            occurrences: occurrences.clone(),
+            lang: Lang::Python,
+        };
+        assert_eq!(alignment.highest_version, "6.0.3");
+        assert!(
+            !alignment.has_misalignment(),
+            "each '==6.*' already admits 6.0.3, so there is nothing to align"
+        );
+    }
+
+    /// Poetry writes its own wildcard as the whole requirement, so `pkg = "*"`
+    /// arrives as a version string that names no release. Alignment took it for
+    /// one, both as an occurrence to raise and as a candidate to raise others to.
+    #[test]
+    fn test_scan_packages_marks_a_poetry_wildcard_not_bumpable() {
+        use std::io::Write;
+        use tempfile::NamedTempFile;
+
+        let mut toml = NamedTempFile::with_suffix(".toml").unwrap();
+        write!(
+            toml,
+            r#"[tool.poetry.dependencies]
+python = "^3.11"
+pyyaml = "*"
+click = "^8.1.0"
+"#
+        )
+        .unwrap();
+
+        let files = vec![(toml.path().to_path_buf(), FileType::PyProject)];
+        let packages = scan_packages(&files, &[], ParseWarnings::Suppress).unwrap();
+
+        let wildcard = &packages
+            .get(&("pyyaml".to_string(), Lang::Python))
+            .expect("pyyaml not found by scan_packages")[0];
+        assert_eq!(wildcard.version, "*");
+        assert!(
+            !wildcard.is_bumpable,
+            "'*' names no release alignment can raise"
+        );
+
+        let caret = &packages
+            .get(&("click".to_string(), Lang::Python))
+            .expect("click not found by scan_packages")[0];
+        assert_eq!(caret.version, "8.1.0");
+        assert!(caret.is_bumpable, "a caret requirement still names a floor");
+    }
+
     /// Regression: compare_semver must not fall back to lexical string compare
     /// for 4-segment versions. "0.9.0.10" > "0.9.0.2" numerically, but
     /// lexically "0.9.0.10" < "0.9.0.2".
