@@ -11,6 +11,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **cli**: support case-sensitive glob patterns in `--package` filters
 
+### Fixed
+
+- **lockscan**: avoid treating unrelated nested `pyproject.toml` files as uv workspace members
+
 ## [0.10.0](https://github.com/rvben/upd/compare/v0.9.2...v0.10.0) - 2026-09-02
 
 ### Added

@@ -1,8 +1,9 @@
 //! Which lockfiles are scannable, and which coverage warnings apply.
 
 use crate::updater::FileType;
+use globset::{GlobBuilder, GlobSet, GlobSetBuilder};
 use ignore::WalkBuilder;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -83,6 +84,99 @@ fn walk_manifests(root: &Path, name: &str, out: &mut Vec<PathBuf>) {
     }
 }
 
+fn workspace_string_list(workspace: &toml::value::Table, key: &str) -> Result<Vec<String>, String> {
+    let Some(value) = workspace.get(key) else {
+        return Ok(Vec::new());
+    };
+    let Some(values) = value.as_array() else {
+        return Err(format!("tool.uv.workspace.{key} must be an array"));
+    };
+    values
+        .iter()
+        .map(|value| {
+            value
+                .as_str()
+                .map(ToOwned::to_owned)
+                .ok_or_else(|| format!("tool.uv.workspace.{key} entries must be strings"))
+        })
+        .collect()
+}
+
+fn workspace_globs(patterns: &[String], key: &str) -> Result<GlobSet, String> {
+    let mut builder = GlobSetBuilder::new();
+    for pattern in patterns {
+        let normalized = pattern
+            .strip_prefix("./")
+            .unwrap_or(pattern)
+            .trim_end_matches('/');
+        let glob = GlobBuilder::new(normalized)
+            .literal_separator(true)
+            .backslash_escape(true)
+            .build()
+            .map_err(|error| {
+                format!("invalid tool.uv.workspace.{key} pattern '{pattern}': {error}")
+            })?;
+        builder.add(glob);
+    }
+    builder
+        .build()
+        .map_err(|error| format!("could not compile tool.uv.workspace.{key}: {error}"))
+}
+
+/// Resolve the manifests that uv actually considers members of the workspace
+/// rooted at `root_manifest`.
+///
+/// A nested pyproject is not implicitly a uv workspace member. Only the root
+/// and directories selected by `[tool.uv.workspace].members` (minus
+/// `exclude`) share the root lockfile. Looking at every pyproject recursively
+/// is both over-broad and especially noisy for generated hidden trees such as
+/// `.ansible/`.
+fn uv_workspace_manifests(root_manifest: &Path) -> Result<HashSet<PathBuf>, String> {
+    let mut result = HashSet::from([root_manifest.to_path_buf()]);
+    let content = std::fs::read_to_string(root_manifest)
+        .map_err(|error| format!("could not read {}: {error}", root_manifest.display()))?;
+    let document: toml::Value = toml::from_str(&content)
+        .map_err(|error| format!("could not parse {}: {error}", root_manifest.display()))?;
+    let Some(workspace) = document
+        .get("tool")
+        .and_then(|tool| tool.get("uv"))
+        .and_then(|uv| uv.get("workspace"))
+        .and_then(toml::Value::as_table)
+    else {
+        return Ok(result);
+    };
+
+    let member_patterns = workspace_string_list(workspace, "members")?;
+    let exclude_patterns = workspace_string_list(workspace, "exclude")?;
+    let members = workspace_globs(&member_patterns, "members")?;
+    let excludes = workspace_globs(&exclude_patterns, "exclude")?;
+    let Some(root) = root_manifest.parent() else {
+        return Ok(result);
+    };
+
+    let mut manifests = Vec::new();
+    walk_manifests(root, "pyproject.toml", &mut manifests);
+    for manifest in manifests {
+        if manifest == root_manifest {
+            continue;
+        }
+        let Some(directory) = manifest.parent() else {
+            continue;
+        };
+        let Ok(relative) = directory.strip_prefix(root) else {
+            continue;
+        };
+        let portable = relative
+            .to_string_lossy()
+            .replace(std::path::MAIN_SEPARATOR, "/");
+        if members.is_match(&portable) && !excludes.is_match(&portable) {
+            result.insert(manifest);
+        }
+    }
+
+    Ok(result)
+}
+
 /// True when the adjacent package.json declares npm workspaces.
 fn has_workspaces_field(package_json: &Path) -> bool {
     std::fs::read_to_string(package_json)
@@ -138,6 +232,7 @@ pub fn discover_locks(files: &[(PathBuf, FileType)], scan_roots: &[PathBuf]) -> 
     let mut discovery = LockDiscovery::default();
     let discovered: HashSet<&Path> = files.iter().map(|(p, _)| p.as_path()).collect();
     let mut seen_locks: HashSet<PathBuf> = HashSet::new();
+    let mut uv_members_by_lock: HashMap<PathBuf, HashSet<PathBuf>> = HashMap::new();
 
     // Pass 1: sibling locks of discovered manifests.
     for (manifest, file_type) in files {
@@ -175,8 +270,22 @@ pub fn discover_locks(files: &[(PathBuf, FileType)], scan_roots: &[PathBuf]) -> 
             }
 
             if matches!(kind, LockKind::Uv | LockKind::Cargo) {
-                let mut members = Vec::new();
-                walk_manifests(dir, member_manifest_name(kind), &mut members);
+                let members: HashSet<PathBuf> = if kind == LockKind::Uv {
+                    match uv_workspace_manifests(manifest) {
+                        Ok(members) => members,
+                        Err(error) => {
+                            discovery.warnings.push(format!(
+                                "{}: workspace membership could not be determined ({error}): lockfile not scanned (no workspace member gets lock-based transitive coverage until this is resolved)",
+                                crate::path_display::display_path(&lock),
+                            ));
+                            continue;
+                        }
+                    }
+                } else {
+                    let mut members = Vec::new();
+                    walk_manifests(dir, member_manifest_name(kind), &mut members);
+                    members.into_iter().collect()
+                };
                 if let Some(missing) = members.iter().find(|m| !discovered.contains(m.as_path())) {
                     discovery.warnings.push(format!(
                         "{}: workspace membership incomplete ({} not in the discovered set): lockfile not scanned (no workspace member gets lock-based transitive coverage until this is resolved)",
@@ -184,6 +293,9 @@ pub fn discover_locks(files: &[(PathBuf, FileType)], scan_roots: &[PathBuf]) -> 
                         crate::path_display::display_path(missing)
                     ));
                     continue;
+                }
+                if kind == LockKind::Uv {
+                    uv_members_by_lock.insert(lock.clone(), members);
                 }
             }
 
@@ -221,7 +333,14 @@ pub fn discover_locks(files: &[(PathBuf, FileType)], scan_roots: &[PathBuf]) -> 
                 let Some(lock_dir) = lock.path.parent() else {
                     continue;
                 };
-                if adjacent_only {
+                if kind == LockKind::Uv {
+                    if uv_members_by_lock
+                        .get(&lock.path)
+                        .is_some_and(|members| members.contains(manifest))
+                    {
+                        best = Some(idx);
+                    }
+                } else if adjacent_only {
                     if lock_dir == dir {
                         best = Some(idx);
                         break;
@@ -362,6 +481,101 @@ mod tests {
             ),
             "warning must spell out the scope of the coverage gap: {}",
             d.warnings[0]
+        );
+    }
+
+    #[test]
+    fn uv_ignores_unrelated_nested_pyprojects() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("pyproject.toml");
+        touch(
+            &root,
+            "[project]\nname='root'\nversion='0.1.0'\ndependencies=[]\n",
+        );
+        touch(&dir.path().join("uv.lock"), "version = 1\n");
+        touch(
+            &dir.path()
+                .join(".ansible/ansible_collections/amazon/aws/pyproject.toml"),
+            "[project]\nname='vendored'\nversion='0.1.0'\n",
+        );
+
+        let files = vec![(root.clone(), FileType::PyProject)];
+        let scan_roots = vec![dir.path().to_path_buf()];
+        let d = discover_locks(&files, &scan_roots);
+
+        assert_eq!(d.locks.len(), 1, "the root uv.lock remains scannable");
+        assert!(
+            d.warnings.is_empty(),
+            "unrelated pyprojects are not members"
+        );
+        assert_eq!(d.locks[0].associated_manifests, vec![root]);
+    }
+
+    #[test]
+    fn uv_guard_only_requires_declared_workspace_members() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("pyproject.toml");
+        touch(
+            &root,
+            "[project]\nname='root'\nversion='0.1.0'\n\n[tool.uv.workspace]\nmembers=['packages/*']\n",
+        );
+        touch(&dir.path().join("uv.lock"), "version = 1\n");
+        let member = dir.path().join("packages/member/pyproject.toml");
+        touch(&member, "[project]\nname='member'\nversion='0.1.0'\n");
+        touch(
+            &dir.path()
+                .join(".ansible/ansible_collections/amazon/aws/pyproject.toml"),
+            "[project]\nname='vendored'\nversion='0.1.0'\n",
+        );
+
+        let files = vec![(root, FileType::PyProject)];
+        let scan_roots = vec![dir.path().to_path_buf()];
+        let d = discover_locks(&files, &scan_roots);
+
+        assert!(d.locks.is_empty(), "an undiscovered real member is unsafe");
+        assert_eq!(d.warnings.len(), 1);
+        assert!(
+            d.warnings[0].contains(&member.display().to_string()),
+            "the warning identifies the declared member: {}",
+            d.warnings[0]
+        );
+        assert!(
+            !d.warnings[0].contains(".ansible"),
+            "unrelated generated projects do not cause the warning"
+        );
+    }
+
+    #[test]
+    fn uv_workspace_globs_and_excludes_drive_association() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("pyproject.toml");
+        touch(
+            &root,
+            "[project]\nname='root'\nversion='0.1.0'\n\n[tool.uv.workspace]\nmembers=['packages/*']\nexclude=['packages/excluded']\n",
+        );
+        touch(&dir.path().join("uv.lock"), "version = 1\n");
+        let member = dir.path().join("packages/member/pyproject.toml");
+        let excluded = dir.path().join("packages/excluded/pyproject.toml");
+        let unrelated = dir.path().join("tools/unrelated/pyproject.toml");
+        for manifest in [&member, &excluded, &unrelated] {
+            touch(manifest, "[project]\nname='nested'\nversion='0.1.0'\n");
+        }
+
+        let files = vec![
+            (root.clone(), FileType::PyProject),
+            (member.clone(), FileType::PyProject),
+            (excluded, FileType::PyProject),
+            (unrelated, FileType::PyProject),
+        ];
+        let scan_roots = vec![dir.path().to_path_buf()];
+        let d = discover_locks(&files, &scan_roots);
+
+        assert_eq!(d.locks.len(), 1);
+        assert!(d.warnings.is_empty());
+        assert_eq!(
+            d.locks[0].associated_manifests,
+            vec![root, member],
+            "only the root and included, non-excluded member share uv.lock"
         );
     }
 

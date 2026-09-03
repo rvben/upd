@@ -99,6 +99,68 @@ source = { registry = "https://pypi.org/simple" }
     assert_eq!(queries[0]["package"]["name"], "lockonly");
 }
 
+/// A generated Ansible collection may contain its own pyproject.toml under a
+/// hidden `.ansible/` tree. It is not an implicit uv workspace member and must
+/// not disable scanning of the repository's adjacent uv.lock.
+#[tokio::test]
+async fn unrelated_hidden_pyproject_does_not_block_uv_lock_scan() {
+    let server = wiremock::MockServer::start().await;
+    wiremock::Mock::given(wiremock::matchers::method("POST"))
+        .and(wiremock::matchers::path("/querybatch"))
+        .respond_with(
+            wiremock::ResponseTemplate::new(200)
+                .set_body_json(serde_json::json!({ "results": [ { "vulns": [] } ] })),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(
+        tmp.path().join("pyproject.toml"),
+        "[project]\nname = \"root\"\nversion = \"1.0.0\"\ndependencies = []\n",
+    )
+    .unwrap();
+    std::fs::write(
+        tmp.path().join("uv.lock"),
+        r#"version = 1
+
+[[package]]
+name = "lockonly"
+version = "1.0.0"
+source = { registry = "https://pypi.org/simple" }
+"#,
+    )
+    .unwrap();
+    let generated = tmp
+        .path()
+        .join(".ansible/ansible_collections/amazon/aws/pyproject.toml");
+    std::fs::create_dir_all(generated.parent().unwrap()).unwrap();
+    std::fs::write(
+        generated,
+        "[project]\nname = \"amazon-aws\"\nversion = \"1.0.0\"\n",
+    )
+    .unwrap();
+
+    let (stdout, stderr, code) = run_with_env(
+        &["audit", "--no-cache", "--format", "json"],
+        tmp.path(),
+        &[("OSV_API_URL", &server.uri())],
+    );
+    assert_eq!(code, 0, "stdout: {stdout}\nstderr: {stderr}");
+    let json: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(json["summary"]["packages_checked"], 1);
+    assert!(
+        json.get("warnings")
+            .and_then(serde_json::Value::as_array)
+            .is_none_or(|warnings| warnings.iter().all(|warning| !warning
+                .as_str()
+                .unwrap_or_default()
+                .contains("workspace membership incomplete"))),
+        "the unrelated hidden project must not cause a workspace warning: {json}"
+    );
+}
+
 /// Same package declared in the manifest and resolved in the lock: the lock
 /// version is ground truth, so exactly ONE query goes out - for the locked
 /// version - and no fabricated manifest-fragment query is sent.
