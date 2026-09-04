@@ -57,7 +57,7 @@ the manifest-wide refresh command is used. The flag is honored by
 | Node      | `package-lock.json`      | `npm install --package-lock-only`              |
 | Node      | `yarn.lock`              | `yarn install --mode update-lockfile` (Yarn 2+)|
 | Node      | `pnpm-lock.yaml`         | `pnpm install --lockfile-only`                 |
-| Node      | `bun.lockb`              | `bun install`                                  |
+| Node      | `bun.lock`, `bun.lockb`  | `bun install --lockfile-only`                  |
 | Rust      | `Cargo.lock`             | `cargo update -p <changed> -p <changed> …`     |
 | Go        | `go.sum`                 | `go mod tidy` (no targeted form)               |
 | Ruby      | `Gemfile.lock`           | `bundle lock --update <changed> …`             |

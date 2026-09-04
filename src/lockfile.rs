@@ -63,7 +63,11 @@ pub enum LockfileType {
     NpmShrinkwrap,
     YarnLock,
     PnpmLock,
+    /// bun's text lockfile, the default since bun 1.2.
     BunLock,
+    /// bun's binary lockfile from before 1.2, still read when no `bun.lock`
+    /// sits beside it.
+    BunLockb,
     CargoLock,
     GoSum,
     GemfileLock,
@@ -81,7 +85,8 @@ impl LockfileType {
             LockfileType::NpmShrinkwrap => "npm-shrinkwrap.json",
             LockfileType::YarnLock => "yarn.lock",
             LockfileType::PnpmLock => "pnpm-lock.yaml",
-            LockfileType::BunLock => "bun.lockb",
+            LockfileType::BunLock => "bun.lock",
+            LockfileType::BunLockb => "bun.lockb",
             LockfileType::CargoLock => "Cargo.lock",
             LockfileType::GoSum => "go.sum",
             LockfileType::GemfileLock => "Gemfile.lock",
@@ -154,7 +159,10 @@ impl LockfileType {
                 "pnpm",
                 vec!["install".to_string(), "--lockfile-only".to_string()],
             ),
-            LockfileType::BunLock => ("bun", vec!["install".to_string()]),
+            LockfileType::BunLock | LockfileType::BunLockb => (
+                "bun",
+                vec!["install".to_string(), "--lockfile-only".to_string()],
+            ),
             LockfileType::CargoLock => {
                 if changed.is_empty() {
                     (
@@ -196,7 +204,8 @@ impl LockfileType {
             | LockfileType::NpmShrinkwrap
             | LockfileType::YarnLock
             | LockfileType::PnpmLock
-            | LockfileType::BunLock => "package.json",
+            | LockfileType::BunLock
+            | LockfileType::BunLockb => "package.json",
             LockfileType::CargoLock => "Cargo.toml",
             LockfileType::GoSum => "go.mod",
             LockfileType::GemfileLock => "Gemfile",
@@ -271,8 +280,12 @@ pub fn detect_lockfiles(manifest_path: &Path) -> Vec<LockfileType> {
         if dir.join("pnpm-lock.yaml").exists() {
             lockfiles.push(LockfileType::PnpmLock);
         }
-        if dir.join("bun.lockb").exists() {
+        // bun reads bun.lock when both formats exist, so the text lockfile
+        // takes priority and the binary one is not also reported.
+        if dir.join("bun.lock").exists() {
             lockfiles.push(LockfileType::BunLock);
+        } else if dir.join("bun.lockb").exists() {
+            lockfiles.push(LockfileType::BunLockb);
         }
     }
 
@@ -1226,6 +1239,38 @@ thiserror = "0.9.1"
     }
 
     #[test]
+    fn bun_relock_only_writes_the_lockfile() {
+        for lockfile in [LockfileType::BunLock, LockfileType::BunLockb] {
+            let (cmd, args) = lockfile.command(&["react".to_string()]);
+            assert_eq!(cmd, "bun", "{lockfile:?}");
+            assert_eq!(args, vec!["install", "--lockfile-only"], "{lockfile:?}");
+        }
+    }
+
+    #[test]
+    fn detect_bun_text_lockfile() {
+        let dir = tempdir().unwrap();
+        let manifest = dir.path().join("package.json");
+        fs::write(&manifest, "{}").unwrap();
+        fs::write(dir.path().join("bun.lock"), "{}").unwrap();
+
+        assert_eq!(detect_lockfiles(&manifest), vec![LockfileType::BunLock]);
+    }
+
+    /// bun reads `bun.lock` when both formats exist, so only the text lockfile
+    /// is reported and the refresh command runs once.
+    #[test]
+    fn detect_prefers_bun_text_lockfile_over_binary() {
+        let dir = tempdir().unwrap();
+        let manifest = dir.path().join("package.json");
+        fs::write(&manifest, "{}").unwrap();
+        fs::write(dir.path().join("bun.lock"), "{}").unwrap();
+        fs::write(dir.path().join("bun.lockb"), "").unwrap();
+
+        assert_eq!(detect_lockfiles(&manifest), vec![LockfileType::BunLock]);
+    }
+
+    #[test]
     fn test_lockfile_type_filename() {
         assert_eq!(LockfileType::PoetryLock.filename(), "poetry.lock");
         assert_eq!(LockfileType::UvLock.filename(), "uv.lock");
@@ -1235,7 +1280,8 @@ thiserror = "0.9.1"
         );
         assert_eq!(LockfileType::YarnLock.filename(), "yarn.lock");
         assert_eq!(LockfileType::PnpmLock.filename(), "pnpm-lock.yaml");
-        assert_eq!(LockfileType::BunLock.filename(), "bun.lockb");
+        assert_eq!(LockfileType::BunLock.filename(), "bun.lock");
+        assert_eq!(LockfileType::BunLockb.filename(), "bun.lockb");
         assert_eq!(LockfileType::CargoLock.filename(), "Cargo.lock");
         assert_eq!(LockfileType::GoSum.filename(), "go.sum");
     }
@@ -1356,16 +1402,6 @@ thiserror = "0.9.1"
     }
 
     #[test]
-    fn test_bun_lock_uses_bun_install() {
-        // Bun does not have a stable lockfile-only mode; plain `install` is the
-        // minimum reliable form. Keeping the test pins the decision so changes
-        // here are intentional.
-        let (cmd, args) = LockfileType::BunLock.command(&["react".to_string()]);
-        assert_eq!(cmd, "bun");
-        assert_eq!(args, vec!["install"]);
-    }
-
-    #[test]
     fn test_lockfile_type_manifest() {
         assert_eq!(LockfileType::PoetryLock.manifest(), "pyproject.toml");
         assert_eq!(LockfileType::UvLock.manifest(), "pyproject.toml");
@@ -1373,6 +1409,7 @@ thiserror = "0.9.1"
         assert_eq!(LockfileType::YarnLock.manifest(), "package.json");
         assert_eq!(LockfileType::PnpmLock.manifest(), "package.json");
         assert_eq!(LockfileType::BunLock.manifest(), "package.json");
+        assert_eq!(LockfileType::BunLockb.manifest(), "package.json");
         assert_eq!(LockfileType::CargoLock.manifest(), "Cargo.toml");
         assert_eq!(LockfileType::GoSum.manifest(), "go.mod");
     }
@@ -1473,7 +1510,7 @@ thiserror = "0.9.1"
     }
 
     #[test]
-    fn test_detect_lockfiles_bun() {
+    fn detect_bun_binary_lockfile() {
         let dir = tempdir().unwrap();
         let manifest = dir.path().join("package.json");
         let lockfile = dir.path().join("bun.lockb");
@@ -1481,9 +1518,7 @@ thiserror = "0.9.1"
         fs::write(&manifest, "{}").unwrap();
         fs::write(&lockfile, "").unwrap();
 
-        let detected = detect_lockfiles(&manifest);
-        assert_eq!(detected.len(), 1);
-        assert_eq!(detected[0], LockfileType::BunLock);
+        assert_eq!(detect_lockfiles(&manifest), vec![LockfileType::BunLockb]);
     }
 
     #[test]

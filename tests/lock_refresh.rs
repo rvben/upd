@@ -2,7 +2,8 @@
 //! The lock command a refresh runs depends on the installed tool, and the
 //! only way to see the command line is to record what the tool received:
 //! Poetry 2 removed `poetry lock --no-update`, so the flag upd passed
-//! Poetry 1 now fails the refresh outright.
+//! Poetry 1 now fails the refresh outright, and bun writes the text
+//! `bun.lock` and has a `--lockfile-only` form.
 //!
 //! The fake tools are POSIX shell scripts, so this file is unix-only.
 #![cfg(unix)]
@@ -62,6 +63,21 @@ async fn mount_pypi_latest(server: &wiremock::MockServer, name: &str, version: &
                 "releases": {
                     version: [{"yanked": false, "upload_time_iso_8601": "2024-01-01T00:00:00Z"}]
                 }
+            })),
+        )
+        .mount(server)
+        .await;
+}
+
+/// Mounts `GET {registry}/{name}` with an abbreviated npm metadata document.
+async fn mount_npm_latest(server: &wiremock::MockServer, name: &str, version: &str) {
+    wiremock::Mock::given(wiremock::matchers::method("GET"))
+        .and(wiremock::matchers::path(format!("/{name}")))
+        .respond_with(
+            wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "name": name,
+                "dist-tags": { "latest": version },
+                "versions": { version: { "name": name, "version": version } }
             })),
         )
         .mount(server)
@@ -136,4 +152,74 @@ async fn poetry_1_locks_with_no_update() {
         poetry_lock_invocations("echo 'Poetry (version 1.8.5)'; exit 0").await,
         "lock --no-update\n"
     );
+}
+
+/// Runs `upd --apply --lock` against a bun project whose lockfile is named
+/// `lockfile`, with a `bun` that records every invocation. Returns the run's
+/// stderr and the invocations recorded.
+async fn bun_refresh_of(lockfile: &str) -> (String, String) {
+    let server = wiremock::MockServer::start().await;
+    mount_npm_latest(&server, "left-pad", "1.3.0").await;
+    let tmp = tempfile::tempdir().unwrap();
+    let bin = tmp.path().join("bin");
+    fs::create_dir(&bin).unwrap();
+    write_fake_tool(
+        &bin,
+        "bun",
+        "#!/bin/sh
+case \"$1\" in
+  --version) echo '1.3.14'; exit 0 ;;
+esac
+echo \"$*\" >> \"$FAKE_LOG\"
+exit 0
+",
+    );
+    let project = tmp.path().join("project");
+    fs::create_dir(&project).unwrap();
+    fs::write(
+        project.join("package.json"),
+        "{\n  \"dependencies\": {\n    \"left-pad\": \"1.0.0\"\n  }\n}\n",
+    )
+    .unwrap();
+    fs::write(project.join(lockfile), "lockfile bytes\n").unwrap();
+    let log = tmp.path().join("bun.log");
+
+    let (stdout, stderr, code) = run_with_env(
+        &["--apply", "--lock", "--no-cache", "--format", "text", "."],
+        &project,
+        &[
+            ("NPM_REGISTRY", &server.uri()),
+            ("PATH", &path_with(&bin)),
+            ("FAKE_LOG", log.to_str().unwrap()),
+        ],
+    );
+
+    assert_eq!(code, 0, "stdout: {stdout}\nstderr: {stderr}");
+    let invocations =
+        fs::read_to_string(&log).unwrap_or_else(|e| panic!("bun was never invoked: {e}"));
+    (stderr, invocations)
+}
+
+#[tokio::test]
+async fn bun_refreshes_the_text_lockfile_without_installing() {
+    let (stderr, invocations) = bun_refresh_of("bun.lock").await;
+
+    assert!(
+        !stderr.contains("no lockfile found"),
+        "bun.lock must be detected as bun's lockfile: {stderr}"
+    );
+    assert_eq!(invocations, "install --lockfile-only\n");
+}
+
+/// The binary lockfile from before bun 1.2 is refreshed the same way; bun
+/// keeps whichever format the project already has.
+#[tokio::test]
+async fn bun_refreshes_the_binary_lockfile_without_installing() {
+    let (stderr, invocations) = bun_refresh_of("bun.lockb").await;
+
+    assert!(
+        !stderr.contains("no lockfile found"),
+        "bun.lockb must be detected as bun's lockfile: {stderr}"
+    );
+    assert_eq!(invocations, "install --lockfile-only\n");
 }
