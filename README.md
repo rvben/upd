@@ -63,7 +63,10 @@ plan, then apply it with `uvx upd --apply`.
 
 `upd` is a local checker and editor, not a package manager or a hosted update
 bot. It can delegate lockfile refreshes to the package managers already in your
-project and can run inside your own GitHub or GitLab automation. See the
+project and can run inside your own GitHub or GitLab automation. A refresh
+writes the lockfile without installing packages or syncing an environment;
+the exact command per ecosystem, and the one old bun release that is the
+exception, are listed under [Commands run by `--lock`](https://github.com/rvben/upd/blob/main/docs/stability.md#commands-run-by---lock). See the
 [decision guide and dated benchmarks](https://github.com/rvben/upd/blob/main/docs/comparison.md)
 for an exact comparison with adjacent tools.
 

@@ -43,29 +43,71 @@ Stable `audit`-specific flags:
 
 ## Commands run by `--lock`
 
-`upd --lock` runs the narrowest per-ecosystem refresh command that
-updates only the packages `upd` just rewrote. Targeted forms are used
-wherever the package manager supports them; targeting falls back to
-`--lockfile-only` flags where no per-package form exists; otherwise
-the manifest-wide refresh command is used. The flag is honored by
-`update` (including `--interactive`) and by `audit --fix-audit --apply`.
+`upd --lock` refreshes a lockfile by running the project's own package
+manager after the manifest beside it has been rewritten. A lockfile is
+refreshed when it sits in the same directory as a manifest `upd`
+changed; `update` never reads a lockfile to decide what is outdated.
+The flag is honored by `update` (including `--interactive`) and implied
+by `audit --fix-audit --apply`, where `--no-lock` opts out.
 
-| Ecosystem | Lockfile                 | Command                                        |
-|-----------|--------------------------|------------------------------------------------|
-| Python    | `poetry.lock`            | `poetry lock` (Poetry 2); `poetry lock --no-update` (Poetry 1) |
-| Python    | `uv.lock`                | `uv lock`                                      |
-| Node      | `package-lock.json`      | `npm install --package-lock-only`              |
-| Node      | `yarn.lock`              | `yarn install --mode update-lockfile` (Yarn 2+)|
-| Node      | `pnpm-lock.yaml`         | `pnpm install --lockfile-only`                 |
-| Node      | `bun.lock`, `bun.lockb`  | `bun install --lockfile-only`                  |
-| Rust      | `Cargo.lock`             | `cargo update -p <changed> -p <changed> …`     |
-| Go        | `go.sum`                 | `go mod tidy` (no targeted form)               |
-| Ruby      | `Gemfile.lock`           | `bundle lock --update <changed> …`             |
-| .NET      | `packages.lock.json`     | `dotnet restore` (no targeted form)            |
-| Terraform | `.terraform.lock.hcl`    | `terraform providers lock` (no targeted form)  |
+The command in the table is the complete invocation. `upd` adds no
+other flags in any ecosystem, so resolution follows the project's own
+package-manager configuration, environment variables and existing
+lockfile rather than anything `upd` decides. Where the package manager
+can refresh named packages, only the packages `upd` rewrote are named;
+everywhere else the whole manifest is re-locked, and the scope column
+says what that means for the packages `upd` did not touch. The one
+variation is the form Cargo and Bundler take when there is no package
+to name, described below the table.
 
-Poetry 2 removed `lock --no-update` and made its behaviour the default,
-so `upd` reads `poetry --version` and passes the flag only to Poetry 1.
+| Ecosystem | Lockfile                | Command                                                          | Scope                                                    |
+|-----------|-------------------------|------------------------------------------------------------------|----------------------------------------------------------|
+| Python    | `poetry.lock`           | `poetry lock` (Poetry 2), `poetry lock --no-update` (Poetry 1)   | whole manifest; unchanged packages keep their locked version |
+| Python    | `uv.lock`               | `uv lock`                                                        | whole manifest; unchanged packages keep their locked version |
+| Node      | `package-lock.json`     | `npm install --package-lock-only --ignore-scripts`               | whole manifest; writes the lockfile, no `node_modules`   |
+| Node      | `yarn.lock`             | `yarn install --mode update-lockfile` (Yarn 2+)                  | whole manifest; writes the lockfile, no `node_modules`   |
+| Node      | `pnpm-lock.yaml`        | `pnpm install --lockfile-only`                                   | whole manifest; writes the lockfile, no `node_modules`   |
+| Node      | `bun.lock`, `bun.lockb` | `bun install --lockfile-only`                                    | whole manifest; writes the lockfile, no `node_modules` from bun 1.1.43 (older bun installs, see below) |
+| Rust      | `Cargo.lock`            | `cargo update -p <changed> -p <changed> …`                       | the changed packages only                                |
+| Go        | `go.sum`                | `go mod tidy`                                                    | whole manifest; no targeted form                         |
+| Ruby      | `Gemfile.lock`          | `bundle lock --update <changed> …`                               | the changed packages only                                |
+| .NET      | `packages.lock.json`    | `dotnet restore`                                                 | whole manifest; no targeted form                         |
+| Terraform | `.terraform.lock.hcl`   | `terraform providers lock`                                       | whole manifest; no targeted form                         |
+
+`uv lock` and `poetry lock` need no targeting flag. Without `--upgrade`
+they re-resolve only what the rewritten manifest forces and keep every
+other locked version, so naming the changed packages would narrow
+nothing. Poetry 2 removed `lock --no-update` and made its behaviour the
+default, so `upd` reads `poetry --version` and passes the flag to Poetry
+1 and to a Poetry whose version it cannot read: on Poetry 2 the flag
+fails loudly, where the bare command on Poetry 1 would silently refresh
+every locked version.
+
+`cargo update -p` and `bundle lock --update` name the packages `upd`
+rewrote, and `update` always has at least one to name because a
+manifest is only refreshed when something in it changed. `audit
+--fix-audit --apply` can reach the lockfile with nothing rewritten: when
+the manifest already admits the fixed version but the lockfile still
+resolves the vulnerable one, there is no package to name and `upd` runs
+`cargo update --workspace` or plain `bundle lock` instead. Both re-lock
+the whole manifest and keep every locked version the manifest still
+admits, the same scope as `uv lock`.
+
+Apart from one old bun release named below, `--lock` never installs or
+syncs anything. No `uv sync`, `poetry
+install`, `pip install`, `npm install` into `node_modules`, `bundle
+install` or `cargo build` is run, no `node_modules` tree is created or
+modified, and npm runs with `--ignore-scripts` so no lifecycle script of
+the project or of a dependency executes. bun accepts `--lockfile-only`
+from 1.1.43; an older bun ignores the flag and installs into
+`node_modules` as a plain `bun install` would. One package manager sets
+up an environment of its own: `poetry lock` creates the project's
+virtualenv when none exists, though it installs nothing into it, and
+Poetry's `virtualenvs.create false` setting skips that step. `go mod tidy`,
+`dotnet restore` and `terraform providers lock` have no lockfile-only
+form: they download the modules, packages or providers they need to
+write the lockfile, and `dotnet restore` also writes its restore outputs
+under `obj/`.
 
 Manifests whose `upd` pass produced zero changes have their lockfile
 refresh skipped entirely. A directory where only config pins were
@@ -87,8 +129,10 @@ not restored, and every write in that directory is then reported
 at its pre-run bytes. A `failed` write is not counted as applied either:
 the directory holds a manifest ahead of a lockfile that was never
 refreshed, and the named file needs putting back by hand. To keep the
-manifest edits when a refresh fails, run `--apply` without `--lock` and
-refresh the lockfile yourself.
+manifest edits when a refresh fails, skip the refresh and run the
+lockfile tool yourself: `update --apply` without `--lock`, or `audit
+--fix-audit --apply --no-lock`, since `audit` implies `--lock` and only
+`--no-lock` turns it off.
 
 ## Bump levels
 

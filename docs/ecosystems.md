@@ -19,6 +19,21 @@ to walk every file regardless.
 An explicitly passed file path bypasses discovery entirely, which is how
 `upd update path/to/versions.env` works for a file no pattern claims.
 
+## Lockfiles
+
+`update` reads manifests, not lockfiles. Whether a dependency is outdated is
+decided from the version the manifest declares and what the registry
+publishes, so a `uv.lock` or `package-lock.json` that already resolves to a
+newer release changes nothing about what `upd` reports. A lockfile beside a
+changed manifest is rewritten only under `--lock`, by the project's own
+package manager; the complete commands are listed under
+[Commands run by `--lock`](stability.md#commands-run-by---lock).
+
+`audit` does read lockfiles. The lockfile beside a manifest is scanned for
+the resolved versions it records, including transitive packages the manifest
+never names, so advisories are matched against what the project installs
+rather than against the ranges it declares. See [Audit](audit.md).
+
 ## Python
 
 - `requirements.txt`, `requirements-dev.txt`, `requirements-*.txt`
