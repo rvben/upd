@@ -28,10 +28,12 @@ use upd::fix::{
 };
 use upd::interactive::{PendingUpdate, prompt_all};
 use upd::lockfile::{
-    LockfileRegenResult, LockfileType, RegenOutcome, detect_lockfiles, regenerate_lockfiles,
+    LockfileType, RegenOutcome, RestoreFailure, Snapshot, containing_dir, detect_lockfiles,
+    regenerate_lockfile,
 };
 use upd::lockscan;
 use upd::normalize::pep503_normalize;
+use upd::output::LockWriteStatus;
 use upd::package_filter::PackageFilter;
 use upd::path_display::display_path;
 use upd::registry::{
@@ -918,39 +920,234 @@ fn lockfile_changes_for(
     names
 }
 
-fn regenerate_changed_lockfiles(
+/// Guidance printed beside a manifest that a failed lockfile refresh put back.
+const LOCK_ROLLBACK_HINT: &str =
+    "rerun without --lock to keep the manifest edits and refresh the lockfile yourself";
+
+/// The manifests that share one directory's lockfiles, with the bytes of every
+/// one of those files as the run found them. A refresh failure restores the
+/// whole group, so a manifest is never left ahead of the lockfile it owns.
+struct LockGroup {
+    dir: PathBuf,
+    lockfiles: Vec<LockfileType>,
+    manifests: Vec<PathBuf>,
+    snapshot: Snapshot,
+}
+
+impl LockGroup {
+    fn lockfile_paths(&self) -> Vec<PathBuf> {
+        self.lockfiles
+            .iter()
+            .map(|lockfile| self.dir.join(lockfile.filename()))
+            .collect()
+    }
+}
+
+/// Group every manifest that owns a lockfile with the others sharing it and
+/// capture manifest and lockfile bytes. Runs before any updater writes, so a
+/// restore puts back what the run found rather than what it wrote.
+fn plan_lock_groups(files: &[(PathBuf, FileType)]) -> Vec<LockGroup> {
+    let mut groups: Vec<LockGroup> = Vec::new();
+    for (path, file_type) in files {
+        if *file_type == FileType::Annotated {
+            continue;
+        }
+        let lockfiles = detect_lockfiles(path);
+        if lockfiles.is_empty() {
+            continue;
+        }
+        let dir = containing_dir(path).to_path_buf();
+        let index = groups
+            .iter()
+            .position(|group| group.dir == dir && group.lockfiles == lockfiles)
+            .unwrap_or_else(|| {
+                let group = LockGroup {
+                    dir,
+                    lockfiles,
+                    manifests: Vec::new(),
+                    snapshot: Snapshot::default(),
+                };
+                let lockfile_paths = group.lockfile_paths();
+                groups.push(group);
+                let index = groups.len() - 1;
+                groups[index].snapshot.extend(&lockfile_paths);
+                index
+            });
+        let group = &mut groups[index];
+        group.snapshot.extend(std::slice::from_ref(path));
+        group.manifests.push(path.clone());
+    }
+    groups
+}
+
+/// What one group's refresh came to.
+struct LockRefresh {
+    /// The group's manifests that the run rewrote.
+    manifests: Vec<PathBuf>,
+    outcomes: Vec<RegenOutcome>,
+    /// Present when a refresh failed and the group was put back.
+    rollback: Option<Rollback>,
+}
+
+struct Rollback {
+    /// The files back at their pre-run bytes.
+    restored: Vec<PathBuf>,
+    failures: Vec<RestoreFailure>,
+}
+
+/// Refresh the lockfiles of every group with a rewritten manifest, one command
+/// per lockfile. A group whose refresh fails is restored from its snapshot,
+/// manifests and lockfiles alike; a group without a rewritten manifest is left
+/// alone.
+fn refresh_lock_groups(
+    groups: Vec<LockGroup>,
     updated_files: &[PathBuf],
     changed_by_lockfile: &ChangedByLockfile,
     verbose: bool,
-) -> Vec<(PathBuf, LockfileRegenResult)> {
-    let mut processed_lockfiles: HashSet<(PathBuf, LockfileType)> = HashSet::new();
-    let mut results = Vec::new();
-
-    for path in updated_files {
-        let Some(dir) = path.parent() else {
+) -> Vec<LockRefresh> {
+    let mut refreshes = Vec::new();
+    for group in groups {
+        let manifests: Vec<PathBuf> = group
+            .manifests
+            .iter()
+            .filter(|manifest| updated_files.contains(manifest))
+            .cloned()
+            .collect();
+        let Some(anchor) = manifests.first() else {
             continue;
         };
-        let lockfiles = detect_lockfiles(path);
-        if lockfiles.is_empty() {
-            results.push((path.clone(), regenerate_lockfiles(path, &[], verbose)));
-            continue;
-        }
-        if lockfiles
+        let changed = lockfile_changes_for(changed_by_lockfile, anchor);
+        let outcomes: Vec<RegenOutcome> = group
+            .lockfiles
             .iter()
-            .all(|lockfile| processed_lockfiles.contains(&(dir.to_path_buf(), *lockfile)))
-        {
-            continue;
-        }
-        processed_lockfiles.extend(
-            lockfiles
-                .iter()
-                .map(|lockfile| (dir.to_path_buf(), *lockfile)),
-        );
-        let changed = lockfile_changes_for(changed_by_lockfile, path);
-        results.push((path.clone(), regenerate_lockfiles(path, &changed, verbose)));
+            .map(|lockfile| regenerate_lockfile(anchor, *lockfile, &changed, verbose))
+            .collect();
+        let rollback = outcomes
+            .iter()
+            .any(|outcome| !matches!(outcome, RegenOutcome::Ok(_)))
+            .then(|| {
+                let failures = group.snapshot.restore();
+                let restored = manifests
+                    .iter()
+                    .cloned()
+                    .chain(group.lockfile_paths())
+                    .filter(|path| !failures.iter().any(|failure| failure.path == *path))
+                    .collect();
+                Rollback { restored, failures }
+            });
+        refreshes.push(LockRefresh {
+            manifests,
+            outcomes,
+            rollback,
+        });
     }
+    refreshes
+}
 
-    results
+/// How a failed lockfile refresh left one rewritten manifest.
+struct LockFailure {
+    /// The refresh errors, what was put back and what was not, for the
+    /// file's error entry.
+    message: String,
+    /// `RolledBack` when the whole directory is back at its pre-run bytes,
+    /// `Failed` when a file in it could not be put back. Either way the
+    /// writes the scan reported for the manifest are not applied updates.
+    status: LockWriteStatus,
+}
+
+type LockFailures = HashMap<PathBuf, LockFailure>;
+
+/// Whether a failed lockfile refresh hit `path`, so the writes the scan
+/// reported for it are not counted as applied.
+fn refresh_failed(lock_failures: &LockFailures, path: &Path) -> bool {
+    lock_failures.contains_key(path)
+}
+
+/// Print every refresh outcome and describe each failure against the
+/// manifests it hit. Returns the failures by manifest and one error message
+/// per manifest hit, in the order the refreshes ran.
+fn report_lock_refreshes(
+    refreshes: Vec<LockRefresh>,
+    print_progress: bool,
+) -> (LockFailures, Vec<String>) {
+    let mut failures = LockFailures::new();
+    let mut errors = Vec::new();
+    for refresh in refreshes {
+        let mut causes = Vec::new();
+        for outcome in &refresh.outcomes {
+            match outcome {
+                RegenOutcome::Ok(lockfile) => {
+                    // A lockfile regenerated before a sibling's refresh failed
+                    // was put back with the rest of its group, so announcing
+                    // it would describe bytes that are no longer on disk.
+                    if print_progress && refresh.rollback.is_none() {
+                        println!("{} Regenerated {}", "✓".green(), lockfile.filename().bold());
+                    }
+                }
+                other => {
+                    if let Some(msg) = other.error_message() {
+                        eprintln!("{}", format!("error: {msg}").red());
+                        causes.push(msg);
+                    }
+                }
+            }
+        }
+        let Some(rollback) = refresh.rollback else {
+            continue;
+        };
+        let mut message = causes.join("; ");
+        if !rollback.restored.is_empty() {
+            let restored = join_names(rollback.restored.iter().map(|path| display_path(path)));
+            eprintln!("rolled back {restored}");
+            message.push_str(&format!("\nrolled back {restored}"));
+        }
+        for failure in &rollback.failures {
+            eprintln!("{}", format!("error: {failure}").red());
+            message.push_str(&format!("\n{failure}"));
+        }
+        // `rolled_back` promises the directory is back at its pre-run bytes.
+        // One file that stayed changed breaks that promise for every manifest
+        // sharing the lockfile, so the whole group is `failed`, and the hint
+        // to rerun without --lock is withheld: the directory first needs the
+        // named file put back by hand.
+        let status = if rollback.failures.is_empty() {
+            eprintln!("hint: {LOCK_ROLLBACK_HINT}");
+            message.push_str(&format!("\nhint: {LOCK_ROLLBACK_HINT}"));
+            LockWriteStatus::RolledBack
+        } else {
+            LockWriteStatus::Failed
+        };
+        for manifest in refresh.manifests {
+            errors.push(message.clone());
+            failures.insert(
+                manifest,
+                LockFailure {
+                    message: message.clone(),
+                    status,
+                },
+            );
+        }
+    }
+    (failures, errors)
+}
+
+/// Join names as prose: "a", "a and b", "a, b and c".
+fn join_names(names: impl IntoIterator<Item = String>) -> String {
+    let names: Vec<String> = names.into_iter().collect();
+    match names.split_last() {
+        None => String::new(),
+        Some((last, [])) => last.clone(),
+        Some((last, rest)) => format!("{} and {last}", rest.join(", ")),
+    }
+}
+
+/// The `note:` printed for a rewritten manifest that owns no lockfile.
+fn print_no_lockfile_note(manifest_path: &Path) {
+    let manifest_name = manifest_path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    eprintln!("note: no lockfile found for {manifest_name} - skipping (nothing to regenerate)");
 }
 
 fn has_checkable_manifest_changes(result: &UpdateResult, filter: UpdateFilter) -> bool {
@@ -1343,6 +1540,7 @@ async fn run_update(cli: &Cli) -> Result<()> {
                 UpdateReportInput {
                     scanned: &[],
                     total_result: &UpdateResult::default(),
+                    lock_failures: &LockFailures::new(),
                     file_count: 0,
                     dry_run: effective_dry_run,
                     filter: UpdateFilter::from_cli(&cli.only_bump, cli.max_bump),
@@ -1580,6 +1778,13 @@ async fn run_update(cli: &Cli) -> Result<()> {
     } else {
         files.clone()
     };
+    // Under --lock, capture every lockfile-owning manifest and its lockfiles
+    // before any updater writes, so a failed refresh can put them back.
+    let lock_groups = if cli.lock && !dry_run {
+        plan_lock_groups(&files)
+    } else {
+        Vec::new()
+    };
     let file_jobs: Vec<_> = files
         .into_iter()
         .map(|(path, file_type)| {
@@ -1747,21 +1952,19 @@ async fn run_update(cli: &Cli) -> Result<()> {
                 scanned.push(ScannedFileResult {
                     path: path.clone(),
                     file_type,
-                    result: file_result.clone(),
+                    result: file_result,
                 });
-                total_result.merge(file_result);
             }
             Err(e) => {
                 let msg = format!("Error processing {}: {}", display_path(&path), e);
                 eprintln!("{}", msg.red());
-                // Surface the outer error in both the aggregate and the per-file
-                // record so JSON output captures it and the exit-code logic can
-                // detect that errors occurred.
+                // Surface the outer error in the per-file record, from where
+                // the aggregate picks it up, so JSON output captures it and
+                // the exit-code logic can detect that errors occurred.
                 let error_result = UpdateResult {
-                    errors: vec![e.clone()],
+                    errors: vec![e],
                     ..Default::default()
                 };
-                total_result.errors.push(e);
                 scanned.push(ScannedFileResult {
                     path: path.clone(),
                     file_type,
@@ -1770,6 +1973,75 @@ async fn run_update(cli: &Cli) -> Result<()> {
             }
         }
     }
+
+    // Refresh lockfiles if requested and at least one manifest changed. This
+    // transaction settles before the floor branch below opens its own: the
+    // lock groups were snapshotted before any manifest was rewritten, so a
+    // rollback here restores the directory to its pre-run state and would
+    // also erase a floor already written and reported as applied. Running
+    // first also lets the floor branch scan the lockfile the refresh wrote.
+    let (lock_failures, lock_errors) = if cli.lock && !dry_run && !updated_files.is_empty() {
+        // Group changed package names by the lockfile their manifest owns.
+        // This keeps unrelated ecosystems in the same directory isolated.
+        let mut changed_by_lockfile = ChangedByLockfile::new();
+        for scanned_file in &scanned {
+            if scanned_file.file_type == FileType::Annotated {
+                continue;
+            }
+            if scanned_file.result.updated.is_empty()
+                && scanned_file.result.pinned.is_empty()
+                && scanned_file.result.normalized.is_empty()
+            {
+                continue;
+            }
+            record_lockfile_changes(
+                &mut changed_by_lockfile,
+                &scanned_file.path,
+                scanned_file
+                    .result
+                    .updated
+                    .iter()
+                    .map(|(name, _, _, _)| name.clone())
+                    .chain(
+                        scanned_file
+                            .result
+                            .pinned
+                            .iter()
+                            .map(|(name, _, _, _)| name.clone()),
+                    )
+                    .chain(
+                        scanned_file
+                            .result
+                            .normalized
+                            .iter()
+                            .map(|entry| entry.package.clone()),
+                    ),
+            );
+        }
+
+        for path in &updated_files {
+            if !lock_groups
+                .iter()
+                .any(|group| group.manifests.contains(path))
+            {
+                print_no_lockfile_note(path);
+            }
+        }
+        let refreshes = refresh_lock_groups(
+            lock_groups,
+            &updated_files,
+            &changed_by_lockfile,
+            verbose && text_mode,
+        );
+        // The header is only printed when there is real work to do.
+        if text_mode && !refreshes.is_empty() && !cli.quiet {
+            println!();
+            println!("{}", "Regenerating lockfiles...".cyan());
+        }
+        report_lock_refreshes(refreshes, text_mode && !cli.quiet)
+    } else {
+        (LockFailures::new(), Vec::new())
+    };
 
     // Version-floor branch for --package lock-only dependencies:
     // lockfiles are parsed only when --package narrows to specific names. A
@@ -2317,90 +2589,23 @@ async fn run_update(cli: &Cli) -> Result<()> {
     }
     run_warnings.extend(package_pattern_warnings);
 
-    // Regenerate lockfiles if requested and at least one manifest changed.
-    if cli.lock && !dry_run && !updated_files.is_empty() {
-        // Group changed package names by the lockfile their manifest owns.
-        // This keeps unrelated ecosystems in the same directory isolated.
-        let mut changed_by_lockfile = ChangedByLockfile::new();
-        for scanned_file in &scanned {
-            if scanned_file.file_type == FileType::Annotated {
-                continue;
-            }
-            if scanned_file.result.updated.is_empty()
-                && scanned_file.result.pinned.is_empty()
-                && scanned_file.result.normalized.is_empty()
-            {
-                continue;
-            }
-            record_lockfile_changes(
-                &mut changed_by_lockfile,
-                &scanned_file.path,
-                scanned_file
-                    .result
-                    .updated
-                    .iter()
-                    .map(|(name, _, _, _)| name.clone())
-                    .chain(
-                        scanned_file
-                            .result
-                            .pinned
-                            .iter()
-                            .map(|(name, _, _, _)| name.clone()),
-                    )
-                    .chain(
-                        scanned_file
-                            .result
-                            .normalized
-                            .iter()
-                            .map(|entry| entry.package.clone()),
-                    ),
-            );
+    // A manifest whose lockfile refresh failed was either put back, carrying
+    // none of the writes its scan reported, or left in a directory that could
+    // not be put back, where the writes are not applied updates either. The
+    // totals are gathered only now, once the lockfile step has settled which
+    // files kept their edits.
+    for scanned_file in &scanned {
+        let mut file_result = scanned_file.result.clone();
+        if refresh_failed(&lock_failures, &scanned_file.path) {
+            file_result.updated.clear();
+            file_result.pinned.clear();
+            file_result.normalized.clear();
+            file_result.annotations.clear();
+            file_result.action_sha_updates.clear();
         }
-
-        let regen_results = regenerate_changed_lockfiles(
-            &updated_files,
-            &changed_by_lockfile,
-            verbose && text_mode,
-        );
-
-        // Determine whether any lockfiles will actually be regenerated so
-        // the header is only printed when there is real work to do.
-        let has_work = regen_results.iter().any(|(_, r)| !r.no_lockfiles);
-
-        if text_mode && has_work && !cli.quiet {
-            println!();
-            println!("{}", "Regenerating lockfiles...".cyan());
-        }
-
-        for (path, result) in regen_results {
-            if result.no_lockfiles {
-                let manifest_name = path
-                    .file_name()
-                    .map(|n| n.to_string_lossy().into_owned())
-                    .unwrap_or_default();
-                eprintln!(
-                    "note: no lockfile found for {} - skipping (nothing to regenerate)",
-                    manifest_name
-                );
-                continue;
-            }
-            for outcome in result.outcomes {
-                match outcome {
-                    RegenOutcome::Ok(lockfile) => {
-                        if text_mode && !cli.quiet {
-                            println!("{} Regenerated {}", "✓".green(), lockfile.filename().bold());
-                        }
-                    }
-                    other => {
-                        if let Some(msg) = other.error_message() {
-                            eprintln!("{}", format!("error: {msg}").red());
-                            total_result.errors.push(msg);
-                        }
-                    }
-                }
-            }
-        }
+        total_result.merge(file_result);
     }
+    total_result.errors.extend(lock_errors);
 
     // Save cache to disk
     if cache_enabled {
@@ -2447,6 +2652,7 @@ async fn run_update(cli: &Cli) -> Result<()> {
             UpdateReportInput {
                 scanned: &scanned,
                 total_result: &total_result,
+                lock_failures: &lock_failures,
                 file_count,
                 dry_run,
                 filter,
@@ -2490,6 +2696,8 @@ impl<'a> BoundedOutputParams<'a> {
 struct UpdateReportInput<'a> {
     scanned: &'a [ScannedFileResult],
     total_result: &'a UpdateResult,
+    /// Manifests whose lockfile refresh failed, keyed by scanned path.
+    lock_failures: &'a LockFailures,
     file_count: usize,
     dry_run: bool,
     filter: UpdateFilter,
@@ -2594,6 +2802,7 @@ fn emit_update_json(input: UpdateReportInput<'_>, bounded: &BoundedOutputParams<
     let UpdateReportInput {
         scanned,
         total_result,
+        lock_failures,
         file_count,
         dry_run,
         filter,
@@ -2607,13 +2816,17 @@ fn emit_update_json(input: UpdateReportInput<'_>, bounded: &BoundedOutputParams<
         .iter()
         .map(|sf| {
             let cooldown_policy = file_cooldowns.get(&sf.path).and_then(|p| p.as_ref());
-            build_update_file_report(
+            let mut report = build_update_file_report(
                 &sf.path,
                 sf.file_type,
                 &sf.result,
                 cooldown_policy,
                 |old, new| classify_update(old, new).as_str(),
-            )
+            );
+            if let Some(failure) = lock_failures.get(&sf.path) {
+                report.record_lock_failure(&failure.message, failure.status);
+            }
+            report
         })
         .collect();
 
@@ -2652,7 +2865,9 @@ fn emit_update_json(input: UpdateReportInput<'_>, bounded: &BoundedOutputParams<
         files_scanned: file_count,
         files_with_changes: scanned
             .iter()
-            .filter(|sf| file_has_manifest_changes(&sf.result))
+            .filter(|sf| {
+                file_has_manifest_changes(&sf.result) && !refresh_failed(lock_failures, &sf.path)
+            })
             .count()
             + floor_files_with_changes,
         updates_total: total + floor_total,
@@ -3104,6 +3319,20 @@ async fn run_interactive_update(
     let mut applied_normalizations = 0;
     let mut updated_files: Vec<std::path::PathBuf> = Vec::new();
     let mut changed_by_lockfile = ChangedByLockfile::new();
+    // Under --lock, capture every lockfile-owning manifest and its lockfiles
+    // before the first write, so a failed refresh can put them back.
+    let lock_groups = if cli.lock {
+        let files: Vec<(PathBuf, FileType)> = scanned_results
+            .iter()
+            .map(|scanned_file| (scanned_file.path.clone(), scanned_file.file_type))
+            .collect();
+        plan_lock_groups(&files)
+    } else {
+        Vec::new()
+    };
+    // What each rewritten file received, so a rollback can take it back out
+    // of the totals: (updates, pins, normalizations).
+    let mut applied_by_file: HashMap<PathBuf, (usize, usize, usize)> = HashMap::new();
 
     for scanned_file in scanned_results {
         let selected_changes =
@@ -3163,6 +3392,20 @@ async fn run_interactive_update(
         if scanned_file.file_type != FileType::Annotated {
             updated_files.push(scanned_file.path.clone());
         }
+        applied_by_file.insert(
+            scanned_file.path.clone(),
+            (
+                selected_changes
+                    .iter()
+                    .filter(|change| change.kind == ChangeKind::RegistryUpdate)
+                    .count(),
+                selected_changes
+                    .iter()
+                    .filter(|change| change.kind == ChangeKind::ConfigPin)
+                    .count(),
+                selected_normalizations.len(),
+            ),
+        );
 
         let file_str = display_path(&scanned_file.path);
         for normalized in &selected_normalizations {
@@ -3229,64 +3472,37 @@ async fn run_interactive_update(
         }
     }
 
-    // Regenerate lockfiles if requested and files were updated
+    // Refresh lockfiles if requested and files were updated. A file whose
+    // refresh failed is put back, and its writes leave the totals with it.
+    let mut lock_errors = Vec::new();
     if cli.lock && !updated_files.is_empty() {
-        let regen_results =
-            regenerate_changed_lockfiles(&updated_files, &changed_by_lockfile, cli.verbose);
-
-        // Only print the header when at least one lockfile will be regenerated.
-        let has_work = regen_results.iter().any(|(_, r)| !r.no_lockfiles);
-
-        if has_work && !cli.quiet {
+        for path in &updated_files {
+            if !lock_groups
+                .iter()
+                .any(|group| group.manifests.contains(path))
+            {
+                print_no_lockfile_note(path);
+            }
+        }
+        let refreshes = refresh_lock_groups(
+            lock_groups,
+            &updated_files,
+            &changed_by_lockfile,
+            cli.verbose,
+        );
+        if !refreshes.is_empty() && !cli.quiet {
             println!();
             println!("{}", "Regenerating lockfiles...".cyan());
         }
-
-        let mut had_error = false;
-        let mut error_messages: Vec<String> = Vec::new();
-        for (path, result) in regen_results {
-            if result.no_lockfiles {
-                let manifest_name = path
-                    .file_name()
-                    .map(|n| n.to_string_lossy().into_owned())
-                    .unwrap_or_default();
-                eprintln!(
-                    "note: no lockfile found for {} - skipping (nothing to regenerate)",
-                    manifest_name
-                );
-                continue;
-            }
-            for outcome in result.outcomes {
-                match outcome {
-                    RegenOutcome::Ok(lockfile) => {
-                        if !cli.quiet {
-                            println!("{} Regenerated {}", "✓".green(), lockfile.filename().bold());
-                        }
-                    }
-                    other => {
-                        if let Some(msg) = other.error_message() {
-                            eprintln!("{}", format!("error: {msg}").red());
-                            had_error = true;
-                            error_messages.push(msg);
-                        }
-                    }
-                }
+        let (lock_failures, errors) = report_lock_refreshes(refreshes, !cli.quiet);
+        for (path, (updates, pins, normalizations)) in &applied_by_file {
+            if refresh_failed(&lock_failures, path) {
+                applied_updates -= updates;
+                applied_pins -= pins;
+                applied_normalizations -= normalizations;
             }
         }
-        if had_error {
-            let combined = error_messages.join("; ");
-            eprintln!(
-                "{}",
-                serde_json::json!({
-                    "error": {
-                        "kind": "io_error",
-                        "message": combined,
-                        "exit_code": 2
-                    }
-                })
-            );
-            std::process::exit(2);
-        }
+        lock_errors = errors;
     }
 
     // Save cache to disk
@@ -3317,6 +3533,20 @@ async fn run_interactive_update(
                 applied_normalizations.to_string().cyan().bold()
             );
         }
+    }
+
+    if !lock_errors.is_empty() {
+        eprintln!(
+            "{}",
+            serde_json::json!({
+                "error": {
+                    "kind": "io_error",
+                    "message": lock_errors.join("; "),
+                    "exit_code": 2
+                }
+            })
+        );
+        std::process::exit(2);
     }
 
     finish_interactive(scan_errors)
@@ -7711,6 +7941,221 @@ serde = "1.0.1"
 
         assert_eq!(lockfile_changes_for(&changed, &cargo_manifest), ["serde"]);
         assert!(lockfile_changes_for(&changed, &dockerfile).is_empty());
+    }
+
+    /// Three manifests with lockfiles, in two directories, and two files
+    /// that own no lockfile: one group per manifest that owns a lockfile,
+    /// keyed on its directory and lockfile set, in discovery order.
+    #[test]
+    fn plan_lock_groups_makes_one_group_per_directory_and_lockfile_set() {
+        let tmp = tempdir().unwrap();
+        let a = tmp.path().join("a");
+        let b = tmp.path().join("b");
+        let c = tmp.path().join("c");
+        for dir in [&a, &b, &c] {
+            std::fs::create_dir(dir).unwrap();
+        }
+        let pyproject = a.join("pyproject.toml");
+        let package_json = a.join("package.json");
+        let dockerfile = a.join("Dockerfile");
+        let cargo_toml = b.join("Cargo.toml");
+        let requirements = c.join("requirements.txt");
+        std::fs::write(&pyproject, "[project]\n").unwrap();
+        std::fs::write(a.join("uv.lock"), "version = 1\n").unwrap();
+        std::fs::write(&package_json, "{}\n").unwrap();
+        std::fs::write(a.join("package-lock.json"), "{}\n").unwrap();
+        std::fs::write(&dockerfile, "FROM rust:1.90-alpine\n").unwrap();
+        std::fs::write(&cargo_toml, "[package]\n").unwrap();
+        std::fs::write(b.join("Cargo.lock"), "version = 4\n").unwrap();
+        std::fs::write(&requirements, "requests==2.31.0\n").unwrap();
+
+        let groups = plan_lock_groups(&[
+            (pyproject.clone(), FileType::PyProject),
+            (dockerfile, FileType::Annotated),
+            (package_json.clone(), FileType::PackageJson),
+            (requirements, FileType::Requirements),
+            (cargo_toml.clone(), FileType::CargoToml),
+        ]);
+
+        let summary: Vec<(PathBuf, Vec<LockfileType>, Vec<PathBuf>)> = groups
+            .iter()
+            .map(|group| {
+                (
+                    group.dir.clone(),
+                    group.lockfiles.clone(),
+                    group.manifests.clone(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            summary,
+            vec![
+                (
+                    a.clone(),
+                    vec![LockfileType::UvLock],
+                    vec![pyproject.clone()]
+                ),
+                (
+                    a.clone(),
+                    vec![LockfileType::PackageLockJson],
+                    vec![package_json.clone()]
+                ),
+                (b.clone(), vec![LockfileType::CargoLock], vec![cargo_toml]),
+            ]
+        );
+        assert_eq!(groups[0].lockfile_paths(), vec![a.join("uv.lock")]);
+    }
+
+    /// The snapshot a group is planned with holds the bytes the run found, so
+    /// a restore after the updaters and the lockfile tool have written puts
+    /// both the manifest and the lockfile back.
+    #[test]
+    fn a_planned_group_restores_the_bytes_the_run_found() {
+        let tmp = tempdir().unwrap();
+        let manifest = tmp.path().join("pyproject.toml");
+        let lockfile = tmp.path().join("uv.lock");
+        std::fs::write(&manifest, "requests==2.31.0\n").unwrap();
+        std::fs::write(&lockfile, "version = 1\n").unwrap();
+        let groups = plan_lock_groups(&[(manifest.clone(), FileType::PyProject)]);
+        std::fs::write(&manifest, "requests==2.32.0\n").unwrap();
+        std::fs::write(&lockfile, "version = 2\n").unwrap();
+
+        let failures = groups[0].snapshot.restore();
+
+        assert!(failures.is_empty(), "{failures:?}");
+        assert_eq!(
+            std::fs::read_to_string(&manifest).unwrap(),
+            "requests==2.31.0\n"
+        );
+        assert_eq!(std::fs::read_to_string(&lockfile).unwrap(), "version = 1\n");
+    }
+
+    fn failed_refresh(
+        manifests: &[&Path],
+        restored: &[&Path],
+        failures: Vec<RestoreFailure>,
+    ) -> LockRefresh {
+        LockRefresh {
+            manifests: manifests.iter().map(|path| path.to_path_buf()).collect(),
+            outcomes: vec![RegenOutcome::Failed {
+                lockfile: LockfileType::UvLock,
+                message: "Failed to regenerate uv.lock: resolver blew up".to_string(),
+            }],
+            rollback: Some(Rollback {
+                restored: restored.iter().map(|path| path.to_path_buf()).collect(),
+                failures,
+            }),
+        }
+    }
+
+    /// A refresh that succeeded records nothing against its manifest.
+    #[test]
+    fn a_successful_refresh_records_no_failure() {
+        let manifest = PathBuf::from("pyproject.toml");
+        let refresh = LockRefresh {
+            manifests: vec![manifest.clone()],
+            outcomes: vec![RegenOutcome::Ok(LockfileType::UvLock)],
+            rollback: None,
+        };
+
+        let (failures, errors) = report_lock_refreshes(vec![refresh], false);
+
+        assert!(failures.is_empty());
+        assert!(errors.is_empty());
+        assert!(!refresh_failed(&failures, &manifest));
+    }
+
+    /// Every file of the group back at its pre-run bytes: the manifest is
+    /// `rolled_back`, its error names the refresh failure and what was put
+    /// back, and carries the hint to rerun without --lock.
+    #[test]
+    fn a_fully_restored_group_is_rolled_back_with_the_hint() {
+        let manifest = PathBuf::from("pyproject.toml");
+        let lockfile = PathBuf::from("uv.lock");
+        let refresh = failed_refresh(&[&manifest], &[&manifest, &lockfile], Vec::new());
+
+        let (failures, errors) = report_lock_refreshes(vec![refresh], false);
+
+        let failure = &failures[&manifest];
+        assert_eq!(failure.status, LockWriteStatus::RolledBack);
+        assert!(
+            failure
+                .message
+                .contains("Failed to regenerate uv.lock: resolver blew up"),
+            "{}",
+            failure.message
+        );
+        assert!(
+            failure
+                .message
+                .contains("rolled back pyproject.toml and uv.lock"),
+            "{}",
+            failure.message
+        );
+        assert!(
+            failure
+                .message
+                .ends_with(&format!("hint: {LOCK_ROLLBACK_HINT}")),
+            "{}",
+            failure.message
+        );
+        assert_eq!(errors, vec![failure.message.clone()]);
+        assert!(refresh_failed(&failures, &manifest));
+        assert!(!refresh_failed(
+            &failures,
+            Path::new("other/pyproject.toml")
+        ));
+    }
+
+    /// One file that could not be put back makes every manifest sharing the
+    /// lockfile `failed`, with the unrestored file named in the error and no
+    /// hint, since the directory first needs that file put back by hand.
+    #[test]
+    fn a_group_with_an_unrestored_file_is_failed_for_every_manifest() {
+        let manifest = PathBuf::from("pyproject.toml");
+        let sibling = PathBuf::from("other.toml");
+        let lockfile = PathBuf::from("uv.lock");
+        let refresh = failed_refresh(
+            &[&manifest, &sibling],
+            &[&sibling, &lockfile],
+            vec![RestoreFailure {
+                path: manifest.clone(),
+                reason: "Permission denied (os error 13)".to_string(),
+            }],
+        );
+
+        let (failures, errors) = report_lock_refreshes(vec![refresh], false);
+
+        for path in [&manifest, &sibling] {
+            let failure = &failures[path];
+            assert_eq!(
+                failure.status,
+                LockWriteStatus::Failed,
+                "{}",
+                path.display()
+            );
+            assert!(
+                failure
+                    .message
+                    .contains("pyproject.toml was not restored: Permission denied (os error 13)"),
+                "{}",
+                failure.message
+            );
+            assert!(
+                failure
+                    .message
+                    .contains("rolled back other.toml and uv.lock"),
+                "{}",
+                failure.message
+            );
+            assert!(
+                !failure.message.contains(LOCK_ROLLBACK_HINT),
+                "{}",
+                failure.message
+            );
+            assert!(refresh_failed(&failures, path));
+        }
+        assert_eq!(errors.len(), 2);
     }
 }
 

@@ -38,7 +38,8 @@ impl ErrorEntry {
     /// Construct an error with a known file path.
     ///
     /// The `kind` argument is one of the documented error categories:
-    /// `"network"`, `"parse"`, `"registry"`, `"io"`, or `"other"`.
+    /// `"network"`, `"parse"`, `"registry"`, `"io"`, `"lockfile"` (the
+    /// file's lockfile could not be refreshed under `--lock`), or `"other"`.
     pub fn with_file(
         file: impl Into<String>,
         kind: &'static str,
@@ -105,6 +106,52 @@ pub struct UpdateFileReport {
     pub warnings: Vec<String>,
 }
 
+/// What a failed lockfile refresh under `--lock` made of the writes in the
+/// refreshed directory. Neither status counts as an applied update.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LockWriteStatus {
+    /// Every file in the directory is back at its pre-run bytes, so the
+    /// writes are gone.
+    RolledBack,
+    /// A file in the directory could not be put back, so the directory holds
+    /// neither its pre-run bytes nor a consistent update. The error names the
+    /// file that was not restored.
+    Failed,
+}
+
+impl LockWriteStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            LockWriteStatus::RolledBack => "rolled_back",
+            LockWriteStatus::Failed => "failed",
+        }
+    }
+}
+
+impl UpdateFileReport {
+    /// Record that this file's lockfile could not be refreshed under
+    /// `--lock`. Every write the file reports takes `status`, so the report
+    /// claims neither an edit the file no longer carries nor one that sits
+    /// ahead of a lockfile that was never refreshed.
+    pub fn record_lock_failure(&mut self, message: &str, status: LockWriteStatus) {
+        self.errors.push(ErrorEntry::with_file(
+            self.path.clone(),
+            "lockfile",
+            message,
+        ));
+        for update in &mut self.updates {
+            update.status = Some(status.as_str());
+            update.error = Some(message.to_string());
+        }
+        for pinned in &mut self.pinned {
+            pinned.status = Some(status.as_str());
+        }
+        for normalized in &mut self.normalized {
+            normalized.status = Some(status.as_str());
+        }
+    }
+}
+
 /// A dependency whose identity was written into the file without its version
 /// changing.
 ///
@@ -139,6 +186,12 @@ pub struct NormalizedEntry {
     pub skipped_published_at: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub line: Option<usize>,
+    /// `"rolled_back"` when a failed lockfile refresh put the file back, so
+    /// this rewrite is no longer in it; `"failed"` when a file in its
+    /// directory could not be put back (see `LockWriteStatus`). Absent
+    /// otherwise.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub status: Option<&'static str>,
 }
 
 /// An available update the bump ceiling refused to write.
@@ -173,12 +226,15 @@ pub struct UpdateEntry {
     /// `"cargo-precise"`); absent for a plain manifest update.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub method: Option<&'static str>,
-    /// Outcome status for a version floor (see `FixStatus::as_str`); absent
-    /// for a plain manifest update.
+    /// Outcome status for a version floor (see `FixStatus::as_str`), or for a
+    /// manifest update whose lockfile refresh failed under `--lock` (see
+    /// `LockWriteStatus`). Absent for a plain manifest update that stands.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub status: Option<&'static str>,
     /// Guidance for an unfixable floor; resolver stderr for a failed or
-    /// rolled-back floor. Absent for a plain manifest update.
+    /// rolled-back floor; the refresh error, what was put back and what was
+    /// not for a manifest update whose lockfile refresh failed. Absent for a
+    /// plain manifest update that stands.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
     /// Annotation source token for an entry whose ecosystem is per-line rather
@@ -262,6 +318,11 @@ pub struct PinnedEntry {
     /// than per-file. Absent for every entry in a file `upd` has a parser for.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub source: Option<&'static str>,
+    /// `"rolled_back"` when a failed lockfile refresh put the file back, so
+    /// this pin is no longer in it; `"failed"` when a file in its directory
+    /// could not be put back (see `LockWriteStatus`). Absent otherwise.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub status: Option<&'static str>,
 }
 
 #[derive(Debug, Serialize)]
@@ -557,6 +618,7 @@ pub fn build_update_file_report(
             pinned_to: new.clone(),
             line: *line,
             source: source_of(name).map(AnnotationSource::token),
+            status: None,
         })
         .collect();
 
@@ -659,6 +721,7 @@ pub fn build_update_file_report(
                 .map(|(version, _)| version.clone()),
             skipped_published_at: entry.held_back_from.as_ref().map(|(_, at)| at.to_rfc3339()),
             line: entry.line_number,
+            status: None,
         })
         .collect();
 
@@ -1133,6 +1196,80 @@ mod tests {
             json["warnings"][0],
             "skipping bar: current version \"%version%\" is not a valid PEP 440 version"
         );
+    }
+
+    fn python_result_with_every_write_kind() -> UpdateResult {
+        let mut result = UpdateResult {
+            updated: vec![("requests".into(), "2.31.0".into(), "2.32.0".into(), Some(4))],
+            pinned: vec![("urllib3".into(), "2.0.0".into(), "2.2.0".into(), Some(5))],
+            ..Default::default()
+        };
+        result.normalized.push(NormalizedSpec {
+            package: "click".to_string(),
+            section: "project.dependencies".to_string(),
+            previous_spec: None,
+            new_spec: ">=8.2.1".to_string(),
+            version: "8.2.1".to_string(),
+            previous_version: None,
+            pinned: false,
+            held_back_from: None,
+            line_number: Some(6),
+        });
+        result
+    }
+
+    /// A rolled-back manifest carries none of the writes its scan reported,
+    /// so every entry is marked and the file gets one lockfile error.
+    #[test]
+    fn a_lock_failure_marks_every_write_of_a_rolled_back_file() {
+        let result = python_result_with_every_write_kind();
+        let mut report = build_update_file_report(
+            Path::new("pyproject.toml"),
+            FileType::PyProject,
+            &result,
+            None,
+            |_, _| "minor",
+        );
+        let message = "Failed to regenerate uv.lock: resolver blew up\nrolled back pyproject.toml and uv.lock";
+
+        report.record_lock_failure(message, LockWriteStatus::RolledBack);
+
+        let json = serde_json::to_value(&report).unwrap();
+        assert_eq!(json["updates"][0]["status"], "rolled_back", "{json}");
+        assert_eq!(json["updates"][0]["error"], message, "{json}");
+        assert_eq!(json["pinned"][0]["status"], "rolled_back", "{json}");
+        assert_eq!(json["normalized"][0]["status"], "rolled_back", "{json}");
+        assert_eq!(json["errors"].as_array().unwrap().len(), 1, "{json}");
+        assert_eq!(json["errors"][0]["kind"], "lockfile", "{json}");
+        assert_eq!(json["errors"][0]["file"], "pyproject.toml", "{json}");
+        assert_eq!(json["errors"][0]["message"], message, "{json}");
+    }
+
+    /// A manifest in a directory that could not be put back is ahead of a
+    /// lockfile that was never refreshed, so every write is marked `failed`
+    /// and carries the error that names the unrestored file.
+    #[test]
+    fn a_lock_failure_that_left_a_file_unrestored_marks_every_write_failed() {
+        let result = python_result_with_every_write_kind();
+        let mut report = build_update_file_report(
+            Path::new("pyproject.toml"),
+            FileType::PyProject,
+            &result,
+            None,
+            |_, _| "minor",
+        );
+        let message = "Failed to regenerate uv.lock: resolver blew up\nrolled back uv.lock\npyproject.toml was not restored: Permission denied (os error 13)";
+
+        report.record_lock_failure(message, LockWriteStatus::Failed);
+
+        let json = serde_json::to_value(&report).unwrap();
+        assert_eq!(json["updates"][0]["status"], "failed", "{json}");
+        assert_eq!(json["updates"][0]["error"], message, "{json}");
+        assert_eq!(json["pinned"][0]["status"], "failed", "{json}");
+        assert_eq!(json["normalized"][0]["status"], "failed", "{json}");
+        assert_eq!(json["errors"].as_array().unwrap().len(), 1, "{json}");
+        assert_eq!(json["errors"][0]["kind"], "lockfile", "{json}");
+        assert_eq!(json["errors"][0]["message"], message, "{json}");
     }
 
     #[test]

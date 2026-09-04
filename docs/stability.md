@@ -72,6 +72,24 @@ refresh skipped entirely. A directory where only config pins were
 applied is still refreshed, and the changed-package list includes
 those pinned packages so `cargo update -p <pkg>` / `bundle lock --update <pkg>` stay scoped.
 
+A refresh is a transaction per directory. Before the first manifest is
+written, `upd` captures the bytes of every manifest and lockfile in the
+directories it may touch. When a refresh command fails, or its tool is
+not installed, every file in that directory is put back exactly as the
+run found it, the output names what was rolled back, and the run exits
+2. Other directories keep their updates and the result of their own
+refresh. In JSON output each rolled-back entry carries
+`"status": "rolled_back"` and the file's `errors` gains an entry of kind
+`lockfile`. A file that cannot be put back is named in that error as
+not restored, and every write in that directory is then reported
+`failed` rather than `rolled_back`, under `update` and `audit
+--fix-audit` alike, because `rolled_back` promises the directory is back
+at its pre-run bytes. A `failed` write is not counted as applied either:
+the directory holds a manifest ahead of a lockfile that was never
+refreshed, and the named file needs putting back by hand. To keep the
+manifest edits when a refresh fails, run `--apply` without `--lock` and
+refresh the lockfile yourself.
+
 ## Bump levels
 
 `--only-bump` and `--max-bump` classify a change by comparing the two version
@@ -179,7 +197,7 @@ that project asked for.
 |------|---------|
 | `0` | Success. No action required, or updates applied cleanly |
 | `1` | Pending updates or misalignments found (dry-run / `--check`). Not an error. |
-| `2` | An error was reported. A file could not be read/written, a required path does not exist, a lockfile refresh failed, a dependency could not be checked (its constraint could not be read, or its registry lookup did not answer), or `--interactive` was given with no terminal on stdin. Takes precedence over every other code. An interactive session reports these the same way a plain run does, after applying whatever it approved |
+| `2` | An error was reported. A file could not be read/written, a required path does not exist, a lockfile refresh failed (its directory is put back as the run found it), a dependency could not be checked (its constraint could not be read, or its registry lookup did not answer), or `--interactive` was given with no terminal on stdin. Takes precedence over every other code. An interactive session reports these the same way a plain run does, after applying whatever it approved |
 | `3` | Network error. A registry was unreachable or timed out |
 | `4` | Invalid CLI arguments or an unparseable dependency file / configuration |
 | `6` | Vulnerabilities found (`upd audit`). Pass `--no-fail` to force exit 0. |

@@ -178,7 +178,7 @@ upd --lang python
 # Exit 1 if anything is outdated (for CI and pre-commit)
 upd --check
 
-# Regenerate lockfiles after writing
+# Regenerate lockfiles after writing; a failed refresh rolls its directory back
 upd --apply --lock
 
 # Print the effective configuration and exit

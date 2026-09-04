@@ -5,7 +5,7 @@
 
 use std::collections::HashMap;
 use std::io;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use colored::Colorize;
@@ -235,7 +235,7 @@ fn is_dotnet_manifest(name: &std::ffi::OsStr) -> bool {
 /// "No such file or directory" error a missing binary produces, which
 /// misreports a perfectly runnable tool as absent. Map the empty parent to
 /// `.` alongside the absent one.
-pub(crate) fn containing_dir(path: &Path) -> &Path {
+pub fn containing_dir(path: &Path) -> &Path {
     match path.parent() {
         Some(dir) if !dir.as_os_str().is_empty() => dir,
         _ => Path::new("."),
@@ -342,6 +342,16 @@ pub fn detect_lockfiles(manifest_path: &Path) -> Vec<LockfileType> {
     lockfiles
 }
 
+/// The full paths of every lockfile [`detect_lockfiles`] maps for a
+/// manifest, in detection order.
+pub fn lockfile_paths_for(manifest_path: &Path) -> Vec<PathBuf> {
+    let dir = containing_dir(manifest_path);
+    detect_lockfiles(manifest_path)
+        .into_iter()
+        .map(|lockfile| dir.join(lockfile.filename()))
+        .collect()
+}
+
 /// The major version in Poetry's `--version` line, which reads
 /// `Poetry (version 2.2.1)` from 1.2 on and `Poetry version 1.1.15` before.
 /// `None` when the line carries no version.
@@ -388,6 +398,103 @@ pub fn tool_available(tool: &str) -> bool {
     !matches!(probe_tool(tool), ToolProbe::Missing)
 }
 
+/// What [`Snapshot::capture`] found at a path.
+#[derive(Debug)]
+enum Captured {
+    /// The file existed with these bytes.
+    Bytes(Vec<u8>),
+    /// Nothing at the path, so restoring removes whatever a later step
+    /// created there.
+    Absent,
+    /// Something is at the path but could not be read, so it can be neither
+    /// rewritten nor removed with confidence; `restore` reports it instead.
+    Unreadable(String),
+}
+
+/// A file a [`Snapshot`] could not put back, and why.
+#[derive(Debug)]
+pub struct RestoreFailure {
+    pub path: PathBuf,
+    pub reason: String,
+}
+
+impl std::fmt::Display for RestoreFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{} was not restored: {}",
+            crate::path_display::display_path(&self.path),
+            self.reason
+        )
+    }
+}
+
+/// A pre-write byte capture of every file a lock transaction may touch, so
+/// a failed refresh can put the manifest and its lockfiles back exactly as
+/// the run found them.
+#[derive(Debug, Default)]
+pub struct Snapshot {
+    files: Vec<(PathBuf, Captured)>,
+}
+
+impl Snapshot {
+    /// Capture `paths` as they are now.
+    pub fn capture(paths: &[PathBuf]) -> Self {
+        let mut snapshot = Self::default();
+        snapshot.extend(paths);
+        snapshot
+    }
+
+    /// Capture the paths not yet held. A path already captured keeps the
+    /// bytes from its first capture, so a manifest captured before the
+    /// updaters write is not replaced by its rewritten form when the
+    /// lockfiles beside it are captured later.
+    pub fn extend(&mut self, paths: &[PathBuf]) {
+        for path in paths {
+            if self.files.iter().any(|(held, _)| held == path) {
+                continue;
+            }
+            let captured = match std::fs::read(path) {
+                Ok(bytes) => Captured::Bytes(bytes),
+                Err(e) if e.kind() == io::ErrorKind::NotFound => Captured::Absent,
+                Err(e) => Captured::Unreadable(e.to_string()),
+            };
+            self.files.push((path.clone(), captured));
+        }
+    }
+
+    /// Put every captured file back. A file whose bytes did not change is
+    /// left alone rather than rewritten. Returns the files that could not
+    /// be restored.
+    pub fn restore(&self) -> Vec<RestoreFailure> {
+        let mut failures = Vec::new();
+        for (path, captured) in &self.files {
+            let result = match captured {
+                Captured::Bytes(bytes) => {
+                    if std::fs::read(path).is_ok_and(|current| current == *bytes) {
+                        continue;
+                    }
+                    std::fs::write(path, bytes)
+                }
+                Captured::Absent => match std::fs::remove_file(path) {
+                    Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+                    other => other,
+                },
+                Captured::Unreadable(reason) => Err(io::Error::other(format!(
+                    "it could not be read before the run ({reason})"
+                ))),
+            };
+            if let Err(e) = result {
+                failures.push(RestoreFailure {
+                    path: path.clone(),
+                    reason: e.to_string(),
+                });
+            }
+        }
+        failures
+    }
+}
+
 /// Regenerate a single lockfile by running the appropriate package manager.
 ///
 /// `changed` is the list of package names that `upd` just rewrote in the
@@ -397,7 +504,7 @@ pub fn tool_available(tool: &str) -> bool {
 ///
 /// Returns a [`RegenOutcome`] distinguishing success, missing tool, and
 /// command failure.
-pub(crate) fn regenerate_lockfile(
+pub fn regenerate_lockfile(
     manifest_path: &Path,
     lockfile_type: LockfileType,
     changed: &[String],
@@ -1268,6 +1375,112 @@ thiserror = "0.9.1"
         fs::write(dir.path().join("bun.lockb"), "").unwrap();
 
         assert_eq!(detect_lockfiles(&manifest), vec![LockfileType::BunLock]);
+    }
+
+    #[test]
+    fn lockfile_paths_for_names_every_detected_lockfile_beside_the_manifest() {
+        let dir = tempdir().unwrap();
+        let manifest = dir.path().join("pyproject.toml");
+        fs::write(&manifest, "[project]\n").unwrap();
+        fs::write(dir.path().join("poetry.lock"), "").unwrap();
+        fs::write(dir.path().join("uv.lock"), "").unwrap();
+
+        assert_eq!(
+            lockfile_paths_for(&manifest),
+            vec![dir.path().join("poetry.lock"), dir.path().join("uv.lock")]
+        );
+    }
+
+    #[test]
+    fn snapshot_restores_bytes_and_removes_files_it_captured_as_absent() {
+        let dir = tempdir().unwrap();
+        let present = dir.path().join("present");
+        let absent = dir.path().join("absent");
+        fs::write(&present, "before").unwrap();
+
+        let snapshot = Snapshot::capture(&[present.clone(), absent.clone()]);
+        fs::write(&present, "after").unwrap();
+        fs::write(&absent, "created").unwrap();
+
+        assert!(snapshot.restore().is_empty());
+        assert_eq!(fs::read_to_string(&present).unwrap(), "before");
+        assert!(!absent.exists(), "a file absent at capture is removed");
+    }
+
+    /// A file whose bytes never changed is not rewritten: restoring a
+    /// group must not touch the manifests in it that the run left alone.
+    /// A read-only file makes the difference observable, since a rewrite
+    /// would fail on it.
+    #[cfg(unix)]
+    #[test]
+    fn snapshot_does_not_rewrite_a_file_whose_bytes_did_not_change() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempdir().unwrap();
+        let untouched = dir.path().join("untouched");
+        fs::write(&untouched, "same").unwrap();
+        let snapshot = Snapshot::capture(std::slice::from_ref(&untouched));
+        fs::set_permissions(&untouched, fs::Permissions::from_mode(0o444)).unwrap();
+
+        let failures = snapshot.restore();
+
+        assert!(failures.is_empty(), "{failures:?}");
+        assert_eq!(fs::read_to_string(&untouched).unwrap(), "same");
+    }
+
+    /// A path already held keeps the bytes from its first capture: the
+    /// manifest is captured before the updaters write and the lockfiles just
+    /// before the refresh, and the later capture must not overwrite the
+    /// earlier one with the rewritten manifest.
+    #[test]
+    fn snapshot_extend_keeps_the_first_capture_of_a_path() {
+        let dir = tempdir().unwrap();
+        let manifest = dir.path().join("manifest");
+        let lock = dir.path().join("lock");
+        fs::write(&manifest, "v1").unwrap();
+        fs::write(&lock, "lock-v1").unwrap();
+
+        let mut snapshot = Snapshot::capture(std::slice::from_ref(&manifest));
+        fs::write(&manifest, "v2").unwrap();
+        snapshot.extend(&[manifest.clone(), lock.clone()]);
+        fs::write(&manifest, "v3").unwrap();
+        fs::write(&lock, "lock-v2").unwrap();
+
+        assert!(snapshot.restore().is_empty());
+        assert_eq!(fs::read_to_string(&manifest).unwrap(), "v1");
+        assert_eq!(fs::read_to_string(&lock).unwrap(), "lock-v1");
+    }
+
+    /// A file that exists but cannot be read is neither deleted nor
+    /// overwritten on restore; the failure is reported instead, because an
+    /// unreadable file and an absent one are different facts.
+    #[cfg(unix)]
+    #[test]
+    fn snapshot_leaves_a_file_it_could_not_read_alone_and_reports_it() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempdir().unwrap();
+        let secret = dir.path().join("secret");
+        fs::write(&secret, "original").unwrap();
+        fs::set_permissions(&secret, fs::Permissions::from_mode(0o000)).unwrap();
+        if fs::read(&secret).is_ok() {
+            // Running as root: the permission bits do not apply, so the
+            // unreadable case cannot be produced here.
+            return;
+        }
+
+        let snapshot = Snapshot::capture(std::slice::from_ref(&secret));
+        fs::set_permissions(&secret, fs::Permissions::from_mode(0o644)).unwrap();
+        fs::write(&secret, "changed").unwrap();
+
+        let failures = snapshot.restore();
+        assert_eq!(failures.len(), 1, "{failures:?}");
+        assert_eq!(failures[0].path, secret);
+        let rendered = failures[0].to_string();
+        assert!(
+            rendered.contains("secret was not restored: ")
+                && rendered.contains("could not be read before the run"),
+            "{rendered}"
+        );
+        assert_eq!(fs::read_to_string(&secret).unwrap(), "changed");
     }
 
     #[test]

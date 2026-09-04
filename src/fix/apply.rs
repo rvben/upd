@@ -7,8 +7,8 @@ use crate::fix::npm::write_npm_override_floor;
 use crate::fix::uv::write_uv_constraint_floor;
 use crate::fix::{FixKind, FixTarget, FloorWriteOutcome, NpmOverrideForm};
 use crate::lockfile::{
-    LockfileType, RegenOutcome, cargo_update_precise, containing_dir, detect_lockfiles,
-    regenerate_lockfile, regenerate_lockfiles,
+    LockfileType, RegenOutcome, RestoreFailure, Snapshot, cargo_update_precise, containing_dir,
+    detect_lockfiles, regenerate_lockfile, regenerate_lockfiles,
 };
 use crate::lockscan::cargo::scan_cargo_lock;
 use crate::lockscan::npm::scan_npm_lock;
@@ -48,7 +48,11 @@ pub enum FixStatus {
     /// Nothing needed to change; an existing entry already satisfies the
     /// floor, or the manifest spec already covers the fixed version.
     AlreadySatisfied,
-    /// A write attempt itself failed (parse error, I/O error, etc.).
+    /// A write attempt itself failed (parse error, I/O error, etc.), or the
+    /// group's relock failed and a file in the group could not be restored.
+    /// In the second case `error` names that file and every written target
+    /// in the group takes this status, because `RolledBack` would promise a
+    /// restore that did not happen.
     Failed,
     /// A write succeeded but the group's relock failed; every file the
     /// group's snapshot covered was restored byte-for-byte.
@@ -209,40 +213,6 @@ fn vulnerable_still_locked(lock: &Path, pairs: &[(String, String)]) -> bool {
     })
 }
 
-/// A pre-write byte capture of every file a group's transaction may touch.
-/// `None` marks a path that did not exist yet, so `restore` deletes it
-/// rather than writing empty bytes (rule 2).
-struct Snapshot {
-    files: Vec<(PathBuf, Option<Vec<u8>>)>,
-}
-
-impl Snapshot {
-    fn capture(paths: &[PathBuf]) -> Self {
-        let mut seen = HashSet::new();
-        let mut files = Vec::new();
-        for path in paths {
-            if !seen.insert(path.clone()) {
-                continue;
-            }
-            files.push((path.clone(), std::fs::read(path).ok()));
-        }
-        Snapshot { files }
-    }
-
-    fn restore(&self) {
-        for (path, bytes) in &self.files {
-            match bytes {
-                Some(bytes) => {
-                    let _ = std::fs::write(path, bytes);
-                }
-                None => {
-                    let _ = std::fs::remove_file(path);
-                }
-            }
-        }
-    }
-}
-
 /// The paths a group's snapshot must cover: the edited file itself, every
 /// lockfile `detect_lockfiles` maps for it, and the group's own lockfile.
 fn snapshot_paths_for(path: &Path, lockfile: &Option<PathBuf>) -> Vec<PathBuf> {
@@ -308,13 +278,36 @@ fn finalize(target: FixTarget, prov: Provisional, wrote_status: FixStatus) -> Ap
 /// that were written or already satisfied lose that progress to the
 /// restore and become `RolledBack`; targets that were already terminal
 /// (`Unfixable`/`Failed`) keep their own status and error (rule 6).
-fn finalize_rolled_back(target: FixTarget, prov: Provisional, message: &str) -> AppliedFix {
+///
+/// `RolledBack` promises that every file the snapshot covered is back at its
+/// pre-run bytes. A group with a file that could not be put back is reported
+/// `Failed` instead, with the file named beside the relock error.
+fn finalize_rolled_back(
+    target: FixTarget,
+    prov: Provisional,
+    message: &str,
+    restore_failures: &[RestoreFailure],
+) -> AppliedFix {
     match prov {
-        Provisional::Wrote | Provisional::AlreadySatisfied => AppliedFix {
-            target,
-            status: FixStatus::RolledBack,
-            error: Some(message.to_string()),
-        },
+        Provisional::Wrote | Provisional::AlreadySatisfied if restore_failures.is_empty() => {
+            AppliedFix {
+                target,
+                status: FixStatus::RolledBack,
+                error: Some(message.to_string()),
+            }
+        }
+        Provisional::Wrote | Provisional::AlreadySatisfied => {
+            let mut error = message.to_string();
+            for failure in restore_failures {
+                error.push('\n');
+                error.push_str(&failure.to_string());
+            }
+            AppliedFix {
+                target,
+                status: FixStatus::Failed,
+                error: Some(error),
+            }
+        }
         Provisional::Unfixable(error) => AppliedFix {
             target,
             status: FixStatus::Unfixable,
@@ -606,14 +599,19 @@ fn apply_edit_group(
             }
         }
         Err(message) => {
-            snapshot.restore();
+            let restore_failures = snapshot.restore();
             let message = if has_floor {
                 format!("{message}\n{RELOCK_ROLLBACK_HINT}")
             } else {
                 message
             };
             for (target, prov) in items {
-                outcomes.push(finalize_rolled_back(target, prov, &message));
+                outcomes.push(finalize_rolled_back(
+                    target,
+                    prov,
+                    &message,
+                    &restore_failures,
+                ));
             }
         }
     }
@@ -705,10 +703,15 @@ fn apply_cargo_precise_group(
             outcomes.push(finalize(target, prov, FixStatus::Applied));
         }
     } else {
-        snapshot.restore();
+        let restore_failures = snapshot.restore();
         let combined = failure_messages.join("; ");
         for (target, prov) in items {
-            outcomes.push(finalize_rolled_back(target, prov, &combined));
+            outcomes.push(finalize_rolled_back(
+                target,
+                prov,
+                &combined,
+                &restore_failures,
+            ));
         }
     }
 }
@@ -770,6 +773,41 @@ mod tests {
 
     fn noop_closure() -> impl Fn(&Path, FileType, &[&FixTarget]) -> anyhow::Result<bool> {
         |_, _, _| panic!("apply_manifest_edits should not be called")
+    }
+
+    /// `RolledBack` promises the group is back at its pre-run bytes. A file
+    /// the restore could not put back breaks that promise, so the target is
+    /// `Failed` and the error names the file beside the relock error.
+    #[test]
+    fn a_restore_failure_demotes_rolled_back_to_failed() {
+        let target =
+            uv_constraint_target(PathBuf::from("pyproject.toml"), PathBuf::from("uv.lock"));
+        let failure = RestoreFailure {
+            path: PathBuf::from("uv.lock"),
+            reason: "permission denied".to_string(),
+        };
+
+        let fix = finalize_rolled_back(target, Provisional::Wrote, "uv lock failed", &[failure]);
+
+        assert_eq!(fix.status, FixStatus::Failed);
+        assert_eq!(
+            fix.error.as_deref(),
+            Some("uv lock failed\nuv.lock was not restored: permission denied")
+        );
+    }
+
+    /// The control for the test above: a clean restore is `RolledBack` and
+    /// carries the relock error alone.
+    #[test]
+    fn a_clean_restore_reports_rolled_back() {
+        let target =
+            uv_constraint_target(PathBuf::from("pyproject.toml"), PathBuf::from("uv.lock"));
+
+        let fix =
+            finalize_rolled_back(target, Provisional::AlreadySatisfied, "uv lock failed", &[]);
+
+        assert_eq!(fix.status, FixStatus::RolledBack);
+        assert_eq!(fix.error.as_deref(), Some("uv lock failed"));
     }
 
     #[test]
