@@ -1299,8 +1299,10 @@ fn workflow_defaults_are_reproducible_and_safe() {
 
 #[test]
 fn repository_dependency_jobs_share_the_hardened_workflow() {
+    // The pinned commit must be one the token broker's trust list carries,
+    // or the workflow is rejected at the token exchange.
     assert!(DEPENDENCIES_WORKFLOW.contains(
-        "uses: rvben/upd/.github/workflows/dependency-health.yml@1a8c9cd6e0e5f21251f89b2bd9f9fcbff776030d"
+        "uses: rvben/upd/.github/workflows/dependency-health.yml@ac374e74eb4f6b5cbd39965c65292ae5e2b51411"
     ));
     assert!(DEPENDENCIES_WORKFLOW.contains("langs: rust,actions"));
     assert!(DEPENDENCIES_WORKFLOW.contains("lock: true"));

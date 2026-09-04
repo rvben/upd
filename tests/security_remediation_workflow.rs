@@ -303,8 +303,10 @@ fn remediation_requires_structured_results_and_a_fresh_post_fix_audit() {
 
 #[test]
 fn repository_caller_is_thin_scoped_and_safe_by_default() {
+    // The pinned commit must be one the token broker's trust list carries,
+    // or the workflow is rejected at the token exchange.
     assert!(CALLER.contains(
-        "uses: rvben/upd/.github/workflows/dependency-remediation.yml@1a8c9cd6e0e5f21251f89b2bd9f9fcbff776030d"
+        "uses: rvben/upd/.github/workflows/dependency-remediation.yml@ac374e74eb4f6b5cbd39965c65292ae5e2b51411"
     ));
     assert!(CALLER.contains("langs: rust"));
     assert!(CALLER.contains("allowed-paths: Cargo.toml Cargo.lock"));
