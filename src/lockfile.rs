@@ -97,12 +97,38 @@ impl LockfileType {
     /// it (`cargo update -p …`, `bundle lock --update …`). Ecosystems whose CLI
     /// supports a lockfile-only flag prefer that over a full install. Everything
     /// else falls back to the manifest-wide refresh command.
+    ///
+    /// The command is the one for an installed tool whose version is not
+    /// known; see [`LockfileType::command_for`] for the version-aware form.
     pub fn command(&self, changed: &[String]) -> (&'static str, Vec<String>) {
+        self.command_for(changed, None)
+    }
+
+    /// Like [`LockfileType::command`], with `tool_version` carrying what the
+    /// tool printed for `--version` where the invocation depends on it.
+    ///
+    /// Poetry is the ecosystem where it matters: Poetry 2 removed
+    /// `lock --no-update` and made its behaviour the default, so a bare
+    /// `poetry lock` keeps every locked version the manifest still admits.
+    /// Poetry 1 needs the flag for the same result. Without a readable version
+    /// the flagged form is used, because on Poetry 2 it fails loudly where the
+    /// bare form on Poetry 1 would silently refresh every package.
+    pub fn command_for(
+        &self,
+        changed: &[String],
+        tool_version: Option<&str>,
+    ) -> (&'static str, Vec<String>) {
         match self {
-            LockfileType::PoetryLock => (
-                "poetry",
-                vec!["lock".to_string(), "--no-update".to_string()],
-            ),
+            LockfileType::PoetryLock => {
+                let mut args = vec!["lock".to_string()];
+                let poetry_2_or_later = tool_version
+                    .and_then(poetry_major)
+                    .is_some_and(|major| major >= 2);
+                if !poetry_2_or_later {
+                    args.push("--no-update".to_string());
+                }
+                ("poetry", args)
+            }
             LockfileType::UvLock => ("uv", vec!["lock".to_string()]),
             LockfileType::PackageLockJson | LockfileType::NpmShrinkwrap => (
                 "npm",
@@ -303,18 +329,50 @@ pub fn detect_lockfiles(manifest_path: &Path) -> Vec<LockfileType> {
     lockfiles
 }
 
-/// Returns `true` if `tool` is found on PATH.
-///
-/// Uses a lightweight probe: attempt to spawn `tool --version` and check
-/// whether the OS reports `NotFound`. Any other result (including non-zero
-/// exit from `--version`) means the binary exists.
-pub fn tool_available(tool: &str) -> bool {
+/// The major version in Poetry's `--version` line, which reads
+/// `Poetry (version 2.2.1)` from 1.2 on and `Poetry version 1.1.15` before.
+/// `None` when the line carries no version.
+pub fn poetry_major(version_output: &str) -> Option<u64> {
+    let (_, after) = version_output.split_once("version")?;
+    after
+        .trim_start_matches(|c: char| !c.is_ascii_digit())
+        .chars()
+        .take_while(char::is_ascii_digit)
+        .collect::<String>()
+        .parse()
+        .ok()
+}
+
+/// What spawning `tool --version` found.
+#[derive(Debug)]
+pub enum ToolProbe {
+    /// The OS could not find the binary on PATH.
+    Missing,
+    /// The binary exists; `version` is what it printed for `--version` when
+    /// that succeeded, which not every tool supports.
+    Present { version: Option<String> },
+}
+
+/// Probe for `tool` by spawning `tool --version`. Only `NotFound` counts as
+/// missing: any other result, including a non-zero exit from `--version`
+/// or an unexpected OS error, means the binary exists.
+pub fn probe_tool(tool: &str) -> ToolProbe {
     match Command::new(tool).arg("--version").output() {
-        Ok(_) => true,
-        Err(e) if e.kind() == io::ErrorKind::NotFound => false,
-        // Unexpected OS error - assume the tool exists to avoid a false error.
-        Err(_) => true,
+        Ok(output) => ToolProbe::Present {
+            version: output
+                .status
+                .success()
+                .then(|| String::from_utf8_lossy(&output.stdout).trim().to_string())
+                .filter(|version| !version.is_empty()),
+        },
+        Err(e) if e.kind() == io::ErrorKind::NotFound => ToolProbe::Missing,
+        Err(_) => ToolProbe::Present { version: None },
     }
+}
+
+/// Returns `true` if `tool` is found on PATH.
+pub fn tool_available(tool: &str) -> bool {
+    !matches!(probe_tool(tool), ToolProbe::Missing)
 }
 
 /// Regenerate a single lockfile by running the appropriate package manager.
@@ -333,20 +391,23 @@ pub(crate) fn regenerate_lockfile(
     verbose: bool,
 ) -> RegenOutcome {
     let dir = containing_dir(manifest_path);
+    let (tool, _) = lockfile_type.command(&[]);
+    let version = match probe_tool(tool) {
+        ToolProbe::Missing => {
+            return RegenOutcome::ToolMissing {
+                lockfile: lockfile_type,
+                tool,
+            };
+        }
+        ToolProbe::Present { version } => version,
+    };
     let (cmd, args) = match lockfile_type {
         LockfileType::CargoLock => {
             let specs = cargo_update_specs(manifest_path, changed);
             lockfile_type.command(&specs)
         }
-        _ => lockfile_type.command(changed),
+        _ => lockfile_type.command_for(changed, version.as_deref()),
     };
-
-    if !tool_available(cmd) {
-        return RegenOutcome::ToolMissing {
-            lockfile: lockfile_type,
-            tool: cmd,
-        };
-    }
 
     if verbose {
         println!(
@@ -1131,6 +1192,37 @@ thiserror = "0.9.1"
 "#,
         );
         assert_eq!(specs, vec!["serde", "thiserror"]);
+    }
+
+    #[test]
+    fn poetry_major_reads_both_version_line_shapes() {
+        assert_eq!(poetry_major("Poetry (version 2.2.1)"), Some(2));
+        assert_eq!(poetry_major("Poetry (version 1.8.5)\n"), Some(1));
+        assert_eq!(poetry_major("Poetry version 1.1.15"), Some(1));
+        assert_eq!(poetry_major(""), None);
+        assert_eq!(poetry_major("poetry: command not found"), None);
+        assert_eq!(poetry_major("Poetry (version unknown)"), None);
+    }
+
+    /// Poetry 2 removed `--no-update`, and no later major brings it back.
+    #[test]
+    fn poetry_2_and_later_lock_commands_drop_the_removed_no_update_flag() {
+        for probe in ["Poetry (version 2.2.1)", "Poetry (version 3.0.0)"] {
+            let (cmd, args) = LockfileType::PoetryLock.command_for(&[], Some(probe));
+            assert_eq!(cmd, "poetry");
+            assert_eq!(args, vec!["lock"], "{probe}");
+        }
+    }
+
+    /// Poetry 1 needs `--no-update` to keep the lock minimal, and a version
+    /// upd cannot read gets the same form: on Poetry 2 it fails loudly, where
+    /// the bare `poetry lock` on Poetry 1 would silently refresh every package.
+    #[test]
+    fn poetry_1_and_an_unreadable_version_keep_no_update() {
+        for probe in [Some("Poetry (version 1.8.5)"), Some("garbage"), None] {
+            let (_, args) = LockfileType::PoetryLock.command_for(&[], probe);
+            assert_eq!(args, vec!["lock", "--no-update"], "{probe:?}");
+        }
     }
 
     #[test]

@@ -52,7 +52,7 @@ the manifest-wide refresh command is used. The flag is honored by
 
 | Ecosystem | Lockfile                 | Command                                        |
 |-----------|--------------------------|------------------------------------------------|
-| Python    | `poetry.lock`            | `poetry lock --no-update`                      |
+| Python    | `poetry.lock`            | `poetry lock` (Poetry 2); `poetry lock --no-update` (Poetry 1) |
 | Python    | `uv.lock`                | `uv lock`                                      |
 | Node      | `package-lock.json`      | `npm install --package-lock-only`              |
 | Node      | `yarn.lock`              | `yarn install --mode update-lockfile` (Yarn 2+)|
@@ -63,6 +63,9 @@ the manifest-wide refresh command is used. The flag is honored by
 | Ruby      | `Gemfile.lock`           | `bundle lock --update <changed> …`             |
 | .NET      | `packages.lock.json`     | `dotnet restore` (no targeted form)            |
 | Terraform | `.terraform.lock.hcl`    | `terraform providers lock` (no targeted form)  |
+
+Poetry 2 removed `lock --no-update` and made its behaviour the default,
+so `upd` reads `poetry --version` and passes the flag only to Poetry 1.
 
 Manifests whose `upd` pass produced zero changes have their lockfile
 refresh skipped entirely. A directory where only config pins were
