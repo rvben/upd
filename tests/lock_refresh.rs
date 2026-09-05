@@ -486,6 +486,60 @@ async fn only_the_group_whose_refresh_failed_is_rolled_back() {
     assert_eq!(json["summary"]["errors"], 1, "{}", json["summary"]);
 }
 
+/// `upd . project` names one directory through two arguments. It is one
+/// manifest with one lockfile, so it is updated once, relocked once and
+/// reported once; a second relock of the same directory would otherwise
+/// undo the first one's success when it failed.
+#[tokio::test]
+async fn overlapping_path_arguments_refresh_a_directory_once() {
+    let server = wiremock::MockServer::start().await;
+    mount_pypi_latest(&server, "requests", "2.32.0").await;
+    let tmp = tempfile::tempdir().unwrap();
+    let count_file = tmp.path().join("uv-lock-calls");
+    let relocked = uv_lock_at("requests", "2.32.0");
+    let bin = tmp.path().join("bin");
+    fs::create_dir(&bin).unwrap();
+    write_fake_tool(&bin, "uv", &uv_failing_on_call(2, &count_file, &relocked));
+    let root = tmp.path().join("root");
+    let project = root.join("project");
+    fs::create_dir_all(&project).unwrap();
+    fs::write(project.join("pyproject.toml"), PYPROJECT).unwrap();
+    fs::write(project.join("uv.lock"), uv_lock_at("requests", "2.31.0")).unwrap();
+
+    let (stdout, stderr, code) = run_with_env(
+        &[
+            "--apply",
+            "--lock",
+            "--no-cache",
+            "--format",
+            "json",
+            ".",
+            "project",
+        ],
+        &root,
+        &[("UV_INDEX_URL", &server.uri()), ("PATH", &path_with(&bin))],
+    );
+
+    assert_eq!(
+        fs::read_to_string(&count_file).unwrap_or_default().trim(),
+        "1",
+        "one directory must be relocked once\nstderr: {stderr}"
+    );
+    assert_eq!(code, 0, "stdout: {stdout}\nstderr: {stderr}");
+    assert_eq!(
+        fs::read_to_string(project.join("pyproject.toml")).unwrap(),
+        PYPROJECT_UPDATED
+    );
+    assert_eq!(
+        fs::read_to_string(project.join("uv.lock")).unwrap(),
+        relocked
+    );
+    let json: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(json["files"].as_array().unwrap().len(), 1, "{json}");
+    assert_eq!(json["summary"]["files_scanned"], 1, "{}", json["summary"]);
+    assert_eq!(json["summary"]["updates_total"], 1, "{}", json["summary"]);
+}
+
 /// A `uv` whose `lock` counts its calls in `count_file` and fails on call
 /// number `failing_call`; every other call leaves `lock` behind and exits 0.
 fn uv_failing_on_call(failing_call: u32, count_file: &Path, lock: &str) -> String {

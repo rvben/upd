@@ -1705,6 +1705,28 @@ struct WalkResult {
     skipped_markers: Vec<PathBuf>,
 }
 
+/// The identity discovery deduplicates on: the canonical path, so a file
+/// reached through two overlapping arguments (`upd . project`) or two
+/// spellings of one path counts once. A path that cannot be canonicalized
+/// stands for itself.
+fn file_identity(path: &Path) -> PathBuf {
+    std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+}
+
+/// Discovered paths in first-seen order, one per physical file.
+#[derive(Default)]
+struct UniqueFiles {
+    seen: std::collections::HashSet<PathBuf>,
+}
+
+impl UniqueFiles {
+    /// Whether `path` names a file not admitted before. The spelling that
+    /// reached the file first is the one discovery reports.
+    fn admit(&mut self, path: &Path) -> bool {
+        self.seen.insert(file_identity(path))
+    }
+}
+
 /// Verbose discovery only: recognize the same annotation grammar the updater
 /// uses, without turning content sniffing into an implicit discovery rule.
 /// Keep the diagnostic bounded because this runs over otherwise-unknown files.
@@ -1744,11 +1766,13 @@ pub fn discover_files_with(
     );
 
     // Explicit file-path arguments bypass the exclude list, just as they bypass
-    // gitignore (the directory walker is never consulted for them).
-    let explicit_files: std::collections::HashSet<&Path> = paths
+    // gitignore (the directory walker is never consulted for them). The file
+    // is matched by identity, since a walk of an enclosing directory argument
+    // may have reached it first under another spelling.
+    let explicit_files: std::collections::HashSet<PathBuf> = paths
         .iter()
         .filter(|p| p.is_file())
-        .map(|p| p.as_path())
+        .map(|p| file_identity(p))
         .collect();
 
     let exclude_set = build_glob_set(options.exclude, "exclude");
@@ -1756,7 +1780,7 @@ pub fn discover_files_with(
     let mut kept: Vec<(PathBuf, FileType)> = Vec::with_capacity(after_gitignore.files.len());
     let mut excluded: Vec<PathBuf> = Vec::new();
     for (path, file_type) in after_gitignore.files {
-        let dropped = !explicit_files.contains(path.as_path())
+        let dropped = !explicit_files.contains(&file_identity(&path))
             && glob_matches(exclude_set.as_ref(), &path, paths);
         if dropped {
             excluded.push(path);
@@ -1833,11 +1857,16 @@ fn walk_dependency_files(
     sniff_skipped_markers: bool,
 ) -> WalkResult {
     let mut result = WalkResult::default();
+    // Two arguments may reach one file (`upd . project`, or a directory and
+    // a file inside it). It is one file with one lockfile, so it is
+    // scanned, updated and relocked once.
+    let mut unique = UniqueFiles::default();
 
     for path in paths {
         if path.is_file() {
             if let Some(file_type) = FileType::detect_with_annotated(path, true)
                 && file_type_selected(file_type, langs)
+                && unique.admit(path)
             {
                 result.files.push((path.clone(), file_type));
             }
@@ -1892,10 +1921,13 @@ fn walk_dependency_files(
             if let Some(file_type) = file_type
                 && file_type_selected(file_type, langs)
             {
-                result.files.push((entry_path.to_path_buf(), file_type));
+                if unique.admit(entry_path) {
+                    result.files.push((entry_path.to_path_buf(), file_type));
+                }
             } else if detected.is_none()
                 && sniff_skipped_markers
                 && contains_annotation_marker(entry_path)
+                && unique.admit(entry_path)
             {
                 result.skipped_markers.push(entry_path.to_path_buf());
             }
@@ -2703,6 +2735,58 @@ mod tests {
         let files = discover_files(&[direct_file.clone(), subdir.clone()], &[]);
 
         assert_eq!(files.len(), 2);
+    }
+
+    /// `upd . project` names one physical manifest through two arguments.
+    /// It is one file with one lockfile, so it is scanned once, under the
+    /// spelling the first argument reached it by.
+    #[test]
+    fn overlapping_path_arguments_discover_a_file_once() {
+        let temp = tempdir().unwrap();
+        let project = temp.path().join("project");
+        fs::create_dir(&project).unwrap();
+        fs::write(project.join("pyproject.toml"), "[project]\nname = \"t\"").unwrap();
+
+        let files = discover_files(&[temp.path().to_path_buf(), project.clone()], &[]);
+
+        assert_eq!(
+            files,
+            vec![(project.join("pyproject.toml"), FileType::PyProject)]
+        );
+    }
+
+    /// The same file reached by a walk and named explicitly is still an
+    /// explicit file: it bypasses `exclude` even when the spelling the walk
+    /// produced differs from the one on the command line.
+    #[test]
+    fn a_file_named_explicitly_beside_its_directory_still_bypasses_exclude() {
+        let temp = tempdir().unwrap();
+        let project = temp.path().join("project");
+        fs::create_dir(&project).unwrap();
+        let manifest = project.join("pyproject.toml");
+        fs::write(&manifest, "[project]\nname = \"t\"").unwrap();
+        let exclude = vec!["**/pyproject.toml".to_string()];
+
+        let files = discover_files_with(
+            &[temp.path().join("./project"), manifest.clone()],
+            &[],
+            DiscoverOptions {
+                exclude: &exclude,
+                ..DiscoverOptions::default()
+            },
+        );
+
+        assert_eq!(
+            files.len(),
+            1,
+            "one physical file must yield one entry: {files:?}"
+        );
+        assert_eq!(files[0].1, FileType::PyProject);
+        assert_eq!(
+            fs::canonicalize(&files[0].0).unwrap(),
+            fs::canonicalize(&manifest).unwrap(),
+            "{files:?}"
+        );
     }
 
     #[test]
