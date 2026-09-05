@@ -260,8 +260,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **cooldown**: ignore already-current versions ([140baff](https://github.com/rvben/upd/commit/140baff6dc3c7a6f768743671c8d261c8d1097be))
 
-## Unreleased
-
 ## [0.5.2](https://github.com/rvben/upd/compare/v0.5.1...v0.5.2) - 2026-08-15
 
 ### Fixed
