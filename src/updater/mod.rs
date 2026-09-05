@@ -1713,17 +1713,40 @@ fn file_identity(path: &Path) -> PathBuf {
     std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
 }
 
-/// Discovered paths in first-seen order, one per physical file.
+/// Discovered files in first-seen order, one per physical file.
 #[derive(Default)]
 struct UniqueFiles {
-    seen: std::collections::HashSet<PathBuf>,
+    files: Vec<(PathBuf, FileType)>,
+    /// The identity of every listed file and its position in `files`.
+    listed: std::collections::HashMap<PathBuf, usize>,
 }
 
 impl UniqueFiles {
-    /// Whether `path` names a file not admitted before. The spelling that
-    /// reached the file first is the one discovery reports.
-    fn admit(&mut self, path: &Path) -> bool {
-        self.seen.insert(file_identity(path))
+    /// Lists `path` as a file of `file_type` unless the file it names is
+    /// listed already. The spelling that reached a file first is the one
+    /// discovery reports, except that a file's own name replaces a symlink
+    /// to it: the type is read from the name and the lockfile is looked for
+    /// in the directory, and a symlink may match the file in neither.
+    fn admit(&mut self, path: &Path, file_type: FileType) {
+        use std::collections::hash_map::Entry;
+        let files = &mut self.files;
+        match self.listed.entry(file_identity(path)) {
+            Entry::Vacant(slot) => {
+                slot.insert(files.len());
+                files.push((path.to_path_buf(), file_type));
+            }
+            Entry::Occupied(slot) => {
+                let at = *slot.get();
+                if files[at].0.is_symlink() && !path.is_symlink() {
+                    files[at] = (path.to_path_buf(), file_type);
+                }
+            }
+        }
+    }
+
+    /// Whether the file `path` names is listed.
+    fn contains(&self, path: &Path) -> bool {
+        self.listed.contains_key(&file_identity(path))
     }
 }
 
@@ -1861,14 +1884,14 @@ fn walk_dependency_files(
     // a file inside it). It is one file with one lockfile, so it is
     // scanned, updated and relocked once.
     let mut unique = UniqueFiles::default();
+    let mut markers = std::collections::HashSet::new();
 
     for path in paths {
         if path.is_file() {
             if let Some(file_type) = FileType::detect_with_annotated(path, true)
                 && file_type_selected(file_type, langs)
-                && unique.admit(path)
             {
-                result.files.push((path.clone(), file_type));
+                unique.admit(path, file_type);
             }
             continue;
         }
@@ -1921,19 +1944,21 @@ fn walk_dependency_files(
             if let Some(file_type) = file_type
                 && file_type_selected(file_type, langs)
             {
-                if unique.admit(entry_path) {
-                    result.files.push((entry_path.to_path_buf(), file_type));
-                }
+                unique.admit(entry_path, file_type);
             } else if detected.is_none()
                 && sniff_skipped_markers
                 && contains_annotation_marker(entry_path)
-                && unique.admit(entry_path)
+                && markers.insert(file_identity(entry_path))
             {
                 result.skipped_markers.push(entry_path.to_path_buf());
             }
         }
     }
 
+    // A file listed under one spelling is scanned, so it was not skipped
+    // under another.
+    result.skipped_markers.retain(|path| !unique.contains(path));
+    result.files = unique.files;
     result
 }
 
@@ -2753,6 +2778,88 @@ mod tests {
             files,
             vec![(project.join("pyproject.toml"), FileType::PyProject)]
         );
+    }
+
+    /// A symlink named `alias.toml` says nothing about the file it points
+    /// at and has no lockfile beside it. Reached under its own name as well,
+    /// the file is listed under its own name whichever spelling came first.
+    #[cfg(unix)]
+    #[test]
+    fn a_file_reached_through_a_symlink_is_listed_under_its_own_name() {
+        let temp = tempdir().unwrap();
+        let project = temp.path().join("project");
+        fs::create_dir(&project).unwrap();
+        let manifest = project.join("pyproject.toml");
+        fs::write(&manifest, "[project]\nname = \"t\"").unwrap();
+        let link = temp.path().join("alias.toml");
+        std::os::unix::fs::symlink(&manifest, &link).unwrap();
+        let expected = vec![(manifest.clone(), FileType::PyProject)];
+
+        assert_eq!(
+            discover_files(&[link.clone(), project.clone()], &[]),
+            expected,
+            "symlink first"
+        );
+        assert_eq!(
+            discover_files(&[project, link], &[]),
+            expected,
+            "symlink second"
+        );
+    }
+
+    /// Two spellings of one file's own name (`project/../project` and
+    /// `project`) are equally good, so the first keeps its place.
+    #[test]
+    fn the_first_of_two_spellings_of_one_file_is_listed() {
+        let temp = tempdir().unwrap();
+        let project = temp.path().join("project");
+        fs::create_dir(&project).unwrap();
+        fs::write(project.join("pyproject.toml"), "[project]\nname = \"t\"").unwrap();
+        let roundabout = temp.path().join("project/../project");
+
+        assert_eq!(
+            discover_files(&[roundabout.clone(), project], &[]),
+            vec![(roundabout.join("pyproject.toml"), FileType::PyProject)]
+        );
+    }
+
+    /// Two symlinks to one file are two spellings of it and neither is the
+    /// file's own name, so the first keeps its place.
+    #[cfg(unix)]
+    #[test]
+    fn the_first_of_two_symlinks_to_one_file_is_listed() {
+        let temp = tempdir().unwrap();
+        let manifest = temp.path().join("target.toml");
+        fs::write(&manifest, "").unwrap();
+        let first = temp.path().join("a.toml");
+        let second = temp.path().join("b.toml");
+        std::os::unix::fs::symlink(&manifest, &first).unwrap();
+        std::os::unix::fs::symlink(&manifest, &second).unwrap();
+
+        assert_eq!(
+            discover_files(&[first.clone(), second], &[]),
+            vec![(first, FileType::Annotated)]
+        );
+    }
+
+    /// A file the walk noted for an `upd:` marker under a symlink's name is
+    /// not "skipped" when the walk then lists it under its own name.
+    #[cfg(unix)]
+    #[test]
+    fn a_listed_file_is_not_also_reported_as_a_skipped_marker() {
+        let temp = tempdir().unwrap();
+        let project = temp.path().join("project");
+        let links = temp.path().join("links");
+        fs::create_dir(&project).unwrap();
+        fs::create_dir(&links).unwrap();
+        let manifest = project.join("requirements.txt");
+        fs::write(&manifest, "flask==2.0.0  # upd: pypi flask\n").unwrap();
+        std::os::unix::fs::symlink(&manifest, links.join("alias.txt")).unwrap();
+
+        let result = walk_dependency_files(&[links, project], &[], false, None, true);
+
+        assert_eq!(result.files, vec![(manifest, FileType::Requirements)]);
+        assert_eq!(result.skipped_markers, Vec::<PathBuf>::new());
     }
 
     /// The same file reached by a walk and named explicitly is still an
