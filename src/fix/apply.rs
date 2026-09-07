@@ -329,6 +329,15 @@ fn write_floor_target(target: &FixTarget, dry_run: bool) -> anyhow::Result<Floor
         FixKind::UvConstraint => {
             write_uv_constraint_floor(&target.path, &target.package, &target.to_version, dry_run)
         }
+        FixKind::NpmOverride if target.npm_form == Some(NpmOverrideForm::CompatibleRange) => {
+            super::npm::write_compatible_npm_override_floor(
+                &target.path,
+                &target.package,
+                &target.vulnerable_version,
+                &target.to_version,
+                dry_run,
+            )
+        }
         FixKind::NpmOverride => write_npm_override_floor(
             &target.path,
             &target.package,
@@ -999,7 +1008,7 @@ mod tests {
             package: "examplepkg".to_string(),
             dependency_key: None,
             from_version: "1.2.0".to_string(),
-            to_version: "2.5.0".to_string(),
+            to_version: "1.5.0".to_string(),
             vulnerable_version: "1.2.0".to_string(),
             kind: FixKind::NpmOverride,
             path: package_json,
@@ -1020,7 +1029,7 @@ mod tests {
         assert_eq!(outcomes.len(), 1);
         assert_eq!(outcomes[0].status, FixStatus::Unfixable);
         let error = outcomes[0].error.as_ref().expect("error present");
-        assert!(error.contains("object"), "{error}");
+        assert!(error.contains("existing override"), "{error}");
     }
 
     #[test]

@@ -93,11 +93,128 @@ fn npm_spec_min(spec: &str) -> Option<semver::Version> {
     semver::Version::parse(stripped).ok()
 }
 
+/// The caret-compatible branch of an installed version. Zero-major releases
+/// use their minor (or patch for 0.0.x) as the compatibility boundary.
+pub fn compatibility_range(version: &str) -> Option<String> {
+    let v = semver::Version::parse(version).ok()?;
+    if !v.pre.is_empty() {
+        return None;
+    }
+    Some(if v.major > 0 {
+        format!("^{}.0.0", v.major)
+    } else if v.minor > 0 {
+        format!("^0.{}.0", v.minor)
+    } else {
+        format!("^0.0.{}", v.patch)
+    })
+}
+
+/// Scope a transitive override to its installed compatibility branch, so a
+/// fix for 2.x cannot replace a sibling 5.x (or force 2.x callers onto 5.x).
+pub fn write_compatible_npm_override_floor(
+    package_json: &Path,
+    package: &str,
+    installed: &str,
+    floor: &str,
+    dry_run: bool,
+) -> Result<FloorWriteOutcome> {
+    let Some(range) = compatibility_range(installed) else {
+        return Ok(FloorWriteOutcome::Unfixable(format!(
+            "cannot determine a stable compatibility range for {package}@{installed}; update its parent dependency manually"
+        )));
+    };
+    if crate::npm_range::admits(&range, floor) != Some(true) {
+        return Ok(FloorWriteOutcome::Unfixable(format!(
+            "fixing {package}@{installed} requires {floor}, outside {range}; update its parent dependency instead of forcing an incompatible override"
+        )));
+    }
+    let content = read_file_safe(package_json)?;
+    let doc: serde_json::Value = serde_json::from_str(&content)?;
+    let selector = format!("{package}@{range}");
+    if let Some(overrides) = doc.get("overrides").and_then(|o| o.as_object()) {
+        // Existing broad, parent-scoped or overlapping selectors need a
+        // deliberate merge. Do not silently shadow their user-owned policy.
+        for (key, value) in overrides {
+            if key == &selector {
+                continue;
+            }
+            if key == package
+                || key
+                    .strip_prefix(&format!("{package}@"))
+                    .is_some_and(|spec| {
+                        // Only another canonical, disjoint compatibility
+                        // branch is known not to overlap the new selector.
+                        spec.strip_prefix('^')
+                            .and_then(compatibility_range)
+                            .is_none_or(|branch| branch != spec || branch == range)
+                    })
+                || contains_override(value, package)
+            {
+                return Ok(FloorWriteOutcome::Unfixable(format!(
+                    "existing override {key} may affect {package}; reconcile it with {selector} manually"
+                )));
+            }
+        }
+    }
+    let mut desired = format!("^{floor}");
+    if let Some(existing) = doc.get("overrides").and_then(|o| o.get(&selector)) {
+        let safe = existing.as_str().map(str::trim).is_some_and(|spec| {
+            !spec.starts_with(">=")
+                && npm_spec_min(spec).is_some_and(|min| {
+                    crate::npm_range::admits(&range, &min.to_string()) == Some(true)
+                })
+        });
+        if !safe {
+            return Ok(FloorWriteOutcome::Unfixable(format!(
+                "existing override {selector} has an unbounded, incompatible or complex value; reconcile it manually"
+            )));
+        }
+        // Retain an existing exact pin or tilde's narrower policy.
+        if let Some(spec) = existing.as_str().map(str::trim) {
+            desired = if spec.starts_with('~') {
+                format!("~{floor}")
+            } else if spec.starts_with('^') {
+                format!("^{floor}")
+            } else {
+                floor.to_string()
+            };
+        }
+    }
+    write_override(package_json, &selector, &desired, floor, dry_run)
+}
+
+fn contains_override(value: &serde_json::Value, package: &str) -> bool {
+    value.as_object().is_some_and(|entries| {
+        entries.iter().any(|(key, value)| {
+            key == package
+                || key.starts_with(&format!("{package}@"))
+                || contains_override(value, package)
+        })
+    })
+}
+
 pub fn write_npm_override_floor(
     package_json: &Path,
     package: &str,
     floor: &str,
     form: NpmOverrideForm,
+    dry_run: bool,
+) -> Result<FloorWriteOutcome> {
+    let desired = match form {
+        NpmOverrideForm::Range => format!(">={floor}"),
+        NpmOverrideForm::CompatibleRange => {
+            bail!("compatible npm overrides require the installed version")
+        }
+        NpmOverrideForm::DollarName => format!("${package}"),
+    };
+    write_override(package_json, package, &desired, floor, dry_run)
+}
+
+fn write_override(
+    package_json: &Path,
+    package: &str,
+    desired: &str,
+    floor: &str,
     dry_run: bool,
 ) -> Result<FloorWriteOutcome> {
     let content = read_file_safe(package_json)?;
@@ -113,11 +230,6 @@ pub fn write_npm_override_floor(
             crate::path_display::display_path(package_json)
         );
     }
-    let desired = match form {
-        NpmOverrideForm::Range => format!(">={floor}"),
-        NpmOverrideForm::DollarName => format!("${package}"),
-    };
-
     // A malformed top-level overrides (string/array) must be refused, not
     // shadowed by a duplicate key: top_level_object_span would return None
     // for it and the create path would write a second "overrides".
@@ -133,7 +245,7 @@ pub fn write_npm_override_floor(
     let replace_from: Option<String> = match existing {
         None => None,
         Some(serde_json::Value::String(current)) => {
-            if *current == desired {
+            if current == desired {
                 return Ok(FloorWriteOutcome::AlreadySatisfied);
             }
             match npm_spec_min(current) {
@@ -266,6 +378,107 @@ mod tests {
     }
 
     const BARE: &str = "{\n  \"name\": \"t\",\n  \"version\": \"1.0.0\",\n  \"dependencies\": {\n    \"other\": \"^1.0.0\"\n  }\n}\n";
+
+    #[test]
+    fn existing_scoped_override_retains_its_range_operator() {
+        for (old, expected) in [
+            ("2.0.2", "2.1.4"),
+            ("~2.0.2", "~2.1.4"),
+            ("^2.0.2", "^2.1.4"),
+        ] {
+            let (_d, path) = write_pj(&format!(r#"{{"overrides": {{"pkg@^2.0.0": "{old}"}}}}"#));
+            assert_eq!(
+                write_compatible_npm_override_floor(&path, "pkg", "2.0.2", "2.1.4", false).unwrap(),
+                FloorWriteOutcome::Written
+            );
+            let doc: serde_json::Value =
+                serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+            assert_eq!(doc["overrides"]["pkg@^2.0.0"], expected);
+        }
+    }
+
+    #[test]
+    fn compatible_overrides_preserve_parallel_major_branches_and_are_idempotent() {
+        let (_d, path) = write_pj(BARE);
+        let before = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(
+            write_compatible_npm_override_floor(&path, "brace-expansion", "2.0.2", "2.1.4", true)
+                .unwrap(),
+            FloorWriteOutcome::Written
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
+        for (old, fixed) in [("2.0.2", "2.1.4"), ("5.0.7", "5.0.9")] {
+            assert_eq!(
+                write_compatible_npm_override_floor(&path, "brace-expansion", old, fixed, false)
+                    .unwrap(),
+                FloorWriteOutcome::Written
+            );
+        }
+        let doc: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(doc["overrides"]["brace-expansion@^2.0.0"], "^2.1.4");
+        assert_eq!(doc["overrides"]["brace-expansion@^5.0.0"], "^5.0.9");
+        assert!(doc["overrides"].get("brace-expansion").is_none());
+        let before = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(
+            write_compatible_npm_override_floor(&path, "brace-expansion", "2.0.2", "2.1.4", false)
+                .unwrap(),
+            FloorWriteOutcome::AlreadySatisfied
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
+    }
+
+    #[test]
+    fn incompatible_transitive_fixes_never_write() {
+        for (old, fixed) in [
+            ("2.0.2", "5.0.9"),
+            ("0.2.1", "0.3.0"),
+            ("0.0.1", "0.0.2"),
+            ("1.0.0-beta.1", "1.0.0"),
+        ] {
+            let (_d, path) = write_pj(BARE);
+            for dry_run in [true, false] {
+                assert!(matches!(
+                    write_compatible_npm_override_floor(&path, "pkg", old, fixed, dry_run).unwrap(),
+                    FloorWriteOutcome::Unfixable(_)
+                ));
+                assert_eq!(std::fs::read_to_string(&path).unwrap(), BARE);
+            }
+        }
+    }
+
+    #[test]
+    fn scoped_packages_and_zero_major_branches() {
+        let (_d, path) = write_pj(BARE);
+        write_compatible_npm_override_floor(&path, "@scope/pkg", "0.2.1", "0.2.3", false).unwrap();
+        let doc: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(doc["overrides"]["@scope/pkg@^0.2.0"], "^0.2.3");
+    }
+
+    #[test]
+    fn existing_override_policies_are_not_silently_shadowed() {
+        for overrides in [
+            r#"{"pkg": "^2.0.0"}"#,
+            r#"{"parent": {"pkg": "^2.0.0"}}"#,
+            r#"{"pkg@>=1": "^2.0.0"}"#,
+            r#"{"pkg@>=2.2.0 <2.3.0": "2.2.5"}"#,
+            r#"{"pkg@^2.0.0": ">=2.1.4"}"#,
+            r#"{"pkg@^2.0.0": " >=2.1.4 "}"#,
+            r#"{"pkg@^2.0.0": "^5.0.0"}"#,
+        ] {
+            let content = format!(r#"{{"overrides": {overrides}}}"#);
+            let (_d, path) = write_pj(&content);
+            for dry_run in [true, false] {
+                assert!(matches!(
+                    write_compatible_npm_override_floor(&path, "pkg", "2.0.2", "2.1.4", dry_run)
+                        .unwrap(),
+                    FloorWriteOutcome::Unfixable(_)
+                ));
+                assert_eq!(std::fs::read_to_string(&path).unwrap(), content);
+            }
+        }
+    }
 
     #[test]
     fn creates_overrides_object_when_absent() {

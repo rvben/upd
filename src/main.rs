@@ -617,8 +617,8 @@ fn floor_config_lookup_path(lockfile: &Path, kind: lockscan::discover::LockKind)
 
 /// Grouping key for routed floor targets, mirroring the merge
 /// `fix::route_fix_targets` applies to uv/npm floors: `(method, manifest,
-/// normalized package)`. One `overrides` or `constraint-dependencies` entry
-/// lifts every locked copy of the package, so the copies describe one floor. A
+/// normalized package)`. npm range overrides also retain their compatibility
+/// branch. A uv constraint or npm $-reference covers every copy. A
 /// `cargo-precise` floor lifts a single locked copy, so its locked version
 /// joins the key and the copies stay apart, exactly as routing keeps them.
 type FloorMergeKey = (&'static str, PathBuf, String, Option<String>);
@@ -629,7 +629,18 @@ fn floor_merge_key(target: &FixTarget) -> FloorMergeKey {
     } else {
         target.package.to_lowercase()
     };
-    let copy = (target.kind == FixKind::CargoPrecise).then(|| target.from_version.clone());
+    let copy = if target.kind == FixKind::CargoPrecise {
+        Some(target.from_version.clone())
+    } else if target.kind == FixKind::NpmOverride
+        && target.npm_form == Some(NpmOverrideForm::CompatibleRange)
+    {
+        Some(
+            upd::fix::npm::compatibility_range(&target.vulnerable_version)
+                .unwrap_or_else(|| target.vulnerable_version.clone()),
+        )
+    } else {
+        None
+    };
     (target.kind.method(), target.path.clone(), normalized, copy)
 }
 
@@ -2350,7 +2361,7 @@ async fn run_update(cli: &Cli) -> Result<()> {
                 errors: Vec::new(),
                 warnings: Vec::new(),
             };
-            let mut routing = route_fix_targets(
+            let mut routing = upd::fix::route_update_targets(
                 &synthetic_audit,
                 prov.as_ref().expect("prov built for a non-empty floor set"),
                 &manifest_packages,
@@ -2424,7 +2435,7 @@ async fn run_update(cli: &Cli) -> Result<()> {
                 errors: Vec::new(),
                 warnings: Vec::new(),
             };
-            let routing = route_fix_targets(
+            let routing = upd::fix::route_update_targets(
                 &capped_audit,
                 prov.as_ref()
                     .expect("prov built for a non-empty capped set"),
@@ -3998,7 +4009,16 @@ async fn run_audit(cli: &Cli) -> Result<()> {
     };
 
     // Convert to audit packages (deduplicate by name+version+ecosystem)
-    let audit_packages = build_audit_packages(&packages, &lock_scan.packages);
+    let package_filter = PackageFilter::new(cli.packages.clone()).map_err(anyhow::Error::msg)?;
+    let mut audit_packages = build_audit_packages(&packages, &lock_scan.packages);
+    audit_packages.retain(|package| {
+        package_filter.matches(&package.name)
+            || package_filter.patterns().iter().any(|pattern| {
+                normalized_package_name(pattern, package.ecosystem)
+                    == normalized_package_name(&package.name, package.ecosystem)
+            })
+    });
+    coverage_warnings.extend(unmatched_package_pattern_warnings(&package_filter));
 
     if audit_packages.is_empty() {
         let empty_result = AuditResult {

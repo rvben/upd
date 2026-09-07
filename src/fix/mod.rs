@@ -57,7 +57,10 @@ impl FixKind {
 /// spec) when it is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NpmOverrideForm {
+    /// An explicit update may cross compatibility branches.
     Range,
+    /// An audit repair stays on the installed compatibility branch.
+    CompatibleRange,
     DollarName,
 }
 
@@ -111,6 +114,7 @@ pub struct FixRouting {
 /// groups combine into the final [`FixRouting::targets`].
 #[derive(Default)]
 struct Sink {
+    preserve_npm_compatibility: bool,
     manifest_edits: Vec<FixTarget>,
     npm_companions: Vec<FixTarget>,
     floor_targets: Vec<FixTarget>,
@@ -479,10 +483,53 @@ fn route_npm_lock_only(
     let host = dir.join("package.json");
     let norm = normalized_name(&pkg.name, pkg.ecosystem);
 
+    let range = npm::compatibility_range(&pkg.version);
+    if sink.preserve_npm_compatibility
+        && range
+            .as_ref()
+            .is_none_or(|range| crate::npm_range::admits(range, to_version) != Some(true))
+    {
+        sink.unfixable.push(UnfixableTarget {
+            package: pkg.name.clone(), dependency_key: None,
+            from_version: pkg.version.clone(), to_version: Some(to_version.to_string()),
+            method: Some("npm-override"), path: Some(host),
+            reason: format!("fixing {}@{} requires {to_version}, outside its compatibility range; update its parent dependency instead of forcing an incompatible override", pkg.name, pkg.version),
+            no_fixed_version: false,
+        });
+        return;
+    }
+
     let matching_direct = prov.npm_direct.get(&host).and_then(|deps| {
         deps.iter()
             .find(|d| normalized_name(&d.package, pkg.ecosystem) == norm)
     });
+
+    // A $name override applies to every copy. It cannot safely unify
+    // different compatibility branches just because one is also direct.
+    if sink.preserve_npm_compatibility
+        && matching_direct.is_some()
+        && prov
+            .map
+            .iter()
+            .any(|((name, version, ecosystem), entries)| {
+                name == &norm
+                    && *ecosystem == "npm"
+                    && npm::compatibility_range(version) != range
+                    && entries.iter().any(|entry| match entry {
+                        Provenance::Manifest { lockfile: path, .. }
+                        | Provenance::LockOnly { lockfile: path, .. } => path == lockfile,
+                    })
+            })
+    {
+        sink.unfixable.push(UnfixableTarget {
+            package: pkg.name.clone(), dependency_key: None,
+            from_version: pkg.version.clone(), to_version: Some(to_version.to_string()),
+            method: Some("npm-override"), path: Some(host),
+            reason: format!("{} has direct and transitive copies on incompatible branches; update its parent dependencies instead of applying a global $-reference override", pkg.name),
+            no_fixed_version: false,
+        });
+        return;
+    }
 
     match matching_direct {
         None => {
@@ -497,7 +544,11 @@ fn route_npm_lock_only(
                 file_type: Some(FileType::PackageJson),
                 lockfile: Some(lockfile.to_path_buf()),
                 line_number: None,
-                npm_form: Some(NpmOverrideForm::Range),
+                npm_form: Some(if sink.preserve_npm_compatibility {
+                    NpmOverrideForm::CompatibleRange
+                } else {
+                    NpmOverrideForm::Range
+                }),
             });
         }
         Some(d) if d.spec.starts_with("npm:") => {
@@ -647,10 +698,23 @@ fn floor_group_key(target: &FixTarget) -> (&'static str, PathBuf, String) {
     } else {
         target.package.to_lowercase()
     };
+    let norm = if target.kind == FixKind::NpmOverride
+        && target.npm_form == Some(NpmOverrideForm::CompatibleRange)
+    {
+        format!(
+            "{}@{}",
+            norm,
+            npm::compatibility_range(&target.vulnerable_version)
+                .unwrap_or_else(|| target.vulnerable_version.clone())
+        )
+    } else {
+        norm
+    };
     (target.kind.method(), target.path.clone(), norm)
 }
 
-/// uv/npm floor targets merge by `(kind, path, normalized package)`: keep
+/// Floor targets merge by kind, path and normalized package; npm range
+/// overrides also retain the installed compatibility branch. Keep
 /// the max `to_version` (the floor must clear every vulnerable version) and
 /// the max `from_version`/`vulnerable_version` (the highest vulnerable
 /// locked version among the merged group).
@@ -701,7 +765,29 @@ pub fn route_fix_targets(
     prov: &ProvenanceIndex,
     packages: &HashMap<(String, Lang), Vec<PackageOccurrence>>,
 ) -> FixRouting {
-    let mut sink = Sink::default();
+    route_targets(audit, prov, packages, true)
+}
+
+/// Route explicitly requested version updates. Unlike automatic audit repairs,
+/// these retain the user's chosen bump policy, including major upgrades.
+pub fn route_update_targets(
+    audit: &AuditResult,
+    prov: &ProvenanceIndex,
+    packages: &HashMap<(String, Lang), Vec<PackageOccurrence>>,
+) -> FixRouting {
+    route_targets(audit, prov, packages, false)
+}
+
+fn route_targets(
+    audit: &AuditResult,
+    prov: &ProvenanceIndex,
+    packages: &HashMap<(String, Lang), Vec<PackageOccurrence>>,
+    preserve_npm_compatibility: bool,
+) -> FixRouting {
+    let mut sink = Sink {
+        preserve_npm_compatibility,
+        ..Sink::default()
+    };
 
     for pkg_result in &audit.vulnerable {
         let pkg = &pkg_result.package;
@@ -968,6 +1054,107 @@ mod tests {
     }
 
     #[test]
+    fn npm_dollar_override_cannot_replace_a_healthy_sibling_branch() {
+        let audit = audit_of(vec![vulnerable(
+            pkg("pkg", "2.0.2", Ecosystem::Npm),
+            vec![vuln("GHSA-1", Some("2.1.4"))],
+        )]);
+        let prov = prov_index(
+            vec![
+                (
+                    ("pkg", "2.0.2", "npm"),
+                    vec![lock_only_prov("proj/package-lock.json", LockKind::Npm)],
+                ),
+                (
+                    ("pkg", "5.0.9", "npm"),
+                    vec![manifest_prov(
+                        vec![owner(
+                            "proj/package.json",
+                            FileType::PackageJson,
+                            "pkg",
+                            false,
+                        )],
+                        "proj/package-lock.json",
+                    )],
+                ),
+            ],
+            vec![("proj/package.json", vec![direct("pkg", "pkg", "^5.0.9")])],
+        );
+        let routing = route_fix_targets(&audit, &prov, &HashMap::new());
+        assert!(routing.targets.is_empty());
+        assert_eq!(routing.unfixable.len(), 1);
+        assert!(
+            routing.unfixable[0]
+                .reason
+                .contains("incompatible branches")
+        );
+    }
+
+    #[test]
+    fn npm_transitive_branches_do_not_merge_into_one_major_upgrade() {
+        let audit = audit_of(vec![
+            vulnerable(
+                pkg("brace-expansion", "2.0.2", Ecosystem::Npm),
+                vec![vuln("GHSA-2", Some("2.1.4"))],
+            ),
+            vulnerable(
+                pkg("brace-expansion", "5.0.6", Ecosystem::Npm),
+                vec![vuln("GHSA-5", Some("5.0.8"))],
+            ),
+            vulnerable(
+                pkg("brace-expansion", "5.0.7", Ecosystem::Npm),
+                vec![vuln("GHSA-5b", Some("5.0.9"))],
+            ),
+        ]);
+        let prov = prov_index(
+            vec![
+                (
+                    ("brace-expansion", "2.0.2", "npm"),
+                    vec![lock_only_prov("proj/package-lock.json", LockKind::Npm)],
+                ),
+                (
+                    ("brace-expansion", "5.0.6", "npm"),
+                    vec![lock_only_prov("proj/package-lock.json", LockKind::Npm)],
+                ),
+                (
+                    ("brace-expansion", "5.0.7", "npm"),
+                    vec![lock_only_prov("proj/package-lock.json", LockKind::Npm)],
+                ),
+            ],
+            vec![],
+        );
+        let routing = route_fix_targets(&audit, &prov, &HashMap::new());
+        assert!(routing.unfixable.is_empty());
+        assert_eq!(routing.targets.len(), 2);
+        let mut fixes: Vec<_> = routing
+            .targets
+            .iter()
+            .map(|t| (t.from_version.as_str(), t.to_version.as_str()))
+            .collect();
+        fixes.sort();
+        assert_eq!(fixes, [("2.0.2", "2.1.4"), ("5.0.7", "5.0.9")]);
+    }
+
+    #[test]
+    fn npm_cross_branch_transitive_fix_is_blocked_before_planning() {
+        let audit = audit_of(vec![vulnerable(
+            pkg("pkg", "2.0.2", Ecosystem::Npm),
+            vec![vuln("GHSA-1", Some("5.0.9"))],
+        )]);
+        let prov = prov_index(
+            vec![(
+                ("pkg", "2.0.2", "npm"),
+                vec![lock_only_prov("proj/package-lock.json", LockKind::Npm)],
+            )],
+            vec![],
+        );
+        let routing = route_fix_targets(&audit, &prov, &HashMap::new());
+        assert!(routing.targets.is_empty());
+        assert_eq!(routing.unfixable.len(), 1);
+        assert!(routing.unfixable[0].reason.contains("parent dependency"));
+    }
+
+    #[test]
     fn no_fixed_version_pair_is_unfixable_with_flag() {
         let audit = audit_of(vec![vulnerable(
             pkg("examplepkg", "1.0.0", Ecosystem::PyPI),
@@ -1113,7 +1300,7 @@ mod tests {
         assert_eq!(routing.targets.len(), 1);
         let t = &routing.targets[0];
         assert_eq!(t.kind, FixKind::NpmOverride);
-        assert_eq!(t.npm_form, Some(NpmOverrideForm::Range));
+        assert_eq!(t.npm_form, Some(NpmOverrideForm::CompatibleRange));
         assert_eq!(t.path, PathBuf::from("proj/package.json"));
         assert_eq!(t.to_version, "1.5.0");
     }
@@ -1677,7 +1864,7 @@ mod tests {
                 vec![vuln("GHSA-1", Some("2.5.0"))],
             ),
             vulnerable(
-                pkg("examplepkg", "1.2.0", Ecosystem::Npm),
+                pkg("examplepkg", "2.2.0", Ecosystem::Npm),
                 vec![vuln("GHSA-2", Some("2.6.0"))],
             ),
         ]);
@@ -1696,7 +1883,7 @@ mod tests {
                     )],
                 ),
                 (
-                    ("examplepkg", "1.2.0", "npm"),
+                    ("examplepkg", "2.2.0", "npm"),
                     vec![lock_only_prov("proj/package-lock.json", LockKind::Npm)],
                 ),
             ],

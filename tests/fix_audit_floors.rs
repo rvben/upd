@@ -518,7 +518,7 @@ async fn npm_both_direct_and_transitive_writes_dollar_name() {
     wiremock::Mock::given(wiremock::matchers::method("POST"))
         .and(wiremock::matchers::path("/querybatch"))
         .respond_with(MultiOsvResponder {
-            answers: vec![("examplepkg", "1.2.0", "GHSA-floors-e")],
+            answers: vec![("examplepkg", "2.2.0", "GHSA-floors-e")],
         })
         .mount(&server)
         .await;
@@ -535,7 +535,7 @@ async fn npm_both_direct_and_transitive_writes_dollar_name() {
         r#"{ "name": "t", "lockfileVersion": 3, "packages": {
             "": {},
             "node_modules/examplepkg": { "version": "2.4.0" },
-            "node_modules/other/node_modules/examplepkg": { "version": "1.2.0" }
+            "node_modules/other/node_modules/examplepkg": { "version": "2.2.0" }
         } }"#,
     )
     .unwrap();
@@ -1390,7 +1390,7 @@ async fn partial_workspace_lock_is_never_floored() {
 #[tokio::test]
 async fn single_package_npm_with_file_dep_still_floors() {
     let server = wiremock::MockServer::start().await;
-    mount_osv_single(&server, "GHSA-floors-filedep", "vulnpkg", "npm", "2.0.1").await;
+    mount_osv_single(&server, "GHSA-floors-filedep", "vulnpkg", "npm", "1.0.1").await;
 
     let tmp = tempfile::tempdir().unwrap();
     fs::write(
@@ -1443,7 +1443,7 @@ async fn single_package_npm_with_file_dep_still_floors() {
     let package_json: serde_json::Value =
         serde_json::from_str(&fs::read_to_string(tmp.path().join("package.json")).unwrap())
             .unwrap();
-    assert_eq!(package_json["overrides"]["vulnpkg"], ">=2.0.1");
+    assert_eq!(package_json["overrides"]["vulnpkg@^1.0.0"], "^1.0.1");
 
     let fixes = json["fixes"].as_array().unwrap();
     assert!(
@@ -1512,4 +1512,87 @@ async fn sarif_output_with_fix_audit_is_unchanged() {
         uri.ends_with("uv.lock"),
         "lock-only finding must anchor to the lockfile, got: {uri}"
     );
+}
+
+/// Parallel npm majors must remain independent through CLI routing, writing,
+/// JSON reporting and the shared relock operation.
+#[cfg(unix)]
+#[tokio::test]
+async fn npm_parallel_major_fixes_write_separate_bounded_overrides() {
+    let server = wiremock::MockServer::start().await;
+    wiremock::Mock::given(wiremock::matchers::method("POST"))
+        .and(wiremock::matchers::path("/querybatch"))
+        .respond_with(MultiOsvResponder {
+            answers: vec![
+                ("brace-expansion", "2.0.2", "GHSA-branch2"),
+                ("brace-expansion", "5.0.7", "GHSA-branch5"),
+                ("unrelated", "1.0.0", "GHSA-unrelated"),
+            ],
+        })
+        .mount(&server)
+        .await;
+    mount_vuln_get(&server, "GHSA-branch2", "brace-expansion", "npm", "2.1.4").await;
+    mount_vuln_get(&server, "GHSA-branch5", "brace-expansion", "npm", "5.0.9").await;
+    mount_vuln_get(&server, "GHSA-unrelated", "unrelated", "npm", "1.0.1").await;
+    for selector in ["brace-expansion", "brace-*"] {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::write(
+            tmp.path().join("package.json"),
+            r#"{"name":"t","version":"1.0.0"}"#,
+        )
+        .unwrap();
+        fs::write(
+            tmp.path().join("package-lock.json"),
+            r#"{"lockfileVersion":3,"packages":{
+        "":{},
+        "node_modules/unrelated":{"version":"1.0.0"},
+        "node_modules/brace-expansion":{"version":"2.0.2"},
+        "node_modules/host/node_modules/brace-expansion":{"version":"5.0.7"}
+    }}"#,
+        )
+        .unwrap();
+        let bin_dir = tmp.path().join("fakebin");
+        fs::create_dir(&bin_dir).unwrap();
+        write_fake_tool(
+            &bin_dir,
+            "npm",
+            "#!/bin/sh\nif [ \"$1\" != \"--version\" ]; then echo relock >> relocks.txt; fi\nexit 0\n",
+        );
+        let (stdout, stderr, code) = run_with_env(
+            &[
+                "audit",
+                "--package",
+                selector,
+                "--fix-audit",
+                "--apply",
+                "--no-cache",
+                "--format",
+                "json",
+            ],
+            tmp.path(),
+            &[
+                ("OSV_API_URL", &server.uri()),
+                ("PATH", &path_with(&bin_dir)),
+            ],
+        );
+        assert_eq!(code, 0, "{stdout}\n{stderr}");
+        let doc: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(tmp.path().join("package.json")).unwrap())
+                .unwrap();
+        assert_eq!(doc["overrides"]["brace-expansion@^2.0.0"], "^2.1.4");
+        assert_eq!(doc["overrides"]["brace-expansion@^5.0.0"], "^5.0.9");
+        assert_eq!(doc["overrides"].as_object().unwrap().len(), 2);
+        assert_eq!(
+            fs::read_to_string(tmp.path().join("relocks.txt"))
+                .unwrap()
+                .lines()
+                .count(),
+            1
+        );
+        let report: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+        assert_eq!(report["summary"]["packages_checked"], 2);
+        let fixes = report["fixes"].as_array().unwrap();
+        assert_eq!(fixes.len(), 2);
+        assert!(fixes.iter().all(|fix| fix["status"] == "applied"));
+    }
 }

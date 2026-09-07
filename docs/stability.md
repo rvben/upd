@@ -204,6 +204,21 @@ manifest already carrying the floor is one of them, since the floor is not the
 only thing the update moves: the constraint needs no rewrite, the lock below it
 does, and regenerating that lock is the work the ceiling is holding back.
 
+`audit --package NAME` limits both advisory queries and automatic fixes to
+matching package names, including transitive dependencies. Repeatable selectors
+and globs such as `--package 'brace-*'` use the same matching rules as updates.
+
+npm audit fixes for transitive dependencies preserve each installed
+compatibility branch. For example, vulnerable `brace-expansion` 2.x and 5.x
+copies receive separate `brace-expansion@^2.0.0` and
+`brace-expansion@^5.0.0` overrides, with bounded replacement ranges such as
+`^2.1.4` and `^5.0.9`. Zero-major versions retain their caret-compatible
+minor or patch boundary. A fix outside that branch is `unfixable`: update
+the parent dependency rather than force its dependency onto an incompatible
+API. Existing overlapping or nested override policies also require manual
+reconciliation. A global `$name` override is refused when direct and
+transitive copies occupy incompatible branches, including healthy copies.
+
 A floor `upd` cannot write is a separate answer, not a capped one, because no
 ceiling is holding it: it is reported in `files[].updates[]` with its own
 `status` and an `error` naming what to do instead. Held back and blocked are
