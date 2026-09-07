@@ -1872,6 +1872,31 @@ fn file_type_selected(file_type: FileType, langs: &[Lang]) -> bool {
         || (file_type.scans_annotations() && selection_reaches_annotations(langs))
 }
 
+/// The file a path names once the symlinks in its final component are
+/// followed. A manifest reached through a symlink is the file the link points
+/// at: its type is read from that file's name, its lockfile lives in that
+/// file's directory, and the rewrite has to land in that file rather than
+/// replace the link. Directories on the way are kept as spelled. A path that
+/// is not a symlink, or a link that cannot be read, stands for itself.
+fn resolve_file_symlink(path: &Path) -> PathBuf {
+    let mut resolved = path.to_path_buf();
+    // Bounded the way the kernel bounds its own symlink walk, so a link cycle
+    // created after the path was checked cannot spin here.
+    for _ in 0..40 {
+        if !resolved.is_symlink() {
+            break;
+        }
+        let Ok(target) = std::fs::read_link(&resolved) else {
+            break;
+        };
+        resolved = match resolved.parent() {
+            Some(parent) => parent.join(target),
+            None => target,
+        };
+    }
+    resolved
+}
+
 fn walk_dependency_files(
     paths: &[PathBuf],
     langs: &[Lang],
@@ -1888,10 +1913,11 @@ fn walk_dependency_files(
 
     for path in paths {
         if path.is_file() {
-            if let Some(file_type) = FileType::detect_with_annotated(path, true)
+            let file = resolve_file_symlink(path);
+            if let Some(file_type) = FileType::detect_with_annotated(&file, true)
                 && file_type_selected(file_type, langs)
             {
-                unique.admit(path, file_type);
+                unique.admit(&file, file_type);
             }
             continue;
         }
@@ -1937,14 +1963,17 @@ fn walk_dependency_files(
             if !entry_path.is_file() {
                 continue;
             }
-            let detected = FileType::detect_with_annotated(entry_path, false);
+            // The type comes from the file the entry names; `include` globs
+            // and the marker diagnostic go by the spelling in the walked tree.
+            let file = resolve_file_symlink(entry_path);
+            let detected = FileType::detect_with_annotated(&file, false);
             let file_type = detected.or_else(|| {
                 glob_matches(include_set, entry_path, paths).then_some(FileType::Annotated)
             });
             if let Some(file_type) = file_type
                 && file_type_selected(file_type, langs)
             {
-                unique.admit(entry_path, file_type);
+                unique.admit(&file, file_type);
             } else if detected.is_none()
                 && sniff_skipped_markers
                 && contains_annotation_marker(entry_path)
@@ -2687,6 +2716,65 @@ mod tests {
         assert_eq!(files.len(), 1);
         assert_eq!(files[0].0, req_path);
         assert_eq!(files[0].1, FileType::Requirements);
+    }
+
+    /// A symlink to a manifest names the manifest. Discovery lists the file
+    /// the link points at, typed by that file's own name, so the rewrite lands
+    /// in that file and its lockfile is looked for beside it.
+    #[cfg(unix)]
+    #[test]
+    fn an_explicit_symlink_is_listed_as_the_file_it_names() {
+        let temp = tempdir().unwrap();
+        let project = temp.path().join("project");
+        fs::create_dir(&project).unwrap();
+        let manifest = project.join("pyproject.toml");
+        fs::write(&manifest, "[project]\nname = \"t\"").unwrap();
+        let link = temp.path().join("alias.toml");
+        std::os::unix::fs::symlink("project/pyproject.toml", &link).unwrap();
+
+        let files = discover_files(&[link], &[]);
+
+        assert_eq!(files, vec![(manifest, FileType::PyProject)]);
+    }
+
+    /// The same for a symlink the directory walk finds, whose target may lie
+    /// outside the walked tree. The target keeps the spelling the link gave
+    /// it, relative to the link's own directory.
+    #[cfg(unix)]
+    #[test]
+    fn a_walked_symlink_is_listed_as_the_file_it_names() {
+        let temp = tempdir().unwrap();
+        let project = temp.path().join("project");
+        let links = temp.path().join("links");
+        fs::create_dir(&project).unwrap();
+        fs::create_dir(&links).unwrap();
+        fs::write(project.join("pyproject.toml"), "[project]\nname = \"t\"").unwrap();
+        std::os::unix::fs::symlink("../project/pyproject.toml", links.join("pyproject.toml"))
+            .unwrap();
+
+        let files = discover_files(std::slice::from_ref(&links), &[]);
+
+        assert_eq!(
+            files,
+            vec![(links.join("../project/pyproject.toml"), FileType::PyProject)]
+        );
+    }
+
+    /// A chain of symlinks is followed to the file at its end.
+    #[cfg(unix)]
+    #[test]
+    fn a_chain_of_symlinks_is_followed_to_the_file() {
+        let temp = tempdir().unwrap();
+        let project = temp.path().join("project");
+        fs::create_dir(&project).unwrap();
+        let manifest = project.join("pyproject.toml");
+        fs::write(&manifest, "[project]\nname = \"t\"").unwrap();
+        std::os::unix::fs::symlink("project/pyproject.toml", temp.path().join("b.toml")).unwrap();
+        std::os::unix::fs::symlink("b.toml", temp.path().join("a.toml")).unwrap();
+
+        let files = discover_files(&[temp.path().join("a.toml")], &[]);
+
+        assert_eq!(files, vec![(manifest, FileType::PyProject)]);
     }
 
     #[test]

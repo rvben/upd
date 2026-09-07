@@ -19,6 +19,11 @@ to walk every file regardless.
 An explicitly passed file path bypasses discovery entirely, which is how
 `upd update path/to/versions.env` works for a file no pattern claims.
 
+A symlink to a manifest, whether passed explicitly or found by the walk, is
+scanned as the file it points at: the type comes from that file's name, its
+lockfile is looked for beside it, and an update is written into it, so the
+link survives. The report names the file rather than the link.
+
 ## Lockfiles
 
 `update` reads manifests, not lockfiles. Whether a dependency is outdated is

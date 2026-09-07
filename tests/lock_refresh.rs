@@ -1122,3 +1122,170 @@ async fn a_lockfile_regenerated_before_the_rollback_is_not_announced() {
         "a lockfile that was put back must not be announced as regenerated: {stdout}"
     );
 }
+
+/// A `uv` whose `lock` appends the directory it ran in to `log_file` and
+/// leaves `lock` behind.
+fn uv_logging_its_directory(log_file: &Path, lock: &str) -> String {
+    format!(
+        "#!/bin/sh
+case \"$1\" in
+  --version) echo 'uv 0.9.0'; exit 0 ;;
+  lock)
+    pwd -P >> '{log}'
+    cat > uv.lock <<'EOF'
+{lock}EOF
+    exit 0
+    ;;
+esac
+exit 0
+",
+        log = log_file.display(),
+    )
+}
+
+/// What `upd` leaves behind when a manifest is reached through a symlink.
+struct SymlinkRun {
+    code: i32,
+    stdout: String,
+    stderr: String,
+    json: serde_json::Value,
+    /// The directories `uv lock` ran in, physical paths.
+    relocked_in: Vec<String>,
+    /// The symlink, `root/<link>`.
+    link: std::path::PathBuf,
+    /// The directory holding the manifest the link points at.
+    project: std::path::PathBuf,
+    /// The lockfile a successful `uv lock` writes.
+    relocked: String,
+    _tmp: tempfile::TempDir,
+}
+
+/// Lays out `root/project/{pyproject.toml,uv.lock}` and `root/<link>`, a
+/// symlink to the manifest, then runs `upd <args>` in `root` with a `uv`
+/// that records where it locked.
+async fn run_with_a_symlinked_manifest(link: &str, args: &[&str]) -> SymlinkRun {
+    let server = wiremock::MockServer::start().await;
+    mount_pypi_latest(&server, "requests", "2.32.0").await;
+    let tmp = tempfile::tempdir().unwrap();
+    let log_file = tmp.path().join("uv-lock-dirs");
+    let relocked = uv_lock_at("requests", "2.32.0");
+    let bin = tmp.path().join("bin");
+    fs::create_dir(&bin).unwrap();
+    write_fake_tool(&bin, "uv", &uv_logging_its_directory(&log_file, &relocked));
+    let root = tmp.path().join("root");
+    let project = root.join("project");
+    fs::create_dir_all(&project).unwrap();
+    fs::write(project.join("pyproject.toml"), PYPROJECT).unwrap();
+    fs::write(project.join("uv.lock"), uv_lock_at("requests", "2.31.0")).unwrap();
+    let link = root.join(link);
+    std::os::unix::fs::symlink("project/pyproject.toml", &link).unwrap();
+
+    let mut full_args = vec!["--no-cache", "--format", "json"];
+    full_args.extend_from_slice(args);
+    let (stdout, stderr, code) = run_with_env(
+        &full_args,
+        &root,
+        &[("UV_INDEX_URL", &server.uri()), ("PATH", &path_with(&bin))],
+    );
+    let json: serde_json::Value =
+        serde_json::from_str(&stdout).unwrap_or_else(|e| panic!("{e}\nstdout: {stdout}"));
+    let relocked_in = fs::read_to_string(&log_file)
+        .unwrap_or_default()
+        .lines()
+        .map(str::to_owned)
+        .collect();
+    SymlinkRun {
+        code,
+        stdout,
+        stderr,
+        json,
+        relocked_in,
+        link,
+        project,
+        relocked,
+        _tmp: tmp,
+    }
+}
+
+/// The manifest is the file the link points at: the link stays a link, the
+/// file is reported once under its own path, updated in place and relocked
+/// once, in the directory that holds its lockfile.
+fn assert_relocked_beside_its_target(run: &SymlinkRun) {
+    assert!(
+        fs::symlink_metadata(&run.link).unwrap().is_symlink(),
+        "the link must survive the rewrite; the file it names is what changes\nstdout: {}\nstderr: {}",
+        run.stdout,
+        run.stderr
+    );
+    let physical_project = fs::canonicalize(&run.project).unwrap();
+    assert_eq!(
+        run.relocked_in,
+        vec![physical_project.display().to_string()],
+        "uv lock must run once, in the manifest's own directory\nstdout: {}\nstderr: {}",
+        run.stdout,
+        run.stderr
+    );
+    assert_eq!(
+        run.code, 0,
+        "stdout: {}\nstderr: {}",
+        run.stdout, run.stderr
+    );
+    assert_eq!(
+        fs::read_to_string(run.project.join("pyproject.toml")).unwrap(),
+        PYPROJECT_UPDATED
+    );
+    assert_eq!(
+        fs::read_to_string(run.project.join("uv.lock")).unwrap(),
+        run.relocked
+    );
+    let files = run.json["files"].as_array().unwrap();
+    assert_eq!(files.len(), 1, "{}", run.json);
+    assert_eq!(files[0]["path"], "project/pyproject.toml", "{}", run.json);
+    assert_eq!(
+        run.json["summary"]["files_scanned"], 1,
+        "{}",
+        run.json["summary"]
+    );
+    assert_eq!(
+        run.json["summary"]["updates_total"], 1,
+        "{}",
+        run.json["summary"]
+    );
+}
+
+/// `upd pyproject.toml --apply --lock` where `pyproject.toml` is a symlink
+/// into `project/`. The rewrite used to replace the link with a regular file
+/// holding the new manifest, leaving the file it named untouched and its
+/// lockfile unrefreshed, and exit 0.
+#[tokio::test]
+async fn a_manifest_named_only_through_a_symlink_is_updated_in_place() {
+    let run =
+        run_with_a_symlinked_manifest("pyproject.toml", &["--apply", "--lock", "pyproject.toml"])
+            .await;
+    assert_relocked_beside_its_target(&run);
+}
+
+/// A symlink named `alias.toml` says nothing about the file's type. The file
+/// it names is a `pyproject.toml` with an update, not an annotated file with
+/// none.
+#[tokio::test]
+async fn a_manifest_named_through_a_differently_named_symlink_keeps_its_type() {
+    let run = run_with_a_symlinked_manifest("alias.toml", &["alias.toml"]).await;
+    let files = run.json["files"].as_array().unwrap();
+    assert_eq!(files.len(), 1, "{}", run.json);
+    assert_eq!(files[0]["path"], "project/pyproject.toml", "{}", run.json);
+    assert_eq!(files[0]["file_type"], "pyproject", "{}", run.json);
+    let updates = files[0]["updates"].as_array().unwrap();
+    assert_eq!(updates.len(), 1, "{}", run.json);
+    assert_eq!(updates[0]["package"], "requests", "{}", run.json);
+    assert_eq!(
+        run.json["summary"]["updates_total"], 1,
+        "{}",
+        run.json["summary"]
+    );
+    assert_eq!(
+        run.code, 1,
+        "stdout: {}\nstderr: {}",
+        run.stdout, run.stderr
+    );
+}
