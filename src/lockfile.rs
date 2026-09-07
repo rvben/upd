@@ -242,6 +242,81 @@ pub fn containing_dir(path: &Path) -> &Path {
     }
 }
 
+/// Find a declared uv workspace that owns this pyproject. Merely being below
+/// a lockfile is insufficient: member globs and exclusions are authoritative.
+/// Canonical paths give a workspace one identity even through path aliases.
+pub fn uv_workspace_root(manifest: &Path) -> anyhow::Result<Option<PathBuf>> {
+    use crate::lockscan::discover::{workspace_globs, workspace_string_list};
+    use anyhow::{Context, anyhow};
+    if manifest
+        .file_name()
+        .is_none_or(|name| name != "pyproject.toml")
+    {
+        return Ok(None);
+    }
+    let manifest = std::fs::canonicalize(manifest).with_context(|| {
+        format!(
+            "Cannot locate {} before lockfile refresh",
+            manifest.display()
+        )
+    })?;
+    let directory = containing_dir(&manifest);
+    for root in directory.ancestors() {
+        let candidate = root.join("pyproject.toml");
+        if candidate.try_exists()? {
+            let text = std::fs::read_to_string(&candidate)?;
+            let doc: toml::Value = toml::from_str(&text).with_context(|| {
+                format!(
+                    "Cannot determine workspace ownership from {}",
+                    candidate.display()
+                )
+            })?;
+            if let Some(workspace) = doc
+                .get("tool")
+                .and_then(|v| v.get("uv"))
+                .and_then(|v| v.get("workspace"))
+            {
+                let workspace = workspace.as_table().ok_or_else(|| {
+                    anyhow!(
+                        "tool.uv.workspace must be a table in {}",
+                        candidate.display()
+                    )
+                })?;
+                let members =
+                    workspace_string_list(workspace, "members").map_err(anyhow::Error::msg)?;
+                let exclude =
+                    workspace_string_list(workspace, "exclude").map_err(anyhow::Error::msg)?;
+                // A transaction must be able to enumerate all its members.
+                for pattern in members.iter().chain(&exclude) {
+                    if Path::new(pattern).is_absolute()
+                        || Path::new(pattern)
+                            .components()
+                            .any(|c| matches!(c, std::path::Component::ParentDir))
+                    {
+                        anyhow::bail!(
+                            "Workspace pattern '{pattern}' in {} reaches outside its root; cannot safely plan lockfile rollback",
+                            candidate.display()
+                        );
+                    }
+                }
+                let members = workspace_globs(&members, "members").map_err(anyhow::Error::msg)?;
+                let exclude = workspace_globs(&exclude, "exclude").map_err(anyhow::Error::msg)?;
+                let relative = directory
+                    .strip_prefix(root)?
+                    .to_string_lossy()
+                    .replace(std::path::MAIN_SEPARATOR, "/");
+                return Ok((directory == root
+                    || (members.is_match(&relative) && !exclude.is_match(&relative)))
+                .then(|| root.to_path_buf()));
+            }
+        }
+        if root.join(".git").exists() {
+            break;
+        }
+    }
+    Ok(None)
+}
+
 /// Detect lockfiles in the directory containing the given manifest file
 pub fn detect_lockfiles(manifest_path: &Path) -> Vec<LockfileType> {
     let dir = containing_dir(manifest_path);
@@ -461,6 +536,23 @@ impl Snapshot {
             };
             self.files.push((path.clone(), captured));
         }
+    }
+
+    /// Refuse to start writes when a pre-run file could not be captured.
+    pub fn ensure_restorable(&self) -> anyhow::Result<()> {
+        for (path, captured) in &self.files {
+            if let Captured::Unreadable(reason) = captured {
+                anyhow::bail!(
+                    "Cannot safely refresh lockfiles: {} could not be captured before the run ({reason})",
+                    path.display()
+                );
+            }
+        }
+        Ok(())
+    }
+
+    pub fn paths(&self) -> impl Iterator<Item = &PathBuf> {
+        self.files.iter().map(|(path, _)| path)
     }
 
     /// Put every captured file back. A file whose bytes did not change is
@@ -2061,5 +2153,74 @@ thiserror = "0.9.1"
         assert_eq!(msgs.len(), 2, "only ToolMissing and Failed are errors");
         assert!(msgs[0].contains("cargo"));
         assert!(msgs[1].contains("exit 1"));
+    }
+}
+
+#[cfg(test)]
+mod uv_workspace_tests {
+    use super::*;
+
+    #[test]
+    fn uv_ownership_requires_declared_membership_and_honors_exclusions() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(temp.path()).unwrap();
+        std::fs::write(
+            root.join("pyproject.toml"),
+            "[tool.uv.workspace]\nmembers=['packages/*']\nexclude=['packages/excluded']\n",
+        )
+        .unwrap();
+        for name in [
+            "packages/member",
+            "packages/excluded",
+            "tools/unrelated",
+            "packages/member/nested",
+        ] {
+            let dir = root.join(name);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("pyproject.toml"), "[project]\nname='test'\n").unwrap();
+        }
+        assert_eq!(
+            uv_workspace_root(&root.join("pyproject.toml")).unwrap(),
+            Some(root.clone())
+        );
+        assert_eq!(
+            uv_workspace_root(&root.join("packages/member/pyproject.toml")).unwrap(),
+            Some(root.clone())
+        );
+        for name in [
+            "packages/excluded",
+            "tools/unrelated",
+            "packages/member/nested",
+        ] {
+            assert!(
+                uv_workspace_root(&root.join(name).join("pyproject.toml"))
+                    .unwrap()
+                    .is_none(),
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn uv_ownership_does_not_walk_above_a_repository_boundary() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            temp.path().join("pyproject.toml"),
+            "[tool.uv.workspace]\nmembers=['inner']\n",
+        )
+        .unwrap();
+        let inner = temp.path().join("inner");
+        std::fs::create_dir_all(inner.join(".git")).unwrap();
+        let manifest = inner.join("pyproject.toml");
+        std::fs::write(&manifest, "[project]\nname='independent'\n").unwrap();
+        assert!(uv_workspace_root(&manifest).unwrap().is_none());
+    }
+
+    #[test]
+    fn a_snapshot_that_cannot_restore_a_file_is_rejected_before_writes() {
+        let temp = tempfile::tempdir().unwrap();
+        // A directory cannot be captured as file bytes on any supported OS.
+        let snapshot = Snapshot::capture(&[temp.path().to_path_buf()]);
+        assert!(snapshot.ensure_restorable().is_err());
     }
 }

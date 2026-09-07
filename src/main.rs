@@ -924,7 +924,7 @@ fn lockfile_changes_for(
 const LOCK_ROLLBACK_HINT: &str =
     "rerun without --lock to keep the manifest edits and refresh the lockfile yourself";
 
-/// The manifests that share one directory's lockfiles, with the bytes of every
+/// The manifests that share lockfiles (including a declared uv workspace), with the bytes of every
 /// one of those files as the run found them. A refresh failure restores the
 /// whole group, so a manifest is never left ahead of the lockfile it owns.
 struct LockGroup {
@@ -932,6 +932,8 @@ struct LockGroup {
     lockfiles: Vec<LockfileType>,
     manifests: Vec<PathBuf>,
     snapshot: Snapshot,
+    /// Workspace root used to invoke a shared resolver.
+    refresh_manifest: Option<PathBuf>,
 }
 
 impl LockGroup {
@@ -946,17 +948,24 @@ impl LockGroup {
 /// Group every manifest that owns a lockfile with the others sharing it and
 /// capture manifest and lockfile bytes. Runs before any updater writes, so a
 /// restore puts back what the run found rather than what it wrote.
-fn plan_lock_groups(files: &[(PathBuf, FileType)]) -> Vec<LockGroup> {
+fn plan_lock_groups(files: &[(PathBuf, FileType)]) -> Result<Vec<LockGroup>> {
     let mut groups: Vec<LockGroup> = Vec::new();
     for (path, file_type) in files {
         if *file_type == FileType::Annotated {
             continue;
         }
-        let lockfiles = detect_lockfiles(path);
+        let workspace = upd::lockfile::uv_workspace_root(path)?;
+        let owner = workspace.as_ref().map(|root| root.join("pyproject.toml"));
+        let lockfiles = match &owner {
+            Some(owner) if owner.with_file_name("uv.lock").exists() => detect_lockfiles(owner),
+            Some(_) => Vec::new(),
+            None => detect_lockfiles(path),
+        };
         if lockfiles.is_empty() {
             continue;
         }
-        let dir = containing_dir(path).to_path_buf();
+        let owner = owner.filter(|owner| owner.with_file_name("uv.lock").exists());
+        let dir = containing_dir(owner.as_deref().unwrap_or(path)).to_path_buf();
         let index = groups
             .iter()
             .position(|group| group.dir == dir && group.lockfiles == lockfiles)
@@ -966,6 +975,7 @@ fn plan_lock_groups(files: &[(PathBuf, FileType)]) -> Vec<LockGroup> {
                     lockfiles,
                     manifests: Vec::new(),
                     snapshot: Snapshot::default(),
+                    refresh_manifest: owner.clone(),
                 };
                 let lockfile_paths = group.lockfile_paths();
                 groups.push(group);
@@ -974,10 +984,33 @@ fn plan_lock_groups(files: &[(PathBuf, FileType)]) -> Vec<LockGroup> {
                 index
             });
         let group = &mut groups[index];
+        if group.manifests.is_empty()
+            && let Some(owner) = &owner
+        {
+            let mut members: Vec<_> = upd::lockscan::discover::uv_workspace_manifests(owner)
+                .map_err(anyhow::Error::msg)?
+                .into_iter()
+                .collect();
+            members.sort();
+            for member in &members {
+                let member_root = upd::lockfile::uv_workspace_root(member)?;
+                if member_root.as_deref() != Some(group.dir.as_path()) {
+                    anyhow::bail!(
+                        "Cannot safely group workspace member {}: its lockfile owner differs from {}",
+                        member.display(),
+                        group.dir.display()
+                    );
+                }
+            }
+            group.snapshot.extend(&members);
+        }
         group.snapshot.extend(std::slice::from_ref(path));
         group.manifests.push(path.clone());
     }
-    groups
+    for group in &groups {
+        group.snapshot.ensure_restorable()?;
+    }
+    Ok(groups)
 }
 
 /// What one group's refresh came to.
@@ -1016,7 +1049,11 @@ fn refresh_lock_groups(
         let Some(anchor) = manifests.first() else {
             continue;
         };
-        let changed = lockfile_changes_for(changed_by_lockfile, anchor);
+        let changed = manifests
+            .iter()
+            .flat_map(|manifest| lockfile_changes_for(changed_by_lockfile, manifest))
+            .collect::<Vec<_>>();
+        let anchor = group.refresh_manifest.as_ref().unwrap_or(anchor);
         let outcomes: Vec<RegenOutcome> = group
             .lockfiles
             .iter()
@@ -1031,6 +1068,15 @@ fn refresh_lock_groups(
                     .iter()
                     .cloned()
                     .chain(group.lockfile_paths())
+                    .chain(
+                        group
+                            .snapshot
+                            .paths()
+                            .filter(|path| {
+                                !manifests.contains(path) && !group.lockfile_paths().contains(path)
+                            })
+                            .cloned(),
+                    )
                     .filter(|path| !failures.iter().any(|failure| failure.path == *path))
                     .collect();
                 Rollback { restored, failures }
@@ -1781,7 +1827,7 @@ async fn run_update(cli: &Cli) -> Result<()> {
     // Under --lock, capture every lockfile-owning manifest and its lockfiles
     // before any updater writes, so a failed refresh can put them back.
     let lock_groups = if cli.lock && !dry_run {
-        plan_lock_groups(&files)
+        plan_lock_groups(&files)?
     } else {
         Vec::new()
     };
@@ -3326,7 +3372,7 @@ async fn run_interactive_update(
             .iter()
             .map(|scanned_file| (scanned_file.path.clone(), scanned_file.file_type))
             .collect();
-        plan_lock_groups(&files)
+        plan_lock_groups(&files)?
     } else {
         Vec::new()
     };
@@ -7975,7 +8021,8 @@ serde = "1.0.1"
             (package_json.clone(), FileType::PackageJson),
             (requirements, FileType::Requirements),
             (cargo_toml.clone(), FileType::CargoToml),
-        ]);
+        ])
+        .unwrap();
 
         let summary: Vec<(PathBuf, Vec<LockfileType>, Vec<PathBuf>)> = groups
             .iter()
@@ -8014,10 +8061,10 @@ serde = "1.0.1"
         let tmp = tempdir().unwrap();
         let manifest = tmp.path().join("pyproject.toml");
         let lockfile = tmp.path().join("uv.lock");
-        std::fs::write(&manifest, "requests==2.31.0\n").unwrap();
+        std::fs::write(&manifest, "[project]\ndependencies=['requests==2.31.0']\n").unwrap();
         std::fs::write(&lockfile, "version = 1\n").unwrap();
-        let groups = plan_lock_groups(&[(manifest.clone(), FileType::PyProject)]);
-        std::fs::write(&manifest, "requests==2.32.0\n").unwrap();
+        let groups = plan_lock_groups(&[(manifest.clone(), FileType::PyProject)]).unwrap();
+        std::fs::write(&manifest, "[project]\ndependencies=['requests==2.32.0']\n").unwrap();
         std::fs::write(&lockfile, "version = 2\n").unwrap();
 
         let failures = groups[0].snapshot.restore();
@@ -8025,7 +8072,7 @@ serde = "1.0.1"
         assert!(failures.is_empty(), "{failures:?}");
         assert_eq!(
             std::fs::read_to_string(&manifest).unwrap(),
-            "requests==2.31.0\n"
+            "[project]\ndependencies=['requests==2.31.0']\n"
         );
         assert_eq!(std::fs::read_to_string(&lockfile).unwrap(), "version = 1\n");
     }

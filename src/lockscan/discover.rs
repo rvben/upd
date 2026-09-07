@@ -84,7 +84,10 @@ fn walk_manifests(root: &Path, name: &str, out: &mut Vec<PathBuf>) {
     }
 }
 
-fn workspace_string_list(workspace: &toml::value::Table, key: &str) -> Result<Vec<String>, String> {
+pub(crate) fn workspace_string_list(
+    workspace: &toml::value::Table,
+    key: &str,
+) -> Result<Vec<String>, String> {
     let Some(value) = workspace.get(key) else {
         return Ok(Vec::new());
     };
@@ -102,7 +105,7 @@ fn workspace_string_list(workspace: &toml::value::Table, key: &str) -> Result<Ve
         .collect()
 }
 
-fn workspace_globs(patterns: &[String], key: &str) -> Result<GlobSet, String> {
+pub(crate) fn workspace_globs(patterns: &[String], key: &str) -> Result<GlobSet, String> {
     let mut builder = GlobSetBuilder::new();
     for pattern in patterns {
         let normalized = pattern
@@ -131,7 +134,7 @@ fn workspace_globs(patterns: &[String], key: &str) -> Result<GlobSet, String> {
 /// `exclude`) share the root lockfile. Looking at every pyproject recursively
 /// is both over-broad and especially noisy for generated hidden trees such as
 /// `.ansible/`.
-fn uv_workspace_manifests(root_manifest: &Path) -> Result<HashSet<PathBuf>, String> {
+pub fn uv_workspace_manifests(root_manifest: &Path) -> Result<HashSet<PathBuf>, String> {
     let mut result = HashSet::from([root_manifest.to_path_buf()]);
     let content = std::fs::read_to_string(root_manifest)
         .map_err(|error| format!("could not read {}: {error}", root_manifest.display()))?;
@@ -154,22 +157,56 @@ fn uv_workspace_manifests(root_manifest: &Path) -> Result<HashSet<PathBuf>, Stri
         return Ok(result);
     };
 
-    let mut manifests = Vec::new();
-    walk_manifests(root, "pyproject.toml", &mut manifests);
-    for manifest in manifests {
-        if manifest == root_manifest {
+    // Unlike the audit's broad manifest walk, transaction membership cannot
+    // silently discard traversal errors or missing member manifests.
+    let walker = WalkBuilder::new(root)
+        .standard_filters(false)
+        .follow_links(true)
+        .filter_entry(|entry| {
+            entry.depth() == 0
+                || !entry
+                    .file_name()
+                    .to_str()
+                    .is_some_and(|name| INSTALL_TREES.contains(&name))
+        })
+        .build();
+    for entry in walker {
+        let entry = entry.map_err(|error| format!("could not enumerate uv workspace: {error}"))?;
+        if entry.depth() == 0 || !entry.path().is_dir() {
             continue;
         }
-        let Some(directory) = manifest.parent() else {
-            continue;
-        };
-        let Ok(relative) = directory.strip_prefix(root) else {
-            continue;
-        };
+        let relative = entry
+            .path()
+            .strip_prefix(root)
+            .map_err(|error| error.to_string())?;
         let portable = relative
             .to_string_lossy()
             .replace(std::path::MAIN_SEPARATOR, "/");
         if members.is_match(&portable) && !excludes.is_match(&portable) {
+            let manifest = entry.path().join("pyproject.toml");
+            let content = std::fs::read_to_string(&manifest).map_err(|error| {
+                format!(
+                    "could not read workspace member {}: {error}",
+                    manifest.display()
+                )
+            })?;
+            let doc: toml::Value = toml::from_str(&content).map_err(|error| {
+                format!(
+                    "could not parse workspace member {}: {error}",
+                    manifest.display()
+                )
+            })?;
+            if doc
+                .get("tool")
+                .and_then(|v| v.get("uv"))
+                .and_then(|v| v.get("workspace"))
+                .is_some()
+            {
+                return Err(format!(
+                    "{} declares a nested workspace while also matching the parent workspace's members; exclude it from the parent to keep lockfile transactions separate",
+                    manifest.display()
+                ));
+            }
             result.insert(manifest);
         }
     }

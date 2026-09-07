@@ -114,25 +114,32 @@ refresh skipped entirely. A directory where only config pins were
 applied is still refreshed, and the changed-package list includes
 those pinned packages so `cargo update -p <pkg>` / `bundle lock --update <pkg>` stay scoped.
 
-A refresh is a transaction per directory. Before the first manifest is
-written, `upd` captures the bytes of every manifest and lockfile in the
-directories it may touch. When a refresh command fails, or its tool is
-not installed, every file in that directory is put back exactly as the
-run found it, the output names what was rolled back, and the run exits
-2. Other directories keep their updates and the result of their own
-refresh. In JSON output each rolled-back entry carries
-`"status": "rolled_back"` and the file's `errors` gains an entry of kind
-`lockfile`. A file that cannot be put back is named in that error as
-not restored, and every write in that directory is then reported
-`failed` rather than `rolled_back`, under `update` and `audit
---fix-audit` alike, because `rolled_back` promises the directory is back
-at its pre-run bytes. A `failed` write is not counted as applied either:
-the directory holds a manifest ahead of a lockfile that was never
-refreshed, and the named file needs putting back by hand. To keep the
-manifest edits when a refresh fails, skip the refresh and run the
-lockfile tool yourself: `update --apply` without `--lock`, or `audit
---fix-audit --apply --no-lock`, since `audit` implies `--lock` and only
-`--no-lock` turns it off.
+A refresh is a transaction for each group of manifests sharing lockfiles.
+For uv workspaces, `upd` follows `[tool.uv.workspace].members` and `exclude`,
+even when only a member subdirectory or manifest was selected. Before writing,
+it captures the root manifest, all declared member manifests (including members
+not selected for updates), and the existing root lockfiles. It runs `uv lock`
+once from the workspace root after applying the selected manifest updates.
+Unrelated nested projects and excluded members keep separate transactions.
+An invalid or ambiguous workspace, or a file that cannot be captured, stops
+`--lock` before manifest writes. Workspace patterns that reach outside the root
+are currently rejected. Workspaces without an existing root `uv.lock` retain
+the usual no-lockfile behavior; a stray member lockfile is not used as a
+substitute. Other ecosystems retain their directory-based lockfile groups.
+
+When a refresh command fails, or its tool is not installed, captured manifests
+and lockfiles are put back exactly as the run found them, preserving existing
+uncommitted edits. The output names what was rolled back, and the run exits 2.
+Other groups keep their successful updates. In JSON output each rolled-back
+entry carries `"status": "rolled_back"` and the file's `errors` gains an entry
+of kind `lockfile`. If a captured file cannot be restored, the error names it
+and every update in the affected group is reported `failed`, not `rolled_back`
+or applied. The named file then needs restoring manually.
+
+Resolution uses `uv lock`; it does not synchronize or install the project
+environment. To keep manifest edits without validating the lockfile, run
+`update --apply` without `--lock`, or `audit --fix-audit --apply --no-lock`.
+`audit` implies `--lock`; only `--no-lock` turns it off.
 
 ## Bump levels
 

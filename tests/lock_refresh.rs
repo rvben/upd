@@ -1289,3 +1289,232 @@ async fn a_manifest_named_through_a_differently_named_symlink_keeps_its_type() {
         run.stdout, run.stderr
     );
 }
+
+const WORKSPACE_ROOT: &str = "[project]\nname = 'root'\nversion = '1.0.0'\ndependencies = ['requests==2.31.0']\n\n[tool.uv.workspace]\nmembers = ['packages/*']\nexclude = ['packages/excluded']\n";
+
+/// Workspace resolver can damage unselected manifests before failing. Every
+/// file in the shared transaction must still return to its pre-run bytes.
+const UV_WORKSPACE_FAILING: &str = r#"#!/bin/sh
+if [ "$1" = '--version' ]; then echo 'uv 0.9.0'; exit 0; fi
+if [ "$1" != 'lock' ] || [ "$#" != 1 ]; then echo 'unexpected command' >&2; exit 9; fi
+printf '%s\n' "$PWD" >> calls
+case "$PWD" in
+  */excluded) printf 'independent lock\n' > uv.lock; exit 0 ;;
+esac
+printf 'partial lock\n' > uv.lock
+printf 'partial root\n' > pyproject.toml
+printf 'partial unselected member\n' > packages/b/pyproject.toml
+echo 'error: workspace constraints conflict' >&2
+exit 1
+"#;
+
+fn uv_workspace_fixture(root: &Path, tool: &str) -> (std::path::PathBuf, std::path::PathBuf) {
+    let bin = root.join("bin");
+    fs::create_dir(&bin).unwrap();
+    write_fake_tool(&bin, "uv", tool);
+    let project = root.join("workspace");
+    for member in ["a", "b", "excluded"] {
+        let dir = project.join("packages").join(member);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("pyproject.toml"), PYPROJECT).unwrap();
+    }
+    fs::write(project.join("pyproject.toml"), WORKSPACE_ROOT).unwrap();
+    fs::write(project.join("uv.lock"), "original shared lock\n").unwrap();
+    fs::write(
+        project.join("packages/excluded/uv.lock"),
+        "original independent lock\n",
+    )
+    .unwrap();
+    (bin, project)
+}
+
+#[tokio::test]
+async fn a_failed_uv_workspace_refresh_restores_all_members_and_keeps_excluded_project_updates() {
+    let server = wiremock::MockServer::start().await;
+    mount_pypi_latest(&server, "requests", "2.32.0").await;
+    let temp = tempfile::tempdir().unwrap();
+    let (bin, project) = uv_workspace_fixture(temp.path(), UV_WORKSPACE_FAILING);
+    let (stdout, stderr, code) = run_with_env(
+        &["--apply", "--lock", "--no-cache", "--format", "json", "."],
+        &project,
+        &[("UV_INDEX_URL", &server.uri()), ("PATH", &path_with(&bin))],
+    );
+    assert_eq!(code, 2, "{stdout}\n{stderr}");
+    assert_eq!(
+        fs::read_to_string(project.join("pyproject.toml")).unwrap(),
+        WORKSPACE_ROOT
+    );
+    for member in ["a", "b"] {
+        assert_eq!(
+            fs::read_to_string(project.join(format!("packages/{member}/pyproject.toml"))).unwrap(),
+            PYPROJECT
+        );
+        assert!(!project.join(format!("packages/{member}/uv.lock")).exists());
+    }
+    assert_eq!(
+        fs::read_to_string(project.join("uv.lock")).unwrap(),
+        "original shared lock\n"
+    );
+    assert_eq!(
+        fs::read_to_string(project.join("packages/excluded/pyproject.toml")).unwrap(),
+        PYPROJECT_UPDATED
+    );
+    assert_eq!(
+        fs::read_to_string(project.join("packages/excluded/uv.lock")).unwrap(),
+        "independent lock\n"
+    );
+    assert_eq!(
+        fs::read_to_string(project.join("calls"))
+            .unwrap()
+            .lines()
+            .count(),
+        1
+    );
+    assert!(
+        stderr.contains("workspace constraints conflict"),
+        "{stderr}"
+    );
+    let json: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    let mut rolled_back = 0;
+    let mut applied = 0;
+    for file in json["files"].as_array().unwrap() {
+        for update in file["updates"].as_array().unwrap() {
+            match update["status"].as_str().unwrap_or("applied") {
+                "rolled_back" => rolled_back += 1,
+                "applied" => applied += 1,
+                status => panic!("unexpected status {status}: {json}"),
+            }
+        }
+    }
+    assert_eq!((rolled_back, applied), (3, 1), "{json}");
+}
+
+#[tokio::test]
+async fn updating_one_uv_member_snapshots_the_unselected_root_and_siblings() {
+    let server = wiremock::MockServer::start().await;
+    mount_pypi_latest(&server, "requests", "2.32.0").await;
+    let temp = tempfile::tempdir().unwrap();
+    let (bin, project) = uv_workspace_fixture(temp.path(), UV_WORKSPACE_FAILING);
+    // Existing local edits must survive. They are not reconstructed from Git.
+    let sibling = format!("{PYPROJECT}# local work to preserve\n");
+    fs::write(project.join("packages/b/pyproject.toml"), &sibling).unwrap();
+    let (stdout, stderr, code) = run_with_env(
+        &[
+            "--apply",
+            "--lock",
+            "--no-cache",
+            "--format",
+            "json",
+            "pyproject.toml",
+        ],
+        &project.join("packages/a"),
+        &[("UV_INDEX_URL", &server.uri()), ("PATH", &path_with(&bin))],
+    );
+    assert_eq!(code, 2, "{stdout}\n{stderr}");
+    assert_eq!(
+        fs::read_to_string(project.join("pyproject.toml")).unwrap(),
+        WORKSPACE_ROOT
+    );
+    assert_eq!(
+        fs::read_to_string(project.join("packages/b/pyproject.toml")).unwrap(),
+        sibling
+    );
+    assert_eq!(
+        fs::read_to_string(project.join("packages/a/pyproject.toml")).unwrap(),
+        PYPROJECT
+    );
+    assert_eq!(
+        fs::read_to_string(project.join("uv.lock")).unwrap(),
+        "original shared lock\n"
+    );
+    assert_eq!(
+        fs::read_to_string(project.join("calls"))
+            .unwrap()
+            .lines()
+            .count(),
+        1
+    );
+    assert!(!stderr.contains("No lockfile"), "{stderr}");
+}
+
+#[tokio::test]
+async fn a_successful_uv_workspace_refresh_runs_once_at_the_root() {
+    let server = wiremock::MockServer::start().await;
+    mount_pypi_latest(&server, "requests", "2.32.0").await;
+    let temp = tempfile::tempdir().unwrap();
+    let script = r#"#!/bin/sh
+if [ "$1" = '--version' ]; then echo 'uv 0.9.0'; exit 0; fi
+if [ "$1" != 'lock' ] || [ "$#" != 1 ]; then exit 9; fi
+printf '%s\n' "$PWD" >> calls
+printf 'workspace resolved\n' > uv.lock
+"#;
+    let (bin, project) = uv_workspace_fixture(temp.path(), script);
+    let (stdout, stderr, code) = run_with_env(
+        &[
+            "--apply",
+            "--lock",
+            "--no-cache",
+            "--format",
+            "json",
+            "packages/a",
+            "packages/b",
+        ],
+        &project,
+        &[("UV_INDEX_URL", &server.uri()), ("PATH", &path_with(&bin))],
+    );
+    assert_eq!(code, 0, "{stdout}\n{stderr}");
+    assert_eq!(
+        fs::read_to_string(project.join("calls"))
+            .unwrap()
+            .lines()
+            .count(),
+        1
+    );
+    assert_eq!(
+        fs::read_to_string(project.join("uv.lock")).unwrap(),
+        "workspace resolved\n"
+    );
+    assert_eq!(
+        fs::read_to_string(project.join("pyproject.toml")).unwrap(),
+        WORKSPACE_ROOT
+    );
+    for member in ["a", "b"] {
+        assert_eq!(
+            fs::read_to_string(project.join(format!("packages/{member}/pyproject.toml"))).unwrap(),
+            PYPROJECT_UPDATED
+        );
+    }
+}
+
+#[tokio::test]
+async fn malformed_uv_workspace_membership_fails_before_any_manifest_is_written() {
+    let server = wiremock::MockServer::start().await;
+    mount_pypi_latest(&server, "requests", "2.32.0").await;
+    let temp = tempfile::tempdir().unwrap();
+    let (bin, project) = uv_workspace_fixture(temp.path(), UV_WORKSPACE_FAILING);
+    let malformed = WORKSPACE_ROOT.replace("members = ['packages/*']", "members = 'packages/*'");
+    fs::write(project.join("pyproject.toml"), &malformed).unwrap();
+    let (stdout, stderr, code) = run_with_env(
+        &[
+            "--apply",
+            "--lock",
+            "--no-cache",
+            "--format",
+            "json",
+            "packages/a",
+        ],
+        &project,
+        &[("UV_INDEX_URL", &server.uri()), ("PATH", &path_with(&bin))],
+    );
+    assert_ne!(code, 0, "{stdout}\n{stderr}");
+    assert!(stderr.contains("members must be an array"), "{stderr}");
+    assert_eq!(
+        fs::read_to_string(project.join("packages/a/pyproject.toml")).unwrap(),
+        PYPROJECT
+    );
+    assert_eq!(
+        fs::read_to_string(project.join("pyproject.toml")).unwrap(),
+        malformed
+    );
+    assert!(!project.join("calls").exists());
+}
