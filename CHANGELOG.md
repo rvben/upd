@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.11.1](https://github.com/rvben/upd/compare/v0.11.0...v0.11.1) - 2026-09-07
+
+### Fixed
+
+- **audit**: preserve npm compatibility when fixing transitive vulnerabilities, and refuse unsafe or conflicting overrides.
+- **audit**: honor exact and glob package selections without changing unrelated dependencies.
+
 ## [0.11.0](https://github.com/rvben/upd/compare/v0.10.4...v0.11.0) - 2026-09-07
 
 ### Breaking Changes
