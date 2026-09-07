@@ -312,6 +312,17 @@ impl<'a> IndexChain<'a> {
 
 #[async_trait]
 impl Registry for IndexChain<'_> {
+    async fn python_releases(&self, package: &str) -> Result<Vec<super::PythonRelease>> {
+        let mut last_error = anyhow!("No package index configured for '{package}'");
+        for link in self.links_for(package) {
+            match link.registry().python_releases(package).await {
+                Ok(releases) => return Ok(releases),
+                Err(error) => last_error = error,
+            }
+        }
+        Err(last_error)
+    }
+
     async fn get_latest_version(&self, package: &str) -> Result<String> {
         self.first_match(package, Query::Latest).await
     }

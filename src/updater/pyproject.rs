@@ -815,7 +815,7 @@ impl PyProjectUpdater {
     async fn update_array_deps(
         &self,
         array: &mut toml_edit::Array,
-        registry: &dyn Registry,
+        registry: &crate::registry::python::PythonRegistry<'_>,
         result: &mut UpdateResult,
         manifest: &ManifestContext<'_>,
         section_path: &str,
@@ -885,6 +885,17 @@ impl PyProjectUpdater {
                     continue;
                 }
 
+                match registry.for_dependency(s) {
+                    Ok(scope) if !scope.is_applicable() => {
+                        result.unchanged += 1;
+                        continue;
+                    }
+                    Err(error) => {
+                        result.errors.push(format!("{}: {error}", parsed.package));
+                        continue;
+                    }
+                    _ => {}
+                }
                 deps_to_check.push((i, s.to_string(), parsed, line_num));
             }
         }
@@ -917,7 +928,9 @@ impl PyProjectUpdater {
         // Fetch versions for remaining deps in parallel
         let version_futures: Vec<_> = deps_to_check
             .iter()
-            .map(|(_, _, parsed, _)| async {
+            .map(|(_, dep_str, parsed, _)| async {
+                let scoped = registry.for_dependency(dep_str)?;
+                let registry = &scoped;
                 if !parsed.raisable {
                     // Nothing here can be rewritten, so the only question left
                     // is whether the newest release is one this specifier
@@ -958,6 +971,10 @@ impl PyProjectUpdater {
         for ((i, dep_str, parsed, line_num), version_result) in
             deps_to_check.into_iter().zip(version_results)
         {
+            let scoped = registry
+                .for_dependency(&dep_str)
+                .expect("marker validated before lookup");
+            let registry = &scoped;
             let ParsedDep {
                 package,
                 version: current_version,
@@ -1112,7 +1129,7 @@ impl PyProjectUpdater {
     async fn normalize_array_deps(
         &self,
         array: &mut toml_edit::Array,
-        registry: &dyn Registry,
+        registry: &crate::registry::python::PythonRegistry<'_>,
         result: &mut UpdateResult,
         manifest: &ManifestContext<'_>,
         options: &UpdateOptions,
@@ -1220,12 +1237,25 @@ impl PyProjectUpdater {
                 continue;
             }
 
+            match registry.for_dependency(dep) {
+                Ok(scope) if !scope.is_applicable() => {
+                    result.unchanged += 1;
+                    continue;
+                }
+                Err(error) => {
+                    result.errors.push(format!("{}: {error}", target.package));
+                    continue;
+                }
+                _ => {}
+            }
             to_resolve.push((i, dep.to_string(), target, line_num));
         }
 
         let lookups: Vec<_> = to_resolve
             .iter()
-            .map(|(_, _, target, _)| async {
+            .map(|(_, dep, target, _)| async {
+                let scoped = registry.for_dependency(dep)?;
+                let registry = &scoped;
                 match target.anchor.as_deref() {
                     Some(anchor) if !is_stable_pep440(anchor) => {
                         python_version_with_revalidation(
@@ -1252,6 +1282,10 @@ impl PyProjectUpdater {
         let resolved = join_all(lookups).await;
 
         for ((i, dep, target, line_num), lookup) in to_resolve.into_iter().zip(resolved) {
+            let scoped = registry
+                .for_dependency(&dep)
+                .expect("marker validated before lookup");
+            let registry = &scoped;
             let latest = match lookup {
                 Ok(latest) => latest,
                 Err(error) => {
@@ -1408,7 +1442,7 @@ impl PyProjectUpdater {
     async fn update_poetry_deps(
         &self,
         deps_table: &mut toml_edit::Table,
-        registry: &dyn Registry,
+        registry: &crate::registry::python::PythonRegistry<'_>,
         result: &mut UpdateResult,
         line_index: &PyProjectLineIndex,
         section_path: &str,
@@ -2055,6 +2089,11 @@ impl Updater for PyProjectUpdater {
             Some(chain) => chain,
             None => registry,
         };
+        let python_registry = crate::registry::python::PythonRegistry::for_project(
+            effective_registry,
+            crate::registry::python::project_requirement(&doc)?,
+        );
+        let effective_registry = &python_registry;
 
         // Update project dependencies in section or inline-table spelling.
         if let Some(deps) = array_at(&mut doc, &["project", "dependencies"]) {
@@ -2139,6 +2178,7 @@ impl Updater for PyProjectUpdater {
             write_file_atomic(path, &doc.to_string())?;
         }
 
+        result.warnings.extend(python_registry.notes());
         Ok(result)
     }
 

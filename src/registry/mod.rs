@@ -8,6 +8,8 @@ pub mod mock;
 mod npm;
 mod nuget;
 mod pypi;
+pub(crate) mod python;
+pub use python::PythonRelease;
 mod rubygems;
 mod terraform;
 mod utils;
@@ -311,6 +313,10 @@ pub fn tags_at_commit_unsupported() -> Result<TagsAtCommit> {
 /// a new one that does not silently loses prerelease and constraint handling.
 #[async_trait]
 pub trait Registry: Send + Sync {
+    /// All Python releases and per-file interpreter constraints.
+    /// Non-Python registries explicitly report this capability as unsupported.
+    async fn python_releases(&self, package: &str) -> Result<Vec<PythonRelease>>;
+
     /// Get the latest stable version of a package
     async fn get_latest_version(&self, package: &str) -> Result<String>;
 
@@ -537,6 +543,13 @@ mod tests {
 
     #[async_trait]
     impl Registry for MinimalRegistry {
+        async fn python_releases(
+            &self,
+            _package: &str,
+        ) -> anyhow::Result<Vec<crate::registry::PythonRelease>> {
+            anyhow::bail!("registry does not expose Python compatibility metadata")
+        }
+
         async fn get_latest_version(&self, _package: &str) -> Result<String> {
             Ok(self.version.clone())
         }

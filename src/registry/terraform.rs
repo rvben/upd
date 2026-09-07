@@ -168,6 +168,13 @@ impl Default for TerraformRegistry {
 
 #[async_trait]
 impl Registry for TerraformRegistry {
+    async fn python_releases(
+        &self,
+        _package: &str,
+    ) -> anyhow::Result<Vec<crate::registry::PythonRelease>> {
+        anyhow::bail!("registry does not expose Python compatibility metadata")
+    }
+
     async fn get_latest_version(&self, package: &str) -> Result<String> {
         let versions = self.get_all_versions(package).await?;
 

@@ -463,6 +463,13 @@ impl Default for CratesIoRegistry {
 
 #[async_trait]
 impl Registry for CratesIoRegistry {
+    async fn python_releases(
+        &self,
+        _package: &str,
+    ) -> anyhow::Result<Vec<crate::registry::PythonRelease>> {
+        anyhow::bail!("registry does not expose Python compatibility metadata")
+    }
+
     async fn get_latest_version(&self, package: &str) -> Result<String> {
         let data = self.fetch_crate(package).await?;
 

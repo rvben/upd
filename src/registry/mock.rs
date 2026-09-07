@@ -162,6 +162,39 @@ impl MockRegistry {
 
 #[async_trait]
 impl Registry for MockRegistry {
+    async fn python_releases(&self, package: &str) -> Result<Vec<super::PythonRelease>> {
+        // Ordinary mock versions represent files with no interpreter restriction.
+        let mut versions = HashSet::new();
+        if let Some((stable, prerelease)) = self.versions.get(package) {
+            versions.insert(stable.clone());
+            versions.extend(prerelease.iter().cloned());
+        }
+        if let Some(metadata) = self.version_metas.get(package) {
+            versions.extend(
+                metadata
+                    .iter()
+                    .filter(|v| !v.yanked)
+                    .map(|v| v.version.clone()),
+            );
+        }
+        versions.extend(
+            self.constrained_versions
+                .iter()
+                .filter(|((name, _), _)| name == package)
+                .map(|(_, version)| version.clone()),
+        );
+        if versions.is_empty() {
+            return Err(anyhow!("Package not found: {package}"));
+        }
+        Ok(versions
+            .into_iter()
+            .map(|version| super::PythonRelease {
+                version,
+                requires_python: vec![None],
+            })
+            .collect())
+    }
+
     async fn get_latest_version(&self, package: &str) -> Result<String> {
         self.versions
             .get(package)

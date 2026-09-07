@@ -207,6 +207,7 @@ pub struct CachedRegistry<R> {
     namespace: Option<String>,
     refresh_locks: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
     revalidated: Mutex<HashMap<String, String>>,
+    python_releases: tokio::sync::Mutex<HashMap<String, Vec<crate::registry::PythonRelease>>>,
 }
 
 impl<R: Registry> CachedRegistry<R> {
@@ -218,6 +219,7 @@ impl<R: Registry> CachedRegistry<R> {
             namespace: None,
             refresh_locks: Mutex::new(HashMap::new()),
             revalidated: Mutex::new(HashMap::new()),
+            python_releases: tokio::sync::Mutex::new(HashMap::new()),
         }
     }
 
@@ -239,6 +241,7 @@ impl<R: Registry> CachedRegistry<R> {
             namespace: Some(namespace.into()),
             refresh_locks: Mutex::new(HashMap::new()),
             revalidated: Mutex::new(HashMap::new()),
+            python_releases: tokio::sync::Mutex::new(HashMap::new()),
         }
     }
 
@@ -284,6 +287,23 @@ impl<R: Registry> CachedRegistry<R> {
 
 #[async_trait]
 impl<R: Registry> Registry for CachedRegistry<R> {
+    async fn python_releases(&self, package: &str) -> Result<Vec<crate::registry::PythonRelease>> {
+        if !self.enabled {
+            return self.inner.python_releases(package).await;
+        }
+        let lock = self.refresh_lock(&format!("python-metadata:{package}"));
+        let _guard = lock.lock().await;
+        if let Some(releases) = self.python_releases.lock().await.get(package).cloned() {
+            return Ok(releases);
+        }
+        let releases = self.inner.python_releases(package).await?;
+        self.python_releases
+            .lock()
+            .await
+            .insert(package.to_string(), releases.clone());
+        Ok(releases)
+    }
+
     async fn get_latest_version(&self, package: &str) -> Result<String> {
         if let Some(v) = self.cache_get(package) {
             return Ok(v);
@@ -764,6 +784,13 @@ mod tests {
 
         #[async_trait]
         impl Registry for CountingRegistry {
+            async fn python_releases(
+                &self,
+                _package: &str,
+            ) -> anyhow::Result<Vec<crate::registry::PythonRelease>> {
+                anyhow::bail!("registry does not expose Python compatibility metadata")
+            }
+
             async fn get_latest_version(&self, _package: &str) -> Result<String> {
                 self.calls.fetch_add(1, Ordering::SeqCst);
                 Ok("1.1.2".to_string())

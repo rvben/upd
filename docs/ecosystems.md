@@ -46,6 +46,41 @@ rather than against the ranges it declares. See [Audit](audit.md).
 - `dev-requirements.txt`, `*-requirements.txt`, `*_requirements.txt`
 - `pyproject.toml` (PEP 621 and Poetry formats)
 
+When `[project].requires-python` or `[tool.poetry.dependencies].python` is
+present, update checks select the newest release whose non-yanked files cover
+the declared Python range. For example, `>=3.10` prevents selecting a release
+that requires `>=3.11`. Upper bounds, exclusions, compatible-release constraints,
+and Poetry caret, tilde, wildcard, and union constraints are supported. When
+both declarations exist, their intersection defines the resolver range.
+Requirements files inherit the nearest enclosing `pyproject.toml`, stopping at
+the repository boundary. Without a declaration, selection is unchanged; the
+installed interpreter and `.python-version` do not override project metadata.
+
+Compatibility checks read per-file `Requires-Python` from Simple JSON, Simple
+HTML, or the legacy PyPI JSON API, including private indexes. Missing metadata
+is treated as unrestricted; files with invalid metadata cannot establish
+compatibility. An empty compatible set reports an error and leaves that
+dependency unchanged. Explicit configuration pins remain user overrides.
+Cooldown candidates are filtered by the same Python range. Complete metadata is
+cached in memory for the current run, independently of project constraints;
+previously cached latest-version answers cannot bypass compatibility checks.
+When Python compatibility selects an older candidate, text and JSON reports
+explain the selected version, the newer release's `Requires-Python`, and the
+project range (including the dependency marker, when present). For example:
+`demo: Python compatibility selects 1.5 instead of 2.0; 2.0 declares
+Requires-Python '>=3.11'; project supports >=3.10`. This describes compatibility
+selection; cooldowns and bump limits can further restrict the final update.
+
+This is an interpreter-metadata check, not a full dependency resolution. It
+does not validate platform wheel tags or transitive dependencies. PEP 508 dependency
+markers narrow the Python range separately for each dependency occurrence,
+including `python_version`, `python_full_version`, and combined `and`/`or`
+expressions. Platform and extra conditions consider all possible environments;
+they are not evaluated against the machine running `upd`. Dependencies whose
+markers cannot apply to the project Python range stay unchanged without a
+registry lookup. Invalid markers report an error and remain unchanged.
+Use `--lock` to have the package manager validate the resulting dependency set.
+
 ## Node.js
 
 - `package.json` (`dependencies` and `devDependencies`)

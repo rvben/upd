@@ -275,6 +275,11 @@ impl Updater for RequirementsUpdater {
             Some(chain) => chain,
             None => registry,
         };
+        let python_registry = crate::registry::python::PythonRegistry::for_project(
+            effective_registry,
+            crate::registry::python::requirements_project(path)?,
+        );
+        let effective_registry = &python_registry;
 
         // First pass: collect all packages that need version checks
         let lines: Vec<&str> = content.lines().collect();
@@ -348,6 +353,17 @@ impl Updater for RequirementsUpdater {
                 continue;
             }
 
+            match effective_registry.for_dependency(line) {
+                Ok(scope) if !scope.is_applicable() => {
+                    result.unchanged += 1;
+                    continue;
+                }
+                Err(error) => {
+                    result.errors.push(format!("{}: {error}", parsed.package));
+                    continue;
+                }
+                _ => {}
+            }
             fetch_deps.push((*line_idx, *line, parsed));
         }
 
@@ -361,7 +377,9 @@ impl Updater for RequirementsUpdater {
         // so we do not silently promote the user to a stable release.
         let version_futures: Vec<_> = fetch_deps
             .iter()
-            .map(|(_, _, parsed)| async {
+            .map(|(_, line, parsed)| async {
+                let scoped = effective_registry.for_dependency(line)?;
+                let effective_registry = &scoped;
                 if !parsed.raisable {
                     // Nothing here can be rewritten, so the only question left
                     // is whether the newest release is one this specifier
@@ -490,8 +508,11 @@ impl Updater for RequirementsUpdater {
                             } else {
                                 Some(parsed.full_constraint.as_str())
                             };
+                            let scoped = effective_registry
+                                .for_dependency(line)
+                                .expect("marker validated before lookup");
                             let (outcome, note) = crate::updater::apply_cooldown(
-                                effective_registry,
+                                &scoped,
                                 &parsed.package,
                                 &parsed.first_version,
                                 &latest_version,
@@ -615,6 +636,7 @@ impl Updater for RequirementsUpdater {
             write_file_atomic(path, &new_content)?;
         }
 
+        result.warnings.extend(python_registry.notes());
         Ok(result)
     }
 

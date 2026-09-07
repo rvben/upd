@@ -476,6 +476,13 @@ impl Default for NpmRegistry {
 
 #[async_trait]
 impl Registry for NpmRegistry {
+    async fn python_releases(
+        &self,
+        _package: &str,
+    ) -> anyhow::Result<Vec<crate::registry::PythonRelease>> {
+        anyhow::bail!("registry does not expose Python compatibility metadata")
+    }
+
     async fn get_latest_version(&self, package: &str) -> Result<String> {
         let data = self.fetch_package_with_scope_resolution(package).await?;
 

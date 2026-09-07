@@ -1352,6 +1352,13 @@ mod tests {
 
     #[async_trait::async_trait]
     impl Registry for CountingRegistry {
+        async fn python_releases(
+            &self,
+            _package: &str,
+        ) -> anyhow::Result<Vec<crate::registry::PythonRelease>> {
+            anyhow::bail!("registry does not expose Python compatibility metadata")
+        }
+
         async fn get_latest_version(&self, package: &str) -> Result<String> {
             self.calls.fetch_add(1, AtomicOrdering::SeqCst);
             self.inner.get_latest_version(package).await

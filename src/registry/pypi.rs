@@ -102,6 +102,8 @@ where
 
 #[derive(Debug, Clone, Deserialize)]
 struct SimpleApiFile {
+    #[serde(default, rename = "requires-python")]
+    requires_python: Option<String>,
     filename: String,
     #[serde(default, deserialize_with = "deserialize_yanked_flag")]
     yanked: bool,
@@ -109,10 +111,17 @@ struct SimpleApiFile {
 
 #[derive(Debug, Clone, Deserialize)]
 struct ReleaseFile {
+    #[serde(default)]
+    requires_python: Option<String>,
     #[serde(default, deserialize_with = "deserialize_yanked_flag")]
     yanked: bool,
     #[serde(default)]
     upload_time_iso_8601: Option<String>,
+}
+
+enum PackageResponse {
+    Simple(SimpleApiResponse),
+    Legacy(PyPiResponse),
 }
 
 impl PyPiRegistry {
@@ -417,6 +426,15 @@ impl PyPiRegistry {
         package: &str,
         include_prereleases: bool,
     ) -> Result<Vec<(Version, String)>> {
+        match self.fetch_package(package).await? {
+            PackageResponse::Simple(data) => {
+                self.parse_simple_api_json_response(data, package, include_prereleases)
+            }
+            PackageResponse::Legacy(data) => self.parse_json_response(data, include_prereleases),
+        }
+    }
+
+    async fn fetch_package(&self, package: &str) -> Result<PackageResponse> {
         let normalized = package.to_lowercase().replace('_', "-");
 
         // Try Simple API with PEP 691 content negotiation
@@ -447,11 +465,13 @@ impl PyPiRegistry {
             {
                 // PEP 691 JSON format
                 let data: SimpleApiResponse = simple_response.json().await?;
-                return self.parse_simple_api_json_response(data, package, include_prereleases);
+                return Ok(PackageResponse::Simple(data));
             } else {
                 // HTML format (standard Simple API or PEP 691 HTML)
                 let html = simple_response.text().await?;
-                return self.parse_simple_api_response(&html, package, include_prereleases);
+                return Ok(PackageResponse::Simple(SimpleApiResponse {
+                    files: Self::html_files(&html),
+                }));
             }
         }
 
@@ -461,7 +481,7 @@ impl PyPiRegistry {
 
         if response.status().is_success() {
             let data: PyPiResponse = response.json().await?;
-            return self.parse_json_response(data, include_prereleases);
+            return Ok(PackageResponse::Legacy(data));
         }
 
         Err(anyhow!(http_error_message(
@@ -552,109 +572,57 @@ impl PyPiRegistry {
 
     /// Parse Simple API HTML response (for private registries)
     /// Extracts versions from package filenames in anchor tags
+    #[cfg(test)]
     fn parse_simple_api_response(
         &self,
         html: &str,
         package: &str,
         include_prereleases: bool,
     ) -> Result<Vec<(Version, String)>> {
-        let mut versions: Vec<(Version, String)> = Vec::new();
-        let normalized = package.to_lowercase().replace('_', "-");
+        self.parse_simple_api_json_response(
+            SimpleApiResponse {
+                files: Self::html_files(html),
+            },
+            package,
+            include_prereleases,
+        )
+    }
 
-        // Use a state machine to collect multi-line <a> opening tags.
-        //
-        // Some registries (e.g. Nexus Repository Manager) spread attributes
-        // across multiple lines:
-        //   <a href="...pkg-1.0.0.whl#sha256=..."
-        //     rel="internal"
-        //     data-requires-python="&gt;=3.10"
-        //     >
-        //       pkg-1.0.0.whl
-        //   </a>
-        //
-        // We extract the filename from the `href` URL (the last path segment
-        // before the `#sha256=...` fragment) rather than the link text, so
-        // both single-line and multi-line formats are handled uniformly.
-        let mut collecting = false;
-        let mut is_yanked = false;
-        let mut href_value: Option<String> = None;
-
-        for line in html.lines() {
-            let trimmed = line.trim();
-
-            // Detect start of an anchor element
-            if trimmed.starts_with("<a ") || trimmed.starts_with("<a\t") {
-                collecting = true;
-                is_yanked = false;
-                href_value = None;
-            }
-
-            if collecting {
-                // Check for yanked attribute (may be on any line of the element)
-                if trimmed.contains("data-yanked") {
-                    is_yanked = true;
-                }
-
-                // Extract href value from whichever line carries it
-                if href_value.is_none()
-                    && let Some(href_start) = trimmed.find("href=\"")
-                {
-                    let after = &trimmed[href_start + 6..];
-                    if let Some(href_end) = after.find('"') {
-                        href_value = Some(after[..href_end].to_string());
-                    }
-                }
-
-                // The opening tag ends when we see a bare `>`.
-                // `&gt;` in attribute values (e.g. data-requires-python="&gt;=3.10")
-                // is the HTML entity and does NOT contain a literal `>` byte in the
-                // raw HTTP response, so it won't trigger this check.
-                if trimmed.contains('>') {
-                    collecting = false;
-
-                    if is_yanked {
-                        continue;
-                    }
-
-                    let Some(href) = href_value.take() else {
-                        continue;
-                    };
-
-                    // Filename is the last URL path segment, before any `#fragment`
-                    let url_path = href.split('#').next().unwrap_or(&href);
-                    let filename = url_path.split('/').next_back().unwrap_or("");
-
-                    let Some(version_str) =
-                        Self::extract_version_from_filename(filename, &normalized)
-                    else {
-                        continue;
-                    };
-
-                    if !include_prereleases && !Self::is_stable_version(&version_str) {
-                        continue;
-                    }
-
-                    let Ok(version) = version_str.parse::<Version>() else {
-                        continue;
-                    };
-
-                    // Avoid duplicates (e.g. both .whl and .tar.gz for the same version)
-                    if !versions.iter().any(|(_, v)| v == &version_str) {
-                        versions.push((version, version_str));
-                    }
-                }
-            }
-        }
-
-        if versions.is_empty() {
-            return Err(anyhow!(
-                "Package '{}' exists but has no suitable versions. All releases may be yanked or pre-release.",
-                package
-            ));
-        }
-
-        versions.sort_by(|a, b| b.0.cmp(&a.0));
-        Ok(versions)
+    fn html_files(html: &str) -> Vec<SimpleApiFile> {
+        use std::sync::LazyLock;
+        static ANCHOR: LazyLock<regex::Regex> = LazyLock::new(|| {
+            regex::Regex::new(r#"(?is)<a\b((?:"[^"]*"|'[^']*'|[^'">])*)>"#).unwrap()
+        });
+        static ATTR: LazyLock<regex::Regex> = LazyLock::new(|| {
+            regex::Regex::new(r#"(?is)([\w-]+)(?:\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s>]+)))?"#)
+                .unwrap()
+        });
+        ANCHOR
+            .captures_iter(html)
+            .filter_map(|tag| {
+                let attrs: HashMap<String, String> = ATTR
+                    .captures_iter(&tag[1])
+                    .map(|attr| {
+                        let value = attr
+                            .get(2)
+                            .or_else(|| attr.get(3))
+                            .or_else(|| attr.get(4))
+                            .map_or("", |m| m.as_str());
+                        (
+                            attr[1].to_ascii_lowercase(),
+                            html_escape::decode_html_entities(value).into_owned(),
+                        )
+                    })
+                    .collect();
+                let href = attrs.get("href")?;
+                let filename = href.split('#').next()?.rsplit('/').next()?.to_string();
+                Some(SimpleApiFile {
+                    filename,
+                    yanked: attrs.contains_key("data-yanked"),
+                    requires_python: attrs.get("data-requires-python").cloned(),
+                })
+            })
+            .collect()
     }
 
     /// Extract version from a package filename
@@ -778,6 +746,17 @@ impl MultiPyPiRegistry {
 
 #[async_trait]
 impl Registry for MultiPyPiRegistry {
+    async fn python_releases(&self, package: &str) -> Result<Vec<super::PythonRelease>> {
+        let mut last_error = anyhow!("No registries configured");
+        for registry in &self.registries {
+            match registry.python_releases(package).await {
+                Ok(releases) => return Ok(releases),
+                Err(error) => last_error = error,
+            }
+        }
+        Err(last_error)
+    }
+
     async fn get_latest_version(&self, package: &str) -> Result<String> {
         if self.registries.is_empty() {
             return Err(anyhow!("No registries configured"));
@@ -927,6 +906,44 @@ impl Registry for MultiPyPiRegistry {
 
 #[async_trait]
 impl Registry for PyPiRegistry {
+    async fn python_releases(&self, package: &str) -> Result<Vec<super::PythonRelease>> {
+        let mut releases: HashMap<String, Vec<Option<String>>> = HashMap::new();
+        match self.fetch_package(package).await? {
+            PackageResponse::Simple(data) => {
+                let normalized = package.to_lowercase().replace('_', "-");
+                for file in data.files.into_iter().filter(|f| !f.yanked) {
+                    if let Some(version) =
+                        Self::extract_version_from_filename(&file.filename, &normalized)
+                    {
+                        releases
+                            .entry(version)
+                            .or_default()
+                            .push(file.requires_python);
+                    }
+                }
+            }
+            PackageResponse::Legacy(data) => {
+                for (version, files) in data.releases {
+                    let requirements: Vec<_> = files
+                        .into_iter()
+                        .filter(|f| !f.yanked)
+                        .map(|f| f.requires_python)
+                        .collect();
+                    if !requirements.is_empty() {
+                        releases.insert(version, requirements);
+                    }
+                }
+            }
+        }
+        Ok(releases
+            .into_iter()
+            .map(|(version, requires_python)| super::PythonRelease {
+                version,
+                requires_python,
+            })
+            .collect())
+    }
+
     async fn get_latest_version(&self, package: &str) -> Result<String> {
         let versions = self.fetch_versions(package).await?;
 
@@ -1248,18 +1265,22 @@ mod tests {
         let data = SimpleApiResponse {
             files: vec![
                 SimpleApiFile {
+                    requires_python: None,
                     filename: "my_package-1.0.0.tar.gz".to_string(),
                     yanked: false,
                 },
                 SimpleApiFile {
+                    requires_python: None,
                     filename: "my_package-1.1.0.tar.gz".to_string(),
                     yanked: false,
                 },
                 SimpleApiFile {
+                    requires_python: None,
                     filename: "my_package-1.2.0-py3-none-any.whl".to_string(),
                     yanked: false,
                 },
                 SimpleApiFile {
+                    requires_python: None,
                     filename: "my_package-2.0.0a1.tar.gz".to_string(),
                     yanked: false,
                 },
@@ -1289,18 +1310,22 @@ mod tests {
         let data = SimpleApiResponse {
             files: vec![
                 SimpleApiFile {
+                    requires_python: None,
                     filename: "my_package-1.0.0.tar.gz".to_string(),
                     yanked: false,
                 },
                 SimpleApiFile {
+                    requires_python: None,
                     filename: "my_package-1.1.0.tar.gz".to_string(),
                     yanked: true, // Yanked
                 },
                 SimpleApiFile {
+                    requires_python: None,
                     filename: "my_package-1.2.0.tar.gz".to_string(),
                     yanked: true, // Yanked
                 },
                 SimpleApiFile {
+                    requires_python: None,
                     filename: "my_package-1.3.0.tar.gz".to_string(),
                     yanked: false,
                 },

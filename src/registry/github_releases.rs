@@ -249,6 +249,13 @@ impl Default for GitHubReleasesRegistry {
 
 #[async_trait]
 impl Registry for GitHubReleasesRegistry {
+    async fn python_releases(
+        &self,
+        _package: &str,
+    ) -> anyhow::Result<Vec<crate::registry::PythonRelease>> {
+        anyhow::bail!("registry does not expose Python compatibility metadata")
+    }
+
     fn name(&self) -> &'static str {
         "github-releases"
     }

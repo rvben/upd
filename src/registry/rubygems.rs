@@ -55,6 +55,13 @@ impl Default for RubyGemsRegistry {
 
 #[async_trait]
 impl Registry for RubyGemsRegistry {
+    async fn python_releases(
+        &self,
+        _package: &str,
+    ) -> anyhow::Result<Vec<crate::registry::PythonRelease>> {
+        anyhow::bail!("registry does not expose Python compatibility metadata")
+    }
+
     async fn get_latest_version(&self, package: &str) -> Result<String> {
         let url = format!("{}/api/v1/gems/{}.json", self.api_url, package);
         let response = get_with_retry(&self.client, &url).await?;

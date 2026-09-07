@@ -329,6 +329,13 @@ impl Default for GoProxyRegistry {
 
 #[async_trait]
 impl Registry for GoProxyRegistry {
+    async fn python_releases(
+        &self,
+        _package: &str,
+    ) -> anyhow::Result<Vec<crate::registry::PythonRelease>> {
+        anyhow::bail!("registry does not expose Python compatibility metadata")
+    }
+
     async fn get_latest_version(&self, package: &str) -> Result<String> {
         // Try @latest endpoint first (returns latest stable)
         let escaped = Self::escape_module_path(package);
