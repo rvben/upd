@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.11.0](https://github.com/rvben/upd/compare/v0.10.4...v0.11.0) - 2026-09-07
+
+### Breaking Changes
+
+- **python**: select compatible dependency updates using Python ranges and markers ([0fa5be0](https://github.com/rvben/upd/commit/0fa5be0c45615644d5fbb06b0f248c73cc68092a))
+
+### Added
+
+- **mise**: check a tool against the backend its entry names ([608d90f](https://github.com/rvben/upd/commit/608d90ffe7554de7ee94924068ba0e582b320da6))
+
+### Fixed
+
+- **lock**: roll back shared uv workspaces when resolution fails ([9826d43](https://github.com/rvben/upd/commit/9826d43184b78e2a4ad59d1982da4a16ef09ba07))
+- **discovery**: follow manifest symlinks when updating and refreshing lockfiles ([630a34a](https://github.com/rvben/upd/commit/630a34aa2a82e78ec151a517d8e81131d97d4fa0))
+- **discover**: scan a file named by overlapping path arguments once ([ddafc6a](https://github.com/rvben/upd/commit/ddafc6a37ed8b0e83cba41e66a26aa7d49571e75))
+- **lock**: roll back a directory whose lockfile refresh fails ([dd502c4](https://github.com/rvben/upd/commit/dd502c405667c060ba6a4343447a92097fce9c75))
+- **lock**: refresh bun.lock and stop the bun refresh from installing ([2ce9fab](https://github.com/rvben/upd/commit/2ce9fab50b0c3c2f1fa9de881f5f5cd638fa401f))
+- **lock**: run poetry lock without --no-update on Poetry 2 ([c575d1a](https://github.com/rvben/upd/commit/c575d1af5587205044d6c0b2cf68f5f8d6e97a4f))
+
 ## [0.10.4](https://github.com/rvben/upd/compare/v0.10.3...v0.10.4) - 2026-09-04
 
 ### Added
