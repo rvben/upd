@@ -2911,11 +2911,10 @@ mod tests {
         );
     }
 
-    /// Two symlinks to one file are two spellings of it and neither is the
-    /// file's own name, so the first keeps its place.
+    /// Two symlinks to one file resolve to one update target.
     #[cfg(unix)]
     #[test]
-    fn the_first_of_two_symlinks_to_one_file_is_listed() {
+    fn two_symlinks_to_one_file_list_the_target_once() {
         let temp = tempdir().unwrap();
         let manifest = temp.path().join("target.toml");
         fs::write(&manifest, "").unwrap();
@@ -2925,8 +2924,8 @@ mod tests {
         std::os::unix::fs::symlink(&manifest, &second).unwrap();
 
         assert_eq!(
-            discover_files(&[first.clone(), second], &[]),
-            vec![(first, FileType::Annotated)]
+            discover_files(&[first, second], &[]),
+            vec![(manifest, FileType::Annotated)]
         );
     }
 
