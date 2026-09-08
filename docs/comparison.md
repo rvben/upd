@@ -9,6 +9,12 @@ solves the same problem.
 The versions below are part of the comparison. Features added after those
 versions are not represented until this page is refreshed.
 
+Since this snapshot, the development version of upd has added `prek.toml`
+and the `--lang prek` alias, plus language-aware Python, Node, and Rust hook
+`additional_dependencies` updates in both pre-commit formats. See the
+[current ecosystem coverage](ecosystems.md#pre-commit) for supported syntax
+and limitations; the versioned matrix below remains the historical snapshot.
+
 ## Choose by the job
 
 These tools overlap, but they are not interchangeable. Start with the job you

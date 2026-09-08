@@ -221,15 +221,14 @@ impl Default for PackageJsonUpdater {
     }
 }
 
-#[async_trait::async_trait]
-impl Updater for PackageJsonUpdater {
-    async fn update(
+impl PackageJsonUpdater {
+    /// Shared in-memory update path for npm requirements embedded in hook configs.
+    pub(crate) async fn update_content(
         &self,
-        path: &Path,
+        content: String,
         registry: &dyn Registry,
         options: UpdateOptions,
-    ) -> Result<UpdateResult> {
-        let content = read_file_safe(path)?;
+    ) -> Result<(UpdateResult, String)> {
         let json = parse_package_json(&content)?;
         let mut result = UpdateResult::default();
         let mut new_content = content.clone();
@@ -825,10 +824,25 @@ impl Updater for PackageJsonUpdater {
             }
         }
 
+        Ok((result, new_content))
+    }
+}
+
+#[async_trait::async_trait]
+impl Updater for PackageJsonUpdater {
+    async fn update(
+        &self,
+        path: &Path,
+        registry: &dyn Registry,
+        options: UpdateOptions,
+    ) -> Result<UpdateResult> {
+        let content = read_file_safe(path)?;
+        let (result, new_content) = self
+            .update_content(content, registry, options.clone())
+            .await?;
         if (!result.updated.is_empty() || !result.pinned.is_empty()) && !options.dry_run {
             write_file_atomic(path, &new_content)?;
         }
-
         Ok(result)
     }
 

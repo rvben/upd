@@ -1,118 +1,392 @@
+mod config;
+mod dependencies;
+#[cfg(test)]
+#[path = "pre_commit/tests.rs"]
+mod extended_tests;
+
 use super::{
-    FileType, ParsedDependency, UpdateOptions, UpdateResult, Updater, downgrade_warning,
-    read_file_safe, write_file_atomic,
+    CooldownOutcome, FileType, ParsedDependency, RegistrySet, UpdateOptions, UpdateResult, Updater,
+    apply_cooldown, downgrade_warning, read_file_safe, write_file_atomic,
 };
 use crate::align::compare_versions;
 use crate::registry::Registry;
 use crate::updater::Lang;
 use crate::version::match_version_precision;
 use anyhow::Result;
-use futures::future::join_all;
-use regex::Regex;
+use config::{Node, Scalar};
 use std::collections::HashMap;
+use std::ops::Range;
 use std::path::Path;
 
 pub struct PreCommitUpdater {
-    repo_re: Regex,
-    rev_re: Regex,
+    registries: RegistrySet,
+}
+
+#[derive(Debug, Clone)]
+pub struct PreCommitEdit {
+    pub package: String,
+    pub current: String,
+    pub new: String,
+    pub line: Option<usize>,
+    pub span: Range<usize>,
+    pub original: String,
+    pub replacement: String,
+    pub source: Option<crate::annotation::AnnotationSource>,
+    pub pinned: bool,
+    /// An inherited language was read at this planned repository revision.
+    pub required_revision: Option<(Range<usize>, String)>,
+}
+
+fn record_edit(result: &mut UpdateResult, scalar: &Scalar, replacement: &str) {
+    for ((package, current, new, line), pinned) in result
+        .updated
+        .iter()
+        .map(|entry| (entry, false))
+        .chain(result.pinned.iter().map(|entry| (entry, true)))
+    {
+        result.pre_commit_edits.push(PreCommitEdit {
+            package: package.clone(),
+            current: current.clone(),
+            new: new.clone(),
+            line: *line,
+            span: scalar.span.clone().unwrap(),
+            original: scalar.value.clone(),
+            replacement: replacement.into(),
+            source: result.entry_ecosystem.get(package).copied(),
+            pinned,
+            required_revision: None,
+        });
+    }
 }
 
 impl PreCommitUpdater {
     pub fn new() -> Self {
-        let repo_re = Regex::new(r"^\s*-?\s*repo:\s*(.+)").expect("Invalid repo regex");
-        let rev_re = Regex::new(r##"^\s*rev:\s*['"]?([^'"#\s]+)"##).expect("Invalid rev regex");
-        Self { repo_re, rev_re }
-    }
-
-    /// Extract `owner/repo` from a GitHub URL.
-    /// Handles `https://github.com/owner/repo` and `https://github.com/owner/repo.git`.
-    /// Returns None for non-GitHub URLs.
-    fn extract_github_owner_repo(url: &str) -> Option<String> {
-        let url = url.trim();
-
-        // Must be a GitHub URL
-        let path = url
-            .strip_prefix("https://github.com/")
-            .or_else(|| url.strip_prefix("http://github.com/"))?;
-
-        let mut parts = path.trim_end_matches('/').splitn(3, '/');
-        let owner = parts.next().filter(|s| !s.is_empty())?;
-        let repo = parts.next().filter(|s| !s.is_empty())?;
-
-        // Strip .git suffix if present
-        let repo = repo.strip_suffix(".git").unwrap_or(repo);
-
-        Some(format!("{}/{}", owner, repo))
-    }
-
-    /// Returns true if the repo line should be skipped (local, meta, or non-GitHub)
-    fn should_skip_repo(repo_url: &str) -> bool {
-        let trimmed = repo_url.trim();
-        trimmed == "local"
-            || trimmed == "meta"
-            || Self::extract_github_owner_repo(trimmed).is_none()
-    }
-
-    /// Compute the updated version string, preserving the `v` prefix and precision
-    fn compute_updated_version(current: &str, latest: &str, full_precision: bool) -> String {
-        let has_v = current.starts_with('v');
-        let stripped_current = current.strip_prefix('v').unwrap_or(current);
-        let stripped_latest = latest.strip_prefix('v').unwrap_or(latest);
-
-        let result = if full_precision {
-            stripped_latest.to_string()
-        } else {
-            match_version_precision(stripped_current, stripped_latest)
-        };
-
-        if has_v {
-            format!("v{}", result)
-        } else {
-            result
+        Self {
+            registries: RegistrySet::parse_only(),
         }
     }
 
-    /// Parse dependencies from content string (for testing without file I/O)
-    pub fn parse_dependencies_from_content(&self, content: &str) -> Vec<ParsedDependency> {
-        let mut deps = Vec::new();
-        let mut current_repo: Option<String> = None;
+    pub fn with_registries(registries: RegistrySet) -> Self {
+        Self { registries }
+    }
 
-        for (line_idx, line) in content.lines().enumerate() {
-            let trimmed = line.trim();
-
-            // Skip commented lines
-            if trimmed.starts_with('#') {
+    async fn update_hooks(
+        &self,
+        repo: &Node,
+        revision: Option<&str>,
+        content: &str,
+        registry: &dyn Registry,
+        options: &UpdateOptions,
+        manifests: &mut HashMap<(String, String), Result<Node, String>>,
+    ) -> UpdateResult {
+        let mut result = UpdateResult::default();
+        if matches!(repo.text("repo"), Some("meta" | "builtin") | None) {
+            return result;
+        }
+        let hooks = repo.get("hooks").map(Node::sequence).unwrap_or_default();
+        let needs_manifest = hooks.iter().any(|hook| {
+            hook.get("language").is_none()
+                && !hook
+                    .get("additional_dependencies")
+                    .map(Node::sequence)
+                    .unwrap_or_default()
+                    .is_empty()
+        });
+        let key = repo
+            .text("repo")
+            .and_then(Self::extract_github_owner_repo)
+            .zip(revision.map(str::to_string));
+        if needs_manifest
+            && let Some(key) = &key
+            && !manifests.contains_key(key)
+        {
+            let manifest = match registry.pre_commit_manifest(&key.0, &key.1).await {
+                Ok(content) => config::yaml(&content).map_err(|e| e.to_string()),
+                Err(error) => Err(error.to_string()),
+            };
+            manifests.insert(key.clone(), manifest);
+        }
+        for hook in hooks {
+            let deps = hook
+                .get("additional_dependencies")
+                .map(Node::sequence)
+                .unwrap_or_default();
+            if deps.is_empty() {
                 continue;
             }
-
-            // Check for repo: line
-            if let Some(caps) = self.repo_re.captures(line) {
-                let repo_url = caps.get(1).unwrap().as_str().trim();
-                if Self::should_skip_repo(repo_url) {
-                    current_repo = None;
-                } else {
-                    current_repo = Self::extract_github_owner_repo(repo_url);
+            let id = hook.text("id").unwrap_or("unknown hook");
+            let language = if hook.get("language").is_some() {
+                hook.text("language")
+            } else {
+                key.as_ref()
+                    .and_then(|k| manifests.get(k))
+                    .and_then(|m| m.as_ref().ok())
+                    .and_then(|manifest| {
+                        let matches: Vec<_> = manifest
+                            .sequence()
+                            .iter()
+                            .filter(|h| h.text("id") == Some(id))
+                            .collect();
+                        if matches.len() == 1 {
+                            matches[0].text("language")
+                        } else {
+                            None
+                        }
+                    })
+            };
+            let Some(language) = language.filter(|language| dependencies::supported(language))
+            else {
+                let detail = key
+                    .as_ref()
+                    .and_then(|k| manifests.get(k))
+                    .and_then(|m| m.as_ref().err());
+                result.warnings.push(format!(
+                    "{id}: additional_dependencies left unchanged: {}{}",
+                    language.map_or("cannot determine hook language".to_string(), |l| format!(
+                        "unsupported hook language '{l}'"
+                    )),
+                    detail.map_or(String::new(), |e| format!(" ({e})"))
+                ));
+                continue;
+            };
+            for dep in deps {
+                let Some(dep) = dep.scalar() else {
+                    continue;
+                };
+                let Some(_) = &dep.span else {
+                    result.warnings.push(format!("{id}: additional dependency uses a shared or nonliteral YAML/TOML value; left unchanged"));
+                    continue;
+                };
+                match dependencies::update(&dep.value, language, &self.registries, options).await {
+                    Ok(Some((mut update, new))) => {
+                        dependencies::relocate(
+                            &mut update,
+                            dep.line(content),
+                            &format!("hooks.{id}.additional_dependencies"),
+                        );
+                        record_edit(&mut update, dep, &new);
+                        if hook.get("language").is_none()
+                            && let Some(rev) = repo.get("rev").and_then(Node::scalar)
+                            && let Some(revision) = revision.filter(|v| *v != rev.value)
+                            && let Some(span) = &rev.span
+                        {
+                            for edit in &mut update.pre_commit_edits {
+                                edit.required_revision = Some((span.clone(), revision.to_string()));
+                            }
+                        }
+                        result.merge(update);
+                    }
+                    Ok(None) => {}
+                    Err(error) => result.errors.push(format!("{id}: {}: {error}", dep.value)),
                 }
-                continue;
             }
+        }
+        result
+    }
 
-            // Check for rev: line
-            if let Some(ref owner_repo) = current_repo
-                && let Some(caps) = self.rev_re.captures(line)
-            {
-                let version = caps.get(1).unwrap().as_str();
-                deps.push(ParsedDependency {
-                    name: owner_repo.clone(),
-                    version: version.to_string(),
-                    line_number: Some(line_idx + 1),
+    fn extract_github_owner_repo(url: &str) -> Option<String> {
+        let url = url::Url::parse(url.trim()).ok()?;
+        if !matches!(url.scheme(), "http" | "https") || url.host_str() != Some("github.com") {
+            return None;
+        }
+        let mut parts = url.path().trim_matches('/').split('/');
+        let owner = parts.next().filter(|s| !s.is_empty())?;
+        let repo = parts.next()?;
+        let repo = repo.strip_suffix(".git").unwrap_or(repo);
+        if repo.is_empty() || parts.next().is_some() {
+            return None;
+        }
+        Some(format!("{owner}/{repo}"))
+    }
+
+    fn compute_updated_version(current: &str, latest: &str, full_precision: bool) -> String {
+        let version = if full_precision {
+            latest.trim_start_matches('v').to_string()
+        } else {
+            match_version_precision(
+                current.trim_start_matches('v'),
+                latest.trim_start_matches('v'),
+            )
+        };
+        if current.starts_with('v') {
+            format!("v{version}")
+        } else {
+            version
+        }
+    }
+
+    fn parse(content: &str, path: &Path) -> Result<Node> {
+        if path.file_name().and_then(|n| n.to_str()) == Some("prek.toml") {
+            config::toml(content)
+        } else {
+            config::yaml(content)
+        }
+    }
+
+    fn revisions(root: &Node, content: &str) -> Vec<ParsedDependency> {
+        root.get("repos")
+            .map(Node::sequence)
+            .unwrap_or_default()
+            .iter()
+            .filter_map(|repo| {
+                let name = Self::extract_github_owner_repo(repo.text("repo")?)?;
+                let rev = repo.get("rev")?.scalar()?;
+                rev.span.as_ref()?;
+                Some(ParsedDependency {
+                    name,
+                    version: rev.value.clone(),
+                    line_number: rev.line(content),
                     has_upper_bound: false,
                     is_bumpable: true,
-                });
-                current_repo = None;
+                })
+            })
+            .collect()
+    }
+
+    pub fn parse_dependencies_from_content(&self, content: &str) -> Vec<ParsedDependency> {
+        config::yaml(content)
+            .map(|root| Self::revisions(&root, content))
+            .unwrap_or_default()
+    }
+
+    /// Rewrite one verified repository revision for version alignment.
+    pub fn rewrite_revision(
+        content: &str,
+        package: &str,
+        old: &str,
+        new: &str,
+        line: Option<usize>,
+    ) -> Option<String> {
+        let root = config::toml(content)
+            .or_else(|_| config::yaml(content))
+            .ok()?;
+        for repo in root.get("repos")?.sequence() {
+            if repo
+                .text("repo")
+                .and_then(Self::extract_github_owner_repo)
+                .as_deref()
+                != Some(package)
+            {
+                continue;
+            }
+            let Some(rev) = repo.get("rev").and_then(Node::scalar) else {
+                continue;
+            };
+            if rev.value != old || line.is_some_and(|line| rev.line(content) != Some(line)) {
+                continue;
+            }
+            let mut rewritten = content.to_string();
+            rewritten.replace_range(rev.span.clone()?, new);
+            return Some(rewritten);
+        }
+        None
+    }
+
+    async fn update_revision(
+        repo: &str,
+        rev: &Scalar,
+        content: &str,
+        registry: &dyn Registry,
+        options: &UpdateOptions,
+        versions: &mut HashMap<String, Result<String, String>>,
+    ) -> (UpdateResult, Option<String>) {
+        let mut result = UpdateResult::default();
+        let current = &rev.value;
+        let line = rev.line(content);
+        if rev.span.is_none() {
+            return (result, None);
+        }
+        if options.is_package_filtered_out(repo) {
+            result.unchanged += 1;
+            return (result, None);
+        }
+        if options.should_ignore(repo) {
+            result.ignored.push((repo.into(), current.clone(), line));
+            return (result, None);
+        }
+        let pin = options.get_pinned_version(repo);
+        let latest = if let Some(pin) = pin {
+            Ok(pin.to_string())
+        } else {
+            if !versions.contains_key(repo) {
+                versions.insert(
+                    repo.into(),
+                    registry
+                        .get_latest_version(repo)
+                        .await
+                        .map_err(|e| e.to_string()),
+                );
+            }
+            versions[repo].clone()
+        };
+        let latest = match latest {
+            Ok(latest) => latest,
+            Err(error) => {
+                result.errors.push(format!("{repo}: {error}"));
+                return (result, None);
+            }
+        };
+        let mut held_back = None;
+        let latest = if pin.is_some() {
+            latest
+        } else {
+            let (outcome, note) =
+                apply_cooldown(registry, repo, current, &latest, None, false, options).await;
+            if let Some(note) = note {
+                options.note_cooldown_unavailable(&note);
+            }
+            match outcome {
+                CooldownOutcome::Unchanged(v) => v,
+                CooldownOutcome::HeldBack {
+                    chosen,
+                    skipped_version,
+                    skipped_published_at,
+                } => {
+                    held_back = Some((skipped_version, skipped_published_at));
+                    chosen
+                }
+                CooldownOutcome::Skipped {
+                    skipped_version,
+                    skipped_published_at,
+                } => {
+                    result.skipped_by_cooldown.push((
+                        repo.into(),
+                        current.clone(),
+                        skipped_version,
+                        skipped_published_at,
+                    ));
+                    return (result, None);
+                }
+            }
+        };
+        let new = Self::compute_updated_version(current, &latest, options.full_precision);
+        if new == *current {
+            result.unchanged += 1;
+            return (result, None);
+        }
+        if pin.is_none()
+            && compare_versions(&new, current, Lang::PreCommit) != std::cmp::Ordering::Greater
+        {
+            result.warnings.push(downgrade_warning(repo, &new, current));
+            result.unchanged += 1;
+            return (result, None);
+        }
+        if pin.is_none() && !options.allows_bump(current, &new) {
+            result.record_capped(repo, current, &new, line);
+            return (result, None);
+        }
+        let entry = (repo.into(), current.clone(), new.clone(), line);
+        if pin.is_some() {
+            result.pinned.push(entry);
+        } else {
+            result.updated.push(entry);
+            if let Some((skipped, at)) = held_back {
+                result
+                    .held_back
+                    .push((repo.into(), current.clone(), new.clone(), skipped, at));
             }
         }
-
-        deps
+        (result, Some(new))
     }
 }
 
@@ -131,266 +405,71 @@ impl Updater for PreCommitUpdater {
         options: UpdateOptions,
     ) -> Result<UpdateResult> {
         let content = read_file_safe(path)?;
+        let root = Self::parse(&content, path)?;
         let mut result = UpdateResult::default();
-
-        // Pass 1: Collect repos to check
-        let mut ignored_repos: Vec<(usize, String, String)> = Vec::new();
-        let mut pinned_repos: Vec<(usize, String, String, String)> = Vec::new();
-        let mut repos_to_check: Vec<(usize, String, String)> = Vec::new();
-
-        let mut current_repo: Option<String> = None;
-
-        for (line_idx, line) in content.lines().enumerate() {
-            let trimmed = line.trim();
-
-            if trimmed.starts_with('#') {
-                continue;
-            }
-
-            if let Some(caps) = self.repo_re.captures(line) {
-                let repo_url = caps.get(1).unwrap().as_str().trim();
-                if Self::should_skip_repo(repo_url) {
-                    current_repo = None;
-                } else {
-                    current_repo = Self::extract_github_owner_repo(repo_url);
-                }
-                continue;
-            }
-
-            if let Some(ref owner_repo) = current_repo
-                && let Some(caps) = self.rev_re.captures(line)
-            {
-                let version = caps.get(1).unwrap().as_str().to_string();
-                let owner_repo = owner_repo.clone();
-
-                if options.is_package_filtered_out(&owner_repo) {
-                    result.unchanged += 1;
-                } else if options.should_ignore(&owner_repo) {
-                    ignored_repos.push((line_idx, owner_repo, version));
-                } else if let Some(pinned_version) = options.get_pinned_version(&owner_repo) {
-                    pinned_repos.push((line_idx, owner_repo, version, pinned_version.to_string()));
-                } else {
-                    repos_to_check.push((line_idx, owner_repo, version));
-                }
-
-                current_repo = None;
-            }
-        }
-
-        // Record ignored repos
-        for (line_idx, owner_repo, version) in ignored_repos {
-            result
-                .ignored
-                .push((owner_repo, version, Some(line_idx + 1)));
-        }
-
-        // Pass 2: Fetch versions in parallel (deduplicated)
-        let unique_repos: Vec<String> = {
-            let mut seen = std::collections::HashSet::new();
-            repos_to_check
-                .iter()
-                .filter_map(|(_, owner_repo, _)| {
-                    if seen.insert(owner_repo.clone()) {
-                        Some(owner_repo.clone())
-                    } else {
-                        None
-                    }
-                })
-                .collect()
-        };
-
-        let version_futures: Vec<_> = unique_repos
+        let repos = root.get("repos").map(Node::sequence).unwrap_or_default();
+        let names: std::collections::BTreeSet<_> = repos
             .iter()
-            .map(|owner_repo| async { registry.get_latest_version(owner_repo).await })
+            .filter_map(|repo| {
+                let rev = repo.get("rev")?.scalar()?;
+                rev.span.as_ref()?;
+                let name = Self::extract_github_owner_repo(repo.text("repo")?)?;
+                (!options.is_package_filtered_out(&name)
+                    && !options.should_ignore(&name)
+                    && options.get_pinned_version(&name).is_none())
+                .then_some(name)
+            })
             .collect();
-
-        let version_results = join_all(version_futures).await;
-
-        let repo_versions: HashMap<String, Result<String, String>> = unique_repos
+        let mut versions: HashMap<_, _> =
+            futures::future::join_all(names.into_iter().map(|name| async move {
+                let version = registry
+                    .get_latest_version(&name)
+                    .await
+                    .map_err(|e| e.to_string());
+                (name, version)
+            }))
+            .await
             .into_iter()
-            .zip(version_results)
-            .map(|(repo, result)| (repo, result.map_err(|e| e.to_string())))
             .collect();
-
-        // Build version map per line index
-        let mut version_map: HashMap<usize, Result<String, anyhow::Error>> = HashMap::new();
-        for (line_idx, owner_repo, _) in &repos_to_check {
-            if let Some(result) = repo_versions.get(owner_repo) {
-                match result {
-                    Ok(version) => {
-                        version_map.insert(*line_idx, Ok(version.clone()));
-                    }
-                    Err(e) => {
-                        version_map.insert(*line_idx, Err(anyhow::anyhow!("{}", e)));
-                    }
+        let mut manifests = HashMap::new();
+        for repo in root.get("repos").map(Node::sequence).unwrap_or_default() {
+            let mut revision = repo.text("rev").map(str::to_string);
+            if let Some(name) = repo.text("repo").and_then(Self::extract_github_owner_repo)
+                && let Some(rev) = repo.get("rev").and_then(Node::scalar)
+            {
+                let (mut update, new) =
+                    Self::update_revision(&name, rev, &content, registry, &options, &mut versions)
+                        .await;
+                if let Some(new) = &new {
+                    record_edit(&mut update, rev, new);
+                }
+                result.merge(update);
+                if let Some(new) = new {
+                    revision = Some(new.clone());
                 }
             }
+            result.merge(
+                self.update_hooks(
+                    repo,
+                    revision.as_deref(),
+                    &content,
+                    registry,
+                    &options,
+                    &mut manifests,
+                )
+                .await,
+            );
         }
-
-        // Add pinned versions
-        for (line_idx, _, _, pinned_version) in &pinned_repos {
-            version_map.insert(*line_idx, Ok(pinned_version.clone()));
-        }
-
-        // Build repo info map: line_idx -> (owner_repo, current_version, is_pinned)
-        let mut repo_info: HashMap<usize, (String, String, bool)> = repos_to_check
-            .into_iter()
-            .map(|(idx, owner_repo, version)| (idx, (owner_repo, version, false)))
-            .collect();
-
-        for (line_idx, owner_repo, current_version, _) in pinned_repos {
-            repo_info.insert(line_idx, (owner_repo, current_version, true));
-        }
-
-        // Pass 3: Apply updates
-        let mut new_lines: Vec<String> = Vec::new();
-
-        for (line_idx, line) in content.lines().enumerate() {
-            let line_num = line_idx + 1;
-
-            if let Some(version_result) = version_map.remove(&line_idx) {
-                let Some((owner_repo, current_version, is_pinned)) = repo_info.get(&line_idx)
-                else {
-                    new_lines.push(line.to_string());
-                    continue;
-                };
-
-                match version_result {
-                    Ok(latest_version) => {
-                        // Apply cooldown policy before writing (registry path only; pins bypass it).
-                        let (latest_version, held_back_record) = if *is_pinned {
-                            (latest_version, None)
-                        } else {
-                            let (outcome, note) = crate::updater::apply_cooldown(
-                                registry,
-                                owner_repo,
-                                current_version,
-                                &latest_version,
-                                None,
-                                false,
-                                &options,
-                            )
-                            .await;
-                            if let Some(msg) = note {
-                                options.note_cooldown_unavailable(&msg);
-                            }
-                            match outcome {
-                                crate::updater::CooldownOutcome::Unchanged(v) => (v, None),
-                                crate::updater::CooldownOutcome::HeldBack {
-                                    chosen,
-                                    skipped_version,
-                                    skipped_published_at,
-                                } => (chosen, Some((skipped_version, skipped_published_at))),
-                                crate::updater::CooldownOutcome::Skipped {
-                                    skipped_version,
-                                    skipped_published_at,
-                                } => {
-                                    result.skipped_by_cooldown.push((
-                                        owner_repo.clone(),
-                                        current_version.clone(),
-                                        skipped_version,
-                                        skipped_published_at,
-                                    ));
-                                    new_lines.push(line.to_string());
-                                    continue;
-                                }
-                            }
-                        };
-
-                        let new_version = Self::compute_updated_version(
-                            current_version,
-                            &latest_version,
-                            options.full_precision,
-                        );
-
-                        if new_version != *current_version {
-                            // Refuse to write a downgrade (registry path only; pins are intentional).
-                            if !is_pinned
-                                && compare_versions(&new_version, current_version, Lang::PreCommit)
-                                    != std::cmp::Ordering::Greater
-                            {
-                                result.warnings.push(downgrade_warning(
-                                    owner_repo,
-                                    &new_version,
-                                    current_version,
-                                ));
-                                result.unchanged += 1;
-                                new_lines.push(line.to_string());
-                            } else if !is_pinned
-                                && !options.allows_bump(current_version, &new_version)
-                            {
-                                // Bump level exceeds the --only-bump/--max-bump ceiling.
-                                // Configured pins are intentional and bypass the ceiling.
-                                result.record_capped(
-                                    owner_repo,
-                                    current_version,
-                                    &new_version,
-                                    Some(line_num),
-                                );
-                                new_lines.push(line.to_string());
-                            } else {
-                                let new_line = line.replacen(current_version, &new_version, 1);
-                                new_lines.push(new_line);
-
-                                if *is_pinned {
-                                    result.pinned.push((
-                                        owner_repo.clone(),
-                                        current_version.clone(),
-                                        new_version,
-                                        Some(line_num),
-                                    ));
-                                } else {
-                                    result.updated.push((
-                                        owner_repo.clone(),
-                                        current_version.clone(),
-                                        new_version.clone(),
-                                        Some(line_num),
-                                    ));
-                                    if let Some((skipped_version, skipped_published_at)) =
-                                        held_back_record
-                                    {
-                                        result.held_back.push((
-                                            owner_repo.clone(),
-                                            current_version.clone(),
-                                            new_version,
-                                            skipped_version,
-                                            skipped_published_at,
-                                        ));
-                                    }
-                                }
-                            }
-                        } else {
-                            new_lines.push(line.to_string());
-                            result.unchanged += 1;
-                        }
-                    }
-                    Err(e) => {
-                        new_lines.push(line.to_string());
-                        result.errors.push(format!("{}: {}", owner_repo, e));
-                    }
-                }
-            } else {
-                new_lines.push(line.to_string());
+        if !options.dry_run && !result.pre_commit_edits.is_empty() {
+            let mut edits: Vec<_> = result.pre_commit_edits.iter().collect();
+            edits.sort_by_key(|edit| std::cmp::Reverse(edit.span.start));
+            let mut updated = content;
+            for edit in edits {
+                updated.replace_range(edit.span.clone(), &edit.replacement);
             }
+            Self::parse(&updated, path)?;
+            write_file_atomic(path, &updated)?;
         }
-
-        if (!result.updated.is_empty() || !result.pinned.is_empty()) && !options.dry_run {
-            let line_ending = if content.contains("\r\n") {
-                "\r\n"
-            } else {
-                "\n"
-            };
-            let new_content = new_lines.join(line_ending);
-
-            let final_content = if content.ends_with('\n') && !new_content.ends_with('\n') {
-                format!("{}{}", new_content, line_ending)
-            } else {
-                new_content
-            };
-
-            write_file_atomic(path, &final_content)?;
-        }
-
         Ok(result)
     }
 
@@ -400,10 +479,9 @@ impl Updater for PreCommitUpdater {
 
     fn parse_dependencies(&self, path: &Path) -> Result<Vec<ParsedDependency>> {
         let content = read_file_safe(path)?;
-        Ok(self.parse_dependencies_from_content(&content))
+        Ok(Self::revisions(&Self::parse(&content, path)?, &content))
     }
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -301,9 +301,40 @@ pull-request workflow are covered in [GitHub Actions](github-actions.md).
 
 ## Pre-commit
 
-- `.pre-commit-config.yaml`
-- Updates `rev:` fields for GitHub-hosted hook repositories
-- Skips local hooks, meta hooks, and non-GitHub repositories
+- `.pre-commit-config.yaml` and `prek.toml`
+- Both `--lang pre-commit` and `--lang prek` select both formats
+- Updates `rev` fields for GitHub-hosted hook repositories; special repositories
+  (`local`, `meta`, `builtin`) and non-GitHub repository revisions stay unchanged
+
+Hook `additional_dependencies` are updated according to the hook's language,
+including `repo: local` hooks:
+
+| Language | Registry | Supported versioned install arguments |
+| --- | --- | --- |
+| `python` | PyPI | PEP 508 requirements, such as `flake8-docstrings==1.6.0` or `demo[extra]>=1.0,<2` |
+| `node` | npm | `package@version` and `@scope/package@range` |
+| `rust` | crates.io | `crate:version` and `cli:crate:version` |
+
+An explicit hook `language` takes precedence. Otherwise, remote GitHub hooks
+get their language from `.pre-commit-hooks.yaml` at the revision selected for
+that update (or the existing revision when it stays unchanged). This uses the
+GitHub API and the existing `GITHUB_TOKEN` / `GH_TOKEN` authentication; it does
+not install or execute hooks. A missing or unsupported language produces a
+warning and leaves that hook's additional dependencies unchanged.
+
+Dependency updates reuse the corresponding ecosystem's constraints, package
+filters, ignores, pins, bump limits, precision, and cooldown rules. Hook Python
+environments do not inherit the enclosing project's Python or uv settings.
+Dry-run, `--check`, `--apply`, and interactive selection work for both formats.
+When an inherited language was resolved at a proposed new repository revision,
+interactive selection must include that revision along with its dependency updates.
+Comments, quoting, line endings, and unrelated content are preserved.
+
+Unpinned arguments, direct URLs and Git references, installer switches,
+parenthesized Python requirements, and unsupported dependency formats remain
+unchanged. Shared YAML anchors/aliases, merge mappings, escaped strings, and
+multiline scalar spellings are not rewritten. Additional dependencies are not
+included in version alignment, which continues to align repository revisions.
 
 ## Mise / asdf
 

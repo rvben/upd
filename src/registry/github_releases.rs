@@ -249,6 +249,48 @@ impl Default for GitHubReleasesRegistry {
 
 #[async_trait]
 impl Registry for GitHubReleasesRegistry {
+    async fn pre_commit_manifest(&self, package: &str, reference: &str) -> Result<String> {
+        use base64::Engine;
+        let (owner, repo) = Self::extract_owner_repo(package)?;
+        let mut url = url::Url::parse(&self.api_url)?;
+        url.path_segments_mut()
+            .map_err(|_| anyhow!("Invalid GitHub API URL"))?
+            .pop_if_empty()
+            .extend(["repos", owner, repo, "contents", ".pre-commit-hooks.yaml"]);
+        url.query_pairs_mut().append_pair("ref", reference);
+        let mut response = get_with_retry(&self.client, url.as_str()).await?;
+        if !response.status().is_success() {
+            return Err(anyhow!(
+                "Cannot read hook manifest for {package}@{reference}: HTTP {}",
+                response.status()
+            ));
+        }
+        let mut bytes = Vec::new();
+        while let Some(chunk) = response.chunk().await? {
+            if bytes.len() + chunk.len() > 2 * 1024 * 1024 {
+                return Err(anyhow!("Hook manifest response exceeds 2 MiB"));
+            }
+            bytes.extend_from_slice(&chunk);
+        }
+        #[derive(Deserialize)]
+        struct Contents {
+            content: String,
+            encoding: String,
+        }
+        let data: Contents = serde_json::from_slice(&bytes)?;
+        if data.encoding != "base64" {
+            return Err(anyhow!("Unsupported hook manifest encoding"));
+        }
+        let encoded: String = data
+            .content
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect();
+        Ok(String::from_utf8(
+            base64::engine::general_purpose::STANDARD.decode(encoded)?,
+        )?)
+    }
+
     async fn python_releases(
         &self,
         _package: &str,

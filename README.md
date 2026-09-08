@@ -185,6 +185,9 @@ upd --only-bump major
 # docker, terraform, actions, pre-commit, mise, annotated
 upd --lang python
 
+# Both pre-commit YAML and prek.toml, including supported hook dependencies
+upd --lang prek
+
 # Exit 1 if anything is outdated (for CI and pre-commit)
 upd --check
 

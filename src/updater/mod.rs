@@ -24,7 +24,7 @@ pub use gradle::GradleUpdater;
 pub use mise::MiseUpdater;
 
 pub use package_json::PackageJsonUpdater;
-pub use pre_commit::PreCommitUpdater;
+pub use pre_commit::{PreCommitEdit, PreCommitUpdater};
 pub use pyproject::{PyProjectUpdater, apply_normalized_specs};
 pub use requirements::RequirementsUpdater;
 pub use terraform::TerraformUpdater;
@@ -845,6 +845,11 @@ pub struct ParsedDependency {
 /// Result of updating a single file
 #[derive(Debug, Default, Clone)]
 pub struct UpdateResult {
+    /// Exact scalar edits retained for applying selected hook updates interactively.
+    pub pre_commit_edits: Vec<PreCommitEdit>,
+    /// Per-occurrence sources for mixed-ecosystem cooldown reporting.
+    pub held_back_sources: BTreeMap<usize, AnnotationSource>,
+    pub cooldown_skip_sources: BTreeMap<usize, AnnotationSource>,
     /// Packages that were updated: (name, old_version, new_version, line_number)
     pub updated: Vec<(String, String, String, Option<usize>)>,
     /// Metadata indexed by position in `updated`, preserving the public tuple
@@ -1038,6 +1043,21 @@ impl UpdateResult {
     }
 
     pub fn merge(&mut self, other: UpdateResult) {
+        let held_offset = self.held_back.len();
+        let skip_offset = self.skipped_by_cooldown.len();
+        self.held_back_sources.extend(
+            other
+                .held_back_sources
+                .into_iter()
+                .map(|(i, s)| (i + held_offset, s)),
+        );
+        self.cooldown_skip_sources.extend(
+            other
+                .cooldown_skip_sources
+                .into_iter()
+                .map(|(i, s)| (i + skip_offset, s)),
+        );
+        self.pre_commit_edits.extend(other.pre_commit_edits);
         let offset = self.updated.len();
         self.update_context.extend(
             other
@@ -1103,6 +1123,7 @@ pub enum Lang {
     DotNet,
     Gradle,
     Actions,
+    #[value(alias = "prek")]
     PreCommit,
     Mise,
     Terraform,
@@ -1299,7 +1320,7 @@ impl FileType {
             return Some(FileType::Csproj);
         }
 
-        if file_name == ".pre-commit-config.yaml" {
+        if matches!(file_name, ".pre-commit-config.yaml" | "prek.toml") {
             return Some(FileType::PreCommitConfig);
         }
 

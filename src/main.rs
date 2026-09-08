@@ -1820,7 +1820,6 @@ async fn run_update(cli: &Cli) -> Result<()> {
     let cargo_toml_updater = Arc::new(CargoTomlUpdater::new());
     let go_mod_updater = Arc::new(GoModUpdater::new());
     let github_actions_updater = Arc::new(GithubActionsUpdater::new());
-    let pre_commit_updater = Arc::new(PreCommitUpdater::new());
     let gemfile_updater = Arc::new(GemfileUpdater::new());
     let terraform_updater = Arc::new(TerraformUpdater::new());
     let csproj_updater = Arc::new(CsprojUpdater::new());
@@ -1853,6 +1852,7 @@ async fn run_update(cli: &Cli) -> Result<()> {
     };
     let annotated_updater = Arc::new(AnnotatedUpdater::new(registry_set()));
     let mise_updater = Arc::new(MiseUpdater::new(registry_set()));
+    let pre_commit_updater = Arc::new(PreCommitUpdater::with_registries(registry_set()));
 
     // Interactive mode: first discover updates, then prompt, then apply approved ones
     if cli.interactive {
@@ -3561,7 +3561,13 @@ async fn run_interactive_update(
                 ),
             })
             .collect();
-        let rewritten = if scanned_file.file_type == FileType::GradleWrapper {
+        let rewritten = if scanned_file.file_type == FileType::PreCommitConfig {
+            apply_selected_pre_commit_edits(
+                &content,
+                &updates,
+                &scanned_file.result.pre_commit_edits,
+            )
+        } else if scanned_file.file_type == FileType::GradleWrapper {
             if updates.len() != 1 {
                 anyhow::bail!("expected one Gradle wrapper update");
             }
@@ -5021,6 +5027,52 @@ impl TextDocument {
     }
 }
 
+fn apply_selected_pre_commit_edits(
+    content: &str,
+    updates: &[VersionEdit<'_>],
+    planned: &[upd::updater::PreCommitEdit],
+) -> Result<AppliedVersionUpdates> {
+    let mut used = std::collections::HashSet::new();
+    let mut edits = Vec::new();
+    for update in updates {
+        let Some((index, edit)) = planned.iter().enumerate().find(|(index, edit)| {
+            !used.contains(index)
+                && edit.package == update.package
+                && edit.current == update.old_version
+                && edit.new == update.new_version
+                && edit.line == update.line_num
+        }) else {
+            anyhow::bail!("Cannot locate selected hook update for {}", update.package);
+        };
+        if content.get(edit.span.clone()) != Some(edit.original.as_str()) {
+            anyhow::bail!("Hook configuration changed since preview; rerun upd");
+        }
+        used.insert(index);
+        edits.push(edit);
+    }
+    for edit in &edits {
+        if let Some((span, revision)) = &edit.required_revision
+            && !edits
+                .iter()
+                .any(|e| e.span == *span && e.replacement == *revision)
+        {
+            anyhow::bail!(
+                "Select the repository revision update together with {}: its hook language was resolved at {revision}",
+                edit.package
+            );
+        }
+    }
+    edits.sort_by_key(|edit| std::cmp::Reverse(edit.span.start));
+    let mut rewritten = content.to_string();
+    for edit in edits {
+        rewritten.replace_range(edit.span.clone(), &edit.replacement);
+    }
+    Ok(AppliedVersionUpdates {
+        content: rewritten,
+        applied: vec![true; updates.len()],
+    })
+}
+
 fn apply_version_updates(
     content: &str,
     updates: &[VersionEdit<'_>],
@@ -5631,13 +5683,19 @@ fn apply_pre_commit_version(
     update: &VersionEdit<'_>,
     target_version: &str,
 ) -> bool {
-    let pattern = format!(r#"(^\s*rev:\s*['"]?){}"#, regex::escape(update.old_version));
-    let re = regex::Regex::new(&pattern).unwrap();
-    let replacement = format!("${{1}}{}", target_version);
-
-    apply_line_replacement(document, update.line_num, |line| {
-        replace_first_match(line, &re, &replacement)
-    })
+    let content = document.clone().into_content();
+    if let Some(updated) = PreCommitUpdater::rewrite_revision(
+        &content,
+        update.package,
+        update.old_version,
+        target_version,
+        update.line_num,
+    ) {
+        *document = TextDocument::from_content(&updated);
+        true
+    } else {
+        false
+    }
 }
 
 fn apply_mise_toml_version(
@@ -6173,10 +6231,16 @@ fn print_file_result(
         let file_ecosystem = ecosystem_key(file_type);
         let now = Utc::now();
 
-        for (package, old, chosen, skipped_latest, skipped_pub_at) in &result.held_back {
+        for (index, (package, old, chosen, skipped_latest, skipped_pub_at)) in
+            result.held_back.iter().enumerate()
+        {
             let cooldown = upd::output::entry_cooldown(
                 cooldown_policy,
-                result.entry_ecosystem.get(package).copied(),
+                result
+                    .held_back_sources
+                    .get(&index)
+                    .copied()
+                    .or_else(|| result.entry_ecosystem.get(package).copied()),
                 file_ecosystem,
             );
             let line = format_held_back_line(
@@ -6191,10 +6255,16 @@ fn print_file_result(
             println!("{} {}", file_location.blue().underline(), line.yellow());
         }
 
-        for (package, _current, skipped_latest, skipped_pub_at) in &result.skipped_by_cooldown {
+        for (index, (package, _current, skipped_latest, skipped_pub_at)) in
+            result.skipped_by_cooldown.iter().enumerate()
+        {
             let cooldown = upd::output::entry_cooldown(
                 cooldown_policy,
-                result.entry_ecosystem.get(package).copied(),
+                result
+                    .cooldown_skip_sources
+                    .get(&index)
+                    .copied()
+                    .or_else(|| result.entry_ecosystem.get(package).copied()),
                 file_ecosystem,
             );
             let line = format_skipped_by_cooldown_line(
@@ -9067,5 +9137,73 @@ mod output_tests {
             "ALPHA ?= v2.0.0  # upd: pypi alpha\r\nUNCHANGED := yes\nBETA ?= 2.0  # upd: pypi beta",
             "both must preserve exact line endings, final-newline state, v prefix, and precision"
         );
+    }
+}
+
+#[cfg(test)]
+mod pre_commit_selection_tests {
+    use super::*;
+    use upd::updater::PreCommitEdit;
+
+    #[test]
+    fn selecting_one_inline_dependency_only_changes_that_scalar() {
+        let content = "repos = [{repo = 'local', hooks = [{id = 'demo', language = 'python', additional_dependencies = ['demo==1.0.0', 'other==1.0.0']}]}]";
+        let start = content.find("demo==1.0.0").unwrap();
+        let planned = vec![PreCommitEdit {
+            package: "demo".into(),
+            current: "1.0.0".into(),
+            new: "2.0.0".into(),
+            line: Some(1),
+            span: start..start + "demo==1.0.0".len(),
+            original: "demo==1.0.0".into(),
+            replacement: "demo==2.0.0".into(),
+            source: Some(AnnotationSource::PyPi),
+            pinned: false,
+            required_revision: None,
+        }];
+        let updates = [VersionEdit {
+            package: "demo",
+            old_version: "1.0.0",
+            new_version: "2.0.0",
+            line_num: Some(1),
+            expected_source: Some(AnnotationSource::PyPi),
+            sha_pin: None,
+        }];
+        let rewritten = apply_selected_pre_commit_edits(content, &updates, &planned).unwrap();
+        assert_eq!(
+            rewritten.content,
+            content.replace("demo==1.0.0", "demo==2.0.0")
+        );
+        assert!(
+            apply_selected_pre_commit_edits(
+                &content.replace("demo==1.0.0", "demo==1.1.0"),
+                &updates,
+                &planned
+            )
+            .is_err()
+        );
+        let mut planned = planned;
+        planned[0].required_revision = Some((0..1, "v2".into()));
+        assert!(apply_selected_pre_commit_edits(content, &updates, &planned).is_err());
+    }
+
+    #[test]
+    fn alignment_rewrites_toml_and_flow_yaml_revisions() {
+        for content in [
+            "repos = [{repo = 'https://github.com/owner/repo', rev = 'v1.0.0', hooks = []}]",
+            "repos: [{repo: 'https://github.com/owner/repo', rev: 'v1.0.0', hooks: []}]",
+        ] {
+            let updates = [VersionEdit {
+                package: "owner/repo",
+                old_version: "v1.0.0",
+                new_version: "v2.0.0",
+                line_num: Some(1),
+                expected_source: None,
+                sha_pin: None,
+            }];
+            let rewritten =
+                apply_version_updates(content, &updates, FileType::PreCommitConfig, false).unwrap();
+            assert_eq!(rewritten.content, content.replace("v1.0.0", "v2.0.0"));
+        }
     }
 }

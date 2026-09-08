@@ -317,6 +317,11 @@ pub fn tags_at_commit_unsupported() -> Result<TagsAtCommit> {
 /// a new one that does not silently loses prerelease and constraint handling.
 #[async_trait]
 pub trait Registry: Send + Sync {
+    /// Read hook definitions at a repository revision without executing hooks.
+    async fn pre_commit_manifest(&self, _package: &str, _reference: &str) -> Result<String> {
+        anyhow::bail!("registry does not provide pre-commit hook manifests")
+    }
+
     /// SHA-256 of an official Gradle distribution; never inferred from a version.
     async fn gradle_distribution_checksum(&self, _version: &str, _kind: &str) -> Result<String> {
         anyhow::bail!("registry does not provide Gradle distribution checksums")

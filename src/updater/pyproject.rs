@@ -440,6 +440,39 @@ enum MultiLineString {
 }
 
 impl PyProjectUpdater {
+    /// Apply the ordinary Python constraint policy to a hook requirement,
+    /// without inheriting the enclosing project's interpreter or uv settings.
+    pub(crate) async fn update_hook_requirement(
+        &self,
+        requirement: &str,
+        registry: &dyn Registry,
+        options: &UpdateOptions,
+    ) -> (UpdateResult, String) {
+        let mut array = Array::new();
+        array.push(requirement);
+        let mut result = UpdateResult::default();
+        let line_index = PyProjectLineIndex::default();
+        let manifest = ManifestContext {
+            line_index: &line_index,
+            non_registry: HashSet::new(),
+        };
+        let registry = crate::registry::python::PythonRegistry::for_project(registry, None);
+        self.update_array_deps(
+            &mut array,
+            &registry,
+            &mut result,
+            &manifest,
+            "pre-commit.additional_dependencies",
+            options,
+        )
+        .await;
+        result.set_update_lang(Lang::Python);
+        (
+            result,
+            array.get(0).and_then(Value::as_str).unwrap().to_string(),
+        )
+    }
+
     /// Select a lock-only Python update using the same project upload policy as
     /// ordinary manifest updates. Configuration pins must pass that policy too.
     pub async fn resolve_floor_version(

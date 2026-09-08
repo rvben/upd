@@ -615,7 +615,15 @@ pub fn build_update_file_report(
                 method: None,
                 status: None,
                 error: None,
-                source: source_of(name).map(AnnotationSource::token),
+                source: context
+                    .and_then(|c| {
+                        AnnotationSource::ALL
+                            .into_iter()
+                            .find(|s| s.lang() == c.lang)
+                    })
+                    .filter(|_| file_type == FileType::PreCommitConfig)
+                    .or_else(|| source_of(name))
+                    .map(AnnotationSource::token),
                 reference_kind: sha.map(|_| "sha"),
                 current_commit: sha.map(|change| change.current_commit.clone()),
                 latest_commit: sha.map(|change| change.new_commit.clone()),
@@ -626,12 +634,20 @@ pub fn build_update_file_report(
     let pinned = result
         .pinned
         .iter()
-        .map(|(name, old, new, line)| PinnedEntry {
+        .enumerate()
+        .map(|(index, (name, old, new, line))| PinnedEntry {
             package: name.clone(),
             current: old.clone(),
             pinned_to: new.clone(),
             line: *line,
-            source: source_of(name).map(AnnotationSource::token),
+            source: result
+                .pre_commit_edits
+                .iter()
+                .filter(|edit| edit.pinned)
+                .nth(index)
+                .and_then(|edit| edit.source)
+                .or_else(|| source_of(name))
+                .map(AnnotationSource::token),
             status: None,
         })
         .collect();
@@ -650,8 +666,13 @@ pub fn build_update_file_report(
     let held_back = result
         .held_back
         .iter()
-        .map(|(name, old, chosen, skipped, pub_at)| {
-            let source = source_of(name);
+        .enumerate()
+        .map(|(index, (name, old, chosen, skipped, pub_at))| {
+            let source = result
+                .held_back_sources
+                .get(&index)
+                .copied()
+                .or_else(|| source_of(name));
             HeldBackEntry {
                 package: name.clone(),
                 current: old.clone(),
@@ -668,8 +689,13 @@ pub fn build_update_file_report(
     let skipped_by_cooldown = result
         .skipped_by_cooldown
         .iter()
-        .map(|(name, current, skipped, pub_at)| {
-            let source = source_of(name);
+        .enumerate()
+        .map(|(index, (name, current, skipped, pub_at))| {
+            let source = result
+                .cooldown_skip_sources
+                .get(&index)
+                .copied()
+                .or_else(|| source_of(name));
             SkippedByCooldownEntry {
                 package: name.clone(),
                 current: current.clone(),
@@ -713,7 +739,12 @@ pub fn build_update_file_report(
                 },
             ),
             line: entry.line_number,
-            source: source_of(&entry.package).map(AnnotationSource::token),
+            source: entry
+                .lang
+                .and_then(|lang| AnnotationSource::ALL.into_iter().find(|s| s.lang() == lang))
+                .filter(|_| file_type == FileType::PreCommitConfig)
+                .or_else(|| source_of(&entry.package))
+                .map(AnnotationSource::token),
         })
         .collect();
 

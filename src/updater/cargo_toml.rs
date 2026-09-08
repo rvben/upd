@@ -98,6 +98,35 @@ impl ReqSpec {
 }
 
 impl CargoTomlUpdater {
+    pub(crate) async fn update_hook_requirement(
+        &self,
+        package: &str,
+        requirement: &str,
+        registry: &dyn Registry,
+        options: &UpdateOptions,
+    ) -> (UpdateResult, String) {
+        let mut table = Table::new();
+        table.insert(package, toml_edit::value(requirement));
+        let mut result = UpdateResult::default();
+        self.update_deps_table(
+            &mut table,
+            registry,
+            &HashMap::new(),
+            &mut HashMap::new(),
+            &mut result,
+            &CargoTomlLineIndex::default(),
+            "dependencies",
+            options,
+        )
+        .await;
+        let updated = table
+            .get(package)
+            .and_then(Item::as_str)
+            .unwrap()
+            .to_string();
+        (result, updated)
+    }
+
     pub fn new() -> Self {
         Self
     }

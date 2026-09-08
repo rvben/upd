@@ -450,6 +450,10 @@ impl<R: Registry> Registry for CachedRegistry<R> {
     fn name(&self) -> &'static str {
         self.inner.name()
     }
+
+    async fn pre_commit_manifest(&self, package: &str, reference: &str) -> Result<String> {
+        self.inner.pre_commit_manifest(package, reference).await
+    }
 }
 
 #[cfg(test)]
