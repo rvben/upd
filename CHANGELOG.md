@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.12.0](https://github.com/rvben/upd/compare/v0.11.5...v0.12.0) - 2026-09-08
+
+### Added
+
+- **pre-commit**: support prek and language-aware hook dependencies ([12ec54a](https://github.com/rvben/upd/commit/12ec54ab8fb5cb9e96ba929b993853646d0cfe74))
+
+### Fixed
+
+- **docker**: show variable FROM warnings only in verbose mode ([7ca6a54](https://github.com/rvben/upd/commit/7ca6a54f8cec0a08933da7c51da665325ac03dde))
+
 ## [0.11.5](https://github.com/rvben/upd/compare/v0.11.4...v0.11.5) - 2026-09-08
 
 ### Added
