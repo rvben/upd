@@ -69,7 +69,7 @@ fn build_schema() -> Value {
                 "short": "-l",
                 "description": "Filter by language/ecosystem (repeatable or comma-separated)",
                 "type": "string[]",
-                "enum": ["python", "node", "rust", "go", "ruby", "dotnet", "actions", "pre-commit", "mise", "terraform", "docker", "github-releases", "annotated"]
+                "enum": ["python", "node", "rust", "go", "ruby", "dotnet", "gradle", "actions", "pre-commit", "mise", "terraform", "docker", "github-releases", "annotated"]
             },
             {
                 "name": "limit",

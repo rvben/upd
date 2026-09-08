@@ -208,7 +208,7 @@ package.json: Skipped express (only newer version 4.19.0 released 1d ago, cooldo
 
 **Supported ecosystems:** PyPI, npm, crates.io, Go modules, RubyGems,
 GitHub releases (covers GitHub Actions, pre-commit, Mise), and Docker Hub.
-NuGet, Terraform Registry, and generic OCI tag listings do not expose
+NuGet, Gradle Maven metadata, Terraform Registry, and generic OCI tag listings do not expose
 per-version publish dates we can consume today; cooldown is reported as
 unavailable for those files.
 

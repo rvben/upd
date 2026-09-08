@@ -433,6 +433,7 @@ impl UpdConfig {
             "rubygems",
             "terraform",
             "nuget",
+            "gradle",
         ];
         if let toml::Value::Table(table) = &raw
             && let Some(toml::Value::Table(cooldown)) = table.get("cooldown")

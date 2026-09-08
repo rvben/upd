@@ -93,6 +93,9 @@ fn get_updater(file_type: FileType, warnings: ParseWarnings) -> Box<dyn Updater>
         FileType::GoMod => Box::new(GoModUpdater::new()),
         FileType::Gemfile => Box::new(GemfileUpdater::new()),
         FileType::Csproj => Box::new(CsprojUpdater::new()),
+        FileType::GradleCatalog | FileType::GradleScript => {
+            Box::new(crate::updater::GradleUpdater::new())
+        }
         FileType::GithubActions => Box::new(GithubActionsUpdater::new()),
         FileType::PreCommitConfig => Box::new(PreCommitUpdater::new()),
         FileType::MiseToml | FileType::ToolVersions => Box::new(MiseUpdater::new_parse_only()),
@@ -202,6 +205,7 @@ fn find_highest_version(occurrences: &[PackageOccurrence], lang: Lang) -> Option
 pub(crate) fn is_stable_version(version: &str, lang: Lang) -> bool {
     match lang {
         Lang::Python => is_stable_pep440(version),
+        Lang::Gradle => !crate::version::gradle::is_prerelease(version),
         Lang::Node | Lang::Rust | Lang::Go | Lang::DotNet => {
             // Semver pre-release indicator: hyphen followed by identifier
             !version.contains('-')
@@ -239,6 +243,7 @@ pub(crate) fn is_stable_version(version: &str, lang: Lang) -> bool {
 pub(crate) fn compare_versions(a: &str, b: &str, lang: Lang) -> std::cmp::Ordering {
     match lang {
         Lang::Python => compare_pep440(a, b),
+        Lang::Gradle => crate::version::gradle::compare(a, b),
         Lang::Node | Lang::Rust | Lang::Ruby | Lang::DotNet => compare_semver(a, b),
         Lang::Go => compare_go_version(a, b),
         Lang::Actions

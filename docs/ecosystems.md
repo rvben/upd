@@ -168,6 +168,52 @@ Use `--lock` to have the package manager validate the resulting dependency set.
   up to date when the range admits the newest release, a warning when the
   release has outgrown it, an error when the notation cannot be read
 
+## Gradle (JVM / Android)
+
+- `*.versions.toml` catalogs, including `gradle/libs.versions.toml`
+- Literal plugin versions in `build.gradle`, `build.gradle.kts`,
+  `settings.gradle`, and `settings.gradle.kts`
+- Select with `--lang gradle`
+- Libraries use Maven Central; plugins use Gradle Plugin Portal marker artifacts
+
+Catalogs support `[libraries]` entries with `module` or `group`/`name`,
+`"group:artifact:version"` shorthand, `[plugins]` entries with `id`, and literal
+versions or `version.ref` pointing into `[versions]`. Scripts support
+`id("org.example") version "1.2.3"`, Groovy's `id 'org.example' version '1.2.3'`,
+and Kotlin's `kotlin("jvm") version "2.2.0"` inside `plugins` blocks.
+Comments, quoting, and unrelated bytes are preserved. Actual published version
+strings are written in full, even without `--full-precision`: `1.2` must not
+be invented by shortening a release named `1.2.3`.
+
+Config and package filters identify libraries as `group:artifact` and plugins
+as `gradle-plugin:plugin.id`. For example, preserve a library that must match
+an IDE's bundled runtime with:
+
+```toml
+[pin]
+"org.eclipse.lsp4j:org.eclipse.lsp4j" = "0.21.1"
+```
+
+A shared version changes only when every consumer permits the same target.
+An ignored, filtered, pinned-to-current, failed, capped, or differently updated
+consumer keeps the shared value unchanged, with a warning. Interactive approval
+must include all consumers of a shared value; a partial selection is refused.
+
+This is static support for public Maven Central and Plugin Portal packages.
+Custom repositories and plugin resolution overrides are not interpreted.
+Dynamic versions, snapshots, rich constraints, externally managed versions,
+and computed plugin versions are reported as unsupported and left unchanged.
+An unsupported consumer of `version.ref` prevents the catalog from being edited.
+Scripts containing slash expressions outside comments or quoted strings are
+refused because Groovy slashy strings cannot safely be interpreted as code.
+Build-script library declarations and arbitrary Gradle expressions are outside
+this initial support; move dependencies to a catalog to check them.
+
+Gradle wrapper files, `gradle.properties` (including IntelliJ target versions),
+lockfile refresh, alignment, and auditing are not supported. No Gradle build is
+executed. Maven metadata does not provide per-release publication timestamps,
+so cooldown is reported as unavailable for this ecosystem.
+
 ## Docker / OCI images
 
 - `Dockerfile` and `Dockerfile.*` (`FROM` references, including multi-stage files)

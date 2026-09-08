@@ -31,8 +31,8 @@ pub use lockfile::{
     tool_available,
 };
 pub use registry::{
-    GitHubReleasesRegistry, NpmRegistry, NuGetRegistry, PyPiRegistry, Registry, RubyGemsRegistry,
-    TerraformRegistry, VersionMeta,
+    GitHubReleasesRegistry, GradleRegistry, NpmRegistry, NuGetRegistry, PyPiRegistry, Registry,
+    RubyGemsRegistry, TerraformRegistry, VersionMeta,
 };
 pub use updater::{
     DiscoverOptions, FileType, Lang, UpdateResult, Updater, discover_files, discover_files_with,

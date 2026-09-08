@@ -37,16 +37,18 @@ use upd::output::LockWriteStatus;
 use upd::package_filter::PackageFilter;
 use upd::path_display::display_path;
 use upd::registry::{
-    CratesIoRegistry, DockerRegistry, GitHubReleasesRegistry, GoProxyRegistry, MultiPyPiRegistry,
-    NpmRegistry, NuGetRegistry, PyPiRegistry, RubyGemsRegistry, TerraformRegistry,
+    CratesIoRegistry, DockerRegistry, GitHubReleasesRegistry, GoProxyRegistry, GradleRegistry,
+    MultiPyPiRegistry, NpmRegistry, NuGetRegistry, PyPiRegistry, RubyGemsRegistry,
+    TerraformRegistry,
 };
 use upd::updater::{
     ActionShaUpdate, AnnotatedUpdater, BumpFilter, BumpKind, CargoTomlUpdater, CsprojUpdater,
     DEFAULT_UPDATE_ACTION_SHAS, DiscoverOptions, DockerUpdater, FileType, GemfileUpdater,
-    GithubActionsUpdater, GoModUpdater, Lang, MiseUpdater, PackageJsonUpdater, ParseWarnings,
-    PreCommitUpdater, PyProjectUpdater, RegistrySet, RequirementsUpdater, SkipStatus,
-    SkippedUpdate, TerraformUpdater, UpdateOptions, UpdateResult, Updater, classify_bump,
-    discover_files_with, ecosystem_key, read_file_safe, update_with_annotations, write_file_atomic,
+    GithubActionsUpdater, GoModUpdater, GradleUpdater, Lang, MiseUpdater, PackageJsonUpdater,
+    ParseWarnings, PreCommitUpdater, PyProjectUpdater, RegistrySet, RequirementsUpdater,
+    SkipStatus, SkippedUpdate, TerraformUpdater, UpdateOptions, UpdateResult, Updater,
+    classify_bump, discover_files_with, ecosystem_key, read_file_safe, update_with_annotations,
+    write_file_atomic,
 };
 use upd::version::{compare_versions, match_version_precision};
 
@@ -1782,6 +1784,12 @@ async fn run_update(cli: &Cli) -> Result<()> {
     let terraform_registry = TerraformRegistry::new();
     let terraform = CachedRegistry::new(terraform_registry, Arc::clone(&cache), cache_enabled);
 
+    // Gradle libraries and plugin markers use distinct Maven repositories.
+    let gradle = Arc::new(CachedRegistry::new(
+        GradleRegistry::new(),
+        Arc::clone(&cache),
+        cache_enabled,
+    ));
     // Create NuGet registry
     let nuget_registry = NuGetRegistry::new();
     let nuget = CachedRegistry::new(nuget_registry, Arc::clone(&cache), cache_enabled);
@@ -1854,6 +1862,7 @@ async fn run_update(cli: &Cli) -> Result<()> {
             &rubygems,
             &terraform,
             &nuget,
+            &gradle,
             &github_releases,
             &docker,
             &requirements_updater,
@@ -1944,6 +1953,7 @@ async fn run_update(cli: &Cli) -> Result<()> {
             let github_actions_updater = Arc::clone(&github_actions_updater);
             let pre_commit_updater = Arc::clone(&pre_commit_updater);
             let mise_updater = Arc::clone(&mise_updater);
+            let gradle = Arc::clone(&gradle);
             let csproj_updater = Arc::clone(&csproj_updater);
             let terraform_updater = Arc::clone(&terraform_updater);
             let docker_updater = Arc::clone(&docker_updater);
@@ -1999,6 +2009,11 @@ async fn run_update(cli: &Cli) -> Result<()> {
                     FileType::MiseToml | FileType::ToolVersions => {
                         mise_updater
                             .update(&path, github_releases.as_ref(), update_options.clone())
+                            .await
+                    }
+                    FileType::GradleCatalog | FileType::GradleScript => {
+                        GradleUpdater::new()
+                            .update(&path, gradle.as_ref(), update_options.clone())
                             .await
                     }
                     FileType::Csproj => {
@@ -3067,6 +3082,7 @@ async fn run_interactive_update(
     rubygems: &Arc<CachedRegistry<RubyGemsRegistry>>,
     terraform: &Arc<CachedRegistry<TerraformRegistry>>,
     nuget: &Arc<CachedRegistry<NuGetRegistry>>,
+    gradle: &Arc<CachedRegistry<GradleRegistry>>,
     github_releases: &Arc<CachedRegistry<GitHubReleasesRegistry>>,
     docker: &Arc<CachedRegistry<DockerRegistry>>,
     requirements_updater: &Arc<RequirementsUpdater>,
@@ -3200,6 +3216,11 @@ async fn run_interactive_update(
             FileType::MiseToml | FileType::ToolVersions => {
                 mise_updater
                     .update(path, github_releases.as_ref(), dry_run_options.clone())
+                    .await
+            }
+            FileType::GradleCatalog | FileType::GradleScript => {
+                GradleUpdater::new()
+                    .update(path, gradle.as_ref(), dry_run_options.clone())
                     .await
             }
             FileType::Csproj => {
@@ -3954,6 +3975,7 @@ pub(crate) fn build_audit_packages(
             || *lang == Lang::Terraform
             || *lang == Lang::Docker
             || *lang == Lang::GithubReleases
+            || *lang == Lang::Gradle
             || *lang == Lang::Annotated
         {
             continue;
@@ -3972,6 +3994,7 @@ pub(crate) fn build_audit_packages(
             | Lang::Terraform
             | Lang::Docker
             | Lang::GithubReleases
+            | Lang::Gradle
             | Lang::Annotated => {
                 unreachable!("filtered above")
             }
@@ -4568,6 +4591,7 @@ fn build_sarif_occurrences(
             || *lang == Lang::Terraform
             || *lang == Lang::Docker
             || *lang == Lang::GithubReleases
+            || *lang == Lang::Gradle
             || *lang == Lang::Annotated
         {
             continue;
@@ -4586,6 +4610,7 @@ fn build_sarif_occurrences(
             | Lang::Terraform
             | Lang::Docker
             | Lang::GithubReleases
+            | Lang::Gradle
             | Lang::Annotated => {
                 unreachable!("filtered above")
             }
@@ -4723,6 +4748,7 @@ fn print_alignment(alignment: &PackageAlignment, _dry_run: bool) {
         Lang::Go => " (go)",
         Lang::Ruby => " (rubygems)",
         Lang::DotNet => " (nuget)",
+        Lang::Gradle => " (gradle)",
         Lang::Actions => " (actions)",
         Lang::PreCommit => " (pre-commit)",
         Lang::Mise => " (mise)",
@@ -4910,6 +4936,17 @@ fn apply_version_updates(
     file_type: FileType,
     full_precision: bool,
 ) -> Result<AppliedVersionUpdates> {
+    if matches!(file_type, FileType::GradleCatalog | FileType::GradleScript) {
+        let edits: Vec<_> = updates
+            .iter()
+            .map(|u| (u.package, u.old_version, u.new_version, u.line_num))
+            .collect();
+        let content = GradleUpdater::apply_approved_updates(content, file_type, &edits)?;
+        return Ok(AppliedVersionUpdates {
+            content,
+            applied: vec![true; updates.len()],
+        });
+    }
     let mut document = TextDocument::from_content(content);
     let mut applied = vec![false; updates.len()];
 
@@ -4941,6 +4978,7 @@ fn apply_version_updates(
             FileType::ToolVersions => {
                 apply_tool_versions_version(&mut document, update, &target_version)
             }
+            FileType::GradleCatalog | FileType::GradleScript => unreachable!("handled as a group"),
             FileType::Csproj => apply_csproj_version(&mut document, update, &target_version),
             FileType::TerraformTf => {
                 apply_terraform_version(&mut document, update, &target_version)

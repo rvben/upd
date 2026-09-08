@@ -31,6 +31,8 @@ pub struct Cache {
     nuget: HashMap<String, CacheEntry>,
     #[serde(default)]
     docker: HashMap<String, CacheEntry>,
+    #[serde(default)]
+    gradle: HashMap<String, CacheEntry>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -104,6 +106,7 @@ impl Cache {
             "terraform" => &self.terraform,
             "nuget" => &self.nuget,
             "docker" => &self.docker,
+            "gradle" => &self.gradle,
             _ => return None,
         };
 
@@ -127,6 +130,7 @@ impl Cache {
             "terraform" => &mut self.terraform,
             "nuget" => &mut self.nuget,
             "docker" => &mut self.docker,
+            "gradle" => &mut self.gradle,
             _ => return,
         };
 
@@ -194,6 +198,8 @@ impl Cache {
         self.nuget
             .retain(|_, entry| !Self::is_expired(entry.fetched_at));
         self.docker
+            .retain(|_, entry| !Self::is_expired(entry.fetched_at));
+        self.gradle
             .retain(|_, entry| !Self::is_expired(entry.fetched_at));
     }
 }

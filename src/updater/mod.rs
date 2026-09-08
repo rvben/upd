@@ -5,6 +5,7 @@ mod docker;
 mod gemfile;
 mod github_actions;
 mod go_mod;
+mod gradle;
 mod mise;
 mod package_json;
 mod pre_commit;
@@ -19,6 +20,7 @@ pub use docker::DockerUpdater;
 pub use gemfile::GemfileUpdater;
 pub use github_actions::GithubActionsUpdater;
 pub use go_mod::GoModUpdater;
+pub use gradle::GradleUpdater;
 pub use mise::MiseUpdater;
 
 pub use package_json::PackageJsonUpdater;
@@ -1099,6 +1101,7 @@ pub enum Lang {
     Ruby,
     #[value(name = "dotnet")]
     DotNet,
+    Gradle,
     Actions,
     PreCommit,
     Mise,
@@ -1118,6 +1121,7 @@ impl Lang {
             Lang::Go => "go",
             Lang::Ruby => "ruby",
             Lang::DotNet => "dotnet",
+            Lang::Gradle => "gradle",
             Lang::Actions => "actions",
             Lang::PreCommit => "pre_commit",
             Lang::Mise => "mise",
@@ -1139,6 +1143,8 @@ pub enum FileType {
     GoMod,
     Gemfile,
     Csproj,
+    GradleCatalog,
+    GradleScript,
     GithubActions,
     PreCommitConfig,
     MiseToml,
@@ -1162,6 +1168,7 @@ impl FileType {
             FileType::GoMod => Lang::Go,
             FileType::Gemfile => Lang::Ruby,
             FileType::Csproj => Lang::DotNet,
+            FileType::GradleCatalog | FileType::GradleScript => Lang::Gradle,
             FileType::GithubActions => Lang::Actions,
             FileType::PreCommitConfig => Lang::PreCommit,
             FileType::MiseToml | FileType::ToolVersions => Lang::Mise,
@@ -1197,6 +1204,8 @@ impl FileType {
             FileType::GoMod => "go_mod",
             FileType::Gemfile => "gemfile",
             FileType::Csproj => "csproj",
+            FileType::GradleCatalog => "gradle_catalog",
+            FileType::GradleScript => "gradle_script",
             FileType::GithubActions => "github_actions",
             FileType::PreCommitConfig => "pre_commit",
             FileType::MiseToml => "mise_toml",
@@ -1225,6 +1234,7 @@ pub fn ecosystem_key(file_type: FileType) -> Option<&'static str> {
         | FileType::MiseToml
         | FileType::ToolVersions => "github-releases",
         FileType::Csproj => "nuget",
+        FileType::GradleCatalog | FileType::GradleScript => "gradle",
         FileType::TerraformTf => "terraform",
         FileType::Dockerfile | FileType::DockerCompose => "docker",
         // An annotated file has no ecosystem of its own. Every entry carries
@@ -1236,6 +1246,15 @@ pub fn ecosystem_key(file_type: FileType) -> Option<&'static str> {
 impl FileType {
     pub fn detect(path: &Path) -> Option<Self> {
         let file_name = path.file_name()?.to_str()?;
+        if file_name.ends_with(".versions.toml") {
+            return Some(FileType::GradleCatalog);
+        }
+        if matches!(
+            file_name,
+            "build.gradle" | "build.gradle.kts" | "settings.gradle" | "settings.gradle.kts"
+        ) {
+            return Some(FileType::GradleScript);
+        }
 
         if file_name == "pyproject.toml" {
             return Some(FileType::PyProject);
@@ -3816,6 +3835,8 @@ mod tests {
         FileType::GoMod,
         FileType::Gemfile,
         FileType::Csproj,
+        FileType::GradleCatalog,
+        FileType::GradleScript,
         FileType::GithubActions,
         FileType::PreCommitConfig,
         FileType::MiseToml,
@@ -3837,6 +3858,8 @@ mod tests {
                 | FileType::GoMod
                 | FileType::Gemfile
                 | FileType::Csproj
+                | FileType::GradleCatalog
+                | FileType::GradleScript
                 | FileType::GithubActions
                 | FileType::PreCommitConfig
                 | FileType::MiseToml

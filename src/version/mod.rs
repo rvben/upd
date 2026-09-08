@@ -1,4 +1,5 @@
 pub mod compare;
+pub mod gradle;
 pub mod pep440;
 pub mod semver_util;
 pub mod tag;

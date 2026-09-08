@@ -9,7 +9,7 @@
 </p>
 
 <p align="center">
-  Python · Node.js · Rust · Go · Ruby · .NET · Docker · Terraform · GitHub Actions · pre-commit · Mise
+  Python · Node.js · Rust · Go · Ruby · .NET · Gradle · Docker · Terraform · GitHub Actions · pre-commit · Mise
 </p>
 
 [![crates.io](https://img.shields.io/crates/v/upd.svg)](https://crates.io/crates/upd)
