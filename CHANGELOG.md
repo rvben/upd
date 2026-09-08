@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.11.3](https://github.com/rvben/upd/compare/v0.11.2...v0.11.3) - 2026-09-08
+
+### Added
+
+- **gradle**: support version catalogs and literal plugin updates ([28d9013](https://github.com/rvben/upd/commit/28d9013af3493a93f99505f5135063f95e0b318c))
+
 ## [0.11.2](https://github.com/rvben/upd/compare/v0.11.1...v0.11.2) - 2026-09-08
 
 ### Fixed
