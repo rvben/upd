@@ -2,7 +2,7 @@
 use super::{Registry, TagsAtCommit, VersionMeta, VersionQuery};
 use anyhow::{Context, Result, anyhow};
 use async_trait::async_trait;
-use pep440_rs::{Version, VersionSpecifiers, release_specifiers_to_ranges};
+use pep440_rs::{Operator, Version, VersionSpecifiers, release_specifiers_to_ranges};
 use pep508_rs::{MarkerTree, MarkerTreeKind, MarkerValueVersion};
 use std::collections::{BTreeSet, HashMap};
 use std::path::Path;
@@ -144,7 +144,7 @@ impl<'a> PythonRegistry<'a> {
                 let file_range = match file.requires_python.as_deref() {
                     None | Some("") => Ranges::full(),
                     Some(requirement) => match requirement.parse::<VersionSpecifiers>() {
-                        Ok(specifiers) => release_specifiers_to_ranges(specifiers),
+                        Ok(specifiers) => dependency_python_range(specifiers),
                         // Invalid metadata cannot establish compatibility for this file.
                         Err(_) => Ranges::empty(),
                     },
@@ -217,6 +217,35 @@ impl<'a> PythonRegistry<'a> {
             ));
         }
         Ok(chosen.1.version.clone())
+    }
+}
+
+/// Ignore a dependency's final upper bound to avoid falling back to older
+/// releases that merely omit a speculative Python cap (for example, `<4`).
+/// Keep lower bounds and holes such as `!=3.10.5`; project and marker ranges
+/// continue to use their complete constraints.
+fn dependency_python_range(specifiers: VersionSpecifiers) -> Ranges<Version> {
+    let exclusions = release_specifiers_to_ranges(
+        specifiers
+            .iter()
+            .filter(|specifier| {
+                matches!(
+                    specifier.operator(),
+                    Operator::NotEqual | Operator::NotEqualStar
+                )
+            })
+            .cloned()
+            .collect(),
+    );
+    let range = release_specifiers_to_ranges(specifiers);
+    match range.iter().last() {
+        Some((lower, _)) => range
+            .union(&Ranges::from_range_bounds((
+                lower.clone(),
+                std::ops::Bound::Unbounded,
+            )))
+            .intersection(&exclusions),
+        None => range.clone(),
     }
 }
 
@@ -485,7 +514,17 @@ mod tests {
         for (project, files, expected) in [
             (">=3.10", vec![Some(">=3.11")], false),
             (">=3.10,<4", vec![Some(">=3.9")], true),
-            (">=3.10", vec![Some(">=3.10,<4")], false),
+            (">=3.10", vec![Some(">=3.10,<4")], true),
+            (">=3.12", vec![Some("<4.0,>=3.5")], true),
+            (">=3.12", vec![Some("<4.0,>=3.7")], true),
+            (">=3.12", vec![Some(">=3.13,<4")], false),
+            (">=3.12", vec![Some(">=3.7,<=3.12")], true),
+            (">=3.12", vec![Some("~=3.7")], true),
+            (">=3.10", vec![Some(">=3.10,!=3.10.5,<4")], false),
+            (">=3.10,!=3.10.5", vec![Some(">=3.10,!=3.10.5,<4")], true),
+            (">=3.12", vec![Some(">=4,<3")], false),
+            (">=3.12", vec![Some(">=3.7,<4,!=4.0")], false),
+            (">=3.12", vec![Some(">=3.7,<4,!=4.0.*")], false),
             (">=3.10,<3.12", vec![Some(">=3.10,!=3.10.5")], false),
             (">=3.10,!=3.10.5", vec![Some(">=3.10,!=3.10.5")], true),
             (">=3.10", vec![Some(">=3.10,<3.11"), Some(">=3.11")], true),

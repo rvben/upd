@@ -110,9 +110,9 @@ The package manager remains responsible for final resolution; a failed
 When `[project].requires-python` or `[tool.poetry.dependencies].python` is
 present, update checks select the newest release whose non-yanked files cover
 the declared Python range. For example, `>=3.10` prevents selecting a release
-that requires `>=3.11`. Upper bounds, exclusions, compatible-release constraints,
-and Poetry caret, tilde, wildcard, and union constraints are supported. When
-both declarations exist, their intersection defines the resolver range.
+that requires `>=3.11`. Project upper bounds, exclusions, compatible-release
+constraints, and Poetry caret, tilde, wildcard, and union constraints are
+supported. When both declarations exist, their intersection defines the resolver range.
 Requirements files inherit the nearest enclosing `pyproject.toml`, stopping at
 the repository boundary. Without a declaration, selection is unchanged; the
 installed interpreter and `.python-version` do not override project metadata.
@@ -120,7 +120,11 @@ installed interpreter and `.python-version` do not override project metadata.
 Compatibility checks read per-file `Requires-Python` from Simple JSON, Simple
 HTML, or the legacy PyPI JSON API, including private indexes. Missing metadata
 is treated as unrestricted; files with invalid metadata cannot establish
-compatibility. An empty compatible set reports an error and leaves that
+compatibility. Dependency upper bounds are ignored so that a cap such as `<4`
+does not reject a release for a project declaring `>=3.12` or cause a fallback
+to an older release without that cap. Dependency minimum versions and explicit
+exclusions are still checked; project constraints and dependency markers retain
+their upper bounds. An empty compatible set reports an error and leaves that
 dependency unchanged. Explicit configuration pins remain user overrides.
 Cooldown candidates are filtered by the same Python range. Complete metadata is
 cached in memory for the current run, independently of project constraints;

@@ -36,6 +36,47 @@ async fn project(
 }
 
 #[tokio::test]
+async fn dependency_python_caps_do_not_downgrade_loguru_or_reject_aws_sso_util() {
+    let server = MockServer::start().await;
+    for (package, files) in [
+        (
+            "loguru",
+            json!([
+                {"filename":"loguru-0.7.2.tar.gz", "requires-python":">=3.5"},
+                {"filename":"loguru-0.7.3.tar.gz", "requires-python":"<4.0,>=3.5"}
+            ]),
+        ),
+        (
+            "aws-sso-util",
+            json!([
+                {"filename":"aws_sso_util-4.32.0.tar.gz", "requires-python":">=3.7,<4.0"},
+                {"filename":"aws_sso_util-4.33.0.tar.gz", "requires-python":"<4.0,>=3.7"}
+            ]),
+        ),
+    ] {
+        Mock::given(path(format!("/simple/{package}/")))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(
+                json!({"files": files}).to_string(),
+                "application/vnd.pypi.simple.v1+json",
+            ))
+            .mount(&server)
+            .await;
+    }
+    let registry = PyPiRegistry::with_index_url(server.uri());
+    for (dependency, expected) in [
+        ("loguru==0.7.2", "loguru==0.7.3"),
+        ("loguru==0.7.3", "loguru==0.7.3"),
+        ("aws_sso_util==4.32.0", "aws_sso_util==4.33.0"),
+    ] {
+        let (result, text) =
+            project(&registry, ">=3.12", dependency, UpdateOptions::default()).await;
+        assert!(result.errors.is_empty(), "{:?}", result.errors);
+        assert!(result.warnings.is_empty(), "{:?}", result.warnings);
+        assert!(text.contains(expected), "{text}");
+    }
+}
+
+#[tokio::test]
 async fn project_selection_isolated_from_cached_latest_and_other_projects() {
     let server = index(json!([
         {"filename":"demo-1.5.tar.gz", "requires-python":">=3.8"},
