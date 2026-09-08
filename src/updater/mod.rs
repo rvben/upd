@@ -1189,9 +1189,9 @@ impl FileType {
     ///
     /// Adding a type to the composed dispatch in `main.rs` means adding it
     /// here; `github_actions_is_scanned_for_annotations` holds the two together
-    /// for the one type that composes today.
+    /// for the workflow composition.
     pub fn scans_annotations(&self) -> bool {
-        matches!(self, FileType::GithubActions)
+        matches!(self, FileType::GithubActions | FileType::Dockerfile)
     }
 
     /// Canonical, stable identifier for this file type (used by JSON output).
@@ -1443,6 +1443,12 @@ pub trait Updater: Send + Sync {
 /// file's own parser understands is never also rewritten from an `upd:`
 /// annotation, so no line is written twice in a single run.
 pub trait OwnsLines: Send + Sync {
+    /// An annotation outcome for each physical line, attributed to the line
+    /// whose version would be rewritten. Formats may require preceding comments.
+    fn annotations(&self, content: &str) -> Vec<crate::annotation::ParseOutcome> {
+        content.lines().map(crate::annotation::parse_line).collect()
+    }
+
     /// Whether this line carries a version this updater resolves itself.
     ///
     /// Answered from the line alone, without the surrounding file structure,

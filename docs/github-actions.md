@@ -394,7 +394,7 @@ says nothing about which release of the tool it will install. Left alone, such a
 version floats or goes stale silently.
 
 An [`upd:` annotation](ecosystems.md#annotated-files) declares its source, and a
-workflow is the one recognized file type that is scanned for annotations as well
+workflow, like a Dockerfile, is scanned for annotations as well
 as by its own updater:
 
 ```yaml

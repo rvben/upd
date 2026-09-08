@@ -341,7 +341,21 @@ An include never changes a recognized manifest's parser: for example, a
 matching `main.tf` remains Terraform. Use `--verbose` to diagnose an `upd:`
 marker in an otherwise undiscovered UTF-8 text file up to 1 MiB.
 
-A GitHub Actions workflow is the exception: it keeps its Actions updater and is
+Dockerfiles also scan annotated `ARG` and `ENV` versions alongside `FROM` updates:
+
+```dockerfile
+# upd: pypi uv
+ARG UV_VERSION=0.9.30
+```
+
+Use `upd --apply` to update both image tags and annotated versions.
+`--lang annotated` selects annotations only; `--lang python` selects PyPI
+annotations, and `--lang docker` selects image tags only. Place the comment
+immediately above a single-line `ARG` or `ENV` assignment. Docker treats inline
+`#` text as instruction arguments, so inline annotations are refused.
+Renovate comments such as `# renovate: datasource=pypi depName=uv` work too.
+
+A GitHub Actions workflow keeps its Actions updater and is
 scanned for annotations as well, so a tool version passed to an action through a
 `with:` input can be updated beside the `uses:` refs around it. See
 [GitHub Actions](docs/github-actions.md#annotated-versions-in-a-workflow).

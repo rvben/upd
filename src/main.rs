@@ -2026,7 +2026,17 @@ async fn run_update(cli: &Cli) -> Result<()> {
                             .update(&path, terraform.as_ref(), update_options.clone())
                             .await
                     }
-                    FileType::Dockerfile | FileType::DockerCompose => {
+                    FileType::Dockerfile => {
+                        update_with_annotations(
+                            docker_updater.as_ref(),
+                            annotated_updater.as_ref(),
+                            &path,
+                            docker.as_ref(),
+                            update_options.clone(),
+                        )
+                        .await
+                    }
+                    FileType::DockerCompose => {
                         docker_updater
                             .update(&path, docker.as_ref(), update_options.clone())
                             .await
@@ -3233,7 +3243,17 @@ async fn run_interactive_update(
                     .update(path, terraform.as_ref(), dry_run_options.clone())
                     .await
             }
-            FileType::Dockerfile | FileType::DockerCompose => {
+            FileType::Dockerfile => {
+                update_with_annotations(
+                    docker_updater.as_ref(),
+                    annotated_updater.as_ref(),
+                    path,
+                    docker.as_ref(),
+                    dry_run_options.clone(),
+                )
+                .await
+            }
+            FileType::DockerCompose => {
                 docker_updater
                     .update(path, docker.as_ref(), dry_run_options.clone())
                     .await
@@ -4986,7 +5006,19 @@ fn apply_version_updates(
             FileType::Dockerfile | FileType::DockerCompose => {
                 let current = document.clone().into_content();
                 let updater = DockerUpdater::new();
-                if let Some(updated) = updater.apply_approved_update(
+                if file_type == FileType::Dockerfile && update.expected_source.is_some() {
+                    let annotation = line_index(update.line_num).and_then(|idx| {
+                        upd::updater::OwnsLines::annotations(&updater, &current)
+                            .into_iter()
+                            .nth(idx)
+                    });
+                    apply_annotated_version_with_outcome(
+                        &mut document,
+                        update,
+                        &target_version,
+                        annotation,
+                    )
+                } else if let Some(updated) = updater.apply_approved_update(
                     &current,
                     file_type,
                     update.package,
@@ -5588,13 +5620,25 @@ fn apply_annotated_version(
     update: &VersionEdit<'_>,
     target_version: &str,
 ) -> bool {
+    let outcome = line_index(update.line_num)
+        .and_then(|idx| document.lines.get(idx))
+        .map(|line| annotation::parse_line(line));
+    apply_annotated_version_with_outcome(document, update, target_version, outcome)
+}
+
+fn apply_annotated_version_with_outcome(
+    document: &mut TextDocument,
+    update: &VersionEdit<'_>,
+    target_version: &str,
+    outcome: Option<annotation::ParseOutcome>,
+) -> bool {
     let Some(idx) = line_index(update.line_num) else {
         return false;
     };
     let Some(line) = document.lines.get(idx).cloned() else {
         return false;
     };
-    let annotation::ParseOutcome::Found(annotation) = annotation::parse_line(&line) else {
+    let Some(annotation::ParseOutcome::Found(annotation)) = outcome else {
         return false;
     };
     // Byte for byte: the annotation names the registry's own spelling, and upd
@@ -8672,6 +8716,44 @@ mod output_tests {
             line_num: Some(line),
             expected_source: source,
             sha_pin: None,
+        }
+    }
+
+    #[test]
+    fn dockerfile_annotated_apply_preserves_other_lines() {
+        let content = "FROM alpine:3.22\r\n # upd: pypi uv\r\nARG UV_VERSION=0.9.30\r\n";
+        let edits = [annotated_edit(
+            "uv",
+            "0.9.30",
+            "0.10.0",
+            3,
+            Some(AnnotationSource::PyPi),
+        )];
+        let result = apply_version_updates(content, &edits, FileType::Dockerfile, false).unwrap();
+        assert_eq!(result.content, content.replace("0.9.30", "0.10.0"));
+        assert_eq!(result.applied_count(), 1);
+    }
+
+    #[test]
+    fn dockerfile_interactive_apply_refuses_changed_annotation_or_value() {
+        let edits = [annotated_edit(
+            "uv",
+            "0.9.30",
+            "0.10.0",
+            3,
+            Some(AnnotationSource::PyPi),
+        )];
+        for content in [
+            "FROM scratch\n# upd: npm uv\nARG UV_VERSION=0.9.30\n",
+            "FROM scratch\n# upd: pypi other\nARG UV_VERSION=0.9.30\n",
+            "FROM scratch\n# upd: pypi uv\nARG UV_VERSION=0.9.31\n",
+            "FROM scratch\n# ordinary comment\nARG UV_VERSION=0.9.30\n",
+            "FROM scratch\n# upd: pypi uv\nFROM uv:0.9.30\n",
+        ] {
+            assert!(
+                apply_version_updates(content, &edits, FileType::Dockerfile, false).is_err(),
+                "{content}"
+            );
         }
     }
 

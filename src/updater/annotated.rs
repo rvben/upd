@@ -204,9 +204,11 @@ fn scan_annotated(content: &str, owner: Option<&dyn OwnsLines>) -> AnnotatedScan
     let mut refusals: Vec<String> = Vec::new();
     let mut unsupported_sources: HashSet<String> = HashSet::new();
 
-    for (line_idx, raw) in content.lines().enumerate() {
-        let outcome = parse_line(raw);
-
+    let outcomes = match owner {
+        Some(owner) => owner.annotations(content),
+        None => content.lines().map(parse_line).collect(),
+    };
+    for (line_idx, (raw, outcome)) in content.lines().zip(outcomes).enumerate() {
         // Checked before the outcome is read, so a marker on an owned line is
         // reported as the collision it is rather than as whatever else might
         // be wrong with it. Refused rather than skipped: an annotation that

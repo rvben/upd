@@ -231,6 +231,11 @@ so cooldown is reported as unavailable for this ecosystem.
   unavailable
 - Reports floating tags such as `latest`, runtime-only variables, and digest
   pins explicitly instead of guessing or claiming they are current
+- Dockerfiles support a standalone `# upd: pypi uv` comment immediately above
+  a single-line `ARG UV_VERSION=0.9.30` or `ENV UV_VERSION=0.9.30` assignment.
+  Renovate comments (`# renovate: datasource=pypi depName=uv`) work too. Inline
+  annotations, multiline assignments, variable values, and multiple assignments
+  on one line are refused. `FROM` tags remain owned by the Docker updater
 - Preserves comments, quoting, line endings, and every byte outside the tag
 
 Docker image tags are mutable registry labels, not package releases. `upd`
@@ -326,9 +331,9 @@ NODE_VERSION := 22.11.0  # upd: npm node
   `include = ["deploy/*.env", "config/version.conf"]`
 - `include` does not reinterpret a recognized file type (`main.tf` remains
   Terraform), and `exclude` takes precedence when both match
-- A GitHub Actions workflow is the exception: it keeps its own updater and is
-  scanned for annotations as well, so a tool version passed to an action through
-  a `with:` input can be updated. See
+- Dockerfiles and GitHub Actions workflows keep their own updaters and are
+  scanned for annotations as well. Dockerfiles require preceding comments as
+  described above; workflow `with:` inputs use trailing comments. See
   [GitHub Actions](github-actions.md#annotated-versions-in-a-workflow)
 - The version on the line is found and rewritten in place, keeping a leading
   `v` and the line's own precision (`v2.60` becomes `v2.65`, not `v2.65.4`)

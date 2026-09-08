@@ -1,14 +1,18 @@
 use super::{
-    CooldownOutcome, FileType, ParsedDependency, SkipStatus, SkippedUpdate, UpdateOptions,
-    UpdateResult, Updater, apply_cooldown, downgrade_warning, read_file_safe, write_file_atomic,
+    CooldownOutcome, FileType, Lang, OwnsLines, ParsedDependency, SkipStatus, SkippedUpdate,
+    UpdateOptions, UpdateResult, Updater, apply_cooldown, downgrade_warning, read_file_safe,
+    write_file_atomic,
 };
+use crate::annotation::{ParseOutcome, is_version_token, parse_line};
 use crate::registry::{DockerRegistry, Registry};
 use anyhow::{Result, anyhow};
 use async_trait::async_trait;
 use regex::Regex;
 use std::collections::HashSet;
+use std::collections::VecDeque;
 use std::ops::Range;
 use std::path::Path;
+use std::sync::LazyLock;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct DockerDependency {
@@ -290,6 +294,138 @@ impl DockerUpdater {
     }
 }
 
+/// Read Dockerfile annotations without treating instruction arguments as comments.
+/// Keep physical line numbers so normal and interactive writes share one parser.
+fn dockerfile_annotations(content: &str) -> Vec<ParseOutcome> {
+    static HEREDOC: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r#"<<(-?)[\t ]*(?:'([^']+)'|"([^"]+)"|([^\s<>|;&'"\\]+))"#).unwrap()
+    });
+    let lines: Vec<_> = content.lines().collect();
+    let mut outcomes = vec![ParseOutcome::None; lines.len()];
+    let mut pending: Option<(usize, ParseOutcome)> = None;
+    let mut continued = false;
+    let mut escape = '\\';
+    let mut heredocs: VecDeque<(String, bool)> = VecDeque::new();
+    for (idx, raw) in lines.iter().enumerate() {
+        let trimmed = raw.trim();
+        if !continued && let Some((delimiter, strip_tabs)) = heredocs.front() {
+            let candidate = if *strip_tabs {
+                raw.trim_start_matches('\t')
+            } else {
+                raw
+            };
+            if candidate == delimiter {
+                heredocs.pop_front();
+            }
+            continue;
+        }
+        if trimmed.starts_with('#') {
+            if let Some((_, value)) = trimmed.split_once('=')
+                && trimmed[..trimmed.find('=').unwrap()]
+                    .trim()
+                    .eq_ignore_ascii_case("# escape")
+                && matches!(value.trim(), "\\" | "`")
+            {
+                escape = value.trim().chars().next().unwrap();
+            }
+            if let Some((line, _)) = pending.take() {
+                outcomes[line] = ParseOutcome::Malformed(
+                    "Dockerfile annotation must immediately precede a single-line ARG or ENV version assignment".into(),
+                );
+            }
+            let outcome = parse_line(raw);
+            if !matches!(outcome, ParseOutcome::None) {
+                if continued {
+                    outcomes[idx] = ParseOutcome::Malformed(
+                        "Dockerfile annotation inside a continued instruction is ignored".into(),
+                    );
+                } else {
+                    pending = Some((idx, outcome));
+                }
+            }
+            continue;
+        }
+        let was_continued = continued;
+        // Empty lines do not end an instruction continued from a prior line.
+        if !trimmed.is_empty() {
+            continued = trimmed.ends_with(escape);
+        }
+        for captures in HEREDOC.captures_iter(raw) {
+            let delimiter = captures
+                .get(2)
+                .or_else(|| captures.get(3))
+                .or_else(|| captures.get(4))
+                .unwrap();
+            heredocs.push_back((delimiter.as_str().to_string(), &captures[1] == "-"));
+        }
+        if let Some((comment_idx, outcome)) = pending.take() {
+            if !was_continued && !continued && literal_version_assignment(trimmed) {
+                outcomes[idx] = match outcome {
+                    ParseOutcome::Found(mut annotation) => {
+                        annotation.comment_start = raw.len();
+                        ParseOutcome::Found(annotation)
+                    }
+                    other => other,
+                };
+            } else {
+                outcomes[comment_idx] = ParseOutcome::Malformed(
+                    "Dockerfile annotation must immediately precede a single-line ARG or ENV version assignment".into(),
+                );
+            }
+        }
+        if !matches!(parse_line(raw), ParseOutcome::None) {
+            outcomes[idx] = ParseOutcome::Malformed(
+                "Dockerfile annotations must be on a separate comment line immediately above ARG or ENV; inline # text is part of the instruction".into(),
+            );
+        }
+    }
+    if let Some((idx, _)) = pending {
+        outcomes[idx] = ParseOutcome::Malformed(
+            "Dockerfile annotation must immediately precede a single-line ARG or ENV version assignment".into(),
+        );
+    }
+    outcomes
+}
+
+fn literal_version_assignment(line: &str) -> bool {
+    let Some((instruction, assignment)) = line.split_once(char::is_whitespace) else {
+        return false;
+    };
+    if !instruction.eq_ignore_ascii_case("ARG") && !instruction.eq_ignore_ascii_case("ENV") {
+        return false;
+    }
+    let Some((name, value)) = assignment.trim().split_once('=') else {
+        return false;
+    };
+    if name.is_empty()
+        || !name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
+        || name.as_bytes()[0].is_ascii_digit()
+    {
+        return false;
+    }
+    let value = value.trim();
+    let value = value
+        .strip_prefix('"')
+        .and_then(|v| v.strip_suffix('"'))
+        .or_else(|| value.strip_prefix('\'').and_then(|v| v.strip_suffix('\'')))
+        .unwrap_or(value);
+    is_version_token(value)
+}
+
+impl OwnsLines for DockerUpdater {
+    fn annotations(&self, content: &str) -> Vec<ParseOutcome> {
+        dockerfile_annotations(content)
+    }
+
+    fn owns_line(&self, line: &str) -> bool {
+        self.from_re.is_match(line)
+    }
+
+    fn lang(&self) -> Lang {
+        Lang::Docker
+    }
+}
+
 impl Default for DockerUpdater {
     fn default() -> Self {
         Self::new()
@@ -500,6 +636,49 @@ impl Updater for DockerUpdater {
 mod tests {
     use super::*;
     use crate::registry::mock::MockRegistry;
+
+    #[tokio::test]
+    async fn preceding_annotations_resolve_from_their_registry_and_preserve_bytes() {
+        use crate::annotation::AnnotationSource;
+        use crate::updater::{AnnotatedUpdater, RegistrySet, update_with_annotations};
+        use std::sync::Arc;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("Dockerfile");
+        let content = "FROM alpine:3.22\r\n# upd: pypi uv\r\nARG UV_VERSION=\"0.9.30\"\r\n# renovate: datasource=pypi depName=uv\r\nENV UV_VERSION='0.9.30'";
+        std::fs::write(&path, content).unwrap();
+        let docker = MockRegistry::new("docker")
+            .with_version(&DockerRegistry::lookup_key("alpine", "3.22"), "3.23");
+        let annotated = AnnotatedUpdater::new(RegistrySet::with_single(
+            AnnotationSource::PyPi,
+            Arc::new(MockRegistry::new("pypi").with_version("uv", "0.10.0")),
+        ));
+        for dry_run in [true, false] {
+            let result = update_with_annotations(
+                &DockerUpdater::new(),
+                &annotated,
+                &path,
+                &docker,
+                UpdateOptions::new(dry_run, false),
+            )
+            .await
+            .unwrap();
+            assert!(result.errors.is_empty(), "{:?}", result.errors);
+            assert!(result.warnings.is_empty(), "{:?}", result.warnings);
+            assert_eq!(result.updated.len(), 3);
+            assert_eq!(result.updated[1].3, Some(3));
+            assert_eq!(result.updated[2].3, Some(5));
+            assert_eq!(
+                std::fs::read_to_string(&path).unwrap(),
+                if dry_run {
+                    content.to_string()
+                } else {
+                    content
+                        .replace("alpine:3.22", "alpine:3.23")
+                        .replace("0.9.30", "0.10.0")
+                }
+            );
+        }
+    }
 
     #[test]
     fn parses_multistage_dockerfiles_and_preserves_registry_ports() {
