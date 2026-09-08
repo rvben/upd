@@ -74,6 +74,41 @@ fn dockerfile_annotations_obey_source_selection_and_discovery() {
 }
 
 #[test]
+fn variable_from_warning_requires_verbose_but_inline_annotation_warning_does_not() {
+    let content = "ARG BASE=alpine:3.22\nFROM $BASE\nARG UV_VERSION=0.9.30 # upd: pypi uv\n";
+    for verbose in [false, true] {
+        let dir = fixture("Dockerfile", content);
+        std::fs::remove_file(dir.path().join(".updrc.toml")).unwrap();
+        let mut args = vec!["--apply"];
+        if verbose {
+            args.push("--verbose");
+        }
+        let output = run(&dir, "Dockerfile", &args);
+        assert!(output.status.success(), "{:?}", output);
+        let report: serde_json::Value = serde_json::from_slice(&output.stdout)
+            .unwrap_or_else(|error| panic!("{error}: {output:?}"));
+        let warnings = report["files"][0]["warnings"].as_array().unwrap();
+        assert_eq!(
+            warnings
+                .iter()
+                .any(|warning| warning.as_str().unwrap().contains("variable-based FROM")),
+            verbose,
+            "{report}"
+        );
+        assert!(
+            warnings
+                .iter()
+                .any(|warning| warning.as_str().unwrap().contains("inline # text")),
+            "{report}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("Dockerfile")).unwrap(),
+            content
+        );
+    }
+}
+
+#[test]
 fn dockerfile_annotation_check_does_not_write() {
     let dir = fixture("Dockerfile", DOCKERFILE);
     let output = run(&dir, "Dockerfile", &["--check", "--lang", "annotated"]);

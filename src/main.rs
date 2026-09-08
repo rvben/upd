@@ -1824,7 +1824,7 @@ async fn run_update(cli: &Cli) -> Result<()> {
     let gemfile_updater = Arc::new(GemfileUpdater::new());
     let terraform_updater = Arc::new(TerraformUpdater::new());
     let csproj_updater = Arc::new(CsprojUpdater::new());
-    let docker_updater = Arc::new(DockerUpdater::new());
+    let docker_updater = Arc::new(DockerUpdater::new().with_verbose(cli.verbose));
 
     // Wrap registries in Arc for parallel processing
     let pypi = Arc::new(pypi);

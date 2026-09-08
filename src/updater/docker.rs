@@ -34,6 +34,7 @@ struct ImageReference {
 pub struct DockerUpdater {
     from_re: Regex,
     compose_image_re: Regex,
+    verbose: bool,
 }
 
 impl DockerUpdater {
@@ -43,7 +44,13 @@ impl DockerUpdater {
                 .expect("valid Dockerfile FROM regex"),
             compose_image_re: Regex::new(r"^(\s*)image\s*:\s*(.*?)\s*(?:#.*)?$")
                 .expect("valid Compose image regex"),
+            verbose: false,
         }
+    }
+
+    pub fn with_verbose(mut self, verbose: bool) -> Self {
+        self.verbose = verbose;
+        self
     }
 
     fn parse_reference(value: &str) -> Option<ImageReference> {
@@ -119,10 +126,12 @@ impl DockerUpdater {
             };
             let value = reference_match.as_str();
             if value.contains('$') {
-                warnings.push(format!(
-                    "line {}: variable-based FROM references are not rewritten; pin the complete image reference directly",
-                    line_idx + 1
-                ));
+                if self.verbose {
+                    warnings.push(format!(
+                        "line {}: variable-based FROM references are not rewritten; pin the complete image reference directly",
+                        line_idx + 1
+                    ));
+                }
                 continue;
             }
             let Some(reference) = Self::parse_reference(value) else {
@@ -756,7 +765,7 @@ mod tests {
 
     #[test]
     fn digest_pins_and_variable_froms_are_reported_not_rewritten() {
-        let updater = DockerUpdater::new();
+        let updater = DockerUpdater::new().with_verbose(true);
         let (dependencies, warnings) = updater.parse_dockerfile(
             "ARG BASE=alpine:3.22\nFROM $BASE\nFROM alpine:3.22@sha256:deadbeef\n",
         );
