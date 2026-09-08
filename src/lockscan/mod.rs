@@ -7,6 +7,7 @@
 
 pub mod cargo;
 pub mod discover;
+pub mod gradle;
 pub mod npm;
 pub mod poetry;
 pub mod provenance;
@@ -82,6 +83,7 @@ pub fn scan_locks(files: &[(PathBuf, FileType)], scan_roots: &[PathBuf]) -> Lock
             discover::LockKind::Poetry => poetry::scan_poetry_lock(&lock.path),
             discover::LockKind::Npm => npm::scan_npm_lock(&lock.path),
             discover::LockKind::Cargo => cargo::scan_cargo_lock(&lock.path),
+            discover::LockKind::Gradle => gradle::scan_gradle_lock(&lock.path),
         };
         match scanned {
             Ok(mut scan) => {

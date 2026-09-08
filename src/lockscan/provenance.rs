@@ -271,6 +271,18 @@ pub fn classify(
             .filter(|lp| lp.lockfile_path == lock.path)
             .collect();
         match lock.kind {
+            LockKind::Gradle => {
+                for lp in &entries {
+                    insert_provenance(
+                        &mut index.map,
+                        (lp.name.clone(), lp.version.clone(), lp.ecosystem.as_str()),
+                        Provenance::LockOnly {
+                            lockfile: lock.path.clone(),
+                            kind: lock.kind,
+                        },
+                    );
+                }
+            }
             LockKind::Uv | LockKind::Poetry => {
                 // Declared names across associated manifests, from the
                 // production parse output (the occurrence map) so config,

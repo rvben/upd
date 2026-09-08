@@ -25,7 +25,12 @@ upd audit --offline
 upd audit --format sarif > results.sarif
 ```
 
-**Supported ecosystems for auditing:** PyPI, npm, crates.io, Go, RubyGems, NuGet
+**Supported ecosystems for auditing:** PyPI, npm, crates.io, Go, RubyGems, NuGet,
+and Maven through Gradle lockfiles.
+
+Gradle auditing reads adjacent `gradle.lockfile` and `buildscript-gradle.lockfile`
+files and reports coverage limitations. Automatic Maven fixes are not supported;
+see [Maven audit coverage](ecosystems.md#maven-audit-coverage).
 
 ## Example output
 

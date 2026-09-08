@@ -229,8 +229,17 @@ sources such as IntelliJ target versions or `gradleVersion`. Run the project's
 wrapper task when adopting new wrapper bootstrap code, and validate toolchain
 compatibility with the project's build and tests.
 
-Gradle auditing, lockfile regeneration, automatic audit fixes, and alignment
-remain unsupported. No Gradle build is executed automatically.
+### Maven audit coverage
+
+`upd audit --lang gradle` reads resolved Maven coordinates from adjacent
+`gradle.lockfile` and `buildscript-gradle.lockfile` files. Both Kotlin and Groovy
+build-script filenames are recognized. Unlocked declarations are not treated
+as a resolved graph. A coverage warning identifies the limits: missing plugin
+resolution graphs, IDE/JDK distributions, and the wrapper are not audited.
+Malformed lockfiles produce a scan warning instead of a partial clean result.
+Gradle lockfile regeneration, automatic audit fixes, and alignment remain
+unsupported; remediate through the owning build configuration and re-lock with
+Gradle. No Gradle build is executed automatically.
 
 Maven metadata does not provide per-release publication timestamps, so cooldown
 is reported as unavailable for this ecosystem.

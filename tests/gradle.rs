@@ -116,3 +116,43 @@ fn literal_maven_dependency_cli_updates_only_selected_coordinate() {
         content.replace("g:lib:1.0", "g:lib:1.2.3")
     );
 }
+
+#[test]
+fn gradle_locked_maven_audit_is_offline_and_does_not_apply_unsafe_fixes() {
+    let dir = fixture();
+    std::fs::write(dir.path().join("build.gradle.kts"), "dependencies {}\n").unwrap();
+    let lock = dir.path().join("gradle.lockfile");
+    let content = "g:transitive:1.0=runtimeClasspath\nempty=testRuntimeClasspath\n";
+    std::fs::write(&lock, content).unwrap();
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    std::fs::write(dir.path().join("cache/audit.json"),json!({"entries":{"Maven::g:transitive::1.0":{"vulnerabilities":[{"id":"GHSA-gradle-test","summary":"test","severity":"High","url":"https://example.com/advisory","fixed_version":"1.1"}],"fetched_at":now,"schema_version":2}}}).to_string()).unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_upd"))
+        .current_dir(dir.path())
+        .env("UPD_CACHE_DIR", dir.path().join("cache"))
+        .args([
+            "audit",
+            ".",
+            "--lang",
+            "gradle",
+            "--offline",
+            "--fix-audit",
+            "--apply",
+            "--format",
+            "json",
+        ])
+        .output()
+        .unwrap();
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["summary"]["packages_checked"], 1, "{report}");
+    assert_eq!(report["vulnerabilities"][0]["ecosystem"], "Maven");
+    assert_eq!(report["vulnerabilities"][0]["package"], "g:transitive");
+    assert_eq!(std::fs::read_to_string(lock).unwrap(), content);
+    assert!(String::from_utf8_lossy(&output.stderr).contains("Gradle audit checks only"));
+    assert!(
+        report.to_string().contains("owning build configuration"),
+        "{report}"
+    );
+}

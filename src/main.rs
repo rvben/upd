@@ -519,6 +519,7 @@ fn ecosystem_to_lang(ecosystem: Ecosystem) -> Lang {
         Ecosystem::Go => Lang::Go,
         Ecosystem::RubyGems => Lang::Ruby,
         Ecosystem::NuGet => Lang::DotNet,
+        Ecosystem::Maven => Lang::Gradle,
     }
 }
 
@@ -615,9 +616,9 @@ fn floor_report_path(lockfile: &Path, kind: lockscan::discover::LockKind) -> Pat
     match kind {
         lockscan::discover::LockKind::Uv => dir.join("pyproject.toml"),
         lockscan::discover::LockKind::Npm => dir.join("package.json"),
-        lockscan::discover::LockKind::Cargo | lockscan::discover::LockKind::Poetry => {
-            lockfile.to_path_buf()
-        }
+        lockscan::discover::LockKind::Cargo
+        | lockscan::discover::LockKind::Poetry
+        | lockscan::discover::LockKind::Gradle => lockfile.to_path_buf(),
     }
 }
 
@@ -632,6 +633,13 @@ fn floor_config_lookup_path(lockfile: &Path, kind: lockscan::discover::LockKind)
         }
         lockscan::discover::LockKind::Npm => dir.join("package.json"),
         lockscan::discover::LockKind::Cargo => dir.join("Cargo.toml"),
+        lockscan::discover::LockKind::Gradle => {
+            if dir.join("build.gradle.kts").exists() {
+                dir.join("build.gradle.kts")
+            } else {
+                dir.join("build.gradle")
+            }
+        }
     }
 }
 
@@ -2340,7 +2348,9 @@ async fn run_update(cli: &Cli) -> Result<()> {
                     Ecosystem::PyPI => pypi.as_ref(),
                     Ecosystem::Npm => npm.as_ref(),
                     Ecosystem::CratesIo => crates_io.as_ref(),
-                    Ecosystem::Go | Ecosystem::RubyGems | Ecosystem::NuGet => continue,
+                    Ecosystem::Go | Ecosystem::RubyGems | Ecosystem::NuGet | Ecosystem::Maven => {
+                        continue;
+                    }
                 };
 
                 let resolution = if lang == Lang::Python {
@@ -4747,6 +4757,7 @@ fn print_audit_vulnerabilities(audit_result: &AuditResult) {
             Ecosystem::Go => "(Go)",
             Ecosystem::RubyGems => "(RubyGems)",
             Ecosystem::NuGet => "(NuGet)",
+            Ecosystem::Maven => "(Maven)",
         };
 
         println!(

@@ -12,6 +12,7 @@ pub enum LockKind {
     Poetry,
     Npm,
     Cargo,
+    Gradle,
 }
 
 #[derive(Debug)]
@@ -48,6 +49,7 @@ fn member_manifest_name(kind: LockKind) -> &'static str {
         LockKind::Uv | LockKind::Poetry => "pyproject.toml",
         LockKind::Npm => "package.json",
         LockKind::Cargo => "Cargo.toml",
+        LockKind::Gradle => "build.gradle.kts",
     }
 }
 
@@ -271,6 +273,14 @@ pub fn discover_locks(files: &[(PathBuf, FileType)], scan_roots: &[PathBuf]) -> 
     let mut seen_locks: HashSet<PathBuf> = HashSet::new();
     let mut uv_members_by_lock: HashMap<PathBuf, HashSet<PathBuf>> = HashMap::new();
 
+    if files.iter().any(|(_, ty)| {
+        matches!(
+            ty,
+            FileType::GradleScript | FileType::GradleCatalog | FileType::GradleWrapper
+        )
+    }) {
+        discovery.warnings.push("Gradle audit checks only adjacent gradle.lockfile/buildscript-gradle.lockfile resolved dependencies; unlocked dependencies, plugin-resolution graphs, the wrapper, JDK, and IDE distributions are not audited".into());
+    }
     // Pass 1: sibling locks of discovered manifests.
     for (manifest, file_type) in files {
         let Some(dir) = manifest.parent() else {
@@ -290,6 +300,10 @@ pub fn discover_locks(files: &[(PathBuf, FileType)], scan_roots: &[PathBuf]) -> 
                 }
             }
             FileType::CargoToml => vec![(dir.join("Cargo.lock"), LockKind::Cargo)],
+            FileType::GradleScript => vec![
+                (dir.join("gradle.lockfile"), LockKind::Gradle),
+                (dir.join("buildscript-gradle.lockfile"), LockKind::Gradle),
+            ],
             _ => vec![],
         };
         for (lock, kind) in candidates {

@@ -144,6 +144,7 @@ fn ecosystem_lang(ecosystem: Ecosystem) -> Lang {
         Ecosystem::Go => Lang::Go,
         Ecosystem::RubyGems => Lang::Ruby,
         Ecosystem::NuGet => Lang::DotNet,
+        Ecosystem::Maven => Lang::Gradle,
     }
 }
 
@@ -429,7 +430,7 @@ fn route_lock_only(
                 npm_form: None,
             });
         }
-        LockKind::Poetry => {
+        LockKind::Poetry | LockKind::Gradle => {
             sink.unfixable.push(UnfixableTarget {
                 package: pkg.name.clone(),
                 dependency_key: None,
@@ -437,10 +438,11 @@ fn route_lock_only(
                 to_version: Some(to_version.to_string()),
                 method: None,
                 path: Some(lockfile.to_path_buf()),
-                reason: format!(
-                    "no floor mechanism exists for poetry.lock; add {}>={} as a direct dependency",
-                    pkg.name, to_version
-                ),
+                reason: if kind == LockKind::Poetry {
+                    format!("no floor mechanism exists for poetry.lock; add {}>={} as a direct dependency", pkg.name, to_version)
+                } else {
+                    "Gradle audit fixes require updating the owning build configuration and regenerating its lockfile".into()
+                },
                 no_fixed_version: false,
             });
         }

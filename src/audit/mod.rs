@@ -58,6 +58,7 @@ pub enum Ecosystem {
     Go,
     RubyGems,
     NuGet,
+    Maven,
 }
 
 impl Ecosystem {
@@ -70,6 +71,7 @@ impl Ecosystem {
             Ecosystem::Go => "Go",
             Ecosystem::RubyGems => "RubyGems",
             Ecosystem::NuGet => "NuGet",
+            Ecosystem::Maven => "Maven",
         }
     }
 }
@@ -677,6 +679,7 @@ mod tests {
             Ecosystem::Go,
             Ecosystem::RubyGems,
             Ecosystem::NuGet,
+            Ecosystem::Maven,
         ];
         let mut seen = std::collections::HashSet::new();
         for eco in all {
