@@ -12,6 +12,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 
 - **docker**: update ARG and ENV versions from preceding annotations ([c333777](https://github.com/rvben/upd/commit/c3337772935c71b886ceec31284a44805ace9a52))
+- **release**: pin the Mise bootstrap to a published version so CI and release jobs do not depend on an unavailable default download.
 
 ## [0.11.3](https://github.com/rvben/upd/compare/v0.11.2...v0.11.3) - 2026-09-08
 
