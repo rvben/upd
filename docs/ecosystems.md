@@ -258,11 +258,12 @@ is reported as unavailable for this ecosystem.
   `*-alpine` channel
 - Supports Docker Hub shorthand, explicit registries and ports, quoted Compose
   values, and defaults such as `${APP_IMAGE:-ghcr.io/acme/app:1.2.3}`
-- Queries Docker Hub and OCI Distribution-compatible registries. Anonymous
-  bearer-token challenges are handled automatically, private GHCR images can
-  use GitHub Actions' repository token with `packages: read`, and Docker Hub
-  lookups fall back to its OCI registry when the richer tag endpoint is
-  unavailable
+- Queries Docker Hub and OCI Distribution-compatible registries. Reuses
+  `docker login` credentials, configured credential helpers, and identity tokens
+  for private images. GitHub Actions' repository token with `packages: read`
+  remains a fallback for private GHCR images. Docker Hub lookups fall back to its
+  OCI registry when the richer tag endpoint is unavailable. See
+  [Docker authentication](private-registries.md#docker--oci-registries)
 - Reports floating tags such as `latest`, runtime-only variables, and digest
   pins explicitly instead of guessing or claiming they are current
 - Dockerfiles support a standalone `# upd: pypi uv` comment immediately above

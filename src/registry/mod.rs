@@ -1,5 +1,6 @@
 mod crates_io;
 mod docker;
+mod docker_credentials;
 mod github_releases;
 mod go_proxy;
 mod gradle;

@@ -13,12 +13,45 @@ upd --verbose
 # Output: Using authenticated GitHub access
 ```
 
-Docker image updates support public Docker Hub and OCI registries, including
-their anonymous bearer-token challenge. In GitHub Actions, private GHCR images
-can use `GITHUB_ACTOR` and a `GITHUB_TOKEN` with `packages: read`. Those
-credentials are sent only to the exact `https://ghcr.io/token` endpoint. Other
-private container registries are reported as unsupported instead of silently
-falling back or leaking credentials to an untrusted endpoint.
+## Docker / OCI registries
+
+Docker image version checks reuse credentials saved by `docker login`. No Docker
+daemon is required. `upd` reads `$DOCKER_CONFIG/config.json`, or
+`~/.docker/config.json` when `DOCKER_CONFIG` is unset or empty, in this order:
+
+1. The registry's `credHelpers` entry.
+2. The global `credsStore` helper.
+3. The registry's inline `auths` entry (base64 `auth`, username/password, or
+   `identitytoken`).
+
+Helpers must be available as `docker-credential-<name>` on `PATH`. This supports
+configured Docker Desktop keychains and registry helpers such as `ecr-login`
+and `gcloud`. A selected helper takes precedence over inline credentials, even
+when it has no credentials for that registry. Helper failures are reported;
+`upd` does not silently use stale inline passwords. Helper calls time out after
+30 seconds, and credentials are cached in memory for the current run.
+
+```bash
+docker login registry.example.com
+upd --check
+```
+
+Docker Hub aliases share the standard `https://index.docker.io/v1/` credential
+entry. Other registries match their hostname and port. Credentials are loaded
+on an authentication challenge; unauthenticated lookups do not invoke helpers.
+Basic authentication and bearer-token challenges are supported, including
+refresh-token exchange for Docker's identity tokens. Public Docker Hub lookups
+retain release dates; OCI fallback lookups do not provide release dates.
+
+If no Docker credentials are found for `ghcr.io`, `GITHUB_ACTOR` and a
+`GITHUB_TOKEN` with `packages: read` remain a fallback. This fallback is sent
+only to the exact `https://ghcr.io/token` endpoint.
+
+Authentication requires HTTPS. A registry may delegate authentication to the
+HTTPS token service named in its challenge, as Docker does. Token requests ask
+only for pull access to the image being checked. HTTP redirects are rejected,
+and pagination must stay on the registry's origin. Credentials and helper
+output are never included in diagnostics or written to disk.
 
 ## PyPI / private Python index
 
