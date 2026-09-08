@@ -943,7 +943,7 @@ mod tests {
     #[tokio::test]
     async fn a_multi_clause_gem_keeps_its_ceiling() {
         let mut file = NamedTempFile::new().unwrap();
-        write!(file, "gem 'rails', '>= 6.0', '< 7.0'\n").unwrap();
+        writeln!(file, "gem 'rails', '>= 6.0', '< 7.0'").unwrap();
 
         // The unconstrained answer is 8.1.0. If the whole constraint set does not
         // reach the registry, the lookup falls back to it and the ceiling is left
@@ -967,7 +967,7 @@ mod tests {
     #[tokio::test]
     async fn an_exclusive_lower_bound_is_not_raised_over_the_release_it_names() {
         let mut file = NamedTempFile::new().unwrap();
-        write!(file, "gem 'rails', '> 6.0'\n").unwrap();
+        writeln!(file, "gem 'rails', '> 6.0'").unwrap();
 
         // `> 6.0` names the one version the author refuses. Raising it to `> 8.1`
         // would write a constraint that excludes the release it was raised to.
@@ -989,7 +989,7 @@ mod tests {
     #[tokio::test]
     async fn an_exclusion_that_admits_the_release_is_up_to_date() {
         let mut file = NamedTempFile::new().unwrap();
-        write!(file, "gem 'rails', '!= 7.0.0'\n").unwrap();
+        writeln!(file, "gem 'rails', '!= 7.0.0'").unwrap();
 
         let registry = MockRegistry::new("rubygems")
             .with_version("rails", "8.1.0")
@@ -1018,7 +1018,7 @@ mod tests {
     #[tokio::test]
     async fn an_uncapped_requirement_asks_for_the_newest_release_outright() {
         let mut file = NamedTempFile::new().unwrap();
-        write!(file, "gem 'rails', '>= 6.0.0'\n").unwrap();
+        writeln!(file, "gem 'rails', '>= 6.0.0'").unwrap();
 
         let registry = MockRegistry::new("rubygems")
             .with_version("rails", "8.1.0")
@@ -1042,7 +1042,7 @@ mod tests {
     #[tokio::test]
     async fn two_gems_at_the_same_requirement_are_each_looked_up() {
         let mut file = NamedTempFile::new().unwrap();
-        write!(file, "gem 'rails', '>= 7.0.0'\ngem 'puma', '>= 7.0.0'\n").unwrap();
+        writeln!(file, "gem 'rails', '>= 7.0.0'\ngem 'puma', '>= 7.0.0'").unwrap();
 
         let registry = MockRegistry::new("rubygems")
             .with_version("rails", "8.1.0")
@@ -1107,7 +1107,7 @@ mod tests {
     #[tokio::test]
     async fn an_exclusion_that_rules_out_the_newest_release_names_it() {
         let mut file = NamedTempFile::new().unwrap();
-        write!(file, "gem 'rails', '!= 8.1.0'\n").unwrap();
+        writeln!(file, "gem 'rails', '!= 8.1.0'").unwrap();
 
         let registry = MockRegistry::new("rubygems")
             .with_version("rails", "8.1.0")
@@ -1138,7 +1138,7 @@ mod tests {
     #[tokio::test]
     async fn an_exclusion_written_short_still_names_the_release_it_rules_out() {
         let mut file = NamedTempFile::new().unwrap();
-        write!(file, "gem 'rails', '!= 8.1'\n").unwrap();
+        writeln!(file, "gem 'rails', '!= 8.1'").unwrap();
 
         let registry = MockRegistry::new("rubygems")
             .with_version("rails", "8.1.0")
@@ -1168,7 +1168,7 @@ mod tests {
     #[tokio::test]
     async fn a_ceiling_below_every_release_is_left_alone_and_named() {
         let mut file = NamedTempFile::new().unwrap();
-        write!(file, "gem 'rails', '< 7.0'\n").unwrap();
+        writeln!(file, "gem 'rails', '< 7.0'").unwrap();
 
         let registry = MockRegistry::new("rubygems")
             .with_version("rails", "8.1.0")
@@ -1197,7 +1197,7 @@ mod tests {
     #[tokio::test]
     async fn a_ceiling_the_newest_release_fits_under_is_up_to_date() {
         let mut file = NamedTempFile::new().unwrap();
-        write!(file, "gem 'rails', '< 9.0'\n").unwrap();
+        writeln!(file, "gem 'rails', '< 9.0'").unwrap();
 
         let registry = MockRegistry::new("rubygems")
             .with_version("rails", "8.1.0")
@@ -1219,7 +1219,7 @@ mod tests {
     #[tokio::test]
     async fn a_bound_no_release_satisfies_names_what_is_available() {
         let mut file = NamedTempFile::new().unwrap();
-        write!(file, "gem 'rails', '> 9.9.9'\n").unwrap();
+        writeln!(file, "gem 'rails', '> 9.9.9'").unwrap();
 
         let registry = MockRegistry::new("rubygems").with_version("rails", "8.1.0");
 
@@ -1244,7 +1244,7 @@ mod tests {
         use std::sync::Arc;
 
         let mut file = NamedTempFile::new().unwrap();
-        write!(file, "gem 'rails', '< 7.0'\n").unwrap();
+        writeln!(file, "gem 'rails', '< 7.0'").unwrap();
 
         let registry = MockRegistry::new("rubygems").with_version("rails", "8.1.0");
 
@@ -1327,7 +1327,7 @@ mod tests {
     #[tokio::test]
     async fn test_unchanged_count() {
         let mut file = NamedTempFile::new().unwrap();
-        write!(file, "gem 'rails', '7.2.3'\ngem 'puma', '6.0.0'\n").unwrap();
+        writeln!(file, "gem 'rails', '7.2.3'\ngem 'puma', '6.0.0'").unwrap();
 
         let registry = MockRegistry::new("rubygems")
             .with_version("rails", "7.2.3") // Already at latest

@@ -30,7 +30,8 @@ fn every_release_pin_consumer_matches_the_manifest() {
     let assets = manifest["assets"].as_object().unwrap();
     assert_eq!(assets.len(), 3);
 
-    let consumers: BTreeMap<&str, (usize, &[(&str, usize)])> = BTreeMap::from([
+    type Consumers<'a> = BTreeMap<&'a str, (usize, &'a [(&'a str, usize)])>;
+    let consumers: Consumers<'_> = BTreeMap::from([
         (
             "ci/gitlab-dependency-update.yml",
             (
