@@ -10,6 +10,7 @@ pub struct GradleRegistry {
     client: Client,
     maven_url: String,
     plugin_url: String,
+    distribution_url: String,
 }
 
 #[derive(Deserialize)]
@@ -51,8 +52,15 @@ impl GradleRegistry {
             client,
             maven_url,
             plugin_url,
+            distribution_url: "https://services.gradle.org".into(),
         }
     }
+    #[cfg(test)]
+    pub(crate) fn with_distribution_url(mut self, url: String) -> Self {
+        self.distribution_url = url;
+        self
+    }
+
     fn metadata_url(&self, package: &str) -> Result<String> {
         fn valid(s: &str) -> bool {
             !s.is_empty()
@@ -79,6 +87,22 @@ impl GradleRegistry {
         ))
     }
     async fn latest(&self, package: &str, prereleases: bool) -> Result<String> {
+        if package == "gradle-wrapper" {
+            let response = get_with_retry(
+                &self.client,
+                &format!("{}/versions/all", self.distribution_url),
+            )
+            .await?;
+            let versions: Vec<serde_json::Value> = response.error_for_status()?.json().await?;
+            return versions
+                .iter()
+                .filter(|v| v["snapshot"] == false && v["nightly"] == false && v["broken"] != true)
+                .filter_map(|v| v["version"].as_str())
+                .filter(|v| is_literal(v) && (prereleases || !is_prerelease(v)))
+                .max_by(|a, b| compare(a, b))
+                .map(str::to_string)
+                .ok_or_else(|| anyhow!("no supported Gradle distributions"));
+        }
         let response = get_with_retry(&self.client, &self.metadata_url(package)?).await?;
         if !response.status().is_success() {
             bail!(
@@ -106,6 +130,35 @@ impl GradleRegistry {
 
 #[async_trait::async_trait]
 impl Registry for GradleRegistry {
+    async fn gradle_distribution_checksum(&self, version: &str, kind: &str) -> Result<String> {
+        if !is_literal(version)
+            || !version
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b".-".contains(&b))
+            || !matches!(kind, "bin" | "all")
+        {
+            bail!("invalid Gradle distribution");
+        }
+        let response = get_with_retry(
+            &self.client,
+            &format!(
+                "{}/distributions/gradle-{version}-{kind}.zip.sha256",
+                self.distribution_url
+            ),
+        )
+        .await?;
+        let checksum = response
+            .error_for_status()?
+            .text()
+            .await?
+            .trim()
+            .to_string();
+        if checksum.len() != 64 || !checksum.bytes().all(|b| b.is_ascii_hexdigit()) {
+            bail!("invalid Gradle distribution checksum");
+        }
+        Ok(checksum)
+    }
+
     async fn get_latest_version(&self, package: &str) -> Result<String> {
         self.latest(package, false).await
     }

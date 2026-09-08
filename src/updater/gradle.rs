@@ -232,14 +232,91 @@ fn script(content: &str) -> Result<Scan> {
     let ts = tokens(content)?;
     let mut scan = Scan::default();
     let mut blocks = Vec::new();
+    let mut dependency_blocks = Vec::new();
     let mut i = 0;
     while i < ts.len() {
         let t = &ts[i];
         if t.text == "{" && !t.quoted {
             blocks.push(i > 0 && ts[i - 1].text == "plugins" && !ts[i - 1].quoted);
+            dependency_blocks.push(
+                i > 0
+                    && !ts[i - 1].quoted
+                    && matches!(ts[i - 1].text, "dependencies" | "constraints"),
+            );
         }
         if t.text == "}" && !t.quoted {
             blocks.pop();
+            dependency_blocks.pop();
+        }
+        if dependency_blocks.contains(&true)
+            && !t.quoted
+            && matches!(
+                t.text,
+                "implementation"
+                    | "api"
+                    | "compileOnly"
+                    | "runtimeOnly"
+                    | "compileOnlyApi"
+                    | "testImplementation"
+                    | "testCompileOnly"
+                    | "testRuntimeOnly"
+                    | "testFixturesImplementation"
+                    | "annotationProcessor"
+                    | "testAnnotationProcessor"
+                    | "classpath"
+                    | "kapt"
+                    | "ksp"
+            )
+        {
+            let mut j = i + 1;
+            let paren = ts.get(j).is_some_and(|t| !t.quoted && t.text == "(");
+            if paren {
+                j += 1;
+            }
+            let wrapped = ts.get(j).is_some_and(|t| {
+                !t.quoted && matches!(t.text, "platform" | "enforcedPlatform" | "testFixtures")
+            });
+            if wrapped {
+                j += 1;
+                if ts.get(j).is_none_or(|t| t.text != "(" || t.quoted) {
+                    i += 1;
+                    continue;
+                }
+                j += 1;
+            }
+            if let Some(value) = ts.get(j).filter(|t| t.quoted) {
+                let mut end = j + 1;
+                let mut valid = value.literal;
+                for _ in 0..(usize::from(paren) + usize::from(wrapped)) {
+                    valid &= ts.get(end).is_some_and(|t| !t.quoted && t.text == ")");
+                    end += 1;
+                }
+                valid &= ts.get(end).is_none_or(|next| {
+                    !next.quoted
+                        && (matches!(next.text, ";" | "}" | "{")
+                            || (content[value.span.end..next.span.start].contains('\n')
+                                && !matches!(next.text, "+" | "." | "?")))
+                });
+                let parts: Vec<_> = value.text.split(':').collect();
+                valid &=
+                    parts.len() == 3 && parts[..parts.len().min(2)].iter().all(|p| !p.is_empty());
+                if valid {
+                    let version = parts[2];
+                    let start = value.span.end - version.len();
+                    scan.entries.push(Entry {
+                        package: format!("{}:{}", parts[0], parts[1]),
+                        version: version.into(),
+                        span: start..value.span.end,
+                        line: line_at(content, start),
+                    });
+                    i = end;
+                    continue;
+                }
+                scan.errors.push(format!(
+                    "line {}: computed or unsupported Maven dependency",
+                    line_at(content, value.span.start)
+                ));
+            }
         }
         if blocks.last() == Some(&true) && !t.quoted && matches!(t.text, "id" | "kotlin") {
             let start = i;
@@ -309,17 +386,95 @@ fn script(content: &str) -> Result<Scan> {
     Ok(scan)
 }
 
+fn wrapper(content: &str) -> Result<Scan> {
+    let url = regex::Regex::new(
+        r"(?m)^[ \t]*distributionUrl[ \t]*=[ \t]*https\\?://(?:services|downloads)\.gradle\.org/distributions/gradle-([0-9][A-Za-z0-9.-]*)-(bin|all)\.zip[ \t]*\r?$",
+    )?;
+    let matches: Vec<_> = url.captures_iter(content).collect();
+    let keys = regex::Regex::new(r"(?m)^[ \t]*distributionUrl\b")?;
+    if matches.len() != 1 || keys.find_iter(content).count() != 1 {
+        bail!("wrapper requires one literal official HTTPS Gradle distributionUrl");
+    }
+    let version = matches[0].get(1).unwrap();
+    if !is_literal(version.as_str()) {
+        bail!("unsupported Gradle distribution version");
+    }
+    Ok(Scan {
+        entries: vec![Entry {
+            package: "gradle-wrapper".into(),
+            version: version.as_str().into(),
+            span: version.range(),
+            line: line_at(content, version.start()),
+        }],
+        errors: vec![],
+    })
+}
+
 impl GradleUpdater {
     pub fn new() -> Self {
         Self
     }
     fn scan(content: &str, file_type: FileType) -> Result<Scan> {
-        if file_type == FileType::GradleCatalog {
+        if file_type == FileType::GradleWrapper {
+            wrapper(content)
+        } else if file_type == FileType::GradleCatalog {
             catalog(content)
         } else {
             script(content)
         }
     }
+    /// Update the distribution URL and its verified checksum as one file edit.
+    pub async fn rewrite_wrapper(
+        content: &str,
+        old: &str,
+        new: &str,
+        registry: &dyn Registry,
+    ) -> Result<String> {
+        let scan = wrapper(content)?;
+        let e = &scan.entries[0];
+        if e.version != old || !is_literal(new) {
+            bail!("Gradle wrapper changed or target is unsupported");
+        }
+        let kind = if content[e.span.end..].starts_with("-all.zip") {
+            "all"
+        } else {
+            "bin"
+        };
+        let key = regex::Regex::new(r"(?m)^[ \t]*distributionSha256Sum\b")?;
+        let checksum_re = regex::Regex::new(
+            r"(?m)^[ \t]*distributionSha256Sum[ \t]*=[ \t]*([a-fA-F0-9]{64})[ \t]*\r?$",
+        )?;
+        let existing: Vec<_> = checksum_re.captures_iter(content).collect();
+        if key.find_iter(content).count() != existing.len() || existing.len() > 1 {
+            bail!("duplicate or unsupported Gradle distribution checksum property");
+        }
+        let checksum = registry.gradle_distribution_checksum(new, kind).await?;
+        if checksum.len() != 64 || !checksum.bytes().all(|b| b.is_ascii_hexdigit()) {
+            bail!("invalid Gradle distribution checksum");
+        }
+        let mut edits = vec![(e.span.clone(), new.to_string())];
+        if let Some(c) = existing.first() {
+            edits.push((c.get(1).unwrap().range(), checksum.clone()));
+        }
+        edits.sort_by_key(|e| std::cmp::Reverse(e.0.start));
+        let mut out = content.to_string();
+        for (span, value) in edits {
+            out.replace_range(span, &value);
+        }
+        if existing.is_empty() {
+            let ending = if content.contains("\r\n") {
+                "\r\n"
+            } else {
+                "\n"
+            };
+            if !out.ends_with('\n') {
+                out.push_str(ending);
+            }
+            out.push_str(&format!("distributionSha256Sum={checksum}{ending}"));
+        }
+        Ok(out)
+    }
+
     /// Re-parse approved edits together: every consumer of a shared catalog
     /// value must be selected, and all targets must agree.
     pub fn apply_approved_updates(
@@ -327,6 +482,9 @@ impl GradleUpdater {
         file_type: FileType,
         edits: &[(&str, &str, &str, Option<usize>)],
     ) -> Result<String> {
+        if file_type == FileType::GradleWrapper {
+            bail!("wrapper edits require checksum-aware application");
+        }
         let scan = Self::scan(content, file_type)?;
         let mut replacements = BTreeMap::new();
         for &(package, old, new, line) in edits {
@@ -530,7 +688,23 @@ impl Updater for GradleUpdater {
             }
         }
         result.set_update_lang(Lang::Gradle);
-        if !options.dry_run && !replacements.is_empty() {
+        if file_type == FileType::GradleWrapper && !replacements.is_empty() {
+            let entry = &scan.entries[0];
+            let target = replacements.values().next().unwrap();
+            match Self::rewrite_wrapper(&content, &entry.version, target, registry).await {
+                Ok(rewritten) => {
+                    result.warnings.push("This update covers the Gradle distribution only; wrapper scripts/JAR and custom gradle.properties version sources are not regenerated".into());
+                    if !options.dry_run {
+                        write_file_atomic(path, &rewritten)?;
+                    }
+                }
+                Err(error) => {
+                    result.updated.clear();
+                    result.pinned.clear();
+                    result.errors.push(format!("gradle-wrapper: {error}"));
+                }
+            }
+        } else if !options.dry_run && !replacements.is_empty() {
             let mut rewritten = content;
             for ((start, end), new) in replacements.into_iter().rev() {
                 rewritten.replace_range(start..end, &new);
@@ -540,7 +714,10 @@ impl Updater for GradleUpdater {
         Ok(result)
     }
     fn handles(&self, file_type: FileType) -> bool {
-        matches!(file_type, FileType::GradleCatalog | FileType::GradleScript)
+        matches!(
+            file_type,
+            FileType::GradleCatalog | FileType::GradleScript | FileType::GradleWrapper
+        )
     }
     fn parse_dependencies(&self, _path: &Path) -> Result<Vec<ParsedDependency>> {
         // Align/audit need catalog-aware grouping and Maven identities. Until
@@ -734,5 +911,178 @@ plugins {
             );
         }
         assert_eq!(FileType::GradleCatalog.lang(), Lang::Gradle);
+    }
+}
+
+#[cfg(test)]
+mod additional_tests {
+    use super::*;
+    use crate::registry::{GradleRegistry, MockRegistry};
+    use wiremock::{
+        Mock, MockServer, ResponseTemplate,
+        matchers::{method, path},
+    };
+
+    #[test]
+    fn literal_libraries_preserve_context_and_skip_comments_and_examples() {
+        let source = r#"
+// dependencies { implementation("bad:comment:1.0") }
+val example = "dependencies { implementation('bad:string:1.0') }"
+dependencies {
+    implementation("g:a:1.0")
+    api(platform("g:b:2.0"))
+    testImplementation 'g:c:3.0'
+    constraints { classpath("g:d:4.0") { because("security") } }
+}
+"#;
+        let scan = script(source).unwrap();
+        assert!(scan.errors.is_empty(), "{:?}", scan.errors);
+        assert_eq!(
+            scan.entries
+                .iter()
+                .map(|e| e.package.as_str())
+                .collect::<Vec<_>>(),
+            vec!["g:a", "g:b", "g:c", "g:d"]
+        );
+        let edited = GradleUpdater::apply_approved_updates(
+            source,
+            FileType::GradleScript,
+            &[("g:a", "1.0", "1.2.3", None)],
+        )
+        .unwrap();
+        assert_eq!(edited, source.replace("g:a:1.0", "g:a:1.2.3"));
+    }
+
+    #[test]
+    fn computed_and_extended_coordinates_are_not_rewritten() {
+        for declaration in [
+            r#"implementation("g:a:$version")"#,
+            r#"implementation("g:a:1.0" + suffix)"#,
+            r#"implementation("g:a:1.0:classifier")"#,
+            r#"implementation("g:a:1.0@jar")"#,
+        ] {
+            let scan = script(&format!("dependencies {{ {declaration} }}")).unwrap();
+            assert!(
+                scan.entries.is_empty() || scan.entries.iter().all(|e| !is_literal(&e.version)),
+                "{declaration}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn wrapper_updates_url_and_checksum_atomically_and_is_idempotent() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/versions/all"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
+                {"version":"9.0.0","snapshot":false,"nightly":false},
+                {"version":"10.0.0-rc-1","snapshot":false,"nightly":false},
+                {"version":"99.0.0","snapshot":true,"nightly":false}
+            ])))
+            .mount(&server)
+            .await;
+        let checksum = "b".repeat(64);
+        Mock::given(method("GET"))
+            .and(path("/distributions/gradle-9.0.0-all.zip.sha256"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(format!("{checksum}\n")))
+            .mount(&server)
+            .await;
+        let registry = GradleRegistry::new().with_distribution_url(server.uri());
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("gradle-wrapper.properties");
+        let source = format!(
+            "# preserve\r\ndistributionUrl=https\\://services.gradle.org/distributions/gradle-8.13-all.zip\r\ndistributionSha256Sum={}\r\nnetworkTimeout=10000\r\n",
+            "a".repeat(64)
+        );
+        std::fs::write(&file, &source).unwrap();
+        let r = GradleUpdater::new()
+            .update(&file, &registry, UpdateOptions::new(true, false))
+            .await
+            .unwrap();
+        assert!(r.errors.is_empty(), "{:?}", r.errors);
+        assert_eq!(r.updated.len(), 1);
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), source);
+        let r = GradleUpdater::new()
+            .update(&file, &registry, UpdateOptions::new(false, false))
+            .await
+            .unwrap();
+        assert!(r.errors.is_empty(), "{:?}", r.errors);
+        let expected = source
+            .replace("8.13", "9.0.0")
+            .replace(&"a".repeat(64), &checksum);
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), expected);
+        let r = GradleUpdater::new()
+            .update(&file, &registry, UpdateOptions::new(false, false))
+            .await
+            .unwrap();
+        assert!(r.updated.is_empty());
+        let without = source
+            .lines()
+            .filter(|l| !l.starts_with("distributionSha256Sum"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let rewritten = GradleUpdater::rewrite_wrapper(&without, "8.13", "9.0.0", &registry)
+            .await
+            .unwrap();
+        assert!(rewritten.ends_with(&format!("distributionSha256Sum={checksum}\n")));
+    }
+
+    #[tokio::test]
+    async fn wrapper_rejects_bad_checksum_responses_and_duplicate_properties() {
+        let server = MockServer::start().await;
+        let registry = GradleRegistry::new().with_distribution_url(server.uri());
+        let source =
+            "distributionUrl=https\\://services.gradle.org/distributions/gradle-8.13-bin.zip\n";
+        for (status, body) in [(404, "missing"), (200, "invalid"), (200, "")] {
+            server.reset().await;
+            Mock::given(method("GET"))
+                .and(path("/distributions/gradle-9.0.0-bin.zip.sha256"))
+                .respond_with(ResponseTemplate::new(status).set_body_string(body))
+                .mount(&server)
+                .await;
+            assert!(
+                GradleUpdater::rewrite_wrapper(source, "8.13", "9.0.0", &registry)
+                    .await
+                    .is_err()
+            );
+        }
+        let property = format!("distributionSha256Sum={}\n", "a".repeat(64));
+        assert!(
+            GradleUpdater::rewrite_wrapper(
+                &format!("{source}{property}{property}"),
+                "8.13",
+                "9.0.0",
+                &registry
+            )
+            .await
+            .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn wrapper_never_writes_without_verified_checksum() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("gradle-wrapper.properties");
+        let source =
+            "distributionUrl=https\\://services.gradle.org/distributions/gradle-8.13-bin.zip\n";
+        std::fs::write(&file, source).unwrap();
+        let r = GradleUpdater::new()
+            .update(
+                &file,
+                &MockRegistry::new("gradle").with_version("gradle-wrapper", "9.0.0"),
+                UpdateOptions::new(false, false),
+            )
+            .await
+            .unwrap();
+        assert!(!r.errors.is_empty());
+        assert!(r.updated.is_empty());
+        assert_eq!(std::fs::read_to_string(file).unwrap(), source);
+        for invalid in [
+            source.replace("services.gradle.org", "evil.example"),
+            format!("{source}{source}"),
+            source.replace("https", "http"),
+        ] {
+            assert!(wrapper(&invalid).is_err());
+        }
     }
 }

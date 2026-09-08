@@ -1145,6 +1145,7 @@ pub enum FileType {
     Csproj,
     GradleCatalog,
     GradleScript,
+    GradleWrapper,
     GithubActions,
     PreCommitConfig,
     MiseToml,
@@ -1168,7 +1169,9 @@ impl FileType {
             FileType::GoMod => Lang::Go,
             FileType::Gemfile => Lang::Ruby,
             FileType::Csproj => Lang::DotNet,
-            FileType::GradleCatalog | FileType::GradleScript => Lang::Gradle,
+            FileType::GradleCatalog | FileType::GradleScript | FileType::GradleWrapper => {
+                Lang::Gradle
+            }
             FileType::GithubActions => Lang::Actions,
             FileType::PreCommitConfig => Lang::PreCommit,
             FileType::MiseToml | FileType::ToolVersions => Lang::Mise,
@@ -1206,6 +1209,7 @@ impl FileType {
             FileType::Csproj => "csproj",
             FileType::GradleCatalog => "gradle_catalog",
             FileType::GradleScript => "gradle_script",
+            FileType::GradleWrapper => "gradle_wrapper",
             FileType::GithubActions => "github_actions",
             FileType::PreCommitConfig => "pre_commit",
             FileType::MiseToml => "mise_toml",
@@ -1234,7 +1238,7 @@ pub fn ecosystem_key(file_type: FileType) -> Option<&'static str> {
         | FileType::MiseToml
         | FileType::ToolVersions => "github-releases",
         FileType::Csproj => "nuget",
-        FileType::GradleCatalog | FileType::GradleScript => "gradle",
+        FileType::GradleCatalog | FileType::GradleScript | FileType::GradleWrapper => "gradle",
         FileType::TerraformTf => "terraform",
         FileType::Dockerfile | FileType::DockerCompose => "docker",
         // An annotated file has no ecosystem of its own. Every entry carries
@@ -1246,6 +1250,9 @@ pub fn ecosystem_key(file_type: FileType) -> Option<&'static str> {
 impl FileType {
     pub fn detect(path: &Path) -> Option<Self> {
         let file_name = path.file_name()?.to_str()?;
+        if file_name == "gradle-wrapper.properties" {
+            return Some(FileType::GradleWrapper);
+        }
         if file_name.ends_with(".versions.toml") {
             return Some(FileType::GradleCatalog);
         }
@@ -3843,6 +3850,7 @@ mod tests {
         FileType::Csproj,
         FileType::GradleCatalog,
         FileType::GradleScript,
+        FileType::GradleWrapper,
         FileType::GithubActions,
         FileType::PreCommitConfig,
         FileType::MiseToml,
@@ -3866,6 +3874,7 @@ mod tests {
                 | FileType::Csproj
                 | FileType::GradleCatalog
                 | FileType::GradleScript
+                | FileType::GradleWrapper
                 | FileType::GithubActions
                 | FileType::PreCommitConfig
                 | FileType::MiseToml

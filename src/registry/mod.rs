@@ -316,6 +316,11 @@ pub fn tags_at_commit_unsupported() -> Result<TagsAtCommit> {
 /// a new one that does not silently loses prerelease and constraint handling.
 #[async_trait]
 pub trait Registry: Send + Sync {
+    /// SHA-256 of an official Gradle distribution; never inferred from a version.
+    async fn gradle_distribution_checksum(&self, _version: &str, _kind: &str) -> Result<String> {
+        anyhow::bail!("registry does not provide Gradle distribution checksums")
+    }
+
     /// All Python releases and per-file interpreter constraints.
     /// Non-Python registries explicitly report this capability as unsupported.
     async fn python_releases(&self, package: &str) -> Result<Vec<PythonRelease>>;

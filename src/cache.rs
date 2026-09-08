@@ -293,6 +293,10 @@ impl<R: Registry> CachedRegistry<R> {
 
 #[async_trait]
 impl<R: Registry> Registry for CachedRegistry<R> {
+    async fn gradle_distribution_checksum(&self, version: &str, kind: &str) -> Result<String> {
+        self.inner.gradle_distribution_checksum(version, kind).await
+    }
+
     async fn python_releases(&self, package: &str) -> Result<Vec<crate::registry::PythonRelease>> {
         if !self.enabled {
             return self.inner.python_releases(package).await;

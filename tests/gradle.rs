@@ -102,3 +102,17 @@ fn gradle_unsupported_versions_are_errors_not_up_to_date() {
     assert_eq!(code, 2, "{report}");
     assert_eq!(report["summary"]["errors"], 1, "{report}");
 }
+
+#[test]
+fn literal_maven_dependency_cli_updates_only_selected_coordinate() {
+    let dir = fixture();
+    let p = dir.path().join("build.gradle.kts");
+    let content = "dependencies { implementation(\"g:lib:1.0\") }\n";
+    std::fs::write(&p, content).unwrap();
+    let (code, report) = run(&dir, &["--apply", "--package", "g:lib"]);
+    assert_eq!(code, 0, "{report}");
+    assert_eq!(
+        std::fs::read_to_string(p).unwrap(),
+        content.replace("g:lib:1.0", "g:lib:1.2.3")
+    );
+}

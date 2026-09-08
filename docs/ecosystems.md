@@ -171,8 +171,9 @@ Use `--lock` to have the package manager validate the resulting dependency set.
 ## Gradle (JVM / Android)
 
 - `*.versions.toml` catalogs, including `gradle/libs.versions.toml`
-- Literal plugin versions in `build.gradle`, `build.gradle.kts`,
+- Literal Maven dependency and plugin versions in `build.gradle`, `build.gradle.kts`,
   `settings.gradle`, and `settings.gradle.kts`
+- `gradle-wrapper.properties` distribution versions and SHA-256 checksums
 - Select with `--lang gradle`
 - Libraries use Maven Central; plugins use Gradle Plugin Portal marker artifacts
 
@@ -181,6 +182,11 @@ Catalogs support `[libraries]` entries with `module` or `group`/`name`,
 versions or `version.ref` pointing into `[versions]`. Scripts support
 `id("org.example") version "1.2.3"`, Groovy's `id 'org.example' version '1.2.3'`,
 and Kotlin's `kotlin("jvm") version "2.2.0"` inside `plugins` blocks.
+Within `dependencies` and `constraints` blocks, standard configurations such as
+`implementation("group:artifact:1.2.3")`, `testImplementation 'group:artifact:1.2.3'`,
+and `classpath(platform("group:bom:1.2.3"))` are supported. Computed versions,
+classifiers, artifact extensions, and arbitrary custom configuration methods
+are not rewritten.
 Comments, quoting, and unrelated bytes are preserved. Actual published version
 strings are written in full, even without `--full-precision`: `1.2` must not
 be invented by shortening a release named `1.2.3`.
@@ -206,13 +212,28 @@ and computed plugin versions are reported as unsupported and left unchanged.
 An unsupported consumer of `version.ref` prevents the catalog from being edited.
 Scripts containing slash expressions outside comments or quoted strings are
 refused because Groovy slashy strings cannot safely be interpreted as code.
-Build-script library declarations and arbitrary Gradle expressions are outside
-this initial support; move dependencies to a catalog to check them.
 
-Gradle wrapper files, `gradle.properties` (including IntelliJ target versions),
-lockfile refresh, alignment, and auditing are not supported. No Gradle build is
-executed. Maven metadata does not provide per-release publication timestamps,
-so cooldown is reported as unavailable for this ecosystem.
+### Gradle wrapper
+
+Select the distribution with `--package gradle-wrapper`. Only a single literal
+HTTPS distribution URL on `services.gradle.org` or `downloads.gradle.org` is
+accepted; `bin`/`all` and the original URL spelling are preserved. The matching
+official SHA-256 checksum is fetched before proposing or applying the change.
+`distributionSha256Sum` is updated or added atomically with the URL. Missing,
+malformed, or unavailable checksum metadata prevents the update. Existing
+checksum entries are never silently removed.
+
+This updates the distribution configuration only. It does not execute Gradle,
+regenerate wrapper scripts/JARs, or change custom `gradle.properties` version
+sources such as IntelliJ target versions or `gradleVersion`. Run the project's
+wrapper task when adopting new wrapper bootstrap code, and validate toolchain
+compatibility with the project's build and tests.
+
+Gradle auditing, lockfile regeneration, automatic audit fixes, and alignment
+remain unsupported. No Gradle build is executed automatically.
+
+Maven metadata does not provide per-release publication timestamps, so cooldown
+is reported as unavailable for this ecosystem.
 
 ## Docker / OCI images
 

@@ -2011,7 +2011,7 @@ async fn run_update(cli: &Cli) -> Result<()> {
                             .update(&path, github_releases.as_ref(), update_options.clone())
                             .await
                     }
-                    FileType::GradleCatalog | FileType::GradleScript => {
+                    FileType::GradleCatalog | FileType::GradleScript | FileType::GradleWrapper => {
                         GradleUpdater::new()
                             .update(&path, gradle.as_ref(), update_options.clone())
                             .await
@@ -3231,7 +3231,7 @@ async fn run_interactive_update(
                     .update(path, github_releases.as_ref(), dry_run_options.clone())
                     .await
             }
-            FileType::GradleCatalog | FileType::GradleScript => {
+            FileType::GradleCatalog | FileType::GradleScript | FileType::GradleWrapper => {
                 GradleUpdater::new()
                     .update(path, gradle.as_ref(), dry_run_options.clone())
                     .await
@@ -3551,12 +3551,30 @@ async fn run_interactive_update(
                 ),
             })
             .collect();
-        let rewritten = apply_version_updates(
-            &content,
-            &updates,
-            scanned_file.file_type,
-            cli.full_precision,
-        )
+        let rewritten = if scanned_file.file_type == FileType::GradleWrapper {
+            if updates.len() != 1 {
+                anyhow::bail!("expected one Gradle wrapper update");
+            }
+            let edit = &updates[0];
+            GradleUpdater::rewrite_wrapper(
+                &content,
+                edit.old_version,
+                edit.new_version,
+                gradle.as_ref(),
+            )
+            .await
+            .map(|content| AppliedVersionUpdates {
+                content,
+                applied: vec![true],
+            })
+        } else {
+            apply_version_updates(
+                &content,
+                &updates,
+                scanned_file.file_type,
+                cli.full_precision,
+            )
+        }
         .map_err(|e| {
             anyhow::anyhow!(
                 "Failed to rewrite {}: {}",
@@ -4998,7 +5016,10 @@ fn apply_version_updates(
     file_type: FileType,
     full_precision: bool,
 ) -> Result<AppliedVersionUpdates> {
-    if matches!(file_type, FileType::GradleCatalog | FileType::GradleScript) {
+    if matches!(
+        file_type,
+        FileType::GradleCatalog | FileType::GradleScript | FileType::GradleWrapper
+    ) {
         let edits: Vec<_> = updates
             .iter()
             .map(|u| (u.package, u.old_version, u.new_version, u.line_num))
@@ -5040,7 +5061,9 @@ fn apply_version_updates(
             FileType::ToolVersions => {
                 apply_tool_versions_version(&mut document, update, &target_version)
             }
-            FileType::GradleCatalog | FileType::GradleScript => unreachable!("handled as a group"),
+            FileType::GradleCatalog | FileType::GradleScript | FileType::GradleWrapper => {
+                unreachable!("handled as a group")
+            }
             FileType::Csproj => apply_csproj_version(&mut document, update, &target_version),
             FileType::TerraformTf => {
                 apply_terraform_version(&mut document, update, &target_version)

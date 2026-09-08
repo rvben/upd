@@ -93,7 +93,7 @@ fn get_updater(file_type: FileType, warnings: ParseWarnings) -> Box<dyn Updater>
         FileType::GoMod => Box::new(GoModUpdater::new()),
         FileType::Gemfile => Box::new(GemfileUpdater::new()),
         FileType::Csproj => Box::new(CsprojUpdater::new()),
-        FileType::GradleCatalog | FileType::GradleScript => {
+        FileType::GradleCatalog | FileType::GradleScript | FileType::GradleWrapper => {
             Box::new(crate::updater::GradleUpdater::new())
         }
         FileType::GithubActions => Box::new(GithubActionsUpdater::new()),
