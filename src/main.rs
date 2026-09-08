@@ -2656,13 +2656,16 @@ async fn run_update(cli: &Cli) -> Result<()> {
         let mut grouped: std::collections::BTreeMap<PathBuf, upd::output::UpdateFileReport> =
             std::collections::BTreeMap::new();
 
+        for message in fix_failure_messages(&outcomes) {
+            eprintln!("{}", message.red());
+        }
+
         for outcome in &outcomes {
             let target = &outcome.target;
             if matches!(outcome.status, FixStatus::Failed | FixStatus::RolledBack)
                 && let Some(err) = &outcome.error
             {
                 let msg = format!("{}: {}", target.package, err);
-                eprintln!("{}", msg.red());
                 total_result.errors.push(msg);
             }
             if outcome.status == FixStatus::Planned {
@@ -4480,6 +4483,45 @@ fn emit_audit_json(
     let doc = apply_bounded_output(doc, "vulnerabilities", bounded);
     println!("{}", serde_json::to_string_pretty(&doc)?);
     Ok(())
+}
+
+/// Report a shared transaction failure once, retaining project attribution and
+/// all affected package names. Structured results remain per target.
+fn fix_failure_messages(outcomes: &[AppliedFix]) -> Vec<String> {
+    let mut groups: BTreeMap<_, Vec<&str>> = BTreeMap::new();
+    for outcome in outcomes {
+        if matches!(outcome.status, FixStatus::Failed | FixStatus::RolledBack)
+            && let Some(error) = outcome.error.as_deref()
+        {
+            let names = groups
+                .entry((
+                    &outcome.target.path,
+                    &outcome.target.lockfile,
+                    outcome.status == FixStatus::RolledBack,
+                    error,
+                ))
+                .or_default();
+            if !names.contains(&outcome.target.package.as_str()) {
+                names.push(&outcome.target.package);
+            }
+        }
+    }
+    groups
+        .into_iter()
+        .map(|((path, lockfile, rolled_back, error), mut names)| {
+            names.sort_unstable();
+            let mut message = format!("{} ({}): {error}", display_path(path), names.join(", "));
+            if rolled_back {
+                message.push_str(&format!("\nrolled back {}", display_path(path)));
+                if let Some(lockfile) = lockfile
+                    && lockfile != path
+                {
+                    message.push_str(&format!(" and {}", display_path(lockfile)));
+                }
+            }
+            message
+        })
+        .collect()
 }
 
 /// Print a single `--fix-audit` outcome line in text mode.

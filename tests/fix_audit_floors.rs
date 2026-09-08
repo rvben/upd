@@ -283,7 +283,11 @@ async fn relock_failure_rolls_back_group_byte_for_byte() {
     assert_eq!(entry["status"], "rolled_back");
     let error = entry["error"].as_str().unwrap();
     assert!(error.contains("unsatisfiable"), "{error}");
-    assert!(error.contains("direct dependency"), "{error}");
+    assert!(
+        error.contains("resolve the lockfile error above"),
+        "{error}"
+    );
+    assert!(error.contains("--no-lock"), "{error}");
 }
 
 /// (c) `--no-lock` writes floors but never invokes a relock. Uses "poison

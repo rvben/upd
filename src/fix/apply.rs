@@ -27,10 +27,9 @@ const DOLLAR_NAME_SUPPRESSED_ERROR: &str = "companion manifest edit failed; not 
 const CARGO_PRECISE_NO_LOCK_HINT: &str =
     "cargo-precise floors only mutate Cargo.lock; rerun without --no-lock";
 
-/// Appended to a floor group's relock-failure error: the resolver's stderr
-/// alone does not tell the user the fix is *why* the direct dependency
-/// still needs attention.
-const RELOCK_ROLLBACK_HINT: &str = "hint: a direct dependency may pin this transitive below the floor; update the direct dependency first, or pass --no-lock to keep the file edits without relocking";
+/// Guidance attached to a floor group's relock failure without assuming
+/// that the new floor caused the resolver error.
+const RELOCK_ROLLBACK_HINT: &str = "hint: resolve the lockfile error above and retry, or pass --no-lock to keep the file edits without relocking";
 
 /// The final disposition of one [`FixTarget`] after `apply_fix_targets` runs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

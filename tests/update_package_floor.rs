@@ -1992,3 +1992,69 @@ async fn a_capped_floor_already_in_the_manifest_is_still_held_back() {
         assert_eq!(json["summary"]["capped"], 1, "{label}: {}", json["summary"]);
     }
 }
+
+/// A resolver failure is shared by the project's floor transaction, while
+/// separate projects must retain their own diagnostics and rollback.
+#[cfg(unix)]
+#[tokio::test]
+async fn relock_failure_is_reported_once_per_project_with_rollback() {
+    let server = wiremock::MockServer::start().await;
+    for name in ["shinychat", "shinyhub"] {
+        mount_pypi_latest(&server, name, "1.1.0").await;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let bin = tmp.path().join("bin");
+    fs::create_dir(&bin).unwrap();
+    write_fake_tool(
+        &bin,
+        "uv",
+        "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then echo 'uv 0.8.0'; exit 0; fi\necho call >> calls\necho 'error: missing-package was not found in the package registry' >&2\nexit 1\n",
+    );
+    let lock = format!(
+        "{}\n[[package]]\nname = \"shinyhub\"\nversion = \"1.0.0\"\nsource = {{ registry = \"https://pypi.org/simple\" }}\n",
+        uv_lock_at("shinychat", "1.0.0")
+    );
+    for project in ["one", "two"] {
+        let dir = tmp.path().join(project);
+        fs::create_dir(&dir).unwrap();
+        fs::write(dir.join("pyproject.toml"), PYPROJECT_BARE).unwrap();
+        fs::write(dir.join("uv.lock"), &lock).unwrap();
+    }
+    let (stdout, stderr, code) = run_with_env(
+        &[
+            "update",
+            "--package",
+            "shiny*",
+            "--no-cache",
+            "--apply",
+            ".",
+        ],
+        tmp.path(),
+        &[("UV_INDEX_URL", &server.uri()), ("PATH", &path_with(&bin))],
+    );
+    assert_eq!(code, 2, "{stdout}\n{stderr}");
+    assert_eq!(
+        stderr.matches("Failed to regenerate uv.lock").count(),
+        2,
+        "{stderr}"
+    );
+    assert!(!stderr.contains("direct dependency may pin"), "{stderr}");
+    for project in ["one", "two"] {
+        assert!(
+            stderr.contains(&format!("{project}/pyproject.toml (shinychat, shinyhub):")),
+            "{stderr}"
+        );
+        assert!(
+            stderr.contains(&format!("rolled back {project}/pyproject.toml"))
+                || stderr.contains(&format!("rolled back ./{project}/pyproject.toml")),
+            "{stderr}"
+        );
+        let dir = tmp.path().join(project);
+        assert_eq!(fs::read_to_string(dir.join("calls")).unwrap(), "call\n");
+        assert_eq!(
+            fs::read_to_string(dir.join("pyproject.toml")).unwrap(),
+            PYPROJECT_BARE
+        );
+        assert_eq!(fs::read_to_string(dir.join("uv.lock")).unwrap(), lock);
+    }
+}
