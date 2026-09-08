@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.11.2](https://github.com/rvben/upd/compare/v0.11.1...v0.11.2) - 2026-09-08
+
+### Fixed
+
+- **python**: classify pre-1.0 updates by Python release components consistently in bump limits, summaries, and interactive output.
+- **python**: report complete dependency constraints and section names, including repeated declarations.
+- **python**: update uv constraint, build-constraint, override, and legacy development dependency arrays while preserving non-registry sources and specifier shapes.
+- **python**: honor declared uv artifact upload cutoffs, package and index overrides, and workspace policies during update candidate selection.
+- **update**: resolve lock-only candidates separately for each project's pins, cooldowns, and upload cutoffs.
+
+### Added
+
+- **config**: support ecosystem enable/disable lists and an opt-out for automatically updating concrete pyproject `==` pins.
+
+### Documentation
+
+- Clarify uv lock behavior, supported policies, and remaining resolver limitations. Upload cutoff filtering applies to update candidate selection; audit fixes continue to use advisory-provided versions.
+
 ## [0.11.1](https://github.com/rvben/upd/compare/v0.11.0...v0.11.1) - 2026-09-07
 
 ### Fixed
