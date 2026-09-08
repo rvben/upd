@@ -70,6 +70,13 @@ exception, are listed under [Commands run by `--lock`](https://github.com/rvben/
 [decision guide and dated benchmarks](https://github.com/rvben/upd/blob/main/docs/comparison.md)
 for an exact comparison with adjacent tools.
 
+For uv projects, `upd update --apply --lock` runs exactly `uv lock` after
+changing a manifest with an existing lockfile (at the workspace root when
+applicable). It passes no flags and never runs `uv sync`; synchronize your
+Python environment separately. Without `--lock`, a normal update refreshes
+neither the lockfile nor the environment. `upd audit --fix-audit --apply`
+refreshes applicable lockfiles by default; `--no-lock` opts out.
+
 ## Where upd fits
 
 Choose by the job rather than treating every dependency tool as interchangeable:
@@ -273,6 +280,11 @@ An npm spec that names no published version is left alone and reported nowhere:
 `file:`, `link:`, `npm:`, `git+ssh:` and `github:owner/repo` forms all resolve
 somewhere other than a release on the registry, so there is no version to
 compare and nothing an update could move.
+
+Python bump labels and `--only-bump` / `--max-bump` follow the changed release
+component: `0.0.77` → `0.0.78` is patch, and `0.77` → `0.78` is minor.
+Other ecosystems retain their existing pre-1.0 compatibility classification.
+Python update reports include each declaration's section and full constraint.
 
 Specifier shape changes are opt-in. A `[normalize.pyproject]` table in
 `.updrc.toml` can independently make project dependencies, optional

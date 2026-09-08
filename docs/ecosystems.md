@@ -45,6 +45,67 @@ rather than against the ranges it declares. See [Audit](audit.md).
 - `requirements.in`, `requirements-dev.in`, `requirements-*.in`
 - `dev-requirements.txt`, `*-requirements.txt`, `*_requirements.txt`
 - `pyproject.toml` (PEP 621 and Poetry formats)
+- `uv.lock` and `poetry.lock`: read for audit; refreshed by the package manager
+  under `--lock`, rather than rewritten directly by ordinary updates
+
+In addition to project dependencies, optional dependencies, and dependency
+groups, `pyproject.toml` updates cover string requirements in
+`tool.uv.constraint-dependencies`, `tool.uv.build-constraint-dependencies`,
+`tool.uv.override-dependencies`, and `tool.uv.dev-dependencies`. Their existing
+specifier shapes and additional clauses are preserved. Constraint and override
+entries are not movable alignment targets. Direct Git, URL and path sources
+are preserved; marker-dependent source alternatives remain untouched.
+
+Reports identify the complete section (including group name) and show the
+full old and new constraint. JSON updates add `section`, `previous_spec`, and
+`new_spec` without changing the existing version fields.
+
+### uv upload cutoffs
+
+Python `update` candidate selection, including lock-only `--package` updates,
+honors `[tool.uv].exclude-newer`,
+`exclude-newer-package`, and per-index `exclude-newer`. Package overrides win
+over index overrides, which win over the global setting. Each setting accepts
+`false` to opt out. Dates include the entire local calendar day; RFC 3339
+cutoffs exclude artifacts uploaded at or after the timestamp. Friendly
+durations (`1 week`, `24 hours`) and ISO durations (`P7D`, `PT24H`) are resolved
+once for the manifest operation. Calendar months and years are rejected.
+
+```toml
+[tool.uv]
+exclude-newer = "1 week"
+exclude-newer-package = { setuptools = false }
+
+[[tool.uv.index]]
+name = "internal"
+url = "https://internal.example.com/simple"
+exclude-newer = false
+```
+
+Cutoffs use each distribution artifact's upload time, before checking Python
+compatibility. A recent wheel cannot borrow an older source archive's upload
+time. Simple JSON `upload-time`, HTML `data-upload-time`, and legacy PyPI
+`upload_time_iso_8601` are retained. Missing upload times make files unavailable
+under a cutoff, except for package opt-outs or indexes with an explicit cutoff
+or opt-out, following uv. Invalid timestamps cannot establish eligibility.
+
+Workspace members use their uv workspace root's cutoff and index settings.
+Existing upd cooldown settings and `--min-age` are additional restrictions;
+uv opt-outs do not disable them. An explicit upd `[pin]` also has to pass the
+active uv cutoff. An empty eligible set is reported as an error and leaves the
+affected declaration unchanged.
+
+This covers declared upload policies and the dependency arrays above, not
+full uv resolver equivalence. Candidate checks do not solve the complete
+transitive graph, emulate every uv setting, or load cutoff settings from
+`uv.toml`, user configuration, or `UV_EXCLUDE_NEWER` environment overrides.
+Relative cutoffs use the operation's time rather than a historical timestamp
+stored in `uv.lock`. Use an absolute cutoff when reproducing an older resolution.
+Audit fixes use advisory-provided versions and do not run this candidate filter.
+The package manager remains responsible for final resolution; a failed
+`--lock` refresh triggers the existing rollback behavior.
+
+### Python compatibility
 
 When `[project].requires-python` or `[tool.poetry.dependencies].python` is
 present, update checks select the newest release whose non-yanked files cover

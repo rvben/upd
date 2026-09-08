@@ -66,6 +66,8 @@ django = "4.2.0"
 | `pin` | `table` | Map of package names to pinned versions |
 | `update_action_shas` | `bool` | Whether SHA-pinned GitHub Actions are checked and updated. Defaults to `true`; `--update-action-shas` and `--no-update-action-shas` override it |
 | `automation.security_remediation` | `bool` | Allow scheduled security remediation to publish or clean up its rolling pull request. Defaults to `false` |
+| `ecosystems` | `table` | Persistent enable/disable lists using `--lang` names |
+| `update.pyproject.exact-pins` | `bool` | Update concrete `==` pins automatically (default `true`) |
 | `normalize` | `table` | Opt-in `pyproject.toml` specifier normalization, configured per section |
 
 Package matching is PEP 503-normalized, so `"Oven-SH/bun"` and `"oven-sh/bun"`
@@ -77,6 +79,41 @@ include glob matches it. Explicit file paths bypass both discovery globs, just
 as they bypass ignore-file filtering. Run with `--verbose` to report files that
 contain an `upd:` marker but are not discovery candidates; this diagnostic
 inspection is limited to UTF-8 text files up to 1 MiB.
+
+### Ecosystem selection
+
+```toml
+[ecosystems]
+enable = ["python", "rust", "actions"]
+disable = ["rust"]
+```
+
+An omitted `enable` includes all ecosystems; `enable = []` includes none.
+`disable` removes ecosystems from that selection. An explicit `--lang`
+replaces both lists for that invocation. Names are exactly those accepted by
+`--lang`; unknown names and misspelled table fields are errors.
+
+This is a root discovery policy, like `include`/`exclude`, shared by update,
+interactive update, alignment, audit, and their associated lockfile handling.
+Nested configuration does not re-enable files excluded by root discovery.
+
+### Preserving exact Python pins
+
+```toml
+[update.pyproject]
+exact-pins = false
+```
+
+The default is `true`. Set it to `false` to preserve a single concrete `==`
+clause in `pyproject.toml`, including when its section has normalization
+configured. These declarations are reported as not examined with the reason
+`exact-pins-disabled`. Explicit `[pin]` entries still take precedence.
+
+This switch does not apply to `===`, prefix matches such as `==1.2.*`, or
+compound constraints. Concrete `===` operands retain their existing update
+behavior. Prefix matches, ceiling-only and exclusion-only constraints remain
+read-only: they are checked and reported without inventing a lower bound.
+Bare names remain unchanged unless normalization is enabled.
 
 ### Normalizing pyproject specifiers
 

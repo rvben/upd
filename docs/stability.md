@@ -74,6 +74,14 @@ to name, described below the table.
 | .NET      | `packages.lock.json`    | `dotnet restore`                                                 | whole manifest; no targeted form                         |
 | Terraform | `.terraform.lock.hcl`   | `terraform providers lock`                                       | whole manifest; no targeted form                         |
 
+For uv, no check-only (`--check`, `--check-exists`, `--dry-run`), script
+(`--script`), upgrade (`--upgrade`, `--upgrade-package`, `--upgrade-group`), or
+resolver override flags (`--resolution`, `--prerelease`, `--fork-strategy`,
+`--exclude-newer`, `--no-sources`) are added. The job is to refresh the project's
+lockfile using its configured policies. `upd` passes no `uv sync` options,
+because it never invokes that command. Run `uv sync` yourself to synchronize
+the environment after reviewing updates.
+
 `uv lock` and `poetry lock` need no targeting flag. Without `--upgrade`
 they re-resolve only what the rewritten manifest forces and keep every
 other locked version, so naming the changed packages would narrow
