@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.11.5](https://github.com/rvben/upd/compare/v0.11.4...v0.11.5) - 2026-09-08
+
+### Added
+
+- **audit**: scan resolved Maven dependencies in Gradle lockfiles ([7e361e3](https://github.com/rvben/upd/commit/7e361e369ffd94475c961d4555f38dd95f0d0da5))
+- **gradle**: update literal dependencies and wrapper distributions ([6662687](https://github.com/rvben/upd/commit/6662687f495b15360f1cc84b0aeea5828469151f))
+
+### Fixed
+
+- **docker**: reuse configured credentials for private image updates ([1b199ce](https://github.com/rvben/upd/commit/1b199ceeb4c17af3924a9c6d92efa6ebeadb5b3b))
+- **python**: ignore dependency interpreter upper bounds ([d02e60f](https://github.com/rvben/upd/commit/d02e60f442099e121d21e472ccc853dd32ad7aae))
+- **update**: group lockfile failures by project and report rollback ([0f5f611](https://github.com/rvben/upd/commit/0f5f61146b1b6358944d54417a40917f7df78913))
+- **annotations**: ignore directive markers in comment prose ([5911d6b](https://github.com/rvben/upd/commit/5911d6b8421d06dcb907eb0d5ed60de5b6ee2b09))
+
 ## [0.11.4](https://github.com/rvben/upd/compare/v0.11.3...v0.11.4) - 2026-09-08
 
 ### Fixed
