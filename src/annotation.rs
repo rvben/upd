@@ -170,7 +170,7 @@ fn marker_hits(bytes: &[u8], comment_start: usize) -> Vec<(MarkerKind, usize)> {
             None
         };
         match hit {
-            Some((kind, len)) if starts_token(bytes, i) => {
+            Some((kind, len)) if follows_comment_introducer(bytes, i) => {
                 hits.push((kind, i + len));
                 i += len;
             }
@@ -184,12 +184,11 @@ fn starts_with_ignore_ascii_case(haystack: &[u8], needle: &[u8]) -> bool {
     haystack.len() >= needle.len() && haystack[..needle.len()].eq_ignore_ascii_case(needle)
 }
 
-/// A marker only counts when it starts a token, so `backupd:` is not one.
-fn starts_token(bytes: &[u8], i: usize) -> bool {
-    match i.checked_sub(1).map(|prev| bytes[prev]) {
-        None => true,
-        Some(b) => b.is_ascii_whitespace() || b == b'#' || b == b'/',
-    }
+/// A directive must immediately follow a comment introducer, allowing whitespace.
+/// Mentions of markers in ordinary prose are not annotations.
+fn follows_comment_introducer(bytes: &[u8], i: usize) -> bool {
+    let prefix = bytes[..i].trim_ascii_end();
+    prefix.ends_with(b"#") || prefix.ends_with(b"//")
 }
 
 fn parse_upd_body(body: &str, comment_start: usize) -> ParseOutcome {
@@ -478,6 +477,31 @@ mod tests {
             parse_line("X = 1.0 # backupd: pypi ruff"),
             ParseOutcome::None
         ));
+    }
+
+    #[test]
+    fn markers_in_comment_prose_are_not_annotations() {
+        for line in [
+            "# I want to use upd: it is awesome",
+            "X = 1.0 # I want to use upd: it is awesome",
+            "X = 1.0 // I want to use upd: it is awesome",
+            "X = 1.0 # use upd: pypi ruff",
+            "X = 1.0 // use renovate: datasource=pypi depName=ruff",
+            "X = 1.0 # /upd: pypi ruff",
+        ] {
+            assert_eq!(parse_line(line), ParseOutcome::None, "{line}");
+        }
+    }
+
+    #[test]
+    fn directives_allow_optional_whitespace_after_the_introducer() {
+        for introducer in ["#", "# ", "#\t", "//", "// ", "//\t"] {
+            for body in ["upd: pypi ruff", "renovate: datasource=pypi depName=ruff"] {
+                let a = found(&format!("X = 1.0 {introducer}{body}"));
+                assert_eq!(a.source, AnnotationSource::PyPi);
+                assert_eq!(a.package, "ruff");
+            }
+        }
     }
 
     #[test]
