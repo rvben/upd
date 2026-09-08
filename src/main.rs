@@ -96,10 +96,26 @@ Pass an explicit path, or run from inside a git repo."
 /// Delegates to the library classifier that the write-time `--max-bump` gate
 /// uses, so a change can never be labelled one thing and gated as another.
 fn classify_update(old: &str, new: &str) -> UpdateType {
-    match classify_bump(old, new) {
+    update_type(classify_bump(old, new))
+}
+
+fn update_type(bump: BumpKind) -> UpdateType {
+    match bump {
         BumpKind::Major => UpdateType::Major,
         BumpKind::Minor => UpdateType::Minor,
         BumpKind::Patch => UpdateType::Patch,
+    }
+}
+
+fn classify_path_update(path: &Path, old: &str, new: &str) -> UpdateType {
+    let python = FileType::detect(path).is_some_and(|kind| kind.lang() == Lang::Python)
+        || path
+            .file_name()
+            .is_some_and(|name| name == "uv.lock" || name == "poetry.lock");
+    if python {
+        update_type(upd::updater::classify_bump_for(Lang::Python, old, new))
+    } else {
+        classify_update(old, new)
     }
 }
 
@@ -461,6 +477,7 @@ fn build_update_options(
     config: Option<Arc<UpdConfig>>,
     package_filter: &PackageFilter,
     langs: &[Lang],
+    annotation_langs: Option<&[Lang]>,
     cooldown_policy: Option<&CooldownPolicy>,
     cooldown_notes: Arc<Mutex<BTreeMap<String, String>>>,
     bump_filter: BumpFilter,
@@ -478,6 +495,7 @@ fn build_update_options(
     }
     options = options.with_package_filter(package_filter.clone());
     options = options.with_langs(langs.to_vec());
+    options.annotation_langs = annotation_langs.map(<[Lang]>::to_vec);
     options = options.with_bump_filter(bump_filter);
     if let Some(policy) = cooldown_policy {
         options = options.with_cooldown_policy(policy.clone(), Utc::now());
@@ -1219,7 +1237,7 @@ fn has_checkable_manifest_changes(result: &UpdateResult, filter: UpdateFilter) -
     // about them would call a tree up to date that the next apply rewrites. The
     // bump filter does not reach them - an annotation moves no version, so
     // there is no bump level for `--major`/`--minor`/`--patch` to select on.
-    let (_, _, _, filtered_total) = count_updates_by_type(&result.updated, filter);
+    let (_, _, _, filtered_total) = count_result_updates(result, filter);
     filtered_total > 0
         || !result.pinned.is_empty()
         || !result.held_back.is_empty()
@@ -1540,6 +1558,35 @@ fn effective_json_mode(cli: &Cli) -> bool {
     }
 }
 
+fn with_ecosystem_config(cli: &Cli, config: &UpdConfig) -> Result<(Cli, bool)> {
+    let selection = config
+        .selected_ecosystems(&cli.langs)
+        .map_err(anyhow::Error::msg)?;
+    let none_enabled = selection.as_ref().is_some_and(Vec::is_empty);
+    let mut resolved = cli.clone();
+    if cli.langs.is_empty() && selection.is_some() {
+        use clap::ValueEnum;
+        let mut sources = selection.clone().unwrap();
+        if sources.contains(&Lang::Annotated) {
+            sources = Lang::value_variants().to_vec();
+        }
+        let disabled: Vec<_> = config
+            .ecosystems
+            .disable
+            .as_deref()
+            .unwrap_or_default()
+            .iter()
+            .map(|name| {
+                <Lang as ValueEnum>::from_str(name, false).expect("config already validated")
+            })
+            .collect();
+        sources.retain(|lang| *lang != Lang::Annotated && !disabled.contains(lang));
+        resolved.annotation_langs = Some(sources);
+    }
+    resolved.langs = selection.unwrap_or_default();
+    Ok((resolved, none_enabled))
+}
+
 async fn run_update(cli: &Cli) -> Result<()> {
     let json_mode = effective_json_mode(cli);
     let package_filter = PackageFilter::new(cli.packages.clone()).map_err(anyhow::Error::msg)?;
@@ -1572,17 +1619,23 @@ async fn run_update(cli: &Cli) -> Result<()> {
     // `include`/`exclude` are discovery-level settings resolved once from the root config;
     // per-file `ignore`/`pin` are loaded separately by `load_update_configs`.
     let root_config = resolve_root_config(cli, &paths)?;
+    let (resolved_cli, no_ecosystems) = with_ecosystem_config(cli, &root_config.config)?;
+    let cli = &resolved_cli;
 
-    let files = discover_files_with(
-        &paths,
-        &cli.langs,
-        DiscoverOptions {
-            no_ignore: cli.no_ignore,
-            verbose: cli.verbose,
-            include: &root_config.config.include,
-            exclude: &root_config.config.exclude,
-        },
-    );
+    let files = if no_ecosystems {
+        Vec::new()
+    } else {
+        discover_files_with(
+            &paths,
+            &cli.langs,
+            DiscoverOptions {
+                no_ignore: cli.no_ignore,
+                verbose: cli.verbose,
+                include: &root_config.config.include,
+                exclude: &root_config.config.exclude,
+            },
+        )
+    };
     let file_count = files.len();
 
     let text_mode_early = !json_mode;
@@ -1857,6 +1910,7 @@ async fn run_update(cli: &Cli) -> Result<()> {
                     config,
                     &package_filter,
                     &cli.langs,
+                    cli.annotation_langs.as_deref(),
                     cooldown_policy,
                     Arc::clone(&cooldown_notes),
                     filter.to_bump_filter(),
@@ -2159,11 +2213,8 @@ async fn run_update(cli: &Cli) -> Result<()> {
             lock_only.push(locked);
         }
 
-        // Distinct (name, version, ecosystem) triples: classify()/
-        // route_fix_targets fan a single triple out to every lockfile that
-        // resolves it, so the floor candidate is resolved once per triple
-        // (not per lockfile) to match that fan-out instead of duplicating
-        // registry calls.
+        // Group identical locked packages so every holder is discovered, then
+        // select and route candidates separately for each project's policy.
         let mut distinct: Vec<&upd::lockscan::LockedPackage> = Vec::new();
         for lp in &lock_only {
             if !distinct.iter().any(|d: &&upd::lockscan::LockedPackage| {
@@ -2173,11 +2224,11 @@ async fn run_update(cli: &Cli) -> Result<()> {
             }
         }
 
-        let mut synthetic_vulnerable: Vec<PackageAuditResult> = Vec::new();
+        let mut synthetic_vulnerable: BTreeMap<PathBuf, Vec<PackageAuditResult>> = BTreeMap::new();
         // Candidates the ceiling refused, held until routing has said whether
         // this lock has a floor mechanism at all. Reported as held back only
         // if it does.
-        let mut capped_pending: Vec<(&upd::lockscan::LockedPackage, String)> = Vec::new();
+        let mut capped_pending: Vec<(&upd::lockscan::LockedPackage, String, PathBuf)> = Vec::new();
         let mut floor_ignored: HashMap<PathBuf, Vec<upd::output::IgnoredEntry>> = HashMap::new();
         let mut floor_errors: HashMap<PathBuf, Vec<upd::output::ErrorEntry>> = HashMap::new();
         let mut floor_capped: HashMap<PathBuf, Vec<upd::output::CappedEntry>> = HashMap::new();
@@ -2191,15 +2242,8 @@ async fn run_update(cli: &Cli) -> Result<()> {
         let mut ignoring_reports: HashMap<PathBuf, (Ecosystem, HashSet<String>)> = HashMap::new();
 
         for locked in &distinct {
-            // Sibling projects can hold one triple under different `.updrc`
-            // files, and ignoring is that project's own decision: a project
-            // that ignores the package must not receive the floor, and must not
-            // suppress it for a sibling that does not ignore it. Every holder is
-            // therefore asked, not just the one the triple was deduplicated
-            // onto. The candidate is still resolved once, from the first holder
-            // that does not ignore the package, so a pin or a cooldown
-            // configured against a lock-only name follows that holder rather
-            // than each project's own config.
+            // Resolve each holder against its own pins, cooldown and Python
+            // upload policy. Routing below is restricted to that holder.
             let mut holders = Vec::new();
             for lp in &lock_only {
                 if lp.name != locked.name
@@ -2235,6 +2279,7 @@ async fn run_update(cli: &Cli) -> Result<()> {
                     config,
                     &package_filter,
                     &cli.langs,
+                    cli.annotation_langs.as_deref(),
                     cooldown_policy.as_ref(),
                     Arc::clone(&cooldown_notes),
                     filter.to_bump_filter(),
@@ -2263,62 +2308,75 @@ async fn run_update(cli: &Cli) -> Result<()> {
                     .insert(normalized_package_name(&lp.name, lp.ecosystem));
             }
 
-            let Some((locked, report_path, options, _)) = holders.iter().find(|h| !h.3) else {
-                continue;
-            };
-            let lang = ecosystem_to_lang(locked.ecosystem);
+            for (locked, report_path, options, _) in holders.iter().filter(|h| !h.3) {
+                let lang = ecosystem_to_lang(locked.ecosystem);
 
-            let registry: &dyn upd::registry::Registry = match locked.ecosystem {
-                Ecosystem::PyPI => pypi.as_ref(),
-                Ecosystem::Npm => npm.as_ref(),
-                Ecosystem::CratesIo => crates_io.as_ref(),
-                Ecosystem::Go | Ecosystem::RubyGems | Ecosystem::NuGet => continue,
-            };
+                let registry: &dyn upd::registry::Registry = match locked.ecosystem {
+                    Ecosystem::PyPI => pypi.as_ref(),
+                    Ecosystem::Npm => npm.as_ref(),
+                    Ecosystem::CratesIo => crates_io.as_ref(),
+                    Ecosystem::Go | Ecosystem::RubyGems | Ecosystem::NuGet => continue,
+                };
 
-            match resolve_floor_version(registry, &locked.name, &locked.version, lang, options)
-                .await
-            {
-                Ok(FloorResolution::Capped(candidate)) => {
-                    // Above the ceiling: nothing is written, but a newer
-                    // release is waiting and has to be visible. Held until the
-                    // router has been asked whether a floor could be written
-                    // here at all, since "held back by the ceiling" promises
-                    // that raising the ceiling releases the update.
-                    capped_pending.push((*locked, candidate));
-                }
-                Ok(FloorResolution::Floor(candidate)) => {
-                    synthetic_vulnerable.push(PackageAuditResult {
-                        package: AuditPackage {
-                            name: locked.name.clone(),
-                            version: locked.version.clone(),
-                            ecosystem: locked.ecosystem,
-                        },
-                        vulnerabilities: vec![Vulnerability {
-                            id: "floor".to_string(),
-                            summary: None,
-                            severity: None,
-                            url: None,
-                            fixed_version: Some(candidate),
-                            aliases: Vec::new(),
-                            source: String::new(),
-                        }],
-                    });
-                }
-                Ok(FloorResolution::NotNeeded) => {}
-                Err(e) => {
-                    let msg = format!("Error resolving floor for {}: {}", locked.name, e);
-                    eprintln!("{}", msg.red());
-                    total_result.errors.push(msg.clone());
-                    // Registry-resolution failures never become a FixTarget, so
-                    // they need their own file-anchored entry: without this the
-                    // error would only bump summary.errors, invisible in files[].
-                    floor_errors.entry(report_path.clone()).or_default().push(
-                        upd::output::ErrorEntry::with_file(
-                            display_path(report_path),
-                            "registry",
-                            msg,
-                        ),
-                    );
+                let resolution = if lang == Lang::Python {
+                    PyProjectUpdater::resolve_floor_version(
+                        report_path,
+                        registry,
+                        &locked.name,
+                        &locked.version,
+                        options,
+                    )
+                    .await
+                } else {
+                    resolve_floor_version(registry, &locked.name, &locked.version, lang, options)
+                        .await
+                };
+                match resolution {
+                    Ok(FloorResolution::Capped(candidate)) => {
+                        // Above the ceiling: nothing is written, but a newer
+                        // release is waiting and has to be visible. Held until the
+                        // router has been asked whether a floor could be written
+                        // here at all, since "held back by the ceiling" promises
+                        // that raising the ceiling releases the update.
+                        capped_pending.push((*locked, candidate, report_path.clone()));
+                    }
+                    Ok(FloorResolution::Floor(candidate)) => {
+                        synthetic_vulnerable
+                            .entry(report_path.clone())
+                            .or_default()
+                            .push(PackageAuditResult {
+                                package: AuditPackage {
+                                    name: locked.name.clone(),
+                                    version: locked.version.clone(),
+                                    ecosystem: locked.ecosystem,
+                                },
+                                vulnerabilities: vec![Vulnerability {
+                                    id: "floor".to_string(),
+                                    summary: None,
+                                    severity: None,
+                                    url: None,
+                                    fixed_version: Some(candidate),
+                                    aliases: Vec::new(),
+                                    source: String::new(),
+                                }],
+                            });
+                    }
+                    Ok(FloorResolution::NotNeeded) => {}
+                    Err(e) => {
+                        let msg = format!("Error resolving floor for {}: {}", locked.name, e);
+                        eprintln!("{}", msg.red());
+                        total_result.errors.push(msg.clone());
+                        // Registry-resolution failures never become a FixTarget, so
+                        // they need their own file-anchored entry: without this the
+                        // error would only bump summary.errors, invisible in files[].
+                        floor_errors.entry(report_path.clone()).or_default().push(
+                            upd::output::ErrorEntry::with_file(
+                                display_path(report_path),
+                                "registry",
+                                msg,
+                            ),
+                        );
+                    }
                 }
             }
         }
@@ -2355,25 +2413,33 @@ async fn run_update(cli: &Cli) -> Result<()> {
         ) = if synthetic_vulnerable.is_empty() {
             (Vec::new(), Vec::new(), Vec::new())
         } else {
-            let synthetic_audit = AuditResult {
-                vulnerable: synthetic_vulnerable,
-                safe_count: 0,
-                errors: Vec::new(),
-                warnings: Vec::new(),
-            };
-            let mut routing = upd::fix::route_update_targets(
-                &synthetic_audit,
-                prov.as_ref().expect("prov built for a non-empty floor set"),
-                &manifest_packages,
-            );
-            routing
-                .targets
-                .retain(|target| !floor_is_ignored(&target.path, &target.package));
-            routing.unfixable.retain(|u| {
-                u.path
-                    .as_ref()
-                    .is_none_or(|path| !floor_is_ignored(path, &u.package))
-            });
+            let mut targets = Vec::new();
+            let mut unfixable = Vec::new();
+            for (report_path, vulnerable) in synthetic_vulnerable {
+                let synthetic_audit = AuditResult {
+                    vulnerable,
+                    safe_count: 0,
+                    errors: Vec::new(),
+                    warnings: Vec::new(),
+                };
+                let routing = upd::fix::route_update_targets(
+                    &synthetic_audit,
+                    prov.as_ref().expect("prov built for a non-empty floor set"),
+                    &manifest_packages,
+                );
+                targets.extend(
+                    routing
+                        .targets
+                        .into_iter()
+                        .filter(|t| t.path == report_path),
+                );
+                unfixable.extend(
+                    routing
+                        .unfixable
+                        .into_iter()
+                        .filter(|u| u.path.as_ref() == Some(&report_path)),
+                );
+            }
 
             let opts = FixApplyOptions {
                 dry_run,
@@ -2381,8 +2447,8 @@ async fn run_update(cli: &Cli) -> Result<()> {
                 relock_floors: !cli.no_lock,
                 verbose: verbose && text_mode,
             };
-            let (outcomes, notes) = apply_fix_targets(routing.targets, &opts, &|_, _, _| Ok(false));
-            (outcomes, routing.unfixable, notes)
+            let (outcomes, notes) = apply_fix_targets(targets, &opts, &|_, _, _| Ok(false));
+            (outcomes, unfixable, notes)
         };
 
         // Classify the candidates the ceiling refused, discarding the fix
@@ -2413,7 +2479,7 @@ async fn run_update(cli: &Cli) -> Result<()> {
         // routing does not.
         let mut capped_targets: BTreeMap<FloorMergeKey, FixTarget> = BTreeMap::new();
 
-        for (locked, candidate) in &capped_pending {
+        for (locked, candidate, report_path) in &capped_pending {
             let capped_audit = AuditResult {
                 vulnerable: vec![PackageAuditResult {
                     package: AuditPackage {
@@ -2450,7 +2516,7 @@ async fn run_update(cli: &Cli) -> Result<()> {
             for target in &routing.targets {
                 // A project whose own config ignores the package is not waiting
                 // on the ceiling, and has been reported as `ignored` already.
-                if floor_is_ignored(&target.path, &target.package) {
+                if target.path != *report_path || floor_is_ignored(&target.path, &target.package) {
                     continue;
                 }
                 merge_capped_target(&mut capped_targets, target);
@@ -2458,7 +2524,7 @@ async fn run_update(cli: &Cli) -> Result<()> {
             unfixable.extend(routing.unfixable.into_iter().filter(|u| {
                 u.path
                     .as_ref()
-                    .is_none_or(|path| !floor_is_ignored(path, &u.package))
+                    .is_some_and(|path| path == report_path && !floor_is_ignored(path, &u.package))
             }));
         }
 
@@ -2518,17 +2584,24 @@ async fn run_update(cli: &Cli) -> Result<()> {
             if text_mode && !cli.quiet {
                 println!(
                     "{}",
-                    format_capped_line(&display_path(&path), None, &package, &current, &available,)
+                    format_capped_line(
+                        &display_path(&path),
+                        None,
+                        &package,
+                        &current,
+                        &available,
+                        classify_path_update(&path, &current, &available)
+                    )
                 );
             }
             floor_capped
-                .entry(path)
+                .entry(path.clone())
                 .or_default()
                 .push(upd::output::CappedEntry {
                     package,
                     current: current.clone(),
                     available: available.clone(),
-                    bump: classify_update(&current, &available).as_str(),
+                    bump: classify_path_update(&path, &current, &available).as_str(),
                     line: None,
                     source: None,
                 });
@@ -2574,10 +2647,14 @@ async fn run_update(cli: &Cli) -> Result<()> {
                 .entry(target.path.clone())
                 .or_insert_with(|| empty_floor_report(&target.path));
             report.updates.push(upd::output::UpdateEntry {
+                section: None,
+                previous_spec: None,
+                new_spec: None,
                 package: target.package.clone(),
                 current: target.from_version.clone(),
                 latest: target.to_version.clone(),
-                bump: classify_update(&target.from_version, &target.to_version).as_str(),
+                bump: classify_path_update(&target.path, &target.from_version, &target.to_version)
+                    .as_str(),
                 line: None,
                 method: Some(target.kind.method()),
                 status: Some(outcome.status.as_str()),
@@ -2599,10 +2676,13 @@ async fn run_update(cli: &Cli) -> Result<()> {
                 .entry(path.clone())
                 .or_insert_with(|| empty_floor_report(&path));
             report.updates.push(upd::output::UpdateEntry {
+                section: None,
+                previous_spec: None,
+                new_spec: None,
                 package: u.package.clone(),
                 current: current.clone(),
                 latest: latest.clone(),
-                bump: classify_update(&current, &latest).as_str(),
+                bump: classify_path_update(&path, &current, &latest).as_str(),
                 line: None,
                 method: u.method,
                 status: Some("unfixable"),
@@ -2655,6 +2735,7 @@ async fn run_update(cli: &Cli) -> Result<()> {
         let mut file_result = scanned_file.result.clone();
         if refresh_failed(&lock_failures, &scanned_file.path) {
             file_result.updated.clear();
+            file_result.update_context.clear();
             file_result.pinned.clear();
             file_result.normalized.clear();
             file_result.annotations.clear();
@@ -2887,7 +2968,7 @@ fn emit_update_json(input: UpdateReportInput<'_>, bounded: &BoundedOutputParams<
         })
         .collect();
 
-    let (major, minor, patch, total) = count_updates_by_type(&total_result.updated, filter);
+    let (major, minor, patch, total) = count_result_updates(total_result, filter);
 
     // Floor entries are gated by allows_bump/cooldown inside resolve_floor_version
     // already, so they count toward the summary unconditionally (rule 7) rather
@@ -3060,6 +3141,7 @@ async fn run_interactive_update(
             file_configs.get(path).cloned().flatten(),
             package_filter,
             &cli.langs,
+            cli.annotation_langs.as_deref(),
             cooldown_policy,
             Arc::clone(&cooldown_notes),
             filter.to_bump_filter(),
@@ -3174,9 +3256,9 @@ async fn run_interactive_update(
                     }
                 }
 
-                for update in &file_result.updated {
+                for (index, update) in file_result.updated.iter().enumerate() {
                     let (package, old_version, new_version, line_num) = update;
-                    let update_type = classify_update(old_version, new_version);
+                    let update_type = update_type(file_result.update_bump(index));
 
                     // Apply filter
                     if !filter.matches(update_type) {
@@ -3191,6 +3273,8 @@ async fn run_interactive_update(
                         new_version.clone(),
                         update_type == UpdateType::Major,
                     ));
+                    pending_updates.last_mut().unwrap().context =
+                        file_result.update_context.get(&index).cloned();
                     planned_changes.push(PlannedChange::from_update(
                         path.clone(),
                         *file_type,
@@ -3204,7 +3288,8 @@ async fn run_interactive_update(
                         .clone()
                         .unwrap_or_else(|| "(no specifier)".to_string());
                     let is_major = normalized.previous_version.as_deref().is_some_and(|old| {
-                        classify_update(old, &normalized.version) == UpdateType::Major
+                        upd::updater::classify_bump_for(Lang::Python, old, &normalized.version)
+                            == BumpKind::Major
                     });
                     pending_updates.push(PendingUpdate::new(
                         display_path(path),
@@ -3641,22 +3726,28 @@ async fn run_align(cli: &Cli) -> Result<()> {
     // front. Precedence mirrors `update`: explicit `--config` wins, else the
     // nearest discovered config.
     let resolved_config = resolve_root_config(cli, &paths)?;
+    let (resolved_cli, no_ecosystems) = with_ecosystem_config(cli, &resolved_config.config)?;
+    let cli = &resolved_cli;
     let config = Arc::clone(&resolved_config.config);
 
     if cli.verbose && text_mode {
         log_update_config_usage(&resolved_config);
     }
 
-    let files = discover_files_with(
-        &paths,
-        &cli.langs,
-        DiscoverOptions {
-            no_ignore: cli.no_ignore,
-            verbose: cli.verbose,
-            include: &config.include,
-            exclude: &config.exclude,
-        },
-    );
+    let files = if no_ecosystems {
+        Vec::new()
+    } else {
+        discover_files_with(
+            &paths,
+            &cli.langs,
+            DiscoverOptions {
+                no_ignore: cli.no_ignore,
+                verbose: cli.verbose,
+                include: &config.include,
+                exclude: &config.exclude,
+            },
+        )
+    };
     let file_count = files.len();
 
     if files.is_empty() {
@@ -3955,16 +4046,22 @@ async fn run_audit(cli: &Cli) -> Result<()> {
     // `include`/`exclude` path globs are honored uniformly across subcommands; resolve the
     // root config so audit drops the same files `update`/`align` would.
     let root_config = resolve_root_config(cli, &paths)?;
-    let files = discover_files_with(
-        &paths,
-        &cli.langs,
-        DiscoverOptions {
-            no_ignore: cli.no_ignore,
-            verbose: cli.verbose,
-            include: &root_config.config.include,
-            exclude: &root_config.config.exclude,
-        },
-    );
+    let (resolved_cli, no_ecosystems) = with_ecosystem_config(cli, &root_config.config)?;
+    let cli = &resolved_cli;
+    let files = if no_ecosystems {
+        Vec::new()
+    } else {
+        discover_files_with(
+            &paths,
+            &cli.langs,
+            DiscoverOptions {
+                no_ignore: cli.no_ignore,
+                verbose: cli.verbose,
+                include: &root_config.config.include,
+                exclude: &root_config.config.exclude,
+            },
+        )
+    };
     let file_count = files.len();
     let mut coverage_warnings = go_mod_coverage_warnings(&files);
     let lock_scan = lockscan::scan_locks(&files, &paths);
@@ -5539,8 +5636,29 @@ impl UpdateFilter {
     }
 }
 
+fn count_result_updates(
+    result: &UpdateResult,
+    filter: UpdateFilter,
+) -> (usize, usize, usize, usize) {
+    let mut counts = (0, 0, 0, 0);
+    for index in 0..result.updated.len() {
+        let kind = update_type(result.update_bump(index));
+        if !filter.matches(kind) {
+            continue;
+        }
+        match kind {
+            UpdateType::Major => counts.0 += 1,
+            UpdateType::Minor => counts.1 += 1,
+            UpdateType::Patch => counts.2 += 1,
+        }
+        counts.3 += 1;
+    }
+    counts
+}
+
 /// Counts updates by type, respecting the filter.
 /// Returns (major_count, minor_count, patch_count, filtered_total)
+#[cfg(test)]
 fn count_updates_by_type(
     updates: &[(String, String, String, Option<usize>)],
     filter: UpdateFilter,
@@ -5572,6 +5690,7 @@ fn format_capped_line(
     package: &str,
     current: &str,
     available: &str,
+    bump: UpdateType,
 ) -> String {
     let location = match line_number {
         Some(n) => format!("{}:{}:", path, n),
@@ -5585,7 +5704,7 @@ fn format_capped_line(
         current.dimmed(),
         "→".dimmed(),
         available.cyan(),
-        classify_update(current, available).as_str()
+        bump.as_str()
     )
 }
 
@@ -5698,6 +5817,7 @@ fn format_normalized_lines(
 /// wording. `--verbose` names each dependency with its own message.
 fn not_examined_phrase(reason: &str) -> &'static str {
     match reason {
+        "exact-pins-disabled" => "exact pin(s) preserved by configuration",
         "action-sha-updates-off" => "SHA-pinned action(s), not checked while SHA updates are off",
         "unsupported-backend" => "tool(s) on a backend upd cannot query",
         "unknown-tool" => "tool(s) upd knows no registry for",
@@ -5781,6 +5901,12 @@ fn format_capped_lines(path: &str, result: &UpdateResult) -> Vec<String> {
                 &capped.package,
                 &capped.current,
                 &capped.available,
+                update_type(capped.lang.map_or_else(
+                    || classify_bump(&capped.current, &capped.available),
+                    |lang| {
+                        upd::updater::classify_bump_for(lang, &capped.current, &capped.available)
+                    },
+                )),
             )
         })
         .collect()
@@ -5812,8 +5938,8 @@ fn print_file_result(
 
     let action = if dry_run { "Would update" } else { "Updated" };
 
-    for (package, old, new, line_num) in &result.updated {
-        let update_type = classify_update(old, new);
+    for (index, (package, old, new, line_num)) in result.updated.iter().enumerate() {
+        let update_type = update_type(result.update_bump(index));
 
         // Skip if filtered out
         if !filter.matches(update_type) {
@@ -5832,14 +5958,24 @@ fn print_file_result(
             UpdateType::Patch => String::new(),
         };
 
+        let context = result.update_context.get(&index);
+        let previous = context
+            .and_then(|c| c.previous_spec.as_deref())
+            .unwrap_or(old);
+        let next = context.and_then(|c| c.new_spec.as_deref()).unwrap_or(new);
+        let section = context
+            .and_then(|c| c.section.as_deref())
+            .map(|s| format!(" [{s}]"))
+            .unwrap_or_default();
         println!(
-            "{} {} {} {} → {}{}",
+            "{} {} {} {} → {}{}{}",
             location.blue().underline(),
             action.green(),
             package.bold(),
-            old.dimmed(),
-            new.green(),
-            type_indicator
+            previous.dimmed(),
+            next.green(),
+            type_indicator,
+            section
         );
     }
 
@@ -6072,7 +6208,7 @@ fn print_summary(
 
     // Count by update type, respecting filter
     let (major_count, minor_count, patch_count, filtered_total) =
-        count_updates_by_type(&result.updated, filter);
+        count_result_updates(result, filter);
 
     let pinned_count = result.pinned.len();
     let ignored_count = result.ignored.len();
@@ -6949,12 +7085,14 @@ mod tests {
         let result = UpdateResult {
             capped: vec![
                 upd::updater::CappedUpdate {
+                    lang: None,
                     package: "reqwest".into(),
                     current: "0.12.1".into(),
                     available: "0.13.0".into(),
                     line_number: Some(7),
                 },
                 upd::updater::CappedUpdate {
+                    lang: None,
                     package: "serde".into(),
                     current: "1.0.1".into(),
                     available: "1.1.0".into(),
@@ -7100,6 +7238,7 @@ mod tests {
                 "an update the bump ceiling held back",
                 UpdateResult {
                     capped: vec![upd::updater::CappedUpdate {
+                        lang: None,
                         package: "a".into(),
                         current: "1.0".into(),
                         available: "2.0".into(),
@@ -8440,6 +8579,7 @@ mod output_tests {
             })),
             &package_filter,
             &[],
+            None,
             None,
             Arc::default(),
             BumpFilter::default(),

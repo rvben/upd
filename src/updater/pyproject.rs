@@ -88,6 +88,13 @@ fn keys_at(doc: &DocumentMut, path: &[&str]) -> Vec<String> {
         .unwrap_or_default()
 }
 
+const UV_DEPENDENCY_ARRAYS: &[&str] = &[
+    "constraint-dependencies",
+    "build-constraint-dependencies",
+    "override-dependencies",
+    "dev-dependencies",
+];
+
 pub struct PyProjectUpdater {
     // Regex to extract version from dependency string
     // Matches: package==1.0.0, package>=1.0.0, package[extra]>=1.0.0, etc.
@@ -172,6 +179,20 @@ fn classify_rewrite(target: &NormalizeTarget, operator: &str, version: &str) -> 
         }
         _ => Rewrite::NewShape,
     }
+}
+
+fn preserve_exact_pin(spec: &str, options: &UpdateOptions) -> bool {
+    if options
+        .config
+        .as_ref()
+        .is_none_or(|c| c.update_exact_pins())
+    {
+        return false;
+    }
+    let spec = spec.trim();
+    spec.strip_prefix("==").is_some_and(|operand| {
+        !operand.starts_with('=') && !operand.contains(',') && is_pep440_version(operand.trim())
+    })
 }
 
 fn section_operator(section_path: &str, options: &UpdateOptions) -> Option<SpecifierOperator> {
@@ -419,6 +440,55 @@ enum MultiLineString {
 }
 
 impl PyProjectUpdater {
+    /// Select a lock-only Python update using the same project upload policy as
+    /// ordinary manifest updates. Configuration pins must pass that policy too.
+    pub async fn resolve_floor_version(
+        path: &Path,
+        registry: &dyn Registry,
+        package: &str,
+        locked: &str,
+        options: &UpdateOptions,
+    ) -> Result<crate::fix::FloorResolution> {
+        let manifest_path = if path
+            .file_name()
+            .is_some_and(|name| name == "poetry.lock" || name == "uv.lock")
+        {
+            path.with_file_name("pyproject.toml")
+        } else {
+            path.to_path_buf()
+        };
+        let path = manifest_path.as_path();
+        let doc: DocumentMut = read_file_safe(path)?.parse()?;
+        let root_doc = crate::lockfile::uv_workspace_root(path)?
+            .map(|root| root.join("pyproject.toml"))
+            .filter(|root| std::fs::canonicalize(path).ok().as_ref() != Some(root))
+            .map(|root| {
+                read_file_safe(&root)?
+                    .parse::<DocumentMut>()
+                    .map_err(anyhow::Error::from)
+            })
+            .transpose()?;
+        let policy_doc = root_doc.as_ref().unwrap_or(&doc);
+        let declared = Self::declared_indexes(policy_doc);
+        let chain = IndexChain::new(declared.chain, &declared.pins, registry);
+        let registry: &dyn Registry = chain.as_ref().map_or(registry, |chain| chain);
+        let registry = crate::registry::python::PythonRegistry::for_project(
+            registry,
+            crate::registry::python::project_requirement(&doc)?,
+        )
+        .with_uv_policy(
+            crate::registry::uv_policy::UvPolicy::from_document(
+                policy_doc,
+                options.cooldown_now.unwrap_or_else(chrono::Utc::now),
+            )
+            .map_err(|error| anyhow!("{error:#}"))?,
+        );
+        if let Some(pin) = options.get_pinned_version(package) {
+            registry.validate_policy_pin(package, pin).await?;
+        }
+        crate::fix::resolve_floor_version(&registry, package, locked, Lang::Python, options).await
+    }
+
     pub fn new() -> Self {
         let version_re = Regex::new(
             r"^([a-zA-Z0-9][-a-zA-Z0-9._]*)\s*(\[[^\]]+\])?\s*(==|>=|<=|~=|!=|>|<)\s*([^\s,;]+)",
@@ -842,16 +912,42 @@ impl PyProjectUpdater {
         let mut pinned_deps: Vec<(usize, String, String, String, String, Option<usize>)> =
             Vec::new();
         let mut deps_to_check: Vec<(usize, String, ParsedDep, Option<usize>)> = Vec::new();
+        let mut occurrences: HashMap<String, usize> = HashMap::new();
 
         for i in 0..array.len() {
             if let Some(item) = array.get(i)
                 && let Some(s) = item.as_str()
                 && let Some(parsed) = self.parse_dependency(s)
             {
-                let line_num = manifest.line_index.line_for(section_path, &parsed.package);
+                let occurrence = occurrences.entry(s.to_string()).or_default();
+                let line_num = manifest
+                    .line_index
+                    .line_for_entry(section_path, s, *occurrence);
+                *occurrence += 1;
+                if manifest
+                    .non_registry
+                    .contains(&pep503_normalize(&parsed.package))
+                {
+                    continue;
+                }
 
                 if options.is_package_filtered_out(&parsed.package) {
                     result.unchanged += 1;
+                    continue;
+                }
+
+                if options.get_pinned_version(&parsed.package).is_none()
+                    && preserve_exact_pin(&parsed.full_constraint, options)
+                {
+                    result.skipped.push(super::SkippedUpdate {
+                        package: parsed.package,
+                        current: parsed.version,
+                        line_number: line_num,
+                        status: super::SkipStatus::NotExamined,
+                        reason: "exact-pins-disabled",
+                        message: "exact == pin preserved by update.pyproject.exact-pins = false"
+                            .into(),
+                    });
                     continue;
                 }
 
@@ -908,6 +1004,13 @@ impl PyProjectUpdater {
         // Process pinned packages (no registry fetch needed)
         let mut updates: Vec<(usize, String)> = Vec::new();
         for (i, dep_str, package, current_version, pinned_version, line_num) in pinned_deps {
+            if let Err(error) = registry
+                .validate_policy_pin(&package, &pinned_version)
+                .await
+            {
+                result.errors.push(format!("{package}: {error}"));
+                continue;
+            }
             let matched_version = if options.full_precision {
                 pinned_version.clone()
             } else {
@@ -1072,7 +1175,11 @@ impl PyProjectUpdater {
                                 &current_version,
                             ));
                             result.unchanged += 1;
-                        } else if !options.allows_bump(&current_version, &matched_version) {
+                        } else if !options.allows_bump_for(
+                            Lang::Python,
+                            &current_version,
+                            &matched_version,
+                        ) {
                             // Bump level exceeds the --only-bump/--max-bump ceiling.
                             result.record_capped(
                                 &package,
@@ -1082,6 +1189,17 @@ impl PyProjectUpdater {
                             );
                         } else {
                             let updated = self.update_dependency(&dep_str, &matched_version);
+                            result.update_context.insert(
+                                result.updated.len(),
+                                super::UpdateContext {
+                                    lang: Lang::Python,
+                                    section: Some(section_path.to_string()),
+                                    previous_spec: Some(full_constraint.clone()),
+                                    new_spec: self
+                                        .parse_dependency(&updated)
+                                        .map(|dep| dep.full_constraint),
+                                },
+                            );
                             result.updated.push((
                                 package.clone(),
                                 current_version.clone(),
@@ -1184,6 +1302,22 @@ impl PyProjectUpdater {
                 }
                 continue;
             }
+            if options.get_pinned_version(&target.package).is_none()
+                && target
+                    .previous_spec
+                    .as_deref()
+                    .is_some_and(|spec| preserve_exact_pin(spec, options))
+            {
+                result.skipped.push(super::SkippedUpdate {
+                    package: target.package,
+                    current: target.version.unwrap_or_default(),
+                    line_number: line_num,
+                    status: super::SkipStatus::NotExamined,
+                    reason: "exact-pins-disabled",
+                    message: "exact == pin preserved by update.pyproject.exact-pins = false".into(),
+                });
+                continue;
+            }
             if options.should_ignore(&target.package) {
                 if let Some(version) = target.version {
                     result.ignored.push((target.package, version, line_num));
@@ -1204,6 +1338,10 @@ impl PyProjectUpdater {
                         "cannot normalize '{}': pin '{}' carries a local label, which {} does not take",
                         target.package, pin, operator
                     ));
+                    continue;
+                }
+                if let Err(error) = registry.validate_policy_pin(&target.package, pin).await {
+                    result.errors.push(format!("{}: {error}", target.package));
                     continue;
                 }
                 let spec = format!("{operator}{pin}");
@@ -1377,7 +1515,7 @@ impl PyProjectUpdater {
                     result.unchanged += 1;
                     continue;
                 }
-                if chosen != *anchor && !options.allows_bump(anchor, &chosen) {
+                if chosen != *anchor && !options.allows_bump_for(Lang::Python, anchor, &chosen) {
                     result.record_capped(&target.package, anchor, &chosen, line_num);
                     continue;
                 }
@@ -1398,6 +1536,15 @@ impl PyProjectUpdater {
                 }
                 Rewrite::SameShape => {
                     let (_, existing) = target.single_clause.clone().unwrap();
+                    result.update_context.insert(
+                        result.updated.len(),
+                        super::UpdateContext {
+                            lang: Lang::Python,
+                            section: Some(section.path.to_string()),
+                            previous_spec: target.previous_spec.clone(),
+                            new_spec: Some(spec.clone()),
+                        },
+                    );
                     result.updated.push((
                         target.package.clone(),
                         existing.clone(),
@@ -1621,11 +1768,21 @@ impl PyProjectUpdater {
                                 &version,
                             ));
                             result.unchanged += 1;
-                        } else if !options.allows_bump(&version, &matched_version) {
+                        } else if !options.allows_bump_for(Lang::Python, &version, &matched_version)
+                        {
                             // Bump level exceeds the --only-bump/--max-bump ceiling.
                             result.record_capped(&key, &version, &matched_version, line_num);
                         } else {
                             let new_val = format!("{}{}", prefix, matched_version);
+                            result.update_context.insert(
+                                result.updated.len(),
+                                super::UpdateContext {
+                                    lang: Lang::Python,
+                                    section: Some(section_path.to_string()),
+                                    previous_spec: Some(format!("{prefix}{version}")),
+                                    new_spec: Some(new_val.clone()),
+                                },
+                            );
                             result.updated.push((
                                 key.clone(),
                                 version.clone(),
@@ -1986,8 +2143,11 @@ impl PyProjectLineIndex {
                         }
                     }
                 }
-                "project.optional-dependencies" | "dependency-groups" => {
+                "project.optional-dependencies" | "dependency-groups" | "tool.uv" => {
                     if let Some((group, value)) = PyProjectUpdater::assignment_parts(line) {
+                        if section == "tool.uv" && !UV_DEPENDENCY_ARRAYS.contains(&group.as_str()) {
+                            continue;
+                        }
                         let brackets = Self::count_structural_array_brackets(value);
                         if brackets.opening == 0 {
                             continue;
@@ -2075,7 +2235,7 @@ impl Updater for PyProjectUpdater {
 
         let mut result = UpdateResult::default();
         let line_index = PyProjectLineIndex::from_content(&content, self);
-        let manifest = ManifestContext {
+        let mut manifest = ManifestContext {
             line_index: &line_index,
             non_registry: non_registry_sources(&doc),
         };
@@ -2083,7 +2243,30 @@ impl Updater for PyProjectUpdater {
         // Indexes the manifest declares (uv/Poetry/PDM) are layered over the
         // registry we were handed; only the tool's own replace-the-default rule
         // takes PyPI out of the chain.
-        let declared = Self::declared_indexes(&doc);
+        let workspace_doc = crate::lockfile::uv_workspace_root(path)?
+            .map(|root| root.join("pyproject.toml"))
+            .filter(|root| std::fs::canonicalize(path).ok().as_ref() != Some(root))
+            .map(|root| {
+                read_file_safe(&root)?
+                    .parse::<DocumentMut>()
+                    .map_err(anyhow::Error::from)
+            })
+            .transpose()?;
+        let policy_doc = workspace_doc.as_ref().unwrap_or(&doc);
+        let mut declared = Self::declared_indexes(policy_doc);
+        if workspace_doc.is_some() {
+            let mut inherited_sources = non_registry_sources(policy_doc);
+            if let Some(uv) = item_at(&doc, &["tool", "uv"]).and_then(Item::as_table_like) {
+                declared.pins.extend(Self::uv_source_pins(uv));
+                if let Some(sources) = uv.get("sources").and_then(Item::as_table_like) {
+                    for (name, _) in sources.iter() {
+                        inherited_sources.remove(&pep503_normalize(name));
+                    }
+                }
+            }
+            inherited_sources.extend(manifest.non_registry);
+            manifest.non_registry = inherited_sources;
+        }
         let chain = IndexChain::new(declared.chain, &declared.pins, registry);
         let effective_registry: &dyn Registry = match &chain {
             Some(chain) => chain,
@@ -2092,6 +2275,13 @@ impl Updater for PyProjectUpdater {
         let python_registry = crate::registry::python::PythonRegistry::for_project(
             effective_registry,
             crate::registry::python::project_requirement(&doc)?,
+        )
+        .with_uv_policy(
+            crate::registry::uv_policy::UvPolicy::from_document(
+                policy_doc,
+                options.cooldown_now.unwrap_or_else(chrono::Utc::now),
+            )
+            .map_err(|error| anyhow!("{error:#}"))?,
         );
         let effective_registry = &python_registry;
 
@@ -2141,6 +2331,20 @@ impl Updater for PyProjectUpdater {
             }
         }
 
+        for key in UV_DEPENDENCY_ARRAYS {
+            if let Some(deps) = array_at(&mut doc, &["tool", "uv", key]) {
+                self.update_array_deps(
+                    deps,
+                    effective_registry,
+                    &mut result,
+                    &manifest,
+                    &format!("tool.uv.{key}"),
+                    &options,
+                )
+                .await;
+            }
+        }
+
         // Update [tool.poetry.dependencies] and [tool.poetry.dev-dependencies]
         if let Some(Item::Table(tool)) = doc.get_mut("tool")
             && let Some(Item::Table(poetry)) = tool.get_mut("poetry")
@@ -2179,6 +2383,7 @@ impl Updater for PyProjectUpdater {
         }
 
         result.warnings.extend(python_registry.notes());
+        result.set_update_lang(Lang::Python);
         Ok(result)
     }
 
@@ -2245,6 +2450,26 @@ impl Updater for PyProjectUpdater {
                                 });
                             }
                         }
+                    }
+                }
+            }
+        }
+
+        // Constraints and overrides do not install packages. Including them in
+        // manifest occurrences would suppress lock-only audit remediation.
+        for key in ["dev-dependencies"] {
+            if let Some(array) = item_at(&doc, &["tool", "uv", key]).and_then(Item::as_array) {
+                for value in array.iter().filter_map(Value::as_str) {
+                    if let Some(parsed) = self.parse_dependency(value) {
+                        let line_number =
+                            line_index.line_for(&format!("tool.uv.{key}"), &parsed.package);
+                        deps.push(ParsedDependency {
+                            name: parsed.package,
+                            version: parsed.version,
+                            line_number,
+                            has_upper_bound: !Self::is_simple_constraint(&parsed.full_constraint),
+                            is_bumpable: parsed.raisable,
+                        });
                     }
                 }
             }

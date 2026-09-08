@@ -555,6 +555,31 @@ pub fn classify_bump(old: &str, new: &str) -> BumpKind {
     BumpKind::Patch
 }
 
+/// Python release components describe bump levels independently of caret
+/// compatibility. Other ecosystems retain the existing pre-1.0 policy.
+pub fn classify_bump_for(lang: Lang, old: &str, new: &str) -> BumpKind {
+    if lang != Lang::Python {
+        return classify_bump(old, new);
+    }
+    fn version(value: &str) -> Option<pep440_rs::Version> {
+        let value = value.trim_start_matches(|c: char| {
+            matches!(c, '^' | '~' | '>' | '<' | '=' | '!' | 'v' | 'V') || c.is_whitespace()
+        });
+        value.split(',').next()?.trim().parse().ok()
+    }
+    let (Some(old), Some(new)) = (version(old), version(new)) else {
+        return BumpKind::Patch;
+    };
+    let component = |v: &pep440_rs::Version, i| v.release().get(i).copied().unwrap_or(0);
+    if new.epoch() > old.epoch() || component(&new, 0) > component(&old, 0) {
+        BumpKind::Major
+    } else if component(&new, 1) > component(&old, 1) {
+        BumpKind::Minor
+    } else {
+        BumpKind::Patch
+    }
+}
+
 /// Which bump levels are permitted to be written.
 ///
 /// The default permits everything, so updaters that are unaware of the filter
@@ -632,6 +657,8 @@ pub struct UpdateOptions {
     /// unconditionally because its ecosystems are not known until its lines are
     /// read.
     pub langs: Vec<Lang>,
+    /// Resolved annotated-line selection. Unlike `langs`, Some(empty) means none.
+    pub annotation_langs: Option<Vec<Lang>>,
     /// Update fully SHA-pinned GitHub Actions when they carry a verified,
     /// concrete version comment (for example `# v4.2.2`). Resolved from the
     /// command line, then the config file, then `DEFAULT_UPDATE_ACTION_SHAS`.
@@ -665,6 +692,7 @@ impl UpdateOptions {
             cooldown_unavailable_notes: Arc::default(),
             bump_filter: BumpFilter::default(),
             langs: Vec::new(),
+            annotation_langs: None,
             update_action_shas: DEFAULT_UPDATE_ACTION_SHAS,
         }
     }
@@ -680,6 +708,17 @@ impl UpdateOptions {
     /// and writing a change so a capped-out update never reaches disk.
     pub fn allows_bump(&self, current: &str, new: &str) -> bool {
         self.bump_filter.allows(current, new)
+    }
+
+    pub fn allows_bump_for(&self, lang: Lang, current: &str, new: &str) -> bool {
+        if current.trim().is_empty() || new.trim().is_empty() {
+            return false;
+        }
+        match classify_bump_for(lang, current, new) {
+            BumpKind::Major => self.bump_filter.major,
+            BumpKind::Minor => self.bump_filter.minor,
+            BumpKind::Patch => self.bump_filter.patch,
+        }
     }
 
     /// Set the configuration
@@ -806,6 +845,10 @@ pub struct ParsedDependency {
 pub struct UpdateResult {
     /// Packages that were updated: (name, old_version, new_version, line_number)
     pub updated: Vec<(String, String, String, Option<usize>)>,
+    /// Metadata indexed by position in `updated`, preserving the public tuple
+    /// representation. Merge rebases indices, including identical occurrences
+    /// from different files or ecosystems.
+    pub update_context: BTreeMap<usize, UpdateContext>,
     /// Number of packages that were already at latest version
     pub unchanged: usize,
     /// Errors encountered during update
@@ -858,6 +901,7 @@ pub struct UpdateResult {
 /// waiting for me?" with a confident no.
 #[derive(Debug, Clone)]
 pub struct CappedUpdate {
+    pub lang: Option<Lang>,
     pub package: String,
     pub current: String,
     pub available: String,
@@ -960,8 +1004,45 @@ impl SkipStatus {
     }
 }
 
+#[derive(Debug, Clone)]
+pub struct UpdateContext {
+    pub lang: Lang,
+    pub section: Option<String>,
+    pub previous_spec: Option<String>,
+    pub new_spec: Option<String>,
+}
+
 impl UpdateResult {
+    pub fn update_bump(&self, index: usize) -> BumpKind {
+        let (_, old, new, _) = &self.updated[index];
+        match self.update_context.get(&index) {
+            Some(context) => classify_bump_for(context.lang, old, new),
+            None => classify_bump(old, new),
+        }
+    }
+
+    pub fn set_update_lang(&mut self, lang: Lang) {
+        for index in 0..self.updated.len() {
+            self.update_context.entry(index).or_insert(UpdateContext {
+                lang,
+                section: None,
+                previous_spec: None,
+                new_spec: None,
+            });
+        }
+        for capped in &mut self.capped {
+            capped.lang = Some(lang);
+        }
+    }
+
     pub fn merge(&mut self, other: UpdateResult) {
+        let offset = self.updated.len();
+        self.update_context.extend(
+            other
+                .update_context
+                .into_iter()
+                .map(|(i, context)| (offset + i, context)),
+        );
         self.updated.extend(other.updated);
         self.unchanged += other.unchanged;
         self.errors.extend(other.errors);
@@ -992,6 +1073,7 @@ impl UpdateResult {
         line_number: Option<usize>,
     ) {
         self.capped.push(CappedUpdate {
+            lang: None,
             package: package.to_string(),
             current: current.to_string(),
             available: available.to_string(),
@@ -4287,5 +4369,41 @@ mod cooldown_integration_tests {
             vec!["aaa arrived second".to_string()],
             "the condition is still one note, and arrival order must not pick it"
         );
+    }
+}
+
+#[cfg(test)]
+mod python_bump_tests {
+    use super::*;
+    #[test]
+    fn python_uses_release_components_and_epoch() {
+        for (old, new, expected) in [
+            ("0.0.77", "0.0.78", BumpKind::Patch),
+            ("0.77.0", "0.78.0", BumpKind::Minor),
+            ("0.77", "1.0", BumpKind::Major),
+            ("1.2", "1.2.post1", BumpKind::Patch),
+            ("1!2.0", "2!1.0", BumpKind::Major),
+        ] {
+            assert_eq!(classify_bump_for(Lang::Python, old, new), expected);
+        }
+        assert_eq!(
+            classify_bump_for(Lang::Rust, "0.0.77", "0.0.78"),
+            BumpKind::Major
+        );
+    }
+    #[test]
+    fn merging_identical_occurrences_keeps_their_ecosystem_classification() {
+        let mut python = UpdateResult::default();
+        python
+            .updated
+            .push(("demo".into(), "0.0.77".into(), "0.0.78".into(), Some(1)));
+        python.set_update_lang(Lang::Python);
+        let mut rust = UpdateResult {
+            updated: python.updated.clone(),
+            ..Default::default()
+        };
+        rust.merge(python);
+        assert_eq!(rust.update_bump(0), BumpKind::Major);
+        assert_eq!(rust.update_bump(1), BumpKind::Patch);
     }
 }

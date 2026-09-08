@@ -440,7 +440,10 @@ impl AnnotatedUpdater {
                     .push((line.package.clone(), line.version.clone(), Some(line_num)));
                 continue;
             }
-            if !lang_selected(&options.langs, line.source) {
+            if !options.annotation_langs.as_ref().map_or_else(
+                || lang_selected(&options.langs, line.source),
+                |langs| langs.contains(&line.source.lang()),
+            ) {
                 result.unchanged += 1;
                 continue;
             }
@@ -594,11 +597,21 @@ impl AnnotatedUpdater {
                         result.unchanged += 1;
                         continue;
                     }
-                    if !options.allows_bump(&line.version, &target) {
+                    if !options.allows_bump_for(lang, &line.version, &target) {
                         result.record_capped(&line.package, &line.version, &target, Some(line_num));
+                        result.capped.last_mut().unwrap().lang = Some(lang);
                         continue;
                     }
 
+                    result.update_context.insert(
+                        result.updated.len(),
+                        super::UpdateContext {
+                            lang,
+                            section: None,
+                            previous_spec: None,
+                            new_spec: None,
+                        },
+                    );
                     result.updated.push((
                         line.package.clone(),
                         line.version.clone(),

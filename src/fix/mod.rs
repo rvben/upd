@@ -926,7 +926,7 @@ pub async fn resolve_floor_version(
     if crate::align::compare_versions(&candidate, locked, lang) != Ordering::Greater {
         return Ok(FloorResolution::NotNeeded);
     }
-    if !options.allows_bump(locked, &candidate) {
+    if !options.allows_bump_for(lang, locked, &candidate) {
         return Ok(FloorResolution::Capped(candidate));
     }
     Ok(FloorResolution::Floor(candidate))

@@ -190,7 +190,11 @@ impl Registry for MockRegistry {
             .into_iter()
             .map(|version| super::PythonRelease {
                 version,
-                requires_python: vec![None],
+                files: vec![super::PythonArtifact {
+                    requires_python: None,
+                    uploaded_at: None,
+                }],
+                index: None,
             })
             .collect())
     }

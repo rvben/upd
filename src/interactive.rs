@@ -91,6 +91,7 @@ pub struct PendingUpdate {
     pub new_version: String,
     pub is_major: bool,
     pub approved: bool,
+    pub context: Option<crate::updater::UpdateContext>,
 }
 
 impl PendingUpdate {
@@ -110,6 +111,7 @@ impl PendingUpdate {
             new_version,
             is_major,
             approved: false,
+            context: None,
         }
     }
 }
@@ -128,12 +130,28 @@ pub fn prompt_all(mut updates: Vec<PendingUpdate>) -> io::Result<Vec<PendingUpda
         // Show progress
         print!("[{}/{}] ", i + 1, total);
 
+        let label = update
+            .context
+            .as_ref()
+            .and_then(|c| c.section.as_deref())
+            .map(|section| format!("{} [{section}]", update.package))
+            .unwrap_or_else(|| update.package.clone());
+        let previous = update
+            .context
+            .as_ref()
+            .and_then(|c| c.previous_spec.as_deref())
+            .unwrap_or(&update.old_version);
+        let next = update
+            .context
+            .as_ref()
+            .and_then(|c| c.new_spec.as_deref())
+            .unwrap_or(&update.new_version);
         let decision = prompt_single(
             &update.file,
             update.line_num,
-            &update.package,
-            &update.old_version,
-            &update.new_version,
+            &label,
+            previous,
+            next,
             update.is_major,
         )?;
 

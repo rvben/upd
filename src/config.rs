@@ -87,6 +87,8 @@ const KNOWN_KEYS: &[&str] = &[
     "update_action_shas",
     "automation",
     "normalize",
+    "update",
+    "ecosystems",
 ];
 
 /// Repository-level policy for unattended automation.
@@ -171,9 +173,33 @@ pub struct NormalizeConfig {
     pub pyproject: Option<PyprojectNormalize>,
 }
 
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EcosystemsConfig {
+    pub enable: Option<Vec<String>>,
+    pub disable: Option<Vec<String>>,
+}
+
+#[derive(Debug, Clone, Copy, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PyprojectUpdate {
+    #[serde(rename = "exact-pins")]
+    pub exact_pins: Option<bool>,
+}
+
+#[derive(Debug, Clone, Copy, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UpdateConfig {
+    pub pyproject: Option<PyprojectUpdate>,
+}
+
 /// Configuration loaded from .updrc.toml or upd.toml
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct UpdConfig {
+    #[serde(default)]
+    pub ecosystems: EcosystemsConfig,
+    #[serde(default)]
+    pub update: UpdateConfig,
     /// Package names to ignore (never update or align)
     #[serde(default)]
     pub ignore: Vec<String>,
@@ -223,6 +249,40 @@ pub struct UpdConfig {
 }
 
 impl UpdConfig {
+    pub fn update_exact_pins(&self) -> bool {
+        self.update
+            .pyproject
+            .and_then(|p| p.exact_pins)
+            .unwrap_or(true)
+    }
+
+    /// An absent selection means all ecosystems; an explicitly empty selection
+    /// means none. CLI selections replace both configured lists.
+    pub fn selected_ecosystems(
+        &self,
+        cli: &[crate::updater::Lang],
+    ) -> Result<Option<Vec<crate::updater::Lang>>, String> {
+        use crate::updater::Lang;
+        use clap::ValueEnum;
+        let parse = |names: &Option<Vec<String>>| -> Result<Option<Vec<Lang>>, String> {
+            names.as_ref().map(|names| names.iter().map(|name| {
+                <Lang as ValueEnum>::from_str(name, false).map_err(|_| format!("unknown ecosystem '{name}' in [ecosystems]; use names accepted by --lang"))
+            }).collect()).transpose()
+        };
+        let enabled = parse(&self.ecosystems.enable)?;
+        let disabled = parse(&self.ecosystems.disable)?.unwrap_or_default();
+        if !cli.is_empty() {
+            return Ok(Some(cli.to_vec()));
+        }
+        if enabled.is_none() && self.ecosystems.disable.is_none() {
+            return Ok(None);
+        }
+        let mut selected = enabled.unwrap_or_else(|| Lang::value_variants().to_vec());
+        selected.retain(|lang| !disabled.contains(lang));
+        selected.dedup();
+        Ok(Some(selected))
+    }
+
     /// Discover the nearest config file, walking up from `start_dir`.
     ///
     /// Returns `Ok(None)` when no config file exists. A config file that is
@@ -410,6 +470,7 @@ impl UpdConfig {
             .try_into()
             .map_err(|e| format!("Invalid TOML in config file {}:\n  {}", source_label, e))?;
 
+        config.selected_ecosystems(&[])?;
         Ok((config, warnings))
     }
 
@@ -461,6 +522,17 @@ exclude = [
 # npm = "14d"
 # pypi = "14d"
 # "crates.io" = "3d"
+
+# Ecosystem selection uses --lang names. Omitted enable means all; [] means none.
+# disable wins over enable. An explicit --lang replaces both lists.
+[ecosystems]
+# enable = ["python", "rust", "actions"]
+# disable = ["node"]
+
+# Preserve concrete == pins during automatic updates and normalization when false.
+# Explicit [pin] entries still win. === and prefix ==1.* are unaffected.
+[update.pyproject]
+exact-pins = true
 
 # normalize: rewrite every registry-backed dependency in a selected
 # pyproject.toml section to one clause at the policy-selected release, in full precision.
@@ -558,10 +630,22 @@ security_remediation = false
             || self.cooldown.is_some()
             || self.automation.security_remediation.is_some()
             || self.normalize.is_some()
+            || self.update.pyproject.is_some()
+            || self.ecosystems.enable.is_some()
+            || self.ecosystems.disable.is_some()
     }
 
     /// Merge another configuration into this one (other takes precedence)
     pub fn merge(&mut self, other: Self) {
+        if other.ecosystems.enable.is_some() {
+            self.ecosystems.enable = other.ecosystems.enable;
+        }
+        if other.ecosystems.disable.is_some() {
+            self.ecosystems.disable = other.ecosystems.disable;
+        }
+        if let Some(value) = other.update.pyproject.and_then(|p| p.exact_pins) {
+            self.update.pyproject.get_or_insert_default().exact_pins = Some(value);
+        }
         // Extend ignore list
         for pkg in other.ignore {
             if !self.ignore.contains(&pkg) {
@@ -727,6 +811,27 @@ impl EffectiveConfig<'_> {
             None => out.push_str("config file: (none found; built-in defaults)\n"),
         }
 
+        out.push_str(&format!(
+            "update.pyproject.exact-pins: {}\n",
+            self.config.update_exact_pins()
+        ));
+        out.push_str(&format!(
+            "ecosystems.enable: {}\n",
+            self.config
+                .ecosystems
+                .enable
+                .as_ref()
+                .map(|v| format!("{v:?}"))
+                .unwrap_or_else(|| "(all)".into())
+        ));
+        out.push_str(&format!(
+            "ecosystems.disable: {:?}\n",
+            self.config
+                .ecosystems
+                .disable
+                .as_deref()
+                .unwrap_or_default()
+        ));
         out.push_str(&render_list("ignore", &self.config.ignore));
         out.push_str(&render_list("include", &self.config.include));
         out.push_str(&render_list("exclude", &self.config.exclude));
@@ -788,6 +893,8 @@ impl EffectiveConfig<'_> {
         serde_json::json!({
             "config_file": self.source.map(crate::path_display::display_path),
             "config_file_explicit": self.explicit,
+            "update": {"pyproject": {"exact-pins": self.config.update_exact_pins()}},
+            "ecosystems": {"enable": self.config.ecosystems.enable, "disable": self.config.ecosystems.disable},
             "ignore": self.config.ignore,
             "include": self.config.include,
             "exclude": self.config.exclude,
@@ -2050,5 +2157,57 @@ default = "nope"
             rendered.contains("--min-age override active: disabled"),
             "should note override: {rendered}"
         );
+    }
+}
+
+#[cfg(test)]
+mod policy_tests {
+    use super::*;
+    use crate::updater::Lang;
+    #[test]
+    fn selections_validate_and_preserve_empty_lists_and_cli_precedence() {
+        let (config, warnings) = UpdConfig::parse_with_warnings("[ecosystems]\nenable = ['python', 'rust']\ndisable = ['rust']\n[update.pyproject]\nexact-pins = false", "test").unwrap();
+        assert!(warnings.is_empty());
+        assert_eq!(
+            config.selected_ecosystems(&[]).unwrap(),
+            Some(vec![Lang::Python])
+        );
+        assert_eq!(
+            config.selected_ecosystems(&[Lang::Rust]).unwrap(),
+            Some(vec![Lang::Rust])
+        );
+        assert!(!config.update_exact_pins());
+        assert!(config.has_config());
+        for text in [
+            "[ecosystems]\nenable=['pypi']",
+            "[ecosystems]\nenabled=['python']",
+            "[update.pyproject]\nexact-pins='false'",
+            "[update.pyproject]\nexact-pin=false",
+        ] {
+            assert!(
+                UpdConfig::parse_with_warnings(text, "test").is_err(),
+                "{text}"
+            );
+        }
+        let (none, _) = UpdConfig::parse_with_warnings("[ecosystems]\nenable=[]", "test").unwrap();
+        assert_eq!(none.selected_ecosystems(&[]).unwrap(), Some(vec![]));
+        assert_eq!(UpdConfig::default().selected_ecosystems(&[]).unwrap(), None);
+    }
+    #[test]
+    fn child_config_only_overrides_explicit_values() {
+        let mut parent = UpdConfig::parse_with_warnings("[update.pyproject]\nexact-pins=false\n[ecosystems]\nenable=['python']\ndisable=['rust']", "test").unwrap().0;
+        parent.merge(UpdConfig::default());
+        assert!(!parent.update_exact_pins());
+        parent.merge(
+            UpdConfig::parse_with_warnings(
+                "[update.pyproject]\nexact-pins=true\n[ecosystems]\nenable=[]",
+                "test",
+            )
+            .unwrap()
+            .0,
+        );
+        assert!(parent.update_exact_pins());
+        assert_eq!(parent.selected_ecosystems(&[]).unwrap(), Some(vec![]));
+        assert_eq!(parent.ecosystems.disable.unwrap(), ["rust"]);
     }
 }

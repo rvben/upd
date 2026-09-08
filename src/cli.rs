@@ -47,7 +47,7 @@ pub enum OutputFormat {
     Sarif,
 }
 
-#[derive(Parser)]
+#[derive(Parser, Clone)]
 #[command(name = "upd")]
 #[command(
     author,
@@ -56,6 +56,10 @@ pub enum OutputFormat {
     after_help = "Run 'upd schema' for machine-readable interface description (clispec v0.3).\n\nTip: changes are applied in-place - use git to revert."
 )]
 pub struct Cli {
+    /// Resolved source selection for annotations. Distinct from file selection:
+    /// `annotated` is a wildcard, but a configured denylist still wins.
+    #[arg(skip)]
+    pub annotation_langs: Option<Vec<crate::updater::Lang>>,
     #[command(subcommand)]
     pub command: Option<Command>,
 
@@ -290,7 +294,7 @@ pub struct Cli {
     pub fields: Option<String>,
 }
 
-#[derive(Subcommand)]
+#[derive(Subcommand, Clone)]
 pub enum Command {
     /// Update dependencies (default when no command specified)
     Update {

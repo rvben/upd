@@ -567,9 +567,11 @@ impl Updater for RequirementsUpdater {
                                     ));
                                     result.unchanged += 1;
                                     new_lines.push(line.to_string());
-                                } else if !options
-                                    .allows_bump(&parsed.first_version, &matched_version)
-                                {
+                                } else if !options.allows_bump_for(
+                                    Lang::Python,
+                                    &parsed.first_version,
+                                    &matched_version,
+                                ) {
                                     // Bump level exceeds the --only-bump/--max-bump
                                     // ceiling: leave the line untouched.
                                     result.record_capped(
@@ -637,6 +639,7 @@ impl Updater for RequirementsUpdater {
         }
 
         result.warnings.extend(python_registry.notes());
+        result.set_update_lang(Lang::Python);
         Ok(result)
     }
 

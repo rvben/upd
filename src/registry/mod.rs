@@ -9,10 +9,11 @@ mod npm;
 mod nuget;
 mod pypi;
 pub(crate) mod python;
-pub use python::PythonRelease;
+pub use python::{PythonArtifact, PythonRelease};
 mod rubygems;
 mod terraform;
 mod utils;
+pub(crate) mod uv_policy;
 
 pub use crates_io::{CargoConfig, CargoCredentials, CratesIoRegistry, read_cargo_config};
 pub use docker::DockerRegistry;

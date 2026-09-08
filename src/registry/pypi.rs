@@ -102,6 +102,8 @@ where
 
 #[derive(Debug, Clone, Deserialize)]
 struct SimpleApiFile {
+    #[serde(default, rename = "upload-time")]
+    uploaded_at: Option<String>,
     #[serde(default, rename = "requires-python")]
     requires_python: Option<String>,
     filename: String,
@@ -618,6 +620,7 @@ impl PyPiRegistry {
                 let filename = href.split('#').next()?.rsplit('/').next()?.to_string();
                 Some(SimpleApiFile {
                     filename,
+                    uploaded_at: attrs.get("data-upload-time").cloned(),
                     yanked: attrs.contains_key("data-yanked"),
                     requires_python: attrs.get("data-requires-python").cloned(),
                 })
@@ -907,7 +910,7 @@ impl Registry for MultiPyPiRegistry {
 #[async_trait]
 impl Registry for PyPiRegistry {
     async fn python_releases(&self, package: &str) -> Result<Vec<super::PythonRelease>> {
-        let mut releases: HashMap<String, Vec<Option<String>>> = HashMap::new();
+        let mut releases: HashMap<String, Vec<super::PythonArtifact>> = HashMap::new();
         match self.fetch_package(package).await? {
             PackageResponse::Simple(data) => {
                 let normalized = package.to_lowercase().replace('_', "-");
@@ -918,7 +921,10 @@ impl Registry for PyPiRegistry {
                         releases
                             .entry(version)
                             .or_default()
-                            .push(file.requires_python);
+                            .push(super::PythonArtifact {
+                                requires_python: file.requires_python,
+                                uploaded_at: file.uploaded_at,
+                            });
                     }
                 }
             }
@@ -927,7 +933,10 @@ impl Registry for PyPiRegistry {
                     let requirements: Vec<_> = files
                         .into_iter()
                         .filter(|f| !f.yanked)
-                        .map(|f| f.requires_python)
+                        .map(|f| super::PythonArtifact {
+                            requires_python: f.requires_python,
+                            uploaded_at: f.upload_time_iso_8601,
+                        })
                         .collect();
                     if !requirements.is_empty() {
                         releases.insert(version, requirements);
@@ -937,9 +946,10 @@ impl Registry for PyPiRegistry {
         }
         Ok(releases
             .into_iter()
-            .map(|(version, requires_python)| super::PythonRelease {
+            .map(|(version, files)| super::PythonRelease {
                 version,
-                requires_python,
+                files,
+                index: Some(super::uv_policy::index_identity(&self.index_url)),
             })
             .collect())
     }
@@ -1265,21 +1275,25 @@ mod tests {
         let data = SimpleApiResponse {
             files: vec![
                 SimpleApiFile {
+                    uploaded_at: None,
                     requires_python: None,
                     filename: "my_package-1.0.0.tar.gz".to_string(),
                     yanked: false,
                 },
                 SimpleApiFile {
+                    uploaded_at: None,
                     requires_python: None,
                     filename: "my_package-1.1.0.tar.gz".to_string(),
                     yanked: false,
                 },
                 SimpleApiFile {
+                    uploaded_at: None,
                     requires_python: None,
                     filename: "my_package-1.2.0-py3-none-any.whl".to_string(),
                     yanked: false,
                 },
                 SimpleApiFile {
+                    uploaded_at: None,
                     requires_python: None,
                     filename: "my_package-2.0.0a1.tar.gz".to_string(),
                     yanked: false,
@@ -1310,21 +1324,25 @@ mod tests {
         let data = SimpleApiResponse {
             files: vec![
                 SimpleApiFile {
+                    uploaded_at: None,
                     requires_python: None,
                     filename: "my_package-1.0.0.tar.gz".to_string(),
                     yanked: false,
                 },
                 SimpleApiFile {
+                    uploaded_at: None,
                     requires_python: None,
                     filename: "my_package-1.1.0.tar.gz".to_string(),
                     yanked: true, // Yanked
                 },
                 SimpleApiFile {
+                    uploaded_at: None,
                     requires_python: None,
                     filename: "my_package-1.2.0.tar.gz".to_string(),
                     yanked: true, // Yanked
                 },
                 SimpleApiFile {
+                    uploaded_at: None,
                     requires_python: None,
                     filename: "my_package-1.3.0.tar.gz".to_string(),
                     yanked: false,

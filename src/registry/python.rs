@@ -14,7 +14,14 @@ use version_ranges::Ranges;
 #[derive(Debug, Clone)]
 pub struct PythonRelease {
     pub version: String,
-    pub requires_python: Vec<Option<String>>,
+    pub files: Vec<PythonArtifact>,
+    pub index: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct PythonArtifact {
+    pub requires_python: Option<String>,
+    pub uploaded_at: Option<String>,
 }
 
 type PythonReleaseCell = Arc<tokio::sync::OnceCell<Vec<PythonRelease>>>;
@@ -22,6 +29,7 @@ type PythonReleaseCell = Arc<tokio::sync::OnceCell<Vec<PythonRelease>>>;
 #[derive(Clone)]
 pub(crate) struct PythonRegistry<'a> {
     enabled: bool,
+    policy: super::uv_policy::UvPolicy,
     inner: &'a dyn Registry,
     requirement: String,
     supported: Ranges<Version>,
@@ -33,6 +41,7 @@ impl<'a> PythonRegistry<'a> {
     pub fn new(inner: &'a dyn Registry, requirement: String, supported: Ranges<Version>) -> Self {
         Self {
             enabled: true,
+            policy: Default::default(),
             notes: Default::default(),
             inner,
             requirement,
@@ -55,10 +64,27 @@ impl<'a> PythonRegistry<'a> {
         }
     }
 
+    pub fn with_uv_policy(mut self, policy: super::uv_policy::UvPolicy) -> Self {
+        self.policy = policy;
+        self
+    }
+
+    pub async fn validate_policy_pin(&self, package: &str, version: &str) -> Result<()> {
+        if self.policy.active() {
+            self.select(package, VersionQuery::Matching(&format!("=={version}")))
+                .await?;
+        }
+        Ok(())
+    }
+
+    fn filtering(&self) -> bool {
+        self.enabled || self.policy.active()
+    }
+
     /// Each occurrence gets its own range; metadata and diagnostics are shared.
     pub fn for_dependency(&self, dependency: &str) -> Result<Self> {
         let mut scoped = self.clone();
-        if !self.enabled {
+        if !self.filtering() {
             return Ok(scoped);
         }
         if let Some((_, marker)) = without_comment(dependency).split_once(';') {
@@ -82,7 +108,7 @@ impl<'a> PythonRegistry<'a> {
     }
 
     pub fn is_applicable(&self) -> bool {
-        !self.enabled || !self.supported.is_empty()
+        !self.filtering() || !self.supported.is_empty()
     }
 
     pub fn notes(&self) -> Vec<String> {
@@ -94,22 +120,37 @@ impl<'a> PythonRegistry<'a> {
             .collect()
     }
 
-    fn compatible(&self, release: &PythonRelease) -> bool {
-        let supported =
-            release
-                .requires_python
-                .iter()
-                .fold(Ranges::empty(), |range, requirement| {
-                    let file_range = match requirement.as_deref() {
-                        None | Some("") => Ranges::full(),
-                        Some(requirement) => match requirement.parse::<VersionSpecifiers>() {
-                            Ok(specifiers) => release_specifiers_to_ranges(specifiers),
-                            // Invalid metadata cannot establish compatibility for this file.
-                            Err(_) => Ranges::empty(),
-                        },
-                    };
-                    range.union(&file_range)
-                });
+    fn compatible(&self, package: &str, release: &PythonRelease) -> bool {
+        if !self.enabled {
+            return release.files.iter().any(|file| {
+                self.policy.admits(
+                    package,
+                    release.index.as_deref(),
+                    file.uploaded_at.as_deref(),
+                )
+            });
+        }
+        let supported = release
+            .files
+            .iter()
+            .filter(|file| {
+                self.policy.admits(
+                    package,
+                    release.index.as_deref(),
+                    file.uploaded_at.as_deref(),
+                )
+            })
+            .fold(Ranges::empty(), |range, file| {
+                let file_range = match file.requires_python.as_deref() {
+                    None | Some("") => Ranges::full(),
+                    Some(requirement) => match requirement.parse::<VersionSpecifiers>() {
+                        Ok(specifiers) => release_specifiers_to_ranges(specifiers),
+                        // Invalid metadata cannot establish compatibility for this file.
+                        Err(_) => Ranges::empty(),
+                    },
+                };
+                range.union(&file_range)
+            });
         self.supported.subset_of(&supported)
     }
 
@@ -118,7 +159,7 @@ impl<'a> PythonRegistry<'a> {
             VersionQuery::Matching(value) => Some(value.parse::<VersionSpecifiers>()?),
             _ => None,
         };
-        if !self.enabled {
+        if !self.filtering() {
             return query.run(self.inner, package).await;
         }
         let releases = self.python_releases(package).await?;
@@ -141,18 +182,37 @@ impl<'a> PythonRegistry<'a> {
             })
             .collect();
         candidates.sort_by(|a, b| b.0.cmp(&a.0));
-        let chosen = candidates.iter().find(|(_, release)| self.compatible(release))
-            .ok_or_else(|| anyhow!("No release of '{package}' satisfies the package constraints and supports the project's Python requirement '{}' (invalid release metadata cannot establish compatibility)", self.requirement))?;
+        let chosen = candidates.iter().find(|(_, release)| self.compatible(package, release))
+            .ok_or_else(|| {
+                let cutoff = if self.policy.active() { " and uv upload cutoff" } else { "" };
+                let python = if self.enabled { format!(" and supports the project's Python requirement '{}'", self.requirement) } else { String::new() };
+                anyhow!("No release of '{package}' satisfies the package constraints{cutoff}{python} (invalid release metadata cannot establish compatibility)")
+            })?;
         if let Some(newest) = candidates.first().filter(|newest| newest.0 > chosen.0) {
+            if !self.enabled {
+                self.notes
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .insert(format!(
+                        "{package}: uv upload cutoff selects {} instead of {}",
+                        chosen.1.version, newest.1.version
+                    ));
+                return Ok(chosen.1.version.clone());
+            }
             let requirements: BTreeSet<_> = newest
                 .1
-                .requires_python
+                .files
                 .iter()
-                .filter_map(|value| value.as_deref())
+                .filter_map(|file| file.requires_python.as_deref())
                 .collect();
             let requirements = requirements.into_iter().collect::<Vec<_>>().join(" or ");
+            let policy = if self.policy.active() {
+                "Python compatibility or uv upload policy"
+            } else {
+                "Python compatibility"
+            };
             self.notes.lock().unwrap_or_else(std::sync::PoisonError::into_inner).insert(format!(
-                "{package}: Python compatibility selects {} instead of {}; {} declares Requires-Python '{}'; project supports {}",
+                "{package}: {policy} selects {} instead of {}; {} declares Requires-Python '{}'; project supports {}",
                 chosen.1.version, newest.1.version, newest.1.version, requirements, self.requirement
             ));
         }
@@ -196,14 +256,14 @@ impl Registry for PythonRegistry<'_> {
         query: VersionQuery<'_>,
         _stale: &str,
     ) -> Result<String> {
-        if !self.enabled {
+        if !self.filtering() {
             return self.inner.revalidate_version(package, query, _stale).await;
         }
         // Metadata is fetched live once per run; a lower compatible answer is valid.
         self.select(package, query).await
     }
     async fn list_versions(&self, package: &str) -> Result<Vec<VersionMeta>> {
-        if !self.enabled {
+        if !self.filtering() {
             return self.inner.list_versions(package).await;
         }
         let releases = self.python_releases(package).await?;
@@ -213,9 +273,9 @@ impl Registry for PythonRegistry<'_> {
             .await?
             .into_iter()
             .filter(|meta| {
-                releases
-                    .iter()
-                    .any(|release| release.version == meta.version && self.compatible(release))
+                releases.iter().any(|release| {
+                    release.version == meta.version && self.compatible(package, release)
+                })
             })
             .collect())
     }
@@ -441,10 +501,17 @@ mod tests {
             );
             let release = PythonRelease {
                 version: "1.0".into(),
-                requires_python: files.into_iter().map(|f| f.map(str::to_string)).collect(),
+                files: files
+                    .into_iter()
+                    .map(|f| PythonArtifact {
+                        requires_python: f.map(str::to_string),
+                        uploaded_at: None,
+                    })
+                    .collect(),
+                index: None,
             };
             assert_eq!(
-                registry.compatible(&release),
+                registry.compatible("example", &release),
                 expected,
                 "{project}: {release:?}"
             );

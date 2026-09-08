@@ -216,6 +216,12 @@ pub struct CappedEntry {
 
 #[derive(Debug, Serialize)]
 pub struct UpdateEntry {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub section: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub previous_spec: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub new_spec: Option<String>,
     pub package: String,
     pub current: String,
     pub latest: String,
@@ -585,7 +591,9 @@ pub fn build_update_file_report(
     let updates = result
         .updated
         .iter()
-        .map(|(name, old, new, line)| {
+        .enumerate()
+        .map(|(index, (name, old, new, line))| {
+            let context = result.update_context.get(&index);
             let sha = result.action_sha_updates.iter().find(|change| {
                 change.package == *name
                     && change.current_version == *old
@@ -593,10 +601,16 @@ pub fn build_update_file_report(
                     && change.line_number == *line
             });
             UpdateEntry {
+                section: context.and_then(|c| c.section.clone()),
+                previous_spec: context.and_then(|c| c.previous_spec.clone()),
+                new_spec: context.and_then(|c| c.new_spec.clone()),
                 package: name.clone(),
                 current: old.clone(),
                 latest: new.clone(),
-                bump: classify(old, new),
+                bump: context.map_or_else(
+                    || classify(old, new),
+                    |_| bump_name(result.update_bump(index)),
+                ),
                 line: *line,
                 method: None,
                 status: None,
@@ -688,7 +702,16 @@ pub fn build_update_file_report(
             package: entry.package.clone(),
             current: entry.current.clone(),
             available: entry.available.clone(),
-            bump: classify(&entry.current, &entry.available),
+            bump: entry.lang.map_or_else(
+                || classify(&entry.current, &entry.available),
+                |lang| {
+                    bump_name(crate::updater::classify_bump_for(
+                        lang,
+                        &entry.current,
+                        &entry.available,
+                    ))
+                },
+            ),
             line: entry.line_number,
             source: source_of(&entry.package).map(AnnotationSource::token),
         })
@@ -1092,6 +1115,14 @@ fn build_vulnerability(
         url: v.url.clone(),
         aliases: v.aliases.clone(),
         source: v.source.clone(),
+    }
+}
+
+fn bump_name(bump: crate::updater::BumpKind) -> &'static str {
+    match bump {
+        crate::updater::BumpKind::Major => "major",
+        crate::updater::BumpKind::Minor => "minor",
+        crate::updater::BumpKind::Patch => "patch",
     }
 }
 
