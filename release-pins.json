@@ -1,19 +1,19 @@
 {
   "assets": {
     "aarch64-unknown-linux-gnu": {
-      "name": "upd-v0.12.0-aarch64-unknown-linux-gnu.tar.gz",
-      "sha256": "ce0cefdf1a6242b61fd30fccb2fc18cddbe401d6439913b99bf5e1502853b275"
+      "name": "upd-v0.12.1-aarch64-unknown-linux-gnu.tar.gz",
+      "sha256": "9a0c14aa6907a72a428e227754eb05fd26536c97339154334b23d7c13fea9c40"
     },
     "x86_64-unknown-linux-gnu": {
-      "name": "upd-v0.12.0-x86_64-unknown-linux-gnu.tar.gz",
-      "sha256": "2617f6a906f9c7c5481781f6bb353ad29319600ed68838c5c24e130032e32096"
+      "name": "upd-v0.12.1-x86_64-unknown-linux-gnu.tar.gz",
+      "sha256": "190ab06762ac2d017c5d1dfc5d5832bb9f1ceafafc6aa323ad2639bcf9bf647a"
     },
     "x86_64-unknown-linux-musl": {
-      "name": "upd-v0.12.0-x86_64-unknown-linux-musl.tar.gz",
-      "sha256": "cfe5693c25be4a5e23e67f636578c0dd0bd3372605d9387c21de10f46809313a"
+      "name": "upd-v0.12.1-x86_64-unknown-linux-musl.tar.gz",
+      "sha256": "79a52f1d95619eeb7400f1a3a5da848afc1f48aa8d65f6cf19bf07ec9206ae1b"
     }
   },
-  "release_commit": "e1cb0dee52d566c1f1147608ccdfff0e7a8ac6f0",
+  "release_commit": "6432a349cc44f95bb7f4df72e769f83df68e5b32",
   "schema": 1,
-  "version": "v0.12.0"
+  "version": "v0.12.1"
 }
