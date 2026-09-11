@@ -53,8 +53,10 @@ impl RequirementsUpdater {
         // E.g., ">=2.8.0,<9" or ">=1.0.0,!=1.5.0,<2.0.0". PEP 508 allows
         // whitespace between an operator and its version, so ">= 2.0, < 3" is
         // the same set of clauses; each version runs to the next separator.
+        // `===` leads the alternation so the longest operator wins: matching
+        // `==` first leaves the third `=` to be read as part of the version.
         let constraint_re = Regex::new(
-            r"^([a-zA-Z0-9][-a-zA-Z0-9._]*)(\[[^\]]+\])?\s*((?:==|>=|<=|~=|!=|>|<)\s*[^\s#;,]+(?:\s*,\s*(?:==|>=|<=|~=|!=|>|<)\s*[^\s#;,]+)*)",
+            r"^([a-zA-Z0-9][-a-zA-Z0-9._]*)(\[[^\]]+\])?\s*((?:===|==|>=|<=|~=|!=|>|<)\s*[^\s#;,]+(?:\s*,\s*(?:===|==|>=|<=|~=|!=|>|<)\s*[^\s#;,]+)*)",
         )
         .expect("Invalid regex");
 

@@ -5274,7 +5274,7 @@ fn apply_requirements_version(
     target_version: &str,
 ) -> bool {
     let pattern = format!(
-        r"^(\s*{}(?:\[[^\]]*\])?\s*(?:==|>=|<=|~=|!=|>|<)\s*){}",
+        r"^(\s*{}(?:\[[^\]]*\])?\s*(?:===|==|>=|<=|~=|!=|>|<)\s*){}",
         regex::escape(update.package),
         regex::escape(update.old_version)
     );
@@ -5292,7 +5292,7 @@ fn apply_pyproject_version(
     target_version: &str,
 ) -> bool {
     let pep621_pattern = format!(
-        r#"({}(?:\[[^\]]*\])?\s*(?:==|>=|<=|~=|!=|>|<)\s*){}"#,
+        r#"({}(?:\[[^\]]*\])?\s*(?:===|==|>=|<=|~=|!=|>|<)\s*){}"#,
         regex::escape(update.package),
         regex::escape(update.old_version)
     );
