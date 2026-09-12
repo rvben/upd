@@ -47,8 +47,7 @@ use upd::updater::{
     GithubActionsUpdater, GoModUpdater, GradleUpdater, Lang, MiseUpdater, PackageJsonUpdater,
     ParseWarnings, PreCommitUpdater, PyProjectUpdater, RegistrySet, RequirementsUpdater,
     SkipStatus, SkippedUpdate, TerraformUpdater, UpdateOptions, UpdateResult, Updater,
-    classify_bump, discover_files_with, ecosystem_key, read_file_safe, update_with_annotations,
-    write_file_atomic,
+    classify_bump, discover_files_with, read_file_safe, update_with_annotations, write_file_atomic,
 };
 use upd::version::{compare_versions, match_version_precision};
 
@@ -1931,7 +1930,8 @@ async fn run_update(cli: &Cli) -> Result<()> {
                     cooldown_policy,
                     Arc::clone(&cooldown_notes),
                     filter.to_bump_filter(),
-                ),
+                )
+                .with_cooldown_lang(file_type.lang()),
             )
         })
         .collect();
@@ -2316,7 +2316,8 @@ async fn run_update(cli: &Cli) -> Result<()> {
                     cooldown_policy.as_ref(),
                     Arc::clone(&cooldown_notes),
                     filter.to_bump_filter(),
-                );
+                )
+                .with_cooldown_lang(ecosystem_to_lang(lp.ecosystem));
 
                 let ignored = options.should_ignore(&lp.name);
                 holders.push((*lp, report_path, options, ignored));
@@ -3184,7 +3185,8 @@ async fn run_interactive_update(
             cooldown_policy,
             Arc::clone(&cooldown_notes),
             filter.to_bump_filter(),
-        );
+        )
+        .with_cooldown_lang(file_type.lang());
 
         if cli.verbose {
             eprintln!("{}", format!("Scanning: {}", display_path(path)).cyan());
@@ -6228,7 +6230,6 @@ fn print_file_result(
     // duration: an annotated file's entries each carry their own ecosystem.
     if !result.held_back.is_empty() || !result.skipped_by_cooldown.is_empty() {
         let file_location = format!("{}:", path);
-        let file_ecosystem = ecosystem_key(file_type);
         let now = Utc::now();
 
         for (index, (package, old, chosen, skipped_latest, skipped_pub_at)) in
@@ -6241,7 +6242,7 @@ fn print_file_result(
                     .get(&index)
                     .copied()
                     .or_else(|| result.entry_ecosystem.get(package).copied()),
-                file_ecosystem,
+                file_type,
             );
             let line = format_held_back_line(
                 package,
@@ -6265,7 +6266,7 @@ fn print_file_result(
                     .get(&index)
                     .copied()
                     .or_else(|| result.entry_ecosystem.get(package).copied()),
-                file_ecosystem,
+                file_type,
             );
             let line = format_skipped_by_cooldown_line(
                 package,

@@ -620,6 +620,122 @@ async fn a_hook_repository_without_releases_is_still_held_to_the_cooldown() {
     );
 }
 
+/// A hook repository and an Actions pin are both resolved by github-releases,
+/// so a cooldown meant for one of them has to be named for the language rather
+/// than the registry. The registry key here says no cooldown at all, which
+/// leaves the hold-back attributable to the `pre-commit` key alone.
+#[tokio::test]
+async fn a_pre_commit_key_holds_a_hook_the_registry_key_would_release() {
+    let (server, dir, file, original, now) = cooldown_key_fixture().await;
+    let result = update_with_cooldown_keys(
+        &server,
+        &file,
+        now,
+        &[("github-releases", 0), ("pre-commit", 30)],
+    )
+    .await;
+
+    assert_eq!(
+        result.skipped_by_cooldown.len(),
+        1,
+        "the pre-commit key should have held v1.1.0 back: {result:?}"
+    );
+    assert_eq!(result.skipped_by_cooldown[0].2, "v1.1.0");
+    assert!(result.updated.is_empty(), "{result:?}");
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), original);
+    drop(dir);
+}
+
+/// The other half: a key named for a different language that shares the same
+/// registry must not reach this file. Were the key read as the registry's, an
+/// Actions cooldown would silently freeze every pre-commit hook in the run.
+#[tokio::test]
+async fn an_actions_key_does_not_reach_a_pre_commit_hook() {
+    let (server, dir, file, _original, now) = cooldown_key_fixture().await;
+    let result = update_with_cooldown_keys(&server, &file, now, &[("actions", 30)]).await;
+
+    assert!(
+        result.skipped_by_cooldown.is_empty(),
+        "an actions cooldown does not apply to a hook: {result:?}"
+    );
+    assert_eq!(
+        result
+            .updated
+            .iter()
+            .map(|(_, _, new, _)| new.as_str())
+            .collect::<Vec<_>>(),
+        ["v1.1.0"],
+        "{result:?}"
+    );
+    drop(dir);
+}
+
+/// A hook repository whose newest release is one day old and whose previous
+/// release is two hundred days old, pinned at the older one.
+async fn cooldown_key_fixture() -> (
+    MockServer,
+    tempfile::TempDir,
+    std::path::PathBuf,
+    String,
+    chrono::DateTime<chrono::Utc>,
+) {
+    use chrono::{Duration, Utc};
+
+    let now = Utc::now();
+    let server = MockServer::start().await;
+    Mock::given(path("/repos/owner/hook/releases/latest"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(serde_json::json!({"tag_name": "v1.1.0"})),
+        )
+        .mount(&server)
+        .await;
+    Mock::given(path("/repos/owner/hook/releases"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
+            {"tag_name": "v1.1.0", "published_at": (now - Duration::days(1)).to_rfc3339()},
+            {"tag_name": "v1.0.0", "published_at": (now - Duration::days(200)).to_rfc3339()},
+        ])))
+        .mount(&server)
+        .await;
+
+    let original = "repos:\n- repo: https://github.com/owner/hook\n  rev: v1.0.0\n  hooks: []\n";
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join(".pre-commit-config.yaml");
+    std::fs::write(&file, original).unwrap();
+    (server, dir, file, original.to_string(), now)
+}
+
+/// Run the updater over that fixture under a policy whose only content is the
+/// named `[cooldown.ecosystem]` keys, asked as a pre-commit file.
+async fn update_with_cooldown_keys(
+    server: &MockServer,
+    file: &std::path::Path,
+    now: chrono::DateTime<chrono::Utc>,
+    keys: &[(&str, i64)],
+) -> crate::updater::UpdateResult {
+    use crate::cooldown::CooldownPolicy;
+    use chrono::Duration;
+
+    let policy = CooldownPolicy {
+        default: Duration::zero(),
+        per_ecosystem: keys
+            .iter()
+            .map(|(key, days)| ((*key).to_string(), Duration::days(*days)))
+            .collect(),
+        force_override: None,
+    };
+    let options = UpdateOptions::new(false, false)
+        .with_cooldown_policy(policy, now)
+        .with_cooldown_lang(crate::updater::Lang::PreCommit);
+    updater()
+        .update(
+            file,
+            &GitHubReleasesRegistry::with_api_url(server.uri()),
+            options,
+        )
+        .await
+        .unwrap()
+}
+
 /// A repository the run was told to leave alone is not also reported as
 /// blocked: an ignore and a `--package` filter are answers, not refusals.
 #[tokio::test]

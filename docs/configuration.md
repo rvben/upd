@@ -183,6 +183,7 @@ npm = "14d"              # stricter for npm
 pypi = "14d"
 "crates.io" = "3d"
 docker = "7d"
+pre-commit = "30d"       # a language, narrower than the registry it shares
 ```
 
 Duration syntax: `<integer><unit>` where unit is `s`, `m`, `h`, `d`, `w`.
@@ -211,6 +212,38 @@ GitHub releases (covers GitHub Actions, pre-commit, Mise), and Docker Hub.
 NuGet, Gradle Maven metadata, Terraform Registry, and generic OCI tag listings do not expose
 per-version publish dates we can consume today; cooldown is reported as
 unavailable for those files.
+
+### Keying a cooldown on a language
+
+`[cooldown.ecosystem]` takes a language name as well as a registry name, spelled
+the way `--lang` spells it:
+
+| Kind | Accepted keys |
+| --- | --- |
+| Registry | `pypi`, `npm`, `crates.io`, `go-proxy`, `rubygems`, `nuget`, `gradle`, `github-releases`, `terraform`, `docker` |
+| Language | `python`, `node`, `rust`, `go`, `ruby`, `dotnet`, `gradle`, `actions`, `pre-commit`, `mise`, `github-releases`, `terraform`, `docker` |
+
+The language is the narrower key, so where both are set the language wins. That
+matters most for GitHub releases, which answers for four languages at once: a
+`github-releases` window cannot say anything about pre-commit hooks without
+saying the same about Actions pins and mise tools.
+
+```toml
+[cooldown.ecosystem]
+github-releases = "3d"
+pre-commit = "30d"       # hooks wait a month, Actions pins and mise tools 3 days
+```
+
+A language key reaches only the dependencies its own registry answers for. An
+annotated line names its source, so `# upd: pypi black` inside a workflow is a
+PyPI dependency that happens to live in a workflow: it reads `pypi` or `python`,
+never the workflow's `actions` key.
+
+`--min-age` is a whole-run answer and still overrides both. Strongest first:
+`--min-age`, the language key, the registry key, `[cooldown] default`.
+
+An unknown key is reported as a warning and ignored, so a typo does not quietly
+switch a cooldown off.
 
 ### Dating a repository that publishes no releases
 

@@ -647,6 +647,11 @@ pub struct UpdateOptions {
     /// condition they describe. Shared across updaters so a single run reports
     /// each condition once however many packages ran into it.
     pub cooldown_unavailable_notes: Arc<Mutex<BTreeMap<String, String>>>,
+    /// Language the file being updated is written in, so a `[cooldown.ecosystem]`
+    /// key naming that language (`pre-commit`, `actions`, `mise`) can override
+    /// the registry key several languages share. None means the caller has no
+    /// language to offer and only registry keys apply.
+    pub cooldown_lang: Option<Lang>,
     /// Bump-level ceiling enforced at write time. Defaults to permitting every
     /// level, so updates are only skipped when `--only-bump` / `--max-bump`
     /// narrow it.
@@ -692,6 +697,7 @@ impl UpdateOptions {
             cooldown_policy: None,
             cooldown_now: None,
             cooldown_unavailable_notes: Arc::default(),
+            cooldown_lang: None,
             bump_filter: BumpFilter::default(),
             langs: Vec::new(),
             annotation_langs: None,
@@ -793,12 +799,11 @@ impl UpdateOptions {
         self
     }
 
-    /// Returns `true` when the cooldown policy is active for `ecosystem`.
-    pub fn cooldown_is_enabled_for(&self, ecosystem: &str) -> bool {
-        self.cooldown_policy
-            .as_ref()
-            .map(|p| p.is_enabled_for(ecosystem))
-            .unwrap_or(false)
+    /// Name the language of the file being updated, so a `[cooldown.ecosystem]`
+    /// key spelled for that language applies to it.
+    pub fn with_cooldown_lang(mut self, lang: Lang) -> Self {
+        self.cooldown_lang = Some(lang);
+        self
     }
 
     /// Record a note that cooldown metadata was unavailable for an ecosystem.
@@ -1133,6 +1138,57 @@ pub enum Lang {
 }
 
 impl Lang {
+    /// The `--lang` spelling of this language, which is also how a
+    /// `[cooldown.ecosystem]` key names it.
+    ///
+    /// One vocabulary for both, so a project that already writes
+    /// `-l pre-commit` does not have to learn a second spelling to give its
+    /// hooks their own cooldown. `every_language_spells_itself_the_way_the_cli_does`
+    /// holds this table to what clap accepts.
+    pub fn cli_name(self) -> &'static str {
+        match self {
+            Lang::Python => "python",
+            Lang::Node => "node",
+            Lang::Rust => "rust",
+            Lang::Go => "go",
+            Lang::Ruby => "ruby",
+            Lang::DotNet => "dotnet",
+            Lang::Gradle => "gradle",
+            Lang::Actions => "actions",
+            Lang::PreCommit => "pre-commit",
+            Lang::Mise => "mise",
+            Lang::Terraform => "terraform",
+            Lang::Docker => "docker",
+            Lang::GithubReleases => "github-releases",
+            Lang::Annotated => "annotated",
+        }
+    }
+
+    /// The registry that answers this language's version questions, named as
+    /// `[cooldown.ecosystem]` and `CooldownPolicy` name it.
+    ///
+    /// Several languages share one registry - a pre-commit hook, an Actions
+    /// pin and a mise tool are all github-releases - which is why the language
+    /// is worth keying on separately. `None` means the language has no registry
+    /// of its own: an annotated entry names its source per line.
+    pub fn ecosystem_key(self) -> Option<&'static str> {
+        Some(match self {
+            Lang::Python => "pypi",
+            Lang::Node => "npm",
+            Lang::Rust => "crates.io",
+            Lang::Go => "go-proxy",
+            Lang::Ruby => "rubygems",
+            Lang::DotNet => "nuget",
+            Lang::Gradle => "gradle",
+            Lang::Actions | Lang::PreCommit | Lang::Mise | Lang::GithubReleases => {
+                "github-releases"
+            }
+            Lang::Terraform => "terraform",
+            Lang::Docker => "docker",
+            Lang::Annotated => return None,
+        })
+    }
+
     /// Canonical, stable identifier for this language (used by JSON output and CLI).
     pub fn as_str(&self) -> &'static str {
         match self {
@@ -1248,24 +1304,37 @@ impl FileType {
 /// use. `None` means the file has no single ecosystem: its entries carry their
 /// own (see `UpdateResult::entry_ecosystem`).
 pub fn ecosystem_key(file_type: FileType) -> Option<&'static str> {
-    Some(match file_type {
-        FileType::Requirements | FileType::PyProject => "pypi",
-        FileType::PackageJson => "npm",
-        FileType::CargoToml => "crates.io",
-        FileType::GoMod => "go-proxy",
-        FileType::Gemfile => "rubygems",
-        FileType::GithubActions
-        | FileType::PreCommitConfig
-        | FileType::MiseToml
-        | FileType::ToolVersions => "github-releases",
-        FileType::Csproj => "nuget",
-        FileType::GradleCatalog | FileType::GradleScript | FileType::GradleWrapper => "gradle",
-        FileType::TerraformTf => "terraform",
-        FileType::Dockerfile | FileType::DockerCompose => "docker",
-        // An annotated file has no ecosystem of its own. Every entry carries
-        // its own, which is what `UpdateResult::entry_ecosystem` is for.
-        FileType::Annotated => return None,
-    })
+    file_type.lang().ecosystem_key()
+}
+
+/// The `[cooldown.ecosystem]` language key that applies to a dependency
+/// `ecosystem` answers for, when the question came from a file written in
+/// `lang`.
+///
+/// A language keys only the registry it resolves through. An annotation names
+/// its own source, so a `# upd: pypi black` line inside a workflow is a pypi
+/// dependency that happens to live in a workflow: it is keyed on pypi, and the
+/// workflow's `actions` key does not reach it.
+pub fn cooldown_lang_key(lang: Option<Lang>, ecosystem: &str) -> Option<&'static str> {
+    lang.filter(|lang| lang.ecosystem_key() == Some(ecosystem))
+        .map(Lang::cli_name)
+}
+
+/// Every key `[cooldown.ecosystem]` accepts: one per registry, plus the
+/// narrower language names that share one.
+///
+/// A language with no registry of its own contributes nothing: an annotated
+/// entry is keyed on the source it names, never on the file holding it.
+pub fn cooldown_ecosystem_keys() -> Vec<&'static str> {
+    use clap::ValueEnum;
+    let mut keys: Vec<&'static str> = Lang::value_variants()
+        .iter()
+        .filter_map(|lang| lang.ecosystem_key().map(|eco| [eco, lang.cli_name()]))
+        .flatten()
+        .collect();
+    keys.sort_unstable();
+    keys.dedup();
+    keys
 }
 
 impl FileType {
@@ -1634,7 +1703,8 @@ async fn apply_cooldown_inner(
     let Some(policy) = options.cooldown_policy.as_ref() else {
         return (CooldownOutcome::Unchanged(latest.to_string()), None);
     };
-    let cooldown = policy.effective_for(ecosystem);
+    let lang = cooldown_lang_key(options.cooldown_lang, ecosystem);
+    let cooldown = policy.effective_for(ecosystem, lang);
     if cooldown <= chrono::Duration::zero() {
         return (CooldownOutcome::Unchanged(latest.to_string()), None);
     }
@@ -2131,6 +2201,59 @@ mod tests {
     use super::*;
     use std::fs;
     use tempfile::tempdir;
+
+    /// A config key is only usable if it is spelled the way the tool spells the
+    /// language everywhere else. `cli_name` is written out by hand because
+    /// clap's own name is borrowed from a temporary, so nothing but this test
+    /// holds the two together.
+    #[test]
+    fn every_language_spells_itself_the_way_the_cli_does() {
+        use clap::ValueEnum;
+        for lang in Lang::value_variants() {
+            let clap_name = lang
+                .to_possible_value()
+                .expect("every language is selectable on the command line");
+            assert_eq!(
+                lang.cli_name(),
+                clap_name.get_name(),
+                "{lang:?} is spelled differently by --lang"
+            );
+        }
+    }
+
+    /// A language keys the registry it resolves through, and only that one.
+    /// github-releases answers for several languages at once, which is the
+    /// whole reason the narrower key exists.
+    #[test]
+    fn a_language_keys_the_registry_it_resolves_through() {
+        assert_eq!(
+            cooldown_lang_key(Some(Lang::PreCommit), "github-releases"),
+            Some("pre-commit")
+        );
+        assert_eq!(
+            cooldown_lang_key(Some(Lang::Actions), "github-releases"),
+            Some("actions")
+        );
+        assert_eq!(
+            cooldown_lang_key(Some(Lang::Python), "pypi"),
+            Some("python")
+        );
+    }
+
+    /// An annotation names its own registry, so a `# upd: pypi black` line in a
+    /// workflow is a pypi dependency living in a workflow. Keying it on the
+    /// workflow's language would let an `actions` cooldown reach a package that
+    /// has nothing to do with Actions.
+    #[test]
+    fn a_line_resolved_by_another_registry_is_not_keyed_on_the_files_language() {
+        assert_eq!(cooldown_lang_key(Some(Lang::Actions), "pypi"), None);
+        assert_eq!(
+            cooldown_lang_key(Some(Lang::Python), "github-releases"),
+            None
+        );
+        assert_eq!(cooldown_lang_key(Some(Lang::Annotated), "pypi"), None);
+        assert_eq!(cooldown_lang_key(None, "pypi"), None);
+    }
 
     /// The clause `specifier_floor` picks, as the text it points at, paired with
     /// whether an update may move it.

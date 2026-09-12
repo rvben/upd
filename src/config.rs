@@ -65,7 +65,13 @@
 //! [cooldown.ecosystem]
 //! npm = "14d"
 //! "crates.io" = "3d"
+//! pre-commit = "30d"
 //! ```
+//!
+//! An ecosystem key names a registry or a language, spelled the way `--lang`
+//! spells it. The language is the narrower key and wins where both are set,
+//! which is how one of the four languages github-releases answers for gets a
+//! window of its own. `--min-age` overrides both.
 //!
 //! Valid duration units: `s`, `m`, `h`, `d`, `w`. Use `"0"` to disable.
 
@@ -423,30 +429,22 @@ impl UpdConfig {
             }
         }
 
-        // Warn on unknown ecosystem keys inside [cooldown.ecosystem].
-        const KNOWN_ECOSYSTEMS: &[&str] = &[
-            "pypi",
-            "npm",
-            "crates.io",
-            "go-proxy",
-            "github-releases",
-            "rubygems",
-            "terraform",
-            "nuget",
-            "gradle",
-        ];
+        // Warn on unknown ecosystem keys inside [cooldown.ecosystem]. Derived
+        // from the languages themselves so a new one is spellable the day it
+        // exists, in both the registry name and the narrower language name.
+        let known_ecosystems = crate::updater::cooldown_ecosystem_keys();
         if let toml::Value::Table(table) = &raw
             && let Some(toml::Value::Table(cooldown)) = table.get("cooldown")
             && let Some(toml::Value::Table(ecosystem)) = cooldown.get("ecosystem")
         {
             for key in ecosystem.keys() {
-                if !KNOWN_ECOSYSTEMS.contains(&key.as_str()) {
+                if !known_ecosystems.contains(&key.as_str()) {
                     warnings.push(format!(
                         "unknown ecosystem `{}` in [cooldown.ecosystem] in config file {}; \
                          valid ecosystems are: {}. Run `upd --show-config` for the expected schema.",
                         key,
                         source_label,
-                        KNOWN_ECOSYSTEMS.join(", ")
+                        known_ecosystems.join(", ")
                     ));
                 }
             }
@@ -517,12 +515,16 @@ exclude = [
 [cooldown]
 # default = "7d"         # applied to every ecosystem unless overridden below
 
-# Per-ecosystem overrides. Valid keys: pypi, npm, crates.io, go-proxy,
-# github-releases, rubygems, terraform, nuget.
+# Per-ecosystem overrides. A key names a registry (pypi, npm, crates.io,
+# go-proxy, rubygems, nuget, gradle, github-releases, terraform, docker) or a
+# language, spelled as --lang spells it (python, node, rust, go, ruby, dotnet,
+# gradle, actions, pre-commit, mise, github-releases, terraform, docker).
+# The language is the narrower key and wins where both are set.
 [cooldown.ecosystem]
 # npm = "14d"
 # pypi = "14d"
 # "crates.io" = "3d"
+# pre-commit = "30d"     # hooks only, not the Actions pins sharing the registry
 
 # Ecosystem selection uses --lang names. Omitted enable means all; [] means none.
 # disable wins over enable. An explicit --lang replaces both lists.
@@ -2059,6 +2061,46 @@ pipy = "7d"
             "warning should mention ecosystem context: {}",
             warnings[0]
         );
+    }
+
+    /// Every language `--lang` accepts is also a `[cooldown.ecosystem]` key,
+    /// because that is the whole point of the language keys: naming the one
+    /// language whose cooldown differs from the registry answering for it.
+    /// Warning on a spelling the tool itself uses would read as a rejection.
+    #[test]
+    fn every_language_and_registry_name_is_a_valid_ecosystem_key() {
+        let keys = crate::updater::cooldown_ecosystem_keys();
+        assert!(
+            keys.contains(&"pre-commit") && keys.contains(&"actions") && keys.contains(&"docker"),
+            "expected the language and registry names, got: {keys:?}"
+        );
+        let content = keys
+            .iter()
+            .map(|key| format!("\"{key}\" = \"7d\""))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let content = format!("[cooldown.ecosystem]\n{content}\n");
+        let (_, warnings) = UpdConfig::parse_with_warnings(&content, "test.toml").unwrap();
+        assert!(warnings.is_empty(), "unexpected warnings: {warnings:?}");
+    }
+
+    /// The language a file is written in is the key `cooldown_lang_key` hands
+    /// the policy, so the accepted spellings have to be exactly those.
+    #[test]
+    fn the_accepted_keys_are_the_ones_the_lookup_uses() {
+        let keys = crate::updater::cooldown_ecosystem_keys();
+        for lang in <crate::updater::Lang as clap::ValueEnum>::value_variants() {
+            let Some(ecosystem) = lang.ecosystem_key() else {
+                continue;
+            };
+            let key = crate::updater::cooldown_lang_key(Some(*lang), ecosystem)
+                .expect("a language keys its own registry");
+            assert!(keys.contains(&key), "{key} is not an accepted config key");
+            assert!(
+                keys.contains(&ecosystem),
+                "{ecosystem} is not an accepted config key"
+            );
+        }
     }
 
     #[test]

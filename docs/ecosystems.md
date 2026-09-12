@@ -348,8 +348,11 @@ When an inherited language was resolved at a proposed new repository revision,
 interactive selection must include that revision along with its dependency updates.
 Comments, quoting, line endings, and unrelated content are preserved.
 
-A hook repository that tags its versions but publishes no releases is dated
-from those tags, so it is held to the cooldown like any other. See
+Hook revisions resolve through GitHub releases, which also answers for Actions
+pins and mise tools, so `[cooldown.ecosystem]` takes `pre-commit` as a key of
+its own and it outranks the shared `github-releases` key. A hook repository that
+tags its versions but publishes no releases is dated from those tags, so it is
+held to the cooldown like any other. Both are described in
 [Configuration](configuration.md#cooldown-minimum-release-age).
 
 Unpinned arguments, direct URLs and Git references, installer switches,

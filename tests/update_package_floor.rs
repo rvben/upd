@@ -177,6 +177,62 @@ fn collect_for_path(
 /// (1) A lock-only uv package with no manifest entry is floored to the
 /// mocked registry latest in a dry run: exit 1, a `uv-constraint` `planned`
 /// entry on `pyproject.toml`, and the manifest itself untouched.
+/// A lock-only floor is a version choice like any other, so the cooldown that
+/// governs it is the one the language names. The registry key here switches
+/// cooldown off, which leaves the language key as the only thing that can keep
+/// a one-day-old release out of the floor.
+#[tokio::test]
+async fn a_lock_only_floor_reads_the_language_key() {
+    let server = wiremock::MockServer::start().await;
+    let fresh = (chrono::Utc::now() - chrono::Duration::days(1)).to_rfc3339();
+    wiremock::Mock::given(wiremock::matchers::method("GET"))
+        .and(wiremock::matchers::path("/simple/lockonly/"))
+        .respond_with(wiremock::ResponseTemplate::new(404))
+        .mount(&server)
+        .await;
+    wiremock::Mock::given(wiremock::matchers::method("GET"))
+        .and(wiremock::matchers::path("/pypi/lockonly/json"))
+        .respond_with(
+            wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "releases": {
+                    "0.49.1": [{"yanked": false, "upload_time_iso_8601": fresh}]
+                }
+            })),
+        )
+        .mount(&server)
+        .await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    fs::write(tmp.path().join("pyproject.toml"), PYPROJECT_BARE).unwrap();
+    fs::write(tmp.path().join("uv.lock"), uv_lock_at("lockonly", "0.40.0")).unwrap();
+    fs::write(
+        tmp.path().join(".updrc.toml"),
+        "[cooldown.ecosystem]\npypi = \"0d\"\npython = \"7d\"\n",
+    )
+    .unwrap();
+
+    let (stdout, stderr, code) = run_with_env(
+        &[
+            "update",
+            "--package",
+            "lock*",
+            "--format",
+            "json",
+            "--no-cache",
+            ".",
+        ],
+        tmp.path(),
+        &[("UV_INDEX_URL", &server.uri())],
+    );
+
+    assert_eq!(code, 0, "stdout: {stdout}\nstderr: {stderr}");
+    let json: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(
+        json["summary"]["updates_total"], 0,
+        "the python key holds a one-day-old release out of the floor: {stdout}"
+    );
+}
+
 #[tokio::test]
 async fn lock_only_package_glob_floors_from_mocked_registry_dry_run() {
     let server = wiremock::MockServer::start().await;

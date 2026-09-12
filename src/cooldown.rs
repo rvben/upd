@@ -56,25 +56,39 @@ pub fn parse_duration(input: &str) -> Result<Duration> {
 
 /// The resolved cooldown policy for a single run.
 ///
-/// Precedence (highest first): `force_override`, then `per_ecosystem`, then
-/// `default`, then zero (disabled).
+/// Precedence (highest first): `force_override`, then the language key, then
+/// the registry key, then `default`, then zero (disabled).
 #[derive(Debug, Clone, Default)]
 pub struct CooldownPolicy {
     /// Applied to every ecosystem unless overridden.
     pub default: Duration,
-    /// Per-ecosystem overrides keyed by registry name (see `src/cache.rs` for
-    /// the canonical names: "pypi", "npm", "crates.io", "go-proxy",
-    /// "github-releases", "rubygems", "terraform", "nuget").
+    /// Overrides keyed by registry name (see `src/cache.rs` for the canonical
+    /// names: "pypi", "npm", "crates.io", "go-proxy", "github-releases",
+    /// "rubygems", "terraform", "nuget", "gradle", "docker") or by the
+    /// narrower language name a file is written in ("pre-commit", "actions",
+    /// "mise"), which several of the registry names answer for at once.
     pub per_ecosystem: HashMap<String, Duration>,
     /// CLI `--min-age` override. Wins over everything else when set.
     pub force_override: Option<Duration>,
 }
 
 impl CooldownPolicy {
-    /// Returns the cooldown that applies to `ecosystem` right now.
-    pub fn effective_for(&self, ecosystem: &str) -> Duration {
+    /// Returns the cooldown that applies right now to a dependency `ecosystem`
+    /// answers for, asked from a file written in language `lang`.
+    ///
+    /// The language is the narrower key and therefore the stronger one: a
+    /// pre-commit hook and a GitHub Actions pin are both resolved by
+    /// github-releases, so a cooldown named for one of them must not reach the
+    /// other. Callers pass `None` where the language does not belong to
+    /// `ecosystem` (`crate::updater::cooldown_lang_key` decides that), which is
+    /// what keeps a `# upd: pypi` annotation inside a workflow off the
+    /// workflow's own key.
+    pub fn effective_for(&self, ecosystem: &str, lang: Option<&str>) -> Duration {
         if let Some(d) = self.force_override {
             return d;
+        }
+        if let Some(d) = lang.and_then(|lang| self.per_ecosystem.get(lang)) {
+            return *d;
         }
         if let Some(d) = self.per_ecosystem.get(ecosystem) {
             return *d;
@@ -82,9 +96,9 @@ impl CooldownPolicy {
         self.default
     }
 
-    /// Convenience: is cooldown active for this ecosystem?
-    pub fn is_enabled_for(&self, ecosystem: &str) -> bool {
-        self.effective_for(ecosystem) > Duration::zero()
+    /// Convenience: is cooldown active for this ecosystem and language?
+    pub fn is_enabled_for(&self, ecosystem: &str, lang: Option<&str>) -> bool {
+        self.effective_for(ecosystem, lang) > Duration::zero()
     }
 }
 
@@ -445,8 +459,8 @@ mod tests {
     #[test]
     fn test_policy_disabled_by_default() {
         let policy = CooldownPolicy::default();
-        assert_eq!(policy.effective_for("pypi"), Duration::zero());
-        assert_eq!(policy.effective_for("npm"), Duration::zero());
+        assert_eq!(policy.effective_for("pypi", None), Duration::zero());
+        assert_eq!(policy.effective_for("npm", None), Duration::zero());
     }
 
     #[test]
@@ -456,9 +470,9 @@ mod tests {
             per_ecosystem: std::collections::HashMap::new(),
             force_override: None,
         };
-        assert_eq!(policy.effective_for("pypi"), Duration::days(7));
-        assert_eq!(policy.effective_for("npm"), Duration::days(7));
-        assert_eq!(policy.effective_for("crates.io"), Duration::days(7));
+        assert_eq!(policy.effective_for("pypi", None), Duration::days(7));
+        assert_eq!(policy.effective_for("npm", None), Duration::days(7));
+        assert_eq!(policy.effective_for("crates.io", None), Duration::days(7));
     }
 
     #[test]
@@ -470,9 +484,9 @@ mod tests {
             per_ecosystem: per,
             force_override: None,
         };
-        assert_eq!(policy.effective_for("npm"), Duration::days(14));
+        assert_eq!(policy.effective_for("npm", None), Duration::days(14));
         assert_eq!(
-            policy.effective_for("pypi"),
+            policy.effective_for("pypi", None),
             Duration::days(7),
             "other ecosystems fall back to default"
         );
@@ -488,12 +502,12 @@ mod tests {
             force_override: Some(Duration::days(3)),
         };
         assert_eq!(
-            policy.effective_for("npm"),
+            policy.effective_for("npm", None),
             Duration::days(3),
             "force override clobbers per-ecosystem"
         );
         assert_eq!(
-            policy.effective_for("pypi"),
+            policy.effective_for("pypi", None),
             Duration::days(3),
             "force override clobbers default"
         );
@@ -508,8 +522,78 @@ mod tests {
             per_ecosystem: per,
             force_override: Some(Duration::zero()),
         };
-        assert_eq!(policy.effective_for("npm"), Duration::zero());
-        assert_eq!(policy.effective_for("pypi"), Duration::zero());
+        assert_eq!(policy.effective_for("npm", None), Duration::zero());
+        assert_eq!(policy.effective_for("pypi", None), Duration::zero());
+    }
+
+    /// One registry answers for several languages. github-releases resolves
+    /// pre-commit hooks, GitHub Actions pins and mise tools alike, so a
+    /// cooldown a project wants on its hooks must be nameable without also
+    /// slowing every action pin in the tree.
+    #[test]
+    fn a_language_key_is_stronger_than_the_registry_that_answers_for_it() {
+        let policy = CooldownPolicy {
+            default: Duration::days(1),
+            per_ecosystem: [
+                ("github-releases".to_string(), Duration::days(7)),
+                ("pre-commit".to_string(), Duration::days(30)),
+            ]
+            .into_iter()
+            .collect(),
+            force_override: None,
+        };
+
+        assert_eq!(
+            policy.effective_for("github-releases", Some("pre-commit")),
+            Duration::days(30),
+        );
+        assert_eq!(
+            policy.effective_for("github-releases", Some("actions")),
+            Duration::days(7),
+            "a language with no key of its own is left to its registry",
+        );
+        assert_eq!(
+            policy.effective_for("github-releases", None),
+            Duration::days(7),
+        );
+    }
+
+    /// A language key needs no registry key beside it, and reaches only the
+    /// language it names.
+    #[test]
+    fn a_language_key_alone_leaves_the_other_languages_on_the_default() {
+        let policy = CooldownPolicy {
+            default: Duration::days(1),
+            per_ecosystem: std::iter::once(("pre-commit".to_string(), Duration::days(30)))
+                .collect(),
+            force_override: None,
+        };
+
+        assert_eq!(
+            policy.effective_for("github-releases", Some("pre-commit")),
+            Duration::days(30),
+        );
+        assert_eq!(
+            policy.effective_for("github-releases", Some("mise")),
+            Duration::days(1),
+        );
+    }
+
+    /// `--min-age` is the user saying it out loud on this run, so it still
+    /// wins over the narrowest key in the config file.
+    #[test]
+    fn force_override_wins_over_a_language_key() {
+        let policy = CooldownPolicy {
+            default: Duration::days(1),
+            per_ecosystem: std::iter::once(("pre-commit".to_string(), Duration::days(30)))
+                .collect(),
+            force_override: Some(Duration::days(3)),
+        };
+
+        assert_eq!(
+            policy.effective_for("github-releases", Some("pre-commit")),
+            Duration::days(3),
+        );
     }
 
     #[test]
@@ -519,8 +603,8 @@ mod tests {
             per_ecosystem: std::iter::once(("npm".to_string(), Duration::days(7))).collect(),
             force_override: None,
         };
-        assert!(policy.is_enabled_for("npm"));
-        assert!(!policy.is_enabled_for("pypi"));
+        assert!(policy.is_enabled_for("npm", None));
+        assert!(!policy.is_enabled_for("pypi", None));
     }
 
     fn meta(version: &str, days_ago: i64, yanked: bool, prerelease: bool) -> VersionMeta {

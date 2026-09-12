@@ -10,7 +10,7 @@ use crate::annotation::AnnotationSource;
 use crate::audit::{AuditResult, Vulnerability};
 use crate::cooldown::CooldownPolicy;
 use crate::path_display::display_path;
-use crate::updater::{FileType, UpdateResult, ecosystem_key};
+use crate::updater::{FileType, UpdateResult, cooldown_lang_key, ecosystem_key};
 use chrono::Duration;
 use serde::Serialize;
 use std::path::Path;
@@ -553,21 +553,30 @@ pub fn build_fix_entries(
 
 /// Effective cooldown for one reported entry. `entry_source` comes from
 /// `UpdateResult::entry_ecosystem` and contributes its `registry_name()`;
-/// `file_ecosystem` is `ecosystem_key(file_type)`. Zero when neither names an
-/// ecosystem, which is what the per-file computation this replaced produced.
+/// `file_type` supplies the fallback ecosystem and the language key. Zero when
+/// neither names an ecosystem, which is what the per-file computation this
+/// replaced produced.
+///
+/// The language reaches the policy through `cooldown_lang_key`, the same helper
+/// `apply_cooldown` uses, so what is reported is what was decided. An annotated
+/// line resolved by another registry keeps the file's language out of its
+/// answer, because that key belongs to the file's own registry.
 pub fn entry_cooldown(
     policy: Option<&CooldownPolicy>,
     entry_source: Option<AnnotationSource>,
-    file_ecosystem: Option<&'static str>,
+    file_type: FileType,
 ) -> Duration {
     let Some(policy) = policy else {
         return Duration::zero();
     };
     match entry_source
         .map(AnnotationSource::registry_name)
-        .or(file_ecosystem)
+        .or_else(|| ecosystem_key(file_type))
     {
-        Some(ecosystem) => policy.effective_for(ecosystem),
+        Some(ecosystem) => policy.effective_for(
+            ecosystem,
+            cooldown_lang_key(Some(file_type.lang()), ecosystem),
+        ),
         None => Duration::zero(),
     }
 }
@@ -585,7 +594,6 @@ pub fn build_update_file_report(
     cooldown_policy: Option<&CooldownPolicy>,
     classify: impl Fn(&str, &str) -> &'static str,
 ) -> UpdateFileReport {
-    let file_ecosystem = ecosystem_key(file_type);
     let source_of = |package: &str| result.entry_ecosystem.get(package).copied();
 
     let updates = result
@@ -679,8 +687,7 @@ pub fn build_update_file_report(
                 chosen: chosen.clone(),
                 skipped_latest: skipped.clone(),
                 skipped_published_at: pub_at.to_rfc3339(),
-                cooldown_seconds: entry_cooldown(cooldown_policy, source, file_ecosystem)
-                    .num_seconds(),
+                cooldown_seconds: entry_cooldown(cooldown_policy, source, file_type).num_seconds(),
                 source: source.map(AnnotationSource::token),
             }
         })
@@ -701,8 +708,7 @@ pub fn build_update_file_report(
                 current: current.clone(),
                 skipped_latest: skipped.clone(),
                 skipped_published_at: pub_at.map(|t| t.to_rfc3339()),
-                cooldown_seconds: entry_cooldown(cooldown_policy, source, file_ecosystem)
-                    .num_seconds(),
+                cooldown_seconds: entry_cooldown(cooldown_policy, source, file_type).num_seconds(),
                 source: source.map(AnnotationSource::token),
             }
         })
@@ -1192,7 +1198,11 @@ mod tests {
     fn entry_cooldown_prefers_the_entry_source_over_the_file_ecosystem() {
         let policy = policy_of(0, &[("pypi", 3), ("crates.io", 7)]);
         assert_eq!(
-            entry_cooldown(Some(&policy), Some(AnnotationSource::Crates), Some("pypi")),
+            entry_cooldown(
+                Some(&policy),
+                Some(AnnotationSource::Crates),
+                FileType::PyProject
+            ),
             Duration::seconds(7)
         );
     }
@@ -1201,7 +1211,7 @@ mod tests {
     fn entry_cooldown_falls_back_to_the_file_ecosystem() {
         let policy = policy_of(0, &[("pypi", 3)]);
         assert_eq!(
-            entry_cooldown(Some(&policy), None, Some("pypi")),
+            entry_cooldown(Some(&policy), None, FileType::PyProject),
             Duration::seconds(3)
         );
     }
@@ -1209,8 +1219,14 @@ mod tests {
     #[test]
     fn entry_cooldown_is_zero_when_nothing_names_an_ecosystem() {
         let policy = policy_of(9, &[]);
-        assert_eq!(entry_cooldown(Some(&policy), None, None), Duration::zero());
-        assert_eq!(entry_cooldown(None, None, Some("pypi")), Duration::zero());
+        assert_eq!(
+            entry_cooldown(Some(&policy), None, FileType::Annotated),
+            Duration::zero()
+        );
+        assert_eq!(
+            entry_cooldown(None, None, FileType::PyProject),
+            Duration::zero()
+        );
     }
 
     #[test]
