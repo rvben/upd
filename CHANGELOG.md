@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.12.2](https://github.com/rvben/upd/compare/v0.12.1...v0.12.2) - 2026-09-12
+
+### Added
+
+- **cooldown**: key a cooldown window on a language ([6b98612](https://github.com/rvben/upd/commit/6b98612a6c3f2689a2ce295f414b76cb7684ef99))
+
+### Fixed
+
+- **cooldown**: date a GitHub repository from its tags when it publishes no releases ([5d0d7b0](https://github.com/rvben/upd/commit/5d0d7b094084bd7322c72dbf26bcdccbef4a96ea))
+- **pre-commit**: stop rewriting a rev that is not a version tag ([40be8a2](https://github.com/rvben/upd/commit/40be8a23fd0d939f2eccdd88bb5ece8ab3b65334))
+
 ## [0.12.1](https://github.com/rvben/upd/compare/v0.12.0...v0.12.1) - 2026-09-11
 
 ### Fixed
