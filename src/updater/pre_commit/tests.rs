@@ -427,3 +427,137 @@ async fn same_named_cooldown_entries_report_their_own_registry_and_policy() {
         assert_eq!(entries[1]["cooldown_seconds"], 10 * 86400);
     }
 }
+
+/// The boundary the whole guard turns on. Every shape upd is able to move has
+/// to stay movable, or the guard trades data destruction for silence.
+#[test]
+fn revs_are_split_into_the_ones_upd_can_move_and_the_ones_it_cannot() {
+    for rev in [
+        "v4.5.0",
+        "24.3.0",
+        "v0.11.0.1",
+        "v1.0.0-rc1",
+        "1.0.0-rc.1",
+        "v6",
+        "20250101",
+        "v1.2.3+build.4",
+        "go1.21.0",
+    ] {
+        assert_eq!(unreadable_rev(rev), None, "{rev} is a version tag");
+    }
+
+    for rev in [
+        "2c9f875913ee60ca25ce70243dc24d5b6415598c",
+        "C4A0B883114B00D8D76B479C820CE7950211C99B",
+        "1234567890123456789012345678901234567890",
+    ] {
+        assert_eq!(
+            unreadable_rev(rev),
+            Some(UnreadableRev::CommitPin),
+            "{rev} is a commit pin"
+        );
+    }
+
+    for rev in [
+        "2c9f875",
+        "1.x",
+        "main",
+        "master",
+        "HEAD",
+        "stable",
+        "release-4",
+        "black-24.3.0",
+        "2c9f875913ee60ca25ce70243dc24d5b6415598",
+    ] {
+        assert_eq!(
+            unreadable_rev(rev),
+            Some(UnreadableRev::NotAVersion),
+            "{rev} is not a version tag"
+        );
+    }
+}
+
+/// A rev upd will not move must not cost a registry lookup either: the guard
+/// runs before the batch that pre-fetches every repository's latest release, so
+/// a config full of commit pins makes no requests at all. The `expect` counts
+/// are the assertion; wiremock verifies them when the server drops.
+#[tokio::test]
+async fn a_guarded_rev_is_reported_without_a_lookup_while_its_neighbour_updates() {
+    let server = MockServer::start().await;
+    Mock::given(path("/repos/owner/readable/releases/latest"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(serde_json::json!({"tag_name":"v2.0.0"})),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(path("/repos/owner/pinned/releases/latest"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(serde_json::json!({"tag_name":"v2.0.0"})),
+        )
+        .expect(0)
+        .mount(&server)
+        .await;
+
+    let sha = "2c9f875913ee60ca25ce70243dc24d5b6415598c";
+    let original = format!(
+        "repos:\n- repo: https://github.com/owner/readable\n  rev: v1.0.0\n  hooks: []\n- repo: https://github.com/owner/pinned\n  rev: {sha}\n  hooks: []\n"
+    );
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join(".pre-commit-config.yaml");
+    std::fs::write(&file, &original).unwrap();
+    let result = updater()
+        .update(
+            &file,
+            &GitHubReleasesRegistry::with_api_url(server.uri()),
+            UpdateOptions::new(false, false),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(result.updated.len(), 1, "{result:?}");
+    assert_eq!(result.updated[0].0, "owner/readable", "{result:?}");
+    assert_eq!(
+        std::fs::read_to_string(&file).unwrap(),
+        original.replace("rev: v1.0.0", "rev: v2.0.0"),
+        "only the readable rev moves"
+    );
+    assert_eq!(result.skipped.len(), 1, "{result:?}");
+    assert_eq!(result.skipped[0].package, "owner/pinned");
+    assert_eq!(result.skipped[0].current, sha);
+    assert_eq!(
+        result.skipped[0].status,
+        crate::updater::SkipStatus::Blocked
+    );
+    assert_eq!(result.skipped[0].reason, "sha-pinned-rev");
+    assert_eq!(result.skipped[0].line_number, Some(6));
+}
+
+/// A repository the run was told to leave alone is not also reported as
+/// blocked: an ignore and a `--package` filter are answers, not refusals.
+#[tokio::test]
+async fn an_ignored_or_filtered_repository_with_an_unreadable_rev_is_not_reported_as_blocked() {
+    let original = "repos:\n- repo: https://github.com/owner/repo\n  rev: main\n  hooks: []\n";
+
+    let (result, written) = run(
+        ".pre-commit-config.yaml",
+        original,
+        UpdateOptions::new(false, false).with_config(Arc::new(UpdConfig {
+            ignore: vec!["owner/repo".into()],
+            ..Default::default()
+        })),
+    )
+    .await;
+    assert!(result.skipped.is_empty(), "{result:?}");
+    assert_eq!(result.ignored.len(), 1, "{result:?}");
+    assert_eq!(written, original);
+
+    let (result, written) = run(
+        ".pre-commit-config.yaml",
+        original,
+        UpdateOptions::new(false, false).with_packages(vec!["something-else".into()]),
+    )
+    .await;
+    assert!(result.skipped.is_empty(), "{result:?}");
+    assert_eq!(written, original);
+}

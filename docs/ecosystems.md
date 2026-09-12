@@ -306,6 +306,24 @@ pull-request workflow are covered in [GitHub Actions](github-actions.md).
 - Updates `rev` fields for GitHub-hosted hook repositories; special repositories
   (`local`, `meta`, `builtin`) and non-GitHub repository revisions stay unchanged
 
+A `rev` is a git reference, not a version, so only one upd can read as a version
+tag is rewritten. `v4.5.0`, `24.3.0`, four-segment tags such as `v0.11.0.1`,
+prereleases, and single-number tags all qualify. Anything else is left exactly as
+it is and reported as blocked, with the reason naming which kind it was:
+
+| Reason | Revisions |
+| --- | --- |
+| `sha-pinned-rev` | a full 40-character commit SHA |
+| `unrecognized-rev` | an abbreviated SHA, a branch (`main`), a moving pointer (`1.x`), a prefixed tag (`black-24.3.0`) |
+
+Neither is examined, so neither costs a registry lookup, and neither makes
+`--check` fail. A configured `[pin]` does not override this: the pinned version
+is written in the shape of the revision it replaces, which for an unreadable
+revision is the truncation this guard exists to prevent. An abbreviated commit
+SHA made only
+of decimal digits is indistinguishable from a numeric tag such as the CalVer
+`20250101`, and is read as the tag.
+
 Hook `additional_dependencies` are updated according to the hook's language,
 including `repo: local` hooks:
 

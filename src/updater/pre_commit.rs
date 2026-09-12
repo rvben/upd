@@ -10,7 +10,8 @@ use super::{
 };
 use crate::align::compare_versions;
 use crate::registry::Registry;
-use crate::updater::Lang;
+use crate::updater::{Lang, SkipStatus, SkippedUpdate};
+use crate::version::TagVersion;
 use crate::version::match_version_precision;
 use anyhow::Result;
 use config::{Node, Scalar};
@@ -35,6 +36,59 @@ pub struct PreCommitEdit {
     pub pinned: bool,
     /// An inherited language was read at this planned repository revision.
     pub required_revision: Option<(Range<usize>, String)>,
+}
+
+/// Why upd will not compute a new value for a repository revision.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UnreadableRev {
+    /// A full 40-character commit SHA, which is a deliberate pin to a commit.
+    CommitPin,
+    /// Anything else upd cannot read as a version: an abbreviated SHA, a branch
+    /// name, a moving pointer like `1.x`, a prefixed tag like `black-24.3.0`.
+    NotAVersion,
+}
+
+impl UnreadableRev {
+    /// Stable token for machine-readable output. The two are separate because
+    /// they are differently actionable: a commit pin is a choice someone made,
+    /// while anything else is usually a revision the maintainer would want to
+    /// hear upd cannot follow.
+    fn reason(self) -> &'static str {
+        match self {
+            Self::CommitPin => "sha-pinned-rev",
+            Self::NotAVersion => "unrecognized-rev",
+        }
+    }
+
+    fn message(self, rev: &str) -> String {
+        match self {
+            Self::CommitPin => format!("rev {rev} is a commit pin, and upd updates version tags"),
+            Self::NotAVersion => format!("rev {rev} is not a version tag upd can read"),
+        }
+    }
+}
+
+/// Classify a revision upd has been asked to move, or `None` when it can move it.
+///
+/// A pre-commit `rev` is a free-form git reference, not a version. upd computes
+/// the new value by matching the latest release to the current value's shape,
+/// which means something only when the current value is itself a version tag:
+/// applied to a commit SHA it yields the release's leading component, so a
+/// 40-character pin becomes `6`. Whether that rewrite happened used to be
+/// decided by a plain string comparison against the new value, so revisions upd
+/// could not read were destroyed or left alone at random. Anything upd cannot
+/// read as a version is therefore left alone and reported.
+///
+/// An abbreviated commit SHA made only of decimal digits is indistinguishable
+/// from a numeric tag such as the CalVer `20250101`, and is read as the tag.
+fn unreadable_rev(rev: &str) -> Option<UnreadableRev> {
+    if TagVersion::parse(rev).is_some() {
+        return None;
+    }
+    if rev.len() == 40 && rev.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Some(UnreadableRev::CommitPin);
+    }
+    Some(UnreadableRev::NotAVersion)
 }
 
 fn record_edit(result: &mut UpdateResult, scalar: &Scalar, replacement: &str) {
@@ -304,6 +358,21 @@ impl PreCommitUpdater {
             result.ignored.push((repo.into(), current.clone(), line));
             return (result, None);
         }
+        // Before the pin is read and before any lookup: a configured pin is
+        // written straight over the revision without the comparison that used
+        // to catch some of these, and a revision upd will not move must not
+        // cost a request either.
+        if let Some(unreadable) = unreadable_rev(current) {
+            result.skipped.push(SkippedUpdate {
+                package: repo.into(),
+                current: current.clone(),
+                status: SkipStatus::Blocked,
+                reason: unreadable.reason(),
+                message: unreadable.message(current),
+                line_number: line,
+            });
+            return (result, None);
+        }
         let pin = options.get_pinned_version(repo);
         let latest = if let Some(pin) = pin {
             Ok(pin.to_string())
@@ -416,6 +485,7 @@ impl Updater for PreCommitUpdater {
                 let name = Self::extract_github_owner_repo(repo.text("repo")?)?;
                 (!options.is_package_filtered_out(&name)
                     && !options.should_ignore(&name)
+                    && unreadable_rev(&rev.value).is_none()
                     && options.get_pinned_version(&name).is_none())
                 .then_some(name)
             })
