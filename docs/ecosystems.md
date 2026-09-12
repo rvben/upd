@@ -348,6 +348,10 @@ When an inherited language was resolved at a proposed new repository revision,
 interactive selection must include that revision along with its dependency updates.
 Comments, quoting, line endings, and unrelated content are preserved.
 
+A hook repository that tags its versions but publishes no releases is dated
+from those tags, so it is held to the cooldown like any other. See
+[Configuration](configuration.md#cooldown-minimum-release-age).
+
 Unpinned arguments, direct URLs and Git references, installer switches,
 parenthesized Python requirements, and unsupported dependency formats remain
 unchanged. Shared YAML anchors/aliases, merge mappings, escaped strings, and

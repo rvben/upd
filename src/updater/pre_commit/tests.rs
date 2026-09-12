@@ -533,6 +533,93 @@ async fn a_guarded_rev_is_reported_without_a_lookup_while_its_neighbour_updates(
     assert_eq!(result.skipped[0].line_number, Some(6));
 }
 
+/// Most hook repositories are mirrors that publish tags and never cut a GitHub
+/// release, so a cooldown that reads publish dates from releases alone is off
+/// for exactly the repositories pre-commit points at: the run reported
+/// "cooldown unavailable for github-releases" once and offered every hook
+/// update anyway, however new.
+#[tokio::test]
+async fn a_hook_repository_without_releases_is_still_held_to_the_cooldown() {
+    use crate::cooldown::CooldownPolicy;
+    use chrono::{Duration, Utc};
+
+    let now = Utc::now();
+    let newer = "1111111111111111111111111111111111111111";
+    let older = "2222222222222222222222222222222222222222";
+    let server = MockServer::start().await;
+    Mock::given(path("/repos/owner/mirror/releases/latest"))
+        .respond_with(ResponseTemplate::new(404))
+        .mount(&server)
+        .await;
+    Mock::given(path("/repos/owner/mirror/releases"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([])))
+        .mount(&server)
+        .await;
+    Mock::given(path("/repos/owner/mirror/tags"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
+            {"name": "v1.1.0", "commit": {"sha": newer}},
+            {"name": "v1.0.0", "commit": {"sha": older}},
+        ])))
+        .mount(&server)
+        .await;
+    for (tag, sha, age) in [("v1.1.0", newer, 1), ("v1.0.0", older, 200)] {
+        Mock::given(path(format!("/repos/owner/mirror/git/ref/tags/{tag}")))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"object": {"sha": sha, "type": "commit"}})),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(path(format!("/repos/owner/mirror/commits/{sha}")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "sha": sha,
+                "commit": {"committer": {"date": (now - Duration::days(age)).to_rfc3339()}},
+            })))
+            .mount(&server)
+            .await;
+    }
+
+    let options = UpdateOptions::new(false, false).with_cooldown_policy(
+        CooldownPolicy {
+            default: Duration::days(7),
+            ..Default::default()
+        },
+        now,
+    );
+    let notes = Arc::clone(&options.cooldown_unavailable_notes);
+    let original = "repos:\n- repo: https://github.com/owner/mirror\n  rev: v1.0.0\n  hooks: []\n";
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join(".pre-commit-config.yaml");
+    std::fs::write(&file, original).unwrap();
+
+    let result = updater()
+        .update(
+            &file,
+            &GitHubReleasesRegistry::with_api_url(server.uri()),
+            options,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        result.skipped_by_cooldown.len(),
+        1,
+        "a release one day old is inside a seven day cooldown: {result:?}"
+    );
+    assert_eq!(result.skipped_by_cooldown[0].2, "v1.1.0");
+    assert!(result.updated.is_empty(), "{result:?}");
+    assert_eq!(
+        std::fs::read_to_string(&file).unwrap(),
+        original,
+        "the rev stays where it is"
+    );
+    assert!(
+        notes.lock().unwrap().is_empty(),
+        "the dates were there to read: {:?}",
+        notes.lock().unwrap()
+    );
+}
+
 /// A repository the run was told to leave alone is not also reported as
 /// blocked: an ignore and a `--package` filter are answers, not refusals.
 #[tokio::test]

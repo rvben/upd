@@ -37,6 +37,42 @@ struct CommitResponse {
     sha: String,
 }
 
+/// A tag ref. `object.kind` is `"tag"` for an annotated tag, whose own object
+/// carries the creation time, and `"commit"` for a lightweight tag, which is a
+/// bare pointer git records nothing else about.
+#[derive(Debug, Deserialize)]
+struct RefResponse {
+    object: RefObject,
+}
+
+#[derive(Debug, Deserialize)]
+struct RefObject {
+    sha: String,
+    #[serde(rename = "type")]
+    kind: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct TagObjectResponse {
+    tagger: Option<GitSignature>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CommitDateResponse {
+    commit: CommitDetail,
+}
+
+#[derive(Debug, Deserialize)]
+struct CommitDetail {
+    committer: Option<GitSignature>,
+    author: Option<GitSignature>,
+}
+
+#[derive(Debug, Deserialize)]
+struct GitSignature {
+    date: Option<String>,
+}
+
 #[derive(Debug, Deserialize)]
 struct ReleaseListEntry {
     tag_name: String,
@@ -201,6 +237,117 @@ impl GitHubReleasesRegistry {
             MAX_TAG_PAGES * TAG_PAGE_SIZE,
         ))
     }
+
+    /// Publish dates read from the tag list, for a repository that publishes no
+    /// releases to read them from.
+    ///
+    /// Every date costs two requests, so the walk keeps the newest
+    /// [`MAX_DATED_TAGS_PER_TRACK`] tags of each release track and stops. What
+    /// truncation drops is the oldest candidates, which cooldown reaches only
+    /// once every newer version has been rejected as too new; the update is
+    /// then reported as skipped rather than held back to an older tag, so a
+    /// version this walk never dated is never offered.
+    async fn tag_versions(&self, owner: &str, repo: &str) -> Result<Vec<VersionMeta>> {
+        let mut tags: Vec<(TagVersion, String)> = self
+            .fetch_tags(owner, repo)
+            .await?
+            .into_iter()
+            .filter_map(|name| TagVersion::parse(&name).map(|v| (v, name)))
+            .collect();
+        tags.sort_by(|a, b| b.0.cmp(&a.0));
+
+        let mut dated_stable = 0usize;
+        let mut dated_prerelease = 0usize;
+        let mut versions = Vec::new();
+        for (version, name) in tags {
+            let prerelease = version.is_prerelease();
+            let dated = if prerelease {
+                &mut dated_prerelease
+            } else {
+                &mut dated_stable
+            };
+            if *dated == MAX_DATED_TAGS_PER_TRACK {
+                continue;
+            }
+            *dated += 1;
+            let published_at = self.tag_published_at(owner, repo, &name).await?;
+            versions.push(VersionMeta {
+                version: name,
+                published_at,
+                yanked: false,
+                prerelease,
+            });
+        }
+        Ok(versions)
+    }
+
+    /// When `tag` became available.
+    ///
+    /// An annotated tag records when it was created, which is the moment the
+    /// version could first be used. A lightweight tag is a bare pointer git
+    /// stores no timestamp for, so the commit it names is the only date there
+    /// is; a tag pushed long after its commit therefore reads as older than it
+    /// is, and is the reason the annotated form is not dated by its commit too.
+    async fn tag_published_at(
+        &self,
+        owner: &str,
+        repo: &str,
+        tag: &str,
+    ) -> Result<Option<DateTime<Utc>>> {
+        let subject = format!("{owner}/{repo}@{tag}");
+        let reference: RefResponse = self
+            .get_json(&["repos", owner, repo, "git", "ref", "tags", tag], &subject)
+            .await?;
+        let sha = reference.object.sha;
+
+        if reference.object.kind == "tag" {
+            let object: TagObjectResponse = self
+                .get_json(&["repos", owner, repo, "git", "tags", &sha], &subject)
+                .await?;
+            return Ok(object
+                .tagger
+                .and_then(|t| t.date)
+                .as_deref()
+                .and_then(timestamp));
+        }
+
+        let commit: CommitDateResponse = self
+            .get_json(&["repos", owner, repo, "commits", &sha], &subject)
+            .await?;
+        Ok(commit
+            .commit
+            .committer
+            .or(commit.commit.author)
+            .and_then(|s| s.date)
+            .as_deref()
+            .and_then(timestamp))
+    }
+
+    /// GET one JSON document, reporting a failure against `subject`.
+    async fn get_json<T: serde::de::DeserializeOwned>(
+        &self,
+        segments: &[&str],
+        subject: &str,
+    ) -> Result<T> {
+        let mut url = reqwest::Url::parse(&self.api_url)?;
+        url.path_segments_mut()
+            .map_err(|_| anyhow!("invalid GitHub API base URL"))?
+            .pop_if_empty()
+            .extend(segments);
+
+        let response = get_with_retry(&self.client, url.as_str()).await?;
+        if !response.status().is_success() {
+            let status = response.status();
+            let hint = match status.as_u16() {
+                403 | 429 => Some("Set GITHUB_TOKEN to increase the API rate limit."),
+                _ => None,
+            };
+            return Err(anyhow!(http_error_message(
+                status, "Git ref", subject, hint
+            )));
+        }
+        Ok(response.json().await?)
+    }
 }
 
 /// Tags requested per page. GitHub's maximum, so the common repository is one
@@ -209,6 +356,21 @@ const TAG_PAGE_SIZE: usize = 100;
 
 /// Pages walked before a commit lookup gives up and reports failure.
 const MAX_TAG_PAGES: usize = 20;
+
+/// Tags dated per release track when a repository publishes no releases.
+///
+/// Five is what a cooldown decision can use: the newest version, plus the four
+/// it can be held back to when that one is inside the window. Dating every tag
+/// of a long-lived repository would spend hundreds of requests to answer a
+/// question the newest handful already settles.
+const MAX_DATED_TAGS_PER_TRACK: usize = 5;
+
+/// An RFC 3339 timestamp from the API, in UTC.
+fn timestamp(raw: &str) -> Option<DateTime<Utc>> {
+    DateTime::parse_from_rfc3339(raw)
+        .ok()
+        .map(|dt| dt.with_timezone(&Utc))
+}
 
 /// The `rel="next"` URL from a `Link` header, if the response has one.
 ///
@@ -457,7 +619,7 @@ impl Registry for GitHubReleasesRegistry {
         let response = get_with_retry(&self.client, &url).await?;
         let status = response.status();
         if status == reqwest::StatusCode::NOT_FOUND {
-            return Ok(Vec::new());
+            return self.tag_versions(owner, repo).await;
         }
         if !status.is_success() {
             let hint = match status.as_u16() {
@@ -477,23 +639,27 @@ impl Registry for GitHubReleasesRegistry {
             .await
             .map_err(|e| anyhow!("Failed to parse GitHub releases for '{package}': {e}"))?;
 
-        Ok(items
+        let releases: Vec<VersionMeta> = items
             .into_iter()
             .filter(|r| !r.draft)
-            .map(|r| {
-                let published_at = r
-                    .published_at
-                    .as_deref()
-                    .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
-                    .map(|dt| dt.with_timezone(&Utc));
-                VersionMeta {
-                    version: r.tag_name,
-                    published_at,
-                    yanked: false,
-                    prerelease: r.prerelease,
-                }
+            .map(|r| VersionMeta {
+                version: r.tag_name,
+                published_at: r.published_at.as_deref().and_then(timestamp),
+                yanked: false,
+                prerelease: r.prerelease,
             })
-            .collect())
+            .collect();
+
+        if !releases.is_empty() {
+            return Ok(releases);
+        }
+
+        // A repository can publish tags and no releases at all, which most
+        // pre-commit hook mirrors do. An empty release list is a statement
+        // about releases, not about whether the repository can say when its
+        // versions appeared, and reading it as the latter turns cooldown off
+        // for every hook the run touches.
+        self.tag_versions(owner, repo).await
     }
 }
 
@@ -1110,6 +1276,252 @@ mod tests {
             Some(expected),
             "published_at should parse from RFC3339 and convert to UTC"
         );
+    }
+
+    /// `/releases` answering with an empty list for `acme/hook`.
+    async fn no_releases(server: &MockServer) {
+        Mock::given(method("GET"))
+            .and(path("/repos/acme/hook/releases"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("[]"))
+            .mount(server)
+            .await;
+    }
+
+    /// `/tags` answering with `name` -> peeled commit SHA pairs.
+    async fn tag_list(server: &MockServer, tags: &[(&str, &str)]) {
+        let body = tags
+            .iter()
+            .map(|(name, sha)| format!(r#"{{"name":"{name}","commit":{{"sha":"{sha}"}}}}"#))
+            .collect::<Vec<_>>()
+            .join(",");
+        Mock::given(method("GET"))
+            .and(path("/repos/acme/hook/tags"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(format!("[{body}]")))
+            .mount(server)
+            .await;
+    }
+
+    /// A lightweight tag: the ref names the commit itself, so the commit's own
+    /// date is the only date git records for the version.
+    async fn lightweight_tag(server: &MockServer, tag: &str, sha: &str, date: &str, lookups: u64) {
+        Mock::given(method("GET"))
+            .and(path(format!("/repos/acme/hook/git/ref/tags/{tag}")))
+            .respond_with(ResponseTemplate::new(200).set_body_string(format!(
+                r#"{{"ref":"refs/tags/{tag}","object":{{"sha":"{sha}","type":"commit"}}}}"#
+            )))
+            .expect(lookups)
+            .mount(server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(format!("/repos/acme/hook/commits/{sha}")))
+            .respond_with(ResponseTemplate::new(200).set_body_string(format!(
+                r#"{{"sha":"{sha}","commit":{{"committer":{{"date":"{date}"}}}}}}"#
+            )))
+            .expect(lookups)
+            .mount(server)
+            .await;
+    }
+
+    /// A repository that publishes tags and no releases still knows when each
+    /// version appeared. Reading the empty release list as "this registry holds
+    /// no publish dates" turns cooldown off for the repository, and most
+    /// pre-commit hook mirrors are exactly this shape.
+    #[tokio::test]
+    async fn a_repository_without_releases_dates_its_tags() {
+        let newer = "1111111111111111111111111111111111111111";
+        let older = "2222222222222222222222222222222222222222";
+        let server = MockServer::start().await;
+        no_releases(&server).await;
+        tag_list(&server, &[("v1.2.0", newer), ("v1.1.0", older)]).await;
+        lightweight_tag(&server, "v1.2.0", newer, "2026-09-01T12:00:00Z", 1).await;
+        lightweight_tag(&server, "v1.1.0", older, "2026-08-01T12:00:00Z", 1).await;
+
+        let versions = registry(&server).list_versions("acme/hook").await.unwrap();
+
+        assert_eq!(versions.len(), 2, "both tags are versions: {versions:?}");
+        let latest = versions.iter().find(|v| v.version == "v1.2.0").unwrap();
+        assert_eq!(
+            latest.published_at,
+            Some(Utc.with_ymd_and_hms(2026, 9, 1, 12, 0, 0).unwrap()),
+        );
+        assert!(!latest.prerelease);
+        assert!(!latest.yanked);
+    }
+
+    /// An annotated tag carries its own creation time, and that is when the
+    /// version became available. The commit under it can be far older - a
+    /// release tagged onto a maintenance branch - and dating the version by the
+    /// commit would make a release published minutes ago look weeks old, which
+    /// is the one direction cooldown must never get wrong.
+    #[tokio::test]
+    async fn an_annotated_tag_is_dated_by_when_it_was_created() {
+        let commit = "3333333333333333333333333333333333333333";
+        let tag_object = "4444444444444444444444444444444444444444";
+        let server = MockServer::start().await;
+        no_releases(&server).await;
+        tag_list(&server, &[("v2.0.0", commit)]).await;
+        Mock::given(method("GET"))
+            .and(path("/repos/acme/hook/git/ref/tags/v2.0.0"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(format!(
+                r#"{{"ref":"refs/tags/v2.0.0","object":{{"sha":"{tag_object}","type":"tag"}}}}"#
+            )))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(format!("/repos/acme/hook/git/tags/{tag_object}")))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_string(
+                    r#"{"tag":"v2.0.0","tagger":{"date":"2026-09-10T08:00:00Z"}}"#,
+                ),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(format!("/repos/acme/hook/commits/{commit}")))
+            .respond_with(ResponseTemplate::new(200).set_body_string(format!(
+                r#"{{"sha":"{commit}","commit":{{"committer":{{"date":"2026-01-01T08:00:00Z"}}}}}}"#
+            )))
+            .expect(0)
+            .mount(&server)
+            .await;
+
+        let versions = registry(&server).list_versions("acme/hook").await.unwrap();
+
+        assert_eq!(
+            versions.first().and_then(|v| v.published_at),
+            Some(Utc.with_ymd_and_hms(2026, 9, 10, 8, 0, 0).unwrap()),
+        );
+    }
+
+    /// Every date costs two requests, so the walk stops once it holds enough
+    /// candidates for the cooldown decision. The tags left undated are the
+    /// oldest ones, which cooldown reaches only after every newer version has
+    /// been rejected as too new.
+    #[tokio::test]
+    async fn only_the_newest_tags_are_dated() {
+        let server = MockServer::start().await;
+        no_releases(&server).await;
+        let shas: Vec<String> = (1..=7).map(|n| n.to_string().repeat(40)).collect();
+        let names: Vec<String> = (1..=7).map(|n| format!("v1.{n}.0")).collect();
+        let pairs: Vec<(&str, &str)> = names
+            .iter()
+            .zip(&shas)
+            .map(|(n, s)| (n.as_str(), s.as_str()))
+            .collect();
+        tag_list(&server, &pairs).await;
+        for (index, (name, sha)) in pairs.iter().enumerate() {
+            // v1.1.0 and v1.2.0 are the two oldest, so they are never dated.
+            let lookups = u64::from(index >= 2);
+            lightweight_tag(&server, name, sha, "2026-05-01T00:00:00Z", lookups).await;
+        }
+
+        let versions = registry(&server).list_versions("acme/hook").await.unwrap();
+
+        let mut dated: Vec<&str> = versions.iter().map(|v| v.version.as_str()).collect();
+        dated.sort_unstable();
+        assert_eq!(dated, ["v1.3.0", "v1.4.0", "v1.5.0", "v1.6.0", "v1.7.0"]);
+    }
+
+    /// Each track carries its own cap, so a prerelease pin is not answered with
+    /// the stable tags alone - cooldown admits only candidates on the current
+    /// version's own track and would otherwise see none. The prerelease here is
+    /// the lowest-ordered tag in the repository, so one shared cap spends the
+    /// whole budget on the stable track and never reaches it.
+    #[tokio::test]
+    async fn the_newest_tags_of_each_track_are_dated() {
+        let server = MockServer::start().await;
+        no_releases(&server).await;
+        let shas: Vec<String> = (1..=7).map(|n| n.to_string().repeat(40)).collect();
+        let names = [
+            "v1.1.0",
+            "v1.2.0",
+            "v1.3.0",
+            "v1.4.0",
+            "v1.5.0",
+            "v1.6.0",
+            "v0.9.0-rc.1",
+        ];
+        let pairs: Vec<(&str, &str)> = names
+            .iter()
+            .zip(&shas)
+            .map(|(n, s)| (*n, s.as_str()))
+            .collect();
+        tag_list(&server, &pairs).await;
+        for (index, (name, sha)) in pairs.iter().enumerate() {
+            // v1.1.0 is the sixth stable tag, one past the cap; the prerelease
+            // is the only one on its own track and is always dated.
+            let lookups = u64::from(index != 0);
+            lightweight_tag(&server, name, sha, "2026-05-01T00:00:00Z", lookups).await;
+        }
+
+        let versions = registry(&server).list_versions("acme/hook").await.unwrap();
+
+        let prerelease = versions
+            .iter()
+            .find(|v| v.version == "v0.9.0-rc.1")
+            .expect("the prerelease track is dated too");
+        assert!(prerelease.prerelease);
+        assert!(prerelease.published_at.is_some());
+        assert_eq!(versions.len(), 6);
+    }
+
+    /// A repository whose release list cannot be read at all is dated from its
+    /// tags for the same reason an empty one is: absent releases say nothing
+    /// about whether the repository knows when its versions appeared. The
+    /// latest-release lookup already reads a missing release list this way.
+    #[tokio::test]
+    async fn a_missing_release_list_is_dated_from_the_tags_too() {
+        let sha = "5555555555555555555555555555555555555555";
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/repos/acme/hook/releases"))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&server)
+            .await;
+        tag_list(&server, &[("v3.1.0", sha)]).await;
+        lightweight_tag(&server, "v3.1.0", sha, "2026-07-04T09:00:00Z", 1).await;
+
+        let versions = registry(&server).list_versions("acme/hook").await.unwrap();
+
+        assert_eq!(
+            versions
+                .iter()
+                .map(|v| v.version.as_str())
+                .collect::<Vec<_>>(),
+            ["v3.1.0"],
+        );
+        assert_eq!(
+            versions[0].published_at,
+            Some(Utc.with_ymd_and_hms(2026, 7, 4, 9, 0, 0).unwrap()),
+        );
+    }
+
+    /// A repository that publishes releases is answered from them alone. The
+    /// tag walk exists for repositories that have no releases at all, and
+    /// running it anyway would spend a request per version on every GitHub
+    /// Actions pin in the tree.
+    #[tokio::test]
+    async fn a_repository_with_releases_does_not_walk_its_tags() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/repos/acme/hook/releases"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                r#"[{"tag_name":"v1.2.0","published_at":"2026-09-01T12:00:00Z","prerelease":false,"draft":false}]"#,
+            ))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/repos/acme/hook/tags"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("[]"))
+            .expect(0)
+            .mount(&server)
+            .await;
+
+        let versions = registry(&server).list_versions("acme/hook").await.unwrap();
+
+        assert_eq!(versions.len(), 1);
     }
 
     #[tokio::test]

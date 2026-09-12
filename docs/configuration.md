@@ -212,6 +212,20 @@ NuGet, Gradle Maven metadata, Terraform Registry, and generic OCI tag listings d
 per-version publish dates we can consume today; cooldown is reported as
 unavailable for those files.
 
+### Dating a repository that publishes no releases
+
+A GitHub repository whose hook or action is tagged but never released has no
+release dates to read, so `upd` dates its versions from the tags themselves: an
+annotated tag by its tagger date, a lightweight tag by the date of the commit it
+points at. A lightweight tag therefore reads as old as its commit, which can be
+older than the day the tag was pushed.
+
+Each date costs two API requests, so the walk dates only the newest five tags
+per release track (stable and prerelease counted separately) and stops. What it
+drops is the oldest candidates, which cooldown reaches only after rejecting
+every newer version as too fresh; such a package is reported as skipped rather
+than held back to a tag whose age was never measured.
+
 ## Caching
 
 Version lookups are cached for 24 hours in:
