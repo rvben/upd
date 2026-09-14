@@ -639,9 +639,15 @@ impl Registry for GitHubReleasesRegistry {
             .await
             .map_err(|e| anyhow!("Failed to parse GitHub releases for '{package}': {e}"))?;
 
+        // A release tag that is not a version names no release of the package:
+        // github/codeql-action publishes CodeQL bundles as releases beside its
+        // own. Listing one lets cooldown pick it, and version ordering ranks
+        // its leading letters above every number, so it would outrank the
+        // real releases. `get_latest_version` filters the same way.
         let releases: Vec<VersionMeta> = items
             .into_iter()
             .filter(|r| !r.draft)
+            .filter(|r| TagVersion::parse(&r.tag_name).is_some())
             .map(|r| VersionMeta {
                 version: r.tag_name,
                 published_at: r.published_at.as_deref().and_then(timestamp),
@@ -1275,6 +1281,63 @@ mod tests {
             v420.published_at,
             Some(expected),
             "published_at should parse from RFC3339 and convert to UTC"
+        );
+    }
+
+    /// github/codeql-action publishes its CodeQL bundles as ordinary releases
+    /// beside the action's own. A bundle tag is not a version of the action,
+    /// and version ordering reads its leading letters as newer than any
+    /// number, so a listed bundle outranks every real release.
+    #[tokio::test]
+    async fn a_release_whose_tag_is_not_a_version_is_not_listed() {
+        let server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/repos/github/codeql-action/releases"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                r#"[
+              {"tag_name": "v4.38.0", "published_at": "2026-09-09T14:04:03Z", "prerelease": false, "draft": false},
+              {"tag_name": "codeql-bundle-v2.27.0", "published_at": "2026-09-09T11:31:59Z", "prerelease": false, "draft": false},
+              {"tag_name": "v4.37.9", "published_at": "2026-08-26T14:41:23Z", "prerelease": false, "draft": false},
+              {"tag_name": "codeql-bundle-v2.26.4", "published_at": "2026-08-26T08:21:37Z", "prerelease": false, "draft": false}
+            ]"#,
+            ))
+            .mount(&server)
+            .await;
+
+        let versions = registry(&server)
+            .list_versions("github/codeql-action")
+            .await
+            .unwrap();
+
+        let names: Vec<&str> = versions.iter().map(|v| v.version.as_str()).collect();
+        assert_eq!(names, ["v4.38.0", "v4.37.9"]);
+    }
+
+    /// A release list holding only non-version tags says nothing about when the
+    /// repository's versions appeared, so the tags are dated instead, exactly
+    /// as for a repository with no releases.
+    #[tokio::test]
+    async fn a_release_list_of_only_non_versions_dates_the_tags() {
+        let sha = "1111111111111111111111111111111111111111";
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/repos/acme/hook/releases"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                r#"[{"tag_name": "images-2026-08-24T193611Z", "published_at": "2026-08-24T19:36:11Z", "prerelease": false, "draft": false}]"#,
+            ))
+            .mount(&server)
+            .await;
+        tag_list(&server, &[("v1.2.0", sha)]).await;
+        lightweight_tag(&server, "v1.2.0", sha, "2026-01-02T03:04:05Z", 1).await;
+
+        let versions = registry(&server).list_versions("acme/hook").await.unwrap();
+
+        assert_eq!(versions.len(), 1, "{versions:?}");
+        assert_eq!(versions[0].version, "v1.2.0");
+        assert_eq!(
+            versions[0].published_at,
+            Some(chrono::Utc.with_ymd_and_hms(2026, 1, 2, 3, 4, 5).unwrap())
         );
     }
 

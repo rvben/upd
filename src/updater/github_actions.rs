@@ -1699,6 +1699,161 @@ jobs:
         assert!(!content.contains("actions/checkout@v5.0.0"));
     }
 
+    const CODEQL_V4_37_9: &str = "cdf488f0000000000000000000000000000000aa";
+    const CODEQL_V4_38_0: &str = "b96794f0000000000000000000000000000000bb";
+    const CODEQL_BUNDLE: &str = "486fec20000000000000000000000000000000cc";
+
+    /// github/codeql-action as GitHub serves it: CodeQL bundle releases
+    /// interleaved with the action's own, the newest action release a few days
+    /// old and the previous one, plus an older bundle, well past a week.
+    async fn codeql_action_repository() -> wiremock::MockServer {
+        use wiremock::matchers::path;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(path("/repos/github/codeql-action/releases/latest"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"tag_name": "v4.38.0"})),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(path("/repos/github/codeql-action/releases"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
+                {"tag_name": "v4.38.0", "published_at": "2026-09-09T14:04:03Z", "prerelease": false, "draft": false},
+                {"tag_name": "codeql-bundle-v2.27.0", "published_at": "2026-09-09T11:31:59Z", "prerelease": false, "draft": false},
+                {"tag_name": "v4.37.9", "published_at": "2026-08-26T14:41:23Z", "prerelease": false, "draft": false},
+                {"tag_name": "codeql-bundle-v2.26.4", "published_at": "2026-08-26T08:21:37Z", "prerelease": false, "draft": false},
+            ])))
+            .mount(&server)
+            .await;
+        Mock::given(path("/repos/github/codeql-action/tags"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
+                {"name": "v4.38.0", "commit": {"sha": CODEQL_V4_38_0}},
+                {"name": "codeql-bundle-v2.27.0", "commit": {"sha": CODEQL_BUNDLE}},
+                {"name": "v4.37.9", "commit": {"sha": CODEQL_V4_37_9}},
+                {"name": "codeql-bundle-v2.26.4", "commit": {"sha": CODEQL_BUNDLE}},
+                {"name": "v4", "commit": {"sha": CODEQL_V4_38_0}},
+            ])))
+            .mount(&server)
+            .await;
+        for (reference, sha) in [
+            ("v4.38.0", CODEQL_V4_38_0),
+            ("v4.37.9", CODEQL_V4_37_9),
+            ("codeql-bundle-v2.26.4", CODEQL_BUNDLE),
+            ("vcodeql-bundle-v2.26.4", CODEQL_BUNDLE),
+        ] {
+            Mock::given(path(format!(
+                "/repos/github/codeql-action/commits/{reference}"
+            )))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"sha": sha})))
+            .mount(&server)
+            .await;
+        }
+        server
+    }
+
+    fn seven_day_cooldown_on(date: &str) -> UpdateOptions {
+        let now = chrono::DateTime::parse_from_rfc3339(date)
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        UpdateOptions::new(false, false)
+            .with_action_sha_updates(true)
+            .with_cooldown_policy(
+                crate::cooldown::CooldownPolicy {
+                    default: chrono::Duration::days(7),
+                    ..Default::default()
+                },
+                now,
+            )
+    }
+
+    /// The newest action release is inside the cooldown and the one before it
+    /// is the pin itself, so there is nothing to move to. The bundle releases
+    /// are older than the window but are not versions of the action; holding
+    /// back to one rewrote the pin to a commit behind the release it named.
+    #[tokio::test]
+    async fn a_sha_pin_is_never_held_back_to_a_release_that_is_not_a_version() {
+        let server = codeql_action_repository().await;
+        let registry = crate::registry::GitHubReleasesRegistry::with_api_url(server.uri());
+        let original = format!(
+            "jobs:\n  scan:\n    steps:\n      - uses: github/codeql-action/init@{CODEQL_V4_37_9} # v4.37.9\n"
+        );
+        let mut file = NamedTempFile::new().unwrap();
+        write!(file, "{original}").unwrap();
+
+        let result = GithubActionsUpdater::new()
+            .update(
+                file.path(),
+                &registry,
+                seven_day_cooldown_on("2026-09-14T12:00:00Z"),
+            )
+            .await
+            .unwrap();
+
+        assert!(result.updated.is_empty(), "{result:?}");
+        assert!(result.action_sha_updates.is_empty(), "{result:?}");
+        assert_eq!(result.skipped_by_cooldown.len(), 1, "{result:?}");
+        assert_eq!(result.skipped_by_cooldown[0].1, "v4.37.9");
+        assert_eq!(result.skipped_by_cooldown[0].2, "v4.38.0");
+        assert_eq!(fs::read_to_string(file.path()).unwrap(), original);
+    }
+
+    /// The same repository through a tag ref rather than a SHA pin.
+    #[tokio::test]
+    async fn a_tag_ref_is_never_held_back_to_a_release_that_is_not_a_version() {
+        let server = codeql_action_repository().await;
+        let registry = crate::registry::GitHubReleasesRegistry::with_api_url(server.uri());
+        let original =
+            "jobs:\n  scan:\n    steps:\n      - uses: github/codeql-action/init@v4.37.9\n";
+        let mut file = NamedTempFile::new().unwrap();
+        write!(file, "{original}").unwrap();
+
+        let result = GithubActionsUpdater::new()
+            .update(
+                file.path(),
+                &registry,
+                seven_day_cooldown_on("2026-09-14T12:00:00Z"),
+            )
+            .await
+            .unwrap();
+
+        assert!(result.updated.is_empty(), "{result:?}");
+        assert_eq!(result.skipped_by_cooldown.len(), 1, "{result:?}");
+        assert_eq!(result.skipped_by_cooldown[0].2, "v4.38.0");
+        assert_eq!(fs::read_to_string(file.path()).unwrap(), original);
+    }
+
+    /// Once the newest action release clears the window it is taken, so the
+    /// bundles are ignored rather than the cooldown blocking everything.
+    #[tokio::test]
+    async fn a_sha_pin_moves_to_the_newest_version_once_it_clears_the_cooldown() {
+        let server = codeql_action_repository().await;
+        let registry = crate::registry::GitHubReleasesRegistry::with_api_url(server.uri());
+        let mut file = NamedTempFile::new().unwrap();
+        write!(
+            file,
+            "jobs:\n  scan:\n    steps:\n      - uses: github/codeql-action/init@{CODEQL_V4_37_9} # v4.37.9\n"
+        )
+        .unwrap();
+
+        let result = GithubActionsUpdater::new()
+            .update(
+                file.path(),
+                &registry,
+                seven_day_cooldown_on("2026-09-30T12:00:00Z"),
+            )
+            .await
+            .unwrap();
+
+        assert!(result.skipped_by_cooldown.is_empty(), "{result:?}");
+        assert_eq!(result.updated.len(), 1, "{result:?}");
+        assert_eq!(result.updated[0].2, "v4.38.0");
+        assert!(fs::read_to_string(file.path()).unwrap().contains(&format!(
+            "github/codeql-action/init@{CODEQL_V4_38_0} # v4.38.0"
+        )));
+    }
+
     #[tokio::test]
     async fn test_updates_quoted_reusable_workflow_sha_pin() {
         const OLD_SHA: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";

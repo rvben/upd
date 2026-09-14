@@ -259,6 +259,12 @@ drops is the oldest candidates, which cooldown reaches only after rejecting
 every newer version as too fresh; such a package is reported as skipped rather
 than held back to a tag whose age was never measured.
 
+A release whose tag is not a version is left out of the dates entirely.
+github/codeql-action, for example, publishes its CodeQL bundles
+(`codeql-bundle-v2.27.0`) as releases beside the action's own, and a bundle is
+never a candidate to hold an action back to. A repository whose releases are all
+of that kind is dated from its tags, as if it published no releases.
+
 ## Caching
 
 Version lookups are cached for 24 hours in:
