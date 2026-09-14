@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.12.4](https://github.com/rvben/upd/compare/v0.12.3...v0.12.4) - 2026-09-15
+
+### Fixed
+
+- **registry**: read a hyphen in NuGet and Terraform build metadata as metadata ([0e06f4f](https://github.com/rvben/upd/commit/0e06f4f4830eb6f0e6c17eb6734a7bc26782872e))
+- **align**: read a hyphen in semver build metadata as metadata, not a pre-release ([18bde65](https://github.com/rvben/upd/commit/18bde6570ccee0af6c18a5babfdcb11dc4d4ce3b))
+- **cargo**: read a release published with build metadata as that release under cooldown ([f58b490](https://github.com/rvben/upd/commit/f58b490c8b2b68669e124df6cf614c94b6870819))
+- **cargo**: write a semver pre-release whole whatever the current precision ([ce4fd5a](https://github.com/rvben/upd/commit/ce4fd5ac341e8d8675f21678131378137e4c6c80))
+- **cargo**: write crates.io versions without semver build metadata ([f704fcd](https://github.com/rvben/upd/commit/f704fcd1ae48c2fccfe6349dcaf181d1771c0d6e))
+
 ## [0.12.3](https://github.com/rvben/upd/compare/v0.12.2...v0.12.3) - 2026-09-14
 
 ### Fixed
