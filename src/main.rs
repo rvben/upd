@@ -49,7 +49,9 @@ use upd::updater::{
     SkipStatus, SkippedUpdate, TerraformUpdater, UpdateOptions, UpdateResult, Updater,
     classify_bump, discover_files_with, read_file_safe, update_with_annotations, write_file_atomic,
 };
-use upd::version::{compare_versions, match_version_precision};
+use upd::version::{
+    compare_versions, match_cargo_precision, match_version_precision, without_build_metadata,
+};
 
 /// Walk up from `start` to find the nearest ancestor directory that contains a
 /// `.git` entry (file or directory). Returns the path to that ancestor.
@@ -4879,7 +4881,7 @@ fn print_alignment(alignment: &PackageAlignment, _dry_run: bool) {
                 occurrence.version.dimmed(),
                 "(constrained, skipped)".yellow()
             );
-        } else if occurrence.version == alignment.highest_version {
+        } else if alignment.is_at_highest(occurrence) {
             println!(
                 "    {} {} {} {}",
                 "├──".dimmed(),
@@ -5099,10 +5101,14 @@ fn apply_version_updates(
     let mut applied = vec![false; updates.len()];
 
     for (idx, update) in updates.iter().enumerate() {
-        let target_version = if full_precision {
-            update.new_version.to_string()
-        } else {
-            match_version_precision(update.old_version, update.new_version)
+        let target_version = match (file_type, full_precision) {
+            // One rule for both Cargo writers; see `match_cargo_precision`.
+            (FileType::CargoToml, true) => without_build_metadata(update.new_version).to_string(),
+            (FileType::CargoToml, false) => {
+                match_cargo_precision(update.old_version, update.new_version)
+            }
+            (_, true) => update.new_version.to_string(),
+            (_, false) => match_version_precision(update.old_version, update.new_version),
         };
 
         applied[idx] = match file_type {
@@ -8076,6 +8082,53 @@ version = "1.0.0"
         );
     }
 
+    /// The interactive, align and audit-fix writer follows the Cargo
+    /// updater's rule, so a version reaching it from another manifest or an
+    /// advisory is written the same way: no build metadata, and a pre-release
+    /// whole.
+    #[test]
+    fn test_apply_version_updates_cargo_drops_build_metadata_and_keeps_prereleases_whole() {
+        let content = r#"[dependencies]
+toml_edit = "0.25.12"
+nightly = "=1.0.0-nightly"
+"#;
+        let updates = [
+            VersionEdit {
+                package: "toml_edit",
+                old_version: "0.25.12",
+                new_version: "0.25.15+spec-1.1.0",
+                line_num: Some(2),
+                expected_source: None,
+                sha_pin: None,
+            },
+            VersionEdit {
+                package: "nightly",
+                old_version: "1.0.0-nightly",
+                new_version: "1.0.1-nightly.1+build.2",
+                line_num: Some(3),
+                expected_source: None,
+                sha_pin: None,
+            },
+        ];
+
+        for full_precision in [false, true] {
+            let applied =
+                apply_version_updates(content, &updates, FileType::CargoToml, full_precision)
+                    .unwrap();
+
+            assert_eq!(
+                applied.applied_count(),
+                2,
+                "full_precision {full_precision}"
+            );
+            assert_eq!(
+                applied.content,
+                "[dependencies]\ntoml_edit = \"0.25.15\"\nnightly = \"=1.0.1-nightly.1\"\n",
+                "full_precision {full_precision}"
+            );
+        }
+    }
+
     #[test]
     fn test_apply_version_updates_package_json_uses_unique_fallback_for_duplicate_targets() {
         let content = r#"{
@@ -8166,6 +8219,68 @@ serde = "1.0.1"
                 .content
                 .contains("[dev-dependencies]\nserde = \"1.0.2\"")
         );
+    }
+
+    /// Cargo ignores semver build metadata in a requirement and upd writes a
+    /// Cargo version without it, so `1.0.0` and `1.0.0+build.1` already agree:
+    /// aligning them is no edit at all, while an older release still aligns.
+    #[test]
+    fn test_align_cargo_reads_build_metadata_as_the_same_release() {
+        for full_precision in [false, true] {
+            let temp = tempdir().unwrap();
+            let manifest = |name: &str, version: &str| {
+                let path = temp.path().join(name).join("Cargo.toml");
+                std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+                std::fs::write(&path, format!("[dependencies]\nfoo = \"{version}\"\n")).unwrap();
+                PackageOccurrence {
+                    file_path: path,
+                    file_type: FileType::CargoToml,
+                    version: version.into(),
+                    line_number: Some(2),
+                    has_upper_bound: false,
+                    original_name: "foo".into(),
+                    is_bumpable: true,
+                }
+            };
+            let bare = manifest("bare", "1.0.0");
+            let built = manifest("built", "1.0.0+build.1");
+            let older = manifest("older", "0.9.0");
+            let group = |occurrences: Vec<PackageOccurrence>| {
+                find_alignments(std::collections::HashMap::from([(
+                    ("foo".to_string(), Lang::Rust),
+                    occurrences,
+                )]))
+            };
+
+            let agreeing = group(vec![bare.clone(), built.clone()]);
+            assert!(
+                !agreeing.packages[0].has_misalignment(),
+                "{:?}",
+                agreeing.packages[0]
+            );
+            assert_eq!(agreeing.misaligned_count, 0);
+
+            let result = group(vec![bare.clone(), built.clone(), older.clone()]);
+            let alignment = &result.packages[0];
+            let misaligned: Vec<&str> = alignment
+                .misaligned_occurrences()
+                .iter()
+                .map(|o| o.version.as_str())
+                .collect();
+            assert_eq!(misaligned, ["0.9.0"]);
+            assert_eq!(apply_alignments(&[alignment], full_precision).unwrap(), 1);
+            for (occurrence, written) in [
+                (&bare, "1.0.0"),
+                (&built, "1.0.0+build.1"),
+                (&older, "1.0.0"),
+            ] {
+                assert_eq!(
+                    std::fs::read_to_string(&occurrence.file_path).unwrap(),
+                    format!("[dependencies]\nfoo = \"{written}\"\n"),
+                    "full_precision={full_precision}"
+                );
+            }
+        }
     }
 
     #[test]

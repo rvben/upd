@@ -815,7 +815,7 @@ pub fn build_align_package(alignment: &PackageAlignment) -> AlignPackage {
     let occurrences = alignment
         .occurrences
         .iter()
-        .map(|o| occurrence_to_json(o, &alignment.highest_version))
+        .map(|o| occurrence_to_json(o, alignment))
         .collect();
 
     AlignPackage {
@@ -827,8 +827,8 @@ pub fn build_align_package(alignment: &PackageAlignment) -> AlignPackage {
     }
 }
 
-fn occurrence_to_json(o: &PackageOccurrence, highest: &str) -> AlignOccurrence {
-    let misaligned = !o.has_upper_bound && o.version != highest;
+fn occurrence_to_json(o: &PackageOccurrence, alignment: &PackageAlignment) -> AlignOccurrence {
+    let misaligned = !o.has_upper_bound && !alignment.is_at_highest(o);
     AlignOccurrence {
         path: display_path(&o.file_path),
         file_type: o.file_type.as_str(),
@@ -1693,6 +1693,34 @@ mod tests {
             json["occurrences"][2]["is_misaligned"], false,
             "upper-bound constrained occurrence is not misaligned"
         );
+    }
+
+    #[test]
+    fn align_package_reads_a_cargo_version_with_build_metadata_as_its_release() {
+        let occurrence = |path: &str, version: &str| PackageOccurrence {
+            file_path: PathBuf::from(path),
+            file_type: FileType::CargoToml,
+            version: version.into(),
+            line_number: Some(2),
+            has_upper_bound: false,
+            original_name: "foo".into(),
+            is_bumpable: true,
+        };
+        let alignment = PackageAlignment {
+            package_name: "foo".into(),
+            highest_version: "1.0.0+build.1".into(),
+            lang: Lang::Rust,
+            occurrences: vec![
+                occurrence("bare/Cargo.toml", "1.0.0"),
+                occurrence("built/Cargo.toml", "1.0.0+build.1"),
+                occurrence("older/Cargo.toml", "0.9.0"),
+            ],
+        };
+        let json = serde_json::to_value(build_align_package(&alignment)).unwrap();
+        assert_eq!(json["is_misaligned"], true);
+        assert_eq!(json["occurrences"][0]["is_misaligned"], false);
+        assert_eq!(json["occurrences"][1]["is_misaligned"], false);
+        assert_eq!(json["occurrences"][2]["is_misaligned"], true);
     }
 
     #[test]

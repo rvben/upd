@@ -56,18 +56,33 @@ pub struct PackageAlignment {
 }
 
 impl PackageAlignment {
+    /// Whether `occurrence` already declares the highest version.
+    ///
+    /// Cargo ignores semver build metadata in a requirement and upd writes a
+    /// Cargo version without it, so a Cargo version is compared as the release
+    /// it names. Every other ecosystem compares the declared strings.
+    pub fn is_at_highest(&self, occurrence: &PackageOccurrence) -> bool {
+        match self.lang {
+            Lang::Rust => {
+                crate::version::without_build_metadata(&occurrence.version)
+                    == crate::version::without_build_metadata(&self.highest_version)
+            }
+            _ => occurrence.version == self.highest_version,
+        }
+    }
+
     /// Returns true if any occurrence is misaligned (not at highest version)
     pub fn has_misalignment(&self) -> bool {
         self.occurrences
             .iter()
-            .any(|o| o.is_bumpable && !o.has_upper_bound && o.version != self.highest_version)
+            .any(|o| o.is_bumpable && !o.has_upper_bound && !self.is_at_highest(o))
     }
 
     /// Returns only the misaligned occurrences (excluding those at highest version, with constraints, or not bumpable)
     pub fn misaligned_occurrences(&self) -> Vec<&PackageOccurrence> {
         self.occurrences
             .iter()
-            .filter(|o| o.is_bumpable && !o.has_upper_bound && o.version != self.highest_version)
+            .filter(|o| o.is_bumpable && !o.has_upper_bound && !self.is_at_highest(o))
             .collect()
     }
 }
@@ -306,6 +321,35 @@ fn compare_go_version(a: &str, b: &str) -> std::cmp::Ordering {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A PEP 440 local version selects a different artifact (`+cpu`), so unlike
+    /// Cargo build metadata it keeps two Python declarations apart.
+    #[test]
+    fn a_python_local_version_is_not_its_public_release() {
+        let occurrence = |path: &str, version: &str| PackageOccurrence {
+            file_path: PathBuf::from(path),
+            file_type: FileType::PyProject,
+            version: version.into(),
+            line_number: Some(1),
+            has_upper_bound: false,
+            original_name: "torch".into(),
+            is_bumpable: true,
+        };
+        let result = find_alignments(HashMap::from([(
+            ("torch".to_string(), Lang::Python),
+            vec![
+                occurrence("a/pyproject.toml", "2.1.0"),
+                occurrence("b/pyproject.toml", "2.1.0+cpu"),
+            ],
+        )]));
+        assert_eq!(result.packages[0].highest_version, "2.1.0+cpu");
+        let misaligned: Vec<&str> = result.packages[0]
+            .misaligned_occurrences()
+            .iter()
+            .map(|o| o.version.as_str())
+            .collect();
+        assert_eq!(misaligned, ["2.1.0"]);
+    }
 
     #[test]
     fn test_is_stable_version_python() {

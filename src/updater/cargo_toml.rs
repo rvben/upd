@@ -6,7 +6,9 @@ use super::{
 use crate::align::compare_versions;
 use crate::registry::{CratesIoRegistry, Registry};
 use crate::updater::Lang;
-use crate::version::{is_prerelease_semver, is_stable_semver, match_version_precision};
+use crate::version::{
+    is_prerelease_semver, is_stable_semver, match_cargo_precision, without_build_metadata,
+};
 use anyhow::{Result, anyhow};
 use futures::future::join_all;
 use std::collections::HashMap;
@@ -95,19 +97,6 @@ impl ReqSpec {
     fn bounds_above(&self) -> bool {
         self.text.contains('<') || self.text.starts_with(['^', '~'])
     }
-}
-
-/// The release a crates.io version names, without its semver build metadata.
-///
-/// Build metadata records how a release was built, so two versions differing
-/// only in it are the same release. Cargo ignores it in a requirement and warns
-/// on every build that reads one, which is why it is compared and written
-/// without it. Other ecosystems keep theirs: a PEP 440 local version such as
-/// `+cpu` selects a different artifact.
-fn without_build_metadata(version: &str) -> &str {
-    version
-        .split_once('+')
-        .map_or(version, |(release, _)| release)
 }
 
 impl CargoTomlUpdater {
@@ -390,7 +379,7 @@ impl CargoTomlUpdater {
             let matched_version = if options.full_precision {
                 pinned_release.to_string()
             } else {
-                match_version_precision(current_release, pinned_release)
+                match_cargo_precision(current_release, pinned_release)
             };
 
             if matched_version == current_release {
@@ -541,7 +530,7 @@ impl CargoTomlUpdater {
                     let matched_version = if options.full_precision {
                         latest_release.to_string()
                     } else {
-                        match_version_precision(current_release, latest_release)
+                        match_cargo_precision(current_release, latest_release)
                     };
                     if matched_version != current_release {
                         // Refuse to write a downgrade.
@@ -1521,6 +1510,98 @@ winnow = "0.7.13+build.1"
             content.contains(r#"winnow = "0.7.13+build.1""#),
             "{content}"
         );
+    }
+
+    /// A semver pre-release cannot be written at a shorter precision, so the
+    /// whole pre-release is written however many dots the current requirement
+    /// happens to contain. Cutting `1.0.1-nightly.1` to `1.0.1-nightly` writes
+    /// an exact requirement that excludes the release it was chosen for.
+    #[tokio::test]
+    async fn a_prerelease_is_written_whole_whatever_the_current_precision() {
+        let mut file = NamedTempFile::with_suffix(".toml").unwrap();
+        write!(
+            file,
+            r#"[dependencies]
+plain = "=1.0.0-nightly"
+built = "=1.0.0-nightly+build.1"
+"#
+        )
+        .unwrap();
+
+        let registry = MockRegistry::new("crates.io")
+            .with_prerelease("plain", "0.9.0", "1.0.1-nightly.1")
+            .with_prerelease("built", "0.9.0", "1.0.1-nightly.1+build.2");
+
+        let result = CargoTomlUpdater::new()
+            .update(file.path(), &registry, UpdateOptions::new(false, false))
+            .await
+            .unwrap();
+
+        assert!(result.warnings.is_empty(), "{:?}", result.warnings);
+        assert!(result.errors.is_empty(), "{:?}", result.errors);
+        let mut updated = updated_versions(&result);
+        updated.sort();
+        assert_eq!(
+            updated,
+            vec![
+                ("built", "1.0.0-nightly+build.1", "1.0.1-nightly.1"),
+                ("plain", "1.0.0-nightly", "1.0.1-nightly.1"),
+            ]
+        );
+
+        let content = fs::read_to_string(file.path()).unwrap();
+        assert!(
+            content.contains(r#"plain = "=1.0.1-nightly.1""#),
+            "{content}"
+        );
+        assert!(
+            content.contains(r#"built = "=1.0.1-nightly.1""#),
+            "{content}"
+        );
+    }
+
+    /// A pin follows the same rule as an update: a pre-release is written
+    /// whole, and a stable release still takes the current precision. Both
+    /// lose their build metadata.
+    #[tokio::test]
+    async fn a_pin_to_a_prerelease_is_written_whole() {
+        use crate::config::UpdConfig;
+
+        let mut file = NamedTempFile::with_suffix(".toml").unwrap();
+        write!(
+            file,
+            r#"[dependencies]
+nightly = "1.0.0-nightly"
+short = "1.0"
+"#
+        )
+        .unwrap();
+
+        let registry = MockRegistry::new("crates.io");
+        let mut pin = HashMap::new();
+        pin.insert("nightly".to_string(), "1.0.1-nightly.1+build.2".to_string());
+        pin.insert("short".to_string(), "1.2.3+build.4".to_string());
+        let config = UpdConfig {
+            pin,
+            ..Default::default()
+        };
+
+        let result = CargoTomlUpdater::new()
+            .update(
+                file.path(),
+                &registry,
+                UpdateOptions::new(false, false).with_config(Arc::new(config)),
+            )
+            .await
+            .unwrap();
+
+        assert!(result.errors.is_empty(), "{:?}", result.errors);
+        let content = fs::read_to_string(file.path()).unwrap();
+        assert!(
+            content.contains(r#"nightly = "1.0.1-nightly.1""#),
+            "{content}"
+        );
+        assert!(content.contains(r#"short = "1.2""#), "{content}");
     }
 
     #[tokio::test]
