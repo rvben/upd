@@ -97,6 +97,19 @@ impl ReqSpec {
     }
 }
 
+/// The release a crates.io version names, without its semver build metadata.
+///
+/// Build metadata records how a release was built, so two versions differing
+/// only in it are the same release. Cargo ignores it in a requirement and warns
+/// on every build that reads one, which is why it is compared and written
+/// without it. Other ecosystems keep theirs: a PEP 440 local version such as
+/// `+cpu` selects a different artifact.
+fn without_build_metadata(version: &str) -> &str {
+    version
+        .split_once('+')
+        .map_or(version, |(release, _)| release)
+}
+
 impl CargoTomlUpdater {
     pub(crate) async fn update_hook_requirement(
         &self,
@@ -372,13 +385,15 @@ impl CargoTomlUpdater {
 
         // Process pinned packages (no registry fetch needed)
         for (key, req, current_version, pinned_version, line_num) in pinned_deps {
+            let current_release = without_build_metadata(&current_version);
+            let pinned_release = without_build_metadata(&pinned_version);
             let matched_version = if options.full_precision {
-                pinned_version.clone()
+                pinned_release.to_string()
             } else {
-                match_version_precision(&current_version, &pinned_version)
+                match_version_precision(current_release, pinned_release)
             };
 
-            if matched_version == current_version {
+            if matched_version == current_release {
                 result.unchanged += 1;
             } else if let Some(new_version_req) = req.with_version(&matched_version) {
                 if let Some(item) = table.get_mut(&key) {
@@ -520,15 +535,17 @@ impl CargoTomlUpdater {
                         }
                     };
 
+                    let current_release = without_build_metadata(&current_version);
+                    let latest_release = without_build_metadata(&latest_version);
                     // Match the precision of the original version (unless full precision requested)
                     let matched_version = if options.full_precision {
-                        latest_version.clone()
+                        latest_release.to_string()
                     } else {
-                        match_version_precision(&current_version, &latest_version)
+                        match_version_precision(current_release, latest_release)
                     };
-                    if matched_version != current_version {
+                    if matched_version != current_release {
                         // Refuse to write a downgrade.
-                        if compare_versions(&matched_version, &current_version, Lang::Rust)
+                        if compare_versions(&matched_version, current_release, Lang::Rust)
                             != std::cmp::Ordering::Greater
                         {
                             result.warnings.push(downgrade_warning(
@@ -537,7 +554,7 @@ impl CargoTomlUpdater {
                                 &current_version,
                             ));
                             result.unchanged += 1;
-                        } else if !options.allows_bump(&current_version, &matched_version) {
+                        } else if !options.allows_bump(current_release, &matched_version) {
                             // Bump level exceeds the --only-bump/--max-bump ceiling:
                             // leave the dependency untouched, and record that a
                             // newer release is waiting on a human.
@@ -1344,6 +1361,166 @@ anyhow = "<2.0"
 
         let content = fs::read_to_string(file.path()).unwrap();
         assert!(content.contains(r#"anyhow = "<2.0""#), "{content}");
+    }
+
+    fn updated_versions(result: &UpdateResult) -> Vec<(&str, &str, &str)> {
+        result
+            .updated
+            .iter()
+            .map(|(name, old, new, _)| (name.as_str(), old.as_str(), new.as_str()))
+            .collect()
+    }
+
+    /// Build metadata says how a release was built, not which release it is.
+    /// Cargo ignores it in a requirement and warns on every build that reads
+    /// one, and toml_edit publishes every release with it
+    /// (`0.25.13+spec-1.1.0`), so what is written is the release alone.
+    #[tokio::test]
+    async fn a_release_published_with_build_metadata_is_written_without_it() {
+        for full_precision in [false, true] {
+            let mut file = NamedTempFile::with_suffix(".toml").unwrap();
+            write!(
+                file,
+                r#"[dependencies]
+toml_edit = "0.25.12"
+toml = "^0.9.5"
+"#
+            )
+            .unwrap();
+
+            let registry = MockRegistry::new("crates.io")
+                .with_version("toml_edit", "0.25.13+spec-1.1.0")
+                .with_version("toml", "0.9.8+spec-1.1.0")
+                .with_constrained("toml", "^0.9.5", "0.9.8+spec-1.1.0");
+
+            let result = CargoTomlUpdater::new()
+                .update(
+                    file.path(),
+                    &registry,
+                    UpdateOptions::new(false, full_precision),
+                )
+                .await
+                .unwrap();
+
+            assert!(result.warnings.is_empty(), "{:?}", result.warnings);
+            assert!(result.errors.is_empty(), "{:?}", result.errors);
+            let mut updated = updated_versions(&result);
+            updated.sort();
+            assert_eq!(
+                updated,
+                vec![
+                    ("toml", "0.9.5", "0.9.8"),
+                    ("toml_edit", "0.25.12", "0.25.13")
+                ],
+                "full_precision {full_precision}"
+            );
+
+            let content = fs::read_to_string(file.path()).unwrap();
+            assert!(content.contains(r#"toml_edit = "0.25.13""#), "{content}");
+            assert!(content.contains(r#"toml = "^0.9.8""#), "{content}");
+            assert!(!content.contains('+'), "{content}");
+        }
+    }
+
+    /// A requirement that already carries build metadata is on the release it
+    /// names. The same release published without the metadata, or with it, is
+    /// neither an update nor a downgrade, and a newer release replaces the
+    /// metadata along with the version it was attached to.
+    #[tokio::test]
+    async fn a_requirement_carrying_build_metadata_reads_as_its_release() {
+        let mut file = NamedTempFile::with_suffix(".toml").unwrap();
+        write!(
+            file,
+            r#"[dependencies]
+same = "0.25.13+spec-1.1.0"
+bare = "0.25.13+spec-1.1.0"
+newer = "0.25.13+spec-1.1.0"
+"#
+        )
+        .unwrap();
+
+        let registry = MockRegistry::new("crates.io")
+            .with_version("same", "0.25.13+spec-1.1.0")
+            .with_version("bare", "0.25.13")
+            .with_version("newer", "0.25.15+spec-1.1.0");
+
+        let result = CargoTomlUpdater::new()
+            .update(file.path(), &registry, UpdateOptions::new(false, false))
+            .await
+            .unwrap();
+
+        assert!(result.warnings.is_empty(), "{:?}", result.warnings);
+        assert!(result.errors.is_empty(), "{:?}", result.errors);
+        assert_eq!(result.unchanged, 2);
+        assert_eq!(
+            updated_versions(&result),
+            vec![("newer", "0.25.13+spec-1.1.0", "0.25.15")]
+        );
+
+        let content = fs::read_to_string(file.path()).unwrap();
+        assert!(
+            content.contains(r#"same = "0.25.13+spec-1.1.0""#),
+            "{content}"
+        );
+        assert!(
+            content.contains(r#"bare = "0.25.13+spec-1.1.0""#),
+            "{content}"
+        );
+        assert!(content.contains(r#"newer = "0.25.15""#), "{content}");
+    }
+
+    /// A pin names a release, so a pin copied from a registry listing with its
+    /// build metadata writes the release alone, the same as an update would.
+    #[tokio::test]
+    async fn a_pin_carrying_build_metadata_is_written_without_it() {
+        use crate::config::UpdConfig;
+
+        let mut file = NamedTempFile::with_suffix(".toml").unwrap();
+        write!(
+            file,
+            r#"[dependencies]
+toml_edit = "0.25.12"
+winnow = "0.7.13+build.1"
+"#
+        )
+        .unwrap();
+
+        let registry = MockRegistry::new("crates.io");
+        let mut pin = HashMap::new();
+        pin.insert("toml_edit".to_string(), "0.25.13+spec-1.1.0".to_string());
+        pin.insert("winnow".to_string(), "0.7.13".to_string());
+        let config = UpdConfig {
+            pin,
+            ..Default::default()
+        };
+
+        let result = CargoTomlUpdater::new()
+            .update(
+                file.path(),
+                &registry,
+                UpdateOptions::new(false, false).with_config(Arc::new(config)),
+            )
+            .await
+            .unwrap();
+
+        assert!(result.errors.is_empty(), "{:?}", result.errors);
+        let pinned: Vec<_> = result
+            .pinned
+            .iter()
+            .map(|(name, old, new, _)| (name.as_str(), old.as_str(), new.as_str()))
+            .collect();
+        assert_eq!(pinned, vec![("toml_edit", "0.25.12", "0.25.13")]);
+        assert_eq!(
+            result.unchanged, 1,
+            "winnow is already on the pinned release"
+        );
+
+        let content = fs::read_to_string(file.path()).unwrap();
+        assert!(content.contains(r#"toml_edit = "0.25.13""#), "{content}");
+        assert!(
+            content.contains(r#"winnow = "0.7.13+build.1""#),
+            "{content}"
+        );
     }
 
     #[tokio::test]
