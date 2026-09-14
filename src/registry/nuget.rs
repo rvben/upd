@@ -38,9 +38,10 @@ impl NuGetRegistry {
         Self { client, api_url }
     }
 
-    /// Check if a version string represents a pre-release (contains `-`)
+    /// Check if a version string represents a pre-release: a `-` before any
+    /// build metadata, which may itself contain hyphens (`1.2.3+build-7`)
     fn is_prerelease(version: &str) -> bool {
-        version.contains('-')
+        crate::version::without_build_metadata(version).contains('-')
     }
 }
 
@@ -539,6 +540,26 @@ mod tests {
         let registry = NuGetRegistry::with_api_url(mock_server.uri());
         let version = registry.get_latest_version("xunit").await.unwrap();
         assert_eq!(version, "2.6.2");
+    }
+
+    /// Only a hyphen before the `+` marks a pre-release; build metadata may
+    /// carry hyphens of its own.
+    #[tokio::test]
+    async fn a_hyphen_in_build_metadata_is_not_a_prerelease() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/pkgx/index.json"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                r#"{"versions": ["1.0.0", "1.2.3+build-7", "1.3.0-rc.1+build-8"]}"#,
+            ))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let registry = NuGetRegistry::with_api_url(mock_server.uri());
+        let version = registry.get_latest_version("pkgx").await.unwrap();
+        assert_eq!(version, "1.2.3+build-7");
     }
 
     #[tokio::test]

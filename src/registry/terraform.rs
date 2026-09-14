@@ -144,7 +144,7 @@ impl TerraformRegistry {
     fn find_latest_stable(versions: &[String]) -> Option<String> {
         versions
             .iter()
-            .filter(|v| !v.contains('-')) // Skip prereleases (semver convention)
+            .filter(|v| !crate::version::without_build_metadata(v).contains('-')) // Skip prereleases (semver convention)
             .filter_map(|v| semver::Version::parse(v).ok().map(|sv| (v.clone(), sv)))
             .max_by(|(_, a), (_, b)| a.cmp(b))
             .map(|(v, _)| v)
@@ -203,7 +203,7 @@ impl Registry for TerraformRegistry {
         // Parse constraint and find matching versions
         let matching: Vec<_> = versions
             .iter()
-            .filter(|v| !v.contains('-')) // Skip prereleases
+            .filter(|v| !crate::version::without_build_metadata(v).contains('-')) // Skip prereleases
             .filter(|v| matches_terraform_constraint(v, constraints))
             .filter_map(|v| semver::Version::parse(v).ok().map(|sv| (v.clone(), sv)))
             .collect();
@@ -536,6 +536,36 @@ mod tests {
         let registry = TerraformRegistry::with_api_url(mock_server.uri());
         let version = registry.get_latest_version("hashicorp/aws").await.unwrap();
         assert_eq!(version, "5.83.0");
+    }
+
+    /// Only a hyphen before the `+` marks a pre-release; build metadata may
+    /// carry hyphens of its own. Both the unconstrained and the constrained
+    /// lookup read it that way.
+    #[tokio::test]
+    async fn a_hyphen_in_build_metadata_is_not_a_prerelease() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/v1/providers/example/thing/versions"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                r#"{"versions": [{"version": "1.0.0"}, {"version": "1.2.3+build-7"}, {"version": "1.3.0-rc.1+build-8"}]}"#,
+            ))
+            .expect(2)
+            .mount(&mock_server)
+            .await;
+
+        let registry = TerraformRegistry::with_api_url(mock_server.uri());
+        assert_eq!(
+            registry.get_latest_version("example/thing").await.unwrap(),
+            "1.2.3+build-7"
+        );
+        assert_eq!(
+            registry
+                .get_latest_version_matching("example/thing", ">= 1.0")
+                .await
+                .unwrap(),
+            "1.2.3+build-7"
+        );
     }
 
     #[test]
