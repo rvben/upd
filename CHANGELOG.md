@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.12.3](https://github.com/rvben/upd/compare/v0.12.2...v0.12.3) - 2026-09-14
+
+### Fixed
+
+- **cooldown**: ignore GitHub releases whose tag is not a version ([cd5ec92](https://github.com/rvben/upd/commit/cd5ec92ec5356f235f8bd562fbe2e6d47233b016))
+
 ## [0.12.2](https://github.com/rvben/upd/compare/v0.12.1...v0.12.2) - 2026-09-12
 
 ### Added
