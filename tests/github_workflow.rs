@@ -1299,8 +1299,9 @@ fn workflow_defaults_are_reproducible_and_safe() {
 
 #[test]
 fn repository_dependency_jobs_share_the_hardened_workflow() {
-    // The pinned commit must be one the token broker's trust list carries,
-    // or the workflow is rejected at the token exchange.
+    // The pinned commit must be the tag commit of a published upd release at
+    // or above the token broker's minimum release, or the workflow is rejected
+    // at the token exchange.
     assert!(DEPENDENCIES_WORKFLOW.contains(
         "uses: rvben/upd/.github/workflows/dependency-health.yml@ac374e74eb4f6b5cbd39965c65292ae5e2b51411"
     ));
