@@ -490,6 +490,16 @@ impl CargoTomlUpdater {
                         continue;
                     }
 
+                    // A version differing from the requirement only in build
+                    // metadata is the required release: current, with nothing
+                    // newer for cooldown to hold back. Cooldown's own ordering
+                    // ranks it above the requirement, so it is settled here.
+                    let current_release = without_build_metadata(&current_version);
+                    if without_build_metadata(&latest_version) == current_release {
+                        result.unchanged += 1;
+                        continue;
+                    }
+
                     let (outcome, note) = crate::updater::apply_cooldown(
                         effective_registry,
                         &key,
@@ -505,6 +515,21 @@ impl CargoTomlUpdater {
                     }
                     let (latest_version, held_back_record) = match outcome {
                         crate::updater::CooldownOutcome::Unchanged(v) => (v, None),
+                        // Held back to the required release published with other
+                        // build metadata: no newer release is old enough yet.
+                        crate::updater::CooldownOutcome::HeldBack {
+                            chosen,
+                            skipped_version,
+                            skipped_published_at,
+                        } if without_build_metadata(&chosen) == current_release => {
+                            result.skipped_by_cooldown.push((
+                                key,
+                                current_version,
+                                skipped_version,
+                                Some(skipped_published_at),
+                            ));
+                            continue;
+                        }
                         crate::updater::CooldownOutcome::HeldBack {
                             chosen,
                             skipped_version,
@@ -524,7 +549,6 @@ impl CargoTomlUpdater {
                         }
                     };
 
-                    let current_release = without_build_metadata(&current_version);
                     let latest_release = without_build_metadata(&latest_version);
                     // Match the precision of the original version (unless full precision requested)
                     let matched_version = if options.full_precision {
@@ -1509,6 +1533,78 @@ winnow = "0.7.13+build.1"
         assert!(
             content.contains(r#"winnow = "0.7.13+build.1""#),
             "{content}"
+        );
+    }
+
+    /// Cooldown holds back newer releases, and a version differing from the
+    /// required one only in build metadata is the same release, not a newer
+    /// one. A requirement already on the latest release is current however
+    /// fresh that release is, and one waiting on a fresh release reports that
+    /// release as skipped whether or not it spells its own build metadata.
+    #[tokio::test]
+    async fn cooldown_reads_a_release_published_with_build_metadata_as_that_release() {
+        use chrono::{Duration, TimeZone, Utc};
+
+        let now = Utc.with_ymd_and_hms(2026, 9, 14, 12, 0, 0).unwrap();
+        let fresh = now - Duration::days(1);
+        let settled = now - Duration::days(30);
+
+        let mut file = NamedTempFile::with_suffix(".toml").unwrap();
+        write!(
+            file,
+            r#"[dependencies]
+current = "0.25.15"
+waiting = "0.25.13"
+built = "0.25.13+spec-1.1.0"
+"#
+        )
+        .unwrap();
+
+        let mut registry = MockRegistry::new("crates.io")
+            .with_version("current", "0.25.15+spec-1.1.0")
+            .with_version_meta("current", "0.25.15+spec-1.1.0", Some(fresh), false, false);
+        for package in ["waiting", "built"] {
+            registry = registry
+                .with_version(package, "0.25.15+spec-1.1.0")
+                .with_version_meta(package, "0.25.13+spec-1.1.0", Some(settled), false, false)
+                .with_version_meta(package, "0.25.15+spec-1.1.0", Some(fresh), false, false);
+        }
+        let policy = crate::cooldown::CooldownPolicy {
+            default: Duration::days(7),
+            per_ecosystem: HashMap::new(),
+            force_override: None,
+        };
+
+        let result = CargoTomlUpdater::new()
+            .update(
+                file.path(),
+                &registry,
+                UpdateOptions::new(false, false).with_cooldown_policy(policy, now),
+            )
+            .await
+            .unwrap();
+
+        assert!(result.updated.is_empty(), "{:?}", result.updated);
+        assert!(result.held_back.is_empty(), "{:?}", result.held_back);
+        assert_eq!(result.unchanged, 1);
+        let mut skipped = result.skipped_by_cooldown.clone();
+        skipped.sort();
+        assert_eq!(
+            skipped,
+            vec![
+                (
+                    "built".to_string(),
+                    "0.25.13+spec-1.1.0".to_string(),
+                    "0.25.15+spec-1.1.0".to_string(),
+                    Some(fresh),
+                ),
+                (
+                    "waiting".to_string(),
+                    "0.25.13".to_string(),
+                    "0.25.15+spec-1.1.0".to_string(),
+                    Some(fresh),
+                ),
+            ]
         );
     }
 
