@@ -8283,6 +8283,57 @@ serde = "1.0.1"
         }
     }
 
+    /// A hyphen inside build metadata is not a pre-release marker: the higher
+    /// release stays the alignment target and the older one is raised to it,
+    /// never the other way round.
+    #[test]
+    fn test_align_cargo_never_lowers_a_release_whose_build_metadata_has_a_hyphen() {
+        for full_precision in [false, true] {
+            let temp = tempdir().unwrap();
+            let manifest = |name: &str, version: &str| {
+                let path = temp.path().join(name).join("Cargo.toml");
+                std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+                std::fs::write(
+                    &path,
+                    format!("[dependencies]\ntoml_edit = \"{version}\"\n"),
+                )
+                .unwrap();
+                PackageOccurrence {
+                    file_path: path,
+                    file_type: FileType::CargoToml,
+                    version: version.into(),
+                    line_number: Some(2),
+                    has_upper_bound: false,
+                    original_name: "toml_edit".into(),
+                    is_bumpable: true,
+                }
+            };
+            let built = manifest("built", "0.25.13+spec-1.1.0");
+            let older = manifest("older", "0.25.10");
+
+            let result = find_alignments(std::collections::HashMap::from([(
+                ("toml_edit".to_string(), Lang::Rust),
+                vec![built.clone(), older.clone()],
+            )]));
+            let alignment = &result.packages[0];
+            assert_eq!(alignment.highest_version, "0.25.13+spec-1.1.0");
+            let misaligned: Vec<&str> = alignment
+                .misaligned_occurrences()
+                .iter()
+                .map(|o| o.version.as_str())
+                .collect();
+            assert_eq!(misaligned, ["0.25.10"]);
+            assert_eq!(apply_alignments(&[alignment], full_precision).unwrap(), 1);
+            for (occurrence, written) in [(&built, "0.25.13+spec-1.1.0"), (&older, "0.25.13")] {
+                assert_eq!(
+                    std::fs::read_to_string(&occurrence.file_path).unwrap(),
+                    format!("[dependencies]\ntoml_edit = \"{written}\"\n"),
+                    "full_precision={full_precision}"
+                );
+            }
+        }
+    }
+
     #[test]
     fn test_apply_alignments_csproj_multiline_uses_occurrence_line_numbers() {
         let temp = tempdir().unwrap();

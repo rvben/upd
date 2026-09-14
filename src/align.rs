@@ -222,8 +222,9 @@ pub(crate) fn is_stable_version(version: &str, lang: Lang) -> bool {
         Lang::Python => is_stable_pep440(version),
         Lang::Gradle => !crate::version::gradle::is_prerelease(version),
         Lang::Node | Lang::Rust | Lang::Go | Lang::DotNet => {
-            // Semver pre-release indicator: hyphen followed by identifier
-            !version.contains('-')
+            // Semver pre-release indicator: a hyphen before any build
+            // metadata, which may itself contain hyphens (`+spec-1.1.0`)
+            !crate::version::without_build_metadata(version).contains('-')
         }
         Lang::Ruby => {
             let v = version.to_lowercase();
@@ -244,6 +245,8 @@ pub(crate) fn is_stable_version(version: &str, lang: Lang) -> bool {
         | Lang::Terraform
         | Lang::GithubReleases
         | Lang::Annotated => {
+            // Tags follow no single grammar: a hyphen after the `+` can
+            // still mark an early-access build (`23+25-ea-leyden`)
             let v = version.strip_prefix('v').unwrap_or(version);
             !v.contains('-')
         }
@@ -370,6 +373,66 @@ mod tests {
         assert!(!is_stable_version("1.0.0-alpha", Lang::Node));
         assert!(!is_stable_version("1.0.0-beta.1", Lang::Rust));
         assert!(!is_stable_version("1.0.0-rc.1", Lang::Go));
+    }
+
+    /// Semver build metadata may carry hyphens (`0.25.13+spec-1.1.0`); only a
+    /// hyphen before the `+` marks a pre-release.
+    #[test]
+    fn a_hyphen_in_build_metadata_is_not_a_prerelease() {
+        for lang in [Lang::Node, Lang::Rust, Lang::Go, Lang::DotNet] {
+            assert!(is_stable_version("0.25.13+spec-1.1.0", lang), "{lang:?}");
+            assert!(!is_stable_version("1.0.0-rc.1+build-2", lang), "{lang:?}");
+        }
+
+        let occurrence = |version: &str| PackageOccurrence {
+            file_path: PathBuf::from("Cargo.toml"),
+            file_type: FileType::CargoToml,
+            version: version.into(),
+            line_number: Some(1),
+            has_upper_bound: false,
+            original_name: "toml_edit".into(),
+            is_bumpable: true,
+        };
+        let occurrences = [occurrence("0.25.10"), occurrence("0.25.13+spec-1.1.0")];
+        for lang in [Lang::Rust, Lang::Node] {
+            assert_eq!(
+                find_highest_version(&occurrences, lang).as_deref(),
+                Some("0.25.13+spec-1.1.0"),
+                "{lang:?}"
+            );
+        }
+    }
+
+    /// Tags follow no single grammar, and a hyphen after the `+` can still mark
+    /// an early-access build: BellSoft publishes `23+25-ea-leyden` beside the
+    /// release `23+38`. The release stays the alignment target.
+    #[test]
+    fn a_tag_suffix_after_the_build_number_still_marks_an_early_access_build() {
+        for lang in [
+            Lang::Actions,
+            Lang::PreCommit,
+            Lang::Mise,
+            Lang::Terraform,
+            Lang::GithubReleases,
+        ] {
+            assert!(is_stable_version("23+38", lang), "{lang:?}");
+            assert!(!is_stable_version("23+25-ea-leyden", lang), "{lang:?}");
+        }
+
+        let occurrence = |version: &str| PackageOccurrence {
+            file_path: PathBuf::from(".mise.toml"),
+            file_type: FileType::MiseToml,
+            version: version.into(),
+            line_number: Some(1),
+            has_upper_bound: false,
+            original_name: "github:bell-sw/Liberica".into(),
+            is_bumpable: true,
+        };
+        let occurrences = [occurrence("23+38"), occurrence("23+25-ea-leyden")];
+        assert_eq!(
+            find_highest_version(&occurrences, Lang::Mise).as_deref(),
+            Some("23+38")
+        );
     }
 
     #[test]
