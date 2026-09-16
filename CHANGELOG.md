@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.13.0](https://github.com/rvben/upd/compare/v0.12.4...v0.13.0) - 2026-09-16
+
+### Added
+
+- **cooldown**: keep --lock refreshes to the cooldown ([f011c71](https://github.com/rvben/upd/commit/f011c71484bdef5a30b36cb43b896335937b2706))
+
 ## [0.12.4](https://github.com/rvben/upd/compare/v0.12.3...v0.12.4) - 2026-09-15
 
 ### Fixed
