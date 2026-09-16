@@ -10,13 +10,14 @@ use crate::lockfile::{
     LockfileType, RegenOutcome, RestoreFailure, Snapshot, cargo_update_precise, containing_dir,
     detect_lockfiles, regenerate_lockfile, regenerate_lockfiles,
 };
+use crate::lockgate::{GateReport, GateStatus, ReleaseAgeGate};
 use crate::lockscan::cargo::scan_cargo_lock;
 use crate::lockscan::npm::scan_npm_lock;
 use crate::lockscan::poetry::scan_poetry_lock;
 use crate::lockscan::uv::scan_uv_lock;
 use crate::normalize::pep503_normalize;
 use std::cmp::Ordering;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 /// The exact error a suppressed `$name` override reports (see
@@ -83,7 +84,7 @@ pub struct AppliedFix {
 }
 
 /// Controls how `apply_fix_targets` writes and relocks.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct FixApplyOptions {
     pub dry_run: bool,
     /// Relock groups containing only manifest edits (--lock semantics;
@@ -93,6 +94,21 @@ pub struct FixApplyOptions {
     /// a floor without a relock is a no-op).
     pub relock_floors: bool,
     pub verbose: bool,
+    /// The cooldown each relock keeps to, by the path of the file a group
+    /// edits. A path without an entry relocks without one.
+    pub gates: HashMap<PathBuf, ReleaseAgeGate>,
+}
+
+/// What [`apply_fix_targets`] did.
+#[derive(Debug, Default)]
+pub struct FixApplyReport {
+    /// The outcome of every target.
+    pub outcomes: Vec<AppliedFix>,
+    /// Stderr-destined informational notes (dry-run "would regenerate"
+    /// listings, "no lockfile found" skips).
+    pub notes: Vec<String>,
+    /// How far each relock that ran under a cooldown kept to it.
+    pub gates: Vec<GateReport>,
 }
 
 /// Applies the ManifestEdit targets for one file; returns Ok(true) when the
@@ -248,6 +264,16 @@ enum Provisional {
 /// `wrote_status` is the status a `Wrote` target resolves to in the
 /// non-rollback case (`Planned`, `PendingRelock`, or `Applied` depending on
 /// which phase is finalizing).
+/// Every version floor the run chose, each as the crate and the version it
+/// is floored at. A floor an earlier target's update already reached counts
+/// too: it is just as much a floor no hold may take the lockfile back below.
+fn floors_to_keep(items: &[(FixTarget, Provisional)]) -> Vec<(String, String)> {
+    items
+        .iter()
+        .map(|(target, _)| (target.package.clone(), target.to_version.clone()))
+        .collect()
+}
+
 fn finalize(target: FixTarget, prov: Provisional, wrote_status: FixStatus) -> AppliedFix {
     match prov {
         Provisional::Wrote => AppliedFix {
@@ -398,9 +424,13 @@ fn apply_edit_group(
     group: Group,
     opts: &FixApplyOptions,
     apply_manifest_edits: ManifestEditFn<'_>,
-    outcomes: &mut Vec<AppliedFix>,
-    notes: &mut Vec<String>,
+    report: &mut FixApplyReport,
 ) {
+    let FixApplyReport {
+        outcomes,
+        notes,
+        gates,
+    } = report;
     let Group {
         path,
         lockfile,
@@ -570,8 +600,13 @@ fn apply_edit_group(
         }
     }
 
+    let gate = opts.gates.get(&path).copied();
+    // Kept only if the group stands: a rolled-back relock leaves no refreshed
+    // lockfile to check.
+    let mut relock_gates: Vec<GateReport> = Vec::new();
     let relock_result: Result<(), String> = if has_manifest_edit {
-        let result = regenerate_lockfiles(&path, &changed, opts.verbose);
+        let mut result = regenerate_lockfiles(&path, &changed, gate, opts.verbose);
+        relock_gates.append(&mut result.gates);
         if result.no_lockfiles {
             notes.push(format!(
                 "no lockfile found for {} - skipping (nothing to regenerate)",
@@ -589,7 +624,10 @@ fn apply_edit_group(
     } else {
         match lockfile.as_ref().and_then(|l| lockfile_type_for(l)) {
             Some(lockfile_type) => {
-                match regenerate_lockfile(&path, lockfile_type, &changed, opts.verbose) {
+                let relock =
+                    regenerate_lockfile(&path, lockfile_type, &changed, gate, opts.verbose);
+                relock_gates.extend(relock.gate);
+                match relock.outcome {
                     RegenOutcome::Ok(_) => Ok(()),
                     other => Err(other
                         .error_message()
@@ -602,6 +640,7 @@ fn apply_edit_group(
 
     match relock_result {
         Ok(()) => {
+            gates.append(&mut relock_gates);
             for (target, prov) in items {
                 outcomes.push(finalize(target, prov, FixStatus::Applied));
             }
@@ -632,12 +671,15 @@ fn apply_edit_group(
 /// plans and emits a "would regenerate" note (rule 8), and a real run has
 /// each target self-repair (if its vulnerable pair is no longer locked) or
 /// run `cargo update --precise`; any failure restores Cargo.lock and rolls
-/// back the group (rule 7).
+/// back the group (rule 7). A group that stands under a cooldown gate reports
+/// its `Cargo.lock` for the read-back check, since `--precise` can lock
+/// companion crates the cooldown never saw.
 fn apply_cargo_precise_group(
     group: Group,
     opts: &FixApplyOptions,
     outcomes: &mut Vec<AppliedFix>,
     notes: &mut Vec<String>,
+    gates: &mut Vec<GateReport>,
 ) {
     let Group {
         path,
@@ -670,8 +712,10 @@ fn apply_cargo_precise_group(
         return;
     }
 
+    let gate = opts.gates.get(&path).copied();
     let lock = lockfile.unwrap_or(path);
     let snapshot = Snapshot::capture(std::slice::from_ref(&lock));
+    let before = std::fs::read(&lock).ok();
     let lock_dir = containing_dir(&lock).to_path_buf();
 
     let mut items: Vec<(FixTarget, Provisional)> = Vec::new();
@@ -707,6 +751,19 @@ fn apply_cargo_precise_group(
         .collect();
 
     if failure_messages.is_empty() {
+        let keep = floors_to_keep(&items);
+        if let Some(gate) = gate.filter(|_| !keep.is_empty()) {
+            gates.push(GateReport {
+                lockfile: lock,
+                lockfile_type: LockfileType::CargoLock,
+                gate,
+                status: GateStatus::Unenforced {
+                    reason: "cargo has no release-age setting".to_string(),
+                },
+                before,
+                keep,
+            });
+        }
         for (target, prov) in items {
             outcomes.push(finalize(target, prov, FixStatus::Applied));
         }
@@ -725,23 +782,26 @@ fn apply_cargo_precise_group(
 }
 
 /// Applies every fix target in transactional per-`(path, lockfile)` groups.
-/// Returns the per-target outcomes and stderr-destined informational notes
-/// (dry-run "would regenerate" listings, "no lockfile found" skips).
 pub fn apply_fix_targets(
     targets: Vec<FixTarget>,
     opts: &FixApplyOptions,
     apply_manifest_edits: ManifestEditFn<'_>,
-) -> (Vec<AppliedFix>, Vec<String>) {
-    let mut outcomes = Vec::new();
-    let mut notes = Vec::new();
+) -> FixApplyReport {
+    let mut report = FixApplyReport::default();
     for group in group_targets(targets) {
         if group.cargo_precise {
-            apply_cargo_precise_group(group, opts, &mut outcomes, &mut notes);
+            apply_cargo_precise_group(
+                group,
+                opts,
+                &mut report.outcomes,
+                &mut report.notes,
+                &mut report.gates,
+            );
         } else {
-            apply_edit_group(group, opts, apply_manifest_edits, &mut outcomes, &mut notes);
+            apply_edit_group(group, opts, apply_manifest_edits, &mut report);
         }
     }
-    (outcomes, notes)
+    report
 }
 
 #[cfg(test)]
@@ -777,6 +837,46 @@ mod tests {
             line_number: None,
             npm_form: None,
         }
+    }
+
+    fn cargo_floor_target(package: &str, to_version: &str) -> FixTarget {
+        FixTarget {
+            package: package.to_string(),
+            dependency_key: None,
+            from_version: "1.0.0".to_string(),
+            to_version: to_version.to_string(),
+            vulnerable_version: "1.0.0".to_string(),
+            kind: FixKind::CargoPrecise,
+            path: PathBuf::from("Cargo.toml"),
+            file_type: None,
+            lockfile: Some(PathBuf::from("Cargo.lock")),
+            line_number: None,
+            npm_form: None,
+        }
+    }
+
+    /// A floor an earlier target's update already reached is a floor the run
+    /// chose just as much as one this run wrote, so both are kept.
+    #[test]
+    fn a_floor_already_satisfied_is_kept_like_one_the_run_wrote() {
+        let items = vec![
+            (
+                cargo_floor_target("clap_builder", "4.6.6"),
+                Provisional::Wrote,
+            ),
+            (
+                cargo_floor_target("anstream", "0.6.9"),
+                Provisional::AlreadySatisfied,
+            ),
+        ];
+
+        assert_eq!(
+            floors_to_keep(&items),
+            vec![
+                ("clap_builder".to_string(), "4.6.6".to_string()),
+                ("anstream".to_string(), "0.6.9".to_string()),
+            ]
+        );
     }
 
     fn noop_closure() -> impl Fn(&Path, FileType, &[&FixTarget]) -> anyhow::Result<bool> {
@@ -831,9 +931,12 @@ mod tests {
             relock_manifests: true,
             relock_floors: true,
             verbose: false,
+            gates: HashMap::new(),
         };
         let closure = noop_closure();
-        let (outcomes, notes) = apply_fix_targets(vec![target], &opts, &closure);
+        let FixApplyReport {
+            outcomes, notes, ..
+        } = apply_fix_targets(vec![target], &opts, &closure);
 
         assert_eq!(outcomes.len(), 1);
         assert_eq!(outcomes[0].status, FixStatus::Planned);
@@ -856,9 +959,10 @@ mod tests {
             relock_manifests: true,
             relock_floors: false,
             verbose: false,
+            gates: HashMap::new(),
         };
         let closure = noop_closure();
-        let (outcomes, _notes) = apply_fix_targets(vec![target], &opts, &closure);
+        let FixApplyReport { outcomes, .. } = apply_fix_targets(vec![target], &opts, &closure);
 
         assert_eq!(outcomes.len(), 1);
         assert_eq!(outcomes[0].status, FixStatus::PendingRelock);
@@ -897,9 +1001,10 @@ mod tests {
             relock_manifests: true,
             relock_floors: false,
             verbose: false,
+            gates: HashMap::new(),
         };
         let closure = noop_closure();
-        let (outcomes, _notes) = apply_fix_targets(vec![target], &opts, &closure);
+        let FixApplyReport { outcomes, .. } = apply_fix_targets(vec![target], &opts, &closure);
 
         assert_eq!(outcomes.len(), 1);
         assert_eq!(outcomes[0].status, FixStatus::Skipped);
@@ -941,9 +1046,12 @@ mod tests {
             relock_manifests: true,
             relock_floors: false,
             verbose: false,
+            gates: HashMap::new(),
         };
         let closure = noop_closure();
-        let (outcomes, notes) = apply_fix_targets(vec![target], &opts, &closure);
+        let FixApplyReport {
+            outcomes, notes, ..
+        } = apply_fix_targets(vec![target], &opts, &closure);
 
         assert_eq!(outcomes.len(), 1);
         assert_eq!(outcomes[0].status, FixStatus::Skipped);
@@ -985,8 +1093,9 @@ mod tests {
             relock_manifests: false,
             relock_floors: false,
             verbose: false,
+            gates: HashMap::new(),
         };
-        let (outcomes, _notes) = apply_fix_targets(vec![target], &opts, &closure);
+        let FixApplyReport { outcomes, .. } = apply_fix_targets(vec![target], &opts, &closure);
 
         assert_eq!(outcomes.len(), 1);
         assert_eq!(outcomes[0].status, FixStatus::AlreadySatisfied);
@@ -1021,9 +1130,10 @@ mod tests {
             relock_manifests: false,
             relock_floors: false,
             verbose: false,
+            gates: HashMap::new(),
         };
         let closure = noop_closure();
-        let (outcomes, _notes) = apply_fix_targets(vec![target], &opts, &closure);
+        let FixApplyReport { outcomes, .. } = apply_fix_targets(vec![target], &opts, &closure);
 
         assert_eq!(outcomes.len(), 1);
         assert_eq!(outcomes[0].status, FixStatus::Unfixable);
@@ -1068,10 +1178,12 @@ mod tests {
             relock_manifests: true,
             relock_floors: true,
             verbose: false,
+            gates: HashMap::new(),
         };
         let closure = noop_closure();
-        let (outcomes, notes) =
-            apply_fix_targets(vec![override_target, manifest_target], &opts, &closure);
+        let FixApplyReport {
+            outcomes, notes, ..
+        } = apply_fix_targets(vec![override_target, manifest_target], &opts, &closure);
 
         assert_eq!(outcomes.len(), 2);
         assert!(outcomes.iter().all(|o| o.status == FixStatus::Planned));
@@ -1138,9 +1250,11 @@ mod tests {
             relock_manifests: false,
             relock_floors: false,
             verbose: false,
+            gates: HashMap::new(),
         };
-        let (outcomes, notes) =
-            apply_fix_targets(vec![manifest_target, override_target], &opts, &closure);
+        let FixApplyReport {
+            outcomes, notes, ..
+        } = apply_fix_targets(vec![manifest_target, override_target], &opts, &closure);
 
         assert_eq!(outcomes.len(), 2);
         assert_eq!(std::fs::read_to_string(&package_json).unwrap(), before);
@@ -1198,9 +1312,12 @@ mod tests {
             relock_manifests: true,
             relock_floors: true,
             verbose: false,
+            gates: HashMap::new(),
         };
         let closure = noop_closure();
-        let (outcomes, notes) = apply_fix_targets(vec![target], &opts, &closure);
+        let FixApplyReport {
+            outcomes, notes, ..
+        } = apply_fix_targets(vec![target], &opts, &closure);
 
         assert_eq!(outcomes.len(), 1);
         assert_eq!(outcomes[0].status, FixStatus::Planned);

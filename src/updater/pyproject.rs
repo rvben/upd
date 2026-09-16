@@ -7,7 +7,7 @@ use super::{
 use crate::align::compare_versions;
 use crate::config::SpecifierOperator;
 use crate::normalize::pep503_normalize;
-use crate::registry::{DeclaredIndex, IndexChain, Registry, VersionQuery};
+use crate::registry::{DeclaredIndex, IndexChain, IndexSource, Registry, VersionQuery};
 use crate::updater::{Lang, NormalizedSpec};
 use crate::version::{is_prerelease_pep440, is_stable_pep440, match_version_precision};
 use anyhow::{Result, anyhow};
@@ -23,6 +23,26 @@ use toml_edit::{Array, DocumentMut, Formatted, Item, TableLike, Value};
 struct DeclaredIndexes {
     chain: Vec<DeclaredIndex>,
     pins: HashMap<String, String>,
+}
+
+/// The index URLs the pyproject.toml beside `lockfile` declares, the indexes
+/// its dependencies are looked up on besides the configured ones. Empty when
+/// it declares none or cannot be read.
+pub fn declared_index_urls(lockfile: &Path) -> Vec<String> {
+    let Some(doc) = read_file_safe(&lockfile.with_file_name("pyproject.toml"))
+        .ok()
+        .and_then(|content| content.parse::<DocumentMut>().ok())
+    else {
+        return Vec::new();
+    };
+    PyProjectUpdater::declared_indexes(&doc)
+        .chain
+        .into_iter()
+        .filter_map(|index| match index.source {
+            IndexSource::Url(url) => Some(url),
+            IndexSource::Default => None,
+        })
+        .collect()
 }
 
 fn table_str<'t>(table: &'t dyn TableLike, key: &str) -> Option<&'t str> {

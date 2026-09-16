@@ -414,6 +414,41 @@ pub struct UpdateReport {
     /// glob or an ancestor lockfile outside the scanned paths.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub warnings: Vec<String>,
+    /// Releases a lockfile refresh locked inside the cooldown.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub lockfile_cooldown: Vec<LockfileCooldownEntry>,
+    /// Crates a lockfile refresh locked inside the cooldown and upd moved back.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub lockfile_holds: Vec<LockfileHold>,
+}
+
+/// One release a lockfile refresh locked although it was published inside
+/// the cooldown.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct LockfileCooldownEntry {
+    pub lockfile: String,
+    pub package: String,
+    pub version: String,
+    pub published_at: chrono::DateTime<chrono::Utc>,
+    pub cooldown: String,
+    /// Why the release could not be moved back, where upd tried.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+}
+
+/// A crate moved back in `Cargo.lock` because the refresh locked a release
+/// published inside the cooldown.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct LockfileHold {
+    pub lockfile: String,
+    pub package: String,
+    /// The release the refresh locked.
+    pub from: String,
+    /// The release it is held at.
+    pub to: String,
+    /// When `from` was published.
+    pub published_at: chrono::DateTime<chrono::Utc>,
+    pub cooldown: String,
 }
 
 #[derive(Debug, Serialize)]

@@ -282,6 +282,11 @@ impl NpmRegistry {
     }
 
     /// Detect custom registry URL from environment or .npmrc
+    /// The registry unscoped packages are read from.
+    pub fn registry_url(&self) -> &str {
+        &self.registry_url
+    }
+
     pub fn detect_registry_url() -> Option<String> {
         // Check environment variable first
         if let Ok(url) = std::env::var("NPM_REGISTRY")
@@ -439,12 +444,23 @@ impl NpmRegistry {
         &self,
         package: &str,
     ) -> Result<(reqwest::StatusCode, Option<NpmPackageMetadata>)> {
-        // For scoped packages, delegate to the scoped-registry instance so that
-        // its configured registry URL and auth headers are used.
+        // For scoped packages, read from the scoped-registry instance so that
+        // its configured registry URL and auth headers are used. That instance
+        // reads the package directly: resolving the scope a second time would
+        // hand the same package back here and never terminate.
         if let Some(scoped_registry) = Self::for_scoped_package(package) {
-            return Box::pin(scoped_registry.fetch_full_metadata(package)).await;
+            return scoped_registry.fetch_full_metadata_direct(package).await;
         }
 
+        self.fetch_full_metadata_direct(package).await
+    }
+
+    /// Fetch full package metadata from this registry, whatever registry the
+    /// package's scope is configured to use.
+    async fn fetch_full_metadata_direct(
+        &self,
+        package: &str,
+    ) -> Result<(reqwest::StatusCode, Option<NpmPackageMetadata>)> {
         let url = format!("{}/{}", self.registry_url, package);
         // The `time` publish-date map is only present on the full metadata document.
         let response = get_with_retry(&self.client, &url).await?;
@@ -675,6 +691,44 @@ mod tests {
     fn test_registry_name() {
         let registry = NpmRegistry::new();
         assert_eq!(registry.name(), "npm");
+    }
+
+    /// A scoped package's full metadata is read from the registry its scope
+    /// maps to. Resolving the scope hands the package to a fetch that reads
+    /// it, never back to the entry point that resolves the scope.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn scoped_full_metadata_comes_from_the_scoped_registry() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/@updscope/widget"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "versions": {"1.2.3": {}},
+                    "time": {"1.2.3": "2026-01-01T00:00:00Z"},
+                })),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        let mut npmrc = NamedTempFile::new().unwrap();
+        writeln!(npmrc, "@updscope:registry={}", server.uri()).unwrap();
+
+        // SAFETY: `#[serial]` keeps every other env-touching test out of this
+        // window.
+        unsafe {
+            std::env::set_var("NPM_CONFIG_USERCONFIG", npmrc.path());
+        }
+        let versions = NpmRegistry::new().list_versions("@updscope/widget").await;
+        // SAFETY: Same `#[serial]` exclusivity as the set above.
+        unsafe {
+            std::env::remove_var("NPM_CONFIG_USERCONFIG");
+        }
+
+        let versions = versions.expect("the scoped registry answers");
+        assert_eq!(versions.len(), 1);
+        assert_eq!(versions[0].version, "1.2.3");
+        assert!(versions[0].published_at.is_some(), "{versions:?}");
     }
 
     #[test]

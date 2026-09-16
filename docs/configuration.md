@@ -265,6 +265,118 @@ github/codeql-action, for example, publishes its CodeQL bundles
 never a candidate to hold an action back to. A repository whose releases are all
 of that kind is dated from its tags, as if it published no releases.
 
+### Lockfiles
+
+A manifest that keeps to the cooldown is not enough on its own: `upd --lock`
+refreshes the lockfile afterwards, and the lock tool resolves the newest
+release the new requirement allows, including the one the cooldown just held
+back, and any transitive release published an hour ago. So the refresh carries
+the cooldown too, in whatever form the tool understands.
+
+This covers the refreshes `upd update` runs, interactive ones and the relock
+that writes a version floor included. `upd audit --fix-audit` is different: it
+moves a vulnerable package to the release that fixes it, however young that
+release is, so its refreshes are neither gated nor checked as below.
+
+
+| Lockfile | How the cooldown reaches it |
+| --- | --- |
+| `package-lock.json` | `npm install --before`, at the earlier of the cooldown and the project's own `before` or `min-release-age` |
+| `pnpm-lock.yaml` | `--config.minimum-release-age` (pnpm 10.16 or newer) |
+| `yarn.lock` (Berry) | `YARN_NPM_MINIMAL_AGE_GATE` (Yarn 4.10 or newer); `.yarnrc.yml` is not touched |
+| `bun.lock` | `--minimum-release-age` (bun 1.3 or newer) |
+| `uv.lock` | `uv lock --exclude-newer`, see below (a uv with `--exclude-newer-package`) |
+| `Cargo.lock` | young crates.io entries are moved back with `cargo update --precise` |
+| `poetry.lock`, `Gemfile.lock` | not gated, only checked |
+| `packages.lock.json`, `.terraform.lock.hcl` | not gated and not checked, reported as such |
+| `go.sum` | nothing to gate: it records checksums for the versions `go.mod` names |
+
+A project setting that is already stricter than the cooldown is kept as it is.
+Nothing is written to the project's configuration.
+
+For uv, packages the lockfile already held are exempted at their own upload
+time, so a locked release is never moved just because it is young. uv records
+the cutoff in `uv.lock`, where it would make `uv lock --locked` fail without the
+same flags, so upd removes it and runs a plain `uv lock` to confirm the result.
+An exemption admits every release of its package up to the exempted time,
+including a young one, which is why a gated refresh is still checked as below.
+
+For Cargo, each crates.io entry the refresh introduced inside the cooldown is
+held at the newest compatible release outside it, never below what the
+lockfile held before. A version floor upd writes to `Cargo.lock` with
+`cargo update --precise` is checked the same way: a companion crate it locked
+inside the cooldown is held, and the floor itself never is, since it is the
+release the run chose. A crate `[pin]` sets to an exact version is a floor in
+the same way: no hold moves it below that version. In JSON each hold is an entry in `lockfile_holds` with
+`lockfile`, `package`, `from`, `to`, `published_at` (of `from`) and `cooldown`:
+
+```text
+✓ Held clap at 4.6.6 in Cargo.lock (4.6.7 released 3h ago, cooldown 7d)
+```
+
+Every hold is read back from `Cargo.lock`. One that cargo did not carry out,
+that moved another crate below the release the lockfile held before the run, or
+that moved a crate below a version floor the run chose (including a floor
+another floor's update already reached) is undone, and the entry is reported as
+below with the reason as its note. A hold a later hold moved the crate away from
+is dropped the same way, since the lockfile the run leaves behind no longer
+carries it. When `Cargo.lock` cannot be put back after
+such a hold, upd stops holding in that lockfile and reports an error (in JSON,
+in the `errors` of the `Cargo.toml` it belongs to), and the run exits 2.
+
+**What gets reported.** After the refresh, every lockfile upd can read
+(`package-lock.json`, `uv.lock`, `poetry.lock`, `Cargo.lock`, `Gemfile.lock`) is
+read back and each new entry is looked up, including a lockfile refreshed under
+the tool's own gate: that gate exempts packages (npm `min-release-age-exclude`,
+the uv exemptions above) and admits a release with no publish date. A release
+still inside the cooldown is a warning, in JSON an entry in `lockfile_cooldown`
+with `lockfile`, `package`, `version`, `published_at`, `cooldown` and, when upd
+tried to move it back and could not, a `note`:
+
+```text
+Warning: Cargo.lock locks foo 1.2.4, released 2h ago, inside the 7d cooldown; no release outside the cooldown can replace it
+```
+
+An entry whose age upd cannot establish is never taken as outside the
+cooldown. When the registry lookup fails, or the registry does not list the
+version or lists no publish date for it, the entry is named in `warnings`:
+
+```text
+Warning: uv.lock: foo 1.2.4 could not be checked against the 7d cooldown (the registry does not list it)
+```
+
+Release dates are read only from the registries upd itself reads: the Python
+indexes and npm registries set up as in
+[Private registries](private-registries.md) (pypi.org and registry.npmjs.org
+otherwise, with `.npmrc` scope registries for scoped packages), the indexes the
+`pyproject.toml` beside a Python lockfile declares, crates.io and rubygems.org.
+A Python entry is dated by the very index the lockfile records it came from,
+and a release the refresh moved to another index counts as new. So does a
+crate moved to another Cargo registry, or a gem moved to another gem server,
+at the same version.
+A new entry the lockfile records as coming from anywhere else is not looked up;
+each lockfile names those entries in one warning instead. A `Gemfile.lock`
+section that lists another gem server beside rubygems.org does not say which
+one served each gem, so its gems count as coming from elsewhere. Git and path
+dependencies are not registry releases and are left out.
+
+```text
+Warning: uv.lock: 2 new entries come from a registry upd does not read (internal-auth 2.1.0, internal-db 0.4.0), so they were not checked against the 7d cooldown
+```
+
+A refresh that ran without the gate after all says so and why, in `warnings`:
+a gated resolution that failed and was rerun without it, or a uv that resolved
+again once the cutoff was removed. Its lockfile is still checked as above.
+
+```text
+Warning: uv.lock was refreshed without the 7d cooldown (the gated refresh failed: error: No solution found when resolving dependencies)
+```
+
+A tool too old to have the setting is not a warning on its own when upd can
+check the lockfile it wrote. Where it cannot (pnpm, Yarn, bun, NuGet and
+Terraform lockfiles),
+the warning names the reason and adds that the new entries were not checked.
+
 ## Caching
 
 Version lookups are cached for 24 hours in:

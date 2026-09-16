@@ -18,9 +18,9 @@ use upd::audit::{
 use upd::cache::{Cache, CachedRegistry};
 use upd::cli::{BumpLevel, Cli, Command, OutputMode, REVERT_TIP};
 use upd::config::UpdConfig;
-use upd::cooldown::CooldownPolicy;
+use upd::cooldown::{CooldownPolicy, humanize_cooldown};
 use upd::fix::apply::{
-    AppliedFix, FixApplyOptions, FixStatus, apply_fix_targets, probe_floor_target,
+    AppliedFix, FixApplyOptions, FixApplyReport, FixStatus, apply_fix_targets, probe_floor_target,
 };
 use upd::fix::{
     FixKind, FixTarget, FloorResolution, NpmOverrideForm, UnfixableTarget, resolve_floor_version,
@@ -31,6 +31,8 @@ use upd::lockfile::{
     LockfileType, RegenOutcome, RestoreFailure, Snapshot, containing_dir, detect_lockfiles,
     regenerate_lockfile,
 };
+use upd::lockgate::check::{LockCooldownCheck, LockRegistries, check_refreshed_lockfiles};
+use upd::lockgate::{GateReport, ReleaseAgeGate, file_identity};
 use upd::lockscan;
 use upd::normalize::pep503_normalize;
 use upd::output::LockWriteStatus;
@@ -141,19 +143,6 @@ fn humanize_age(age: Duration) -> String {
     }
     let weeks = days / 7;
     format!("{}w ago", weeks)
-}
-
-fn humanize_cooldown(d: Duration) -> String {
-    if d.num_seconds() == 0 {
-        return "disabled".to_string();
-    }
-    if d.num_days() > 0 && d.num_days() * 86_400 == d.num_seconds() {
-        return format!("{}d", d.num_days());
-    }
-    if d.num_hours() * 3600 == d.num_seconds() {
-        return format!("{}h", d.num_hours());
-    }
-    format!("{}s", d.num_seconds())
 }
 
 fn init_tls(cli: &Cli) -> anyhow::Result<()> {
@@ -1053,6 +1042,131 @@ fn plan_lock_groups(files: &[(PathBuf, FileType)]) -> Result<Vec<LockGroup>> {
     Ok(groups)
 }
 
+/// The cooldown each file's lockfile refresh keeps to, for the files that
+/// have one, measured from `now`.
+fn release_age_gates(
+    files: &[(PathBuf, FileType)],
+    file_cooldowns: &HashMap<PathBuf, Option<CooldownPolicy>>,
+    now: chrono::DateTime<Utc>,
+) -> HashMap<PathBuf, ReleaseAgeGate> {
+    files
+        .iter()
+        .filter_map(|(path, file_type)| {
+            let policy = file_cooldowns.get(path).and_then(Option::as_ref);
+            let min_age = upd::output::entry_cooldown(policy, None, *file_type);
+            Some((path.clone(), ReleaseAgeGate::new(min_age, now)?))
+        })
+        .collect()
+}
+
+/// The manifest type whose cooldown a version floor of `kind` is chosen
+/// under, and whose cooldown gates the relock that writes it. A Cargo floor's
+/// `cargo update --precise` can lock companion crates of its own, so it is
+/// gated like a relock; a Poetry or Gradle lock takes no floor.
+fn floor_manifest_type(kind: lockscan::discover::LockKind) -> Option<FileType> {
+    match kind {
+        lockscan::discover::LockKind::Uv => Some(FileType::PyProject),
+        lockscan::discover::LockKind::Npm => Some(FileType::PackageJson),
+        lockscan::discover::LockKind::Cargo => Some(FileType::CargoToml),
+        lockscan::discover::LockKind::Poetry | lockscan::discover::LockKind::Gradle => None,
+    }
+}
+
+/// The registries a refreshed lockfile is read back against, and where each
+/// one reads from.
+fn lock_registries<'a>(
+    pypi: &'a CachedRegistry<MultiPyPiRegistry>,
+    npm: &'a CachedRegistry<NpmRegistry>,
+    crates_io: &'a CachedRegistry<CratesIoRegistry>,
+    rubygems: &'a CachedRegistry<RubyGemsRegistry>,
+) -> LockRegistries<'a> {
+    LockRegistries {
+        pypi,
+        npm,
+        crates_io,
+        rubygems,
+        pypi_indexes: pypi
+            .inner()
+            .registries()
+            .iter()
+            .map(|index| {
+                let registry: &dyn upd::registry::Registry = index.as_ref();
+                (index.index_url().to_string(), registry)
+            })
+            .collect(),
+        npm_registry: npm.inner().registry_url().to_string(),
+        npm_scopes: upd::registry::read_npmrc_config().scoped_registries,
+    }
+}
+
+/// Add each exact version pinned in the configuration of the Cargo manifest
+/// beside a refreshed `Cargo.lock` to what its holds keep: a pin is a version
+/// floor the run chose, like one it wrote.
+fn keep_configured_pins(
+    gates: &mut [GateReport],
+    cli: &Cli,
+    file_configs: &HashMap<PathBuf, Option<Arc<UpdConfig>>>,
+) -> Result<()> {
+    for gate in gates
+        .iter_mut()
+        .filter(|gate| gate.lockfile_type == LockfileType::CargoLock)
+    {
+        let manifest = containing_dir(&gate.lockfile).join("Cargo.toml");
+        let Some(config) = resolve_floor_config(cli, file_configs, &manifest)? else {
+            continue;
+        };
+        for (name, pin) in &config.pin {
+            let version = pin.trim().trim_start_matches('=').trim_start();
+            if semver::Version::parse(version).is_ok() {
+                gate.keep.push((name.clone(), version.to_string()));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Print what reading the refreshed lockfiles back found. Warnings always go
+/// to stderr; the crates held back are progress, shown unless `show_holds`
+/// is off.
+fn print_lock_cooldown(check: &LockCooldownCheck, show_holds: bool) {
+    if show_holds {
+        for hold in &check.holds {
+            println!(
+                "{} Held {} at {} in {} ({} released {}, cooldown {})",
+                "✓".green(),
+                hold.package.bold(),
+                hold.to,
+                hold.lockfile,
+                hold.from,
+                humanize_age(Utc::now() - hold.published_at),
+                hold.cooldown
+            );
+        }
+    }
+    for finding in &check.findings {
+        let note = finding
+            .note
+            .as_ref()
+            .map(|note| format!("; {note}"))
+            .unwrap_or_default();
+        eprintln!(
+            "{} {} locks {} {}, released {}, inside the {} cooldown{note}",
+            "Warning:".yellow(),
+            finding.lockfile,
+            finding.package,
+            finding.version,
+            humanize_age(Utc::now() - finding.published_at),
+            finding.cooldown
+        );
+    }
+    for warning in &check.warnings {
+        eprintln!("{} {}", "Warning:".yellow(), warning);
+    }
+    for (_, error) in &check.errors {
+        eprintln!("{}", format!("error: {error}").red());
+    }
+}
+
 /// What one group's refresh came to.
 struct LockRefresh {
     /// The group's manifests that the run rewrote.
@@ -1060,6 +1174,9 @@ struct LockRefresh {
     outcomes: Vec<RegenOutcome>,
     /// Present when a refresh failed and the group was put back.
     rollback: Option<Rollback>,
+    /// How far the group's refreshes kept to the cooldown; empty when the
+    /// group was put back, since nothing they wrote is left on disk.
+    gates: Vec<GateReport>,
 }
 
 struct Rollback {
@@ -1071,11 +1188,13 @@ struct Rollback {
 /// Refresh the lockfiles of every group with a rewritten manifest, one command
 /// per lockfile. A group whose refresh fails is restored from its snapshot,
 /// manifests and lockfiles alike; a group without a rewritten manifest is left
-/// alone.
+/// alone. Each refresh keeps to the longest cooldown configured for any of the
+/// group's manifests in `manifest_gates`.
 fn refresh_lock_groups(
     groups: Vec<LockGroup>,
     updated_files: &[PathBuf],
     changed_by_lockfile: &ChangedByLockfile,
+    manifest_gates: &HashMap<PathBuf, ReleaseAgeGate>,
     verbose: bool,
 ) -> Vec<LockRefresh> {
     let mut refreshes = Vec::new();
@@ -1094,11 +1213,18 @@ fn refresh_lock_groups(
             .flat_map(|manifest| lockfile_changes_for(changed_by_lockfile, manifest))
             .collect::<Vec<_>>();
         let anchor = group.refresh_manifest.as_ref().unwrap_or(anchor);
-        let outcomes: Vec<RegenOutcome> = group
-            .lockfiles
+        let gate = group
+            .manifests
             .iter()
-            .map(|lockfile| regenerate_lockfile(anchor, *lockfile, &changed, verbose))
-            .collect();
+            .filter_map(|manifest| manifest_gates.get(manifest).copied())
+            .reduce(ReleaseAgeGate::stricter);
+        let mut outcomes: Vec<RegenOutcome> = Vec::new();
+        let mut gates = Vec::new();
+        for lockfile in &group.lockfiles {
+            let relock = regenerate_lockfile(anchor, *lockfile, &changed, gate, verbose);
+            outcomes.push(relock.outcome);
+            gates.extend(relock.gate);
+        }
         let rollback = outcomes
             .iter()
             .any(|outcome| !matches!(outcome, RegenOutcome::Ok(_)))
@@ -1121,10 +1247,14 @@ fn refresh_lock_groups(
                     .collect();
                 Rollback { restored, failures }
             });
+        if rollback.is_some() {
+            gates.clear();
+        }
         refreshes.push(LockRefresh {
             manifests,
             outcomes,
             rollback,
+            gates,
         });
     }
     refreshes
@@ -1669,6 +1799,8 @@ async fn run_update(cli: &Cli) -> Result<()> {
                     cooldown_notes: Vec::new(),
                     floor_reports: Vec::new(),
                     run_warnings: Vec::new(),
+                    lockfile_cooldown: Vec::new(),
+                    lockfile_holds: Vec::new(),
                 },
                 &BoundedOutputParams::from_cli(cli),
             )?;
@@ -1913,6 +2045,10 @@ async fn run_update(cli: &Cli) -> Result<()> {
     } else {
         Vec::new()
     };
+    // One clock for every lockfile refresh in the run, so a lockfile refreshed
+    // twice is held to one cutoff.
+    let run_started = Utc::now();
+    let manifest_gates = release_age_gates(&files, &file_cooldowns, run_started);
     let file_jobs: Vec<_> = files
         .into_iter()
         .map(|(path, file_type)| {
@@ -2126,6 +2262,7 @@ async fn run_update(cli: &Cli) -> Result<()> {
     // rollback here restores the directory to its pre-run state and would
     // also erase a floor already written and reported as applied. Running
     // first also lets the floor branch scan the lockfile the refresh wrote.
+    let mut lock_gates: Vec<GateReport> = Vec::new();
     let (lock_failures, lock_errors) = if cli.lock && !dry_run && !updated_files.is_empty() {
         // Group changed package names by the lockfile their manifest owns.
         // This keeps unrelated ecosystems in the same directory isolated.
@@ -2173,11 +2310,17 @@ async fn run_update(cli: &Cli) -> Result<()> {
                 print_no_lockfile_note(path);
             }
         }
-        let refreshes = refresh_lock_groups(
+        let mut refreshes = refresh_lock_groups(
             lock_groups,
             &updated_files,
             &changed_by_lockfile,
+            &manifest_gates,
             verbose && text_mode,
+        );
+        lock_gates.extend(
+            refreshes
+                .iter_mut()
+                .flat_map(|refresh| std::mem::take(&mut refresh.gates)),
         );
         // The header is only printed when there is real work to do.
         if text_mode && !refreshes.is_empty() && !cli.quiet {
@@ -2196,6 +2339,9 @@ async fn run_update(cli: &Cli) -> Result<()> {
     // the lock's own mechanism (uv constraint, npm override, cargo
     // --precise); poetry has no floor mechanism and is reported unfixable.
     let mut floor_reports: Vec<upd::output::UpdateFileReport> = Vec::new();
+    // The cooldown each floor's relock keeps to, by the file the floor is
+    // written to.
+    let mut floor_gates: HashMap<PathBuf, ReleaseAgeGate> = HashMap::new();
     let mut run_warnings: Vec<String> = Vec::new();
     let mut floor_has_planned = false;
 
@@ -2322,6 +2468,13 @@ async fn run_update(cli: &Cli) -> Result<()> {
                 .with_cooldown_lang(ecosystem_to_lang(lp.ecosystem));
 
                 let ignored = options.should_ignore(&lp.name);
+                if let Some(file_type) = floor_manifest_type(kind) {
+                    let min_age =
+                        upd::output::entry_cooldown(cooldown_policy.as_ref(), None, file_type);
+                    if let Some(gate) = ReleaseAgeGate::new(min_age, run_started) {
+                        floor_gates.insert(report_path.clone(), gate);
+                    }
+                }
                 holders.push((*lp, report_path, options, ignored));
             }
 
@@ -2484,8 +2637,14 @@ async fn run_update(cli: &Cli) -> Result<()> {
                 relock_manifests: cli.lock && !cli.no_lock,
                 relock_floors: !cli.no_lock,
                 verbose: verbose && text_mode,
+                gates: std::mem::take(&mut floor_gates),
             };
-            let (outcomes, notes) = apply_fix_targets(targets, &opts, &|_, _, _| Ok(false));
+            let FixApplyReport {
+                outcomes,
+                notes,
+                gates,
+            } = apply_fix_targets(targets, &opts, &|_, _, _| Ok(false));
+            lock_gates.extend(gates);
             (outcomes, unfixable, notes)
         };
 
@@ -2759,6 +2918,38 @@ async fn run_update(cli: &Cli) -> Result<()> {
         floor_reports = grouped.into_values().collect();
     }
 
+    // Read back every lockfile a refresh rewrote without keeping to the
+    // cooldown, once the lockfile steps have settled what is on disk.
+    let lock_cooldown = if lock_gates.is_empty() {
+        LockCooldownCheck::default()
+    } else {
+        keep_configured_pins(&mut lock_gates, cli, &file_configs)?;
+        let registries = lock_registries(&pypi, &npm, &crates_io, &rubygems);
+        check_refreshed_lockfiles(lock_gates, registries, verbose && text_mode).await
+    };
+    if text_mode {
+        print_lock_cooldown(&lock_cooldown, !cli.quiet);
+    }
+    // A lockfile left carrying a refused hold fails the run. The error goes on
+    // the Cargo manifest nearest the lockfile, so the report names it.
+    for (lockfile, error) in lock_cooldown.errors {
+        let lock_dir = file_identity(containing_dir(&lockfile));
+        let owner = scanned
+            .iter_mut()
+            .filter(|sf| {
+                sf.file_type == FileType::CargoToml
+                    && file_identity(containing_dir(&sf.path)).starts_with(&lock_dir)
+            })
+            .min_by_key(|sf| file_identity(&sf.path).components().count());
+        match owner {
+            Some(sf) => sf.result.errors.push(error),
+            None => total_result.errors.push(error),
+        }
+    }
+    run_warnings.extend(lock_cooldown.warnings);
+    let lockfile_cooldown = lock_cooldown.findings;
+    let lockfile_holds = lock_cooldown.holds;
+
     let package_pattern_warnings = unmatched_package_pattern_warnings(&package_filter);
     if text_mode {
         for warning in &package_pattern_warnings {
@@ -2839,6 +3030,8 @@ async fn run_update(cli: &Cli) -> Result<()> {
                 cooldown_notes: notes_vec,
                 floor_reports,
                 run_warnings,
+                lockfile_cooldown,
+                lockfile_holds,
             },
             &BoundedOutputParams::from_cli(cli),
         )?;
@@ -2888,6 +3081,11 @@ struct UpdateReportInput<'a> {
     /// Run-level warnings that do not belong to one dependency file, including
     /// lock discovery guards and unmatched package patterns.
     run_warnings: Vec<String>,
+    /// Releases a lockfile refresh locked inside the cooldown.
+    lockfile_cooldown: Vec<upd::output::LockfileCooldownEntry>,
+    /// Crates moved back after a lockfile refresh locked them inside the
+    /// cooldown.
+    lockfile_holds: Vec<upd::output::LockfileHold>,
 }
 
 /// Apply --limit, --offset, and --fields to a JSON document for bounded output.
@@ -2989,6 +3187,8 @@ fn emit_update_json(input: UpdateReportInput<'_>, bounded: &BoundedOutputParams<
         cooldown_notes,
         floor_reports,
         run_warnings,
+        lockfile_cooldown,
+        lockfile_holds,
     } = input;
 
     let mut files: Vec<_> = scanned
@@ -3056,7 +3256,7 @@ fn emit_update_json(input: UpdateReportInput<'_>, bounded: &BoundedOutputParams<
         pinned: total_result.pinned.len(),
         ignored: total_result.ignored.len() + floor_ignored,
         errors: total_result.errors.len(),
-        warnings: total_result.warnings.len() + run_warnings.len(),
+        warnings: total_result.warnings.len() + run_warnings.len() + lockfile_cooldown.len(),
         held_back: total_result.held_back.len(),
         skipped_by_cooldown: total_result.skipped_by_cooldown.len(),
         skipped: total_result
@@ -3085,6 +3285,8 @@ fn emit_update_json(input: UpdateReportInput<'_>, bounded: &BoundedOutputParams<
         summary,
         cooldown_notes,
         warnings: run_warnings,
+        lockfile_cooldown,
+        lockfile_holds,
     };
 
     let doc = serde_json::to_value(&report)?;
@@ -3708,17 +3910,30 @@ async fn run_interactive_update(
                 print_no_lockfile_note(path);
             }
         }
-        let refreshes = refresh_lock_groups(
+        let manifest_gates = release_age_gates(files, file_cooldowns, Utc::now());
+        let mut refreshes = refresh_lock_groups(
             lock_groups,
             &updated_files,
             &changed_by_lockfile,
+            &manifest_gates,
             cli.verbose,
         );
+        let mut lock_gates: Vec<GateReport> = refreshes
+            .iter_mut()
+            .flat_map(|refresh| std::mem::take(&mut refresh.gates))
+            .collect();
         if !refreshes.is_empty() && !cli.quiet {
             println!();
             println!("{}", "Regenerating lockfiles...".cyan());
         }
-        let (lock_failures, errors) = report_lock_refreshes(refreshes, !cli.quiet);
+        let (lock_failures, mut errors) = report_lock_refreshes(refreshes, !cli.quiet);
+        if !lock_gates.is_empty() {
+            keep_configured_pins(&mut lock_gates, cli, file_configs)?;
+            let registries = lock_registries(pypi, npm, crates_io, rubygems);
+            let check = check_refreshed_lockfiles(lock_gates, registries, cli.verbose).await;
+            print_lock_cooldown(&check, !cli.quiet);
+            errors.extend(check.errors.into_iter().map(|(_, error)| error));
+        }
         for (path, (updates, pins, normalizations)) in &applied_by_file {
             if refresh_failed(&lock_failures, path) {
                 applied_updates -= updates;
@@ -4383,6 +4598,7 @@ async fn run_audit(cli: &Cli) -> Result<()> {
                 relock_manifests: !cli.no_lock,
                 relock_floors: !cli.no_lock,
                 verbose: cli.verbose && text_mode,
+                gates: HashMap::new(),
             };
             let manifest_editor =
                 |path: &Path, file_type: FileType, targets: &[&FixTarget]| -> Result<bool> {
@@ -4409,7 +4625,10 @@ async fn run_audit(cli: &Cli) -> Result<()> {
                         Ok(false)
                     }
                 };
-            apply_fix_targets(routing.targets, &opts, &manifest_editor)
+            let FixApplyReport {
+                outcomes, notes, ..
+            } = apply_fix_targets(routing.targets, &opts, &manifest_editor);
+            (outcomes, notes)
         };
 
         if !all_blocked {
@@ -6698,6 +6917,7 @@ mod tests {
             lockfile_path: PathBuf::from("uv.lock"),
             line_number: None,
             locator: None,
+            index: None,
         };
         let empty_manifest: HashMap<(String, Lang), Vec<PackageOccurrence>> = HashMap::new();
         assert!(is_lock_only_package(&locked, &empty_manifest));
@@ -6728,6 +6948,7 @@ mod tests {
             lockfile_path: PathBuf::from("uv.lock"),
             line_number: None,
             locator: None,
+            index: None,
         };
 
         let exact = PackageFilter::new(vec!["Typing_Extensions".to_string()]).unwrap();
@@ -8646,6 +8867,7 @@ serde = "1.0.1"
                 restored: restored.iter().map(|path| path.to_path_buf()).collect(),
                 failures,
             }),
+            gates: Vec::new(),
         }
     }
 
@@ -8657,6 +8879,7 @@ serde = "1.0.1"
             manifests: vec![manifest.clone()],
             outcomes: vec![RegenOutcome::Ok(LockfileType::UvLock)],
             rollback: None,
+            gates: Vec::new(),
         };
 
         let (failures, errors) = report_lock_refreshes(vec![refresh], false);
@@ -8885,21 +9108,6 @@ mod output_tests {
     #[test]
     fn test_humanize_age_boundary_14d_switches_to_weeks() {
         assert_eq!(humanize_age(Duration::days(14)), "2w ago");
-    }
-
-    #[test]
-    fn test_humanize_cooldown_days() {
-        assert_eq!(humanize_cooldown(Duration::days(7)), "7d");
-    }
-
-    #[test]
-    fn test_humanize_cooldown_hours() {
-        assert_eq!(humanize_cooldown(Duration::hours(6)), "6h");
-    }
-
-    #[test]
-    fn test_humanize_cooldown_disabled() {
-        assert_eq!(humanize_cooldown(Duration::zero()), "disabled");
     }
 
     #[test]

@@ -43,7 +43,12 @@ fn index_key_lines(content: &str) -> HashMap<String, usize> {
 pub fn scan_npm_lock(path: &Path) -> Result<LockScan> {
     let content = std::fs::read_to_string(path)
         .with_context(|| format!("reading {}", crate::path_display::display_path(path)))?;
-    let doc: serde_json::Value = serde_json::from_str(&content)
+    parse_npm_lock(path, &content)
+}
+
+/// Read package-lock.json `content`, attributing its packages to `path`.
+pub(crate) fn parse_npm_lock(path: &Path, content: &str) -> Result<LockScan> {
+    let doc: serde_json::Value = serde_json::from_str(content)
         .with_context(|| format!("parsing {}", crate::path_display::display_path(path)))?;
 
     let mut scan = LockScan::default();
@@ -58,7 +63,7 @@ pub fn scan_npm_lock(path: &Path) -> Result<LockScan> {
     let Some(packages) = doc.get("packages").and_then(|p| p.as_object()) else {
         return Ok(scan);
     };
-    let key_lines = index_key_lines(&content);
+    let key_lines = index_key_lines(content);
     for (key, entry) in packages {
         let Some(path_name) = name_from_key(key) else {
             continue;
@@ -82,6 +87,10 @@ pub fn scan_npm_lock(path: &Path) -> Result<LockScan> {
             lockfile_path: path.to_path_buf(),
             line_number: key_lines.get(key).copied(),
             locator: Some(key.clone()),
+            index: entry
+                .get("resolved")
+                .and_then(|r| r.as_str())
+                .map(str::to_string),
         });
     }
     Ok(scan)
@@ -134,6 +143,17 @@ mod tests {
         );
         assert!(scan.packages.iter().all(|p| p.ecosystem == Ecosystem::Npm));
         assert!(scan.warnings.is_empty());
+        let index = |name: &str| {
+            scan.packages
+                .iter()
+                .find(|p| p.name == name)
+                .and_then(|p| p.index.as_deref())
+        };
+        assert_eq!(
+            index("examplepkg"),
+            Some("https://registry.npmjs.org/examplepkg/-/examplepkg-4.3.4.tgz")
+        );
+        assert_eq!(index("realpkg"), None);
     }
 
     #[test]

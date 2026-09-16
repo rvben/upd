@@ -13,6 +13,11 @@ use std::path::Path;
 pub fn scan_poetry_lock(path: &Path) -> Result<LockScan> {
     let content = std::fs::read_to_string(path)
         .with_context(|| format!("reading {}", crate::path_display::display_path(path)))?;
+    parse_poetry_lock(path, &content)
+}
+
+/// Read poetry.lock `content`, attributing its packages to `path`.
+pub(crate) fn parse_poetry_lock(path: &Path, content: &str) -> Result<LockScan> {
     let doc: toml::Table = content
         .parse()
         .with_context(|| format!("parsing {}", crate::path_display::display_path(path)))?;
@@ -21,7 +26,7 @@ pub fn scan_poetry_lock(path: &Path) -> Result<LockScan> {
     let Some(packages) = doc.get("package").and_then(|p| p.as_array()) else {
         return Ok(scan);
     };
-    let name_lines = index_name_lines(&content);
+    let name_lines = index_name_lines(content);
     for entry in packages {
         let Some(name) = entry.get("name").and_then(|v| v.as_str()) else {
             continue;
@@ -29,16 +34,14 @@ pub fn scan_poetry_lock(path: &Path) -> Result<LockScan> {
         let Some(version) = entry.get("version").and_then(|v| v.as_str()) else {
             continue;
         };
-        let registry_like = match entry.get("source").and_then(|s| s.as_table()) {
-            None => true,
-            Some(source) => source
-                .get("type")
-                .and_then(|t| t.as_str())
-                .is_some_and(|t| t == "legacy"),
+        let index = match entry.get("source").and_then(|s| s.as_table()) {
+            None => None,
+            Some(source) if source.get("type").and_then(|t| t.as_str()) == Some("legacy") => source
+                .get("url")
+                .and_then(|u| u.as_str())
+                .map(str::to_string),
+            Some(_) => continue,
         };
-        if !registry_like {
-            continue;
-        }
         scan.packages.push(LockedPackage {
             name: name.to_string(),
             version: version.to_string(),
@@ -46,6 +49,7 @@ pub fn scan_poetry_lock(path: &Path) -> Result<LockScan> {
             lockfile_path: path.to_path_buf(),
             line_number: name_lines.get(name).copied(),
             locator: None,
+            index,
         });
     }
     Ok(scan)
@@ -125,6 +129,8 @@ content-hash = "0000"
         );
         assert!(scan.packages.iter().all(|p| p.ecosystem == Ecosystem::PyPI));
         assert!(scan.packages.iter().all(|p| p.line_number.is_some()));
+        let indexes: Vec<Option<&str>> = scan.packages.iter().map(|p| p.index.as_deref()).collect();
+        assert_eq!(indexes, [None, Some("https://pypi.org/simple")]);
     }
 
     #[test]

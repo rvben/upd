@@ -31,6 +31,11 @@ pub struct LockedPackage {
     /// `packages`-map key (encodes nesting, drives positional provenance).
     /// Other formats: None.
     pub locator: Option<String>,
+    /// Where the lockfile records the entry as resolved from: uv's
+    /// `source.registry`, a Poetry legacy source's `url`, npm's `resolved`
+    /// URL, Cargo's `source`. `None` when it records none, which for Poetry
+    /// and npm means the tool's default registry; Gradle records none.
+    pub index: Option<String>,
 }
 
 /// Result of scanning one lockfile.

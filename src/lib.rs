@@ -9,6 +9,7 @@ pub mod fix;
 pub mod http;
 pub mod interactive;
 pub mod lockfile;
+pub mod lockgate;
 pub mod lockscan;
 pub mod normalize;
 pub mod npm_range;

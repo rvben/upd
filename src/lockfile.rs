@@ -10,6 +10,7 @@ use std::process::Command;
 
 use colored::Colorize;
 
+use crate::lockgate::{GateReport, GateStatus, ReleaseAgeGate, condense, native, run_query, uv};
 use crate::updater::specifier_floor;
 
 /// The outcome of attempting to regenerate a single lockfile.
@@ -455,7 +456,18 @@ pub enum ToolProbe {
 /// missing: any other result, including a non-zero exit from `--version`
 /// or an unexpected OS error, means the binary exists.
 pub fn probe_tool(tool: &str) -> ToolProbe {
-    match Command::new(tool).arg("--version").output() {
+    probe_in(tool, None)
+}
+
+/// [`probe_tool`] run in `dir`, where a version manager may select a
+/// different release of the tool than the one outside the project.
+fn probe_in(tool: &str, dir: Option<&Path>) -> ToolProbe {
+    let mut command = Command::new(tool);
+    command.arg("--version");
+    if let Some(dir) = dir {
+        command.current_dir(dir);
+    }
+    match command.output() {
         Ok(output) => ToolProbe::Present {
             version: output
                 .status
@@ -587,6 +599,82 @@ impl Snapshot {
     }
 }
 
+/// What one lockfile refresh came to.
+#[derive(Debug)]
+pub struct Relock {
+    pub outcome: RegenOutcome,
+    /// How far a successful refresh under a cooldown kept to it; `None` when
+    /// no cooldown applied or the refresh did not succeed.
+    pub gate: Option<GateReport>,
+}
+
+/// One package manager command.
+struct Invocation {
+    cmd: &'static str,
+    args: Vec<String>,
+    env: Vec<(String, String)>,
+}
+
+/// Why an [`Invocation`] failed.
+struct ToolFailure {
+    /// The error entry for the refresh.
+    message: String,
+    /// What the tool itself said.
+    detail: String,
+}
+
+impl Invocation {
+    fn run(
+        &self,
+        lockfile_type: LockfileType,
+        dir: &Path,
+        verbose: bool,
+    ) -> Result<(), ToolFailure> {
+        if verbose {
+            let env: String = self
+                .env
+                .iter()
+                .map(|(key, value)| format!("{key}={value} "))
+                .collect();
+            println!(
+                "{}",
+                format!(
+                    "Regenerating {} with `{env}{} {}`...",
+                    lockfile_type.filename(),
+                    self.cmd,
+                    self.args.join(" ")
+                )
+                .cyan()
+            );
+        }
+
+        let output = Command::new(self.cmd)
+            .args(&self.args)
+            .envs(self.env.iter().map(|(key, value)| (key, value)))
+            .current_dir(dir)
+            .output()
+            .map_err(|e| ToolFailure {
+                message: format!("Failed to run `{}`: {e}", self.cmd),
+                detail: e.to_string(),
+            })?;
+
+        if output.status.success() {
+            // Success reporting is the caller's job: this module cannot know
+            // whether stdout is a JSON report that stray text would corrupt.
+            Ok(())
+        } else {
+            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+            Err(ToolFailure {
+                message: format!(
+                    "Failed to regenerate {}: {stderr}",
+                    lockfile_type.filename()
+                ),
+                detail: stderr,
+            })
+        }
+    }
+}
+
 /// Regenerate a single lockfile by running the appropriate package manager.
 ///
 /// `changed` is the list of package names that `upd` just rewrote in the
@@ -594,21 +682,27 @@ impl Snapshot {
 /// ecosystems that support targeted commands (e.g. `cargo update -p …`) only
 /// touch the packages that actually changed.
 ///
-/// Returns a [`RegenOutcome`] distinguishing success, missing tool, and
-/// command failure.
+/// Under a `gate` the refresh is handed the tool's own release-age setting
+/// where it has one. When the tool refuses to resolve under it, the lockfile
+/// is put back and refreshed without it, and the returned [`GateReport`] says
+/// so, so the caller can read the result back against the cooldown.
 pub fn regenerate_lockfile(
     manifest_path: &Path,
     lockfile_type: LockfileType,
     changed: &[String],
+    gate: Option<ReleaseAgeGate>,
     verbose: bool,
-) -> RegenOutcome {
+) -> Relock {
     let dir = containing_dir(manifest_path);
     let (tool, _) = lockfile_type.command(&[]);
-    let version = match probe_tool(tool) {
+    let version = match probe_in(tool, Some(dir)) {
         ToolProbe::Missing => {
-            return RegenOutcome::ToolMissing {
-                lockfile: lockfile_type,
-                tool,
+            return Relock {
+                outcome: RegenOutcome::ToolMissing {
+                    lockfile: lockfile_type,
+                    tool,
+                },
+                gate: None,
             };
         }
         ToolProbe::Present { version } => version,
@@ -620,45 +714,205 @@ pub fn regenerate_lockfile(
         }
         _ => lockfile_type.command_for(changed, version.as_deref()),
     };
-
-    if verbose {
-        println!(
-            "{}",
-            format!(
-                "Regenerating {} with `{} {}`...",
-                lockfile_type.filename(),
-                cmd,
-                args.join(" ")
-            )
-            .cyan()
-        );
-    }
-
-    let output = match Command::new(cmd).args(&args).current_dir(dir).output() {
-        Ok(o) => o,
-        Err(e) => {
-            return RegenOutcome::Failed {
-                lockfile: lockfile_type,
-                message: format!("Failed to run `{cmd}`: {e}"),
-            };
-        }
+    let plain = Invocation {
+        cmd,
+        args,
+        env: Vec::new(),
     };
 
-    if output.status.success() {
-        // Success reporting is the caller's job: this module cannot know
-        // whether stdout is a JSON report that stray text would corrupt.
-        RegenOutcome::Ok(lockfile_type)
-    } else {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        RegenOutcome::Failed {
-            lockfile: lockfile_type,
-            message: format!(
-                "Failed to regenerate {}: {}",
-                lockfile_type.filename(),
-                stderr.trim()
-            ),
+    // `go.sum` records checksums for the versions `go.mod` already names, so
+    // its refresh introduces no release of its own choosing.
+    let Some(gate) = gate.filter(|_| lockfile_type != LockfileType::GoSum) else {
+        let outcome = match plain.run(lockfile_type, dir, verbose) {
+            Ok(()) => RegenOutcome::Ok(lockfile_type),
+            Err(failure) => RegenOutcome::Failed {
+                lockfile: lockfile_type,
+                message: failure.message,
+            },
+        };
+        return Relock {
+            outcome,
+            gate: None,
+        };
+    };
+
+    let lock_path = dir.join(lockfile_type.filename());
+    let refresh = GatedRefresh {
+        lockfile_type,
+        dir,
+        gate,
+        before: std::fs::read(&lock_path).ok(),
+        snapshot: Snapshot::capture(std::slice::from_ref(&lock_path)),
+        lock_path,
+        plain,
+        verbose,
+    };
+    match lockfile_type {
+        LockfileType::UvLock => refresh.uv(),
+        _ => refresh.native(version.as_deref()),
+    }
+}
+
+/// One lockfile refresh under a cooldown.
+struct GatedRefresh<'a> {
+    lockfile_type: LockfileType,
+    dir: &'a Path,
+    gate: ReleaseAgeGate,
+    lock_path: PathBuf,
+    before: Option<Vec<u8>>,
+    snapshot: Snapshot,
+    plain: Invocation,
+    verbose: bool,
+}
+
+impl GatedRefresh<'_> {
+    fn run(&self, invocation: &Invocation) -> Result<(), ToolFailure> {
+        invocation.run(self.lockfile_type, self.dir, self.verbose)
+    }
+
+    /// The plain command with `extra_args` and `env` added.
+    fn gated(&self, extra_args: Vec<String>, env: Vec<(String, String)>) -> Invocation {
+        Invocation {
+            cmd: self.plain.cmd,
+            args: self.plain.args.iter().cloned().chain(extra_args).collect(),
+            env,
         }
     }
+
+    /// A failed refresh, leaving the lockfile as the tool left it: every
+    /// caller of `regenerate_lockfile` restores its own snapshot on anything
+    /// but `Ok`, which covers a partial write the tool made before failing.
+    fn failed(&self, message: String) -> Relock {
+        Relock {
+            outcome: RegenOutcome::Failed {
+                lockfile: self.lockfile_type,
+                message,
+            },
+            gate: None,
+        }
+    }
+
+    fn succeeded(self, status: GateStatus) -> Relock {
+        Relock {
+            outcome: RegenOutcome::Ok(self.lockfile_type),
+            gate: Some(GateReport {
+                lockfile: self.lock_path,
+                lockfile_type: self.lockfile_type,
+                gate: self.gate,
+                status,
+                before: self.before,
+                keep: Vec::new(),
+            }),
+        }
+    }
+
+    /// Run the plain command and report it as keeping to the gate as far as
+    /// `status` says.
+    fn finish_plain(self, status: GateStatus) -> Relock {
+        match self.run(&self.plain) {
+            Ok(()) => self.succeeded(status),
+            Err(failure) => self.failed(failure.message),
+        }
+    }
+
+    /// Put the lockfile back after a gated run that cannot stand, and refresh
+    /// it without the gate.
+    fn fall_back(self, reason: String) -> Relock {
+        let failures = self.snapshot.restore();
+        if !failures.is_empty() {
+            let failures = failures
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join("; ");
+            return self.failed(format!(
+                "Failed to regenerate {} under the {} cooldown ({reason}), and {failures}",
+                self.lockfile_type.filename(),
+                self.gate.humanized()
+            ));
+        }
+        self.finish_plain(GateStatus::Bypassed { reason })
+    }
+
+    fn native(self, version: Option<&str>) -> Relock {
+        match native::plan(self.lockfile_type, self.dir, version, self.gate) {
+            Ok(Some(setting)) => {
+                let gated = self.gated(setting.extra_args, setting.env);
+                match self.run(&gated) {
+                    Ok(()) => self.succeeded(GateStatus::Enforced),
+                    Err(failure) => self.fall_back(refused(&failure)),
+                }
+            }
+            Ok(None) => self.finish_plain(GateStatus::Enforced),
+            Err(reason) => self.finish_plain(GateStatus::Unenforced { reason }),
+        }
+    }
+
+    /// uv is gated in two passes. The first resolves under `--exclude-newer`,
+    /// exempting each locked package that already has a release inside the
+    /// cooldown so it is not moved back. The cutoff it records in `uv.lock` is
+    /// then removed, since `uv lock --locked` rejects a lockfile whose cutoff
+    /// the project does not configure, and a plain `uv lock` confirms the
+    /// result. Some uv releases resolve again once the cutoff is gone, so a
+    /// plain pass that moves anything is reported as not keeping to the gate.
+    fn uv(self) -> Relock {
+        let query = |cmd: &str, args: &[&str]| run_query(self.dir, cmd, args);
+        let plan = uv::plan(
+            self.dir,
+            self.before.as_deref(),
+            self.gate,
+            &query,
+            &|key| std::env::var_os(key),
+        );
+        let extra_args = match plan {
+            Ok(extra_args) => extra_args,
+            Err(reason) => return self.finish_plain(GateStatus::Unenforced { reason }),
+        };
+        if let Err(failure) = self.run(&self.gated(extra_args, Vec::new())) {
+            return self.fall_back(refused(&failure));
+        }
+        let gated = match std::fs::read(&self.lock_path) {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                return self.fall_back(format!(
+                    "uv.lock could not be read back after the gated refresh ({e})"
+                ));
+            }
+        };
+        if let Some(reason) = self
+            .before
+            .as_deref()
+            .and_then(|before| uv::downgrade(before, &gated))
+        {
+            return self.fall_back(reason);
+        }
+        let unpinned = match uv::strip_cutoff(&gated) {
+            Ok(bytes) => bytes,
+            Err(reason) => return self.fall_back(reason),
+        };
+        if let Err(e) = std::fs::write(&self.lock_path, &unpinned) {
+            return self.fall_back(format!(
+                "the cutoff could not be removed from uv.lock ({e})"
+            ));
+        }
+        if let Err(failure) = self.run(&self.plain) {
+            return self.failed(failure.message);
+        }
+        let status = match std::fs::read(&self.lock_path) {
+            Ok(after) => uv::drift(&unpinned, &after).map_or(GateStatus::Enforced, |reason| {
+                GateStatus::Bypassed { reason }
+            }),
+            Err(e) => GateStatus::Unenforced {
+                reason: format!("uv.lock could not be read back after the refresh ({e})"),
+            },
+        };
+        self.succeeded(status)
+    }
+}
+
+/// The reason a refresh ran without the gate after the tool refused it.
+fn refused(failure: &ToolFailure) -> String {
+    format!("the gated refresh failed: {}", condense(&failure.detail))
 }
 
 /// Cargo's semver-compatibility key: the position of the leading non-zero
@@ -667,7 +921,7 @@ pub fn regenerate_lockfile(
 /// Two versions of one crate can only sit in the same lockfile when their keys
 /// differ, which is what makes the key enough to tell locked entries apart.
 /// Answers `None` for a version whose leading components are not numeric.
-fn cargo_compat_key(version: &str) -> Option<(usize, u64)> {
+pub(crate) fn cargo_compat_key(version: &str) -> Option<(usize, u64)> {
     let core = version.split(['-', '+']).next().unwrap_or(version);
     for (index, component) in core.split('.').take(3).enumerate() {
         let value: u64 = component.trim().parse().ok()?;
@@ -1029,6 +1283,8 @@ pub struct LockfileRegenResult {
     pub outcomes: Vec<RegenOutcome>,
     /// True if the manifest had no associated lockfiles to regenerate.
     pub no_lockfiles: bool,
+    /// How far each successful refresh under a cooldown kept to it.
+    pub gates: Vec<GateReport>,
 }
 
 impl LockfileRegenResult {
@@ -1054,26 +1310,25 @@ impl LockfileRegenResult {
 pub fn regenerate_lockfiles(
     manifest_path: &Path,
     changed: &[String],
+    gate: Option<ReleaseAgeGate>,
     verbose: bool,
 ) -> LockfileRegenResult {
     let lockfiles = detect_lockfiles(manifest_path);
 
     if lockfiles.is_empty() {
         return LockfileRegenResult {
-            outcomes: Vec::new(),
             no_lockfiles: true,
+            ..LockfileRegenResult::default()
         };
     }
 
-    let outcomes = lockfiles
-        .into_iter()
-        .map(|lf| regenerate_lockfile(manifest_path, lf, changed, verbose))
-        .collect();
-
-    LockfileRegenResult {
-        outcomes,
-        no_lockfiles: false,
+    let mut result = LockfileRegenResult::default();
+    for lockfile in lockfiles {
+        let relock = regenerate_lockfile(manifest_path, lockfile, changed, gate, verbose);
+        result.outcomes.push(relock.outcome);
+        result.gates.extend(relock.gate);
     }
+    result
 }
 
 #[cfg(test)]
@@ -2070,7 +2325,7 @@ thiserror = "0.9.1"
         fs::write(&manifest, "{}").unwrap();
         // Deliberately do NOT create package-lock.json
 
-        let result = regenerate_lockfiles(&manifest, &[], false);
+        let result = regenerate_lockfiles(&manifest, &[], None, false);
         assert!(
             result.no_lockfiles,
             "no_lockfiles should be true when no lockfile exists beside the manifest"
@@ -2089,7 +2344,7 @@ thiserror = "0.9.1"
         fs::write(&manifest, "[package]").unwrap();
         // Deliberately do NOT create Cargo.lock
 
-        let result = regenerate_lockfiles(&manifest, &[], false);
+        let result = regenerate_lockfiles(&manifest, &[], None, false);
         assert!(
             result.no_lockfiles,
             "no_lockfiles should be true when Cargo.lock is absent"
@@ -2148,6 +2403,7 @@ thiserror = "0.9.1"
                 },
             ],
             no_lockfiles: false,
+            gates: Vec::new(),
         };
         let msgs = result.error_messages();
         assert_eq!(msgs.len(), 2, "only ToolMissing and Failed are errors");

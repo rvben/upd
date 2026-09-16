@@ -54,6 +54,21 @@ pub fn parse_duration(input: &str) -> Result<Duration> {
     }
 }
 
+/// A cooldown as the short form it is configured in: `7d`, `6h`, or seconds
+/// when neither divides it, and `disabled` for zero.
+pub fn humanize_cooldown(d: Duration) -> String {
+    if d.num_seconds() == 0 {
+        return "disabled".to_string();
+    }
+    if d.num_days() > 0 && d.num_days() * 86_400 == d.num_seconds() {
+        return format!("{}d", d.num_days());
+    }
+    if d.num_hours() * 3600 == d.num_seconds() {
+        return format!("{}h", d.num_hours());
+    }
+    format!("{}s", d.num_seconds())
+}
+
 /// The resolved cooldown policy for a single run.
 ///
 /// Precedence (highest first): `force_override`, then the language key, then
@@ -377,6 +392,26 @@ fn parse_version_padded(v: &str) -> Option<semver::Version> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn humanize_cooldown_days() {
+        assert_eq!(humanize_cooldown(Duration::days(7)), "7d");
+    }
+
+    #[test]
+    fn humanize_cooldown_hours() {
+        assert_eq!(humanize_cooldown(Duration::hours(6)), "6h");
+    }
+
+    #[test]
+    fn humanize_cooldown_seconds() {
+        assert_eq!(humanize_cooldown(Duration::seconds(90)), "90s");
+    }
+
+    #[test]
+    fn humanize_cooldown_disabled() {
+        assert_eq!(humanize_cooldown(Duration::zero()), "disabled");
+    }
 
     #[test]
     fn test_parse_duration_seconds() {

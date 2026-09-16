@@ -229,6 +229,11 @@ impl<R: Registry> CachedRegistry<R> {
         }
     }
 
+    /// The registry this wraps.
+    pub fn inner(&self) -> &R {
+        &self.inner
+    }
+
     /// Use a registry-configuration-specific cache namespace.
     ///
     /// Registries in the same ecosystem can serve different releases for the

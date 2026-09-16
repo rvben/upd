@@ -25,7 +25,7 @@ pub use mise::MiseUpdater;
 
 pub use package_json::PackageJsonUpdater;
 pub use pre_commit::{PreCommitEdit, PreCommitUpdater};
-pub use pyproject::{PyProjectUpdater, apply_normalized_specs};
+pub use pyproject::{PyProjectUpdater, apply_normalized_specs, declared_index_urls};
 pub use requirements::RequirementsUpdater;
 pub use terraform::TerraformUpdater;
 

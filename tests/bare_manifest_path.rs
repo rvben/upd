@@ -41,7 +41,7 @@ fn bare_manifest_name_regenerates_in_current_directory() {
     write_fixture_crate(tmp.path());
     std::env::set_current_dir(tmp.path()).unwrap();
 
-    let result = regenerate_lockfiles(Path::new("Cargo.toml"), &[], false);
+    let result = regenerate_lockfiles(Path::new("Cargo.toml"), &[], None, false);
 
     assert!(
         !result.no_lockfiles,

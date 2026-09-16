@@ -40,6 +40,7 @@ pub fn scan_gradle_lock(path: &Path) -> anyhow::Result<LockScan> {
             lockfile_path: path.into(),
             line_number: Some(line + 1),
             locator: None,
+            index: None,
         });
     }
     if !result.warnings.is_empty() {

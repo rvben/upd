@@ -28,13 +28,13 @@ pub fn scan_cargo_lock(path: &Path) -> Result<LockScan> {
         let Some(version) = entry.get("version").and_then(|v| v.as_str()) else {
             continue;
         };
-        let is_registry = entry
+        let Some(source) = entry
             .get("source")
             .and_then(|v| v.as_str())
-            .is_some_and(|s| s.starts_with("registry+"));
-        if !is_registry {
+            .filter(|s| s.starts_with("registry+"))
+        else {
             continue;
-        }
+        };
         scan.packages.push(LockedPackage {
             name: name.to_string(),
             version: version.to_string(),
@@ -44,6 +44,7 @@ pub fn scan_cargo_lock(path: &Path) -> Result<LockScan> {
                 .get(&(name.to_string(), version.to_string()))
                 .copied(),
             locator: None,
+            index: Some(source.to_string()),
         });
     }
     Ok(scan)

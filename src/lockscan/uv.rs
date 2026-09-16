@@ -12,6 +12,11 @@ use std::path::Path;
 pub fn scan_uv_lock(path: &Path) -> Result<LockScan> {
     let content = std::fs::read_to_string(path)
         .with_context(|| format!("reading {}", crate::path_display::display_path(path)))?;
+    parse_uv_lock(path, &content)
+}
+
+/// Read uv.lock `content`, attributing its packages to `path`.
+pub(crate) fn parse_uv_lock(path: &Path, content: &str) -> Result<LockScan> {
     let doc: toml::Table = content
         .parse()
         .with_context(|| format!("parsing {}", crate::path_display::display_path(path)))?;
@@ -20,7 +25,7 @@ pub fn scan_uv_lock(path: &Path) -> Result<LockScan> {
     let Some(packages) = doc.get("package").and_then(|p| p.as_array()) else {
         return Ok(scan);
     };
-    let name_lines = index_name_lines(&content);
+    let name_lines = index_name_lines(content);
     for entry in packages {
         let Some(name) = entry.get("name").and_then(|v| v.as_str()) else {
             continue;
@@ -28,13 +33,13 @@ pub fn scan_uv_lock(path: &Path) -> Result<LockScan> {
         let Some(version) = entry.get("version").and_then(|v| v.as_str()) else {
             continue;
         };
-        let is_registry = entry
+        let Some(registry) = entry
             .get("source")
             .and_then(|s| s.as_table())
-            .is_some_and(|t| t.contains_key("registry"));
-        if !is_registry {
+            .and_then(|t| t.get("registry"))
+        else {
             continue;
-        }
+        };
         scan.packages.push(LockedPackage {
             name: name.to_string(),
             version: version.to_string(),
@@ -42,6 +47,7 @@ pub fn scan_uv_lock(path: &Path) -> Result<LockScan> {
             lockfile_path: path.to_path_buf(),
             line_number: name_lines.get(name).copied(),
             locator: None,
+            index: registry.as_str().map(str::to_string),
         });
     }
     Ok(scan)
@@ -106,6 +112,7 @@ source = { editable = "pkgs/editdep" }
         assert_eq!(pkg.version, "2.0.5");
         assert_eq!(pkg.ecosystem, Ecosystem::PyPI);
         assert_eq!(pkg.lockfile_path, path);
+        assert_eq!(pkg.index.as_deref(), Some("https://pypi.org/simple"));
         assert!(scan.warnings.is_empty());
     }
 

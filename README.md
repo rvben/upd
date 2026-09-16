@@ -481,7 +481,8 @@ release integrity.
 
 ### Cooldown (minimum release age)
 
-Hold back versions published less than N days ago, per ecosystem or per language.
+Hold back versions published less than N days ago, per ecosystem or per language,
+and keep `--lock` refreshes to the same cooldown.
 → [docs/configuration.md#cooldown-minimum-release-age](https://github.com/rvben/upd/blob/main/docs/configuration.md#cooldown-minimum-release-age)
 
 ### Caching

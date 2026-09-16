@@ -548,6 +548,7 @@ unixdep = "0.3"
             lockfile_path: lock.to_path_buf(),
             line_number: None,
             locator: locator.map(str::to_string),
+            index: None,
         }
     }
 

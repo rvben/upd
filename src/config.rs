@@ -711,7 +711,7 @@ security_remediation = false
 /// Lowercases the name and collapses any run of `-`, `_`, or `.` into a single
 /// `-`. Applied to both sides of an ignore-list comparison so spellings that
 /// differ only in case or separator are treated as the same package.
-fn normalize_package_name(name: &str) -> String {
+pub(crate) fn normalize_package_name(name: &str) -> String {
     let mut out = String::with_capacity(name.len());
     let mut prev_separator = false;
     for ch in name.chars() {
