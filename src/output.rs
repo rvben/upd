@@ -1686,6 +1686,7 @@ mod tests {
             package_name: "react".into(),
             highest_version: "19.0.0".into(),
             lang: Lang::Node,
+            full_precision: false,
             occurrences: vec![
                 PackageOccurrence {
                     file_path: PathBuf::from("app/package.json"),
@@ -1745,6 +1746,7 @@ mod tests {
             package_name: "foo".into(),
             highest_version: "1.0.0+build.1".into(),
             lang: Lang::Rust,
+            full_precision: false,
             occurrences: vec![
                 occurrence("bare/Cargo.toml", "1.0.0"),
                 occurrence("built/Cargo.toml", "1.0.0+build.1"),

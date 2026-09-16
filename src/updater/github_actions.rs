@@ -5,7 +5,6 @@ use super::{
 use crate::align::compare_versions;
 use crate::registry::{Registry, is_ref_not_found};
 use crate::updater::Lang;
-use crate::version::match_version_precision;
 use anyhow::Result;
 use futures::future::join_all;
 use regex::Regex;
@@ -343,21 +342,7 @@ impl GithubActionsUpdater {
 
     /// Compute the updated version string, preserving the `v` prefix and precision
     fn compute_updated_version(current: &str, latest: &str, full_precision: bool) -> String {
-        let has_v = current.starts_with('v');
-        let stripped_current = current.strip_prefix('v').unwrap_or(current);
-        let stripped_latest = latest.strip_prefix('v').unwrap_or(latest);
-
-        let result = if full_precision {
-            stripped_latest.to_string()
-        } else {
-            match_version_precision(stripped_current, stripped_latest)
-        };
-
-        if has_v {
-            format!("v{}", result)
-        } else {
-            result
-        }
+        crate::version::match_precision_with_prefix(current, latest, full_precision)
     }
 
     /// Resolve a precision-matched version against the refs a repo actually

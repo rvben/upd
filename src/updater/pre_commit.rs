@@ -12,7 +12,6 @@ use crate::align::compare_versions;
 use crate::registry::Registry;
 use crate::updater::{Lang, SkipStatus, SkippedUpdate};
 use crate::version::TagVersion;
-use crate::version::match_version_precision;
 use anyhow::Result;
 use config::{Node, Scalar};
 use std::collections::HashMap;
@@ -254,19 +253,7 @@ impl PreCommitUpdater {
     }
 
     fn compute_updated_version(current: &str, latest: &str, full_precision: bool) -> String {
-        let version = if full_precision {
-            latest.trim_start_matches('v').to_string()
-        } else {
-            match_version_precision(
-                current.trim_start_matches('v'),
-                latest.trim_start_matches('v'),
-            )
-        };
-        if current.starts_with('v') {
-            format!("v{version}")
-        } else {
-            version
-        }
+        crate::version::match_precision_with_prefix(current, latest, full_precision)
     }
 
     fn parse(content: &str, path: &Path) -> Result<Node> {

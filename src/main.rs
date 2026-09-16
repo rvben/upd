@@ -51,9 +51,7 @@ use upd::updater::{
     SkipStatus, SkippedUpdate, TerraformUpdater, UpdateOptions, UpdateResult, Updater,
     classify_bump, discover_files_with, read_file_safe, update_with_annotations, write_file_atomic,
 };
-use upd::version::{
-    compare_versions, match_cargo_precision, match_version_precision, without_build_metadata,
-};
+use upd::version::{compare_versions, written_version};
 
 /// Walk up from `start` to find the nearest ancestor directory that contains a
 /// `.git` entry (file or directory). Returns the path to that ancestor.
@@ -4079,7 +4077,7 @@ async fn run_align(cli: &Cli) -> Result<()> {
     };
 
     // Find alignments
-    let align_result = find_alignments(packages);
+    let align_result = find_alignments(packages, cli.full_precision);
 
     // Surface packages the config ignores so a green `--check` is explainable.
     // Goes to stderr (like the discovery "skipping <path>" lines) so it never
@@ -5320,15 +5318,46 @@ fn apply_version_updates(
     let mut applied = vec![false; updates.len()];
 
     for (idx, update) in updates.iter().enumerate() {
-        let target_version = match (file_type, full_precision) {
-            // One rule for both Cargo writers; see `match_cargo_precision`.
-            (FileType::CargoToml, true) => without_build_metadata(update.new_version).to_string(),
-            (FileType::CargoToml, false) => {
-                match_cargo_precision(update.old_version, update.new_version)
-            }
-            (_, true) => update.new_version.to_string(),
-            (_, false) => match_version_precision(update.old_version, update.new_version),
-        };
+        let target_version = written_version(
+            file_type,
+            update.old_version,
+            update.new_version,
+            full_precision,
+        );
+
+        // A target equal to what the file already declares is not an edit: the
+        // writer would produce the bytes that are there. Reporting it as a
+        // failed edit fails a run that has nothing to do.
+        //
+        // Skipping is only safe when the declaration already names a release no
+        // older than the one requested. Matching precision can shorten a target
+        // below what was asked for, and a `3.2` standing in for a requested
+        // `3.2.1` is a different release rather than the same one spelled
+        // shorter. Security remediation writes through this dispatcher, so
+        // counting that as satisfied would report a fix while the file still
+        // carries the vulnerable version.
+        //
+        // The check pads release segments, which is what makes `1.0` and
+        // `1.0.0` one release here and keeps a precision-only difference
+        // skippable.
+        //
+        // A SHA pin is the exception, because the edit it carries is the
+        // 40-character commit rather than the version string. A restyled tag
+        // resolving to the new commit reports the same version on both sides,
+        // and the target version cannot express that pending commit, so
+        // skipping here would leave the old commit in the file and still count
+        // the pin as written.
+        if update.sha_pin.is_none()
+            && target_version == update.old_version
+            && upd::align::names_release_at_least(
+                &target_version,
+                update.new_version,
+                file_type.lang(),
+            )
+        {
+            applied[idx] = true;
+            continue;
+        }
 
         applied[idx] = match file_type {
             FileType::Requirements => {
@@ -8168,6 +8197,121 @@ mod tests {
         );
     }
 
+    /// Security remediation writes through this same dispatcher, and there a
+    /// target that matches the declaration's precision is not a no-op: it is a
+    /// vulnerable file left as it was. `django==3.2` with an advisory fixed in
+    /// `3.2.1` matches back to `3.2`, which is exactly what the file already
+    /// says, so treating it as nothing to write reports the fix as satisfied
+    /// while the vulnerable pin survives.
+    ///
+    /// Skipping is only safe when the version already declared is not LOWER
+    /// than the one requested. `1.0` against a requested `1.0.0` names one
+    /// release and may be skipped; `3.2` against a requested `3.2.1` does not.
+    #[test]
+    fn test_apply_version_updates_refuses_a_target_below_the_requested_version() {
+        let content = "django==3.2\n";
+        let updates = [VersionEdit {
+            package: "django",
+            old_version: "3.2",
+            new_version: "3.2.1",
+            line_num: Some(1),
+            expected_source: None,
+            sha_pin: None,
+        }];
+
+        let error = apply_version_updates(content, &updates, FileType::Requirements, false)
+            .unwrap_err()
+            .to_string();
+
+        assert!(
+            error.contains("Failed to apply 1 version edit"),
+            "a fix that cannot reach the requested version must fail loudly rather than report success: {error}"
+        );
+    }
+
+    /// The other half of the same guard. A target equal to what the file
+    /// already declares is not an edit, and must count as satisfied rather than
+    /// failed: without the skip the writer runs, produces the bytes that are
+    /// already there, reports that it changed nothing, and the run fails with
+    /// "Failed to apply 1 version edit(s)" over work that did not need doing.
+    ///
+    /// align can no longer reach this, because its predicate now predicts the
+    /// same written version and never schedules such an edit. The registry
+    /// path still reaches it, where the declared precision truncates a higher
+    /// release back onto the declaration already present, so the skip stays
+    /// load-bearing and needs an assertion of its own rather than one borrowed
+    /// from align.
+    #[test]
+    fn test_apply_version_updates_skips_a_non_pin_edit_that_would_rewrite_the_same_bytes() {
+        let content = "[dependencies]\nserde = \"1.0\"\n";
+        let updates = [VersionEdit {
+            package: "serde",
+            old_version: "1.0",
+            new_version: "1.0.0",
+            line_num: Some(2),
+            expected_source: None,
+            sha_pin: None,
+        }];
+
+        let applied = apply_version_updates(content, &updates, FileType::CargoToml, false).unwrap();
+
+        assert_eq!(
+            applied.content, content,
+            "a target the file already declares must leave the bytes untouched"
+        );
+        assert_eq!(
+            applied.applied_count(),
+            1,
+            "an edit with nothing to write is satisfied, not failed"
+        );
+    }
+
+    /// A pin can be approved while its version string stays put: when a
+    /// restyled tag resolves to the new commit, the scan reports the same
+    /// version on both sides and the only edit is the 40-character commit.
+    /// Predicting the version a writer would produce cannot see that commit,
+    /// so treating an unchanged version as "nothing to write" skips the
+    /// rewrite and still counts it as done, leaving the old commit in the file.
+    #[test]
+    fn test_apply_version_updates_rewrites_a_sha_pin_whose_version_is_unchanged() {
+        const OLD_SHA: &str = "11bd71901bbe5b1630ceea73d27597364c9af683";
+        const NEW_SHA: &str = "08c6903cd8c0fde910a37f88322edcfb5dd907a8";
+        let content = format!(
+            "jobs:\n  build:\n    steps:\n      - uses: actions/checkout@{OLD_SHA} # v4.2.2\n"
+        );
+        let pin = ActionShaUpdate {
+            package: "actions/checkout".to_string(),
+            current_version: "v4.2.2".to_string(),
+            new_version: "v4.2.2".to_string(),
+            current_commit: OLD_SHA.to_string(),
+            new_commit: NEW_SHA.to_string(),
+            line_number: Some(4),
+        };
+        let updates = [VersionEdit {
+            package: "actions/checkout",
+            old_version: "v4.2.2",
+            new_version: "v4.2.2",
+            line_num: Some(4),
+            expected_source: None,
+            sha_pin: Some(&pin),
+        }];
+
+        let applied =
+            apply_version_updates(&content, &updates, FileType::GithubActions, false).unwrap();
+
+        assert!(
+            applied.content.contains(NEW_SHA),
+            "the approved commit must reach the file even though the version string is unchanged:\n{}",
+            applied.content
+        );
+        assert!(
+            !applied.content.contains(OLD_SHA),
+            "the old commit must not survive:\n{}",
+            applied.content
+        );
+        assert_eq!(applied.applied_count(), 1);
+    }
+
     /// Build a pin for `package` on `line`, with commits distinguishable by the
     /// line they came from.
     fn pin_on_line(package: &str, line: Option<usize>) -> ActionShaUpdate {
@@ -8467,10 +8611,13 @@ serde = "1.0.1"
             let built = manifest("built", "1.0.0+build.1");
             let older = manifest("older", "0.9.0");
             let group = |occurrences: Vec<PackageOccurrence>| {
-                find_alignments(std::collections::HashMap::from([(
-                    ("foo".to_string(), Lang::Rust),
-                    occurrences,
-                )]))
+                find_alignments(
+                    std::collections::HashMap::from([(
+                        ("foo".to_string(), Lang::Rust),
+                        occurrences,
+                    )]),
+                    full_precision,
+                )
             };
 
             let agreeing = group(vec![bare.clone(), built.clone()]);
@@ -8532,10 +8679,13 @@ serde = "1.0.1"
             let built = manifest("built", "0.25.13+spec-1.1.0");
             let older = manifest("older", "0.25.10");
 
-            let result = find_alignments(std::collections::HashMap::from([(
-                ("toml_edit".to_string(), Lang::Rust),
-                vec![built.clone(), older.clone()],
-            )]));
+            let result = find_alignments(
+                std::collections::HashMap::from([(
+                    ("toml_edit".to_string(), Lang::Rust),
+                    vec![built.clone(), older.clone()],
+                )]),
+                full_precision,
+            );
             let alignment = &result.packages[0];
             assert_eq!(alignment.highest_version, "0.25.13+spec-1.1.0");
             let misaligned: Vec<&str> = alignment
@@ -8585,6 +8735,7 @@ serde = "1.0.1"
                 is_bumpable: true,
             }],
             lang: Lang::DotNet,
+            full_precision: false,
         };
 
         let updated_count = apply_alignments(&[&alignment], false).unwrap();

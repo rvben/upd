@@ -53,21 +53,33 @@ pub struct PackageAlignment {
     pub occurrences: Vec<PackageOccurrence>,
     /// Language/ecosystem of this package
     pub lang: Lang,
+    /// Whether the run writes a version whole rather than at the precision the
+    /// declaration already uses. It decides whether two declarations differing
+    /// only in precision are a misalignment: by default they cannot be written
+    /// apart, and under `--full-precision` they can.
+    pub full_precision: bool,
 }
 
 impl PackageAlignment {
-    /// Whether `occurrence` already declares the highest version.
+    /// Whether raising `occurrence` to the highest version would change its file.
     ///
-    /// Cargo ignores semver build metadata in a requirement and upd writes a
-    /// Cargo version without it, so a Cargo version is compared as the release
-    /// it names. Every other ecosystem compares the declared strings.
+    /// A declaration is raised by writing a new string into it, and a writer
+    /// keeps the precision and `v` prefix the declaration already uses. Two
+    /// declarations a writer cannot express apart (`1.0` against `1.0.0`)
+    /// therefore already agree, and an edit between them would write the bytes
+    /// that are already there. Cargo ignores semver build metadata in a
+    /// requirement and upd writes a Cargo version without it, so a Cargo
+    /// declaration is compared as the release it names.
     pub fn is_at_highest(&self, occurrence: &PackageOccurrence) -> bool {
+        let target = crate::version::written_version(
+            occurrence.file_type,
+            &occurrence.version,
+            &self.highest_version,
+            self.full_precision,
+        );
         match self.lang {
-            Lang::Rust => {
-                crate::version::without_build_metadata(&occurrence.version)
-                    == crate::version::without_build_metadata(&self.highest_version)
-            }
-            _ => occurrence.version == self.highest_version,
+            Lang::Rust => target == crate::version::without_build_metadata(&occurrence.version),
+            _ => target == occurrence.version,
         }
     }
 
@@ -162,7 +174,10 @@ pub fn scan_packages(
 }
 
 /// Find the highest version for each package and identify misalignments
-pub fn find_alignments(packages: HashMap<(String, Lang), Vec<PackageOccurrence>>) -> AlignResult {
+pub fn find_alignments(
+    packages: HashMap<(String, Lang), Vec<PackageOccurrence>>,
+    full_precision: bool,
+) -> AlignResult {
     let mut result = AlignResult::default();
 
     for ((package_name, lang), occurrences) in packages {
@@ -187,6 +202,7 @@ pub fn find_alignments(packages: HashMap<(String, Lang), Vec<PackageOccurrence>>
                 highest_version: highest_version.clone(),
                 occurrences,
                 lang,
+                full_precision,
             };
 
             if alignment.has_misalignment() {
@@ -212,8 +228,26 @@ fn find_highest_version(occurrences: &[PackageOccurrence], lang: Lang) -> Option
         .filter(|o| o.is_bumpable) // Skip commit-pinned refs (e.g. Go pseudo-versions)
         .filter(|o| !o.has_upper_bound) // Skip constrained versions
         .filter(|o| is_stable_version(&o.version, lang)) // Skip pre-releases
-        .max_by(|a, b| compare_versions(&a.version, &b.version, lang))
+        // Release segments compare with implicit trailing zeros, so `v4` and
+        // `v4.0.0` name one release and compare Equal. `max_by` keeps the last
+        // of several equal maxima, which would leave the winner resting on
+        // whichever file the walk reached last. Breaking the tie toward the
+        // more precise declaration keeps the result independent of walk order,
+        // and stops a raise from ever shortening a declaration.
+        .max_by(|a, b| {
+            compare_versions(&a.version, &b.version, lang)
+                .then_with(|| release_segments(&a.version).cmp(&release_segments(&b.version)))
+        })
         .map(|o| o.version.clone())
+}
+
+/// How precisely a version names its release: the number of dot-separated
+/// segments, ignoring a `v` prefix, pre-release suffix and build metadata.
+fn release_segments(version: &str) -> usize {
+    let bare = version.strip_prefix('v').unwrap_or(version);
+    let release = crate::version::without_build_metadata(bare);
+    let release = release.split('-').next().unwrap_or(release);
+    release.split('.').count()
 }
 
 /// Check if a version is stable (not a pre-release)
@@ -278,6 +312,22 @@ pub(crate) fn compare_versions(a: &str, b: &str, lang: Lang) -> std::cmp::Orderi
     }
 }
 
+/// Whether `declared` names a release no older than `requested`.
+///
+/// Release segments compare with implicit trailing zeros, so a declaration that
+/// differs from the request only in precision (`1.0` against `1.0.0`) names the
+/// same release and satisfies it. A shorter string is not automatically a
+/// satisfied one, though: `3.2` against a requested `3.2.1` is an earlier
+/// release spelled at lower precision, not the same one spelled shorter.
+///
+/// Callers outside this module write version strings into files and need to
+/// know whether an edit is still owed, which is the question this answers. The
+/// comparator itself stays private so that the ecosystem rules it encodes have
+/// one entry point.
+pub fn names_release_at_least(declared: &str, requested: &str, lang: Lang) -> bool {
+    compare_versions(declared, requested, lang) != std::cmp::Ordering::Less
+}
+
 /// Compare PEP 440 versions
 fn compare_pep440(a: &str, b: &str) -> std::cmp::Ordering {
     match (
@@ -325,6 +375,117 @@ fn compare_go_version(a: &str, b: &str) -> std::cmp::Ordering {
 mod tests {
     use super::*;
 
+    /// Precision is measured on the release alone. Counting raw dots would rank
+    /// `1.0.0+build.1` above `1.0.0` and hand every metadata-carrying
+    /// declaration the tie, which installs a different arbitrary winner rather
+    /// than removing one.
+    #[test]
+    fn precision_counts_release_segments_only() {
+        assert_eq!(release_segments("1.0"), 2);
+        assert_eq!(release_segments("1.0.0"), 3);
+        assert_eq!(release_segments("v1.0.0"), 3, "a v prefix is not a segment");
+        assert_eq!(
+            release_segments("1.0.0+build.1"),
+            3,
+            "build metadata must not inflate precision"
+        );
+        assert_eq!(
+            release_segments("23+38"),
+            1,
+            "build metadata must not inflate precision"
+        );
+        assert_eq!(
+            release_segments("1.0.0-rc.1"),
+            3,
+            "a pre-release suffix is not a segment"
+        );
+    }
+
+    /// A shorter version string is two different things depending on what it
+    /// omits, and a writer deciding whether an edit is still owed has to tell
+    /// them apart. `1.0` omits zeros it implies, so it already names `1.0.0`.
+    /// `3.2` omits a `1` it does not imply, so it names an earlier release than
+    /// `3.2.1` and the edit is still outstanding.
+    #[test]
+    fn a_declaration_satisfies_a_request_only_when_it_is_not_an_earlier_release() {
+        assert!(
+            names_release_at_least("1.0", "1.0.0", Lang::Rust),
+            "trailing zeros are implied, so these name one release"
+        );
+        assert!(
+            names_release_at_least("1.0.0", "1.0", Lang::Rust),
+            "the same holds with the operands the other way round"
+        );
+        assert!(
+            !names_release_at_least("3.2", "3.2.1", Lang::Python),
+            "3.2 is an earlier release than 3.2.1, not 3.2.1 spelled shorter"
+        );
+        assert!(
+            names_release_at_least("3.3", "3.2.1", Lang::Python),
+            "a later release satisfies the request"
+        );
+        assert!(
+            names_release_at_least("v4", "v4.0.0", Lang::Actions),
+            "a v prefix does not change which release a string names"
+        );
+        assert!(
+            !names_release_at_least("v4.0.0", "v4.1.0", Lang::Actions),
+            "a v prefix does not excuse an earlier release either"
+        );
+    }
+
+    /// `1.0` and `1.0.0` name one release, so neither is higher and the order
+    /// occurrences arrive in must not decide the winner. The more precise
+    /// spelling wins, which also gives a genuinely lower declaration a target
+    /// that keeps every segment it declared: `0.9.5` is raised to `1.0.0`,
+    /// not written down to `1.0`.
+    #[test]
+    fn a_precision_tie_is_won_by_the_more_precise_declaration_in_either_order() {
+        let occurrence = |path: &str, version: &str| PackageOccurrence {
+            file_path: PathBuf::from(path),
+            file_type: FileType::CargoToml,
+            version: version.into(),
+            line_number: Some(1),
+            has_upper_bound: false,
+            original_name: "serde".into(),
+            is_bumpable: true,
+        };
+        let highest = |occurrences: Vec<PackageOccurrence>| {
+            find_alignments(
+                HashMap::from([(("serde".to_string(), Lang::Rust), occurrences)]),
+                false,
+            )
+            .packages[0]
+                .highest_version
+                .clone()
+        };
+
+        assert_eq!(
+            highest(vec![
+                occurrence("a/Cargo.toml", "1.0"),
+                occurrence("b/Cargo.toml", "1.0.0"),
+            ]),
+            "1.0.0"
+        );
+        assert_eq!(
+            highest(vec![
+                occurrence("a/Cargo.toml", "1.0.0"),
+                occurrence("b/Cargo.toml", "1.0"),
+            ]),
+            "1.0.0",
+            "the winner must not depend on which declaration is seen last"
+        );
+        assert_eq!(
+            highest(vec![
+                occurrence("a/Cargo.toml", "0.9.5"),
+                occurrence("b/Cargo.toml", "1.0"),
+                occurrence("c/Cargo.toml", "1.0.0"),
+            ]),
+            "1.0.0",
+            "a lower declaration must be raised to the more precise spelling"
+        );
+    }
+
     /// A PEP 440 local version selects a different artifact (`+cpu`), so unlike
     /// Cargo build metadata it keeps two Python declarations apart.
     #[test]
@@ -338,13 +499,16 @@ mod tests {
             original_name: "torch".into(),
             is_bumpable: true,
         };
-        let result = find_alignments(HashMap::from([(
-            ("torch".to_string(), Lang::Python),
-            vec![
-                occurrence("a/pyproject.toml", "2.1.0"),
-                occurrence("b/pyproject.toml", "2.1.0+cpu"),
-            ],
-        )]));
+        let result = find_alignments(
+            HashMap::from([(
+                ("torch".to_string(), Lang::Python),
+                vec![
+                    occurrence("a/pyproject.toml", "2.1.0"),
+                    occurrence("b/pyproject.toml", "2.1.0+cpu"),
+                ],
+            )]),
+            false,
+        );
         assert_eq!(result.packages[0].highest_version, "2.1.0+cpu");
         let misaligned: Vec<&str> = result.packages[0]
             .misaligned_occurrences()
@@ -451,6 +615,7 @@ mod tests {
             package_name: "requests".to_string(),
             highest_version: "2.31.0".to_string(),
             lang: Lang::Python,
+            full_precision: false,
             occurrences: vec![
                 PackageOccurrence {
                     file_path: PathBuf::from("requirements.txt"),
@@ -483,6 +648,7 @@ mod tests {
             package_name: "django".to_string(),
             highest_version: "4.2.0".to_string(),
             lang: Lang::Python,
+            full_precision: false,
             occurrences: vec![
                 PackageOccurrence {
                     file_path: PathBuf::from("requirements.txt"),
@@ -582,7 +748,7 @@ mod tests {
             (file_b.path().to_path_buf(), FileType::GoMod),
         ];
         let packages = scan_packages(&files, &[], ParseWarnings::Suppress).unwrap();
-        let result = find_alignments(packages);
+        let result = find_alignments(packages, false);
 
         // There must be no misaligned occurrences - the pseudo-version is a pin, not
         // a version choice that should be aligned to v0.17.0.
@@ -694,6 +860,7 @@ dev = ["pyyaml==6.0.*"]
             highest_version: find_highest_version(occurrences, Lang::Python).unwrap(),
             occurrences: occurrences.clone(),
             lang: Lang::Python,
+            full_precision: false,
         };
         assert_eq!(alignment.highest_version, "6.0.3");
         assert!(
@@ -807,7 +974,7 @@ click = "^8.1.0"
             vec![occ_for_test("1.0.0"), occ_for_test("2.0.0")],
         );
 
-        let result = find_alignments(packages);
+        let result = find_alignments(packages, false);
 
         assert!(
             result.packages.is_empty(),
@@ -825,7 +992,7 @@ click = "^8.1.0"
             vec![occ_for_test("1.0.0"), occ_for_test("2.0.0")],
         );
 
-        let result = find_alignments(packages);
+        let result = find_alignments(packages, false);
 
         assert_eq!(result.packages.len(), 1);
         assert_eq!(result.packages[0].highest_version, "2.0.0");
@@ -861,7 +1028,7 @@ click = "^8.1.0"
             packages.keys().collect::<Vec<_>>()
         );
 
-        let result = find_alignments(packages);
+        let result = find_alignments(packages, false);
 
         assert!(
             result.packages.is_empty(),

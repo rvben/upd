@@ -11,6 +11,60 @@ pub use semver_util::{
 };
 pub use tag::TagVersion;
 
+use crate::updater::FileType;
+
+/// Match `latest` to the precision and `v` prefix that `current` declares.
+///
+/// A git ref names a tag, so the `v` belongs to the declaration rather than to
+/// the release: shortening `v4.1.2` to `4` names a ref the repository does not
+/// publish. Both parts of the declaration's shape therefore survive the rewrite.
+pub fn match_precision_with_prefix(current: &str, latest: &str, full_precision: bool) -> String {
+    let bare_current = current.strip_prefix('v').unwrap_or(current);
+    let bare_latest = latest.strip_prefix('v').unwrap_or(latest);
+    let matched = if full_precision {
+        bare_latest.to_string()
+    } else {
+        match_version_precision(bare_current, bare_latest)
+    };
+    crate::annotation::reapply_v_prefix(current, &matched)
+}
+
+/// The string a writer puts in a file of `file_type` when raising `original` to
+/// `new_version`.
+///
+/// Writing a version is the only way to raise one, so this answers what any
+/// caller proposing an edit would actually produce. Asking it before scheduling
+/// an edit is what keeps a report of pending work and the work itself the same
+/// question: a target equal to what is already declared is no edit at all.
+pub fn written_version(
+    file_type: FileType,
+    original: &str,
+    new_version: &str,
+    full_precision: bool,
+) -> String {
+    match (file_type, full_precision) {
+        // One rule for both Cargo writers; see `match_cargo_precision`.
+        (FileType::CargoToml, true) => without_build_metadata(new_version).to_string(),
+        (FileType::CargoToml, false) => match_cargo_precision(original, new_version),
+        // Gradle versions are written whole, by a writer that takes the target
+        // before any precision matching.
+        (FileType::GradleCatalog | FileType::GradleScript | FileType::GradleWrapper, _) => {
+            new_version.to_string()
+        }
+        // Refs carry their own prefix.
+        (FileType::GithubActions | FileType::PreCommitConfig, _) => {
+            match_precision_with_prefix(original, new_version, full_precision)
+        }
+        (FileType::Annotated, true) => crate::annotation::reapply_v_prefix(original, new_version),
+        (FileType::Annotated, false) => crate::annotation::reapply_v_prefix(
+            original,
+            &match_version_precision(original, new_version),
+        ),
+        (_, true) => new_version.to_string(),
+        (_, false) => match_version_precision(original, new_version),
+    }
+}
+
 /// Match the precision of a new version to the original version's precision.
 ///
 /// For PEP 440 versions (Python), the release segment length is determined by
