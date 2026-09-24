@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.13.2](https://github.com/rvben/upd/compare/v0.13.1...v0.13.2) - 2026-09-24
+
+### Fixed
+
+- **actions**: advise ignoring an action that publishes no releases ([15384c3](https://github.com/rvben/upd/commit/15384c379292896ce38e86648680abbc3b6d69fd))
+
 ## [0.13.1](https://github.com/rvben/upd/compare/v0.13.0...v0.13.1) - 2026-09-24
 
 ### Added
