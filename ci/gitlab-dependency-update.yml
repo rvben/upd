@@ -245,6 +245,45 @@ spec:
       else
         expected_remote_sha=""
       fi
+      if [ -n "$expected_remote_sha" ]; then
+        # The rolling branch contains exactly one generated commit. A lease
+        # protects against races, but cannot protect a commit already present
+        # when this job starts. Check before either rewriting or deleting it.
+        branch_commits="$(git rev-list "refs/remotes/origin/${CI_DEFAULT_BRANCH}..refs/remotes/origin/${UPD_BRANCH}")"
+        branch_count="$(printf '%s\n' "$branch_commits" | grep --count . || true)"
+        branch_owned=false
+        if [ "$branch_count" -eq 1 ]; then
+          branch_author="$(git show -s --format=%ae "$expected_remote_sha")"
+          branch_committer="$(git show -s --format=%ce "$expected_remote_sha")"
+          branch_message="$(git show -s --format=%s "$expected_remote_sha")"
+          if [ "$branch_author" = "$UPD_GIT_EMAIL" ] &&
+             [ "$branch_committer" = "$UPD_GIT_EMAIL" ] &&
+             [ "$branch_message" = "$UPD_COMMIT_MESSAGE" ]; then
+            branch_owned=true
+          fi
+        fi
+        if [ "$branch_owned" != true ]; then
+          echo "Paused: unexpected commits on ${UPD_BRANCH}; leaving the branch untouched"
+          mr_list="$(find_open_mrs)"
+          mr_count="$(jq 'length' <<< "$mr_list")"
+          if [ "$mr_count" -ne 1 ]; then
+            echo "Cannot publish a pause notice: expected one open merge request, found $mr_count" >&2
+            exit 2
+          fi
+          if ! jq --exit-status '.[0].description | type == "string"' <<< "$mr_list" >/dev/null; then
+            echo "Cannot preserve the merge-request description while publishing a pause notice" >&2
+            exit 2
+          fi
+          mr_iid="$(jq --raw-output '.[0].iid' <<< "$mr_list")"
+          jq --raw-output '.[0].description' <<< "$mr_list" > "$work_dir/pause-description"
+          if ! grep --fixed-strings --quiet '<!-- upd-human-commit-pause -->' "$work_dir/pause-description"; then
+            printf '\n\n<!-- upd-human-commit-pause -->\n> **Automation paused:** this branch has commits outside the generated upd commit. Preserve them or remove them before automation resumes.\n' >> "$work_dir/pause-description"
+            gitlab_api --request PUT --form "description=<$work_dir/pause-description" \
+              "$mr_api/$mr_iid" >/dev/null
+          fi
+          exit 0
+        fi
+      fi
       git switch --force-create "$UPD_BRANCH" "refs/remotes/origin/${CI_DEFAULT_BRANCH}"
 
       if [ -n "$UPD_PREPARE_COMMAND" ]; then

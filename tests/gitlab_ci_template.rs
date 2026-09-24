@@ -563,6 +563,116 @@ async fn template_closes_an_obsolete_merge_request_and_deletes_its_branch() {
     assert_eq!(fixture.branch_file(), None);
 }
 
+#[tokio::test]
+async fn template_preserves_human_commits_even_when_no_updates_remain() {
+    let create_server = MockServer::start().await;
+    let fixture = Fixture::new();
+    list_mock(json!([])).mount(&create_server).await;
+    Mock::given(method("POST"))
+        .and(path("/api/v4/projects/1/merge_requests"))
+        .respond_with(ResponseTemplate::new(201).set_body_json(mr_response(7, false)))
+        .mount(&create_server)
+        .await;
+    fixture.run_template(&create_server, true, "first", false);
+
+    git(
+        &fixture.checkout,
+        &["config", "user.name", "Human Maintainer"],
+    );
+    git(
+        &fixture.checkout,
+        &["config", "user.email", "human@example.com"],
+    );
+    fs::write(fixture.checkout.join("human-fix.txt"), "keep me\n").unwrap();
+    git(&fixture.checkout, &["add", "human-fix.txt"]);
+    git(&fixture.checkout, &["commit", "-m", "fix: adapt to update"]);
+    git(&fixture.checkout, &["push", "origin", BRANCH]);
+    let human_tip = String::from_utf8(git(&fixture.checkout, &["rev-parse", "HEAD"]).stdout)
+        .unwrap()
+        .trim()
+        .to_string();
+
+    let paused_server = MockServer::start().await;
+    let mut existing = mr_list_response(7, false);
+    existing[0]["description"] = json!("Existing review evidence");
+    list_mock(existing).mount(&paused_server).await;
+    Mock::given(method("PUT"))
+        .and(path("/api/v4/projects/1/merge_requests/7"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(mr_response(7, false)))
+        .expect(1)
+        .mount(&paused_server)
+        .await;
+
+    fixture.run_template(&paused_server, true, "second", false);
+
+    let cleanup_server = MockServer::start().await;
+    let mut paused_mr = mr_list_response(7, false);
+    paused_mr[0]["description"] = json!(
+        "Existing review evidence\n\n<!-- upd-human-commit-pause -->\n> **Automation paused**"
+    );
+    list_mock(paused_mr).mount(&cleanup_server).await;
+    fixture.run_template(&cleanup_server, false, "unused", false);
+
+    let remote_tip = String::from_utf8(
+        run(Command::new("git")
+            .arg(format!("--git-dir={}", fixture.remote.display()))
+            .args(["rev-parse", &format!("refs/heads/{BRANCH}")]))
+        .stdout,
+    )
+    .unwrap()
+    .trim()
+    .to_string();
+    assert_eq!(remote_tip, human_tip);
+    assert_eq!(fixture.branch_file().as_deref(), Some("first\n"));
+    assert_eq!(fixture.branch_commit_count(), 2);
+
+    let requests = paused_server.received_requests().await.unwrap();
+    assert!(requests.iter().any(|request| {
+        String::from_utf8_lossy(&request.body).contains("upd-human-commit-pause")
+    }));
+}
+
+#[tokio::test]
+async fn template_does_not_adopt_a_single_human_commit_as_its_own() {
+    let fixture = Fixture::new();
+    git(&fixture.checkout, &["switch", "-c", BRANCH]);
+    fs::write(fixture.checkout.join("dependency.txt"), "human change\n").unwrap();
+    git(&fixture.checkout, &["add", "dependency.txt"]);
+    git(
+        &fixture.checkout,
+        &["commit", "-m", "chore(deps): test update"],
+    );
+    git(&fixture.checkout, &["push", "origin", BRANCH]);
+    let human_tip = String::from_utf8(git(&fixture.checkout, &["rev-parse", "HEAD"]).stdout)
+        .unwrap()
+        .trim()
+        .to_string();
+
+    let server = MockServer::start().await;
+    let mut existing = mr_list_response(7, false);
+    existing[0]["description"] = json!("Human review work");
+    list_mock(existing).mount(&server).await;
+    Mock::given(method("PUT"))
+        .and(path("/api/v4/projects/1/merge_requests/7"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(mr_response(7, false)))
+        .expect(1)
+        .mount(&server)
+        .await;
+    fixture.run_template(&server, true, "bot change", false);
+
+    let remote_tip = String::from_utf8(
+        run(Command::new("git")
+            .arg(format!("--git-dir={}", fixture.remote.display()))
+            .args(["rev-parse", &format!("refs/heads/{BRANCH}")]))
+        .stdout,
+    )
+    .unwrap()
+    .trim()
+    .to_string();
+    assert_eq!(remote_tip, human_tip);
+    assert_eq!(fixture.branch_file().as_deref(), Some("human change\n"));
+}
+
 #[test]
 fn template_defaults_are_reproducible_and_safe() {
     assert!(TEMPLATE.contains("debian:bookworm-slim@sha256:"));

@@ -128,6 +128,8 @@ The template:
 - downloads an exact release artifact and verifies its SHA-256 before execution;
 - serializes jobs with a resource group;
 - starts from the latest default branch on every run;
+- pauses if the automation branch contains commits outside its single generated
+  commit, preserving the branch and adding a notice to the open merge request;
 - updates the remote branch with `--force-with-lease`, never a blind force push;
 - refuses ambiguous duplicate open merge requests;
 - fails if preparation or validation leaves unexpected repository changes;
@@ -136,8 +138,16 @@ The template:
 - closes the obsolete merge request and lease-deletes its branch when no eligible
   updates remain.
 
+The pause check runs before both branch replacement and no-update cleanup. If
+someone needs to adapt an update, they can commit to the automation branch;
+scheduled runs will leave that work in place. Automation resumes after those
+commits are removed or the merge request is resolved. The check expects the
+existing branch to contain one commit with the configured automation author,
+committer, and commit message, so changing that identity or message while a
+merge request is open also pauses the branch.
+
 Treat the configured branch, generated commit, title, and description as
-automation-owned. A later successful run replaces them.
+automation-owned unless intentionally pausing the branch as above.
 
 ## Merge-request review experience
 
