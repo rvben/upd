@@ -259,7 +259,8 @@ impl Registry for MockRegistry {
     /// Derived from the declared refs rather than configured separately, so a
     /// fixture cannot state that `v1.2.3` resolves to one commit while claiming
     /// a different set of tags names it. A test that declares the resolution
-    /// gets the inverse for free and the two can never drift apart.
+    /// gets the inverse for free and the two can never drift apart. Likewise a
+    /// package whose declared refs include no release answers `NoReleases`.
     async fn tags_at_commit(&self, package: &str, commit: &str) -> Result<TagsAtCommit> {
         if self.without_tag_concept.contains(package) {
             return super::tags_at_commit_unsupported();
@@ -280,6 +281,13 @@ impl Registry for MockRegistry {
         // the mock's answer differ between runs and hide an ordering bug in the
         // caller behind an intermittent test.
         tags.sort();
+        let publishes_releases = self
+            .resolved_refs
+            .keys()
+            .any(|(pkg, reference)| pkg == package && super::is_release_tag(reference));
+        if !publishes_releases {
+            return Ok(TagsAtCommit::NoReleases);
+        }
         Ok(TagsAtCommit::Known(tags))
     }
 

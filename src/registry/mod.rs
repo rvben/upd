@@ -272,8 +272,9 @@ pub fn ref_resolution_unsupported(registry: &str, package: &str, reference: &str
 
 /// What a registry knows about the tags naming a particular commit.
 ///
-/// The three answers a caller must tell apart are "the repository publishes
-/// these tags at that commit", "this registry has no tags to look at" and, as an
+/// The answers a caller must tell apart are "the repository publishes these
+/// tags at that commit", "the repository publishes no releases at all", "this
+/// registry has no tags to look at" and, as an
 /// `Err`, "the question went unanswered". A plain `Vec` would collapse the first
 /// two, because an empty list is a real and common answer here: a commit that no
 /// release names is exactly the case the caller has to report honestly rather
@@ -284,8 +285,19 @@ pub enum TagsAtCommit {
     /// The repository was consulted. These tags name the commit, in no
     /// particular order, and an empty list means none do.
     Known(Vec<String>),
+    /// The repository was consulted and none of its tags is a release, only
+    /// moving aliases like `v1` or none at all. No commit in it can be tied to
+    /// a release, so re-pinning cannot help; kept apart from `Known` so the
+    /// caller does not advise it.
+    NoReleases,
     /// This registry has no concept of tags, so nothing was learned.
     Unsupported,
+}
+
+/// Whether a tag names one concrete release (`v1.2.3`, `1.2.3`) rather than a
+/// moving alias such as `v1`.
+pub fn is_release_tag(tag: &str) -> bool {
+    semver::Version::parse(tag.strip_prefix('v').unwrap_or(tag)).is_ok()
 }
 
 /// The answer from a registry with no tag concept.

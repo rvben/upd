@@ -178,18 +178,23 @@ impl GitHubReleasesRegistry {
     /// beside a floating `v7` - and only the concrete one is usable. Stopping
     /// early can see the floating tag alone and report a perfectly ordinary
     /// release as unidentifiable.
+    ///
+    /// Reading the whole list also shows whether the repository publishes any
+    /// release at all, which decides what the caller can advise about a commit
+    /// no release names.
     async fn fetch_tags_at_commit(
         &self,
         owner: &str,
         repo: &str,
         commit: &str,
-    ) -> Result<Vec<String>> {
+    ) -> Result<TagsAtCommit> {
         let target = commit.to_ascii_lowercase();
         let mut url = format!(
             "{}/repos/{}/{}/tags?per_page={}",
             self.api_url, owner, repo, TAG_PAGE_SIZE
         );
         let mut names = Vec::new();
+        let mut publishes_releases = false;
 
         for _ in 0..MAX_TAG_PAGES {
             let response = get_with_retry(&self.client, &url).await?;
@@ -212,6 +217,7 @@ impl GitHubReleasesRegistry {
             let tags: Vec<TagResponse> = response.json().await?;
 
             for tag in tags {
+                publishes_releases |= super::is_release_tag(&tag.name);
                 if tag
                     .commit
                     .is_some_and(|c| c.sha.eq_ignore_ascii_case(&target))
@@ -222,7 +228,8 @@ impl GitHubReleasesRegistry {
 
             match next {
                 Some(next_url) => url = next_url,
-                None => return Ok(names),
+                None if !publishes_releases => return Ok(TagsAtCommit::NoReleases),
+                None => return Ok(TagsAtCommit::Known(names)),
             }
         }
 
@@ -607,9 +614,7 @@ impl Registry for GitHubReleasesRegistry {
                 "'{commit}' is not a full 40-character commit SHA for '{owner}/{repo}'"
             ));
         }
-        self.fetch_tags_at_commit(owner, repo, commit)
-            .await
-            .map(TagsAtCommit::Known)
+        self.fetch_tags_at_commit(owner, repo, commit).await
     }
 
     async fn list_versions(&self, package: &str) -> Result<Vec<VersionMeta>> {
@@ -752,7 +757,8 @@ mod tests {
         Mock::given(method("GET"))
             .and(path("/repos/acme/action/tags"))
             .respond_with(ResponseTemplate::new(200).set_body_string(
-                r#"[{"name": "v1", "commit": {"sha": "abcdefabcdefabcdefabcdefabcdefabcdefabcd"}}]"#,
+                r#"[{"name": "v1", "commit": {"sha": "abcdefabcdefabcdefabcdefabcdefabcdefabcd"}},
+                    {"name": "v1.0.0", "commit": {"sha": "abcdefabcdefabcdefabcdefabcdefabcdefabcd"}}]"#,
             ))
             .mount(&server)
             .await;
@@ -760,6 +766,87 @@ mod tests {
         assert_eq!(
             registry(&server)
                 .tags_at_commit("acme/action", "1234567890abcdef1234567890abcdef12345678")
+                .await
+                .unwrap(),
+            TagsAtCommit::Known(Vec::new())
+        );
+    }
+
+    /// dtolnay/rust-toolchain publishes only a moving `v1` and per-toolchain
+    /// branches. With no release anywhere in the repository, re-pinning cannot
+    /// help, and the answer has to say so rather than look like a commit that
+    /// merely sits between releases.
+    #[tokio::test]
+    async fn a_repository_without_releases_says_so_wherever_the_commit_is() {
+        let sha = "1234567890abcdef1234567890abcdef12345678";
+        let other = "abcdefabcdefabcdefabcdefabcdefabcdefabcd";
+        for (case, body) in [
+            (
+                "off every tag",
+                format!(r#"[{{"name": "v1", "commit": {{"sha": "{other}"}}}}]"#),
+            ),
+            (
+                "at the floating tag",
+                format!(r#"[{{"name": "v1", "commit": {{"sha": "{sha}"}}}}]"#),
+            ),
+            ("no tags at all", "[]".to_string()),
+        ] {
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path("/repos/acme/action/tags"))
+                .respond_with(ResponseTemplate::new(200).set_body_string(body))
+                .mount(&server)
+                .await;
+
+            assert_eq!(
+                registry(&server)
+                    .tags_at_commit("acme/action", sha)
+                    .await
+                    .unwrap(),
+                TagsAtCommit::NoReleases,
+                "{case}"
+            );
+        }
+    }
+
+    /// A release on an earlier page still counts once later pages hold only
+    /// aliases, or a heavily tagged repository would be told it has none.
+    #[tokio::test]
+    async fn a_release_on_any_page_means_the_repository_publishes_releases() {
+        let sha = "1234567890abcdef1234567890abcdef12345678";
+        let other = "abcdefabcdefabcdefabcdefabcdefabcdefabcd";
+        let server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/repos/acme/action/tags"))
+            .and(query_param("page", "2"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(format!(
+                r#"[{{"name": "v1", "commit": {{"sha": "{other}"}}}}]"#
+            )))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let next = format!(
+            "{}/repos/acme/action/tags?per_page=100&page=2",
+            server.uri()
+        );
+        Mock::given(method("GET"))
+            .and(path("/repos/acme/action/tags"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("link", format!(r#"<{next}>; rel="next""#).as_str())
+                    .set_body_string(format!(
+                        r#"[{{"name": "v1.0.0", "commit": {{"sha": "{other}"}}}}]"#
+                    )),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        assert_eq!(
+            registry(&server)
+                .tags_at_commit("acme/action", sha)
                 .await
                 .unwrap(),
             TagsAtCommit::Known(Vec::new())
@@ -827,7 +914,9 @@ mod tests {
                         "link",
                         r#"<https://attacker.example/repos/acme/action/tags?page=2>; rel="next""#,
                     )
-                    .set_body_string("[]"),
+                    .set_body_string(
+                        r#"[{"name": "v1.0.0", "commit": {"sha": "abcdefabcdefabcdefabcdefabcdefabcdefabcd"}}]"#,
+                    ),
             )
             .mount(&server)
             .await;

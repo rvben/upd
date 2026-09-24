@@ -358,11 +358,15 @@ An annotation is a write, so `--check` reports it and exits `1`, and `--apply`
 performs it. It is counted separately from updates because nothing moved: the
 same commit runs before and after.
 
-Three conditions leave a bare pin alone, each with its own reason. The commit
+Four conditions leave a bare pin alone, each with its own reason. The commit
 may belong to no release (`unreleased-commit`, typical of a pin taken from a
 branch head), it may be named only by a moving alias (`floating-tag-only`), or
-the registry may have no tags to consult (`missing-version-comment`). All three
-are settled by writing the version comment yourself. A lookup that never
+the registry may have no tags to consult (`missing-version-comment`). These
+three are settled by writing the version comment yourself, re-pinning to a
+release first where needed. The fourth is an action that publishes no releases
+at all, only moving aliases or branches (`no-releases`), as
+`dtolnay/rust-toolchain` does. No pin to it can name a release, so add it to
+`ignore` in `.updrc.toml` to stop checking it. A lookup that never
 answered - a rate limit, an outage - is an error rather than a blocked pin, so
 a run does not tell you to edit a workflow that would have resolved itself.
 

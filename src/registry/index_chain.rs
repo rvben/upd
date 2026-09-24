@@ -421,26 +421,33 @@ impl Registry for IndexChain<'_> {
     /// this commit": the caller writes a version comment from this answer, and
     /// an outage that reads as a definitive absence would have it annotate, or
     /// refuse to annotate, on evidence nobody gathered. Only when every link
-    /// answered, and none of them had a tag, is the empty answer real. A chain
-    /// of registries that all lack tags stays `Unsupported`, which is a third
-    /// fact again.
+    /// answered, and none of them had a tag, is the empty answer real, and it
+    /// is `NoReleases` only when every link that answered publishes none: a
+    /// link with releases makes re-pinning possible. A chain of registries that
+    /// all lack tags stays `Unsupported`, which is another fact again.
     async fn tags_at_commit(&self, package: &str, commit: &str) -> Result<super::TagsAtCommit> {
         let mut last_error = None;
         let mut any_answered = false;
+        let mut any_releases = false;
         for link in self.links_for(package) {
             match link.registry().tags_at_commit(package, commit).await {
                 Ok(super::TagsAtCommit::Known(tags)) if !tags.is_empty() => {
                     return Ok(super::TagsAtCommit::Known(tags));
                 }
-                Ok(super::TagsAtCommit::Known(_)) => any_answered = true,
+                Ok(super::TagsAtCommit::Known(_)) => {
+                    any_answered = true;
+                    any_releases = true;
+                }
+                Ok(super::TagsAtCommit::NoReleases) => any_answered = true,
                 Ok(super::TagsAtCommit::Unsupported) => {}
                 Err(error) => last_error = Some(error),
             }
         }
-        match (last_error, any_answered) {
-            (Some(error), _) => Err(error),
-            (None, true) => Ok(super::TagsAtCommit::Known(Vec::new())),
-            (None, false) => super::tags_at_commit_unsupported(),
+        match (last_error, any_answered, any_releases) {
+            (Some(error), _, _) => Err(error),
+            (None, true, true) => Ok(super::TagsAtCommit::Known(Vec::new())),
+            (None, true, false) => Ok(super::TagsAtCommit::NoReleases),
+            (None, false, _) => super::tags_at_commit_unsupported(),
         }
     }
 
@@ -776,6 +783,34 @@ mod tests {
                 .await
                 .unwrap(),
             sha
+        );
+    }
+
+    /// "This repository publishes no releases" decides the advice the caller
+    /// gives, so the chain passes it on rather than flattening it into "no tag
+    /// names this commit".
+    #[tokio::test]
+    async fn a_repository_without_releases_stays_so_through_the_chain() {
+        let sha = "1234567890abcdef1234567890abcdef12345678";
+        let default = MockRegistry::new("github-releases").with_resolved_ref(
+            "dtolnay/rust-toolchain",
+            "v1",
+            sha,
+        );
+
+        let chain = IndexChain::new(
+            vec![DeclaredIndex::default_registry()],
+            &no_pins(),
+            &default,
+        )
+        .unwrap();
+
+        assert_eq!(
+            chain
+                .tags_at_commit("dtolnay/rust-toolchain", sha)
+                .await
+                .unwrap(),
+            super::super::TagsAtCommit::NoReleases
         );
     }
 

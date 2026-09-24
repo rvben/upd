@@ -55,10 +55,10 @@ enum PinVersion {
 
 /// Why a SHA pin with no version comment could not be tied to a release.
 ///
-/// The four are kept apart because they call for different things: two are a
-/// property of the pin that a human has to resolve, one is a property of the
-/// registry, and one is a lookup that never answered and may well answer next
-/// run. Reporting them as one another would either invent a permanent problem
+/// They are kept apart because they call for different things: two are a
+/// property of the pin that re-pinning resolves, one is a property of the
+/// action that no pin can resolve, one is a property of the registry, and one
+/// is a lookup that never answered and may well answer next run. Reporting them as one another would either invent a permanent problem
 /// out of a rate limit or describe an outage as a workflow that needs editing.
 #[derive(Debug, Clone)]
 enum RecoveryFailure {
@@ -68,6 +68,9 @@ enum RecoveryFailure {
     /// Tags name the commit but none of them is a concrete version, so none can
     /// say which release the commit was.
     FloatingOnly(Vec<String>),
+    /// The repository publishes no release at all, so there is no commit to
+    /// re-pin to and the only remedy is to stop checking the action.
+    NoReleases,
     /// This registry has no tag concept, so nothing was learned either way.
     Unsupported,
     /// The lookup did not complete, so whether a release names the commit is
@@ -84,6 +87,7 @@ impl RecoveryFailure {
         match self {
             Self::Untagged => "unreleased-commit",
             Self::FloatingOnly(_) => "floating-tag-only",
+            Self::NoReleases => "no-releases",
             Self::Unsupported | Self::Failed(_) => "missing-version-comment",
         }
     }
@@ -103,6 +107,7 @@ impl RecoveryFailure {
                     tags.join(", ")
                 )
             }
+            Self::NoReleases => "the repository publishes no release tags, so no pin to it can name a release; add the action to `ignore` in .updrc.toml to stop checking it".to_string(),
             Self::Unsupported | Self::Failed(_) => annotate.to_string(),
         }
     }
@@ -768,6 +773,9 @@ impl Updater for GithubActionsUpdater {
                             }
                             None => PinVersion::Unrecoverable(RecoveryFailure::FloatingOnly(tags)),
                         }
+                    }
+                    Ok(crate::registry::TagsAtCommit::NoReleases) => {
+                        PinVersion::Unrecoverable(RecoveryFailure::NoReleases)
                     }
                     Ok(crate::registry::TagsAtCommit::Unsupported) => {
                         PinVersion::Unrecoverable(RecoveryFailure::Unsupported)
@@ -3463,6 +3471,64 @@ mod sha_pin_annotation_tests {
         );
     }
 
+    /// An action that publishes no releases, like dtolnay/rust-toolchain, can
+    /// never be pinned to one, so the advice to re-pin would send the reader
+    /// looking for a tag that does not exist. Whether the pin sits on a branch
+    /// commit or on the moving `v1` itself, the reason and the advice are the
+    /// same: stop checking the action.
+    #[tokio::test]
+    async fn a_pin_to_an_action_without_releases_advises_ignoring_it() {
+        for (case, v1_commit) in [
+            (
+                "a branch commit",
+                "7777777777777777777777777777777777777777",
+            ),
+            ("the floating tag's commit", BARE_SHA),
+        ] {
+            let mut file = NamedTempFile::new().unwrap();
+            write!(
+                file,
+                "steps:\n  - uses: dtolnay/rust-toolchain@{BARE_SHA}\n"
+            )
+            .unwrap();
+
+            let registry = MockRegistry::new("github-releases").with_resolved_ref(
+                "dtolnay/rust-toolchain",
+                "v1",
+                v1_commit,
+            );
+
+            let result = GithubActionsUpdater::new()
+                .update(
+                    file.path(),
+                    &registry,
+                    UpdateOptions::new(false, false).with_action_sha_updates(true),
+                )
+                .await
+                .unwrap();
+
+            assert!(result.errors.is_empty(), "{case}: {:?}", result.errors);
+            assert_eq!(result.skipped.len(), 1, "{case}");
+            assert_eq!(result.skipped[0].reason, "no-releases", "{case}");
+            assert_eq!(result.skipped[0].status, SkipStatus::Blocked, "{case}");
+            assert_eq!(result.skipped[0].line_number, Some(2), "{case}");
+            let message = &result.skipped[0].message;
+            assert!(
+                message.contains("publishes no release tags") && message.contains("`ignore`"),
+                "{case}: {message}"
+            );
+            assert!(
+                !message.contains("pin the action to a commit"),
+                "{case}: re-pinning cannot help: {message}"
+            );
+            let content = fs::read_to_string(file.path()).unwrap();
+            assert!(
+                content.contains(&format!("rust-toolchain@{BARE_SHA}\n")),
+                "{case}: {content}"
+            );
+        }
+    }
+
     /// The repository moves a floating major onto this commit but has published
     /// no release at it, so nothing can say which release the pin is at.
     #[tokio::test]
@@ -3472,7 +3538,12 @@ mod sha_pin_annotation_tests {
 
         let registry = MockRegistry::new("github-releases")
             .with_version("acme/action", "v2.0.0")
-            .with_resolved_ref("acme/action", "v2", BARE_SHA);
+            .with_resolved_ref("acme/action", "v2", BARE_SHA)
+            .with_resolved_ref(
+                "acme/action",
+                "v2.0.0",
+                "7777777777777777777777777777777777777777",
+            );
 
         let result = GithubActionsUpdater::new()
             .update(
