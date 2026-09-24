@@ -1,4 +1,5 @@
 use anyhow::{Context, Result};
+mod lock_maintenance;
 use chrono::{DateTime, Duration, Utc};
 use clap::Parser;
 use colored::Colorize;
@@ -1561,7 +1562,7 @@ async fn run() -> Result<()> {
             "version": env!("CARGO_PKG_VERSION"),
             "clispec": "0.3",
             "output": ["text", "json", "sarif"],
-            "features": ["schema", "dry-run", "dependency updates", "security audit", "verified action SHA updates"]
+            "features": ["schema", "dry-run", "dependency updates", "lockfile maintenance", "security audit", "verified action SHA updates"]
         });
         if effective_json_mode(&cli) {
             println!("{}", serde_json::to_string_pretty(&capabilities)?);
@@ -1649,6 +1650,10 @@ async fn run() -> Result<()> {
         }
         Some(Command::Align { .. }) => {
             run_align(&cli).await?;
+        }
+        Some(Command::LockRefresh { .. }) => {
+            let paths = resolve_scan_paths(&cli).map_err(anyhow::Error::msg)?;
+            lock_maintenance::run(&cli, &paths, effective_json_mode(&cli))?;
         }
         Some(Command::Audit { .. }) => {
             run_audit(&cli).await?;

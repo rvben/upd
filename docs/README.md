@@ -10,6 +10,7 @@ than read.
 | [Comparison](comparison.md) | Dated feature matrix and reproducible, workload-based benchmarks against related tools |
 | [GitHub pull requests](github-actions.md) | Rolling freshness and security-remediation PRs, immutable Action SHA pins, validation, and credentials |
 | [GitLab merge requests](gitlab.md) | Scheduled rolling dependency MRs, token setup, validation, and opt-in native auto-merge |
+| [Lockfile maintenance](lock-maintenance.md) | Refresh resolved uv, npm, and Cargo dependencies within manifest constraints |
 | [Configuration](configuration.md) | `.updrc.toml` discovery and keys, cooldown, caching, environment variables |
 | [Private registries](private-registries.md) | Credential detection for PyPI, npm, Cargo, Go, and GitHub |
 | [Security auditing](audit.md) | OSV scanning, `--fix-audit`, SARIF, CI integration |

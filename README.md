@@ -222,6 +222,7 @@ comma-separated values instead of brace alternation.
 upd --version      # Print version
 upd self-update    # Check for upd updates
 upd clean-cache    # Clear the version cache
+upd lock-refresh   # Refresh uv, npm, and Cargo locks within manifest constraints
 upd align          # Align versions across files (--check exits 1 on misalignment)
 upd audit          # Scan for known vulnerabilities (exit 6 if found)
 upd schema         # Machine-readable interface description

@@ -67,10 +67,9 @@ pub struct Cli {
     #[arg(global = true)]
     pub paths: Vec<PathBuf>,
 
-    /// Show available updates without writing any files.
-    ///
-    /// Exits with code 1 when updates are available, 2 on errors.
-    /// Equivalent to --check when you also want CI to fail on outdated deps.
+    /// Do not write any files. Update commands report available changes;
+    /// lock-refresh lists candidate lockfiles without resolving them.
+    /// Use --check with update to fail CI when updates are available.
     #[arg(short = 'n', long, global = true)]
     pub dry_run: bool,
 
@@ -303,6 +302,16 @@ pub enum Command {
         paths: Vec<PathBuf>,
     },
 
+    /// Refresh resolved dependencies within existing manifest constraints.
+    ///
+    /// Supports uv.lock, npm package-lock.json/npm-shrinkwrap.json, and
+    /// Cargo.lock. Without --apply, reports the lockfiles it would refresh.
+    LockRefresh {
+        /// Project directories or lockfiles to refresh
+        #[arg()]
+        paths: Vec<PathBuf>,
+    },
+
     /// Align duplicate packages to their highest pinned version across files.
     ///
     /// Useful for monorepos where the same package appears at different versions
@@ -403,6 +412,7 @@ impl Cli {
     pub fn get_paths(&self) -> Vec<PathBuf> {
         match &self.command {
             Some(Command::Update { paths }) if !paths.is_empty() => paths.clone(),
+            Some(Command::LockRefresh { paths }) if !paths.is_empty() => paths.clone(),
             Some(Command::Align { paths }) if !paths.is_empty() => paths.clone(),
             Some(Command::Audit { paths, .. }) if !paths.is_empty() => paths.clone(),
             _ if !self.paths.is_empty() => self.paths.clone(),

@@ -44,7 +44,7 @@ fn build_schema() -> Value {
             {
                 "name": "dry-run",
                 "short": "-n",
-                "description": "Show what would change without writing any files",
+                "description": "Prevent writes. Update commands report available changes; lock-refresh lists candidate lockfiles without resolving them",
                 "type": "boolean"
             },
             {
@@ -180,6 +180,25 @@ fn build_schema() -> Value {
             }
         ],
         "commands": [
+            {
+                "name": "lock-refresh",
+                "description": "Refresh uv, npm, and Cargo lockfiles within existing manifest constraints. Without --apply, list candidates without running package managers",
+                "effects": "non_idempotent",
+                "mutating": true,
+                "cardinality": "unbounded",
+                "pagination": {"style": "offset", "limit_arg": "limit", "offset_arg": "offset"},
+                "fields_arg": "fields",
+                "args": [
+                    {"name": "paths", "description": "Project directories or supported lockfiles", "type": "path[]", "required": false}
+                ],
+                "output_fields": [
+                    {"name": "lockfile", "type": "string", "description": "Lockfile path"},
+                    {"name": "status", "type": "string", "description": "planned, skipped, unchanged, refreshed, or failed"},
+                    {"name": "changes", "type": "array", "items": {"type": "object"}, "description": "Resolved package version changes with from, to, and bump"},
+                    {"name": "error", "type": "string", "description": "Failure reason, present only when status is failed"}
+                ],
+                "example": {"args": ["lock-refresh", "--apply", "."]}
+            },
             {
                 "name": "update",
                 "description": "Update dependencies (default when no subcommand is given). Dry-run by default; pass --apply to write",
