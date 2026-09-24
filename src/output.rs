@@ -351,6 +351,10 @@ pub struct UpdateSummary {
     pub updates_major: usize,
     pub updates_minor: usize,
     pub updates_patch: usize,
+    /// Locked commits moved along an unchanged reference (Nix flake inputs).
+    /// Disjoint from the three version levels.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub updates_revision: usize,
     pub pinned: usize,
     pub ignored: usize,
     pub errors: usize,
@@ -1195,6 +1199,7 @@ fn bump_name(bump: crate::updater::BumpKind) -> &'static str {
         crate::updater::BumpKind::Major => "major",
         crate::updater::BumpKind::Minor => "minor",
         crate::updater::BumpKind::Patch => "patch",
+        crate::updater::BumpKind::Revision => "revision",
     }
 }
 

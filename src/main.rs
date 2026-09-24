@@ -46,11 +46,12 @@ use upd::registry::{
 };
 use upd::updater::{
     ActionShaUpdate, AnnotatedUpdater, BumpFilter, BumpKind, CargoTomlUpdater, CsprojUpdater,
-    DEFAULT_UPDATE_ACTION_SHAS, DiscoverOptions, DockerUpdater, FileType, GemfileUpdater,
-    GithubActionsUpdater, GoModUpdater, GradleUpdater, Lang, MiseUpdater, PackageJsonUpdater,
-    ParseWarnings, PreCommitUpdater, PyProjectUpdater, RegistrySet, RequirementsUpdater,
-    SkipStatus, SkippedUpdate, TerraformUpdater, UpdateOptions, UpdateResult, Updater,
-    classify_bump, discover_files_with, read_file_safe, update_with_annotations, write_file_atomic,
+    DEFAULT_UPDATE_ACTION_SHAS, DiscoverOptions, DockerUpdater, FileType, FlakeLockUpdater,
+    GemfileUpdater, GithubActionsUpdater, GoModUpdater, GradleUpdater, Lang, MiseUpdater,
+    PackageJsonUpdater, ParseWarnings, PreCommitUpdater, PyProjectUpdater, RegistrySet,
+    RequirementsUpdater, SkipStatus, SkippedUpdate, TerraformUpdater, UpdateOptions, UpdateResult,
+    Updater, classify_bump, discover_files_with, read_file_safe, update_with_annotations,
+    write_file_atomic,
 };
 use upd::version::{compare_versions, written_version};
 
@@ -108,6 +109,7 @@ fn update_type(bump: BumpKind) -> UpdateType {
         BumpKind::Major => UpdateType::Major,
         BumpKind::Minor => UpdateType::Minor,
         BumpKind::Patch => UpdateType::Patch,
+        BumpKind::Revision => UpdateType::Revision,
     }
 }
 
@@ -192,11 +194,22 @@ fn format_skipped_by_cooldown_line(
     )
 }
 
+/// A flake input under cooldown waits on the age of the commit it is locked
+/// to, not on when the newer commit landed, so the line says that instead of
+/// naming a release date.
+fn format_flake_cooldown_line(name: &str, current: &str, head: &str, cooldown: Duration) -> String {
+    format!(
+        "Kept {name} at {current} (moves to {head} once the locked commit is {} old)",
+        humanize_cooldown(cooldown),
+    )
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum UpdateType {
     Major,
     Minor,
     Patch,
+    Revision,
 }
 
 impl UpdateType {
@@ -207,6 +220,7 @@ impl UpdateType {
             UpdateType::Major => "major",
             UpdateType::Minor => "minor",
             UpdateType::Patch => "patch",
+            UpdateType::Revision => "revision",
         }
     }
 }
@@ -1377,7 +1391,7 @@ fn has_checkable_manifest_changes(result: &UpdateResult, filter: UpdateFilter) -
     // about them would call a tree up to date that the next apply rewrites. The
     // bump filter does not reach them - an annotation moves no version, so
     // there is no bump level for `--major`/`--minor`/`--patch` to select on.
-    let (_, _, _, filtered_total) = count_result_updates(result, filter);
+    let (_, _, _, _, filtered_total) = count_result_updates(result, filter);
     filtered_total > 0
         || !result.pinned.is_empty()
         || !result.held_back.is_empty()
@@ -2188,6 +2202,11 @@ async fn run_update(cli: &Cli) -> Result<()> {
                     FileType::DockerCompose => {
                         docker_updater
                             .update(&path, docker.as_ref(), update_options.clone())
+                            .await
+                    }
+                    FileType::FlakeLock => {
+                        FlakeLockUpdater::new()
+                            .update(&path, github_releases.as_ref(), update_options.clone())
                             .await
                     }
                     FileType::Annotated => {
@@ -3212,7 +3231,7 @@ fn emit_update_json(input: UpdateReportInput<'_>, bounded: &BoundedOutputParams<
         })
         .collect();
 
-    let (major, minor, patch, total) = count_result_updates(total_result, filter);
+    let (major, minor, patch, revision, total) = count_result_updates(total_result, filter);
 
     // Floor entries are gated by allows_bump/cooldown inside resolve_floor_version
     // already, so they count toward the summary unconditionally (rule 7) rather
@@ -3256,6 +3275,7 @@ fn emit_update_json(input: UpdateReportInput<'_>, bounded: &BoundedOutputParams<
         updates_major: major + floor_major,
         updates_minor: minor + floor_minor,
         updates_patch: patch + floor_patch,
+        updates_revision: revision,
         pinned: total_result.pinned.len(),
         ignored: total_result.ignored.len() + floor_ignored,
         errors: total_result.errors.len(),
@@ -3478,6 +3498,11 @@ async fn run_interactive_update(
             FileType::DockerCompose => {
                 docker_updater
                     .update(path, docker.as_ref(), dry_run_options.clone())
+                    .await
+            }
+            FileType::FlakeLock => {
+                FlakeLockUpdater::new()
+                    .update(path, github_releases.as_ref(), dry_run_options.clone())
                     .await
             }
             FileType::Annotated => {
@@ -3792,6 +3817,20 @@ async fn run_interactive_update(
                 content,
                 applied: vec![true],
             })
+        } else if scanned_file.file_type == FileType::FlakeLock {
+            // A lock records a hash only Nix computes, so the approved inputs
+            // are moved by Nix and checked against the scanned commits.
+            let expected = updates
+                .iter()
+                .map(|edit| (edit.package.to_string(), edit.new_version.to_string()))
+                .collect();
+            FlakeLockUpdater::new()
+                .refresh_inputs(&scanned_file.path, &expected)
+                .await
+                .map(|content| AppliedVersionUpdates {
+                    content,
+                    applied: vec![true; updates.len()],
+                })
         } else {
             apply_version_updates(
                 &content,
@@ -4247,7 +4286,7 @@ pub(crate) fn build_audit_packages(
 
     for ((name, lang), occurrences) in packages {
         // OSV doesn't cover GitHub Actions, pre-commit hooks, mise tools, Docker,
-        // Terraform, GitHub releases, or annotated pins; skip
+        // Terraform, Nix flake inputs, GitHub releases, or annotated pins; skip
         if *lang == Lang::Actions
             || *lang == Lang::PreCommit
             || *lang == Lang::Mise
@@ -4255,6 +4294,7 @@ pub(crate) fn build_audit_packages(
             || *lang == Lang::Docker
             || *lang == Lang::GithubReleases
             || *lang == Lang::Gradle
+            || *lang == Lang::Nix
             || *lang == Lang::Annotated
         {
             continue;
@@ -4274,6 +4314,7 @@ pub(crate) fn build_audit_packages(
             | Lang::Docker
             | Lang::GithubReleases
             | Lang::Gradle
+            | Lang::Nix
             | Lang::Annotated => {
                 unreachable!("filtered above")
             }
@@ -4914,6 +4955,7 @@ fn build_sarif_occurrences(
             || *lang == Lang::Docker
             || *lang == Lang::GithubReleases
             || *lang == Lang::Gradle
+            || *lang == Lang::Nix
             || *lang == Lang::Annotated
         {
             continue;
@@ -4933,6 +4975,7 @@ fn build_sarif_occurrences(
             | Lang::Docker
             | Lang::GithubReleases
             | Lang::Gradle
+            | Lang::Nix
             | Lang::Annotated => {
                 unreachable!("filtered above")
             }
@@ -5077,6 +5120,7 @@ fn print_alignment(alignment: &PackageAlignment, _dry_run: bool) {
         Lang::Mise => " (mise)",
         Lang::Terraform => " (terraform)",
         Lang::Docker => " (docker)",
+        Lang::Nix => " (nix)",
         Lang::GithubReleases => " (github-releases)",
         Lang::Annotated => " (annotated)",
     };
@@ -5365,6 +5409,8 @@ fn apply_version_updates(
         }
 
         applied[idx] = match file_type {
+            // Rewritten by Nix, never as text; see `FlakeLockUpdater::refresh_inputs`.
+            FileType::FlakeLock => false,
             FileType::Requirements => {
                 apply_requirements_version(&mut document, update, &target_version)
             }
@@ -6099,6 +6145,9 @@ impl UpdateFilter {
             UpdateType::Major => self.major,
             UpdateType::Minor => self.minor,
             UpdateType::Patch => self.patch,
+            // A revision has no level to select on, and the write-time
+            // `BumpFilter` never caps one, so reporting agrees with writing.
+            UpdateType::Revision => true,
         }
     }
 
@@ -6113,11 +6162,13 @@ impl UpdateFilter {
     }
 }
 
+/// Counts updates by type, respecting the filter.
+/// Returns (major, minor, patch, revision, filtered_total).
 fn count_result_updates(
     result: &UpdateResult,
     filter: UpdateFilter,
-) -> (usize, usize, usize, usize) {
-    let mut counts = (0, 0, 0, 0);
+) -> (usize, usize, usize, usize, usize) {
+    let mut counts = (0, 0, 0, 0, 0);
     for index in 0..result.updated.len() {
         let kind = update_type(result.update_bump(index));
         if !filter.matches(kind) {
@@ -6127,8 +6178,9 @@ fn count_result_updates(
             UpdateType::Major => counts.0 += 1,
             UpdateType::Minor => counts.1 += 1,
             UpdateType::Patch => counts.2 += 1,
+            UpdateType::Revision => counts.3 += 1,
         }
-        counts.3 += 1;
+        counts.4 += 1;
     }
     counts
 }
@@ -6148,7 +6200,9 @@ fn count_updates_by_type(
                 match update_type {
                     UpdateType::Major => (major + 1, minor, patch, total + 1),
                     UpdateType::Minor => (major, minor + 1, patch, total + 1),
-                    UpdateType::Patch => (major, minor, patch + 1, total + 1),
+                    UpdateType::Patch | UpdateType::Revision => {
+                        (major, minor, patch + 1, total + 1)
+                    }
                 }
             } else {
                 (major, minor, patch, total)
@@ -6432,7 +6486,7 @@ fn print_file_result(
         let type_indicator = match update_type {
             UpdateType::Major => " (MAJOR)".yellow().bold().to_string(),
             UpdateType::Minor => String::new(),
-            UpdateType::Patch => String::new(),
+            UpdateType::Patch | UpdateType::Revision => String::new(),
         };
 
         let context = result.update_context.get(&index);
@@ -6515,7 +6569,7 @@ fn print_file_result(
             println!("{} {}", file_location.blue().underline(), line.yellow());
         }
 
-        for (index, (package, _current, skipped_latest, skipped_pub_at)) in
+        for (index, (package, current, skipped_latest, skipped_pub_at)) in
             result.skipped_by_cooldown.iter().enumerate()
         {
             let cooldown = upd::output::entry_cooldown(
@@ -6527,13 +6581,17 @@ fn print_file_result(
                     .or_else(|| result.entry_ecosystem.get(package).copied()),
                 file_type,
             );
-            let line = format_skipped_by_cooldown_line(
-                package,
-                skipped_latest,
-                *skipped_pub_at,
-                cooldown,
-                now,
-            );
+            let line = if file_type == FileType::FlakeLock {
+                format_flake_cooldown_line(package, current, skipped_latest, cooldown)
+            } else {
+                format_skipped_by_cooldown_line(
+                    package,
+                    skipped_latest,
+                    *skipped_pub_at,
+                    cooldown,
+                    now,
+                )
+            };
             println!("{} {}", file_location.blue().underline(), line.dimmed());
         }
     }
@@ -6695,7 +6753,7 @@ fn print_summary(
     let action = if dry_run { "Would update" } else { "Updated" };
 
     // Count by update type, respecting filter
-    let (major_count, minor_count, patch_count, filtered_total) =
+    let (major_count, minor_count, patch_count, revision_count, filtered_total) =
         count_result_updates(result, filter);
 
     let pinned_count = result.pinned.len();
@@ -6732,6 +6790,9 @@ fn print_summary(
         }
         if patch_count > 0 {
             parts.push(format!("{} patch", patch_count));
+        }
+        if revision_count > 0 {
+            parts.push(format!("{} revision", revision_count));
         }
         let breakdown = if parts.is_empty() {
             String::new()
@@ -9190,6 +9251,20 @@ mod output_tests {
     /// is not a missing word but a plausible one: substituting the run time
     /// renders "released 0s ago", which looks like a real, very recent release
     /// and is consistent with the cooldown that skipped it.
+    #[test]
+    fn test_format_flake_cooldown_line_names_the_locked_commit_age() {
+        let line = format_flake_cooldown_line(
+            "nixpkgs",
+            "971984758d0a",
+            "00455b0a3690",
+            Duration::days(7),
+        );
+        assert_eq!(
+            line,
+            "Kept nixpkgs at 971984758d0a (moves to 00455b0a3690 once the locked commit is 7d old)"
+        );
+    }
+
     #[test]
     fn test_format_skipped_by_cooldown_line_without_a_publish_date() {
         let line = format_skipped_by_cooldown_line(

@@ -52,7 +52,7 @@ pub enum OutputFormat {
 #[command(
     author,
     version,
-    about = "A fast dependency updater for Python, Node.js, Rust, Go, Ruby, .NET, Terraform, GitHub Actions, pre-commit, and Mise/asdf projects",
+    about = "A fast dependency updater for Python, Node.js, Rust, Go, Ruby, .NET, Docker, Terraform, Nix flakes, GitHub Actions, pre-commit, and Mise/asdf projects",
     after_help = "Run 'upd schema' for machine-readable interface description (clispec v0.3).\n\nTip: changes are applied in-place - use git to revert."
 )]
 pub struct Cli {

@@ -287,6 +287,40 @@ the replacement manifest digest, so digest pins are blocked in this release.
 - Skips local modules (`./`, `../`) and git sources
 - Supports pessimistic constraints (`~> 5.0`)
 
+## Nix flakes
+
+- `flake.lock` (lock format version 7, as written by current Nix)
+- Moves each direct `github:` and `gitlab:` input to the commit its branch or
+  tag points at today. `flake.nix` is never edited: it keeps naming the branch,
+  and only the locked commit changes
+- Reports each change with bump `revision` and short commit hashes
+  (`nixpkgs 00455b0a3690 -> 4975466d3247`). A revision has no semver level, so
+  `--max-bump` and `--only-bump` never hold it back
+- Reads upstream heads straight from the GitHub and GitLab APIs, so checking
+  needs no Nix installation. `GITHUB_TOKEN` (or `GH_TOKEN`) raises the GitHub
+  rate limit and reaches private repositories, as for GitHub Actions. For a
+  private GitLab project set `GITLAB_TOKEN`, plus `GITLAB_HOST` when it is not
+  on gitlab.com; the token is only ever sent to that one host
+- Writing needs Nix: the lock records a hash of the fetched source that only
+  Nix computes. `--apply` runs `nix flake update <input>...` for the inputs
+  that moved, then checks the lock holds exactly the commits `upd` resolved and
+  that nothing else changed: inputs of an updated input may move with it, but
+  every other input, direct or transitive, must be locked exactly as before,
+  and no new input may appear. Anything else, a missing `nix` included, is an
+  error and the lock is put back as it was
+- Inputs that `follows` another input move with it and are not listed. Inputs
+  pinned to a commit in `flake.nix` (`?rev=`) count as up to date. Registry
+  (`nixpkgs` without a URL), `git+https:`, tarball, and GitHub Enterprise
+  inputs are left alone and reported as not examined
+- `ignore` and `--package` work by input name. `[pin]` does not apply: name
+  the commit in `flake.nix` instead
+
+Cooldown works differently here, because a branch has no releases to age.
+With a cooldown of 7 days, an input moves only once its locked commit is at
+least 7 days old, and then to the newest commit. That limits how often the
+lock changes without ever holding it on a commit nobody picked. Set it per
+ecosystem with `nix = "7d"` under `[cooldown.ecosystem]`.
+
 ## GitHub Actions
 
 - `.github/workflows/*.yml` and `.github/workflows/*.yaml`

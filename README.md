@@ -9,7 +9,7 @@
 </p>
 
 <p align="center">
-  Python · Node.js · Rust · Go · Ruby · .NET · Gradle · Docker · Terraform · GitHub Actions · pre-commit · Mise
+  Python · Node.js · Rust · Go · Ruby · .NET · Gradle · Docker · Terraform · Nix flakes · GitHub Actions · pre-commit · Mise
 </p>
 
 [![crates.io](https://img.shields.io/crates/v/upd.svg)](https://crates.io/crates/upd)
@@ -106,7 +106,7 @@ references and leave a parseable result. See the
 
 ## Features
 
-- **Multi-ecosystem**: Python, Node.js, Rust, Go, Ruby, .NET, Docker, Terraform, GitHub Actions, pre-commit, Mise/asdf
+- **Multi-ecosystem**: Python, Node.js, Rust, Go, Ruby, .NET, Docker, Terraform, Nix flakes, GitHub Actions, pre-commit, Mise/asdf
 - **Dry-run by default**: nothing is written without `--apply`
 - **Fast**: parallel registry requests, with a 24-hour version cache
 - **Constraint-aware**: respects `>=2.0,<3` (Python), `~> 7.1` (Ruby), and `^2.0.0` / `~2.0.0` (npm, Cargo)
@@ -182,7 +182,7 @@ upd --max-bump minor
 upd --only-bump major
 
 # One ecosystem at a time: python, node, rust, go, ruby, dot-net,
-# docker, terraform, actions, pre-commit, mise, annotated
+# docker, terraform, nix, actions, pre-commit, mise, annotated
 upd --lang python
 
 # Both pre-commit YAML and prek.toml, including supported hook dependencies

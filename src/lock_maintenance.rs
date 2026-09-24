@@ -166,6 +166,7 @@ fn bump(kind: Kind, from: &[String], to: &[String]) -> Option<&'static str> {
         BumpKind::Major => "major",
         BumpKind::Minor => "minor",
         BumpKind::Patch => "patch",
+        BumpKind::Revision => "revision",
     })
 }
 

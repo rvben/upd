@@ -128,6 +128,7 @@ fn get_updater(file_type: FileType, warnings: ParseWarnings) -> Box<dyn Updater>
         FileType::MiseToml | FileType::ToolVersions => Box::new(MiseUpdater::new_parse_only()),
         FileType::TerraformTf => Box::new(TerraformUpdater::new()),
         FileType::Dockerfile | FileType::DockerCompose => Box::new(DockerUpdater::new()),
+        FileType::FlakeLock => Box::new(crate::updater::FlakeLockUpdater::new()),
         FileType::Annotated => Box::new(AnnotatedUpdater::new_parse_only(warnings)),
     }
 }
@@ -260,6 +261,8 @@ pub(crate) fn is_stable_version(version: &str, lang: Lang) -> bool {
             // metadata, which may itself contain hyphens (`+spec-1.1.0`)
             !crate::version::without_build_metadata(version).contains('-')
         }
+        // A locked commit is not a release, so it is never a prerelease.
+        Lang::Nix => true,
         Lang::Ruby => {
             let v = version.to_lowercase();
             !v.contains(".pre")
@@ -298,6 +301,8 @@ pub(crate) fn compare_versions(a: &str, b: &str, lang: Lang) -> std::cmp::Orderi
         Lang::Gradle => crate::version::gradle::compare(a, b),
         Lang::Node | Lang::Rust | Lang::Ruby | Lang::DotNet => compare_semver(a, b),
         Lang::Go => compare_go_version(a, b),
+        // Commits carry no order of their own.
+        Lang::Nix => std::cmp::Ordering::Equal,
         Lang::Actions
         | Lang::PreCommit
         | Lang::Mise

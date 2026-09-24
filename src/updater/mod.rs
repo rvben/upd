@@ -2,6 +2,7 @@ mod annotated;
 mod cargo_toml;
 mod csproj;
 mod docker;
+mod flake_lock;
 mod gemfile;
 mod github_actions;
 mod go_mod;
@@ -17,6 +18,7 @@ pub use annotated::{AnnotatedUpdater, ParseWarnings, RegistrySet, selection_reac
 pub use cargo_toml::CargoTomlUpdater;
 pub use csproj::CsprojUpdater;
 pub use docker::DockerUpdater;
+pub use flake_lock::FlakeLockUpdater;
 pub use gemfile::GemfileUpdater;
 pub use github_actions::GithubActionsUpdater;
 pub use go_mod::GoModUpdater;
@@ -499,6 +501,10 @@ pub enum BumpKind {
     Major,
     Minor,
     Patch,
+    /// The same reference moved to a newer commit, as a Nix flake input does.
+    /// There is no version number to compare, so no ceiling applies: the
+    /// manifest names the branch or tag, and following it is what it asks for.
+    Revision,
 }
 
 /// Classify a version change as major / minor / patch.
@@ -560,6 +566,9 @@ pub fn classify_bump(old: &str, new: &str) -> BumpKind {
 /// Python release components describe bump levels independently of caret
 /// compatibility. Other ecosystems retain the existing pre-1.0 policy.
 pub fn classify_bump_for(lang: Lang, old: &str, new: &str) -> BumpKind {
+    if lang == Lang::Nix {
+        return BumpKind::Revision;
+    }
     if lang != Lang::Python {
         return classify_bump(old, new);
     }
@@ -619,6 +628,7 @@ impl BumpFilter {
             BumpKind::Major => self.major,
             BumpKind::Minor => self.minor,
             BumpKind::Patch => self.patch,
+            BumpKind::Revision => true,
         }
     }
 }
@@ -726,6 +736,7 @@ impl UpdateOptions {
             BumpKind::Major => self.bump_filter.major,
             BumpKind::Minor => self.bump_filter.minor,
             BumpKind::Patch => self.bump_filter.patch,
+            BumpKind::Revision => true,
         }
     }
 
@@ -1133,6 +1144,7 @@ pub enum Lang {
     Mise,
     Terraform,
     Docker,
+    Nix,
     GithubReleases,
     Annotated,
 }
@@ -1159,6 +1171,7 @@ impl Lang {
             Lang::Mise => "mise",
             Lang::Terraform => "terraform",
             Lang::Docker => "docker",
+            Lang::Nix => "nix",
             Lang::GithubReleases => "github-releases",
             Lang::Annotated => "annotated",
         }
@@ -1185,6 +1198,7 @@ impl Lang {
             }
             Lang::Terraform => "terraform",
             Lang::Docker => "docker",
+            Lang::Nix => "nix",
             Lang::Annotated => return None,
         })
     }
@@ -1204,6 +1218,7 @@ impl Lang {
             Lang::Mise => "mise",
             Lang::Terraform => "terraform",
             Lang::Docker => "docker",
+            Lang::Nix => "nix",
             Lang::GithubReleases => "github_releases",
             Lang::Annotated => "annotated",
         }
@@ -1230,6 +1245,7 @@ pub enum FileType {
     TerraformTf,
     Dockerfile,
     DockerCompose,
+    FlakeLock,
     /// A file whose dependencies declare their own ecosystem in a trailing
     /// comment. Unlike every other variant, the file name does not decide the
     /// registry; each annotated line does.
@@ -1254,6 +1270,7 @@ impl FileType {
             FileType::MiseToml | FileType::ToolVersions => Lang::Mise,
             FileType::TerraformTf => Lang::Terraform,
             FileType::Dockerfile | FileType::DockerCompose => Lang::Docker,
+            FileType::FlakeLock => Lang::Nix,
             FileType::Annotated => Lang::Annotated,
         }
     }
@@ -1294,6 +1311,7 @@ impl FileType {
             FileType::TerraformTf => "terraform_tf",
             FileType::Dockerfile => "dockerfile",
             FileType::DockerCompose => "docker_compose",
+            FileType::FlakeLock => "flake_lock",
             FileType::Annotated => "annotated",
         }
     }
@@ -1399,6 +1417,10 @@ impl FileType {
 
         if file_name == ".tool-versions" {
             return Some(FileType::ToolVersions);
+        }
+
+        if file_name == "flake.lock" {
+            return Some(FileType::FlakeLock);
         }
 
         if file_name == "Dockerfile" || file_name.starts_with("Dockerfile.") {
@@ -4002,6 +4024,7 @@ mod tests {
         FileType::TerraformTf,
         FileType::Dockerfile,
         FileType::DockerCompose,
+        FileType::FlakeLock,
         FileType::Annotated,
     ];
 
@@ -4026,6 +4049,7 @@ mod tests {
                 | FileType::TerraformTf
                 | FileType::Dockerfile
                 | FileType::DockerCompose
+                | FileType::FlakeLock
                 | FileType::Annotated => {}
             }
         }

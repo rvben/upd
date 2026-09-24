@@ -455,6 +455,7 @@ spec:
               updates_major: ([$updates[] | select((.bump | ascii_downcase) == "major")] | length),
               updates_minor: ([$updates[] | select((.bump | ascii_downcase) == "minor")] | length),
               updates_patch: ([$updates[] | select((.bump | ascii_downcase) == "patch")] | length),
+              updates_revision: ([$updates[] | select((.bump | ascii_downcase) == "revision")] | length),
               updates_review_worthy: ([$updates[] | select((.bump | ascii_downcase) != "patch")] | length),
               updates_quiet: ([$updates[] | select((.bump | ascii_downcase) == "patch")] | length),
               annotations: ($annotations | length),
@@ -679,7 +680,7 @@ spec:
         def evidence:
           "<details>\n<summary><strong>Proof and provenance</strong></summary>\n\n" +
           "- Applied updates: \(.counts.updates)\n" +
-          "- Change mix: \(.counts.updates_major) major, \(.counts.updates_minor) minor, \(.counts.updates_patch) patch\n" +
+          "- Change mix: \(.counts.updates_major) major, \(.counts.updates_minor) minor, \(.counts.updates_patch) patch, \(.counts.updates_revision) revision\n" +
           "- Normalized specifiers: \(.counts.normalized)\n" +
           "- Dependency annotations: \(.counts.annotations)\n" +
           "- Held back by policy: \(.counts.policy_holds)\n" +

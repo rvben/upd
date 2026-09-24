@@ -803,6 +803,50 @@ fn github_presentation_prioritizes_review_worthy_updates() {
 }
 
 #[test]
+fn github_presentation_counts_flake_input_revisions_as_review_worthy() {
+    let fixture = Fixture::new();
+    let report = r#"{
+      "files": [{
+        "path": "flake.lock",
+        "updates": [
+          {"package":"nixpkgs","current":"00455b0a3690","latest":"4975466d3247","bump":"revision"}
+        ]
+      }],
+      "summary": {"updates_total":1,"updates_revision":1,"files_with_changes":1,"warnings":0}
+    }"#;
+    fixture.run_publish_with_report(true, "new", false, report);
+
+    let presentation = fixture.presentation();
+    assert_eq!(presentation["counts"]["updates_revision"], 1);
+    assert_eq!(presentation["counts"]["updates_review_worthy"], 1);
+    let body = fixture.body();
+    assert!(
+        body.contains("**no minor · no patches · no majors · 1 revision**"),
+        "{body}"
+    );
+    assert!(body.contains("<code>nixpkgs 00455b0a3690 → 4975466d3247</code>"));
+}
+
+#[test]
+fn workflow_installs_nix_only_for_a_repository_with_flake_inputs_to_update() {
+    let install = WORKFLOW
+        .find("- name: Install Nix for flake.lock inputs")
+        .unwrap();
+    let apply = WORKFLOW
+        .find("- name: Apply policy-approved dependency updates")
+        .unwrap();
+    assert!(install < apply);
+    assert!(WORKFLOW.contains(
+        "if: (inputs.langs == '' || contains(inputs.langs, 'nix')) && hashFiles('**/flake.lock') != ''"
+    ));
+    assert!(
+        WORKFLOW.contains(
+            "cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24 # v31.11.1"
+        )
+    );
+}
+
+#[test]
 fn github_presentation_is_a_compact_email_safe_summary_with_an_evidence_link() {
     let fixture = Fixture::new();
     let updates = [

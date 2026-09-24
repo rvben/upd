@@ -259,6 +259,14 @@ jobs:
             exit 2
           fi
 
+      # Writing flake.lock needs Nix, which alone computes the hash the lock
+      # records for each input.
+      - name: Install Nix for flake.lock inputs
+        if: (inputs.langs == '' || contains(inputs.langs, 'nix')) && hashFiles('**/flake.lock') != ''
+        uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24 # v31.11.1
+        with:
+          github_access_token: ${{ github.token }}
+
       - name: Apply policy-approved dependency updates
         id: update
         env:
@@ -449,6 +457,7 @@ jobs:
                   updates_major: ([$updates[] | select((.bump | ascii_downcase) == "major")] | length),
                   updates_minor: ([$updates[] | select((.bump | ascii_downcase) == "minor")] | length),
                   updates_patch: ([$updates[] | select((.bump | ascii_downcase) == "patch")] | length),
+                  updates_revision: ([$updates[] | select((.bump | ascii_downcase) == "revision")] | length),
                   updates_review_worthy: ([$updates[] | select((.bump | ascii_downcase) != "patch")] | length),
                   updates_quiet: ([$updates[] | select((.bump | ascii_downcase) == "patch")] | length),
                   annotations: ($annotations | length),
@@ -927,6 +936,7 @@ jobs:
             def summary:
               if .counts.updates > 0 then
                 "**\(bump_count(.counts.updates_minor; "minor"; "minor")) · \(bump_count(.counts.updates_patch; "patch"; "patches")) · \(bump_count(.counts.updates_major; "major"; "majors"))" +
+                (if .counts.updates_revision > 0 then " · \(.counts.updates_revision) \(plural(.counts.updates_revision; "revision"; "revisions"))" else "" end) +
                 (if .counts.normalized > 0 then " · \(.counts.normalized) normalized" else "" end) + "**"
               elif .counts.normalized > 0 then
                 "**\(.counts.normalized) normalized \(plural(.counts.normalized; "specifier"; "specifiers"))**"
