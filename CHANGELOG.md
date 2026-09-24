@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.13.1](https://github.com/rvben/upd/compare/v0.13.0...v0.13.1) - 2026-09-24
+
+### Added
+
+- **nix**: update flake.lock inputs ([c987929](https://github.com/rvben/upd/commit/c987929812bba0e5bbc05cc20de2f399bd3c9852))
+- **lockfile**: add explicit transitive lock refresh ([2d61c84](https://github.com/rvben/upd/commit/2d61c84d39c6b56d0c02bc4701e9c825f630c0e6))
+
+### Fixed
+
+- **gitlab**: preserve human commits on automation branches ([469fb7e](https://github.com/rvben/upd/commit/469fb7ea88ca0d86e3cd30a103d412ce3df31386))
+- **align**: report only the edits the writer would actually make ([0ff159a](https://github.com/rvben/upd/commit/0ff159ad7b7c9bbe9ff7c0a399fac6eca32b2ce2))
+
 ## [0.13.0](https://github.com/rvben/upd/compare/v0.12.4...v0.13.0) - 2026-09-16
 
 ### Added
