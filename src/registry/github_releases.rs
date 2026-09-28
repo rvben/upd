@@ -6,6 +6,7 @@ use chrono::{DateTime, Utc};
 use reqwest::Client;
 use reqwest::header::{ACCEPT, AUTHORIZATION, HeaderMap, HeaderValue};
 use serde::Deserialize;
+use std::sync::OnceLock;
 use std::time::Duration;
 
 pub struct GitHubReleasesRegistry {
@@ -122,12 +123,20 @@ impl GitHubReleasesRegistry {
         Self { client, api_url }
     }
 
-    /// Check `GITHUB_TOKEN` then `GH_TOKEN` for an auth token.
+    /// Check `GITHUB_TOKEN`, then `GH_TOKEN`, then fall back to the token an
+    /// authenticated `gh` CLI session already has cached.
+    ///
+    /// A user who ran `gh auth login` has a working GitHub credential sitting
+    /// right there; without this fallback, `upd` ignores it and makes
+    /// unauthenticated requests instead, hitting the much lower rate limit for
+    /// no reason. Explicit env vars still win, so CI and other automation that
+    /// sets `GITHUB_TOKEN`/`GH_TOKEN` deliberately is unaffected.
     pub fn detect_token() -> Option<String> {
         std::env::var("GITHUB_TOKEN")
             .ok()
             .filter(|s| !s.is_empty())
             .or_else(|| std::env::var("GH_TOKEN").ok().filter(|s| !s.is_empty()))
+            .or_else(|| gh_cli_token().cloned())
     }
 
     /// Extract `owner/repo` from a package string like `owner/repo` or `owner/repo/path/to/action`.
@@ -354,6 +363,45 @@ impl GitHubReleasesRegistry {
             )));
         }
         Ok(response.json().await?)
+    }
+}
+
+/// The `gh auth token` result, computed at most once per process.
+///
+/// A flake.lock update calls `detect_token` once per GitHub input, and a
+/// resolving `RegistrySet` can be built more than once per run; without this
+/// cache, each of those would spawn its own `gh` subprocess for a value that
+/// never changes mid-run.
+fn gh_cli_token() -> Option<&'static String> {
+    static TOKEN: OnceLock<Option<String>> = OnceLock::new();
+    TOKEN.get_or_init(token_from_gh_cli).as_ref()
+}
+
+/// Run `gh auth token` and return its trimmed stdout, or `None` if the CLI is
+/// missing, unauthenticated, or the subprocess otherwise fails - any of which
+/// just means this fallback has nothing to offer, not an error worth
+/// surfacing to the caller.
+fn token_from_gh_cli() -> Option<String> {
+    let output = std::process::Command::new("gh")
+        .args(["auth", "token"])
+        .output()
+        .ok()?;
+    parse_gh_token_output(output.status.success(), &output.stdout)
+}
+
+/// Pure parsing of a `gh auth token` subprocess result, split out from
+/// [`token_from_gh_cli`] so the decision logic is testable without spawning a
+/// real `gh` process (which may not be installed or authenticated in CI).
+fn parse_gh_token_output(status_success: bool, stdout: &[u8]) -> Option<String> {
+    if !status_success {
+        return None;
+    }
+    let token = String::from_utf8_lossy(stdout);
+    let token = token.trim();
+    if token.is_empty() {
+        None
+    } else {
+        Some(token.to_string())
     }
 }
 
@@ -684,6 +732,65 @@ mod tests {
 
     fn registry(server: &MockServer) -> GitHubReleasesRegistry {
         GitHubReleasesRegistry::with_api_url(server.uri())
+    }
+
+    #[test]
+    fn parse_gh_token_output_accepts_a_trimmed_successful_token() {
+        // gh prints the token followed by a trailing newline.
+        assert_eq!(
+            parse_gh_token_output(true, b"gho_abc123\n"),
+            Some("gho_abc123".to_string())
+        );
+    }
+
+    #[test]
+    fn parse_gh_token_output_rejects_a_failed_invocation() {
+        // Non-zero exit (not installed, not logged in) must not hand back
+        // whatever happened to be on stdout.
+        assert_eq!(parse_gh_token_output(false, b"gho_abc123\n"), None);
+    }
+
+    #[test]
+    fn parse_gh_token_output_rejects_empty_or_blank_stdout() {
+        assert_eq!(parse_gh_token_output(true, b""), None);
+        assert_eq!(parse_gh_token_output(true, b"\n"), None);
+        assert_eq!(parse_gh_token_output(true, b"   \n"), None);
+    }
+
+    #[test]
+    fn detect_token_prefers_github_token_over_the_gh_cli_fallback() {
+        // With GITHUB_TOKEN set, `Option::or_else`'s laziness means the gh
+        // CLI branch is never even evaluated, so this is safe to assert
+        // without a real `gh` binary on PATH.
+        // SAFETY: nextest runs each test in its own process.
+        unsafe {
+            std::env::set_var("GITHUB_TOKEN", "env-token");
+        }
+        assert_eq!(
+            GitHubReleasesRegistry::detect_token(),
+            Some("env-token".to_string())
+        );
+        // SAFETY: nextest runs each test in its own process.
+        unsafe {
+            std::env::remove_var("GITHUB_TOKEN");
+        }
+    }
+
+    #[test]
+    fn detect_token_falls_back_to_gh_token_over_the_gh_cli_fallback() {
+        // SAFETY: nextest runs each test in its own process.
+        unsafe {
+            std::env::remove_var("GITHUB_TOKEN");
+            std::env::set_var("GH_TOKEN", "gh-env-token");
+        }
+        assert_eq!(
+            GitHubReleasesRegistry::detect_token(),
+            Some("gh-env-token".to_string())
+        );
+        // SAFETY: nextest runs each test in its own process.
+        unsafe {
+            std::env::remove_var("GH_TOKEN");
+        }
     }
 
     /// The SHA-pin updater tries the other spelling of a version only when the
