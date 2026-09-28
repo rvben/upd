@@ -238,7 +238,8 @@ fn refresh_one(path: &Path, cli: &Cli) -> Result<Entry> {
         });
     }
     let (ecosystem, lang) = kind.ecosystem();
-    let cooldown = config.to_cooldown_policy(cli.min_age.as_deref())?;
+    let cooldown =
+        config.to_cooldown_policy(cli.min_age.as_deref(), cli.min_age_floor.as_deref())?;
     if cooldown.is_enabled_for(ecosystem, Some(lang)) {
         bail!(
             "{}: lock maintenance under a cooldown is not yet supported for {}; no files changed",

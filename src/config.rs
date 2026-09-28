@@ -580,9 +580,13 @@ auto_merge = false
     ///
     /// `cli_override` corresponds to the `--min-age` CLI flag; when set it
     /// becomes the policy's `force_override` and wins over all config values.
+    /// `floor` corresponds to `--min-age-floor`: every configured window,
+    /// including the zero default of an unconfigured repository, is raised
+    /// to at least that duration, and longer windows stay as configured.
     pub fn to_cooldown_policy(
         &self,
         cli_override: Option<&str>,
+        floor: Option<&str>,
     ) -> anyhow::Result<crate::cooldown::CooldownPolicy> {
         use crate::cooldown::{CooldownPolicy, parse_duration};
 
@@ -607,6 +611,19 @@ auto_merge = false
                 parse_duration(s).map_err(|e| anyhow::anyhow!("invalid --min-age '{s}': {e}"))?,
             ),
             None => None,
+        };
+
+        let (default, per_ecosystem) = match floor {
+            Some(s) => {
+                let floor = parse_duration(s)
+                    .map_err(|e| anyhow::anyhow!("invalid --min-age-floor '{s}': {e}"))?;
+                let per_ecosystem = per_ecosystem
+                    .into_iter()
+                    .map(|(ecosystem, window)| (ecosystem, window.max(floor)))
+                    .collect();
+                (default.max(floor), per_ecosystem)
+            }
+            None => (default, per_ecosystem),
         };
 
         Ok(CooldownPolicy {
@@ -2231,7 +2248,7 @@ pipy = "7d"
     #[test]
     fn test_config_to_cooldown_policy_empty() {
         let config = UpdConfig::default();
-        let policy = config.to_cooldown_policy(None).unwrap();
+        let policy = config.to_cooldown_policy(None, None).unwrap();
         assert_eq!(policy.default, chrono::Duration::zero());
         assert!(policy.per_ecosystem.is_empty());
         assert!(policy.force_override.is_none());
@@ -2247,7 +2264,7 @@ default = "7d"
 npm = "14d"
 "#;
         let (config, _) = UpdConfig::parse_with_warnings(content, "test.toml").unwrap();
-        let policy = config.to_cooldown_policy(None).unwrap();
+        let policy = config.to_cooldown_policy(None, None).unwrap();
         assert_eq!(policy.default, chrono::Duration::days(7));
         assert_eq!(
             policy.per_ecosystem.get("npm"),
@@ -2262,8 +2279,40 @@ npm = "14d"
 default = "7d"
 "#;
         let (config, _) = UpdConfig::parse_with_warnings(content, "test.toml").unwrap();
-        let policy = config.to_cooldown_policy(Some("0")).unwrap();
+        let policy = config.to_cooldown_policy(Some("0"), None).unwrap();
         assert_eq!(policy.force_override, Some(chrono::Duration::zero()));
+    }
+
+    #[test]
+    fn test_min_age_floor_lifts_short_windows_and_keeps_long_ones() {
+        let content = r#"
+[cooldown]
+default = "3d"
+
+[cooldown.ecosystem]
+npm = "30d"
+pypi = "1d"
+"#;
+        let (config, _) = UpdConfig::parse_with_warnings(content, "test.toml").unwrap();
+        let policy = config.to_cooldown_policy(None, Some("7d")).unwrap();
+        let days = chrono::Duration::days;
+        assert_eq!(policy.default, days(7));
+        assert_eq!(policy.per_ecosystem.get("npm"), Some(&days(30)));
+        assert_eq!(policy.per_ecosystem.get("pypi"), Some(&days(7)));
+        assert!(policy.force_override.is_none());
+        assert_eq!(policy.effective_for("crates.io", None), days(7));
+        assert_eq!(policy.effective_for("npm", Some("node")), days(30));
+
+        let unconfigured = UpdConfig::default()
+            .to_cooldown_policy(None, Some("7d"))
+            .unwrap();
+        assert_eq!(unconfigured.effective_for("pypi", None), days(7));
+
+        let error = UpdConfig::default()
+            .to_cooldown_policy(None, Some("soon"))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("--min-age-floor"), "{error}");
     }
 
     #[test]
@@ -2273,7 +2322,10 @@ default = "7d"
 default = "nope"
 "#;
         let (config, _) = UpdConfig::parse_with_warnings(content, "test.toml").unwrap();
-        let err = config.to_cooldown_policy(None).unwrap_err().to_string();
+        let err = config
+            .to_cooldown_policy(None, None)
+            .unwrap_err()
+            .to_string();
         assert!(
             err.contains("cooldown"),
             "error should mention cooldown: {err}"

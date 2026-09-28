@@ -163,6 +163,11 @@ fn build_schema() -> Value {
                 "type": "string"
             },
             {
+                "name": "min-age-floor",
+                "description": "Raise every configured cooldown window, and the zero default, to at least this release age; longer configured windows stay. Conflicts with --min-age",
+                "type": "string"
+            },
+            {
                 "name": "config",
                 "short": "-c",
                 "description": "Path to config file (default: auto-discover .updrc.toml, upd.toml, or .updrc)",

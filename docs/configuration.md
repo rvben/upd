@@ -198,6 +198,15 @@ upd --min-age 14d         # use 14 days regardless of config
 upd --min-age 0           # disable cooldown entirely for this run
 ```
 
+`--min-age-floor` tightens instead of replacing: every window shorter than the
+floor, including the zero default of a repository without `[cooldown]`, is
+raised to it, and longer configured windows stay. Organization automation uses
+it so a central policy never loosens a repository's own cooldown.
+
+```text
+upd --min-age-floor 7d    # at least 7 days; a configured npm = "30d" stays 30 days
+```
+
 **How it works:** when the latest version is still inside the cooldown
 window, `upd` updates to the newest version that *is* old enough. If nothing
 newer is old enough yet, the package is held back. Output marks these

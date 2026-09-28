@@ -1645,7 +1645,8 @@ async fn run() -> Result<()> {
             }
         };
 
-        let policy = loaded_config.to_cooldown_policy(cli.min_age.as_deref())?;
+        let policy = loaded_config
+            .to_cooldown_policy(cli.min_age.as_deref(), cli.min_age_floor.as_deref())?;
         let effective = upd::config::EffectiveConfig {
             source: source.as_deref(),
             explicit,
@@ -1915,8 +1916,11 @@ async fn run_update(cli: &Cli) -> Result<()> {
         .iter()
         .map(|(path, config)| {
             let raw = match config.as_ref() {
-                Some(cfg) => cfg.to_cooldown_policy(cli.min_age.as_deref())?,
-                None => UpdConfig::default().to_cooldown_policy(cli.min_age.as_deref())?,
+                Some(cfg) => {
+                    cfg.to_cooldown_policy(cli.min_age.as_deref(), cli.min_age_floor.as_deref())?
+                }
+                None => UpdConfig::default()
+                    .to_cooldown_policy(cli.min_age.as_deref(), cli.min_age_floor.as_deref())?,
             };
             let is_noop = raw.force_override.is_none()
                 && raw.default <= Duration::zero()
@@ -2541,8 +2545,10 @@ async fn run_update(cli: &Cli) -> Result<()> {
                 let config = resolve_floor_config(cli, &file_configs, &lookup_path)?;
 
                 let raw_policy = match config.as_ref() {
-                    Some(cfg) => cfg.to_cooldown_policy(cli.min_age.as_deref())?,
-                    None => UpdConfig::default().to_cooldown_policy(cli.min_age.as_deref())?,
+                    Some(cfg) => cfg
+                        .to_cooldown_policy(cli.min_age.as_deref(), cli.min_age_floor.as_deref())?,
+                    None => UpdConfig::default()
+                        .to_cooldown_policy(cli.min_age.as_deref(), cli.min_age_floor.as_deref())?,
                 };
                 let is_noop_cooldown = raw_policy.force_override.is_none()
                     && raw_policy.default <= Duration::zero()

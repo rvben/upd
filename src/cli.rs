@@ -229,6 +229,21 @@ pub struct Cli {
     #[arg(long, global = true, value_name = "DURATION")]
     pub min_age: Option<String>,
 
+    /// Raise every cooldown window to at least this release age.
+    ///
+    /// Unlike `--min-age`, which replaces the `[cooldown]` config, the floor
+    /// keeps every configured window that is already longer and lifts the
+    /// shorter ones (and an unconfigured repository's zero default) to it.
+    /// Organization automation uses it so a central policy can tighten, but
+    /// never loosen, a repository's own cooldown.
+    #[arg(
+        long,
+        global = true,
+        value_name = "DURATION",
+        conflicts_with = "min_age"
+    )]
+    pub min_age_floor: Option<String>,
+
     /// Update only matching package(s), skipping all others.
     ///
     /// Accepts case-sensitive globs (`*`, `?`, `[abc]`). Quote globs to keep
@@ -1077,6 +1092,16 @@ mod tests {
     fn test_cli_min_age_zero_for_disable() {
         let cli = Cli::try_parse_from(["upd", "--min-age", "0"]).unwrap();
         assert_eq!(cli.min_age.as_deref(), Some("0"));
+    }
+
+    #[test]
+    fn test_cli_min_age_floor_excludes_min_age() {
+        let cli = Cli::try_parse_from(["upd", "update", "--min-age-floor", "7d"]).unwrap();
+        assert_eq!(cli.min_age_floor.as_deref(), Some("7d"));
+        assert!(
+            Cli::try_parse_from(["upd", "--min-age", "1d", "--min-age-floor", "7d"]).is_err(),
+            "a floor and an override would disagree about the window"
+        );
     }
 
     #[test]

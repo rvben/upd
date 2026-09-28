@@ -29,7 +29,7 @@ lockfiles from being attempted, and the command exits nonzero if any failed.
 
 The no-write mode lists candidates; it does not predict the package-manager
 resolution. Use `--apply` in a clean Git checkout to review the resulting diff.
-An active `[cooldown]` or `--min-age` is currently refused before invoking a
+An active `[cooldown]`, `--min-age` or `--min-age-floor` is currently refused before invoking a
 package manager. Cooldown-aware maintenance needs its own release-age checks
 for the full resolved graph. `--only-bump` and `--package` are not yet supported
 for maintenance; `--lang` and `--max-bump` are supported.
