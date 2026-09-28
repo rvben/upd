@@ -160,10 +160,13 @@ pub enum Outcome {
         merge_request: Option<String>,
         branch_deleted: bool,
     },
-    /// The update was pushed and its merge request created or refreshed.
+    /// The update is on the rolling branch and its merge request created or
+    /// refreshed. `pushed` is false when the branch already held exactly this
+    /// commit's content and was left as it was.
     Published {
         merge_request: String,
         created: bool,
+        pushed: bool,
         commit: String,
         auto_merge: AutoMerge,
     },
@@ -172,8 +175,9 @@ pub enum Outcome {
         merge_request: String,
         notice_added: bool,
     },
-    /// Dry run: an update is ready and would be published under `title`.
-    WouldPublish { title: String },
+    /// Dry run: an update is ready and would be published under `title`;
+    /// `push` is false when the branch already holds it.
+    WouldPublish { title: String, push: bool },
     /// Dry run: nothing to propose; the obsolete merge request and/or branch
     /// would be removed.
     WouldClose {
@@ -223,18 +227,31 @@ impl Outcome {
             Self::Published {
                 merge_request,
                 created,
+                pushed,
                 commit,
                 auto_merge,
-            } => format!(
-                "{} {merge_request} for {} on {branch}; auto-merge {}.",
-                if *created { "Created" } else { "Updated" },
-                commit.get(..12).unwrap_or(commit),
-                match auto_merge {
+            } => {
+                let commit = commit.get(..12).unwrap_or(commit);
+                let auto_merge = match auto_merge {
                     AutoMerge::Enabled => "enabled",
                     AutoMerge::Disabled => "disabled",
                     AutoMerge::Off => "off",
-                },
-            ),
+                };
+                match (created, pushed) {
+                    (true, true) => format!(
+                        "Created {merge_request} for {commit} on {branch}; auto-merge {auto_merge}."
+                    ),
+                    (false, true) => format!(
+                        "Updated {merge_request} to {commit} on {branch}; auto-merge {auto_merge}."
+                    ),
+                    (true, false) => format!(
+                        "Created {merge_request} for {commit}, already on {branch}; auto-merge {auto_merge}."
+                    ),
+                    (false, false) => format!(
+                        "{merge_request} already proposes {commit} on {branch}; nothing pushed; auto-merge {auto_merge}."
+                    ),
+                }
+            }
             Self::Paused {
                 merge_request,
                 notice_added,
@@ -246,9 +263,12 @@ impl Outcome {
                     "notice already on"
                 }
             ),
-            Self::WouldPublish { title } => {
+            Self::WouldPublish { title, push: true } => {
                 format!("Dry run: would publish \"{title}\" on {branch}.")
             }
+            Self::WouldPublish { title, push: false } => format!(
+                "Dry run: {branch} already holds \"{title}\"; would push nothing and only refresh its merge request."
+            ),
             Self::WouldClose {
                 merge_request,
                 delete_branch,
@@ -494,19 +514,36 @@ impl<'a> Session<'a> {
         } else {
             settings.mr_title.clone()
         };
+        // Rewriting an identical commit would only change its timestamps, yet
+        // it restarts the merge request's pipeline and approvals.
+        let pushed = expected_remote_sha.is_empty()
+            || !already_proposed(&git, settings, &default_ref, &expected_remote_sha).await?;
         if settings.dry_run {
-            return Ok(Outcome::WouldPublish { title });
+            return Ok(Outcome::WouldPublish {
+                title,
+                push: pushed,
+            });
         }
 
-        git.commit(
-            &settings.commit_message,
-            &settings.git_name,
-            &settings.git_email,
-        )
-        .await?;
-        let commit = git.read(["rev-parse", "HEAD"]).await?;
+        let commit = if pushed {
+            git.commit(
+                &settings.commit_message,
+                &settings.git_name,
+                &settings.git_email,
+            )
+            .await?;
+            git.read(["rev-parse", "HEAD"]).await?
+        } else {
+            log.line(format_args!(
+                "{} already holds this update; leaving it as it is",
+                settings.branch
+            ));
+            expected_remote_sha.clone()
+        };
+        // Unpushed, the same lease is a no-op that still proves the branch is
+        // the commit this run inspected before the merge request is touched.
         if let Push::Stale(detail) = git
-            .push_with_lease(&url, &settings.branch, &expected_remote_sha, "HEAD")
+            .push_with_lease(&url, &settings.branch, &expected_remote_sha, &commit)
             .await?
         {
             return Err(lease_conflict(&settings.branch, &detail));
@@ -517,29 +554,41 @@ impl<'a> Session<'a> {
         write_artifact(settings, "upd-mr-description.md", &description)?;
 
         let created = existing.is_none();
-        let response = match existing {
-            None => {
-                api.create(
+        let merge_request = match existing {
+            None => MergeRequest::from_response(
+                &api.create(
                     &settings.branch,
                     &settings.default_branch,
                     &title,
                     &description,
                 )
-                .await?
+                .await?,
+            )?,
+            Some(existing)
+                if existing.raw["title"] == title.as_str()
+                    && existing.raw["description"] == description.as_str() =>
+            {
+                existing
             }
-            Some(existing) => {
-                api.edit(
+            Some(existing) => MergeRequest::from_response(
+                &api.edit(
                     existing.iid,
                     json!({"title": title, "description": description}),
                 )
-                .await?
-            }
+                .await?,
+            )?,
         };
-        let merge_request = MergeRequest::from_response(&response)?;
         log.line(format_args!("Merge request: {}", merge_request.web_url));
 
         let auto_merge = if settings.auto_merge {
-            api.enable_auto_merge(merge_request.iid, &commit).await?;
+            // Auto-merge armed earlier is bound to this same commit when
+            // nothing was pushed; arming it again would be a no-op write,
+            // unless it no longer removes the branch once merged.
+            let armed = merge_request.auto_merge_enabled()
+                && merge_request.raw["should_remove_source_branch"] == true;
+            if pushed || !armed {
+                api.enable_auto_merge(merge_request.iid, &commit).await?;
+            }
             AutoMerge::Enabled
         } else if merge_request.auto_merge_enabled() {
             api.cancel_auto_merge(merge_request.iid).await?;
@@ -551,6 +600,7 @@ impl<'a> Session<'a> {
         Ok(Outcome::Published {
             merge_request: merge_request.web_url,
             created,
+            pushed,
             commit,
             auto_merge,
         })
@@ -633,6 +683,38 @@ async fn branch_is_owned(
     let expected = format!(
         "{}\0{}\0{}",
         settings.git_email, settings.git_email, settings.commit_message
+    );
+    Ok(identity == expected)
+}
+
+/// Whether `tip`, a branch `branch_is_owned` accepted, already is the commit
+/// this run would write from the staged result: the same tree, directly on
+/// the current default branch, with the configured name and message.
+async fn already_proposed(
+    git: &Git,
+    settings: &Settings,
+    default_ref: &str,
+    tip: &str,
+) -> Result<bool, Error> {
+    let base = git
+        .read(["rev-parse", &format!("{default_ref}^{{commit}}")])
+        .await?;
+    let parent = git.read(["rev-parse", &format!("{tip}^")]).await?;
+    if parent != base {
+        return Ok(false);
+    }
+    let tree = git.read(["write-tree"]).await?;
+    if tree != git.read(["rev-parse", &format!("{tip}^{{tree}}")]).await? {
+        return Ok(false);
+    }
+    let identity = git
+        .read(["show", "-s", "--format=%an%x00%cn%x00%B", tip])
+        .await?;
+    let expected = format!(
+        "{}\0{}\0{}",
+        settings.git_name,
+        settings.git_name,
+        settings.commit_message.trim_end()
     );
     Ok(identity == expected)
 }
@@ -902,10 +984,56 @@ mod tests {
     }
 
     #[test]
+    fn the_text_outcome_says_whether_anything_was_pushed() {
+        let branch = "automation/upd-dependencies";
+        let url = "https://gitlab.example.test/p/-/merge_requests/7";
+        let published = |created, pushed| Outcome::Published {
+            merge_request: url.to_string(),
+            created,
+            pushed,
+            commit: "0123456789abcdef".to_string(),
+            auto_merge: AutoMerge::Enabled,
+        };
+        assert_eq!(
+            published(true, true).render_text(branch),
+            format!("Created {url} for 0123456789ab on {branch}; auto-merge enabled.")
+        );
+        assert_eq!(
+            published(false, true).render_text(branch),
+            format!("Updated {url} to 0123456789ab on {branch}; auto-merge enabled.")
+        );
+        assert_eq!(
+            published(true, false).render_text(branch),
+            format!("Created {url} for 0123456789ab, already on {branch}; auto-merge enabled.")
+        );
+        assert_eq!(
+            published(false, false).render_text(branch),
+            format!(
+                "{url} already proposes 0123456789ab on {branch}; nothing pushed; auto-merge enabled."
+            )
+        );
+        let would = |push| Outcome::WouldPublish {
+            title: "chore(deps): refresh".to_string(),
+            push,
+        };
+        assert_eq!(
+            would(true).render_text(branch),
+            format!("Dry run: would publish \"chore(deps): refresh\" on {branch}.")
+        );
+        assert_eq!(
+            would(false).render_text(branch),
+            format!(
+                "Dry run: {branch} already holds \"chore(deps): refresh\"; would push nothing and only refresh its merge request."
+            )
+        );
+    }
+
+    #[test]
     fn outcome_json_names_the_command_and_branch() {
         let outcome = Outcome::Published {
             merge_request: "https://gitlab.example.test/p/-/merge_requests/7".to_string(),
             created: true,
+            pushed: true,
             commit: "abc".to_string(),
             auto_merge: AutoMerge::Off,
         };
@@ -917,6 +1045,7 @@ mod tests {
                 "branch": "automation/upd-dependencies",
                 "merge_request": "https://gitlab.example.test/p/-/merge_requests/7",
                 "created": true,
+                "pushed": true,
                 "commit": "abc",
                 "auto_merge": "off",
             })

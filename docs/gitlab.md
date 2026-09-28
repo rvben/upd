@@ -140,6 +140,11 @@ The template:
   commit, preserving the branch and adding a notice to the open merge request;
 - updates the remote branch with a lease on the commit it last saw, never a
   blind force push, and fails with a conflict if the branch moved meanwhile;
+- leaves the branch untouched when it already holds exactly the commit the run
+  would write (same content, on the current default branch, with the configured
+  identity and message), so a scheduled run with nothing new does not restart
+  the merge request's pipeline or reset its approvals, and edits the merge
+  request only when its title or description differ;
 - refuses ambiguous duplicate open merge requests;
 - fails if preparation or validation leaves unexpected repository changes;
 - retains the machine-readable update report as a one-week CI artifact;
@@ -222,9 +227,12 @@ command from its own job instead. It reads the GitLab CI job environment:
 
 Progress goes to stderr. The outcome goes to stdout, as one line of text or, with
 `--output json`, an object whose `outcome` is `clean`, `closed`, `published`, or
-`paused`. With `--dry-run` the update, validation and ownership checks still
-run, but nothing is pushed and nothing is written to GitLab; the outcome is then
-`would_publish`, `would_close`, or `would_pause` in place of the last three.
+`paused`. A `published` outcome carries `pushed: false` when the branch already
+held the update and only the merge request was checked. With `--dry-run` the
+update, validation and ownership checks still run, but nothing is pushed and
+nothing is written to GitLab; the outcome is then `would_publish` (with `push`
+saying whether the branch would change), `would_close`, or `would_pause` in
+place of the last three.
 Failures print a JSON error to stderr and exit with the code listed in
 `upd schema`: 4 for missing or invalid settings, 3 for network and GitLab
 server errors (retryable), 5 when the branch moved during the run, and 2 for

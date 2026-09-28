@@ -87,6 +87,7 @@ struct Run {
     validation_command: String,
     mr_title: String,
     branch: String,
+    git_name: String,
 }
 
 impl Default for Run {
@@ -105,6 +106,7 @@ impl Default for Run {
             validation_command: String::new(),
             mr_title: String::new(),
             branch: BRANCH.to_string(),
+            git_name: "upd test".to_string(),
         }
     }
 }
@@ -130,6 +132,16 @@ impl Fixture {
             &["remote", "add", "origin", remote.to_str().unwrap()],
         );
         git(&checkout, &["push", "origin", "main"]);
+        let hook = remote.join("hooks/update");
+        fs::write(
+            &hook,
+            format!(
+                "#!/bin/sh\necho \"$1\" >> '{}'\n",
+                temp.path().join("pushes.log").display()
+            ),
+        )
+        .expect("push log hook");
+        fs::set_permissions(&hook, fs::Permissions::from_mode(0o755)).unwrap();
 
         fs::write(
             &updater,
@@ -257,7 +269,7 @@ fi
             .env("UPD_BRANCH", &run.branch)
             .env("UPD_COMMIT_MESSAGE", "chore(deps): test update")
             .env("UPD_MR_TITLE", &run.mr_title)
-            .env("UPD_GIT_NAME", "upd test")
+            .env("UPD_GIT_NAME", &run.git_name)
             .env("UPD_GIT_EMAIL", "upd-test@example.com")
             .env("UPD_AUTO_MERGE", run.auto_merge.to_string())
             .env("UPD_EXECUTABLE", &self.updater)
@@ -283,6 +295,15 @@ fi
             .status
             .success()
             .then(|| String::from_utf8(output.stdout).unwrap().trim().to_string())
+    }
+
+    /// How many pushes updated the rolling branch.
+    fn branch_pushes(&self) -> usize {
+        fs::read_to_string(self._temp.path().join("pushes.log"))
+            .unwrap_or_default()
+            .lines()
+            .filter(|line| *line == format!("refs/heads/{BRANCH}"))
+            .count()
     }
 
     fn remote_author(&self) -> String {
@@ -1507,7 +1528,7 @@ async fn template_recovers_when_the_push_succeeded_but_merge_request_creation_fa
     assert_eq!(fixture.branch_commit_count(), 1);
 }
 
-async fn assert_lease_rejects_a_racing_push(existing_branch: bool) {
+async fn assert_lease_rejects_a_racing_push(existing_branch: bool, content: &str) {
     let fixture = Fixture::new();
     if existing_branch {
         create_rolling_branch(&fixture, "first").await;
@@ -1517,7 +1538,7 @@ async fn assert_lease_rejects_a_racing_push(existing_branch: bool) {
     let output = fixture.execute(
         &server,
         &Run {
-            content: "second".to_string(),
+            content: content.to_string(),
             validation_command: RACING_PUSH.to_string(),
             ..Run::default()
         },
@@ -1534,12 +1555,17 @@ async fn assert_lease_rejects_a_racing_push(existing_branch: bool) {
 
 #[tokio::test]
 async fn template_lease_rejects_a_push_racing_an_existing_branch() {
-    assert_lease_rejects_a_racing_push(true).await;
+    assert_lease_rejects_a_racing_push(true, "second").await;
+}
+
+#[tokio::test]
+async fn template_lease_catches_a_push_racing_an_unchanged_branch() {
+    assert_lease_rejects_a_racing_push(true, "first").await;
 }
 
 #[tokio::test]
 async fn template_lease_rejects_a_push_racing_branch_creation() {
-    assert_lease_rejects_a_racing_push(false).await;
+    assert_lease_rejects_a_racing_push(false, "second").await;
 }
 
 #[tokio::test]
@@ -1806,6 +1832,7 @@ async fn run_reports_its_outcome_as_json() {
             "outcome": "published",
             "merge_request": "https://gitlab.example.test/project/-/merge_requests/7",
             "created": true,
+            "pushed": true,
             "commit": fixture.remote_tip().unwrap(),
             "auto_merge": "off",
         })
@@ -1997,4 +2024,326 @@ async fn the_artifact_directory_is_excluded_once() {
         fs::read_to_string(&exclude).unwrap(),
         "# existing rule without a trailing newline\n/.upd-ci/\n"
     );
+}
+
+/// The rolling branch and merge request as a first run publishes them.
+struct Published {
+    tip: String,
+    title: String,
+    description: String,
+}
+
+/// Publishes `run` to a fresh branch and merge request 7.
+async fn publish(fixture: &Fixture, run: &Run) -> Published {
+    let server = MockServer::start().await;
+    list_mock(json!([])).mount(&server).await;
+    Mock::given(method("POST"))
+        .and(path("/api/v4/projects/1/merge_requests"))
+        .respond_with(ResponseTemplate::new(201).set_body_json(mr_response(7, false)))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("PUT"))
+        .and(path("/api/v4/projects/1/merge_requests/7/merge"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(mr_response(7, true)))
+        .mount(&server)
+        .await;
+    fixture.run(&server, run);
+    let requests = server.received_requests().await.unwrap();
+    let create = requests
+        .iter()
+        .find(|request| request.method.as_str() == "POST")
+        .expect("merge request created");
+    let body = json_body(create);
+    Published {
+        tip: fixture.remote_tip().expect("rolling branch pushed"),
+        title: body["title"].as_str().unwrap().to_string(),
+        description: body["description"].as_str().unwrap().to_string(),
+    }
+}
+
+/// The open merge request 7 as GitLab lists it; auto-merge, when armed,
+/// removes the source branch.
+fn listed(title: &str, description: &str, auto_merge: bool) -> serde_json::Value {
+    json!([{
+        "iid": 7,
+        "web_url": "https://gitlab.example.test/project/-/merge_requests/7",
+        "title": title,
+        "description": description,
+        "merge_when_pipeline_succeeds": auto_merge,
+        "should_remove_source_branch": auto_merge,
+    }])
+}
+
+fn writes(requests: &[wiremock::Request]) -> Vec<String> {
+    requests
+        .iter()
+        .filter(|request| request.method.as_str() != "GET")
+        .map(|request| format!("{} {}", request.method, request.url.path()))
+        .collect()
+}
+
+fn outcome_of(output: &Output) -> serde_json::Value {
+    assert!(output.status.success(), "{}", describe(output));
+    serde_json::from_slice(&output.stdout).unwrap()
+}
+
+#[tokio::test]
+async fn rerunning_an_unchanged_update_leaves_branch_and_merge_request_alone() {
+    let fixture = Fixture::new();
+    let first = publish(&fixture, &Run::default()).await;
+    // A commit rebuilt in a later second gets a new id; waiting makes a
+    // rewritten branch visible even to a run that pushes an identical tree.
+    std::thread::sleep(std::time::Duration::from_millis(1100));
+
+    let server = MockServer::start().await;
+    list_mock(listed(&first.title, &first.description, false))
+        .mount(&server)
+        .await;
+    let output = fixture.execute_upd(&server, &Run::default(), &["--output", "json"]);
+
+    assert_eq!(
+        outcome_of(&output),
+        json!({
+            "command": "gitlab run",
+            "branch": BRANCH,
+            "outcome": "published",
+            "merge_request": "https://gitlab.example.test/project/-/merge_requests/7",
+            "created": false,
+            "pushed": false,
+            "commit": first.tip,
+            "auto_merge": "off",
+        })
+    );
+    assert_eq!(fixture.remote_tip().as_deref(), Some(first.tip.as_str()));
+    assert_eq!(
+        fixture.branch_pushes(),
+        1,
+        "the unchanged branch was pushed again"
+    );
+    let writes = writes(&server.received_requests().await.unwrap());
+    assert!(
+        writes.is_empty(),
+        "an unchanged rerun wrote to GitLab: {writes:?}"
+    );
+}
+
+#[tokio::test]
+async fn an_unchanged_update_still_refreshes_a_stale_description() {
+    let fixture = Fixture::new();
+    let first = publish(&fixture, &Run::default()).await;
+
+    let server = MockServer::start().await;
+    list_mock(listed(&first.title, "edited by hand", false))
+        .mount(&server)
+        .await;
+    Mock::given(method("PUT"))
+        .and(path("/api/v4/projects/1/merge_requests/7"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(mr_response(7, false)))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let output = fixture.execute_upd(&server, &Run::default(), &["--output", "json"]);
+
+    let outcome = outcome_of(&output);
+    assert_eq!(outcome["pushed"], false, "{outcome}");
+    assert_eq!(outcome["commit"], first.tip.as_str(), "{outcome}");
+    assert_eq!(fixture.branch_pushes(), 1);
+    let requests = server.received_requests().await.unwrap();
+    let edit = requests
+        .iter()
+        .find(|request| request.method.as_str() == "PUT")
+        .unwrap();
+    assert_eq!(
+        json_body(edit),
+        json!({"title": first.title, "description": first.description})
+    );
+}
+
+#[tokio::test]
+async fn an_unchanged_branch_without_a_merge_request_gets_one_without_a_push() {
+    let fixture = Fixture::new();
+    let first = publish(&fixture, &Run::default()).await;
+
+    let server = MockServer::start().await;
+    list_mock(json!([])).mount(&server).await;
+    Mock::given(method("POST"))
+        .and(path("/api/v4/projects/1/merge_requests"))
+        .respond_with(ResponseTemplate::new(201).set_body_json(mr_response(7, false)))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let output = fixture.execute_upd(&server, &Run::default(), &["--output", "json"]);
+
+    let outcome = outcome_of(&output);
+    assert_eq!(outcome["created"], true, "{outcome}");
+    assert_eq!(outcome["pushed"], false, "{outcome}");
+    assert_eq!(outcome["commit"], first.tip.as_str(), "{outcome}");
+    assert_eq!(fixture.branch_pushes(), 1);
+}
+
+#[tokio::test]
+async fn an_unchanged_update_keeps_an_armed_auto_merge() {
+    let fixture = Fixture::new();
+    let run = Run {
+        auto_merge: true,
+        ..Run::default()
+    };
+    let first = publish(&fixture, &run).await;
+
+    let server = MockServer::start().await;
+    list_mock(listed(&first.title, &first.description, true))
+        .mount(&server)
+        .await;
+    let output = fixture.execute_upd(&server, &run, &["--output", "json"]);
+
+    let outcome = outcome_of(&output);
+    assert_eq!(outcome["auto_merge"], "enabled", "{outcome}");
+    assert_eq!(outcome["pushed"], false, "{outcome}");
+    let writes = writes(&server.received_requests().await.unwrap());
+    assert!(writes.is_empty(), "auto-merge was re-armed: {writes:?}");
+}
+
+#[tokio::test]
+async fn an_unchanged_update_rearms_auto_merge_that_keeps_the_source_branch() {
+    let fixture = Fixture::new();
+    let run = Run {
+        auto_merge: true,
+        ..Run::default()
+    };
+    let first = publish(&fixture, &run).await;
+
+    // Someone re-armed auto-merge by hand without removing the source branch.
+    let mut merge_request = listed(&first.title, &first.description, true);
+    merge_request[0]["should_remove_source_branch"] = json!(false);
+    let server = MockServer::start().await;
+    list_mock(merge_request).mount(&server).await;
+    Mock::given(method("PUT"))
+        .and(path("/api/v4/projects/1/merge_requests/7/merge"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(mr_response(7, true)))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let output = fixture.execute_upd(&server, &run, &["--output", "json"]);
+
+    assert_eq!(outcome_of(&output)["pushed"], false);
+    let requests = server.received_requests().await.unwrap();
+    assert_eq!(
+        json_body(&requests[requests.len() - 1]),
+        json!({"auto_merge": true, "sha": first.tip, "should_remove_source_branch": true})
+    );
+}
+
+#[tokio::test]
+async fn an_unchanged_update_arms_auto_merge_on_the_existing_commit() {
+    let fixture = Fixture::new();
+    let run = Run {
+        auto_merge: true,
+        ..Run::default()
+    };
+    let first = publish(&fixture, &run).await;
+
+    // Auto-merge armed earlier was cancelled since, e.g. by a failed pipeline.
+
+    let server = MockServer::start().await;
+    list_mock(listed(&first.title, &first.description, false))
+        .mount(&server)
+        .await;
+    Mock::given(method("PUT"))
+        .and(path("/api/v4/projects/1/merge_requests/7/merge"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(mr_response(7, true)))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let output = fixture.execute_upd(&server, &run, &["--output", "json"]);
+
+    let outcome = outcome_of(&output);
+    assert_eq!(outcome["auto_merge"], "enabled", "{outcome}");
+    let requests = server.received_requests().await.unwrap();
+    assert_eq!(
+        json_body(&requests[requests.len() - 1]),
+        json!({"auto_merge": true, "sha": first.tip, "should_remove_source_branch": true})
+    );
+    assert_eq!(fixture.branch_pushes(), 1);
+}
+
+#[tokio::test]
+async fn an_advanced_default_branch_is_built_on_even_without_new_updates() {
+    let fixture = Fixture::new();
+    let first = publish(&fixture, &Run::default()).await;
+    // A commit that leaves the tree as it was: only the parent can tell the
+    // branch is behind.
+    git(&fixture.checkout, &["switch", "main"]);
+    git(
+        &fixture.checkout,
+        &["commit", "--allow-empty", "-m", "chore: tree unchanged"],
+    );
+    git(&fixture.checkout, &["push", "origin", "main"]);
+
+    let server = MockServer::start().await;
+    list_mock(listed(&first.title, &first.description, false))
+        .mount(&server)
+        .await;
+    let output = fixture.execute_upd(&server, &Run::default(), &["--output", "json"]);
+
+    let outcome = outcome_of(&output);
+    assert_eq!(outcome["pushed"], true, "{outcome}");
+    let tip = fixture.remote_tip().unwrap();
+    assert_ne!(tip, first.tip);
+    assert_eq!(outcome["commit"], tip.as_str(), "{outcome}");
+    assert_eq!(fixture.branch_pushes(), 2);
+    assert_eq!(fixture.branch_commit_count(), 1);
+}
+
+#[tokio::test]
+async fn a_changed_automation_name_rewrites_the_commit() {
+    let fixture = Fixture::new();
+    let first = publish(&fixture, &Run::default()).await;
+
+    let server = MockServer::start().await;
+    list_mock(listed(&first.title, &first.description, false))
+        .mount(&server)
+        .await;
+    let run = Run {
+        git_name: "renamed bot".to_string(),
+        ..Run::default()
+    };
+    let output = fixture.execute_upd(&server, &run, &["--output", "json"]);
+
+    assert_eq!(outcome_of(&output)["pushed"], true);
+    assert_eq!(
+        fixture.remote_author(),
+        "renamed bot <upd-test@example.com>|renamed bot <upd-test@example.com>|chore(deps): test update"
+    );
+}
+
+#[tokio::test]
+async fn a_dry_run_says_when_the_branch_is_already_up_to_date() {
+    let fixture = Fixture::new();
+    let first = publish(&fixture, &Run::default()).await;
+
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/v4/projects/1/merge_requests"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(listed(
+            &first.title,
+            &first.description,
+            false,
+        )))
+        .mount(&server)
+        .await;
+    let output = fixture.execute_upd(&server, &Run::default(), &["--dry-run", "--output", "json"]);
+    let outcome = outcome_of(&output);
+    assert_eq!(outcome["outcome"], "would_publish", "{outcome}");
+    assert_eq!(outcome["push"], false, "{outcome}");
+
+    // A dry run leaves the update in the working tree, as a job would.
+    git(&fixture.checkout, &["reset", "--hard", "--quiet"]);
+    let changed = Run {
+        content: "newer".to_string(),
+        ..Run::default()
+    };
+    let output = fixture.execute_upd(&server, &changed, &["--dry-run", "--output", "json"]);
+    assert_eq!(outcome_of(&output)["push"], true);
+    assert_eq!(fixture.branch_pushes(), 1);
 }

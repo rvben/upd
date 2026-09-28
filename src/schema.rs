@@ -326,14 +326,16 @@ fn build_schema() -> Value {
                 "output_fields": [
                     {"name": "command", "type": "string", "description": "Always \"gitlab run\""},
                     {"name": "branch", "type": "string", "description": "The rolling automation branch"},
-                    {"name": "outcome", "type": "string", "description": "\"clean\" (nothing to propose or clean up), \"closed\" (nothing to propose; the obsolete merge request and/or branch was removed), \"published\" (the update was pushed and its merge request created or refreshed), \"paused\" (the branch holds commits automation did not write and was left untouched), or under --dry-run \"would_publish\", \"would_close\" or \"would_pause\" in place of the last three"},
+                    {"name": "outcome", "type": "string", "description": "\"clean\" (nothing to propose or clean up), \"closed\" (nothing to propose; the obsolete merge request and/or branch was removed), \"published\" (the update is on the branch and its merge request created or refreshed), \"paused\" (the branch holds commits automation did not write and was left untouched), or under --dry-run \"would_publish\", \"would_close\" or \"would_pause\" in place of the last three"},
                     {"name": "merge_request", "type": "string", "description": "Web URL of the merge request; present for published and paused, and for closed and would_close when one was or would be closed (null otherwise)"},
                     {"name": "created", "type": "boolean", "description": "published only: whether the merge request was created by this run"},
-                    {"name": "commit", "type": "string", "description": "published only: the pushed commit"},
-                    {"name": "auto_merge", "type": "string", "description": "published only: \"enabled\" (bound to the pushed commit), \"disabled\" (an earlier auto-merge was cancelled) or \"off\""},
+                    {"name": "pushed", "type": "boolean", "description": "published only: whether this run pushed a new commit; false when the branch already held exactly this update, on the current default branch, and was left as it was"},
+                    {"name": "commit", "type": "string", "description": "published only: the commit the merge request proposes"},
+                    {"name": "auto_merge", "type": "string", "description": "published only: \"enabled\" (bound to that commit), \"disabled\" (an earlier auto-merge was cancelled) or \"off\""},
                     {"name": "branch_deleted", "type": "boolean", "description": "closed only: whether the rolling branch was deleted"},
                     {"name": "notice_added", "type": "boolean", "description": "paused only: whether this run added the pause notice to the merge request description"},
                     {"name": "title", "type": "string", "description": "would_publish only: the merge request title the update would be published under"},
+                    {"name": "push", "type": "boolean", "description": "would_publish only: whether a commit would be pushed; false when the branch already holds this update"},
                     {"name": "delete_branch", "type": "boolean", "description": "would_close only: whether the rolling branch would be deleted"}
                 ]
             },
