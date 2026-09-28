@@ -87,7 +87,9 @@ struct Run {
     validation_command: String,
     mr_title: String,
     branch: String,
+    commit_message: String,
     git_name: String,
+    git_email: String,
 }
 
 impl Default for Run {
@@ -106,7 +108,9 @@ impl Default for Run {
             validation_command: String::new(),
             mr_title: String::new(),
             branch: BRANCH.to_string(),
+            commit_message: "chore(deps): test update".to_string(),
             git_name: "upd test".to_string(),
+            git_email: "upd-test@example.com".to_string(),
         }
     }
 }
@@ -267,10 +271,10 @@ fi
             .env("UPD_PREPARE_COMMAND", &run.prepare_command)
             .env("UPD_VALIDATION_COMMAND", &run.validation_command)
             .env("UPD_BRANCH", &run.branch)
-            .env("UPD_COMMIT_MESSAGE", "chore(deps): test update")
+            .env("UPD_COMMIT_MESSAGE", &run.commit_message)
             .env("UPD_MR_TITLE", &run.mr_title)
             .env("UPD_GIT_NAME", &run.git_name)
-            .env("UPD_GIT_EMAIL", "upd-test@example.com")
+            .env("UPD_GIT_EMAIL", &run.git_email)
             .env("UPD_AUTO_MERGE", run.auto_merge.to_string())
             .env("UPD_EXECUTABLE", &self.updater)
             .env("REAL_UPD", env!("CARGO_BIN_EXE_upd"))
@@ -2346,4 +2350,43 @@ async fn a_dry_run_says_when_the_branch_is_already_up_to_date() {
     let output = fixture.execute_upd(&server, &changed, &["--dry-run", "--output", "json"]);
     assert_eq!(outcome_of(&output)["push"], true);
     assert_eq!(fixture.branch_pushes(), 1);
+}
+
+#[tokio::test]
+async fn a_multi_line_commit_message_keeps_the_branch_owned() {
+    // Blank-line runs and trailing spaces are what a default `git commit`
+    // would rewrite; the message must survive exactly as configured.
+    let run = Run {
+        commit_message: "chore(deps): test update\n\n\nWritten by upd.  \nSee the merge request."
+            .to_string(),
+        ..Run::default()
+    };
+    let fixture = Fixture::new();
+    let first = publish(&fixture, &run).await;
+
+    // With no merge request left to consult, only the commit itself can say
+    // that automation wrote it.
+    let server = MockServer::start().await;
+    list_mock(json!([])).mount(&server).await;
+    Mock::given(method("POST"))
+        .and(path("/api/v4/projects/1/merge_requests"))
+        .respond_with(ResponseTemplate::new(201).set_body_json(mr_response(7, false)))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let output = fixture.execute_upd(&server, &run, &["--output", "json"]);
+
+    let outcome = outcome_of(&output);
+    assert_eq!(outcome["outcome"], "published", "{outcome}");
+    assert_eq!(outcome["pushed"], false, "{outcome}");
+    assert_eq!(outcome["commit"], first.tip.as_str(), "{outcome}");
+    let message = run_git_in_remote(&fixture, &["show", "-s", "--format=%B", &first.tip]);
+    assert_eq!(message.trim_end(), run.commit_message);
+}
+
+fn run_git_in_remote(fixture: &Fixture, args: &[&str]) -> String {
+    let output = run(Command::new("git")
+        .arg(format!("--git-dir={}", fixture.remote.display()))
+        .args(args));
+    String::from_utf8(output.stdout).unwrap()
 }

@@ -113,9 +113,16 @@ impl Git {
         checked(self.local(args), "git").await.map(drop)
     }
 
-    /// Runs `git commit` as the automation identity.
+    /// Runs `git commit` as the automation identity, storing `message`
+    /// verbatim so the commit can later be recognised by it.
     pub async fn commit(&self, message: &str, name: &str, email: &str) -> Result<(), Error> {
-        let mut command = self.local(["commit", "--quiet", "--message", message]);
+        let mut command = self.local([
+            "commit",
+            "--quiet",
+            "--cleanup=verbatim",
+            "--message",
+            message,
+        ]);
         command
             .env("GIT_AUTHOR_NAME", name)
             .env("GIT_AUTHOR_EMAIL", email)

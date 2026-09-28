@@ -678,11 +678,13 @@ async fn branch_is_owned(
         return Ok(false);
     }
     let identity = git
-        .read(["show", "-s", "--format=%ae%x00%ce%x00%s", tip])
+        .read(["show", "-s", "--format=%ae%x00%ce%x00%B", tip])
         .await?;
     let expected = format!(
         "{}\0{}\0{}",
-        settings.git_email, settings.git_email, settings.commit_message
+        settings.git_email,
+        settings.git_email,
+        settings.commit_message.trim_end()
     );
     Ok(identity == expected)
 }
