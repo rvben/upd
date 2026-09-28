@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.13.4](https://github.com/rvben/upd/compare/v0.13.3...v0.13.4) - 2026-09-28
+
+### Added
+
+- **workflow**: remediate advisories in the same PR as dependency updates ([1e702fc](https://github.com/rvben/upd/commit/1e702fc535d8b490fe1c012562fceb4cceb3f40b))
+
+### Fixed
+
+- **registry**: fall back to gh auth token for GHCR authentication ([64db6aa](https://github.com/rvben/upd/commit/64db6aae92897534e4c1a6c902808e8dc1d3257c))
+- **registry**: retry HTTP 429 in the Go proxy and PyPI registries ([ca6e1fb](https://github.com/rvben/upd/commit/ca6e1fb3b9e0654966300f5a735cc807907da6b5))
+
 ## [0.13.3](https://github.com/rvben/upd/compare/v0.13.2...v0.13.3) - 2026-09-28
 
 ### Fixed
