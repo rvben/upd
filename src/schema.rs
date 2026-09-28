@@ -306,6 +306,25 @@ fn build_schema() -> Value {
                 "stdout_schema": {}
             },
             {
+                "name": "gitlab run",
+                "description": "Run one GitLab CI dependency update for the current project: update dependencies on the rolling automation branch, push it with a lease, and create, refresh or close its merge request. Configured by the GitLab CI job environment: requires UPD_GITLAB_TOKEN, CI_API_V4_URL, CI_DEFAULT_BRANCH, CI_PROJECT_DIR, CI_PROJECT_ID, CI_PROJECT_PATH and CI_SERVER_URL; reads UPD_BRANCH, UPD_PATHS, UPD_LANGS, UPD_PACKAGES, UPD_MIN_AGE, UPD_MAX_BUMP, UPD_LOCK, UPD_PREPARE_COMMAND, UPD_VALIDATION_COMMAND, UPD_COMMIT_MESSAGE, UPD_MR_TITLE, UPD_GIT_NAME, UPD_GIT_EMAIL and UPD_AUTO_MERGE. The token is passed only to upd's own git and API calls, never to the prepare command, the validation command or the updater. Progress goes to stderr",
+                "effects": "non_idempotent",
+                "mutating": true,
+                "cardinality": "single",
+                "args": [],
+                "output_fields": [
+                    {"name": "command", "type": "string", "description": "Always \"gitlab run\""},
+                    {"name": "branch", "type": "string", "description": "The rolling automation branch"},
+                    {"name": "outcome", "type": "string", "description": "\"clean\" (nothing to propose or clean up), \"closed\" (nothing to propose; the obsolete merge request and/or branch was removed), \"published\" (the update was pushed and its merge request created or refreshed) or \"paused\" (the branch holds commits automation did not write and was left untouched)"},
+                    {"name": "merge_request", "type": "string", "description": "Web URL of the merge request; present for published and paused, and for closed when one was closed (null otherwise)"},
+                    {"name": "created", "type": "boolean", "description": "published only: whether the merge request was created by this run"},
+                    {"name": "commit", "type": "string", "description": "published only: the pushed commit"},
+                    {"name": "auto_merge", "type": "string", "description": "published only: \"enabled\" (bound to the pushed commit), \"disabled\" (an earlier auto-merge was cancelled) or \"off\""},
+                    {"name": "branch_deleted", "type": "boolean", "description": "closed only: whether the rolling branch was deleted"},
+                    {"name": "notice_added", "type": "boolean", "description": "paused only: whether this run added the pause notice to the merge request description"}
+                ]
+            },
+            {
                 "name": "capabilities",
                 "description": "Describe offline-safe CLI capabilities",
                 "effects": "read_only",
@@ -368,8 +387,20 @@ fn build_schema() -> Value {
                 "retryable": false
             },
             {
+                "kind": "refused",
+                "description": "gitlab run: GitLab or the repository is in a state the run will not act on (more than one open merge request for the branch, or a response that does not identify a merge request)",
+                "exit_code": 2,
+                "retryable": false
+            },
+            {
+                "kind": "api_error",
+                "description": "gitlab run: the GitLab API rejected a request (a 4xx other than 429, e.g. an invalid or under-scoped token)",
+                "exit_code": 2,
+                "retryable": false
+            },
+            {
                 "kind": "conflict",
-                "description": "Version conflict detected between files",
+                "description": "Version conflict detected between files, or (gitlab run) the automation branch moved while the run was working, so its push lease was refused",
                 "exit_code": 5,
                 "retryable": false
             }
@@ -527,6 +558,48 @@ mod tests {
                 declared.contains(&kind),
                 "error kind '{kind}' is emitted by the binary but not declared in errors[]; declared: {declared:?}"
             );
+        }
+    }
+
+    #[test]
+    fn schema_declares_every_gitlab_error_as_reported() {
+        use crate::gitlab::Error;
+        let s = build_schema();
+        let errors = s["errors"].as_array().expect("errors must be an array");
+        for error in [
+            Error::Input(String::new()),
+            Error::Refused(String::new()),
+            Error::Api(String::new()),
+            Error::Network(String::new()),
+            Error::Io(String::new()),
+            Error::Conflict(String::new()),
+        ] {
+            let kind = error.kind();
+            let declared = errors
+                .iter()
+                .find(|e| e["kind"].as_str() == Some(kind))
+                .unwrap_or_else(|| panic!("gitlab error kind '{kind}' must be declared"));
+            assert_eq!(
+                declared["exit_code"].as_i64(),
+                Some(i64::from(error.exit_code())),
+                "{kind}"
+            );
+            assert_eq!(
+                declared["retryable"].as_bool(),
+                Some(matches!(error, Error::Network(_))),
+                "{kind}"
+            );
+        }
+    }
+
+    #[test]
+    fn schema_declares_gitlab_run() {
+        let s = build_schema();
+        let command = find_command(&s, "gitlab run");
+        assert_eq!(command["mutating"], true);
+        let fields = output_field_names(command);
+        for field in ["command", "branch", "outcome", "merge_request"] {
+            assert!(fields.iter().any(|f| f == field), "{field}");
         }
     }
 

@@ -1,8 +1,9 @@
 # GitLab merge requests
 
 `upd` ships a reusable GitLab CI template that maintains one rolling dependency
-merge request. The CLI edits the checkout; the template safely owns the branch,
-commit, merge request, and optional GitLab-native auto-merge.
+merge request. The template installs a pinned `upd` release and runs
+`upd gitlab run`, which edits the checkout and safely owns the branch, commit,
+merge request, and optional GitLab-native auto-merge.
 
 Every run rebuilds the automation branch from the latest default branch. That
 keeps the proposal current and limits the branch to one generated commit.
@@ -40,7 +41,10 @@ upd-dependency-update:
   extends: .upd-dependency-update
 ```
 
-Replace `<FULL_COMMIT_SHA>` with a revision containing the template. Pinning the
+Replace `<FULL_COMMIT_SHA>` with a revision containing the template, preferably
+the `chore(release): refresh integration pins` commit that follows a release:
+that revision's default `upd_version` is the release itself, while the tagged
+revision still defaults to the release before it. Pinning the
 include prevents a later repository change from silently changing executable CI
 code. The template also pins its default container by digest and its `upd`
 archive by version and SHA-256.
@@ -78,7 +82,7 @@ upd-dependency-update:
 ```
 
 The image must provide the tools needed by the selected ecosystems. The template
-bootstraps Bash, Git, curl, jq, tar, and checksum utilities with `apt-get` or
+bootstraps Bash, Git, curl, tar, and checksum utilities with `apt-get` or
 `apk` only when they are absent. `prepare_command` can initialize existing tools,
 but must leave the repository clean; dependency updates belong exclusively to
 `upd`.
@@ -105,7 +109,9 @@ but must leave the repository clean; dependency updates belong exclusively to
 | `mr_title` | derived from update evidence | Optional merge-request title override |
 | `auto_merge` | `false` | Ask GitLab to merge after project checks pass |
 
-Input types and formats are checked while GitLab creates the pipeline. When
+Input types and formats are checked while GitLab creates the pipeline. The job
+runs `upd gitlab run`, so `upd_version` must name a release that provides that
+command; an older release fails with an unrecognized-subcommand error. When
 changing `upd_version` or `upd_target`, also supply the published archive digest:
 
 ```yaml
@@ -127,10 +133,13 @@ The template:
 
 - downloads an exact release artifact and verifies its SHA-256 before execution;
 - serializes jobs with a resource group;
+- passes `UPD_GITLAB_TOKEN` only to its own Git and GitLab API calls, never to
+  `prepare_command`, `validation_command`, or the dependency update itself;
 - starts from the latest default branch on every run;
 - pauses if the automation branch contains commits outside its single generated
   commit, preserving the branch and adding a notice to the open merge request;
-- updates the remote branch with `--force-with-lease`, never a blind force push;
+- updates the remote branch with a lease on the commit it last saw, never a
+  blind force push, and fails with a conflict if the branch moved meanwhile;
 - refuses ambiguous duplicate open merge requests;
 - fails if preparation or validation leaves unexpected repository changes;
 - retains the machine-readable update report as a one-week CI artifact;
@@ -142,9 +151,10 @@ The pause check runs before both branch replacement and no-update cleanup. If
 someone needs to adapt an update, they can commit to the automation branch;
 scheduled runs will leave that work in place. Automation resumes after those
 commits are removed or the merge request is resolved. The check expects the
-existing branch to contain one commit with the configured automation author,
-committer, and commit message, so changing that identity or message while a
-merge request is open also pauses the branch.
+existing branch to contain one commit, based on the default branch's history,
+with the configured automation author, committer, and commit message. Changing
+that identity or message while a merge request is open therefore also pauses
+the branch.
 
 Treat the configured branch, generated commit, title, and description as
 automation-owned unless intentionally pausing the branch as above.
@@ -189,6 +199,32 @@ cancels auto-merge if this job previously enabled it.
 
 The `auto_merge` API option requires GitLab 17.11 or newer. Creating and updating
 merge requests works on older supported versions without that option.
+
+## Running `upd gitlab run` directly
+
+The template is a thin wrapper: it installs and verifies `upd`, then runs
+`upd gitlab run`. A project that vendors `upd` in its own image can call the
+command from its own job instead. It reads the GitLab CI job environment:
+
+| Variable | Required | Meaning |
+|----------|----------|---------|
+| `UPD_GITLAB_TOKEN` | yes | Token described under authentication |
+| `CI_API_V4_URL`, `CI_DEFAULT_BRANCH`, `CI_PROJECT_DIR`, `CI_PROJECT_ID`, `CI_PROJECT_PATH`, `CI_SERVER_URL` | yes | Predefined by GitLab CI |
+| `UPD_BRANCH` | no | Rolling branch (`automation/upd-dependencies`) |
+| `UPD_PATHS` | no | Whitespace-separated paths (`.`) |
+| `UPD_LANGS`, `UPD_PACKAGES`, `UPD_MIN_AGE`, `UPD_MAX_BUMP` | no | Update filters and policy; empty defers to project configuration |
+| `UPD_LOCK`, `UPD_AUTO_MERGE` | no | `true` or `false` (`false`) |
+| `UPD_PREPARE_COMMAND`, `UPD_VALIDATION_COMMAND` | no | Bash commands run with `set -euo pipefail` in the checkout |
+| `UPD_COMMIT_MESSAGE`, `UPD_MR_TITLE` | no | Commit message and title override |
+| `UPD_GIT_NAME`, `UPD_GIT_EMAIL` | no | Automation commit identity (`upd automation`, `upd-automation@noreply.invalid`) |
+| `UPD_EXECUTABLE` | no | `upd` binary that performs the update (the running `upd`) |
+
+Progress goes to stderr. The outcome goes to stdout, as one line of text or, with
+`--output json`, an object whose `outcome` is `clean`, `closed`, `published`, or
+`paused`. Failures print a JSON error to stderr and exit with the code listed in
+`upd schema`: 4 for missing or invalid settings, 3 for network and GitLab
+server errors (retryable), 5 when the branch moved during the run, and 2 for
+everything else, including API rejections and states the run refuses to act on.
 
 ## Scope
 

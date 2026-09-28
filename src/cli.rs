@@ -353,6 +353,12 @@ pub enum Command {
         offline: bool,
     },
 
+    /// Maintain dependency merge requests on GitLab
+    Gitlab {
+        #[command(subcommand)]
+        command: GitlabCommand,
+    },
+
     /// Clear the version cache
     CleanCache,
 
@@ -368,6 +374,17 @@ pub enum Command {
 
     /// Describe offline-safe CLI capabilities
     Capabilities,
+}
+
+#[derive(Subcommand, Clone)]
+pub enum GitlabCommand {
+    /// Rebuild the rolling dependency branch and create, refresh or close its merge request.
+    ///
+    /// Runs inside a GitLab CI job and is configured by the job environment:
+    /// the CI_* variables GitLab provides and the UPD_* variables the
+    /// ci/gitlab-dependency-update.yml template sets (see docs/gitlab.md).
+    /// Leaves a branch holding commits it did not write untouched.
+    Run,
 }
 
 impl Cli {

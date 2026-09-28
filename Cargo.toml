@@ -58,6 +58,7 @@ semver = "1.0.28"
 ignore = "0.4.33"
 globset = "0.4.20"
 directories = "6.0.0"
+tempfile = "3.27.0"
 
 # Error handling
 anyhow = "1.0.104"
@@ -77,7 +78,6 @@ jiff = "0.2"
 saphyr-parser = "0.0.12"
 
 [dev-dependencies]
-tempfile = "3.27.0"
 wiremock = "0.6"
 serial_test = "3.5"
 

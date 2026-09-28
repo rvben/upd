@@ -135,6 +135,13 @@ impl Fixture {
             &updater,
             r#"#!/usr/bin/env bash
 set -euo pipefail
+if [ "${1:-}" = gitlab ]; then
+  exec "$REAL_UPD" "$@"
+fi
+if [ -n "${UPD_GITLAB_TOKEN+set}" ]; then
+  echo "fake upd received the GitLab token" >&2
+  exit 9
+fi
 if [ -n "${FAKE_UPD_EXIT:-}" ]; then
   echo "fake upd failure" >&2
   exit "$FAKE_UPD_EXIT"
@@ -209,12 +216,25 @@ fi
 
     /// Runs the job with the given inputs and returns its outcome unjudged.
     fn execute(&self, server: &MockServer, run: &Run) -> Output {
+        let mut command = Command::new("bash");
+        command.arg("-c").arg(embedded_script());
+        self.job(&mut command, server, run);
+        command.output().expect("template starts")
+    }
+
+    /// Runs `upd gitlab run` directly, with the job's environment.
+    fn execute_upd(&self, server: &MockServer, run: &Run, args: &[&str]) -> Output {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_upd"));
+        command.args(["gitlab", "run"]).args(args);
+        self.job(&mut command, server, run);
+        command.output().expect("upd starts")
+    }
+
+    /// Gives `command` the CI job environment for `run`.
+    fn job(&self, command: &mut Command, server: &MockServer, run: &Run) {
         let report_file = self._temp.path().join("fake-upd-report.json");
         fs::write(&report_file, &run.report).expect("fixture report");
-        let mut command = Command::new("bash");
         command
-            .arg("-c")
-            .arg(embedded_script())
             .current_dir(&self.checkout)
             .env("UPD_GITLAB_TOKEN", "test-token")
             .env("CI_API_V4_URL", format!("{}/api/v4", server.uri()))
@@ -241,6 +261,7 @@ fi
             .env("UPD_GIT_EMAIL", "upd-test@example.com")
             .env("UPD_AUTO_MERGE", run.auto_merge.to_string())
             .env("UPD_EXECUTABLE", &self.updater)
+            .env("REAL_UPD", env!("CARGO_BIN_EXE_upd"))
             .env("FAKE_UPD_CHANGE", run.change.to_string())
             .env("FAKE_UPD_CONTENT", &run.content)
             .env("FAKE_UPD_FILE", &run.file)
@@ -249,7 +270,6 @@ fi
         if let Some(code) = run.upd_exit {
             command.env("FAKE_UPD_EXIT", code.to_string());
         }
-        command.output().expect("template starts")
     }
 
     fn remote_tip(&self) -> Option<String> {
@@ -626,7 +646,6 @@ async fn template_updates_the_rolling_branch_and_enables_sha_bound_automerge() {
 
     assert_eq!(fixture.branch_file().as_deref(), Some("second\n"));
     assert_eq!(fixture.branch_commit_count(), 1);
-    assert!(TEMPLATE.contains("--form \"sha=${commit_sha}\""));
 }
 
 #[tokio::test]
@@ -771,7 +790,7 @@ async fn template_does_not_adopt_a_single_human_commit_as_its_own() {
 fn template_defaults_are_reproducible_and_safe() {
     assert!(TEMPLATE.contains("debian:bookworm-slim@sha256:"));
     assert!(TEMPLATE.contains("UPD_VERSION: \"$[[ inputs.upd_version ]]\""));
-    assert!(TEMPLATE.contains("--force-with-lease="));
+    assert!(TEMPLATE.contains("\"$upd_bin\" gitlab run"));
     assert!(!TEMPLATE.contains("JOB-TOKEN:"));
     assert!(!TEMPLATE.contains("UPD_VERSION: \"latest\""));
 }
@@ -812,8 +831,14 @@ fn golden_report(case: &str) -> String {
         .expect("golden case report")
 }
 
-fn form_field(name: &str, value: &str) -> String {
-    format!("name=\"{name}\"\r\n\r\n{value}\r\n")
+/// The JSON body of a request.
+fn json_body(request: &wiremock::Request) -> serde_json::Value {
+    serde_json::from_slice(&request.body).unwrap_or_else(|error| {
+        panic!(
+            "request body is not JSON ({error}): {}",
+            String::from_utf8_lossy(&request.body)
+        )
+    })
 }
 
 async fn assert_rendering_matches_golden(case: &str, run: Run) -> String {
@@ -851,28 +876,20 @@ async fn assert_rendering_matches_golden(case: &str, run: Run) -> String {
         .iter()
         .find(|request| request.method.as_str() == "POST")
         .expect("merge request created");
-    let body = String::from_utf8_lossy(&create.body);
     let title = if run.mr_title.is_empty() {
         presentation["title"].as_str().unwrap().to_string()
     } else {
         run.mr_title.clone()
     };
-    assert!(body.contains(&form_field("title", &title)), "{body}");
-    assert!(
-        body.contains(&form_field("description", &description)),
-        "{body}"
-    );
-    assert!(
-        body.contains(&form_field("source_branch", BRANCH)),
-        "{body}"
-    );
-    assert!(
-        body.contains(&form_field("target_branch", "main")),
-        "{body}"
-    );
-    assert!(
-        body.contains(&form_field("remove_source_branch", "true")),
-        "{body}"
+    assert_eq!(
+        json_body(create),
+        json!({
+            "title": title,
+            "description": description,
+            "source_branch": BRANCH,
+            "target_branch": "main",
+            "remove_source_branch": true,
+        })
     );
     description
 }
@@ -1370,12 +1387,9 @@ async fn template_binds_auto_merge_to_the_pushed_commit() {
         .iter()
         .find(|request| request.url.path().ends_with("/merge"))
         .expect("auto-merge requested");
-    let body = String::from_utf8_lossy(&merge.body);
-    assert!(body.contains(&form_field("auto_merge", "true")), "{body}");
-    assert!(body.contains(&form_field("sha", &tip)), "{body}");
-    assert!(
-        body.contains(&form_field("should_remove_source_branch", "true")),
-        "{body}"
+    assert_eq!(
+        json_body(merge),
+        json!({"auto_merge": true, "sha": tip, "should_remove_source_branch": true})
     );
 }
 
@@ -1431,7 +1445,7 @@ async fn assert_lease_rejects_a_racing_push(existing_branch: bool) {
         },
     );
 
-    assert!(!output.status.success(), "{}", describe(&output));
+    assert!(failed_with(&output, 5), "{}", describe(&output));
     let racer_tip = fs::read_to_string(fixture._temp.path().join("racer-tip"))
         .expect("racing push ran")
         .trim()
@@ -1486,7 +1500,12 @@ async fn template_stops_when_upd_fails() {
         },
     );
 
-    assert!(!output.status.success(), "{}", describe(&output));
+    assert!(failed_with(&output, 3), "{}", describe(&output));
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("fake upd failure"),
+        "the updater's diagnostics reach the job log\n{}",
+        describe(&output)
+    );
     assert_eq!(fixture.remote_tip(), None);
     assert!(server.received_requests().await.unwrap().is_empty());
 }
@@ -1608,13 +1627,11 @@ async fn template_pause_notice_appends_to_the_existing_description() {
         .iter()
         .find(|request| request.method.as_str() == "PUT")
         .unwrap();
-    let body = String::from_utf8_lossy(&update.body);
-    assert!(
-        body.contains(&form_field(
-            "description",
-            "Review notes\n\n\n<!-- upd-human-commit-pause -->\n> **Automation paused:** this branch has commits outside the generated upd commit. Preserve them or remove them before automation resumes.\n"
-        )),
-        "{body}"
+    assert_eq!(
+        json_body(update),
+        json!({
+            "description": "Review notes\n\n\n<!-- upd-human-commit-pause -->\n> **Automation paused:** this branch has commits outside the generated upd commit. Preserve them or remove them before automation resumes.\n"
+        })
     );
 }
 
@@ -1654,4 +1671,175 @@ async fn template_rejects_an_invalid_branch_name() {
         ..Run::default()
     })
     .await;
+}
+
+// Behavior of `upd gitlab run` itself: its token boundary, its outcome
+// report, and the repository state it leaves behind.
+
+const TOKEN_ABSENT: &str =
+    r#"if [ -n "${UPD_GITLAB_TOKEN+set}" ]; then echo "token visible" >&2; exit 1; fi"#;
+
+#[tokio::test]
+async fn repository_commands_and_the_updater_never_see_the_token() {
+    let fixture = Fixture::new();
+    let server = MockServer::start().await;
+    list_mock(json!([])).mount(&server).await;
+    Mock::given(method("POST"))
+        .and(path("/api/v4/projects/1/merge_requests"))
+        .respond_with(ResponseTemplate::new(201).set_body_json(mr_response(7, false)))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    // The fake updater refuses to run when the token reaches it.
+    fixture.run(
+        &server,
+        &Run {
+            prepare_command: TOKEN_ABSENT.to_string(),
+            validation_command: TOKEN_ABSENT.to_string(),
+            ..Run::default()
+        },
+    );
+
+    assert_eq!(fixture.branch_file().as_deref(), Some("new\n"));
+}
+
+#[tokio::test]
+async fn run_reports_its_outcome_as_json() {
+    let fixture = Fixture::new();
+    let server = MockServer::start().await;
+    list_mock(json!([])).mount(&server).await;
+    Mock::given(method("POST"))
+        .and(path("/api/v4/projects/1/merge_requests"))
+        .respond_with(ResponseTemplate::new(201).set_body_json(mr_response(7, false)))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let output = fixture.execute_upd(&server, &Run::default(), &["--output", "json"]);
+
+    assert!(output.status.success(), "{}", describe(&output));
+    let outcome: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(
+        outcome,
+        json!({
+            "command": "gitlab run",
+            "branch": BRANCH,
+            "outcome": "published",
+            "merge_request": "https://gitlab.example.test/project/-/merge_requests/7",
+            "created": true,
+            "commit": fixture.remote_tip().unwrap(),
+            "auto_merge": "off",
+        })
+    );
+}
+
+#[tokio::test]
+async fn run_reports_a_missing_setting_as_a_json_input_error() {
+    let fixture = Fixture::new();
+    let server = MockServer::start().await;
+
+    let mut command = Command::new(env!("CARGO_BIN_EXE_upd"));
+    command.args(["gitlab", "run", "--output", "json"]);
+    fixture.job(&mut command, &server, &Run::default());
+    let output = command.env_remove("UPD_GITLAB_TOKEN").output().unwrap();
+
+    assert!(failed_with(&output, 4), "{}", describe(&output));
+    assert!(output.stdout.is_empty(), "{}", describe(&output));
+    let error: serde_json::Value = serde_json::from_slice(&output.stderr).unwrap();
+    assert_eq!(error["error"]["kind"], "parse_error");
+    assert!(
+        error["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("UPD_GITLAB_TOKEN"),
+        "{error}"
+    );
+    assert!(server.received_requests().await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn an_unrelated_commit_with_the_automation_identity_pauses() {
+    let fixture = Fixture::new();
+    git(&fixture.checkout, &["switch", "--orphan", BRANCH]);
+    fs::write(fixture.checkout.join("dependency.txt"), "orphan\n").unwrap();
+    git(&fixture.checkout, &["add", "dependency.txt"]);
+    run(Command::new("git")
+        .current_dir(&fixture.checkout)
+        .args(["commit", "-m", "chore(deps): test update"])
+        .env("GIT_AUTHOR_NAME", "upd test")
+        .env("GIT_AUTHOR_EMAIL", "upd-test@example.com")
+        .env("GIT_COMMITTER_NAME", "upd test")
+        .env("GIT_COMMITTER_EMAIL", "upd-test@example.com"));
+    git(&fixture.checkout, &["push", "origin", BRANCH]);
+    git(&fixture.checkout, &["switch", "main"]);
+    let orphan_tip = fixture.remote_tip().unwrap();
+
+    let server = MockServer::start().await;
+    let mut existing = mr_list_response(7, false);
+    existing[0]["description"] = json!("Review notes");
+    list_mock(existing).mount(&server).await;
+    Mock::given(method("PUT"))
+        .and(path("/api/v4/projects/1/merge_requests/7"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(mr_response(7, false)))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let output = fixture.execute_upd(&server, &Run::default(), &["--output", "json"]);
+
+    assert!(output.status.success(), "{}", describe(&output));
+    let outcome: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(outcome["outcome"], "paused", "{outcome}");
+    assert_eq!(outcome["notice_added"], true, "{outcome}");
+    assert_eq!(fixture.remote_tip().as_deref(), Some(orphan_tip.as_str()));
+}
+
+#[tokio::test]
+async fn changed_paths_are_reported_as_written() {
+    let fixture = Fixture::new();
+    let server = MockServer::start().await;
+    list_mock(json!([])).mount(&server).await;
+    Mock::given(method("POST"))
+        .and(path("/api/v4/projects/1/merge_requests"))
+        .respond_with(ResponseTemplate::new(201).set_body_json(mr_response(7, false)))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    fixture.run(
+        &server,
+        &Run {
+            file: "dépendances/paquet.txt".to_string(),
+            ..Run::default()
+        },
+    );
+
+    assert_eq!(
+        fixture.presentation()["changed_paths"],
+        json!(["dépendances/paquet.txt"])
+    );
+}
+
+#[tokio::test]
+async fn the_artifact_directory_is_excluded_once() {
+    let fixture = Fixture::new();
+    let exclude = fixture.checkout.join(".git/info/exclude");
+    fs::write(&exclude, "# existing rule without a trailing newline").unwrap();
+    for _ in 0..2 {
+        let server = MockServer::start().await;
+        list_mock(json!([])).mount(&server).await;
+        fixture.run(
+            &server,
+            &Run {
+                change: false,
+                ..Run::default()
+            },
+        );
+    }
+
+    assert_eq!(
+        fs::read_to_string(&exclude).unwrap(),
+        "# existing rule without a trailing newline\n/.upd-ci/\n"
+    );
 }

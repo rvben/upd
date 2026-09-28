@@ -11,7 +11,6 @@ use tempfile::TempDir;
 
 const WORKFLOW: &str = include_str!("../.github/workflows/dependency-health.yml");
 const DEPENDENCIES_WORKFLOW: &str = include_str!("../.github/workflows/dependencies.yml");
-const GITLAB_TEMPLATE: &str = include_str!("../ci/gitlab-dependency-update.yml");
 const BRANCH: &str = "automation/upd-github-actions";
 
 fn workflow_script(name: &str) -> String {
@@ -1082,44 +1081,88 @@ fn github_presentation_titles_mixed_and_single_normalizations() {
     );
 }
 
+const SHARED_PRESENTATION_FIELDS: &[&str] = &[
+    "schema",
+    "state",
+    "updates",
+    "annotations",
+    "normalized",
+    "policy_holds",
+    "blocked",
+    "changed_paths",
+    "counts",
+    "policy",
+    "validation",
+    "auto_merge_requested",
+];
+
+const SHARED_COUNT_FIELDS: &[&str] = &[
+    "updates",
+    "updates_major",
+    "updates_minor",
+    "updates_patch",
+    "updates_review_worthy",
+    "updates_quiet",
+    "annotations",
+    "normalized",
+    "policy_holds",
+    "blocked",
+];
+
+fn gitlab_golden(case: &str, file: &str) -> String {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/gitlab-template")
+        .join(case)
+        .join(file);
+    fs::read_to_string(&path).unwrap_or_else(|error| panic!("{}: {error}", path.display()))
+}
+
 #[test]
 fn normal_update_presentation_contract_is_shared_across_providers() {
-    for source in [WORKFLOW, GITLAB_TEMPLATE] {
-        for field in [
-            "schema: 1",
-            "state:",
-            "updates:",
-            "updates_major:",
-            "updates_minor:",
-            "updates_patch:",
-            "updates_review_worthy:",
-            "updates_quiet:",
-            "annotations:",
-            "normalized:",
-            "policy_holds:",
-            "blocked:",
-            "changed_paths:",
-            "counts:",
-            "policy:",
-            "validation:",
-            "auto_merge_requested:",
-        ] {
-            assert!(source.contains(field), "missing presentation field {field}");
-        }
-        assert!(source.contains("\\($title_prefix): refresh \\(.counts.updates) dependencies"));
+    for field in SHARED_PRESENTATION_FIELDS.iter().chain(SHARED_COUNT_FIELDS) {
         assert!(
-            source.contains(
-                "\\($title_prefix): normalize \\(.counts.normalized) dependency specifiers"
-            )
+            WORKFLOW.contains(&format!("{field}:")),
+            "GitHub workflow is missing presentation field {field}"
         );
+    }
+    assert!(WORKFLOW.contains("schema: 1"));
+    assert!(WORKFLOW.contains("\\($title_prefix): refresh \\(.counts.updates) dependencies"));
+    assert!(
+        WORKFLOW
+            .contains("\\($title_prefix): normalize \\(.counts.normalized) dependency specifiers")
+    );
+
+    // The GitLab presentation is built by `upd gitlab run`; its goldens are
+    // asserted byte for byte against that output, so they carry its shape.
+    for (case, title) in [
+        ("review-and-quiet", "chore(deps): refresh 4 dependencies"),
+        (
+            "normalized-only",
+            "chore(deps): normalize 2 dependency specifiers",
+        ),
+    ] {
+        let presentation: serde_json::Value =
+            serde_json::from_str(&gitlab_golden(case, "presentation.json")).unwrap();
+        assert_eq!(presentation["schema"], 1, "{case}");
+        assert_eq!(presentation["title"], title, "{case}");
+        for field in SHARED_PRESENTATION_FIELDS {
+            assert!(
+                presentation.get(field).is_some(),
+                "GitLab presentation {case} is missing field {field}"
+            );
+        }
+        for field in SHARED_COUNT_FIELDS {
+            assert!(
+                presentation["counts"].get(field).is_some(),
+                "GitLab presentation {case} is missing count {field}"
+            );
+        }
+        assert!(!gitlab_golden(case, "description.md").contains("> [!IMPORTANT]"));
     }
     assert!(WORKFLOW.contains("[View the full update report →]"));
     assert!(WORKFLOW.contains("steps.report.outputs.artifact-url"));
     assert!(WORKFLOW.contains("REPORT_URL"));
     assert!(WORKFLOW.contains("### Normalized specifiers"));
-    assert!(GITLAB_TEMPLATE.contains("wc -c"));
-    assert!(GITLAB_TEMPLATE.contains("32768"));
-    assert!(!GITLAB_TEMPLATE.contains("> [!IMPORTANT]"));
 }
 
 #[test]

@@ -1672,6 +1672,11 @@ async fn run() -> Result<()> {
         Some(Command::Audit { .. }) => {
             run_audit(&cli).await?;
         }
+        Some(Command::Gitlab {
+            command: upd::cli::GitlabCommand::Run,
+        }) => {
+            run_gitlab(&cli).await?;
+        }
         Some(Command::Schema) => {
             // Already handled above before show_config check.
             unreachable!("Schema handled earlier");
@@ -1685,6 +1690,42 @@ async fn run() -> Result<()> {
     }
 
     Ok(())
+}
+
+async fn run_gitlab(cli: &Cli) -> Result<()> {
+    use upd::gitlab::run;
+
+    init_tls(cli)?;
+    let result = match run::Settings::from_env() {
+        Ok(settings) => run::run(&settings)
+            .await
+            .map(|outcome| (outcome, settings.branch)),
+        Err(error) => Err(error),
+    };
+    match result {
+        Ok((outcome, branch)) => {
+            if effective_json_mode(cli) {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&outcome.to_json(&branch))?
+                );
+            } else {
+                println!("{}", outcome.render_text(&branch));
+            }
+            Ok(())
+        }
+        Err(error) => {
+            eprintln!(
+                "{}",
+                serde_json::json!({"error": {
+                    "kind": error.kind(),
+                    "message": error.message(),
+                    "exit_code": error.exit_code(),
+                }})
+            );
+            std::process::exit(error.exit_code());
+        }
+    }
 }
 
 /// Returns true when JSON output should be emitted, honoring both --output/-o

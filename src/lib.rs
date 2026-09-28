@@ -6,6 +6,7 @@ pub mod cli;
 pub mod config;
 pub mod cooldown;
 pub mod fix;
+pub mod gitlab;
 pub mod http;
 pub mod interactive;
 pub mod lockfile;
