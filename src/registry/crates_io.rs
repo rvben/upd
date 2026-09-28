@@ -1,19 +1,13 @@
 use super::utils::home_dir;
-use super::{Registry, VersionMeta, http_error_message};
+use super::{Registry, VersionMeta, get_with_retry, http_error_message};
 use anyhow::{Result, anyhow};
 use async_trait::async_trait;
+use reqwest::Client;
 use reqwest::header::{AUTHORIZATION, HeaderMap, HeaderValue};
-use reqwest::{Client, Response};
 use serde::Deserialize;
 use std::io::BufRead;
 use std::path::PathBuf;
 use std::time::Duration;
-
-/// Maximum number of retry attempts for failed HTTP requests
-const MAX_RETRIES: u32 = 3;
-
-/// Base delay for exponential backoff (100ms, 200ms, 400ms)
-const BASE_DELAY_MS: u64 = 100;
 
 /// Credentials for authenticating with a Cargo registry
 #[derive(Clone)]
@@ -370,39 +364,9 @@ impl CratesIoRegistry {
         read_cargo_credentials(registry_name)
     }
 
-    /// Execute a GET request with retry
-    async fn get_with_retry(&self, url: &str) -> anyhow::Result<Response> {
-        let mut last_error = None;
-
-        for attempt in 0..MAX_RETRIES {
-            match self.client.get(url).send().await {
-                Ok(response) => {
-                    if response.status().is_client_error() || response.status().is_success() {
-                        return Ok(response);
-                    }
-                    if response.status().is_server_error() && attempt < MAX_RETRIES - 1 {
-                        let delay = Duration::from_millis(BASE_DELAY_MS * (1 << attempt));
-                        tokio::time::sleep(delay).await;
-                        continue;
-                    }
-                    return Ok(response);
-                }
-                Err(e) => {
-                    last_error = Some(e);
-                    if attempt < MAX_RETRIES - 1 {
-                        let delay = Duration::from_millis(BASE_DELAY_MS * (1 << attempt));
-                        tokio::time::sleep(delay).await;
-                    }
-                }
-            }
-        }
-
-        Err(crate::http::wrap_send_err(last_error.unwrap(), url))
-    }
-
     async fn fetch_crate_opt(&self, name: &str) -> Result<Option<CratesResponse>> {
         let url = format!("{}/{}", self.registry_url, name);
-        let response = self.get_with_retry(&url).await?;
+        let response = get_with_retry(&self.client, &url).await?;
 
         let status = response.status();
         if status == reqwest::StatusCode::NOT_FOUND {
@@ -833,5 +797,42 @@ mod tests {
         assert!(!stable.prerelease);
         assert!(!stable.yanked);
         assert!(stable.published_at.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_crates_io_retries_past_a_rate_limit() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+        let call_count = Arc::new(AtomicUsize::new(0));
+        let call_count_clone = call_count.clone();
+
+        // crates.io returning 429 must not surface as an immediate lookup
+        // failure: a client asking one package too fast should back off and
+        // succeed, not report the crate unreachable.
+        Mock::given(method("GET"))
+            .and(path("/serde"))
+            .respond_with(move |_: &wiremock::Request| {
+                let count = call_count_clone.fetch_add(1, Ordering::SeqCst);
+                if count == 0 {
+                    ResponseTemplate::new(429)
+                } else {
+                    ResponseTemplate::new(200).set_body_string(
+                        r#"{"crate": {"max_stable_version": "1.0.200"}, "versions": []}"#,
+                    )
+                }
+            })
+            .expect(2)
+            .mount(&mock_server)
+            .await;
+
+        let registry = CratesIoRegistry::with_registry_url(mock_server.uri());
+        let version = registry.get_latest_version("serde").await.unwrap();
+
+        assert_eq!(version, "1.0.200");
+        assert_eq!(call_count.load(Ordering::SeqCst), 2);
     }
 }

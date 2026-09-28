@@ -48,21 +48,40 @@ const MAX_RETRIES: u32 = 3;
 /// Base delay for exponential backoff (100ms, 200ms, 400ms)
 const BASE_DELAY_MS: u64 = 100;
 
+/// Upper bound on how long a server-provided `Retry-After` value can make us
+/// wait. Registries are third parties; a misconfigured or hostile one could
+/// otherwise stall a CLI invocation indefinitely.
+const MAX_RETRY_AFTER_SECS: u64 = 10;
+
 /// Execute an HTTP GET request with retry and exponential backoff.
-/// Retries on transient errors (network issues, 5xx server errors).
+/// Retries on transient errors (network issues, 5xx server errors, and 429
+/// rate limiting).
 pub async fn get_with_retry(client: &Client, url: &str) -> anyhow::Result<Response> {
     let mut last_error = None;
 
     for attempt in 0..MAX_RETRIES {
         match client.get(url).send().await {
             Ok(response) => {
-                // Don't retry client errors (4xx) - they won't succeed on retry
-                if response.status().is_client_error() || response.status().is_success() {
+                let status = response.status();
+
+                // Rate limiting is transient by definition, so it gets its own
+                // branch ahead of the general 4xx check below: honor a
+                // server-provided Retry-After when present, otherwise fall back
+                // to the same exponential backoff used for 5xx.
+                if status == reqwest::StatusCode::TOO_MANY_REQUESTS && attempt < MAX_RETRIES - 1 {
+                    let delay = retry_after_delay(&response)
+                        .unwrap_or_else(|| Duration::from_millis(BASE_DELAY_MS * (1 << attempt)));
+                    tokio::time::sleep(delay).await;
+                    continue;
+                }
+
+                // Don't retry other client errors (4xx) - they won't succeed on retry
+                if status.is_client_error() || status.is_success() {
                     return Ok(response);
                 }
 
                 // Retry server errors (5xx)
-                if response.status().is_server_error() && attempt < MAX_RETRIES - 1 {
+                if status.is_server_error() && attempt < MAX_RETRIES - 1 {
                     let delay = Duration::from_millis(BASE_DELAY_MS * (1 << attempt));
                     tokio::time::sleep(delay).await;
                     continue;
@@ -83,6 +102,17 @@ pub async fn get_with_retry(client: &Client, url: &str) -> anyhow::Result<Respon
     }
 
     Err(crate::http::wrap_send_err(last_error.unwrap(), url))
+}
+
+/// Parse a `Retry-After` header's delta-seconds form into a bounded delay.
+///
+/// The HTTP-date form is deliberately not supported: none of the registries
+/// this client talks to send it, and parsing it would need a date library
+/// dependency purely for a fallback path that already has a safe default.
+fn retry_after_delay(response: &Response) -> Option<Duration> {
+    let header = response.headers().get(reqwest::header::RETRY_AFTER)?;
+    let seconds: u64 = header.to_str().ok()?.trim().parse().ok()?;
+    Some(Duration::from_secs(seconds.min(MAX_RETRY_AFTER_SECS)))
 }
 
 /// A registry's definitive answer that a Git ref names no commit in a
@@ -530,6 +560,103 @@ mod tests {
         let response = get_with_retry(&client, &url).await.unwrap();
         // Should recover and return 200
         assert!(response.status().is_success());
+    }
+
+    #[tokio::test]
+    async fn test_get_with_retry_rate_limit_retries_and_recovers() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let mock_server = MockServer::start().await;
+        let call_count = Arc::new(AtomicUsize::new(0));
+        let call_count_clone = call_count.clone();
+
+        // First call is rate limited, second succeeds. A registry's 429 is a
+        // transient "slow down", not a permanent rejection like a 404, so it
+        // must be retried the same way a 500 is.
+        Mock::given(method("GET"))
+            .and(path("/throttled"))
+            .respond_with(move |_: &wiremock::Request| {
+                let count = call_count_clone.fetch_add(1, Ordering::SeqCst);
+                if count == 0 {
+                    ResponseTemplate::new(429)
+                } else {
+                    ResponseTemplate::new(200).set_body_string("recovered")
+                }
+            })
+            .expect(2) // Should be called twice: 429 then 200
+            .mount(&mock_server)
+            .await;
+
+        let client = Client::new();
+        let url = format!("{}/throttled", mock_server.uri());
+
+        let response = get_with_retry(&client, &url).await.unwrap();
+        assert!(response.status().is_success());
+    }
+
+    #[tokio::test]
+    async fn test_get_with_retry_rate_limit_exhausts_retries() {
+        let mock_server = MockServer::start().await;
+
+        // Always 429 - verifies the retry loop gives up after MAX_RETRIES
+        // rather than looping forever, and still surfaces the 429 to the
+        // caller instead of turning it into a generic transport error.
+        Mock::given(method("GET"))
+            .and(path("/always-throttled"))
+            .respond_with(ResponseTemplate::new(429))
+            .expect(3) // MAX_RETRIES = 3
+            .mount(&mock_server)
+            .await;
+
+        let client = Client::new();
+        let url = format!("{}/always-throttled", mock_server.uri());
+
+        let response = get_with_retry(&client, &url).await.unwrap();
+        assert_eq!(response.status().as_u16(), 429);
+    }
+
+    #[tokio::test]
+    async fn test_get_with_retry_honors_retry_after_header() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::time::Instant;
+
+        let mock_server = MockServer::start().await;
+        let call_count = Arc::new(AtomicUsize::new(0));
+        let call_count_clone = call_count.clone();
+
+        // The server asks for a 1-second pause via Retry-After. The default
+        // backoff for a first-attempt retry is 100ms, so recording an
+        // elapsed time well past that proves the header value was actually
+        // read rather than ignored in favor of the fixed backoff schedule
+        // (or, on the pre-fix code, not retried at all).
+        Mock::given(method("GET"))
+            .and(path("/retry-after"))
+            .respond_with(move |_: &wiremock::Request| {
+                let count = call_count_clone.fetch_add(1, Ordering::SeqCst);
+                if count == 0 {
+                    ResponseTemplate::new(429).insert_header("retry-after", "1")
+                } else {
+                    ResponseTemplate::new(200).set_body_string("recovered")
+                }
+            })
+            .expect(2)
+            .mount(&mock_server)
+            .await;
+
+        let client = Client::new();
+        let url = format!("{}/retry-after", mock_server.uri());
+
+        let started = Instant::now();
+        let response = get_with_retry(&client, &url).await.unwrap();
+        let elapsed = started.elapsed();
+
+        assert!(response.status().is_success());
+        assert!(
+            elapsed >= Duration::from_millis(900),
+            "expected the 1s Retry-After to be honored, only waited {elapsed:?}"
+        );
     }
 
     #[tokio::test]
