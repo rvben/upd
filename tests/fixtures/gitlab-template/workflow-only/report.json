@@ -1,0 +1,15 @@
+{
+  "command": "update",
+  "mode": "applied",
+  "files": [
+    {
+      "path": ".github/workflows/ci.yml",
+      "file_type": "github-actions",
+      "lang": "actions",
+      "updates": [{"package": "actions/checkout", "current": "v4.1.0", "latest": "v4.2.2", "bump": "minor", "status": "applied"}],
+      "errors": [],
+      "warnings": []
+    }
+  ],
+  "summary": {"files_scanned": 1, "files_with_changes": 1, "updates_total": 1, "errors": 0, "warnings": 0}
+}

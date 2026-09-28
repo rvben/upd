@@ -1,0 +1,66 @@
+{
+  "annotations": [],
+  "auto_merge_requested": false,
+  "blocked": [],
+  "changed": true,
+  "changed_paths": [
+    "dependency.txt"
+  ],
+  "counts": {
+    "annotations": 0,
+    "blocked": 0,
+    "files_changed": 1,
+    "normalized": 1,
+    "not_examined": 0,
+    "policy_holds": 0,
+    "updates": 2,
+    "updates_major": 0,
+    "updates_minor": 2,
+    "updates_patch": 0,
+    "updates_quiet": 0,
+    "updates_review_worthy": 2,
+    "updates_revision": 0,
+    "warnings": 0
+  },
+  "normalized": [
+    {
+      "line": 7,
+      "new": ">=8.1.7",
+      "package": "click",
+      "path": "pyproject.toml",
+      "previous": "~=8.1",
+      "version": "8.1.7"
+    }
+  ],
+  "policy": {
+    "lockfile_regeneration": false,
+    "max_bump": "minor",
+    "min_age": "7d"
+  },
+  "policy_holds": [],
+  "schema": 1,
+  "state": "ready",
+  "title": "chore(deps): prepare 3 dependency changes",
+  "updates": [
+    {
+      "bump": "minor",
+      "current": "3.6",
+      "latest": "3.7",
+      "package": "idna",
+      "path": "pyproject.toml",
+      "status": "pending_relock"
+    },
+    {
+      "bump": "minor",
+      "current": "2.31.0",
+      "latest": "2.32.3",
+      "package": "requests",
+      "path": "pyproject.toml",
+      "status": "applied"
+    }
+  ],
+  "validation": {
+    "proposal_integrity_passed": true,
+    "repository_command_configured": false
+  }
+}

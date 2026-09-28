@@ -1,0 +1,65 @@
+{
+  "annotations": [],
+  "auto_merge_requested": false,
+  "blocked": [],
+  "changed": true,
+  "changed_paths": [
+    "dependency.txt"
+  ],
+  "counts": {
+    "annotations": 0,
+    "blocked": 0,
+    "files_changed": 1,
+    "normalized": 2,
+    "not_examined": 0,
+    "policy_holds": 1,
+    "updates": 0,
+    "updates_major": 0,
+    "updates_minor": 0,
+    "updates_patch": 0,
+    "updates_quiet": 0,
+    "updates_review_worthy": 0,
+    "updates_revision": 0,
+    "warnings": 0
+  },
+  "normalized": [
+    {
+      "line": 3,
+      "new": ">=8.5.0",
+      "package": "click",
+      "path": "pyproject.toml",
+      "previous": "(no specifier)",
+      "version": "8.5.0"
+    },
+    {
+      "line": 4,
+      "new": ">=2.7.0",
+      "package": "urllib3",
+      "path": "pyproject.toml",
+      "previous": "<= 2.0.0",
+      "version": "2.7.0"
+    }
+  ],
+  "policy": {
+    "lockfile_regeneration": false,
+    "max_bump": "minor",
+    "min_age": "7d"
+  },
+  "policy_holds": [
+    {
+      "available": "2.8.0",
+      "kind": "cooldown",
+      "package": "urllib3",
+      "path": "pyproject.toml",
+      "selected": "2.7.0"
+    }
+  ],
+  "schema": 1,
+  "state": "ready",
+  "title": "chore(deps): normalize 2 dependency specifiers",
+  "updates": [],
+  "validation": {
+    "proposal_integrity_passed": true,
+    "repository_command_configured": false
+  }
+}

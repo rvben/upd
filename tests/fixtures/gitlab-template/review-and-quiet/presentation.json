@@ -1,0 +1,95 @@
+{
+  "annotations": [],
+  "auto_merge_requested": false,
+  "blocked": [
+    {
+      "current": "5.0.0",
+      "package": "skipped-one",
+      "path": "dependency.txt",
+      "reason": "relock failed"
+    }
+  ],
+  "changed": true,
+  "changed_paths": [
+    "dependency.txt"
+  ],
+  "counts": {
+    "annotations": 0,
+    "blocked": 1,
+    "files_changed": 1,
+    "normalized": 0,
+    "not_examined": 0,
+    "policy_holds": 2,
+    "updates": 4,
+    "updates_major": 1,
+    "updates_minor": 1,
+    "updates_patch": 2,
+    "updates_quiet": 2,
+    "updates_review_worthy": 2,
+    "updates_revision": 0,
+    "warnings": 0
+  },
+  "normalized": [],
+  "policy": {
+    "lockfile_regeneration": false,
+    "max_bump": "minor",
+    "min_age": "7d"
+  },
+  "policy_holds": [
+    {
+      "available": "2.0.0",
+      "kind": "bump ceiling",
+      "package": "later",
+      "path": "dependency.txt",
+      "selected": "1.0.0"
+    },
+    {
+      "available": "1.3.0",
+      "kind": "cooldown",
+      "package": "too-new",
+      "path": "dependency.txt",
+      "selected": "1.2.0"
+    }
+  ],
+  "schema": 1,
+  "state": "ready",
+  "title": "chore(deps): refresh 4 dependencies",
+  "updates": [
+    {
+      "bump": "patch",
+      "current": "1.0.0",
+      "latest": "1.0.1",
+      "package": "quiet-one",
+      "path": "dependency.txt",
+      "status": "applied"
+    },
+    {
+      "bump": "patch",
+      "current": "2.0.0",
+      "latest": "2.0.1",
+      "package": "quiet-two",
+      "path": "dependency.txt",
+      "status": "applied"
+    },
+    {
+      "bump": "minor",
+      "current": "1.0.0",
+      "latest": "1.1.0",
+      "package": "review-one",
+      "path": "dependency.txt",
+      "status": "applied"
+    },
+    {
+      "bump": "major",
+      "current": "3.0.0",
+      "latest": "4.0.0",
+      "package": "review-two",
+      "path": "dependency.txt",
+      "status": "applied"
+    }
+  ],
+  "validation": {
+    "proposal_integrity_passed": true,
+    "repository_command_configured": false
+  }
+}

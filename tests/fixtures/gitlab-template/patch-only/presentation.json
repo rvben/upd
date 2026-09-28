@@ -1,0 +1,49 @@
+{
+  "annotations": [],
+  "auto_merge_requested": false,
+  "blocked": [],
+  "changed": true,
+  "changed_paths": [
+    "dependency.txt"
+  ],
+  "counts": {
+    "annotations": 0,
+    "blocked": 0,
+    "files_changed": 1,
+    "normalized": 0,
+    "not_examined": 0,
+    "policy_holds": 0,
+    "updates": 1,
+    "updates_major": 0,
+    "updates_minor": 0,
+    "updates_patch": 1,
+    "updates_quiet": 1,
+    "updates_review_worthy": 0,
+    "updates_revision": 0,
+    "warnings": 0
+  },
+  "normalized": [],
+  "policy": {
+    "lockfile_regeneration": false,
+    "max_bump": "minor",
+    "min_age": "7d"
+  },
+  "policy_holds": [],
+  "schema": 1,
+  "state": "ready",
+  "title": "chore(deps): refresh example to 1.0.1",
+  "updates": [
+    {
+      "bump": "patch",
+      "current": "1.0.0",
+      "latest": "1.0.1",
+      "package": "example",
+      "path": "dependency.txt",
+      "status": "applied"
+    }
+  ],
+  "validation": {
+    "proposal_integrity_passed": true,
+    "repository_command_configured": false
+  }
+}

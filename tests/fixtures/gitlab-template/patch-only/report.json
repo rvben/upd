@@ -1,0 +1,15 @@
+{
+  "command": "update",
+  "mode": "applied",
+  "files": [
+    {
+      "path": "dependency.txt",
+      "file_type": "test",
+      "lang": "test",
+      "updates": [{"package": "example", "current": "1.0.0", "latest": "1.0.1", "bump": "patch", "status": "applied"}],
+      "errors": [],
+      "warnings": []
+    }
+  ],
+  "summary": {"files_scanned": 1, "files_with_changes": 1, "updates_total": 1, "errors": 0, "warnings": 0}
+}

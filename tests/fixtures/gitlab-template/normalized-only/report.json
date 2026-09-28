@@ -1,0 +1,18 @@
+{
+  "command": "update",
+  "mode": "applied",
+  "files": [
+    {
+      "path": "pyproject.toml",
+      "file_type": "pyproject",
+      "lang": "python",
+      "normalized": [
+        {"line": 3, "package": "click", "previous_spec": null, "new_spec": ">=8.5.0", "version": "8.5.0", "pinned": false},
+        {"line": 4, "package": "urllib3", "previous_spec": "<= 2.0.0", "new_spec": ">=2.7.0", "version": "2.7.0", "pinned": false, "skipped_latest": "2.8.0"}
+      ],
+      "errors": [],
+      "warnings": []
+    }
+  ],
+  "summary": {"files_scanned": 1, "files_with_changes": 1, "updates_total": 0, "normalized": 2, "errors": 0, "warnings": 0}
+}

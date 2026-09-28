@@ -67,6 +67,48 @@ struct Fixture {
     server_url: String,
 }
 
+/// Job inputs for one template run. Defaults mirror the template's own input
+/// defaults, except for the fake updater controls.
+#[derive(Clone)]
+struct Run {
+    /// Whether the fake updater writes `content` to `file`.
+    change: bool,
+    content: String,
+    file: String,
+    /// Report the fake updater prints; empty selects its built-in reports.
+    report: String,
+    /// Exit status the fake updater fails with, before writing anything.
+    upd_exit: Option<i32>,
+    auto_merge: bool,
+    lock: String,
+    min_age: String,
+    max_bump: String,
+    prepare_command: String,
+    validation_command: String,
+    mr_title: String,
+    branch: String,
+}
+
+impl Default for Run {
+    fn default() -> Self {
+        Self {
+            change: true,
+            content: "new".to_string(),
+            file: "dependency.txt".to_string(),
+            report: String::new(),
+            upd_exit: None,
+            auto_merge: false,
+            lock: "false".to_string(),
+            min_age: "7d".to_string(),
+            max_bump: "minor".to_string(),
+            prepare_command: String::new(),
+            validation_command: String::new(),
+            mr_title: String::new(),
+            branch: BRANCH.to_string(),
+        }
+    }
+}
+
 impl Fixture {
     fn new() -> Self {
         let temp = tempfile::tempdir().expect("tempdir");
@@ -93,8 +135,14 @@ impl Fixture {
             &updater,
             r#"#!/usr/bin/env bash
 set -euo pipefail
+if [ -n "${FAKE_UPD_EXIT:-}" ]; then
+  echo "fake upd failure" >&2
+  exit "$FAKE_UPD_EXIT"
+fi
 if [ "${FAKE_UPD_CHANGE}" = "true" ]; then
-  printf '%s\n' "${FAKE_UPD_CONTENT}" > dependency.txt
+  target="${FAKE_UPD_FILE:-dependency.txt}"
+  mkdir -p "$(dirname "$target")"
+  printf '%s\n' "${FAKE_UPD_CONTENT}" > "$target"
 fi
 if [ -s "${FAKE_UPD_REPORT_FILE:-}" ]; then
   cat "$FAKE_UPD_REPORT_FILE"
@@ -135,9 +183,36 @@ fi
         auto_merge: bool,
         report: &str,
     ) {
+        self.run(
+            server,
+            &Run {
+                change,
+                content: content.to_string(),
+                auto_merge,
+                report: report.to_string(),
+                ..Run::default()
+            },
+        );
+    }
+
+    /// Runs the job and requires it to succeed.
+    fn run(&self, server: &MockServer, run: &Run) -> Output {
+        let output = self.execute(server, run);
+        assert!(
+            output.status.success(),
+            "template failed\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        output
+    }
+
+    /// Runs the job with the given inputs and returns its outcome unjudged.
+    fn execute(&self, server: &MockServer, run: &Run) -> Output {
         let report_file = self._temp.path().join("fake-upd-report.json");
-        fs::write(&report_file, report).expect("fixture report");
-        let output = Command::new("bash")
+        fs::write(&report_file, &run.report).expect("fixture report");
+        let mut command = Command::new("bash");
+        command
             .arg("-c")
             .arg(embedded_script())
             .current_dir(&self.checkout)
@@ -154,29 +229,48 @@ fi
             .env("UPD_PATHS", ".")
             .env("UPD_LANGS", "")
             .env("UPD_PACKAGES", "")
-            .env("UPD_MIN_AGE", "7d")
-            .env("UPD_MAX_BUMP", "minor")
-            .env("UPD_LOCK", "false")
-            .env("UPD_PREPARE_COMMAND", "")
-            .env("UPD_VALIDATION_COMMAND", "")
-            .env("UPD_BRANCH", BRANCH)
+            .env("UPD_MIN_AGE", &run.min_age)
+            .env("UPD_MAX_BUMP", &run.max_bump)
+            .env("UPD_LOCK", &run.lock)
+            .env("UPD_PREPARE_COMMAND", &run.prepare_command)
+            .env("UPD_VALIDATION_COMMAND", &run.validation_command)
+            .env("UPD_BRANCH", &run.branch)
             .env("UPD_COMMIT_MESSAGE", "chore(deps): test update")
-            .env("UPD_MR_TITLE", "")
+            .env("UPD_MR_TITLE", &run.mr_title)
             .env("UPD_GIT_NAME", "upd test")
             .env("UPD_GIT_EMAIL", "upd-test@example.com")
-            .env("UPD_AUTO_MERGE", auto_merge.to_string())
+            .env("UPD_AUTO_MERGE", run.auto_merge.to_string())
             .env("UPD_EXECUTABLE", &self.updater)
-            .env("FAKE_UPD_CHANGE", change.to_string())
-            .env("FAKE_UPD_CONTENT", content)
+            .env("FAKE_UPD_CHANGE", run.change.to_string())
+            .env("FAKE_UPD_CONTENT", &run.content)
+            .env("FAKE_UPD_FILE", &run.file)
             .env("FAKE_UPD_REPORT_FILE", report_file)
+            .env("FIXTURE_REMOTE", &self.remote);
+        if let Some(code) = run.upd_exit {
+            command.env("FAKE_UPD_EXIT", code.to_string());
+        }
+        command.output().expect("template starts")
+    }
+
+    fn remote_tip(&self) -> Option<String> {
+        let output = Command::new("git")
+            .arg(format!("--git-dir={}", self.remote.display()))
+            .args(["rev-parse", "--verify", "--quiet"])
+            .arg(format!("refs/heads/{BRANCH}"))
             .output()
-            .expect("template starts");
-        assert!(
-            output.status.success(),
-            "template failed\nstdout:\n{}\nstderr:\n{}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        );
+            .expect("git rev-parse starts");
+        output
+            .status
+            .success()
+            .then(|| String::from_utf8(output.stdout).unwrap().trim().to_string())
+    }
+
+    fn remote_author(&self) -> String {
+        let output = run(Command::new("git")
+            .arg(format!("--git-dir={}", self.remote.display()))
+            .args(["show", "-s", "--format=%an <%ae>|%cn <%ce>|%s"])
+            .arg(format!("refs/heads/{BRANCH}")));
+        String::from_utf8(output.stdout).unwrap().trim().to_string()
     }
 
     fn branch_file(&self) -> Option<String> {
@@ -680,4 +774,838 @@ fn template_defaults_are_reproducible_and_safe() {
     assert!(TEMPLATE.contains("--force-with-lease="));
     assert!(!TEMPLATE.contains("JOB-TOKEN:"));
     assert!(!TEMPLATE.contains("UPD_VERSION: \"latest\""));
+}
+
+// Golden rendering. Each case pins the exact presentation model and merge
+// request description the template produces for a fixed update report, so any
+// reimplementation of the rendering can be held to byte-identical output.
+// Regenerate deliberately with `UPD_BLESS=1` and review the diff.
+
+const GOLDEN_DIR: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/tests/fixtures/gitlab-template"
+);
+
+fn assert_golden(case: &str, name: &str, actual: &str) {
+    let path = Path::new(GOLDEN_DIR).join(case).join(name);
+    if std::env::var_os("UPD_BLESS").is_some() {
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, actual).unwrap();
+        return;
+    }
+    let expected = fs::read_to_string(&path).unwrap_or_else(|error| {
+        panic!(
+            "missing golden file {}: {error}; generate it with UPD_BLESS=1",
+            path.display()
+        )
+    });
+    assert_eq!(
+        expected,
+        actual,
+        "{} differs from the rendered output",
+        path.display()
+    );
+}
+
+fn golden_report(case: &str) -> String {
+    fs::read_to_string(Path::new(GOLDEN_DIR).join(case).join("report.json"))
+        .expect("golden case report")
+}
+
+fn form_field(name: &str, value: &str) -> String {
+    format!("name=\"{name}\"\r\n\r\n{value}\r\n")
+}
+
+async fn assert_rendering_matches_golden(case: &str, run: Run) -> String {
+    let server = MockServer::start().await;
+    let fixture = Fixture::new();
+    list_mock(json!([])).mount(&server).await;
+    Mock::given(method("POST"))
+        .and(path("/api/v4/projects/1/merge_requests"))
+        .respond_with(ResponseTemplate::new(201).set_body_json(mr_response(7, false)))
+        .expect(1)
+        .mount(&server)
+        .await;
+    if run.auto_merge {
+        Mock::given(method("PUT"))
+            .and(path("/api/v4/projects/1/merge_requests/7/merge"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(mr_response(7, true)))
+            .expect(1)
+            .mount(&server)
+            .await;
+    }
+
+    fixture.run(&server, &run);
+
+    let presentation = fixture.presentation();
+    assert_golden(
+        case,
+        "presentation.json",
+        &(serde_json::to_string_pretty(&presentation).unwrap() + "\n"),
+    );
+    let description = fixture.description();
+    assert_golden(case, "description.md", &description);
+
+    let requests = server.received_requests().await.unwrap();
+    let create = requests
+        .iter()
+        .find(|request| request.method.as_str() == "POST")
+        .expect("merge request created");
+    let body = String::from_utf8_lossy(&create.body);
+    let title = if run.mr_title.is_empty() {
+        presentation["title"].as_str().unwrap().to_string()
+    } else {
+        run.mr_title.clone()
+    };
+    assert!(body.contains(&form_field("title", &title)), "{body}");
+    assert!(
+        body.contains(&form_field("description", &description)),
+        "{body}"
+    );
+    assert!(
+        body.contains(&form_field("source_branch", BRANCH)),
+        "{body}"
+    );
+    assert!(
+        body.contains(&form_field("target_branch", "main")),
+        "{body}"
+    );
+    assert!(
+        body.contains(&form_field("remove_source_branch", "true")),
+        "{body}"
+    );
+    description
+}
+
+#[tokio::test]
+async fn golden_single_minor_update() {
+    assert_rendering_matches_golden("single-minor", Run::default()).await;
+}
+
+#[tokio::test]
+async fn golden_untrusted_text_with_holds_and_blocked() {
+    let report = golden_report("untrusted-holds-blocked");
+    assert_rendering_matches_golden(
+        "untrusted-holds-blocked",
+        Run {
+            report,
+            ..Run::default()
+        },
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn golden_normalized_specifiers_only() {
+    let report = golden_report("normalized-only");
+    assert_rendering_matches_golden(
+        "normalized-only",
+        Run {
+            report,
+            ..Run::default()
+        },
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn golden_updates_and_normalized_specifiers() {
+    let report = golden_report("updates-and-normalized");
+    assert_rendering_matches_golden(
+        "updates-and-normalized",
+        Run {
+            report,
+            ..Run::default()
+        },
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn golden_review_worthy_and_quiet_updates() {
+    let report = golden_report("review-and-quiet");
+    assert_rendering_matches_golden(
+        "review-and-quiet",
+        Run {
+            report,
+            ..Run::default()
+        },
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn golden_patch_only_update() {
+    let report = golden_report("patch-only");
+    assert_rendering_matches_golden(
+        "patch-only",
+        Run {
+            report,
+            ..Run::default()
+        },
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn golden_workflow_only_change_uses_the_ci_prefix() {
+    let report = golden_report("workflow-only");
+    assert_rendering_matches_golden(
+        "workflow-only",
+        Run {
+            report,
+            file: ".github/workflows/ci.yml".to_string(),
+            ..Run::default()
+        },
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn golden_validated_repository_policy_with_auto_merge() {
+    let report = golden_report("validated-auto-merge");
+    assert_rendering_matches_golden(
+        "validated-auto-merge",
+        Run {
+            report,
+            validation_command: "true".to_string(),
+            lock: "true".to_string(),
+            min_age: String::new(),
+            max_bump: String::new(),
+            auto_merge: true,
+            ..Run::default()
+        },
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn golden_truncates_long_tables_within_the_body_budget() {
+    let mut updates = Vec::new();
+    for index in 0..15 {
+        updates.push(
+            json!({"package": format!("review-{index:02}"), "current": "1.0.0",
+            "latest": "1.1.0", "bump": "minor", "status": "applied"}),
+        );
+    }
+    for index in 0..25 {
+        updates.push(
+            json!({"package": format!("quiet-{index:02}"), "current": "1.0.0",
+            "latest": "1.0.1", "bump": "patch", "status": "applied"}),
+        );
+    }
+    let held = (0..25)
+        .map(|index| {
+            json!({"package": format!("held-{index:02}"), "current": "1.0.0",
+            "available": "2.0.0"})
+        })
+        .collect::<Vec<_>>();
+    let blocked = (0..14)
+        .map(|index| {
+            json!({"package": format!("blocked-{index:02}"), "current": "1.0.0",
+            "status": "blocked", "message": "needs a person"})
+        })
+        .collect::<Vec<_>>();
+    let report = json!({
+        "command": "update", "mode": "applied",
+        "files": [{"path": "dependency.txt", "file_type": "test", "lang": "test",
+            "updates": updates, "capped": held, "skipped": blocked,
+            "errors": [], "warnings": []}],
+        "summary": {"files_scanned": 1, "files_with_changes": 1, "updates_total": 40,
+            "errors": 0, "warnings": 0}
+    });
+    let description = assert_rendering_matches_golden(
+        "truncated-tables",
+        Run {
+            report: report.to_string(),
+            ..Run::default()
+        },
+    )
+    .await;
+    assert!(description.contains("_3 more review-worthy updates are preserved"));
+    assert!(description.contains("_5 more patch updates are preserved"));
+    assert!(description.contains("_5 more policy decisions are preserved"));
+    assert!(description.contains("_2 more blocked decisions are preserved"));
+}
+
+#[tokio::test]
+async fn golden_oversized_description_falls_back_to_a_summary() {
+    let long = |prefix: String, fill: &str| format!("{prefix}-{}", fill.repeat(300));
+    let updates = (0..40)
+        .map(|index| {
+            json!({
+                "package": long(format!("package-{index:02}"), "x"),
+                "current": long("1.0.0".to_string(), "c"),
+                "latest": long("1.1.0".to_string(), "l"),
+                "bump": if index < 20 { "minor" } else { "patch" }, "status": "applied"
+            })
+        })
+        .collect::<Vec<_>>();
+    let held = (0..20)
+        .map(|index| {
+            json!({
+                "package": long(format!("held-{index:02}"), "y"),
+                "current": long("1.0.0".to_string(), "c"),
+                "chosen": long("1.0.1".to_string(), "s"),
+                "skipped_latest": long("1.1.0".to_string(), "a")
+            })
+        })
+        .collect::<Vec<_>>();
+    let blocked = (0..12)
+        .map(|index| {
+            json!({
+                "package": format!("blocked-{index:02}"),
+                "current": long("1.0.0".to_string(), "c"),
+                "status": "blocked", "message": "z".repeat(300)
+            })
+        })
+        .collect::<Vec<_>>();
+    let report = json!({
+        "command": "update", "mode": "applied",
+        "files": [{"path": long("dependency".to_string(), "p"), "file_type": "test",
+            "lang": "test", "updates": updates, "held_back": held, "skipped": blocked,
+            "errors": [], "warnings": []}],
+        "summary": {"files_scanned": 1, "files_with_changes": 1, "updates_total": 40,
+            "errors": 0, "warnings": 0}
+    });
+    let description = assert_rendering_matches_golden(
+        "oversized-fallback",
+        Run {
+            report: report.to_string(),
+            ..Run::default()
+        },
+    )
+    .await;
+    assert!(description.contains("exceeded the configured body budget"));
+    assert!(description.len() <= 32 * 1024);
+}
+
+#[tokio::test]
+async fn golden_title_override_replaces_only_the_merge_request_title() {
+    assert_rendering_matches_golden(
+        "title-override",
+        Run {
+            mr_title: "chore: custom dependency title".to_string(),
+            ..Run::default()
+        },
+    )
+    .await;
+}
+
+// Lifecycle contract. These pin what the rolling branch and the GitLab API see
+// in each situation, independently of how the description is worded.
+
+fn only_reads(requests: &[wiremock::Request]) -> bool {
+    requests
+        .iter()
+        .all(|request| request.method.as_str() == "GET")
+}
+
+fn failed_with(output: &Output, code: i32) -> bool {
+    output.status.code() == Some(code)
+}
+
+fn describe(output: &Output) -> String {
+    format!(
+        "status: {:?}\nstdout:\n{}\nstderr:\n{}",
+        output.status.code(),
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    )
+}
+
+async fn create_rolling_branch(fixture: &Fixture, content: &str) {
+    let server = MockServer::start().await;
+    list_mock(json!([])).mount(&server).await;
+    Mock::given(method("POST"))
+        .and(path("/api/v4/projects/1/merge_requests"))
+        .respond_with(ResponseTemplate::new(201).set_body_json(mr_response(7, false)))
+        .mount(&server)
+        .await;
+    fixture.run(
+        &server,
+        &Run {
+            content: content.to_string(),
+            ..Run::default()
+        },
+    );
+}
+
+fn push_human_commit(fixture: &Fixture) -> String {
+    git(&fixture.checkout, &["fetch", "origin", BRANCH]);
+    git(
+        &fixture.checkout,
+        &["switch", "--force-create", "human-work", "FETCH_HEAD"],
+    );
+    fs::write(fixture.checkout.join("human-fix.txt"), "keep me\n").unwrap();
+    git(&fixture.checkout, &["add", "human-fix.txt"]);
+    git(
+        &fixture.checkout,
+        &[
+            "-c",
+            "user.name=Human Maintainer",
+            "-c",
+            "user.email=human@example.com",
+            "commit",
+            "-m",
+            "fix: adapt to update",
+        ],
+    );
+    git(
+        &fixture.checkout,
+        &["push", "origin", &format!("HEAD:refs/heads/{BRANCH}")],
+    );
+    let tip = String::from_utf8(git(&fixture.checkout, &["rev-parse", "HEAD"]).stdout)
+        .unwrap()
+        .trim()
+        .to_string();
+    git(&fixture.checkout, &["switch", "main"]);
+    tip
+}
+
+/// A validation command that pushes a commit to the rolling branch from
+/// another clone, standing in for a concurrent writer between fetch and push.
+const RACING_PUSH: &str = r#"racer="$(mktemp -d)"
+git clone --quiet "$FIXTURE_REMOTE" "$racer"
+if git -C "$racer" rev-parse --verify --quiet "refs/remotes/origin/automation/upd-dependencies" >/dev/null; then
+  git -C "$racer" switch --quiet automation/upd-dependencies
+fi
+echo race > "$racer/race.txt"
+git -C "$racer" add race.txt
+git -C "$racer" -c user.name=Racer -c user.email=racer@example.com commit --quiet -m race
+git -C "$racer" push --quiet origin HEAD:refs/heads/automation/upd-dependencies
+git -C "$racer" rev-parse HEAD > "$FIXTURE_REMOTE/../racer-tip""#;
+
+#[tokio::test]
+async fn template_commits_as_the_automation_identity() {
+    let fixture = Fixture::new();
+    create_rolling_branch(&fixture, "new").await;
+
+    assert_eq!(
+        fixture.remote_author(),
+        "upd test <upd-test@example.com>|upd test <upd-test@example.com>|chore(deps): test update"
+    );
+}
+
+#[tokio::test]
+async fn template_does_nothing_when_clean_and_no_branch_exists() {
+    let server = MockServer::start().await;
+    let fixture = Fixture::new();
+    list_mock(json!([])).mount(&server).await;
+
+    fixture.run(
+        &server,
+        &Run {
+            change: false,
+            ..Run::default()
+        },
+    );
+
+    assert_eq!(fixture.remote_tip(), None);
+    assert!(only_reads(&server.received_requests().await.unwrap()));
+}
+
+#[tokio::test]
+async fn template_refuses_duplicate_merge_requests_when_publishing() {
+    let server = MockServer::start().await;
+    let fixture = Fixture::new();
+    let mut duplicates = mr_list_response(7, false);
+    duplicates
+        .as_array_mut()
+        .unwrap()
+        .push(mr_list_response(8, false)[0].clone());
+    list_mock(duplicates).mount(&server).await;
+
+    let output = fixture.execute(&server, &Run::default());
+
+    assert!(failed_with(&output, 2), "{}", describe(&output));
+    assert!(only_reads(&server.received_requests().await.unwrap()));
+}
+
+#[tokio::test]
+async fn template_refuses_duplicate_merge_requests_when_cleaning_up() {
+    let fixture = Fixture::new();
+    create_rolling_branch(&fixture, "new").await;
+    let tip = fixture.remote_tip();
+    let server = MockServer::start().await;
+    let mut duplicates = mr_list_response(7, false);
+    duplicates
+        .as_array_mut()
+        .unwrap()
+        .push(mr_list_response(8, false)[0].clone());
+    list_mock(duplicates).mount(&server).await;
+
+    let output = fixture.execute(
+        &server,
+        &Run {
+            change: false,
+            ..Run::default()
+        },
+    );
+
+    assert!(failed_with(&output, 2), "{}", describe(&output));
+    assert_eq!(fixture.remote_tip(), tip);
+    assert!(only_reads(&server.received_requests().await.unwrap()));
+}
+
+async fn assert_cancels_previous_auto_merge(existing: serde_json::Value) {
+    let fixture = Fixture::new();
+    create_rolling_branch(&fixture, "first").await;
+    let server = MockServer::start().await;
+    list_mock(json!([existing.clone()])).mount(&server).await;
+    Mock::given(method("PUT"))
+        .and(path("/api/v4/projects/1/merge_requests/7"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(existing))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path(
+            "/api/v4/projects/1/merge_requests/7/cancel_merge_when_pipeline_succeeds",
+        ))
+        .respond_with(ResponseTemplate::new(201).set_body_json(mr_response(7, false)))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    fixture.run(
+        &server,
+        &Run {
+            content: "second".to_string(),
+            ..Run::default()
+        },
+    );
+}
+
+#[tokio::test]
+async fn template_cancels_auto_merge_reported_by_the_legacy_field() {
+    assert_cancels_previous_auto_merge(mr_response(7, true)).await;
+}
+
+#[tokio::test]
+async fn template_cancels_auto_merge_reported_by_the_current_field() {
+    assert_cancels_previous_auto_merge(json!({
+        "iid": 7,
+        "web_url": "https://gitlab.example.test/project/-/merge_requests/7",
+        "auto_merge_enabled": true,
+    }))
+    .await;
+}
+
+#[tokio::test]
+async fn template_binds_auto_merge_to_the_pushed_commit() {
+    let server = MockServer::start().await;
+    let fixture = Fixture::new();
+    list_mock(json!([])).mount(&server).await;
+    Mock::given(method("POST"))
+        .and(path("/api/v4/projects/1/merge_requests"))
+        .respond_with(ResponseTemplate::new(201).set_body_json(mr_response(7, false)))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("PUT"))
+        .and(path("/api/v4/projects/1/merge_requests/7/merge"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(mr_response(7, true)))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    fixture.run(
+        &server,
+        &Run {
+            auto_merge: true,
+            ..Run::default()
+        },
+    );
+
+    let tip = fixture.remote_tip().expect("rolling branch pushed");
+    let requests = server.received_requests().await.unwrap();
+    let merge = requests
+        .iter()
+        .find(|request| request.url.path().ends_with("/merge"))
+        .expect("auto-merge requested");
+    let body = String::from_utf8_lossy(&merge.body);
+    assert!(body.contains(&form_field("auto_merge", "true")), "{body}");
+    assert!(body.contains(&form_field("sha", &tip)), "{body}");
+    assert!(
+        body.contains(&form_field("should_remove_source_branch", "true")),
+        "{body}"
+    );
+}
+
+#[tokio::test]
+async fn template_recovers_when_the_push_succeeded_but_merge_request_creation_failed() {
+    let fixture = Fixture::new();
+    let failing = MockServer::start().await;
+    list_mock(json!([])).mount(&failing).await;
+    Mock::given(method("POST"))
+        .and(path("/api/v4/projects/1/merge_requests"))
+        .respond_with(ResponseTemplate::new(500).set_body_string("unavailable"))
+        .expect(1)
+        .mount(&failing)
+        .await;
+
+    let output = fixture.execute(&failing, &Run::default());
+    assert!(!output.status.success(), "{}", describe(&output));
+    assert!(fixture.remote_tip().is_some());
+
+    let retry = MockServer::start().await;
+    list_mock(json!([])).mount(&retry).await;
+    Mock::given(method("POST"))
+        .and(path("/api/v4/projects/1/merge_requests"))
+        .respond_with(ResponseTemplate::new(201).set_body_json(mr_response(7, false)))
+        .expect(1)
+        .mount(&retry)
+        .await;
+    fixture.run(
+        &retry,
+        &Run {
+            content: "retried".to_string(),
+            ..Run::default()
+        },
+    );
+
+    assert_eq!(fixture.branch_file().as_deref(), Some("retried\n"));
+    assert_eq!(fixture.branch_commit_count(), 1);
+}
+
+async fn assert_lease_rejects_a_racing_push(existing_branch: bool) {
+    let fixture = Fixture::new();
+    if existing_branch {
+        create_rolling_branch(&fixture, "first").await;
+    }
+    let server = MockServer::start().await;
+
+    let output = fixture.execute(
+        &server,
+        &Run {
+            content: "second".to_string(),
+            validation_command: RACING_PUSH.to_string(),
+            ..Run::default()
+        },
+    );
+
+    assert!(!output.status.success(), "{}", describe(&output));
+    let racer_tip = fs::read_to_string(fixture._temp.path().join("racer-tip"))
+        .expect("racing push ran")
+        .trim()
+        .to_string();
+    assert_eq!(fixture.remote_tip(), Some(racer_tip));
+    assert!(server.received_requests().await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn template_lease_rejects_a_push_racing_an_existing_branch() {
+    assert_lease_rejects_a_racing_push(true).await;
+}
+
+#[tokio::test]
+async fn template_lease_rejects_a_push_racing_branch_creation() {
+    assert_lease_rejects_a_racing_push(false).await;
+}
+
+#[tokio::test]
+async fn template_refuses_to_publish_a_report_with_errors() {
+    let server = MockServer::start().await;
+    let fixture = Fixture::new();
+    let report = r#"{"command":"update","mode":"applied",
+      "files":[{"path":"dependency.txt","file_type":"test","lang":"test",
+        "updates":[{"package":"example","current":"1.0.0","latest":"1.1.0","bump":"minor"}],
+        "errors":["registry unavailable"],"warnings":[]}],
+      "summary":{"files_scanned":1,"files_with_changes":1,"updates_total":1,"errors":1,"warnings":0}}"#;
+
+    let output = fixture.execute(
+        &server,
+        &Run {
+            report: report.to_string(),
+            ..Run::default()
+        },
+    );
+
+    assert!(failed_with(&output, 2), "{}", describe(&output));
+    assert_eq!(fixture.remote_tip(), None);
+    assert!(server.received_requests().await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn template_stops_when_upd_fails() {
+    let server = MockServer::start().await;
+    let fixture = Fixture::new();
+
+    let output = fixture.execute(
+        &server,
+        &Run {
+            upd_exit: Some(3),
+            ..Run::default()
+        },
+    );
+
+    assert!(!output.status.success(), "{}", describe(&output));
+    assert_eq!(fixture.remote_tip(), None);
+    assert!(server.received_requests().await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn template_refuses_a_prepare_command_that_changes_repository_files() {
+    let server = MockServer::start().await;
+    let fixture = Fixture::new();
+
+    let output = fixture.execute(
+        &server,
+        &Run {
+            prepare_command: "echo setup > stray.txt".to_string(),
+            ..Run::default()
+        },
+    );
+
+    assert!(failed_with(&output, 2), "{}", describe(&output));
+    assert_eq!(fixture.remote_tip(), None);
+    assert!(server.received_requests().await.unwrap().is_empty());
+}
+
+async fn assert_refuses_dirty_validation(command: &str) {
+    let server = MockServer::start().await;
+    let fixture = Fixture::new();
+
+    let output = fixture.execute(
+        &server,
+        &Run {
+            validation_command: command.to_string(),
+            ..Run::default()
+        },
+    );
+
+    assert!(failed_with(&output, 2), "{}", describe(&output));
+    assert_eq!(fixture.remote_tip(), None);
+    assert!(server.received_requests().await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn template_refuses_validation_that_modifies_a_tracked_file() {
+    assert_refuses_dirty_validation("echo more >> dependency.txt").await;
+}
+
+#[tokio::test]
+async fn template_refuses_validation_that_creates_an_untracked_file() {
+    assert_refuses_dirty_validation("echo build > output.txt").await;
+}
+
+#[tokio::test]
+async fn template_pause_requires_exactly_one_open_merge_request() {
+    let fixture = Fixture::new();
+    create_rolling_branch(&fixture, "first").await;
+    let human_tip = push_human_commit(&fixture);
+    let server = MockServer::start().await;
+    list_mock(json!([])).mount(&server).await;
+
+    let output = fixture.execute(&server, &Run::default());
+
+    assert!(failed_with(&output, 2), "{}", describe(&output));
+    assert_eq!(fixture.remote_tip(), Some(human_tip));
+    assert!(only_reads(&server.received_requests().await.unwrap()));
+}
+
+#[tokio::test]
+async fn template_pause_refuses_to_overwrite_an_unreadable_description() {
+    let fixture = Fixture::new();
+    create_rolling_branch(&fixture, "first").await;
+    let human_tip = push_human_commit(&fixture);
+    let server = MockServer::start().await;
+    let mut existing = mr_list_response(7, false);
+    existing[0]["description"] = serde_json::Value::Null;
+    list_mock(existing).mount(&server).await;
+
+    let output = fixture.execute(&server, &Run::default());
+
+    assert!(failed_with(&output, 2), "{}", describe(&output));
+    assert_eq!(fixture.remote_tip(), Some(human_tip));
+    assert!(only_reads(&server.received_requests().await.unwrap()));
+}
+
+#[tokio::test]
+async fn template_pause_notice_is_published_once() {
+    let fixture = Fixture::new();
+    create_rolling_branch(&fixture, "first").await;
+    let human_tip = push_human_commit(&fixture);
+    let server = MockServer::start().await;
+    let mut existing = mr_list_response(7, false);
+    existing[0]["description"] =
+        json!("Review notes\n\n<!-- upd-human-commit-pause -->\n> **Automation paused**");
+    list_mock(existing).mount(&server).await;
+
+    fixture.run(&server, &Run::default());
+
+    assert_eq!(fixture.remote_tip(), Some(human_tip));
+    assert!(only_reads(&server.received_requests().await.unwrap()));
+}
+
+#[tokio::test]
+async fn template_pause_notice_appends_to_the_existing_description() {
+    let fixture = Fixture::new();
+    create_rolling_branch(&fixture, "first").await;
+    push_human_commit(&fixture);
+    let server = MockServer::start().await;
+    let mut existing = mr_list_response(7, false);
+    existing[0]["description"] = json!("Review notes");
+    list_mock(existing).mount(&server).await;
+    Mock::given(method("PUT"))
+        .and(path("/api/v4/projects/1/merge_requests/7"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(mr_response(7, false)))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    fixture.run(&server, &Run::default());
+
+    let requests = server.received_requests().await.unwrap();
+    let update = requests
+        .iter()
+        .find(|request| request.method.as_str() == "PUT")
+        .unwrap();
+    let body = String::from_utf8_lossy(&update.body);
+    assert!(
+        body.contains(&form_field(
+            "description",
+            "Review notes\n\n\n<!-- upd-human-commit-pause -->\n> **Automation paused:** this branch has commits outside the generated upd commit. Preserve them or remove them before automation resumes.\n"
+        )),
+        "{body}"
+    );
+}
+
+async fn assert_rejects_input(run: Run) {
+    let server = MockServer::start().await;
+    let fixture = Fixture::new();
+
+    let output = fixture.execute(&server, &run);
+
+    assert!(failed_with(&output, 4), "{}", describe(&output));
+    assert_eq!(fixture.remote_tip(), None);
+    assert!(server.received_requests().await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn template_rejects_a_non_boolean_lock_input() {
+    assert_rejects_input(Run {
+        lock: "yes".to_string(),
+        ..Run::default()
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn template_rejects_the_default_branch_as_automation_branch() {
+    assert_rejects_input(Run {
+        branch: "main".to_string(),
+        ..Run::default()
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn template_rejects_an_invalid_branch_name() {
+    assert_rejects_input(Run {
+        branch: "automation/bad..name".to_string(),
+        ..Run::default()
+    })
+    .await;
 }

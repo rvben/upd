@@ -1,0 +1,21 @@
+{
+  "command": "update",
+  "mode": "applied",
+  "files": [
+    {
+      "path": "pyproject.toml",
+      "file_type": "pyproject",
+      "lang": "python",
+      "updates": [
+        {"package": "requests", "current": "2.31.0", "latest": "2.32.3", "bump": "minor", "status": "applied"},
+        {"package": "idna", "current": "3.6", "latest": "3.7", "bump": "minor", "status": "pending_relock"}
+      ],
+      "normalized": [
+        {"line": 7, "package": "click", "previous_spec": "~=8.1", "new_spec": ">=8.1.7", "version": "8.1.7", "pinned": false}
+      ],
+      "errors": [],
+      "warnings": []
+    }
+  ],
+  "summary": {"files_scanned": 1, "files_with_changes": 1, "updates_total": 2, "normalized": 1, "errors": 0, "warnings": 0}
+}

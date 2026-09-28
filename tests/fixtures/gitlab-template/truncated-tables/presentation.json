@@ -1,0 +1,622 @@
+{
+  "annotations": [],
+  "auto_merge_requested": false,
+  "blocked": [
+    {
+      "current": "1.0.0",
+      "package": "blocked-00",
+      "path": "dependency.txt",
+      "reason": "needs a person"
+    },
+    {
+      "current": "1.0.0",
+      "package": "blocked-01",
+      "path": "dependency.txt",
+      "reason": "needs a person"
+    },
+    {
+      "current": "1.0.0",
+      "package": "blocked-02",
+      "path": "dependency.txt",
+      "reason": "needs a person"
+    },
+    {
+      "current": "1.0.0",
+      "package": "blocked-03",
+      "path": "dependency.txt",
+      "reason": "needs a person"
+    },
+    {
+      "current": "1.0.0",
+      "package": "blocked-04",
+      "path": "dependency.txt",
+      "reason": "needs a person"
+    },
+    {
+      "current": "1.0.0",
+      "package": "blocked-05",
+      "path": "dependency.txt",
+      "reason": "needs a person"
+    },
+    {
+      "current": "1.0.0",
+      "package": "blocked-06",
+      "path": "dependency.txt",
+      "reason": "needs a person"
+    },
+    {
+      "current": "1.0.0",
+      "package": "blocked-07",
+      "path": "dependency.txt",
+      "reason": "needs a person"
+    },
+    {
+      "current": "1.0.0",
+      "package": "blocked-08",
+      "path": "dependency.txt",
+      "reason": "needs a person"
+    },
+    {
+      "current": "1.0.0",
+      "package": "blocked-09",
+      "path": "dependency.txt",
+      "reason": "needs a person"
+    },
+    {
+      "current": "1.0.0",
+      "package": "blocked-10",
+      "path": "dependency.txt",
+      "reason": "needs a person"
+    },
+    {
+      "current": "1.0.0",
+      "package": "blocked-11",
+      "path": "dependency.txt",
+      "reason": "needs a person"
+    },
+    {
+      "current": "1.0.0",
+      "package": "blocked-12",
+      "path": "dependency.txt",
+      "reason": "needs a person"
+    },
+    {
+      "current": "1.0.0",
+      "package": "blocked-13",
+      "path": "dependency.txt",
+      "reason": "needs a person"
+    }
+  ],
+  "changed": true,
+  "changed_paths": [
+    "dependency.txt"
+  ],
+  "counts": {
+    "annotations": 0,
+    "blocked": 14,
+    "files_changed": 1,
+    "normalized": 0,
+    "not_examined": 0,
+    "policy_holds": 25,
+    "updates": 40,
+    "updates_major": 0,
+    "updates_minor": 15,
+    "updates_patch": 25,
+    "updates_quiet": 25,
+    "updates_review_worthy": 15,
+    "updates_revision": 0,
+    "warnings": 0
+  },
+  "normalized": [],
+  "policy": {
+    "lockfile_regeneration": false,
+    "max_bump": "minor",
+    "min_age": "7d"
+  },
+  "policy_holds": [
+    {
+      "available": "2.0.0",
+      "kind": "bump ceiling",
+      "package": "held-00",
+      "path": "dependency.txt",
+      "selected": "1.0.0"
+    },
+    {
+      "available": "2.0.0",
+      "kind": "bump ceiling",
+      "package": "held-01",
+      "path": "dependency.txt",
+      "selected": "1.0.0"
+    },
+    {
+      "available": "2.0.0",
+      "kind": "bump ceiling",
+      "package": "held-02",
+      "path": "dependency.txt",
+      "selected": "1.0.0"
+    },
+    {
+      "available": "2.0.0",
+      "kind": "bump ceiling",
+      "package": "held-03",
+      "path": "dependency.txt",
+      "selected": "1.0.0"
+    },
+    {
+      "available": "2.0.0",
+      "kind": "bump ceiling",
+      "package": "held-04",
+      "path": "dependency.txt",
+      "selected": "1.0.0"
+    },
+    {
+      "available": "2.0.0",
+      "kind": "bump ceiling",
+      "package": "held-05",
+      "path": "dependency.txt",
+      "selected": "1.0.0"
+    },
+    {
+      "available": "2.0.0",
+      "kind": "bump ceiling",
+      "package": "held-06",
+      "path": "dependency.txt",
+      "selected": "1.0.0"
+    },
+    {
+      "available": "2.0.0",
+      "kind": "bump ceiling",
+      "package": "held-07",
+      "path": "dependency.txt",
+      "selected": "1.0.0"
+    },
+    {
+      "available": "2.0.0",
+      "kind": "bump ceiling",
+      "package": "held-08",
+      "path": "dependency.txt",
+      "selected": "1.0.0"
+    },
+    {
+      "available": "2.0.0",
+      "kind": "bump ceiling",
+      "package": "held-09",
+      "path": "dependency.txt",
+      "selected": "1.0.0"
+    },
+    {
+      "available": "2.0.0",
+      "kind": "bump ceiling",
+      "package": "held-10",
+      "path": "dependency.txt",
+      "selected": "1.0.0"
+    },
+    {
+      "available": "2.0.0",
+      "kind": "bump ceiling",
+      "package": "held-11",
+      "path": "dependency.txt",
+      "selected": "1.0.0"
+    },
+    {
+      "available": "2.0.0",
+      "kind": "bump ceiling",
+      "package": "held-12",
+      "path": "dependency.txt",
+      "selected": "1.0.0"
+    },
+    {
+      "available": "2.0.0",
+      "kind": "bump ceiling",
+      "package": "held-13",
+      "path": "dependency.txt",
+      "selected": "1.0.0"
+    },
+    {
+      "available": "2.0.0",
+      "kind": "bump ceiling",
+      "package": "held-14",
+      "path": "dependency.txt",
+      "selected": "1.0.0"
+    },
+    {
+      "available": "2.0.0",
+      "kind": "bump ceiling",
+      "package": "held-15",
+      "path": "dependency.txt",
+      "selected": "1.0.0"
+    },
+    {
+      "available": "2.0.0",
+      "kind": "bump ceiling",
+      "package": "held-16",
+      "path": "dependency.txt",
+      "selected": "1.0.0"
+    },
+    {
+      "available": "2.0.0",
+      "kind": "bump ceiling",
+      "package": "held-17",
+      "path": "dependency.txt",
+      "selected": "1.0.0"
+    },
+    {
+      "available": "2.0.0",
+      "kind": "bump ceiling",
+      "package": "held-18",
+      "path": "dependency.txt",
+      "selected": "1.0.0"
+    },
+    {
+      "available": "2.0.0",
+      "kind": "bump ceiling",
+      "package": "held-19",
+      "path": "dependency.txt",
+      "selected": "1.0.0"
+    },
+    {
+      "available": "2.0.0",
+      "kind": "bump ceiling",
+      "package": "held-20",
+      "path": "dependency.txt",
+      "selected": "1.0.0"
+    },
+    {
+      "available": "2.0.0",
+      "kind": "bump ceiling",
+      "package": "held-21",
+      "path": "dependency.txt",
+      "selected": "1.0.0"
+    },
+    {
+      "available": "2.0.0",
+      "kind": "bump ceiling",
+      "package": "held-22",
+      "path": "dependency.txt",
+      "selected": "1.0.0"
+    },
+    {
+      "available": "2.0.0",
+      "kind": "bump ceiling",
+      "package": "held-23",
+      "path": "dependency.txt",
+      "selected": "1.0.0"
+    },
+    {
+      "available": "2.0.0",
+      "kind": "bump ceiling",
+      "package": "held-24",
+      "path": "dependency.txt",
+      "selected": "1.0.0"
+    }
+  ],
+  "schema": 1,
+  "state": "ready",
+  "title": "chore(deps): refresh 40 dependencies",
+  "updates": [
+    {
+      "bump": "patch",
+      "current": "1.0.0",
+      "latest": "1.0.1",
+      "package": "quiet-00",
+      "path": "dependency.txt",
+      "status": "applied"
+    },
+    {
+      "bump": "patch",
+      "current": "1.0.0",
+      "latest": "1.0.1",
+      "package": "quiet-01",
+      "path": "dependency.txt",
+      "status": "applied"
+    },
+    {
+      "bump": "patch",
+      "current": "1.0.0",
+      "latest": "1.0.1",
+      "package": "quiet-02",
+      "path": "dependency.txt",
+      "status": "applied"
+    },
+    {
+      "bump": "patch",
+      "current": "1.0.0",
+      "latest": "1.0.1",
+      "package": "quiet-03",
+      "path": "dependency.txt",
+      "status": "applied"
+    },
+    {
+      "bump": "patch",
+      "current": "1.0.0",
+      "latest": "1.0.1",
+      "package": "quiet-04",
+      "path": "dependency.txt",
+      "status": "applied"
+    },
+    {
+      "bump": "patch",
+      "current": "1.0.0",
+      "latest": "1.0.1",
+      "package": "quiet-05",
+      "path": "dependency.txt",
+      "status": "applied"
+    },
+    {
+      "bump": "patch",
+      "current": "1.0.0",
+      "latest": "1.0.1",
+      "package": "quiet-06",
+      "path": "dependency.txt",
+      "status": "applied"
+    },
+    {
+      "bump": "patch",
+      "current": "1.0.0",
+      "latest": "1.0.1",
+      "package": "quiet-07",
+      "path": "dependency.txt",
+      "status": "applied"
+    },
+    {
+      "bump": "patch",
+      "current": "1.0.0",
+      "latest": "1.0.1",
+      "package": "quiet-08",
+      "path": "dependency.txt",
+      "status": "applied"
+    },
+    {
+      "bump": "patch",
+      "current": "1.0.0",
+      "latest": "1.0.1",
+      "package": "quiet-09",
+      "path": "dependency.txt",
+      "status": "applied"
+    },
+    {
+      "bump": "patch",
+      "current": "1.0.0",
+      "latest": "1.0.1",
+      "package": "quiet-10",
+      "path": "dependency.txt",
+      "status": "applied"
+    },
+    {
+      "bump": "patch",
+      "current": "1.0.0",
+      "latest": "1.0.1",
+      "package": "quiet-11",
+      "path": "dependency.txt",
+      "status": "applied"
+    },
+    {
+      "bump": "patch",
+      "current": "1.0.0",
+      "latest": "1.0.1",
+      "package": "quiet-12",
+      "path": "dependency.txt",
+      "status": "applied"
+    },
+    {
+      "bump": "patch",
+      "current": "1.0.0",
+      "latest": "1.0.1",
+      "package": "quiet-13",
+      "path": "dependency.txt",
+      "status": "applied"
+    },
+    {
+      "bump": "patch",
+      "current": "1.0.0",
+      "latest": "1.0.1",
+      "package": "quiet-14",
+      "path": "dependency.txt",
+      "status": "applied"
+    },
+    {
+      "bump": "patch",
+      "current": "1.0.0",
+      "latest": "1.0.1",
+      "package": "quiet-15",
+      "path": "dependency.txt",
+      "status": "applied"
+    },
+    {
+      "bump": "patch",
+      "current": "1.0.0",
+      "latest": "1.0.1",
+      "package": "quiet-16",
+      "path": "dependency.txt",
+      "status": "applied"
+    },
+    {
+      "bump": "patch",
+      "current": "1.0.0",
+      "latest": "1.0.1",
+      "package": "quiet-17",
+      "path": "dependency.txt",
+      "status": "applied"
+    },
+    {
+      "bump": "patch",
+      "current": "1.0.0",
+      "latest": "1.0.1",
+      "package": "quiet-18",
+      "path": "dependency.txt",
+      "status": "applied"
+    },
+    {
+      "bump": "patch",
+      "current": "1.0.0",
+      "latest": "1.0.1",
+      "package": "quiet-19",
+      "path": "dependency.txt",
+      "status": "applied"
+    },
+    {
+      "bump": "patch",
+      "current": "1.0.0",
+      "latest": "1.0.1",
+      "package": "quiet-20",
+      "path": "dependency.txt",
+      "status": "applied"
+    },
+    {
+      "bump": "patch",
+      "current": "1.0.0",
+      "latest": "1.0.1",
+      "package": "quiet-21",
+      "path": "dependency.txt",
+      "status": "applied"
+    },
+    {
+      "bump": "patch",
+      "current": "1.0.0",
+      "latest": "1.0.1",
+      "package": "quiet-22",
+      "path": "dependency.txt",
+      "status": "applied"
+    },
+    {
+      "bump": "patch",
+      "current": "1.0.0",
+      "latest": "1.0.1",
+      "package": "quiet-23",
+      "path": "dependency.txt",
+      "status": "applied"
+    },
+    {
+      "bump": "patch",
+      "current": "1.0.0",
+      "latest": "1.0.1",
+      "package": "quiet-24",
+      "path": "dependency.txt",
+      "status": "applied"
+    },
+    {
+      "bump": "minor",
+      "current": "1.0.0",
+      "latest": "1.1.0",
+      "package": "review-00",
+      "path": "dependency.txt",
+      "status": "applied"
+    },
+    {
+      "bump": "minor",
+      "current": "1.0.0",
+      "latest": "1.1.0",
+      "package": "review-01",
+      "path": "dependency.txt",
+      "status": "applied"
+    },
+    {
+      "bump": "minor",
+      "current": "1.0.0",
+      "latest": "1.1.0",
+      "package": "review-02",
+      "path": "dependency.txt",
+      "status": "applied"
+    },
+    {
+      "bump": "minor",
+      "current": "1.0.0",
+      "latest": "1.1.0",
+      "package": "review-03",
+      "path": "dependency.txt",
+      "status": "applied"
+    },
+    {
+      "bump": "minor",
+      "current": "1.0.0",
+      "latest": "1.1.0",
+      "package": "review-04",
+      "path": "dependency.txt",
+      "status": "applied"
+    },
+    {
+      "bump": "minor",
+      "current": "1.0.0",
+      "latest": "1.1.0",
+      "package": "review-05",
+      "path": "dependency.txt",
+      "status": "applied"
+    },
+    {
+      "bump": "minor",
+      "current": "1.0.0",
+      "latest": "1.1.0",
+      "package": "review-06",
+      "path": "dependency.txt",
+      "status": "applied"
+    },
+    {
+      "bump": "minor",
+      "current": "1.0.0",
+      "latest": "1.1.0",
+      "package": "review-07",
+      "path": "dependency.txt",
+      "status": "applied"
+    },
+    {
+      "bump": "minor",
+      "current": "1.0.0",
+      "latest": "1.1.0",
+      "package": "review-08",
+      "path": "dependency.txt",
+      "status": "applied"
+    },
+    {
+      "bump": "minor",
+      "current": "1.0.0",
+      "latest": "1.1.0",
+      "package": "review-09",
+      "path": "dependency.txt",
+      "status": "applied"
+    },
+    {
+      "bump": "minor",
+      "current": "1.0.0",
+      "latest": "1.1.0",
+      "package": "review-10",
+      "path": "dependency.txt",
+      "status": "applied"
+    },
+    {
+      "bump": "minor",
+      "current": "1.0.0",
+      "latest": "1.1.0",
+      "package": "review-11",
+      "path": "dependency.txt",
+      "status": "applied"
+    },
+    {
+      "bump": "minor",
+      "current": "1.0.0",
+      "latest": "1.1.0",
+      "package": "review-12",
+      "path": "dependency.txt",
+      "status": "applied"
+    },
+    {
+      "bump": "minor",
+      "current": "1.0.0",
+      "latest": "1.1.0",
+      "package": "review-13",
+      "path": "dependency.txt",
+      "status": "applied"
+    },
+    {
+      "bump": "minor",
+      "current": "1.0.0",
+      "latest": "1.1.0",
+      "package": "review-14",
+      "path": "dependency.txt",
+      "status": "applied"
+    }
+  ],
+  "validation": {
+    "proposal_integrity_passed": true,
+    "repository_command_configured": false
+  }
+}

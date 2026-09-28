@@ -1,0 +1,19 @@
+{
+  "command": "update",
+  "mode": "applied",
+  "files": [
+    {
+      "path": "dependency.txt",
+      "file_type": "test",
+      "lang": "test",
+      "updates": [{"package": "bad|pkg</code>", "current": "1.0.0`", "latest": "1.1.0", "bump": "minor", "status": "applied"}],
+      "annotations": [{"package": "annotated", "version": "2.0.0"}],
+      "held_back": [{"package": "fresh_pkg", "current": "1.0.0", "chosen": "1.0.1", "skipped_latest": "1.1.0"}],
+      "capped": [{"package": "major_pkg", "current": "1.0.0", "available": "2.0.0"}],
+      "skipped": [{"package": "blocked<script>", "current": "3.0.0", "status": "blocked", "reason": "missing-version-comment", "message": "Add *trusted* metadata | before updating ‮this pin"}],
+      "errors": [],
+      "warnings": []
+    }
+  ],
+  "summary": {"files_scanned": 1, "files_with_changes": 1, "updates_total": 1, "errors": 0, "warnings": 2, "not_examined": 1}
+}

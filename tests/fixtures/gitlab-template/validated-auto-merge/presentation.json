@@ -1,0 +1,57 @@
+{
+  "annotations": [],
+  "auto_merge_requested": true,
+  "blocked": [],
+  "changed": true,
+  "changed_paths": [
+    "dependency.txt"
+  ],
+  "counts": {
+    "annotations": 0,
+    "blocked": 0,
+    "files_changed": 1,
+    "normalized": 0,
+    "not_examined": 0,
+    "policy_holds": 0,
+    "updates": 2,
+    "updates_major": 0,
+    "updates_minor": 1,
+    "updates_patch": 1,
+    "updates_quiet": 1,
+    "updates_review_worthy": 1,
+    "updates_revision": 0,
+    "warnings": 0
+  },
+  "normalized": [],
+  "policy": {
+    "lockfile_regeneration": true,
+    "max_bump": "repository configuration",
+    "min_age": "repository configuration"
+  },
+  "policy_holds": [],
+  "schema": 1,
+  "state": "ready",
+  "title": "chore(deps): refresh 2 dependencies",
+  "updates": [
+    {
+      "bump": "minor",
+      "current": "1.0.200",
+      "latest": "1.1.0",
+      "package": "serde",
+      "path": "dependency.txt",
+      "status": "applied"
+    },
+    {
+      "bump": "patch",
+      "current": "1.40.0",
+      "latest": "1.40.1",
+      "package": "tokio",
+      "path": "dependency.txt",
+      "status": "applied"
+    }
+  ],
+  "validation": {
+    "proposal_integrity_passed": true,
+    "repository_command_configured": true
+  }
+}
