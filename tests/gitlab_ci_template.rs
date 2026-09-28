@@ -1311,6 +1311,84 @@ async fn template_refuses_duplicate_merge_requests_when_cleaning_up() {
     assert!(only_reads(&server.received_requests().await.unwrap()));
 }
 
+/// Answers the open merge-request lookup after pushing a human commit to the
+/// rolling branch, standing in for a maintainer who pushes while a run is
+/// deciding what to clean up.
+struct PushWhileListing {
+    remote: PathBuf,
+    racer: PathBuf,
+    response: serde_json::Value,
+}
+
+impl wiremock::Respond for PushWhileListing {
+    fn respond(&self, _: &wiremock::Request) -> ResponseTemplate {
+        git(
+            self.remote.parent().unwrap(),
+            &[
+                "clone",
+                "--quiet",
+                "--branch",
+                BRANCH,
+                self.remote.to_str().unwrap(),
+                self.racer.to_str().unwrap(),
+            ],
+        );
+        fs::write(self.racer.join("human-fix.txt"), "keep me\n").unwrap();
+        git(&self.racer, &["add", "human-fix.txt"]);
+        git(
+            &self.racer,
+            &[
+                "-c",
+                "user.name=Human Maintainer",
+                "-c",
+                "user.email=human@example.com",
+                "commit",
+                "--quiet",
+                "-m",
+                "fix: adapt to update",
+            ],
+        );
+        git(&self.racer, &["push", "--quiet", "origin", "HEAD"]);
+        ResponseTemplate::new(200).set_body_json(self.response.clone())
+    }
+}
+
+#[tokio::test]
+async fn cleanup_leaves_the_merge_request_open_when_a_human_pushes_first() {
+    let fixture = Fixture::new();
+    create_rolling_branch(&fixture, "new").await;
+    let racer = fixture._temp.path().join("racer");
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/v4/projects/1/merge_requests"))
+        .respond_with(PushWhileListing {
+            remote: fixture.remote.clone(),
+            racer: racer.clone(),
+            response: mr_list_response(7, false),
+        })
+        .mount(&server)
+        .await;
+
+    let output = fixture.execute(
+        &server,
+        &Run {
+            change: false,
+            ..Run::default()
+        },
+    );
+
+    assert!(failed_with(&output, 5), "{}", describe(&output));
+    let human_tip = String::from_utf8(git(&racer, &["rev-parse", "HEAD"]).stdout)
+        .unwrap()
+        .trim()
+        .to_string();
+    assert_eq!(fixture.remote_tip(), Some(human_tip));
+    assert!(
+        only_reads(&server.received_requests().await.unwrap()),
+        "the merge request carrying the human commit must stay open"
+    );
+}
+
 async fn assert_cancels_previous_auto_merge(existing: serde_json::Value) {
     let fixture = Fixture::new();
     create_rolling_branch(&fixture, "first").await;

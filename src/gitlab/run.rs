@@ -583,16 +583,10 @@ async fn close_obsolete(
     url: &str,
     expected_remote_sha: &str,
 ) -> Result<Outcome, Error> {
+    // The lease-protected delete runs before the close: a human commit pushed
+    // after the ownership check fails the lease, and the merge request that
+    // carries it stays open.
     let existing = single_open_merge_request(api, settings).await?;
-    let merge_request = match existing {
-        Some(merge_request) => {
-            api.edit(merge_request.iid, json!({"state_event": "close"}))
-                .await?;
-            eprintln!("Closed obsolete merge request: {}", merge_request.web_url);
-            Some(merge_request.web_url)
-        }
-        None => None,
-    };
     let branch_deleted = !expected_remote_sha.is_empty();
     if branch_deleted {
         if let Push::Stale(detail) = git
@@ -603,6 +597,15 @@ async fn close_obsolete(
         }
         eprintln!("Removed obsolete automation branch: {}", settings.branch);
     }
+    let merge_request = match existing {
+        Some(merge_request) => {
+            api.edit(merge_request.iid, json!({"state_event": "close"}))
+                .await?;
+            eprintln!("Closed obsolete merge request: {}", merge_request.web_url);
+            Some(merge_request.web_url)
+        }
+        None => None,
+    };
     if merge_request.is_none() && !branch_deleted {
         return Ok(Outcome::Clean);
     }

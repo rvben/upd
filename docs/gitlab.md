@@ -144,8 +144,9 @@ The template:
 - fails if preparation or validation leaves unexpected repository changes;
 - retains the machine-readable update report as a one-week CI artifact;
 - creates or updates one automation-owned merge request; and
-- closes the obsolete merge request and lease-deletes its branch when no eligible
-  updates remain.
+- lease-deletes the obsolete branch and then closes its merge request when no
+  eligible updates remain, so a commit pushed during the run keeps the merge
+  request open.
 
 The pause check runs before both branch replacement and no-update cleanup. If
 someone needs to adapt an update, they can commit to the automation branch;
