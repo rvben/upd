@@ -1,0 +1,54 @@
+{
+  "annotations": [
+    {
+      "package": "actions/checkout",
+      "path": ".github/workflows/ci.yml",
+      "version": "v5.0.0"
+    }
+  ],
+  "auto_merge_requested": false,
+  "blocked": [],
+  "changed": true,
+  "changed_paths": [
+    ".github/workflows/ci.yml"
+  ],
+  "counts": {
+    "annotations": 1,
+    "blocked": 0,
+    "files_changed": 1,
+    "normalized": 0,
+    "not_examined": 0,
+    "policy_holds": 1,
+    "updates": 0,
+    "updates_major": 0,
+    "updates_minor": 0,
+    "updates_patch": 0,
+    "updates_quiet": 0,
+    "updates_review_worthy": 0,
+    "updates_revision": 0,
+    "warnings": 0
+  },
+  "normalized": [],
+  "policy": {
+    "lockfile_regeneration": false,
+    "max_bump": "minor",
+    "min_age": "7d"
+  },
+  "policy_holds": [
+    {
+      "available": "v7.0.1",
+      "kind": "bump ceiling",
+      "package": "actions/checkout",
+      "path": ".github/workflows/ci.yml",
+      "selected": "v5.0.0"
+    }
+  ],
+  "schema": 1,
+  "state": "ready",
+  "title": "ci(deps): annotate dependency metadata",
+  "updates": [],
+  "validation": {
+    "proposal_integrity_passed": true,
+    "repository_command_configured": false
+  }
+}

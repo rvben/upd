@@ -581,10 +581,11 @@ spec:
           else "\(.changed_paths[:3] | map(code) | join(", ")) and \(.counts.files_changed - 3) more"
           end;
         def result_summary:
-          ([(if .counts.updates > 0 then "\(.counts.updates) dependency \(plural(.counts.updates; "update"; "updates"))" else empty end),
-            (if .counts.normalized > 0 then "\(.counts.normalized) normalized \(plural(.counts.normalized; "specifier"; "specifiers"))" else empty end)]
-           | if length > 0 then join(" and ")
-             else "\(.counts.annotations) dependency metadata \(plural(.counts.annotations; "annotation"; "annotations"))" end);
+          .counts as $counts
+          | [(if $counts.updates > 0 then "\($counts.updates) dependency \(plural($counts.updates; "update"; "updates"))" else empty end),
+             (if $counts.normalized > 0 then "\($counts.normalized) normalized \(plural($counts.normalized; "specifier"; "specifiers"))" else empty end)]
+          | if length > 0 then join(" and ")
+            else "\($counts.annotations) dependency metadata \(plural($counts.annotations; "annotation"; "annotations"))" end;
         def review_updates: [.updates[] | select((.bump | ascii_downcase) != "patch")];
         def quiet_updates: [.updates[] | select((.bump | ascii_downcase) == "patch")];
         def validation_phrase:

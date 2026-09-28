@@ -1,0 +1,47 @@
+{
+  "command": "update",
+  "files": [
+    {
+      "annotations": [
+        {
+          "commit": "08c6903cd8c0fde910a37f88322edcfb5dd907a8",
+          "line": 7,
+          "package": "actions/checkout",
+          "version": "v5.0.0"
+        }
+      ],
+      "capped": [
+        {
+          "available": "v7.0.1",
+          "bump": "major",
+          "current": "v5.0.0",
+          "line": 7,
+          "package": "actions/checkout"
+        }
+      ],
+      "errors": [],
+      "file_type": "github_actions",
+      "ignored": [],
+      "lang": "actions",
+      "path": ".github/workflows/ci.yml",
+      "pinned": [],
+      "updates": [],
+      "warnings": []
+    }
+  ],
+  "mode": "applied",
+  "summary": {
+    "annotations": 1,
+    "capped": 1,
+    "errors": 0,
+    "files_scanned": 1,
+    "files_with_changes": 1,
+    "ignored": 0,
+    "pinned": 0,
+    "updates_major": 0,
+    "updates_minor": 0,
+    "updates_patch": 0,
+    "updates_total": 0,
+    "warnings": 0
+  }
+}

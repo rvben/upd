@@ -948,6 +948,52 @@ async fn golden_patch_only_update() {
 }
 
 #[tokio::test]
+async fn golden_annotations_only() {
+    let report = golden_report("annotations-only");
+    assert_rendering_matches_golden(
+        "annotations-only",
+        Run {
+            report,
+            file: ".github/workflows/ci.yml".to_string(),
+            ..Run::default()
+        },
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn template_publishes_an_annotation_only_change() {
+    let server = MockServer::start().await;
+    let fixture = Fixture::new();
+    list_mock(json!([])).mount(&server).await;
+    Mock::given(method("POST"))
+        .and(path("/api/v4/projects/1/merge_requests"))
+        .respond_with(ResponseTemplate::new(201).set_body_json(mr_response(7, false)))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    fixture.run(
+        &server,
+        &Run {
+            report: golden_report("annotations-only"),
+            file: ".github/workflows/ci.yml".to_string(),
+            ..Run::default()
+        },
+    );
+
+    assert_eq!(
+        fixture.presentation()["title"],
+        "ci(deps): annotate dependency metadata"
+    );
+    assert!(
+        fixture
+            .description()
+            .contains("upd prepared 1 dependency metadata annotation across 1 file")
+    );
+}
+
+#[tokio::test]
 async fn golden_workflow_only_change_uses_the_ci_prefix() {
     let report = golden_report("workflow-only");
     assert_rendering_matches_golden(
