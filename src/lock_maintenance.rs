@@ -226,7 +226,7 @@ fn refresh_one(path: &Path, cli: &Cli) -> Result<Entry> {
             .unwrap_or_default(),
     };
     if !config
-        .selected_ecosystems(&cli.langs)
+        .selected_ecosystems(&cli.langs, &cli.exclude_langs)
         .map_err(anyhow::Error::msg)?
         .is_none_or(|selected| selected.contains(&kind.lang()))
     {

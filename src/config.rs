@@ -276,10 +276,12 @@ impl UpdConfig {
     }
 
     /// An absent selection means all ecosystems; an explicitly empty selection
-    /// means none. CLI selections replace both configured lists.
+    /// means none. CLI selections replace both configured lists; `excluded`
+    /// then removes ecosystems from whatever was selected.
     pub fn selected_ecosystems(
         &self,
         cli: &[crate::updater::Lang],
+        excluded: &[crate::updater::Lang],
     ) -> Result<Option<Vec<crate::updater::Lang>>, String> {
         use crate::updater::Lang;
         use clap::ValueEnum;
@@ -290,14 +292,19 @@ impl UpdConfig {
         };
         let enabled = parse(&self.ecosystems.enable)?;
         let disabled = parse(&self.ecosystems.disable)?.unwrap_or_default();
-        if !cli.is_empty() {
-            return Ok(Some(cli.to_vec()));
-        }
-        if enabled.is_none() && self.ecosystems.disable.is_none() {
-            return Ok(None);
-        }
-        let mut selected = enabled.unwrap_or_else(|| Lang::value_variants().to_vec());
-        selected.retain(|lang| !disabled.contains(lang));
+        let mut selected = if !cli.is_empty() {
+            cli.to_vec()
+        } else if enabled.is_none() && self.ecosystems.disable.is_none() {
+            if excluded.is_empty() {
+                return Ok(None);
+            }
+            Lang::value_variants().to_vec()
+        } else {
+            let mut selected = enabled.unwrap_or_else(|| Lang::value_variants().to_vec());
+            selected.retain(|lang| !disabled.contains(lang));
+            selected
+        };
+        selected.retain(|lang| !excluded.contains(lang));
         selected.dedup();
         Ok(Some(selected))
     }
@@ -470,7 +477,7 @@ impl UpdConfig {
             .try_into()
             .map_err(|e| format!("Invalid TOML in config file {}:\n  {}", source_label, e))?;
 
-        config.selected_ecosystems(&[])?;
+        config.selected_ecosystems(&[], &[])?;
         Ok((config, warnings))
     }
 
@@ -2389,11 +2396,11 @@ mod policy_tests {
         let (config, warnings) = UpdConfig::parse_with_warnings("[ecosystems]\nenable = ['python', 'rust']\ndisable = ['rust']\n[update.pyproject]\nexact-pins = false", "test").unwrap();
         assert!(warnings.is_empty());
         assert_eq!(
-            config.selected_ecosystems(&[]).unwrap(),
+            config.selected_ecosystems(&[], &[]).unwrap(),
             Some(vec![Lang::Python])
         );
         assert_eq!(
-            config.selected_ecosystems(&[Lang::Rust]).unwrap(),
+            config.selected_ecosystems(&[Lang::Rust], &[]).unwrap(),
             Some(vec![Lang::Rust])
         );
         assert!(!config.update_exact_pins());
@@ -2410,8 +2417,47 @@ mod policy_tests {
             );
         }
         let (none, _) = UpdConfig::parse_with_warnings("[ecosystems]\nenable=[]", "test").unwrap();
-        assert_eq!(none.selected_ecosystems(&[]).unwrap(), Some(vec![]));
-        assert_eq!(UpdConfig::default().selected_ecosystems(&[]).unwrap(), None);
+        assert_eq!(none.selected_ecosystems(&[], &[]).unwrap(), Some(vec![]));
+        assert_eq!(
+            UpdConfig::default().selected_ecosystems(&[], &[]).unwrap(),
+            None
+        );
+    }
+    #[test]
+    fn exclusions_apply_after_every_other_selection() {
+        use clap::ValueEnum;
+        let all_but_nix: Vec<Lang> = Lang::value_variants()
+            .iter()
+            .copied()
+            .filter(|lang| *lang != Lang::Nix)
+            .collect();
+        assert_eq!(
+            UpdConfig::default()
+                .selected_ecosystems(&[], &[Lang::Nix])
+                .unwrap(),
+            Some(all_but_nix)
+        );
+        let (config, _) = UpdConfig::parse_with_warnings(
+            "[ecosystems]\nenable = ['python', 'nix', 'rust']\ndisable = ['rust']",
+            "test",
+        )
+        .unwrap();
+        assert_eq!(
+            config.selected_ecosystems(&[], &[Lang::Nix]).unwrap(),
+            Some(vec![Lang::Python])
+        );
+        assert_eq!(
+            config
+                .selected_ecosystems(&[Lang::Nix, Lang::Go], &[Lang::Nix])
+                .unwrap(),
+            Some(vec![Lang::Go])
+        );
+        assert_eq!(
+            config
+                .selected_ecosystems(&[Lang::Nix], &[Lang::Nix])
+                .unwrap(),
+            Some(vec![])
+        );
     }
     #[test]
     fn child_config_only_overrides_explicit_values() {
@@ -2427,7 +2473,7 @@ mod policy_tests {
             .0,
         );
         assert!(parent.update_exact_pins());
-        assert_eq!(parent.selected_ecosystems(&[]).unwrap(), Some(vec![]));
+        assert_eq!(parent.selected_ecosystems(&[], &[]).unwrap(), Some(vec![]));
         assert_eq!(parent.ecosystems.disable.unwrap(), ["rust"]);
     }
 }

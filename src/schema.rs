@@ -72,6 +72,12 @@ fn build_schema() -> Value {
                 "enum": ["python", "node", "rust", "go", "ruby", "dotnet", "gradle", "actions", "pre-commit", "mise", "terraform", "docker", "nix", "github-releases", "annotated"]
             },
             {
+                "name": "exclude-lang",
+                "description": "Leave ecosystems out after --lang and the [ecosystems] configuration, annotated lines included (repeatable or comma-separated)",
+                "type": "string[]",
+                "enum": ["python", "node", "rust", "go", "ruby", "dotnet", "gradle", "actions", "pre-commit", "mise", "terraform", "docker", "nix", "github-releases", "annotated"]
+            },
+            {
                 "name": "limit",
                 "description": "Limit output to N items",
                 "type": "integer"
@@ -679,15 +685,6 @@ mod tests {
         use clap::ValueEnum;
 
         let s = build_schema();
-        let arg = find_global_arg(&s, "lang");
-        let mut values: Vec<String> = arg["enum"]
-            .as_array()
-            .expect("--lang must have an enum of valid ecosystems")
-            .iter()
-            .filter_map(|v| v.as_str().map(str::to_string))
-            .collect();
-        values.sort();
-
         let mut expected: Vec<String> = Lang::value_variants()
             .iter()
             .map(|lang| {
@@ -699,10 +696,20 @@ mod tests {
             .collect();
         expected.sort();
 
-        assert_eq!(
-            values, expected,
-            "the --lang enum in the schema must list exactly the Lang variants clap accepts"
-        );
+        for flag in ["lang", "exclude-lang"] {
+            let arg = find_global_arg(&s, flag);
+            let mut values: Vec<String> = arg["enum"]
+                .as_array()
+                .unwrap_or_else(|| panic!("--{flag} must have an enum of valid ecosystems"))
+                .iter()
+                .filter_map(|v| v.as_str().map(str::to_string))
+                .collect();
+            values.sort();
+            assert_eq!(
+                values, expected,
+                "the --{flag} enum in the schema must list exactly the Lang variants clap accepts"
+            );
+        }
     }
 
     #[test]

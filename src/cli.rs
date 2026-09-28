@@ -166,6 +166,21 @@ pub struct Cli {
     )]
     pub langs: Vec<Lang>,
 
+    /// Leave ecosystems out after every other selection (repeatable, or
+    /// comma-separated).
+    ///
+    /// Applied after `--lang` and the `[ecosystems]` configuration, and to
+    /// annotated lines as well as files, so an excluded ecosystem is never
+    /// updated whatever else selects it. Organization automation uses it to
+    /// keep `nix flake update` out of a job that holds a group-wide token.
+    #[arg(
+        long = "exclude-lang",
+        value_name = "LANG",
+        global = true,
+        value_delimiter = ','
+    )]
+    pub exclude_langs: Vec<Lang>,
+
     /// Exit with code 1 if updates are available, without writing any changes.
     ///
     /// Intended for CI pipelines that should fail when dependencies are outdated.

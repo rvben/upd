@@ -1795,27 +1795,46 @@ fn effective_json_mode(cli: &Cli) -> bool {
 
 fn with_ecosystem_config(cli: &Cli, config: &UpdConfig) -> Result<(Cli, bool)> {
     let selection = config
-        .selected_ecosystems(&cli.langs)
+        .selected_ecosystems(&cli.langs, &cli.exclude_langs)
         .map_err(anyhow::Error::msg)?;
     let none_enabled = selection.as_ref().is_some_and(Vec::is_empty);
     let mut resolved = cli.clone();
-    if cli.langs.is_empty() && selection.is_some() {
+    // `annotated` in a selection admits every annotation source, so a
+    // configured denylist or an exclusion is applied to the sources here.
+    // A CLI selection alone needs no resolution: it replaces the denylist.
+    if let Some(selection) = selection
+        .as_ref()
+        .filter(|_| cli.langs.is_empty() || !cli.exclude_langs.is_empty())
+    {
         use clap::ValueEnum;
-        let mut sources = selection.clone().unwrap();
+        let mut sources = selection.clone();
         if sources.contains(&Lang::Annotated) {
             sources = Lang::value_variants().to_vec();
         }
-        let disabled: Vec<_> = config
-            .ecosystems
-            .disable
-            .as_deref()
-            .unwrap_or_default()
-            .iter()
-            .map(|name| {
-                <Lang as ValueEnum>::from_str(name, false).expect("config already validated")
-            })
-            .collect();
-        sources.retain(|lang| *lang != Lang::Annotated && !disabled.contains(lang));
+        let disabled: Vec<_> = if cli.langs.is_empty() {
+            config
+                .ecosystems
+                .disable
+                .as_deref()
+                .unwrap_or_default()
+                .iter()
+                .map(|name| {
+                    <Lang as ValueEnum>::from_str(name, false).expect("config already validated")
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+        // Excluding `annotated` itself leaves every annotated line alone,
+        // whatever its source.
+        if cli.exclude_langs.contains(&Lang::Annotated) {
+            sources.clear();
+        }
+        sources.retain(|lang| {
+            *lang != Lang::Annotated
+                && !disabled.contains(lang)
+                && !cli.exclude_langs.contains(lang)
+        });
         resolved.annotation_langs = Some(sources);
     }
     resolved.langs = selection.unwrap_or_default();

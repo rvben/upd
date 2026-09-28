@@ -95,6 +95,13 @@ An omitted `enable` includes all ecosystems; `enable = []` includes none.
 replaces both lists for that invocation. Names are exactly those accepted by
 `--lang`; unknown names and misspelled table fields are errors.
 
+`--exclude-lang` removes ecosystems after all of that: after `--lang`, after
+both lists, and from annotated lines as well as files, so an excluded ecosystem
+is never updated whatever else selects it; `--exclude-lang annotated` leaves
+every annotated line alone. The configured `disable` list stays
+in force alongside it. Organization automation passes `--exclude-lang nix` so
+`nix flake update` never runs in a job holding a group-wide token.
+
 This is a root discovery policy, like `include`/`exclude`, shared by update,
 interactive update, alignment, audit, and their associated lockfile handling.
 Nested configuration does not re-enable files excluded by root discovery.

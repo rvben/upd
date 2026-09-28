@@ -450,6 +450,50 @@ async fn ecosystem_denylist_wins_over_the_annotated_wildcard() {
 }
 
 #[tokio::test]
+async fn an_excluded_ecosystem_stays_out_whatever_else_selects_it() {
+    let server = MockServer::start().await;
+    serve(&server, "demo", json!([{"filename":"demo-1.5.tar.gz"}])).await;
+    let dir = tempfile::tempdir().unwrap();
+    write(&dir, "versions.mk", "VERSION := 1.0  # upd: pypi demo\n");
+    write(&dir, "upd.toml", "include = ['versions.mk']\n");
+    for args in [
+        &["--check"][..],
+        &["--check", "--exclude-lang", "nix"],
+        &["--check", "--lang", "annotated", "--exclude-lang", "nix"],
+    ] {
+        let result = report(&run(&dir, &server, args), 1);
+        assert_eq!(result["summary"]["updates_total"], 1, "{args:?}: {result}");
+    }
+    for args in [
+        &["--check", "--exclude-lang", "python"][..],
+        &["--check", "--exclude-lang", "annotated"],
+        &["--check", "--lang", "annotated", "--exclude-lang", "python"],
+        &[
+            "--check",
+            "--lang",
+            "python,annotated",
+            "--exclude-lang",
+            "python",
+        ],
+    ] {
+        let result = report(&run(&dir, &server, args), 0);
+        assert_eq!(result["summary"]["updates_total"], 0, "{args:?}: {result}");
+    }
+
+    // An exclusion of something else keeps the configured denylist in force.
+    write(
+        &dir,
+        "upd.toml",
+        "include = ['versions.mk']\n[ecosystems]\nenable = ['annotated']\ndisable = ['python']\n",
+    );
+    let result = report(
+        &run(&dir, &server, &["--check", "--exclude-lang", "nix"]),
+        0,
+    );
+    assert_eq!(result["summary"]["updates_total"], 0, "{result}");
+}
+
+#[tokio::test]
 async fn empty_ecosystem_selection_also_applies_to_align_and_audit() {
     let server = MockServer::start().await;
     let dir = tempfile::tempdir().unwrap();
