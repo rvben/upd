@@ -47,14 +47,16 @@ pub struct Settings {
     pub validation_command: String,
     /// The updater to run; this executable unless `UPD_EXECUTABLE` names one.
     pub updater: PathBuf,
+    /// Report what the run would do without pushing or writing to GitLab.
+    pub dry_run: bool,
 }
 
 impl Settings {
-    pub fn from_env() -> Result<Self, Error> {
-        Self::from_lookup(|name| env::var(name).ok())
+    pub fn from_env(dry_run: bool) -> Result<Self, Error> {
+        Self::from_lookup(|name| env::var(name).ok(), dry_run)
     }
 
-    fn from_lookup(lookup: impl Fn(&str) -> Option<String>) -> Result<Self, Error> {
+    fn from_lookup(lookup: impl Fn(&str) -> Option<String>, dry_run: bool) -> Result<Self, Error> {
         let required = |name: &str, hint: &str| {
             lookup(name)
                 .filter(|value| !value.is_empty())
@@ -107,6 +109,7 @@ impl Settings {
             prepare_command: optional("UPD_PREPARE_COMMAND", ""),
             validation_command: optional("UPD_VALIDATION_COMMAND", ""),
             updater,
+            dry_run,
         };
         if settings.project_id.contains('/') {
             return Err(Error::Input(
@@ -157,6 +160,16 @@ pub enum Outcome {
         merge_request: String,
         notice_added: bool,
     },
+    /// Dry run: an update is ready and would be published under `title`.
+    WouldPublish { title: String },
+    /// Dry run: nothing to propose; the obsolete merge request and/or branch
+    /// would be removed.
+    WouldClose {
+        merge_request: Option<String>,
+        delete_branch: bool,
+    },
+    /// Dry run: the branch holds commits automation did not write.
+    WouldPause,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -221,6 +234,28 @@ impl Outcome {
                     "notice already on"
                 }
             ),
+            Self::WouldPublish { title } => {
+                format!("Dry run: would publish \"{title}\" on {branch}.")
+            }
+            Self::WouldClose {
+                merge_request,
+                delete_branch,
+            } => {
+                let mut actions = Vec::new();
+                if let Some(url) = merge_request {
+                    actions.push(format!("close {url}"));
+                }
+                if *delete_branch {
+                    actions.push(format!("remove {branch}"));
+                }
+                format!(
+                    "Dry run: no dependency updates within policy; would {}.",
+                    actions.join(" and ")
+                )
+            }
+            Self::WouldPause => format!(
+                "Dry run: would pause; {branch} holds commits outside the generated upd commit."
+            ),
         }
     }
 }
@@ -261,6 +296,9 @@ pub async fn run(settings: &Settings) -> Result<Outcome, Error> {
     if !expected_remote_sha.is_empty()
         && !branch_is_owned(&git, settings, &default_ref, &expected_remote_sha).await?
     {
+        if settings.dry_run {
+            return Ok(Outcome::WouldPause);
+        }
         return pause(&api, settings).await;
     }
 
@@ -336,6 +374,14 @@ pub async fn run(settings: &Settings) -> Result<Outcome, Error> {
         "upd-presentation.json",
         &presentation.to_artifact(),
     )?;
+    let title = if settings.mr_title.is_empty() {
+        presentation.title.clone()
+    } else {
+        settings.mr_title.clone()
+    };
+    if settings.dry_run {
+        return Ok(Outcome::WouldPublish { title });
+    }
 
     git.commit(
         &settings.commit_message,
@@ -352,11 +398,6 @@ pub async fn run(settings: &Settings) -> Result<Outcome, Error> {
     }
 
     let existing = single_open_merge_request(&api, settings).await?;
-    let title = if settings.mr_title.is_empty() {
-        presentation.title.clone()
-    } else {
-        settings.mr_title.clone()
-    };
     let description = presentation.description();
     write_artifact(settings, "upd-mr-description.md", &description)?;
 
@@ -588,6 +629,16 @@ async fn close_obsolete(
     // carries it stays open.
     let existing = single_open_merge_request(api, settings).await?;
     let branch_deleted = !expected_remote_sha.is_empty();
+    if settings.dry_run {
+        return Ok(if existing.is_none() && !branch_deleted {
+            Outcome::Clean
+        } else {
+            Outcome::WouldClose {
+                merge_request: existing.map(|merge_request| merge_request.web_url),
+                delete_branch: branch_deleted,
+            }
+        });
+    }
     if branch_deleted {
         if let Push::Stale(detail) = git
             .push_with_lease(url, &settings.branch, expected_remote_sha, "")
@@ -661,7 +712,7 @@ mod tests {
             ("UPD_EXECUTABLE", "/usr/local/bin/upd"),
         ]);
         vars.extend(overrides.iter().copied());
-        Settings::from_lookup(|name| vars.get(name).map(|value| value.to_string()))
+        Settings::from_lookup(|name| vars.get(name).map(|value| value.to_string()), false)
     }
 
     #[test]

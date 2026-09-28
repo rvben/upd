@@ -318,7 +318,7 @@ fn build_schema() -> Value {
             },
             {
                 "name": "gitlab run",
-                "description": "Run one GitLab CI dependency update for the current project: update dependencies on the rolling automation branch, push it with a lease, and create, refresh or close its merge request. Configured by the GitLab CI job environment: requires UPD_GITLAB_TOKEN, CI_API_V4_URL, CI_DEFAULT_BRANCH, CI_PROJECT_DIR, CI_PROJECT_ID, CI_PROJECT_PATH and CI_SERVER_URL; reads UPD_BRANCH, UPD_PATHS, UPD_LANGS, UPD_PACKAGES, UPD_MIN_AGE, UPD_MAX_BUMP, UPD_LOCK, UPD_PREPARE_COMMAND, UPD_VALIDATION_COMMAND, UPD_COMMIT_MESSAGE, UPD_MR_TITLE, UPD_GIT_NAME, UPD_GIT_EMAIL and UPD_AUTO_MERGE. The token is passed only to upd's own git and API calls, never to the prepare command, the validation command or the updater. Progress goes to stderr",
+                "description": "Run one GitLab CI dependency update for the current project: update dependencies on the rolling automation branch, push it with a lease, and create, refresh or close its merge request. Configured by the GitLab CI job environment: requires UPD_GITLAB_TOKEN, CI_API_V4_URL, CI_DEFAULT_BRANCH, CI_PROJECT_DIR, CI_PROJECT_ID, CI_PROJECT_PATH and CI_SERVER_URL; reads UPD_BRANCH, UPD_PATHS, UPD_LANGS, UPD_PACKAGES, UPD_MIN_AGE, UPD_MAX_BUMP, UPD_LOCK, UPD_PREPARE_COMMAND, UPD_VALIDATION_COMMAND, UPD_COMMIT_MESSAGE, UPD_MR_TITLE, UPD_GIT_NAME, UPD_GIT_EMAIL and UPD_AUTO_MERGE. The token is passed only to upd's own git and API calls, never to the prepare command, the validation command or the updater. With --dry-run the update and its checks still run, but nothing is pushed and nothing is written to GitLab; the outcome names what would have happened. Progress goes to stderr",
                 "effects": "non_idempotent",
                 "mutating": true,
                 "cardinality": "single",
@@ -326,13 +326,15 @@ fn build_schema() -> Value {
                 "output_fields": [
                     {"name": "command", "type": "string", "description": "Always \"gitlab run\""},
                     {"name": "branch", "type": "string", "description": "The rolling automation branch"},
-                    {"name": "outcome", "type": "string", "description": "\"clean\" (nothing to propose or clean up), \"closed\" (nothing to propose; the obsolete merge request and/or branch was removed), \"published\" (the update was pushed and its merge request created or refreshed) or \"paused\" (the branch holds commits automation did not write and was left untouched)"},
-                    {"name": "merge_request", "type": "string", "description": "Web URL of the merge request; present for published and paused, and for closed when one was closed (null otherwise)"},
+                    {"name": "outcome", "type": "string", "description": "\"clean\" (nothing to propose or clean up), \"closed\" (nothing to propose; the obsolete merge request and/or branch was removed), \"published\" (the update was pushed and its merge request created or refreshed), \"paused\" (the branch holds commits automation did not write and was left untouched), or under --dry-run \"would_publish\", \"would_close\" or \"would_pause\" in place of the last three"},
+                    {"name": "merge_request", "type": "string", "description": "Web URL of the merge request; present for published and paused, and for closed and would_close when one was or would be closed (null otherwise)"},
                     {"name": "created", "type": "boolean", "description": "published only: whether the merge request was created by this run"},
                     {"name": "commit", "type": "string", "description": "published only: the pushed commit"},
                     {"name": "auto_merge", "type": "string", "description": "published only: \"enabled\" (bound to the pushed commit), \"disabled\" (an earlier auto-merge was cancelled) or \"off\""},
                     {"name": "branch_deleted", "type": "boolean", "description": "closed only: whether the rolling branch was deleted"},
-                    {"name": "notice_added", "type": "boolean", "description": "paused only: whether this run added the pause notice to the merge request description"}
+                    {"name": "notice_added", "type": "boolean", "description": "paused only: whether this run added the pause notice to the merge request description"},
+                    {"name": "title", "type": "string", "description": "would_publish only: the merge request title the update would be published under"},
+                    {"name": "delete_branch", "type": "boolean", "description": "would_close only: whether the rolling branch would be deleted"}
                 ]
             },
             {

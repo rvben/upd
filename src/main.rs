@@ -1732,7 +1732,7 @@ async fn run_gitlab(cli: &Cli) -> Result<()> {
     use upd::gitlab::run;
 
     init_tls(cli)?;
-    let result = match run::Settings::from_env() {
+    let result = match run::Settings::from_env(cli.dry_run) {
         Ok(settings) => run::run(&settings)
             .await
             .map(|outcome| (outcome, settings.branch)),

@@ -222,7 +222,10 @@ command from its own job instead. It reads the GitLab CI job environment:
 
 Progress goes to stderr. The outcome goes to stdout, as one line of text or, with
 `--output json`, an object whose `outcome` is `clean`, `closed`, `published`, or
-`paused`. Failures print a JSON error to stderr and exit with the code listed in
+`paused`. With `--dry-run` the update, validation and ownership checks still
+run, but nothing is pushed and nothing is written to GitLab; the outcome is then
+`would_publish`, `would_close`, or `would_pause` in place of the last three.
+Failures print a JSON error to stderr and exit with the code listed in
 `upd schema`: 4 for missing or invalid settings, 3 for network and GitLab
 server errors (retryable), 5 when the branch moved during the run, and 2 for
 everything else, including API rejections and states the run refuses to act on.

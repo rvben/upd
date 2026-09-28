@@ -1813,6 +1813,83 @@ async fn run_reports_its_outcome_as_json() {
 }
 
 #[tokio::test]
+async fn a_dry_run_reports_the_proposal_without_publishing_it() {
+    let fixture = Fixture::new();
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/v4/projects/1/merge_requests"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([])))
+        .mount(&server)
+        .await;
+
+    let output = fixture.execute_upd(&server, &Run::default(), &["--dry-run", "--output", "json"]);
+
+    assert!(output.status.success(), "{}", describe(&output));
+    let outcome: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(outcome["outcome"], "would_publish", "{outcome}");
+    assert_eq!(fixture.remote_tip(), None, "a dry run pushed the branch");
+    let writes: Vec<String> = server
+        .received_requests()
+        .await
+        .unwrap()
+        .iter()
+        .filter(|request| request.method.as_str() != "GET")
+        .map(|request| format!("{} {}", request.method, request.url.path()))
+        .collect();
+    assert!(writes.is_empty(), "a dry run wrote to GitLab: {writes:?}");
+}
+
+#[tokio::test]
+async fn a_dry_run_names_the_cleanup_it_would_do_without_doing_it() {
+    let create_server = MockServer::start().await;
+    let fixture = Fixture::new();
+    list_mock(json!([])).mount(&create_server).await;
+    Mock::given(method("POST"))
+        .and(path("/api/v4/projects/1/merge_requests"))
+        .respond_with(ResponseTemplate::new(201).set_body_json(mr_response(7, false)))
+        .mount(&create_server)
+        .await;
+    fixture.run_template(&create_server, true, "new", false);
+    let tip = fixture
+        .remote_tip()
+        .expect("the first run pushed the branch");
+
+    let server = MockServer::start().await;
+    list_mock(mr_list_response(7, false)).mount(&server).await;
+    let output = fixture.execute_upd(
+        &server,
+        &Run {
+            change: false,
+            ..Run::default()
+        },
+        &["--dry-run", "--output", "json"],
+    );
+
+    assert!(output.status.success(), "{}", describe(&output));
+    let outcome: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(outcome["outcome"], "would_close", "{outcome}");
+    assert_eq!(
+        outcome["merge_request"],
+        "https://gitlab.example.test/project/-/merge_requests/7"
+    );
+    assert_eq!(outcome["delete_branch"], true, "{outcome}");
+    assert_eq!(
+        fixture.remote_tip(),
+        Some(tip),
+        "a dry run removed the branch"
+    );
+    let writes: Vec<String> = server
+        .received_requests()
+        .await
+        .unwrap()
+        .iter()
+        .filter(|request| request.method.as_str() != "GET")
+        .map(|request| format!("{} {}", request.method, request.url.path()))
+        .collect();
+    assert!(writes.is_empty(), "a dry run wrote to GitLab: {writes:?}");
+}
+
+#[tokio::test]
 async fn run_reports_a_missing_setting_as_a_json_input_error() {
     let fixture = Fixture::new();
     let server = MockServer::start().await;
