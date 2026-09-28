@@ -546,7 +546,19 @@ async fn npm_both_direct_and_transitive_writes_dollar_name() {
 
     let bin_dir = tmp.path().join("fakebin");
     fs::create_dir(&bin_dir).unwrap();
-    write_fake_tool(&bin_dir, "npm", "#!/bin/sh\nexit 0\n");
+    // Rewrites package-lock.json the way a real `npm install` would once the
+    // override forces both copies of examplepkg onto the fixed version, so
+    // the post-relock re-verification sees a genuinely resolved lockfile.
+    let fixed_lock = r#"{ "name": "t", "lockfileVersion": 3, "packages": {
+            "": {},
+            "node_modules/examplepkg": { "version": "2.5.0" },
+            "node_modules/other/node_modules/examplepkg": { "version": "2.5.0" }
+        } }"#;
+    write_fake_tool(
+        &bin_dir,
+        "npm",
+        &format!("#!/bin/sh\ncat > package-lock.json <<'EOF'\n{fixed_lock}\nEOF\nexit 0\n"),
+    );
 
     let (stdout, stderr, code) = run_with_env(
         &[
@@ -1415,7 +1427,21 @@ async fn single_package_npm_with_file_dep_still_floors() {
 
     let bin_dir = tmp.path().join("fakebin");
     fs::create_dir(&bin_dir).unwrap();
-    write_fake_tool(&bin_dir, "npm", "#!/bin/sh\nexit 0\n");
+    // Rewrites package-lock.json the way a real `npm install` would once the
+    // override bumps vulnpkg to the fixed version, leaving the unrelated
+    // file: link entry untouched, so the post-relock re-verification sees a
+    // genuinely resolved lockfile.
+    let fixed_lock = r#"{ "name": "t", "lockfileVersion": 3, "packages": {
+            "": {},
+            "node_modules/locallib": { "resolved": "../local-lib", "link": true },
+            "../local-lib": { "name": "local-lib", "version": "1.0.0" },
+            "node_modules/vulnpkg": { "version": "1.0.1" }
+        } }"#;
+    write_fake_tool(
+        &bin_dir,
+        "npm",
+        &format!("#!/bin/sh\ncat > package-lock.json <<'EOF'\n{fixed_lock}\nEOF\nexit 0\n"),
+    );
 
     let (stdout, stderr, code) = run_with_env(
         &[
@@ -1557,10 +1583,22 @@ async fn npm_parallel_major_fixes_write_separate_bounded_overrides() {
         .unwrap();
         let bin_dir = tmp.path().join("fakebin");
         fs::create_dir(&bin_dir).unwrap();
+        // Rewrites package-lock.json the way a real `npm install` would once
+        // both bounded overrides resolve, leaving the unrelated package
+        // untouched, so the post-relock re-verification sees a genuinely
+        // resolved lockfile rather than the pre-fix versions.
+        let fixed_lock = r#"{"lockfileVersion":3,"packages":{
+        "":{},
+        "node_modules/unrelated":{"version":"1.0.0"},
+        "node_modules/brace-expansion":{"version":"2.1.4"},
+        "node_modules/host/node_modules/brace-expansion":{"version":"5.0.9"}
+    }}"#;
         write_fake_tool(
             &bin_dir,
             "npm",
-            "#!/bin/sh\nif [ \"$1\" != \"--version\" ]; then echo relock >> relocks.txt; fi\nexit 0\n",
+            &format!(
+                "#!/bin/sh\nif [ \"$1\" != \"--version\" ]; then echo relock >> relocks.txt; cat > package-lock.json <<'EOF'\n{fixed_lock}\nEOF\nfi\nexit 0\n"
+            ),
         );
         let (stdout, stderr, code) = run_with_env(
             &[

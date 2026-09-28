@@ -228,6 +228,35 @@ fn vulnerable_still_locked(lock: &Path, pairs: &[(String, String)]) -> bool {
     })
 }
 
+/// Packages a relock must explicitly target: every `Wrote` target (its
+/// manifest spec just changed), plus any other target whose own vulnerable
+/// pair is still locked. The second half matters for `AlreadySatisfied`
+/// targets - the manifest text already covers the fix, so nothing was
+/// written, but if the lock still pins the vulnerable version, a relock that
+/// only names the group's `Wrote` packages (or, with none, falls back to an
+/// untargeted refresh) can leave that package's stale entry untouched. Naming
+/// it explicitly asks the resolver to reconsider it rather than relying on
+/// the untargeted refresh to reach it incidentally.
+fn changed_packages(items: &[(FixTarget, Provisional)], lockfile: Option<&Path>) -> Vec<String> {
+    let mut changed: Vec<String> = Vec::new();
+    for (target, prov) in items {
+        let include = match prov {
+            Provisional::Wrote => true,
+            Provisional::AlreadySatisfied => lockfile.is_some_and(|lock| {
+                vulnerable_still_locked(
+                    lock,
+                    &[(target.package.clone(), target.vulnerable_version.clone())],
+                )
+            }),
+            Provisional::Unfixable(_) | Provisional::Failed(_) => false,
+        };
+        if include && !changed.contains(&target.package) {
+            changed.push(target.package.clone());
+        }
+    }
+    changed
+}
+
 /// The paths a group's snapshot must cover: the edited file itself, every
 /// lockfile `detect_lockfiles` maps for it, and the group's own lockfile.
 fn snapshot_paths_for(path: &Path, lockfile: &Option<PathBuf>) -> Vec<PathBuf> {
@@ -593,12 +622,7 @@ fn apply_edit_group(
         return;
     }
 
-    let mut changed: Vec<String> = Vec::new();
-    for (target, prov) in &items {
-        if matches!(prov, Provisional::Wrote) && !changed.contains(&target.package) {
-            changed.push(target.package.clone());
-        }
-    }
+    let changed = changed_packages(&items, lockfile.as_deref());
 
     let gate = opts.gates.get(&path).copied();
     // Kept only if the group stands: a rolled-back relock leaves no refreshed
@@ -642,7 +666,28 @@ fn apply_edit_group(
         Ok(()) => {
             gates.append(&mut relock_gates);
             for (target, prov) in items {
-                outcomes.push(finalize(target, prov, FixStatus::Applied));
+                let recheckable =
+                    matches!(prov, Provisional::Wrote | Provisional::AlreadySatisfied);
+                let still_vulnerable = recheckable
+                    && lockfile.as_deref().is_some_and(|lock| {
+                        vulnerable_still_locked(
+                            lock,
+                            &[(target.package.clone(), target.vulnerable_version.clone())],
+                        )
+                    });
+                if still_vulnerable {
+                    let message = format!(
+                        "relock finished but {} is still locked at {}; a manual bump or --full-precision may be required",
+                        target.package, target.vulnerable_version
+                    );
+                    outcomes.push(finalize(
+                        target,
+                        Provisional::Failed(message),
+                        FixStatus::Applied,
+                    ));
+                } else {
+                    outcomes.push(finalize(target, prov, FixStatus::Applied));
+                }
             }
         }
         Err(message) => {
@@ -1207,6 +1252,122 @@ mod tests {
             &uv_lock,
             &[("lockonly".to_string(), "0.49.1".to_string())]
         ));
+    }
+
+    const CARGO_LOCK_TWO_PACKAGES: &str = "version = 3\n\n[[package]]\nname = \"alpha\"\nversion = \"1.0.0\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\n\n[[package]]\nname = \"beta\"\nversion = \"1.0.0\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\n";
+
+    fn manifest_edit_target(
+        package: &str,
+        from_version: &str,
+        to_version: &str,
+        vulnerable_version: &str,
+        path: PathBuf,
+    ) -> FixTarget {
+        FixTarget {
+            package: package.to_string(),
+            dependency_key: None,
+            from_version: from_version.to_string(),
+            to_version: to_version.to_string(),
+            vulnerable_version: vulnerable_version.to_string(),
+            kind: FixKind::ManifestEdit,
+            path,
+            file_type: Some(FileType::CargoToml),
+            lockfile: None,
+            line_number: Some(4),
+            npm_form: None,
+        }
+    }
+
+    #[test]
+    fn changed_packages_includes_still_locked_already_satisfied_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let cargo_lock = write(dir.path(), "Cargo.lock", CARGO_LOCK_TWO_PACKAGES);
+
+        // alpha: manifest already covers the fix (AlreadySatisfied), but its
+        // lock entry is still the vulnerable one - a relock must name it.
+        let alpha = manifest_edit_target("alpha", "1.5.0", "1.5.0", "1.0.0", cargo_lock.clone());
+        // beta: manifest needed a real bump (Wrote), always included.
+        let beta = manifest_edit_target("beta", "1.0.0", "1.5.0", "1.0.0", cargo_lock.clone());
+
+        let items = vec![
+            (alpha, Provisional::AlreadySatisfied),
+            (beta, Provisional::Wrote),
+        ];
+
+        let changed = changed_packages(&items, Some(&cargo_lock));
+
+        assert_eq!(changed, vec!["alpha".to_string(), "beta".to_string()]);
+    }
+
+    #[test]
+    fn changed_packages_omits_already_satisfied_target_once_lock_catches_up() {
+        let dir = tempfile::tempdir().unwrap();
+        let cargo_lock = write(
+            dir.path(),
+            "Cargo.lock",
+            "version = 3\n\n[[package]]\nname = \"alpha\"\nversion = \"1.5.0\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\n",
+        );
+        let alpha = manifest_edit_target("alpha", "1.5.0", "1.5.0", "1.0.0", cargo_lock.clone());
+        let items = vec![(alpha, Provisional::AlreadySatisfied)];
+
+        let changed = changed_packages(&items, Some(&cargo_lock));
+
+        assert!(changed.is_empty(), "{changed:?}");
+    }
+
+    #[test]
+    fn relock_success_does_not_hide_a_still_vulnerable_lock() {
+        // package.json lives alone, with no sibling package-lock.json, so
+        // `detect_lockfiles` finds nothing and the relock takes the
+        // no-lockfiles shortcut (`Ok(())`) without running any external
+        // tool. The target's own `lockfile` still points at a real fixture
+        // (as it would when routing found the lock elsewhere), so the
+        // post-relock check reads real, deliberately stale content.
+        let manifest_dir = tempfile::tempdir().unwrap();
+        let package_json = write(manifest_dir.path(), "package.json", PACKAGE_JSON_BARE);
+
+        let lock_dir = tempfile::tempdir().unwrap();
+        let package_lock = write(
+            lock_dir.path(),
+            "package-lock.json",
+            "{\n  \"packages\": {\n    \"node_modules/examplepkg\": { \"version\": \"1.0.0\" }\n  }\n}\n",
+        );
+
+        let target = FixTarget {
+            package: "examplepkg".to_string(),
+            dependency_key: None,
+            from_version: "1.0.0".to_string(),
+            to_version: "1.5.0".to_string(),
+            vulnerable_version: "1.0.0".to_string(),
+            kind: FixKind::ManifestEdit,
+            path: package_json,
+            file_type: Some(FileType::PackageJson),
+            lockfile: Some(package_lock.clone()),
+            line_number: Some(4),
+            npm_form: None,
+        };
+        let opts = FixApplyOptions {
+            dry_run: false,
+            relock_manifests: true,
+            relock_floors: true,
+            verbose: false,
+            gates: HashMap::new(),
+        };
+        let closure =
+            |_: &Path, _: FileType, _: &[&FixTarget]| -> anyhow::Result<bool> { Ok(true) };
+        let FixApplyReport { outcomes, .. } = apply_fix_targets(vec![target], &opts, &closure);
+
+        assert_eq!(outcomes.len(), 1);
+        assert_eq!(outcomes[0].status, FixStatus::Failed);
+        let error = outcomes[0].error.as_ref().expect("error present");
+        assert!(error.contains("examplepkg"), "{error}");
+        assert!(error.contains("still locked"), "{error}");
+        // The lock fixture itself is untouched by the shortcut relock.
+        assert!(
+            std::fs::read_to_string(&package_lock)
+                .unwrap()
+                .contains("1.0.0")
+        );
     }
 
     #[test]
