@@ -5,7 +5,7 @@ use directories::ProjectDirs;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -58,27 +58,39 @@ pub struct CachedVersionMeta {
 
 impl Cache {
     pub fn load() -> Result<Self> {
-        let path = Self::cache_path()?;
+        Self::load_from(&Self::cache_path()?)
+    }
 
+    fn load_from(path: &Path) -> Result<Self> {
         if !path.exists() {
             return Ok(Self::default());
         }
 
-        let content = fs::read_to_string(&path)?;
+        let content = fs::read_to_string(path)?;
         let cache: Cache = serde_json::from_str(&content)?;
         Ok(cache)
     }
 
     pub fn save(&self) -> Result<()> {
-        let path = Self::cache_path()?;
+        self.save_to(&Self::cache_path()?)
+    }
 
+    fn save_to(&self, path: &Path) -> Result<()> {
         // Ensure parent directory exists
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
 
-        let content = serde_json::to_string_pretty(self)?;
-        fs::write(&path, content)?;
+        // Write beside the target and rename over it: other upd processes
+        // sharing the cache then read either the old file or the new one,
+        // never a partial write.
+        let parent = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or(Path::new("."));
+        let mut file = tempfile::NamedTempFile::new_in(parent)?;
+        serde_json::to_writer_pretty(&mut file, self)?;
+        file.persist(path)?;
         Ok(())
     }
 
@@ -466,6 +478,44 @@ mod tests {
     use super::*;
     use serial_test::serial;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    /// Several upd processes share one cache file (an organization run
+    /// updates projects concurrently), so a reader must never see a
+    /// half-written file.
+    #[test]
+    fn concurrent_saves_never_expose_a_partial_cache_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("versions.json");
+        let mut cache = Cache::default();
+        for index in 0..20000 {
+            cache.set("npm", &format!("package-{index}"), "1.2.3".to_string());
+        }
+        cache.save_to(&path).unwrap();
+        let cache = Arc::new(cache);
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let writers: Vec<_> = (0..4)
+            .map(|_| {
+                let (cache, path, stop) = (cache.clone(), path.clone(), stop.clone());
+                std::thread::spawn(move || {
+                    while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                        cache.save_to(&path).unwrap();
+                    }
+                })
+            })
+            .collect();
+        let mut failures = 0;
+        for _ in 0..200 {
+            if Cache::load_from(&path).is_err() {
+                failures += 1;
+            }
+        }
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        for writer in writers {
+            writer.join().unwrap();
+        }
+        assert_eq!(failures, 0, "a reader saw a partially written cache");
+        assert_eq!(Cache::load_from(&path).unwrap().npm.len(), 20000);
+    }
 
     #[test]
     fn test_cache_get_set() {
