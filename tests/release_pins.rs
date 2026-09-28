@@ -44,6 +44,17 @@ fn every_release_pin_consumer_matches_the_manifest() {
             ),
         ),
         (
+            "ci/gitlab-organization-update.yml",
+            (
+                2,
+                &[
+                    ("aarch64-unknown-linux-gnu", 1),
+                    ("x86_64-unknown-linux-gnu", 1),
+                    ("x86_64-unknown-linux-musl", 1),
+                ][..],
+            ),
+        ),
+        (
             "docs/github-actions.md",
             (1, &[("x86_64-unknown-linux-gnu", 1)][..]),
         ),

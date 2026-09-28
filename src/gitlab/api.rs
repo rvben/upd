@@ -1,5 +1,5 @@
-//! The slice of the GitLab merge-request API a rolling update needs, behind
-//! one retry policy.
+//! The slice of the GitLab API the automation needs: merge requests, group
+//! project listing and repository file reads, behind one retry policy.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -12,6 +12,11 @@ use super::Error;
 
 /// Longest excerpt of a GitLab error body quoted in a message.
 const BODY_EXCERPT: usize = 500;
+
+/// Most group-project pages followed before discovery gives up; at 100 per
+/// page that is far past any real group, and it bounds a server that keeps
+/// answering with a next page.
+const MAX_PAGES: u32 = 1000;
 
 /// An open merge request as the run needs to see it.
 #[derive(Debug, Clone)]
@@ -69,19 +74,23 @@ impl Retry {
 pub struct Client {
     http: reqwest::Client,
     token: String,
+    api_url: String,
     merge_requests: String,
     retry: Retry,
 }
 
-/// A GitLab answer after retries: its status and body text.
+/// A GitLab answer after retries: its status, headers and body text.
 struct Answer {
     status: StatusCode,
+    headers: HeaderMap,
     url: String,
     body: String,
 }
 
 impl Client {
-    pub fn new(api_url: &str, project_id: &str, token: &str) -> Result<Self, Error> {
+    /// A client for group-level calls; [`Client::for_project`] addresses a
+    /// project's merge requests.
+    pub fn new(api_url: &str, token: &str) -> Result<Self, Error> {
         let builder = reqwest::Client::builder()
             .connect_timeout(Duration::from_secs(15))
             .timeout(Duration::from_secs(60))
@@ -89,13 +98,22 @@ impl Client {
         let http = crate::http::apply(builder)
             .build()
             .map_err(|error| Error::Io(format!("cannot build the GitLab client: {error}")))?;
-        let api_url = api_url.trim_end_matches('/');
+        let api_url = api_url.trim_end_matches('/').to_string();
         Ok(Self {
             http,
             token: token.to_string(),
-            merge_requests: format!("{api_url}/projects/{project_id}/merge_requests"),
+            merge_requests: String::new(),
+            api_url,
             retry: Retry::default(),
         })
+    }
+
+    /// The same connection and credentials, addressing another project.
+    pub fn for_project(&self, project_id: impl std::fmt::Display) -> Self {
+        Self {
+            merge_requests: format!("{}/projects/{project_id}/merge_requests", self.api_url),
+            ..self.clone()
+        }
     }
 
     #[cfg(test)]
@@ -163,6 +181,97 @@ impl Client {
         self.send(Method::POST, url, None).await.map(drop)
     }
 
+    /// Every project in `group` and its subgroups that is not archived,
+    /// excluding projects merely shared with it, in project-id order and
+    /// without duplicates. `group` is a numeric id or a full path.
+    pub async fn group_projects(&self, group: &str) -> Result<Vec<Value>, Error> {
+        let base = self.url(&format!(
+            "{}/groups/{}/projects",
+            self.api_url,
+            encode_segment(group)
+        ))?;
+        let mut projects: Vec<Value> = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        let mut page: u32 = 1;
+        for _ in 0..MAX_PAGES {
+            let mut url = base.clone();
+            url.query_pairs_mut()
+                .append_pair("include_subgroups", "true")
+                .append_pair("with_shared", "false")
+                .append_pair("archived", "false")
+                .append_pair("order_by", "id")
+                .append_pair("sort", "asc")
+                .append_pair("per_page", "100")
+                .append_pair("page", &page.to_string());
+            let answer = self.execute(Method::GET, url, None).await?;
+            let next = answer
+                .headers
+                .get("x-next-page")
+                .and_then(|value| value.to_str().ok())
+                .map(str::trim)
+                .unwrap_or_default()
+                .to_string();
+            match parse_json(answer)? {
+                Value::Array(items) => {
+                    for item in items {
+                        let Some(id) = item["id"].as_u64() else {
+                            return Err(Error::Refused(format!(
+                                "GitLab listed a project without a numeric id: {}",
+                                excerpt(&item.to_string())
+                            )));
+                        };
+                        if seen.insert(id) {
+                            projects.push(item);
+                        }
+                    }
+                }
+                other => {
+                    return Err(Error::Refused(format!(
+                        "GitLab returned a project list that is not a list: {}",
+                        excerpt(&other.to_string())
+                    )));
+                }
+            }
+            if next.is_empty() {
+                return Ok(projects);
+            }
+            match next.parse::<u32>() {
+                Ok(following) if following > page => page = following,
+                _ => {
+                    return Err(Error::Refused(format!(
+                        "GitLab sent an X-Next-Page header of {} after page {page}",
+                        excerpt(&next)
+                    )));
+                }
+            }
+        }
+        Err(Error::Refused(format!(
+            "GitLab kept paginating past {MAX_PAGES} pages of projects for {group}"
+        )))
+    }
+
+    /// The content of `path` at `reference` in `project_id`, or `None` when
+    /// the file does not exist there.
+    pub async fn raw_file(
+        &self,
+        project_id: u64,
+        path: &str,
+        reference: &str,
+    ) -> Result<Option<String>, Error> {
+        let mut url = self.url(&format!(
+            "{}/projects/{project_id}/repository/files/{}/raw",
+            self.api_url,
+            encode_segment(path)
+        ))?;
+        url.query_pairs_mut().append_pair("ref", reference);
+        let answer = self.execute(Method::GET, url, None).await?;
+        if answer.status == StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        check_status(&answer)?;
+        Ok(Some(answer.body))
+    }
+
     fn url(&self, text: &str) -> Result<Url, Error> {
         Url::parse(text)
             .map_err(|error| Error::Input(format!("invalid GitLab API URL {text}: {error}")))
@@ -215,6 +324,7 @@ impl Client {
                         })?;
                         return Ok(Answer {
                             status,
+                            headers,
                             url: shown,
                             body,
                         });
@@ -300,6 +410,20 @@ fn jitter(ceiling: Duration) -> Duration {
     Duration::from_nanos(z % span.saturating_add(1))
 }
 
+/// Percent-encodes one path segment: a project path or file path becomes a
+/// single segment, as the GitLab API expects.
+fn encode_segment(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for byte in text.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~') {
+            out.push(byte as char);
+        } else {
+            out.push_str(&format!("%{byte:02X}"));
+        }
+    }
+    out
+}
+
 impl MergeRequest {
     /// Reads the identity of a merge request from a GitLab response,
     /// refusing one that does not name it.
@@ -354,7 +478,7 @@ fn excerpt(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use wiremock::matchers::{method, path};
+    use wiremock::matchers::{method, path, query_param};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     const FAST: Retry = Retry {
@@ -364,8 +488,9 @@ mod tests {
     };
 
     async fn client(server: &MockServer) -> Client {
-        Client::new(&format!("{}/api/v4", server.uri()), "1", "token")
+        Client::new(&format!("{}/api/v4", server.uri()), "token")
             .unwrap()
+            .for_project(1)
             .with_retry(FAST)
     }
 
@@ -469,8 +594,9 @@ mod tests {
         let address = listener.local_addr().unwrap();
         drop(listener);
         let started = std::time::Instant::now();
-        let error = Client::new(&format!("http://{address}/api/v4"), "1", "token")
+        let error = Client::new(&format!("http://{address}/api/v4"), "token")
             .unwrap()
+            .for_project(1)
             .with_retry(Retry {
                 attempts: 3,
                 base: Duration::from_millis(40),
@@ -575,5 +701,148 @@ mod tests {
             json!({"auto_merge_enabled": 1, "merge_when_pipeline_succeeds": true})
         ));
         assert!(!state(json!({})));
+    }
+
+    const GROUP_PROJECTS: &str = "/api/v4/groups/acme%2Fplatform/projects";
+
+    fn projects_page(ids: &[u64], next: Option<&str>) -> ResponseTemplate {
+        let body: Vec<Value> = ids
+            .iter()
+            .map(|id| json!({"id": id, "path_with_namespace": format!("acme/p{id}")}))
+            .collect();
+        let template = ResponseTemplate::new(200).set_body_json(body);
+        match next {
+            Some(next) => template.insert_header("X-Next-Page", next),
+            None => template.insert_header("X-Next-Page", ""),
+        }
+    }
+
+    async fn mount_page(server: &MockServer, page: &str, response: ResponseTemplate) {
+        Mock::given(method("GET"))
+            .and(path(GROUP_PROJECTS))
+            .and(query_param("page", page))
+            .and(query_param("include_subgroups", "true"))
+            .and(query_param("with_shared", "false"))
+            .and(query_param("archived", "false"))
+            .and(query_param("order_by", "id"))
+            .respond_with(response)
+            .expect(1)
+            .mount(server)
+            .await;
+    }
+
+    #[tokio::test]
+    async fn group_projects_follow_every_page_once_and_drop_duplicates() {
+        let server = MockServer::start().await;
+        mount_page(&server, "1", projects_page(&[1, 2], Some("2"))).await;
+        mount_page(&server, "2", projects_page(&[2, 3], Some("3"))).await;
+        mount_page(&server, "3", projects_page(&[4], None)).await;
+        let projects = client(&server)
+            .await
+            .group_projects("acme/platform")
+            .await
+            .unwrap();
+        let ids: Vec<u64> = projects.iter().map(|p| p["id"].as_u64().unwrap()).collect();
+        assert_eq!(ids, [1, 2, 3, 4]);
+    }
+
+    #[tokio::test]
+    async fn group_projects_refuse_pagination_that_does_not_advance() {
+        for next in ["1", "0", "two", "-3"] {
+            let server = MockServer::start().await;
+            mount_page(&server, "1", projects_page(&[1], Some(next))).await;
+            let error = client(&server)
+                .await
+                .group_projects("acme/platform")
+                .await
+                .unwrap_err();
+            assert_eq!(error.kind(), "refused", "{next}: {error}");
+            assert!(error.to_string().contains("X-Next-Page"), "{error}");
+        }
+    }
+
+    #[tokio::test]
+    async fn group_projects_refuse_entries_without_a_numeric_id() {
+        for body in [
+            json!([{"id": "5"}]),
+            json!([{"name": "x"}]),
+            json!({"id": 5}),
+        ] {
+            let server = MockServer::start().await;
+            mount_page(
+                &server,
+                "1",
+                ResponseTemplate::new(200).set_body_json(body.clone()),
+            )
+            .await;
+            let error = client(&server)
+                .await
+                .group_projects("acme/platform")
+                .await
+                .unwrap_err();
+            assert_eq!(error.kind(), "refused", "{body}: {error}");
+        }
+    }
+
+    #[tokio::test]
+    async fn raw_file_distinguishes_a_missing_file_from_a_failure() {
+        let server = MockServer::start().await;
+        let route = "/api/v4/projects/42/repository/files/config%2F.updrc.toml/raw";
+        Mock::given(method("GET"))
+            .and(path(route))
+            .and(query_param("ref", "main"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("[automation]\n"))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(route))
+            .and(query_param("ref", "gone"))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(route))
+            .and(query_param("ref", "denied"))
+            .respond_with(ResponseTemplate::new(403))
+            .mount(&server)
+            .await;
+        let client = client(&server).await;
+        assert_eq!(
+            client
+                .raw_file(42, "config/.updrc.toml", "main")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("[automation]\n")
+        );
+        assert_eq!(
+            client
+                .raw_file(42, "config/.updrc.toml", "gone")
+                .await
+                .unwrap(),
+            None
+        );
+        let error = client
+            .raw_file(42, "config/.updrc.toml", "denied")
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), "api_error", "{error}");
+    }
+
+    #[test]
+    fn segments_encode_everything_but_unreserved_bytes() {
+        assert_eq!(encode_segment("acme/platform"), "acme%2Fplatform");
+        assert_eq!(encode_segment("a b.c-d_e~f"), "a%20b.c-d_e~f");
+        assert_eq!(encode_segment("../x?y#z"), "..%2Fx%3Fy%23z");
+        assert_eq!(encode_segment("é"), "%C3%A9");
+    }
+
+    #[test]
+    fn a_project_client_addresses_that_project() {
+        let base = Client::new("https://gitlab.example.test/api/v4/", "t").unwrap();
+        assert_eq!(
+            base.for_project(99).merge_requests,
+            "https://gitlab.example.test/api/v4/projects/99/merge_requests"
+        );
     }
 }

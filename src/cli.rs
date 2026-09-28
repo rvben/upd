@@ -415,6 +415,25 @@ pub enum GitlabCommand {
     /// ci/gitlab-dependency-update.yml template sets (see docs/gitlab.md).
     /// Leaves a branch holding commits it did not write untouched.
     Run,
+
+    /// Maintain rolling dependency merge requests across a GitLab group
+    Org {
+        #[command(subcommand)]
+        command: GitlabOrgCommand,
+    },
+}
+
+#[derive(Subcommand, Clone)]
+pub enum GitlabOrgCommand {
+    /// Run `gitlab run` for every group project that opts in.
+    ///
+    /// Lists the projects of UPD_GROUP and its subgroups, and updates each
+    /// whose root configuration file sets `[automation] dependency_updates =
+    /// true`. Configured by the job environment the
+    /// ci/gitlab-organization-update.yml template sets (see docs/gitlab.md).
+    /// With --dry-run, reports what each project would get without pushing
+    /// or writing to GitLab.
+    Run,
 }
 
 impl Cli {

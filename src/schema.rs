@@ -338,6 +338,22 @@ fn build_schema() -> Value {
                 ]
             },
             {
+                "name": "gitlab org run",
+                "description": "Run the GitLab dependency update for every project in a group that opted in, from one central CI job. Lists the group's projects (subgroups included), skips (with reason) the central project itself, projects matching UPD_EXCLUDE, and archived, pending-deletion, empty, repository-disabled and branchless projects, and processes a project only when the configuration file on its default branch commit sets [automation] dependency_updates = true; each such project then gets the same rolling branch and merge request as gitlab run. Auto-merge is enabled only when both UPD_AUTO_MERGE and the project's [automation] auto_merge allow it. The ecosystem nix is always left out, and cannot be selected through UPD_LANGS. Configured by the environment: requires UPD_GITLAB_TOKEN, CI_SERVER_URL and UPD_GROUP; reads CI_API_V4_URL, CI_PROJECT_ID (the central project, which is skipped), UPD_EXCLUDE (space-separated path globs), UPD_LANGS, UPD_MIN_AGE (a floor under each project's configured cooldown), UPD_MAX_BUMP, UPD_BRANCH, UPD_COMMIT_MESSAGE, UPD_GIT_NAME, UPD_GIT_EMAIL, UPD_AUTO_MERGE and UPD_CONCURRENCY (1 to 16, default 4). The token is never passed to the updater. A project that fails is reported and the others still run; the command then exits 2. With --dry-run nothing is pushed and nothing is written to GitLab. Progress goes to stderr, and in JSON mode a one-line summary is written to stderr before the report",
+                "effects": "non_idempotent",
+                "mutating": true,
+                "cardinality": "single",
+                "args": [],
+                "output_fields": [
+                    {"name": "command", "type": "string", "description": "Always \"gitlab org run\""},
+                    {"name": "group", "type": "string", "description": "The group that was listed"},
+                    {"name": "branch", "type": "string", "description": "The rolling automation branch used in every project"},
+                    {"name": "dry_run", "type": "boolean", "description": "Whether the run was a dry run"},
+                    {"name": "counts", "type": "object", "description": "Number of projects listed (projects) and in each state (skipped, not_opted_in, config_invalid, processed, failed)"},
+                    {"name": "projects", "type": "array", "items": {"type": "object"}, "description": "One entry per listed project with id, path and state. skipped carries reason (central_project, excluded, archived, pending_deletion, repository_disabled, empty_repository or no_default_branch) and not_opted_in carries reason; config_invalid carries config (the file) and message; processed carries the gitlab run outcome fields (outcome, merge_request, ...); failed carries error with kind, message and exit_code. config_invalid and failed entries make the command exit 2"}
+                ]
+            },
+            {
                 "name": "capabilities",
                 "description": "Describe offline-safe CLI capabilities",
                 "effects": "read_only",
@@ -401,19 +417,19 @@ fn build_schema() -> Value {
             },
             {
                 "kind": "refused",
-                "description": "gitlab run: GitLab or the repository is in a state the run will not act on (more than one open merge request for the branch, or a response that does not identify a merge request)",
+                "description": "gitlab run, gitlab org run: GitLab or the repository is in a state the run will not act on (more than one open merge request for the branch, or a response that does not identify a merge request)",
                 "exit_code": 2,
                 "retryable": false
             },
             {
                 "kind": "api_error",
-                "description": "gitlab run: the GitLab API rejected a request (a 4xx other than 429, e.g. an invalid or under-scoped token)",
+                "description": "gitlab run, gitlab org run: the GitLab API rejected a request (a 4xx other than 429, e.g. an invalid or under-scoped token)",
                 "exit_code": 2,
                 "retryable": false
             },
             {
                 "kind": "conflict",
-                "description": "Version conflict detected between files, or (gitlab run) the automation branch moved while the run was working, so its push lease was refused",
+                "description": "Version conflict detected between files, or (gitlab run, gitlab org run) the automation branch moved while the run was working, so its push lease was refused",
                 "exit_code": 5,
                 "retryable": false
             }
@@ -612,6 +628,19 @@ mod tests {
         assert_eq!(command["mutating"], true);
         let fields = output_field_names(command);
         for field in ["command", "branch", "outcome", "merge_request"] {
+            assert!(fields.iter().any(|f| f == field), "{field}");
+        }
+    }
+
+    #[test]
+    fn schema_declares_gitlab_org_run() {
+        let s = build_schema();
+        let command = find_command(&s, "gitlab org run");
+        assert_eq!(command["mutating"], true);
+        let fields = output_field_names(command);
+        for field in [
+            "command", "group", "branch", "dry_run", "counts", "projects",
+        ] {
             assert!(fields.iter().any(|f| f == field), "{field}");
         }
     }

@@ -8,6 +8,7 @@
 
 mod api;
 mod git;
+pub mod org;
 pub mod present;
 pub mod run;
 

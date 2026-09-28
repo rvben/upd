@@ -1,0 +1,193 @@
+# Reusable GitLab CI template that keeps one rolling dependency merge request
+# in every project of a group that opts in. Include this file from a pinned upd
+# commit in one central project, configure its typed inputs, then extend
+# `.upd-organization-update`. See docs/gitlab.md#organization-mode.
+
+spec:
+  inputs:
+    group:
+      description: Full path or numeric ID of the group whose projects are updated, subgroups included
+      regex: '^[0-9A-Za-z_.][0-9A-Za-z_./-]*$'
+    stage:
+      description: Existing pipeline stage for the organization job
+      default: test
+    image:
+      description: Compatible Linux job image; pin custom images by digest
+      default: "debian:bookworm-slim@sha256:abd67ffcfa541b485a3dff59865ab629aa048a6c613e639d36e7456b0b229241"
+    upd_version:
+      description: Exact released upd version
+      default: "v0.14.1"
+      regex: '^v[0-9]+\.[0-9]+\.[0-9]+([+-][0-9A-Za-z.-]+)?$'
+    upd_sha256:
+      description: Archive digest; required when overriding upd_version or upd_target
+      default: ""
+      regex: '^$|^[0-9a-fA-F]{64}$'
+    upd_target:
+      description: Release target; detected for supported Linux runners when empty
+      default: ""
+      regex: '^$|^[0-9A-Za-z_.+-]+$'
+    exclude:
+      description: Whitespace-separated globs of project paths to leave alone
+      default: ""
+    langs:
+      description: Comma-separated ecosystem filter applied to every project
+      default: ""
+    min_age:
+      description: Shortest release age any project accepts; longer project cooldowns still apply
+      default: "7d"
+    max_bump:
+      description: Highest applied bump in every project; empty uses each project's configuration
+      default: "minor"
+    branch:
+      description: Automation-owned rolling branch in each project
+      default: "automation/upd-dependencies"
+    commit_message:
+      description: Conventional Commits message for the generated commits
+      default: "chore(deps): update dependencies with upd"
+    auto_merge:
+      description: Allow auto-merge in projects that also set [automation] auto_merge = true
+      type: boolean
+      default: false
+    concurrency:
+      description: Projects processed at the same time (1 to 16)
+      type: number
+      default: 4
+    dry_run:
+      description: Report what each project would get without pushing or writing to GitLab
+      type: boolean
+      default: false
+---
+
+.upd-organization-update:
+  image: "$[[ inputs.image ]]"
+  stage: "$[[ inputs.stage ]]"
+  timeout: 2h
+  interruptible: false
+  resource_group: upd-organization-update
+  artifacts:
+    when: always
+    expire_in: 1 week
+    access: developer
+    paths:
+      - .upd-ci/
+  variables:
+    UPD_VERSION: "$[[ inputs.upd_version ]]"
+    UPD_SHA256: "$[[ inputs.upd_sha256 ]]"
+    UPD_TARGET: "$[[ inputs.upd_target ]]"
+    UPD_GROUP: "$[[ inputs.group ]]"
+    UPD_EXCLUDE: "$[[ inputs.exclude ]]"
+    UPD_LANGS: "$[[ inputs.langs ]]"
+    UPD_MIN_AGE: "$[[ inputs.min_age ]]"
+    UPD_MAX_BUMP: "$[[ inputs.max_bump ]]"
+    UPD_BRANCH: "$[[ inputs.branch ]]"
+    UPD_COMMIT_MESSAGE: "$[[ inputs.commit_message ]]"
+    UPD_GIT_NAME: "upd automation"
+    UPD_GIT_EMAIL: "upd-automation@noreply.invalid"
+    UPD_AUTO_MERGE: "$[[ inputs.auto_merge ]]"
+    UPD_CONCURRENCY: "$[[ inputs.concurrency ]]"
+    UPD_DRY_RUN: "$[[ inputs.dry_run ]]"
+    # Test/advanced escape hatch. Normal jobs always install a released binary.
+    UPD_EXECUTABLE: ""
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "schedule"'
+    - if: '$CI_PIPELINE_SOURCE == "web"'
+    - when: never
+  before_script:
+    - |
+      missing=""
+      for tool in bash curl cut git grep mktemp sha256sum tar tr uname; do
+        command -v "$tool" >/dev/null 2>&1 || missing="$missing $tool"
+      done
+      if [ -n "$missing" ]; then
+        if command -v apt-get >/dev/null 2>&1; then
+          apt-get update
+          apt-get install --yes --no-install-recommends bash ca-certificates coreutils curl git grep tar
+        elif command -v apk >/dev/null 2>&1; then
+          apk add --no-cache bash ca-certificates coreutils curl git tar
+        else
+          echo "Missing required commands:$missing" >&2
+          echo "Use a compatible image or install them in before_script." >&2
+          exit 2
+        fi
+      fi
+  script:
+    - |
+      bash <<'UPD_JOB'
+      set -euo pipefail
+
+      work_dir="$(mktemp -d)"
+      trap 'rm -rf "$work_dir"' EXIT
+
+      version="${UPD_VERSION}"
+      case "$version" in
+        v*) ;;
+        *) version="v${version}" ;;
+      esac
+
+      if [ -n "$UPD_EXECUTABLE" ]; then
+        upd_bin="$UPD_EXECUTABLE"
+      else
+        target="${UPD_TARGET}"
+        if [ -z "$target" ]; then
+          case "$(uname -m)" in
+            x86_64|amd64) target="x86_64-unknown-linux-gnu" ;;
+            aarch64|arm64) target="aarch64-unknown-linux-gnu" ;;
+            *)
+              echo "Unsupported runner architecture: $(uname -m); set upd_target explicitly" >&2
+              exit 4
+              ;;
+          esac
+        fi
+
+        expected_sha="${UPD_SHA256}"
+        if [ -z "$expected_sha" ] && [ "$version" = "v0.14.1" ]; then
+          case "$target" in
+            x86_64-unknown-linux-gnu)
+              expected_sha="4c04040d56a09b1767e953e6c1a49723b8ad9ad55537b5923616871883ab14b1"
+              ;;
+            x86_64-unknown-linux-musl)
+              expected_sha="4afb926ffab0afcd7a01e191f0b179e23e2ff298ef17afabbe398aaacdc0279a"
+              ;;
+            aarch64-unknown-linux-gnu)
+              expected_sha="1065cad2e0e824f3a131f59c00d8016c7915fed8477f20c95c3f5a1a5e56fb24"
+              ;;
+          esac
+        fi
+        if ! printf '%s\n' "$expected_sha" | grep --extended-regexp --quiet '^[0-9a-fA-F]{64}$'; then
+          echo "Set upd_sha256 when overriding upd_version or upd_target" >&2
+          exit 4
+        fi
+
+        asset="upd-${version}-${target}.tar.gz"
+        release_url="https://github.com/rvben/upd/releases/download/${version}"
+        curl --silent --show-error --fail-with-body --location \
+          --output "$work_dir/$asset" "$release_url/$asset"
+        actual_sha="$(sha256sum "$work_dir/$asset" | cut -d ' ' -f 1)"
+        if [ "$(printf '%s' "$actual_sha" | tr 'A-F' 'a-f')" != \
+          "$(printf '%s' "$expected_sha" | tr 'A-F' 'a-f')" ]; then
+          echo "Checksum verification failed for $asset" >&2
+          exit 2
+        fi
+        tar --extract --gzip --file "$work_dir/$asset" --directory "$work_dir" upd
+        chmod 0755 "$work_dir/upd"
+        upd_bin="$work_dir/upd"
+      fi
+
+      if [ ! -x "$upd_bin" ]; then
+        echo "upd executable is missing or not executable: $upd_bin" >&2
+        exit 2
+      fi
+
+      # upd owns the rest of the job: discovery, opt-in, and for each opted-in
+      # project the branch ownership check, update, lease-protected push and
+      # merge request. Progress goes to the job log; the JSON report is kept
+      # as an artifact.
+      args=(gitlab org run --output json)
+      if [ "$UPD_DRY_RUN" = "true" ]; then
+        args+=(--dry-run)
+      fi
+      mkdir -p .upd-ci
+      status=0
+      "$upd_bin" "${args[@]}" > .upd-ci/upd-org-report.json || status=$?
+      exit "$status"
+      UPD_JOB

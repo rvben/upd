@@ -230,6 +230,103 @@ Failures print a JSON error to stderr and exit with the code listed in
 server errors (retryable), 5 when the branch moved during the run, and 2 for
 everything else, including API rejections and states the run refuses to act on.
 
+## Organization mode
+
+One central project can keep the rolling merge request in every project of a
+group, with each project deciding for itself whether it takes part. The
+[`ci/gitlab-organization-update.yml`](../ci/gitlab-organization-update.yml)
+template runs `upd gitlab org run`, which lists the group's projects (subgroups
+included) and, for each one that opted in, does exactly what `upd gitlab run`
+does in a single project: same branch ownership rules, same lease-protected
+push, same merge request.
+
+### Opt in per project
+
+A project takes part only when the configuration file at the root of its
+default branch says so:
+
+```toml
+# .updrc.toml
+[automation]
+dependency_updates = true
+auto_merge = true   # optional; the central job must allow it too
+```
+
+The file is found the way `upd` finds configuration (`.updrc.toml`, then
+`upd.toml`, then `.updrc`). A quick read through the API skips projects that
+have not opted in without cloning them; for the rest, the copy in the
+default-branch commit the update starts from makes the final decision. A project without the file,
+or without `dependency_updates = true`, is reported as not opted in. A file that
+cannot be parsed, or that is not a regular file, is reported as invalid and
+fails the job, so a broken opt-in is visible instead of silently ignored. The
+update then runs with that file as its configuration, so the project's own
+policy (cooldowns, ignores, pins) applies.
+
+Turning `dependency_updates` off stops future runs from touching the project; an
+existing merge request is left open for the project to close.
+
+### Set up the central project
+
+Create a group access token (or, on GitLab.com Free, a personal access token of
+a dedicated service user) with `api` and `write_repository` scopes and a role
+that can push branches and create merge requests in every project of the group,
+normally **Developer**. When auto-merge is used, the role must also be allowed to
+merge into the protected target branches. Store it as the masked, protected
+`UPD_GITLAB_TOKEN` variable of the central project.
+
+```yaml
+include:
+  - remote: "https://raw.githubusercontent.com/rvben/upd/<FULL_COMMIT_SHA>/ci/gitlab-organization-update.yml"
+    inputs:
+      group: "my-group"
+      exclude: "my-group/legacy-* my-group/sandbox/*"
+
+upd-organization-update:
+  extends: .upd-organization-update
+```
+
+Schedule a pipeline on the central project's default branch. The central project
+itself is always skipped; give it its own `upd gitlab run` job if it needs
+updates. The template requires GitLab 16.11 or newer, because it restricts its
+report artifact to project members with the Developer role or higher. As with
+the single-project template, include the pin-refresh commit that follows a
+release: `upd_version` must name a release that provides `upd gitlab org run`.
+
+### Organization inputs
+
+| Input | Default | Purpose |
+|-------|---------|---------|
+| `group` | required | Full path or numeric ID of the group, subgroups included |
+| `stage`, `image`, `upd_version`, `upd_sha256`, `upd_target` | as above | Job placement and the pinned `upd` release |
+| `exclude` | empty | Whitespace-separated globs of project paths to leave alone |
+| `langs` | empty | Comma-separated ecosystem filter applied to every project |
+| `min_age` | `7d` | Shortest release age any project accepts; longer project cooldowns still apply |
+| `max_bump` | `minor` | Highest applied bump; empty uses each project's configuration |
+| `branch`, `commit_message` | as above | Rolling branch and generated commit message in every project |
+| `auto_merge` | `false` | Allow auto-merge in projects that also set `auto_merge = true` |
+| `concurrency` | `4` | Projects processed at the same time (1 to 16) |
+| `dry_run` | `false` | Report what each project would get without pushing or writing to GitLab |
+
+`min_age` is a floor rather than an override: a project that configures a
+longer cooldown keeps it. Organization mode never runs `nix flake update`, which
+would evaluate repository content in a job holding a group-wide token, so Nix
+is always left out and `langs` cannot select it. Lockfile regeneration,
+preparation and validation commands are single-project features and are not
+offered here: one job image cannot carry every project's toolchain.
+
+### Results
+
+Every listed project gets one line in the job log: skipped (archived, empty,
+excluded, pending deletion, repository disabled, or the central project), not
+opted in, invalid configuration, processed with the same outcome `upd gitlab
+run` reports, or failed. A failing project does not stop the others. The job
+fails when any project failed or had an invalid opt-in, so a scheduled run
+surfaces problems without hiding the projects that succeeded.
+
+The full JSON report, including each project's merge request URL or error, is
+kept for one week as the `.upd-ci/upd-org-report.json` artifact. Its shape is
+described by `upd schema` under `gitlab org run`.
+
 ## Scope
 
 This integration intentionally produces one policy-constrained rolling merge

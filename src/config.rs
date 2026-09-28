@@ -316,11 +316,9 @@ impl UpdConfig {
     /// to defaults would drop the user's `ignore`/`pin` rules and let unwanted
     /// updates through.
     pub fn discover(start_dir: &Path) -> Result<Option<(Self, PathBuf)>, String> {
-        let config_names = [".updrc.toml", "upd.toml", ".updrc"];
-
         let mut current = Some(start_dir);
         while let Some(dir) = current {
-            for name in &config_names {
+            for name in CONFIG_FILE_NAMES {
                 let config_path = dir.join(name);
                 if config_path.exists() {
                     let (config, warnings) = Self::load_with_warnings(&config_path)?;
@@ -771,6 +769,10 @@ auto_merge = false
         self.automation.auto_merge.unwrap_or(false)
     }
 }
+
+/// Configuration file names in discovery order; in each directory the first
+/// that exists is the configuration.
+pub const CONFIG_FILE_NAMES: [&str; 3] = [".updrc.toml", "upd.toml", ".updrc"];
 
 /// Warnings for `[automation]` keys the schema does not define.
 fn automation_warnings(raw: &toml::Value, source_label: &str) -> Vec<String> {

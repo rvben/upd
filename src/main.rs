@@ -1713,6 +1713,14 @@ async fn run() -> Result<()> {
         }) => {
             run_gitlab(&cli).await?;
         }
+        Some(Command::Gitlab {
+            command:
+                upd::cli::GitlabCommand::Org {
+                    command: upd::cli::GitlabOrgCommand::Run,
+                },
+        }) => {
+            run_gitlab_org(&cli).await?;
+        }
         Some(Command::Schema) => {
             // Already handled above before show_config check.
             unreachable!("Schema handled earlier");
@@ -1733,7 +1741,7 @@ async fn run_gitlab(cli: &Cli) -> Result<()> {
 
     init_tls(cli)?;
     let result = match run::Settings::from_env(cli.dry_run) {
-        Ok(settings) => run::run(&settings)
+        Ok(settings) => run::run(&settings, &run::Log::direct())
             .await
             .map(|outcome| (outcome, settings.branch)),
         Err(error) => Err(error),
@@ -1747,6 +1755,42 @@ async fn run_gitlab(cli: &Cli) -> Result<()> {
                 );
             } else {
                 println!("{}", outcome.render_text(&branch));
+            }
+            Ok(())
+        }
+        Err(error) => {
+            eprintln!(
+                "{}",
+                serde_json::json!({"error": {
+                    "kind": error.kind(),
+                    "message": error.message(),
+                    "exit_code": error.exit_code(),
+                }})
+            );
+            std::process::exit(error.exit_code());
+        }
+    }
+}
+
+async fn run_gitlab_org(cli: &Cli) -> Result<()> {
+    use upd::gitlab::org;
+
+    init_tls(cli)?;
+    let result = match org::OrgSettings::from_env(cli.dry_run) {
+        Ok(settings) => org::run(&settings).await,
+        Err(error) => Err(error),
+    };
+    match result {
+        Ok(report) => {
+            if effective_json_mode(cli) {
+                // The job log shows stderr; the JSON goes to a report file.
+                eprintln!("{}", report.summary());
+                println!("{}", serde_json::to_string_pretty(&report.to_json())?);
+            } else {
+                println!("{}", report.render_text());
+            }
+            if report.failures() > 0 {
+                std::process::exit(2);
             }
             Ok(())
         }

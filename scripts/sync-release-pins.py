@@ -31,6 +31,10 @@ CONSUMERS: dict[str, dict[str, Any]] = {
         "version": 2,
         "hashes": {target: 1 for target in TARGETS},
     },
+    "ci/gitlab-organization-update.yml": {
+        "version": 2,
+        "hashes": {target: 1 for target in TARGETS},
+    },
     "docs/github-actions.md": {
         "version": 1,
         "hashes": {"x86_64-unknown-linux-gnu": 1},

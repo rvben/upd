@@ -164,6 +164,7 @@ jobs:
           git add \
             release-pins.json \
             ci/gitlab-dependency-update.yml \
+            ci/gitlab-organization-update.yml \
             docs/github-actions.md \
             docs/gitlab.md
           git commit -m "chore(release): refresh integration pins for ${VERSION}"

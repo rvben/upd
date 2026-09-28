@@ -4,6 +4,7 @@ use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::Mutex;
 
 use serde::Serialize;
 use serde_json::{Value, json};
@@ -38,8 +39,13 @@ pub struct Settings {
     pub git_email: String,
     pub paths: Vec<String>,
     pub langs: String,
+    /// Ecosystems left out whatever `langs` or the repository selects.
+    pub exclude_langs: String,
     pub packages: String,
     pub min_age: String,
+    /// Shortest release age accepted whatever the repository configures;
+    /// empty for none.
+    pub min_age_floor: String,
     pub max_bump: String,
     pub lock: bool,
     pub auto_merge: bool,
@@ -47,6 +53,9 @@ pub struct Settings {
     pub validation_command: String,
     /// The updater to run; this executable unless `UPD_EXECUTABLE` names one.
     pub updater: PathBuf,
+    /// Configuration file, relative to the checkout, the updater must read
+    /// instead of discovering one.
+    pub config: Option<PathBuf>,
     /// Report what the run would do without pushing or writing to GitLab.
     pub dry_run: bool,
 }
@@ -101,14 +110,17 @@ impl Settings {
             git_email: optional("UPD_GIT_EMAIL", "upd-automation@noreply.invalid"),
             paths: paths_input.split_whitespace().map(str::to_string).collect(),
             langs: optional("UPD_LANGS", ""),
+            exclude_langs: String::new(),
             packages: optional("UPD_PACKAGES", ""),
             min_age: optional("UPD_MIN_AGE", ""),
+            min_age_floor: String::new(),
             max_bump: optional("UPD_MAX_BUMP", ""),
             lock: flag("UPD_LOCK")?,
             auto_merge: flag("UPD_AUTO_MERGE")?,
             prepare_command: optional("UPD_PREPARE_COMMAND", ""),
             validation_command: optional("UPD_VALIDATION_COMMAND", ""),
             updater,
+            config: None,
             dry_run,
         };
         if settings.project_id.contains('/') {
@@ -124,7 +136,7 @@ impl Settings {
         Ok(settings)
     }
 
-    fn git_url(&self) -> String {
+    pub(super) fn git_url(&self) -> String {
         format!(
             "{}/{}.git",
             self.server_url.trim_end_matches('/'),
@@ -260,185 +272,298 @@ impl Outcome {
     }
 }
 
-pub async fn run(settings: &Settings) -> Result<Outcome, Error> {
-    let dir = &settings.project_dir;
-    let git = Git::new(dir, &settings.token)?;
-    if !git::child(dir, "git")
-        .args(["check-ref-format", "--branch", &settings.branch])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .await
-        .map_err(|error| Error::Io(format!("cannot start git: {error}")))?
-        .success()
-    {
-        return Err(Error::Input(format!(
-            "Invalid automation branch: {}",
-            settings.branch
-        )));
+/// Where a run's progress goes: straight to stderr, or into a buffer the
+/// caller prints as one block, so concurrent runs do not interleave.
+#[derive(Debug, Default)]
+pub struct Log {
+    buffer: Option<Mutex<String>>,
+}
+
+impl Log {
+    pub fn direct() -> Self {
+        Self { buffer: None }
     }
 
-    prepare_artifact_dir(&git, dir).await?;
-    let api = Client::new(&settings.api_url, &settings.project_id, &settings.token)?;
-    let url = settings.git_url();
-    let default_ref = format!("refs/remotes/origin/{}", settings.default_branch);
-    let branch_ref = format!("refs/remotes/origin/{}", settings.branch);
+    pub fn buffered() -> Self {
+        Self {
+            buffer: Some(Mutex::new(String::new())),
+        }
+    }
 
-    git.fetch(&url, &settings.default_branch).await?;
-    let expected_remote_sha = if git.remote_has_branch(&url, &settings.branch).await? {
-        git.fetch(&url, &settings.branch).await?;
-        git.read(["rev-parse", "--verify", &format!("{branch_ref}^{{commit}}")])
+    pub fn line(&self, text: impl std::fmt::Display) {
+        match &self.buffer {
+            None => eprintln!("{text}"),
+            Some(buffer) => {
+                let mut buffer = buffer.lock().unwrap_or_else(|poison| poison.into_inner());
+                buffer.push_str(&text.to_string());
+                buffer.push('\n');
+            }
+        }
+    }
+
+    /// Appends captured process output verbatim.
+    fn raw(&self, bytes: &[u8]) {
+        if let Some(buffer) = &self.buffer {
+            let mut buffer = buffer.lock().unwrap_or_else(|poison| poison.into_inner());
+            buffer.push_str(&String::from_utf8_lossy(bytes));
+            if !buffer.is_empty() && !buffer.ends_with('\n') {
+                buffer.push('\n');
+            }
+        }
+    }
+
+    fn is_buffered(&self) -> bool {
+        self.buffer.is_some()
+    }
+
+    /// Everything buffered so far; empty for a direct log.
+    pub fn take(&self) -> String {
+        match &self.buffer {
+            None => String::new(),
+            Some(buffer) => {
+                std::mem::take(&mut *buffer.lock().unwrap_or_else(|poison| poison.into_inner()))
+            }
+        }
+    }
+}
+
+/// A checkout holding the fetched default branch and, when it exists, the
+/// automation branch, before anything is changed.
+pub struct Session<'a> {
+    pub settings: Settings,
+    pub git: Git,
+    pub log: &'a Log,
+    api: Client,
+    url: String,
+    /// `refs/remotes/origin/<default branch>`.
+    pub default_ref: String,
+    /// The remote automation branch tip, empty when the branch is absent.
+    expected_remote_sha: String,
+}
+
+pub async fn run(settings: &Settings, log: &Log) -> Result<Outcome, Error> {
+    Session::open(settings.clone(), log).await?.propose().await
+}
+
+impl<'a> Session<'a> {
+    /// Validates the branch name and fetches both branches into the
+    /// checkout at `settings.project_dir`.
+    pub async fn open(settings: Settings, log: &'a Log) -> Result<Self, Error> {
+        let dir = &settings.project_dir;
+        let git = Git::new(dir, &settings.token)?;
+        if !git::child(dir, "git")
+            .args(["check-ref-format", "--branch", &settings.branch])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .await
+            .map_err(|error| Error::Io(format!("cannot start git: {error}")))?
+            .success()
+        {
+            return Err(Error::Input(format!(
+                "Invalid automation branch: {}",
+                settings.branch
+            )));
+        }
+
+        prepare_artifact_dir(&git, dir).await?;
+        let api =
+            Client::new(&settings.api_url, &settings.token)?.for_project(&settings.project_id);
+        let url = settings.git_url();
+        let default_ref = format!("refs/remotes/origin/{}", settings.default_branch);
+        let branch_ref = format!("refs/remotes/origin/{}", settings.branch);
+
+        git.fetch(&url, &settings.default_branch).await?;
+        let expected_remote_sha = if git.remote_has_branch(&url, &settings.branch).await? {
+            git.fetch(&url, &settings.branch).await?;
+            git.read(["rev-parse", "--verify", &format!("{branch_ref}^{{commit}}")])
+                .await?
+        } else {
+            String::new()
+        };
+        Ok(Self {
+            settings,
+            git,
+            log,
+            api,
+            url,
+            default_ref,
+            expected_remote_sha,
+        })
+    }
+
+    /// Rebuilds the automation branch from the default branch, runs the
+    /// update and publishes, closes or pauses accordingly.
+    pub async fn propose(self) -> Result<Outcome, Error> {
+        let Self {
+            settings,
+            git,
+            log,
+            api,
+            url,
+            default_ref,
+            expected_remote_sha,
+        } = self;
+        let settings = &settings;
+        let dir = &settings.project_dir;
+
+        if !expected_remote_sha.is_empty()
+            && !branch_is_owned(&git, settings, &default_ref, &expected_remote_sha).await?
+        {
+            if settings.dry_run {
+                return Ok(Outcome::WouldPause);
+            }
+            return pause(&api, settings, log).await;
+        }
+
+        git.run([
+            "switch",
+            "--quiet",
+            "--force-create",
+            &settings.branch,
+            &default_ref,
+        ])
+        .await?;
+
+        if !settings.prepare_command.is_empty() {
+            git::shell(dir, "prepare command", &settings.prepare_command).await?;
+        }
+        if !git.read(["status", "--porcelain"]).await?.is_empty() {
+            return Err(Error::Refused(
+                "The prepare command changed repository files; refusing to mix setup with updates"
+                    .to_string(),
+            ));
+        }
+
+        let report = run_updater(settings, log).await?;
+        log.line(present::summary_line(&report)?);
+        if !present::report_is_error_free(&report)? {
+            return Err(Error::Refused(
+                "upd reported errors; refusing to publish a partial result".to_string(),
+            ));
+        }
+
+        git.run(["add", "--all"]).await?;
+        let changed = !git.test(["diff", "--cached", "--quiet"]).await?;
+        let changed_paths = staged_paths(&git).await?;
+        let min_age = policy_min_age(settings);
+        let mut presentation = Presentation::from_report(
+            &report,
+            &present::Context {
+                min_age: &min_age,
+                max_bump: &settings.max_bump,
+                lock: settings.lock,
+                auto_merge: settings.auto_merge,
+                validation_configured: !settings.validation_command.is_empty(),
+                changed,
+                changed_paths: &changed_paths,
+            },
+        )?;
+        write_artifact(
+            settings,
+            "upd-presentation.json",
+            &presentation.to_artifact(),
+        )?;
+
+        if !changed {
+            return close_obsolete(&api, &git, settings, log, &url, &expected_remote_sha).await;
+        }
+
+        if !settings.validation_command.is_empty() {
+            git::shell(dir, "validation command", &settings.validation_command).await?;
+        }
+        let unstaged = !git.test(["diff", "--quiet"]).await?;
+        let untracked = !git
+            .read(["ls-files", "--others", "--exclude-standard"])
             .await?
-    } else {
-        String::new()
-    };
-
-    if !expected_remote_sha.is_empty()
-        && !branch_is_owned(&git, settings, &default_ref, &expected_remote_sha).await?
-    {
+            .is_empty();
+        if unstaged || untracked {
+            return Err(Error::Refused(
+                "Validation changed uncommitted files; refusing to publish an unvalidated diff"
+                    .to_string(),
+            ));
+        }
+        presentation.validation.proposal_integrity_passed = true;
+        write_artifact(
+            settings,
+            "upd-presentation.json",
+            &presentation.to_artifact(),
+        )?;
+        let title = if settings.mr_title.is_empty() {
+            presentation.title.clone()
+        } else {
+            settings.mr_title.clone()
+        };
         if settings.dry_run {
-            return Ok(Outcome::WouldPause);
+            return Ok(Outcome::WouldPublish { title });
         }
-        return pause(&api, settings).await;
-    }
 
-    git.run([
-        "switch",
-        "--quiet",
-        "--force-create",
-        &settings.branch,
-        &default_ref,
-    ])
-    .await?;
-
-    if !settings.prepare_command.is_empty() {
-        git::shell(dir, "prepare command", &settings.prepare_command).await?;
-    }
-    if !git.read(["status", "--porcelain"]).await?.is_empty() {
-        return Err(Error::Refused(
-            "The prepare command changed repository files; refusing to mix setup with updates"
-                .to_string(),
-        ));
-    }
-
-    let report = run_updater(settings).await?;
-    eprintln!("{}", present::summary_line(&report)?);
-    if !present::report_is_error_free(&report)? {
-        return Err(Error::Refused(
-            "upd reported errors; refusing to publish a partial result".to_string(),
-        ));
-    }
-
-    git.run(["add", "--all"]).await?;
-    let changed = !git.test(["diff", "--cached", "--quiet"]).await?;
-    let changed_paths = staged_paths(&git).await?;
-    let mut presentation = Presentation::from_report(
-        &report,
-        &present::Context {
-            min_age: &settings.min_age,
-            max_bump: &settings.max_bump,
-            lock: settings.lock,
-            auto_merge: settings.auto_merge,
-            validation_configured: !settings.validation_command.is_empty(),
-            changed,
-            changed_paths: &changed_paths,
-        },
-    )?;
-    write_artifact(
-        settings,
-        "upd-presentation.json",
-        &presentation.to_artifact(),
-    )?;
-
-    if !changed {
-        return close_obsolete(&api, &git, settings, &url, &expected_remote_sha).await;
-    }
-
-    if !settings.validation_command.is_empty() {
-        git::shell(dir, "validation command", &settings.validation_command).await?;
-    }
-    let unstaged = !git.test(["diff", "--quiet"]).await?;
-    let untracked = !git
-        .read(["ls-files", "--others", "--exclude-standard"])
-        .await?
-        .is_empty();
-    if unstaged || untracked {
-        return Err(Error::Refused(
-            "Validation changed uncommitted files; refusing to publish an unvalidated diff"
-                .to_string(),
-        ));
-    }
-    presentation.validation.proposal_integrity_passed = true;
-    write_artifact(
-        settings,
-        "upd-presentation.json",
-        &presentation.to_artifact(),
-    )?;
-    let title = if settings.mr_title.is_empty() {
-        presentation.title.clone()
-    } else {
-        settings.mr_title.clone()
-    };
-    if settings.dry_run {
-        return Ok(Outcome::WouldPublish { title });
-    }
-
-    git.commit(
-        &settings.commit_message,
-        &settings.git_name,
-        &settings.git_email,
-    )
-    .await?;
-    let commit = git.read(["rev-parse", "HEAD"]).await?;
-    if let Push::Stale(detail) = git
-        .push_with_lease(&url, &settings.branch, &expected_remote_sha, "HEAD")
-        .await?
-    {
-        return Err(lease_conflict(&settings.branch, &detail));
-    }
-
-    let existing = single_open_merge_request(&api, settings).await?;
-    let description = presentation.description();
-    write_artifact(settings, "upd-mr-description.md", &description)?;
-
-    let created = existing.is_none();
-    let response = match existing {
-        None => {
-            api.create(
-                &settings.branch,
-                &settings.default_branch,
-                &title,
-                &description,
-            )
+        git.commit(
+            &settings.commit_message,
+            &settings.git_name,
+            &settings.git_email,
+        )
+        .await?;
+        let commit = git.read(["rev-parse", "HEAD"]).await?;
+        if let Push::Stale(detail) = git
+            .push_with_lease(&url, &settings.branch, &expected_remote_sha, "HEAD")
             .await?
+        {
+            return Err(lease_conflict(&settings.branch, &detail));
         }
-        Some(existing) => {
-            api.edit(
-                existing.iid,
-                json!({"title": title, "description": description}),
-            )
-            .await?
-        }
-    };
-    let merge_request = MergeRequest::from_response(&response)?;
-    eprintln!("Merge request: {}", merge_request.web_url);
 
-    let auto_merge = if settings.auto_merge {
-        api.enable_auto_merge(merge_request.iid, &commit).await?;
-        AutoMerge::Enabled
-    } else if merge_request.auto_merge_enabled() {
-        api.cancel_auto_merge(merge_request.iid).await?;
-        AutoMerge::Disabled
-    } else {
-        AutoMerge::Off
-    };
+        let existing = single_open_merge_request(&api, settings).await?;
+        let description = presentation.description();
+        write_artifact(settings, "upd-mr-description.md", &description)?;
 
-    Ok(Outcome::Published {
-        merge_request: merge_request.web_url,
-        created,
-        commit,
-        auto_merge,
-    })
+        let created = existing.is_none();
+        let response = match existing {
+            None => {
+                api.create(
+                    &settings.branch,
+                    &settings.default_branch,
+                    &title,
+                    &description,
+                )
+                .await?
+            }
+            Some(existing) => {
+                api.edit(
+                    existing.iid,
+                    json!({"title": title, "description": description}),
+                )
+                .await?
+            }
+        };
+        let merge_request = MergeRequest::from_response(&response)?;
+        log.line(format_args!("Merge request: {}", merge_request.web_url));
+
+        let auto_merge = if settings.auto_merge {
+            api.enable_auto_merge(merge_request.iid, &commit).await?;
+            AutoMerge::Enabled
+        } else if merge_request.auto_merge_enabled() {
+            api.cancel_auto_merge(merge_request.iid).await?;
+            AutoMerge::Disabled
+        } else {
+            AutoMerge::Off
+        };
+
+        Ok(Outcome::Published {
+            merge_request: merge_request.web_url,
+            created,
+            commit,
+            auto_merge,
+        })
+    }
+}
+
+/// The freshness policy as the merge request states it.
+fn policy_min_age(settings: &Settings) -> String {
+    match (settings.min_age.as_str(), settings.min_age_floor.as_str()) {
+        ("", "") => String::new(),
+        ("", floor) => format!("repository configuration, at least {floor}"),
+        (min_age, _) => min_age.to_string(),
+    }
 }
 
 /// Creates the artifact directory and keeps it out of the repository's view,
@@ -512,11 +637,11 @@ async fn branch_is_owned(
     Ok(identity == expected)
 }
 
-async fn pause(api: &Client, settings: &Settings) -> Result<Outcome, Error> {
-    eprintln!(
+async fn pause(api: &Client, settings: &Settings, log: &Log) -> Result<Outcome, Error> {
+    log.line(format_args!(
         "Paused: unexpected commits on {}; leaving the branch untouched",
         settings.branch
-    );
+    ));
     let open = api
         .open_merge_requests(&settings.branch, &settings.default_branch)
         .await?;
@@ -548,15 +673,23 @@ async fn pause(api: &Client, settings: &Settings) -> Result<Outcome, Error> {
     })
 }
 
-async fn run_updater(settings: &Settings) -> Result<Value, Error> {
+async fn run_updater(settings: &Settings, log: &Log) -> Result<Value, Error> {
     let mut args: Vec<&str> = vec!["update", "--apply", "--format", "json"];
     if settings.lock {
         args.push("--lock");
     }
+    let config = settings
+        .config
+        .as_ref()
+        .map(|path| path.to_string_lossy().into_owned())
+        .unwrap_or_default();
     for (flag, value) in [
+        ("--config", &config),
         ("--min-age", &settings.min_age),
+        ("--min-age-floor", &settings.min_age_floor),
         ("--max-bump", &settings.max_bump),
         ("--lang", &settings.langs),
+        ("--exclude-lang", &settings.exclude_langs),
         ("--package", &settings.packages),
     ] {
         if !value.is_empty() {
@@ -566,11 +699,15 @@ async fn run_updater(settings: &Settings) -> Result<Value, Error> {
     args.extend(settings.paths.iter().map(String::as_str));
 
     // `spawn` rather than `output`: `output` would capture stderr too, hiding
-    // the updater's progress and diagnostics from the job log.
+    // the updater's progress and diagnostics from a direct job log.
     let child = git::child(&settings.project_dir, &settings.updater)
         .args(&args)
         .stdout(Stdio::piped())
-        .stderr(Stdio::inherit())
+        .stderr(if log.is_buffered() {
+            Stdio::piped()
+        } else {
+            Stdio::inherit()
+        })
         .spawn()
         .map_err(|error| {
             Error::Io(format!(
@@ -582,6 +719,7 @@ async fn run_updater(settings: &Settings) -> Result<Value, Error> {
         .wait_with_output()
         .await
         .map_err(|error| Error::Io(format!("cannot read the updater output: {error}")))?;
+    log.raw(&output.stderr);
     write_artifact(
         settings,
         "upd-report.json",
@@ -621,6 +759,7 @@ async fn close_obsolete(
     api: &Client,
     git: &Git,
     settings: &Settings,
+    log: &Log,
     url: &str,
     expected_remote_sha: &str,
 ) -> Result<Outcome, Error> {
@@ -646,13 +785,19 @@ async fn close_obsolete(
         {
             return Err(lease_conflict(&settings.branch, &detail));
         }
-        eprintln!("Removed obsolete automation branch: {}", settings.branch);
+        log.line(format_args!(
+            "Removed obsolete automation branch: {}",
+            settings.branch
+        ));
     }
     let merge_request = match existing {
         Some(merge_request) => {
             api.edit(merge_request.iid, json!({"state_event": "close"}))
                 .await?;
-            eprintln!("Closed obsolete merge request: {}", merge_request.web_url);
+            log.line(format_args!(
+                "Closed obsolete merge request: {}",
+                merge_request.web_url
+            ));
             Some(merge_request.web_url)
         }
         None => None,
