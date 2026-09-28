@@ -137,17 +137,12 @@ impl RecoveryFailure {
 /// rather than guess.
 #[derive(Debug, Clone)]
 enum SelfPinFetchFailure {
-    /// `upd-target` names a target `release-pins.json` has no asset for.
+    /// `upd-target` names a target this repository's release assets never
+    /// cover (see `SELF_PIN_TARGETS`).
     TargetUnknown(String),
-    /// `release-pins.json` could not be read, or could not be parsed, at the
-    /// target release tag.
-    ManifestUnavailable(String),
     /// The release's `<asset>.sha256` sidecar could not be read, or did not
     /// contain a recognizable digest.
     ChecksumUnavailable(String),
-    /// The manifest and the sidecar name different checksums for the same
-    /// asset, so neither is trusted on its own.
-    ChecksumMismatch { manifest: String, sidecar: String },
 }
 
 impl SelfPinFetchFailure {
@@ -155,59 +150,58 @@ impl SelfPinFetchFailure {
     fn reason(&self) -> &'static str {
         match self {
             Self::TargetUnknown(_) => "self-pin-target-unknown",
-            Self::ManifestUnavailable(_) => "self-pin-manifest-unavailable",
             Self::ChecksumUnavailable(_) => "self-pin-checksum-unavailable",
-            Self::ChecksumMismatch { .. } => "self-pin-checksum-mismatch",
         }
     }
 
     fn message(&self, owner_repo: &str, target_version: &str) -> String {
         match self {
             Self::TargetUnknown(target) => format!(
-                "{owner_repo}'s release-pins.json at {target_version} has no asset for target {target}"
-            ),
-            Self::ManifestUnavailable(error) => format!(
-                "could not read {owner_repo}'s release-pins.json at {target_version}: {error}"
+                "{owner_repo}@{target_version} has no self-pin release asset for target {target}"
             ),
             Self::ChecksumUnavailable(error) => format!(
                 "could not read the release checksum sidecar for {owner_repo}@{target_version}: {error}"
-            ),
-            Self::ChecksumMismatch { manifest, sidecar } => format!(
-                "{owner_repo}@{target_version}'s release-pins.json checksum {manifest} disagrees with its release checksum sidecar {sidecar}"
             ),
         }
     }
 }
 
-/// Read the checksum for `target` out of `rvben/upd`'s release assets for
-/// `target_version`, cross-checked between two independent sources.
+/// The only targets `scripts/sync-release-pins.py`'s own `TARGETS` covers,
+/// because the GitHub Actions runners this self-pin bypass exists for run
+/// Linux. Kept as the single source of truth for validating `upd-target`
+/// before spending a network round trip on it.
+const SELF_PIN_TARGETS: [&str; 3] = [
+    "aarch64-unknown-linux-gnu",
+    "x86_64-unknown-linux-gnu",
+    "x86_64-unknown-linux-musl",
+];
+
+/// Read the checksum for `target` out of `rvben/upd`'s own release assets for
+/// `target_version`.
 ///
-/// `release-pins.json` at the target tag names the asset for `target` and its
-/// expected checksum; the release's own `<asset>.sha256` sidecar is fetched
-/// independently and must agree. Reading the manifest only from `main` would
-/// let a self-pin trust a file that can already have moved past the release
-/// being pinned to, so both reads are pinned to `target_version` itself.
+/// The asset name is derived directly from `target_version` and `target`
+/// (matching the `upd-{version}-{target}.tar.gz` convention
+/// `scripts/sync-release-pins.py` itself validates) rather than looked up in
+/// `release-pins.json`. That manifest is committed by a follow-up
+/// "Synchronize integration release pins" job that runs after the release tag
+/// and its assets already exist, so the file's content at the tag's own
+/// commit is always the *previous* release's manifest, never the one being
+/// pinned to - confirmed directly: `release-pins.json` at the `v0.14.2` tag
+/// still names `v0.14.1` assets. Reading it from `main` instead trades that
+/// staleness for the opposite problem, since `main` can already have moved
+/// past the release being pinned to. So neither read happens here; the
+/// release's own `<asset>.sha256` sidecar is trusted on its own, since it is
+/// produced by the same build as the asset it certifies and always exists on
+/// the release it names.
 async fn fetch_self_pin_checksum(
     registry: &dyn Registry,
     target_version: &str,
     target: &str,
 ) -> std::result::Result<String, SelfPinFetchFailure> {
-    let manifest_bytes = registry
-        .repo_file_at_ref("rvben/upd", target_version, "release-pins.json")
-        .await
-        .map_err(|error| SelfPinFetchFailure::ManifestUnavailable(error.to_string()))?;
-    let manifest: serde_json::Value = serde_json::from_slice(&manifest_bytes)
-        .map_err(|error| SelfPinFetchFailure::ManifestUnavailable(error.to_string()))?;
-    let asset = manifest.get("assets").and_then(|assets| assets.get(target));
-    let manifest_sha256 = asset
-        .and_then(|asset| asset.get("sha256"))
-        .and_then(|value| value.as_str())
-        .ok_or_else(|| SelfPinFetchFailure::TargetUnknown(target.to_string()))?
-        .to_string();
-    let asset_name = asset
-        .and_then(|asset| asset.get("name"))
-        .and_then(|value| value.as_str())
-        .ok_or_else(|| SelfPinFetchFailure::TargetUnknown(target.to_string()))?;
+    if !SELF_PIN_TARGETS.contains(&target) {
+        return Err(SelfPinFetchFailure::TargetUnknown(target.to_string()));
+    }
+    let asset_name = format!("upd-{target_version}-{target}.tar.gz");
 
     let sidecar_bytes = registry
         .release_asset("rvben/upd", target_version, &format!("{asset_name}.sha256"))
@@ -227,12 +221,6 @@ async fn fetch_self_pin_checksum(
         })?
         .to_ascii_lowercase();
 
-    if manifest_sha256.to_ascii_lowercase() != sidecar_sha256 {
-        return Err(SelfPinFetchFailure::ChecksumMismatch {
-            manifest: manifest_sha256,
-            sidecar: sidecar_sha256,
-        });
-    }
     Ok(sidecar_sha256)
 }
 
@@ -2704,79 +2692,6 @@ jobs:
         assert!(fs::read_to_string(file.path()).unwrap().contains(OLD_SHA));
     }
 
-    /// A `MockRegistry` wrapper that also answers a self-pin's
-    /// `repo_file_at_ref`/`release_asset` fetches, which `MockRegistry` itself
-    /// leaves at the trait's unsupported default. Only the tests proving a
-    /// successful checksum fetch need this; the tests proving atomicity on a
-    /// fetch failure use a plain `MockRegistry` and rely on that default.
-    struct SelfPinFixtureRegistry {
-        inner: MockRegistry,
-        manifest: Vec<u8>,
-        sidecar: Vec<u8>,
-    }
-
-    #[async_trait::async_trait]
-    impl Registry for SelfPinFixtureRegistry {
-        async fn python_releases(
-            &self,
-            package: &str,
-        ) -> Result<Vec<crate::registry::PythonRelease>> {
-            self.inner.python_releases(package).await
-        }
-
-        async fn get_latest_version(&self, package: &str) -> Result<String> {
-            self.inner.get_latest_version(package).await
-        }
-
-        async fn list_versions(&self, package: &str) -> Result<Vec<crate::registry::VersionMeta>> {
-            self.inner.list_versions(package).await
-        }
-
-        async fn list_ref_names(&self, package: &str) -> Result<Vec<String>> {
-            self.inner.list_ref_names(package).await
-        }
-
-        async fn resolve_ref_to_commit(&self, package: &str, reference: &str) -> Result<String> {
-            self.inner.resolve_ref_to_commit(package, reference).await
-        }
-
-        async fn tags_at_commit(
-            &self,
-            package: &str,
-            commit: &str,
-        ) -> Result<crate::registry::TagsAtCommit> {
-            self.inner.tags_at_commit(package, commit).await
-        }
-
-        fn name(&self) -> &'static str {
-            self.inner.name()
-        }
-
-        async fn repo_file_at_ref(
-            &self,
-            package: &str,
-            _reference: &str,
-            path: &str,
-        ) -> Result<Vec<u8>> {
-            if package == "rvben/upd" && path == "release-pins.json" {
-                return Ok(self.manifest.clone());
-            }
-            anyhow::bail!("SelfPinFixtureRegistry has no file fixture for {package}:{path}")
-        }
-
-        async fn release_asset(
-            &self,
-            package: &str,
-            _tag: &str,
-            _asset_name: &str,
-        ) -> Result<Vec<u8>> {
-            if package == "rvben/upd" {
-                return Ok(self.sidecar.clone());
-            }
-            anyhow::bail!("SelfPinFixtureRegistry has no asset fixture for {package}")
-        }
-    }
-
     #[tokio::test]
     async fn test_self_pin_bypasses_bump_ceiling_for_minor_jump() {
         use crate::updater::BumpFilter;
@@ -2860,7 +2775,7 @@ jobs:
     }
 
     #[tokio::test]
-    async fn test_self_pin_triple_is_left_untouched_when_checksum_manifest_unavailable() {
+    async fn test_self_pin_triple_is_left_untouched_when_checksum_sidecar_unavailable() {
         const OLD_SHA: &str = "1111111111111111111111111111111111111111";
         const NEW_SHA: &str = "2222222222222222222222222222222222222222";
         let old_checksum = "a".repeat(64);
@@ -2871,11 +2786,11 @@ jobs:
         )
         .unwrap();
 
-        // A plain MockRegistry has no fixture for `repo_file_at_ref`, so it
-        // answers the trait's unsupported default: exactly the "manifest
-        // could not be read" case the triple must abort on, leaving the
-        // `uses:` line untouched alongside the `with:` block it did not dare
-        // rewrite half of.
+        // A plain MockRegistry has no fixture for `release_asset`, so it
+        // answers the trait's unsupported default: exactly the "checksum
+        // sidecar could not be read" case the triple must abort on, leaving
+        // the `uses:` line untouched alongside the `with:` block it did not
+        // dare rewrite half of.
         let registry = MockRegistry::new("github-releases")
             .with_version("rvben/upd", "v0.15.0")
             .with_resolved_ref("rvben/upd", "v0.14.1", OLD_SHA)
@@ -2889,7 +2804,7 @@ jobs:
 
         assert!(result.updated.is_empty());
         assert_eq!(result.skipped.len(), 1, "skipped: {:?}", result.skipped);
-        assert_eq!(result.skipped[0].reason, "self-pin-manifest-unavailable");
+        assert_eq!(result.skipped[0].reason, "self-pin-checksum-unavailable");
         let content = fs::read_to_string(file.path()).unwrap();
         assert!(content.contains(OLD_SHA), "content: {content}");
         assert!(content.contains(&old_checksum), "content: {content}");
@@ -2897,6 +2812,37 @@ jobs:
             content.contains("upd-version: v0.14.1"),
             "content: {content}"
         );
+    }
+
+    #[tokio::test]
+    async fn test_self_pin_unknown_target_is_rejected_without_a_network_call() {
+        const OLD_SHA: &str = "1111111111111111111111111111111111111111";
+        const NEW_SHA: &str = "2222222222222222222222222222222222222222";
+        let old_checksum = "a".repeat(64);
+        let mut file = NamedTempFile::new().unwrap();
+        write!(
+            file,
+            "jobs:\n  update:\n    uses: rvben/upd/.github/workflows/dependency-health.yml@{OLD_SHA} # v0.14.1\n    with:\n      upd-version: v0.14.1\n      upd-target: sparc64-unknown-linux-gnu\n      upd-sha256: {old_checksum}\n"
+        )
+        .unwrap();
+
+        // No `release_asset` fixture is configured at all: a target outside
+        // `SELF_PIN_TARGETS` must be rejected before any fetch is attempted,
+        // not discovered by a fetch failing.
+        let registry = MockRegistry::new("github-releases")
+            .with_version("rvben/upd", "v0.15.0")
+            .with_resolved_ref("rvben/upd", "v0.14.1", OLD_SHA)
+            .with_resolved_ref("rvben/upd", "v0.15.0", NEW_SHA);
+        let options = UpdateOptions::new(false, false).with_action_sha_updates(true);
+
+        let result = GithubActionsUpdater::new()
+            .update(file.path(), &registry, options)
+            .await
+            .unwrap();
+
+        assert!(result.updated.is_empty());
+        assert_eq!(result.skipped.len(), 1, "skipped: {:?}", result.skipped);
+        assert_eq!(result.skipped[0].reason, "self-pin-target-unknown");
     }
 
     #[tokio::test]
@@ -2924,30 +2870,25 @@ jobs:
         )
         .unwrap();
 
-        let manifest = serde_json::json!({
-            "schema": 1,
-            "version": "v0.15.0",
-            "release_commit": NEW_SHA,
-            "assets": {
-                "x86_64-unknown-linux-gnu": {
-                    "name": "upd-v0.15.0-x86_64-unknown-linux-gnu.tar.gz",
-                    "sha256": new_checksum,
-                }
-            }
-        })
-        .to_string()
-        .into_bytes();
+        // The asset name is derived from the target version and target,
+        // never read from `release-pins.json`: at the `v0.15.0` tag itself
+        // that file would still be `v0.14.1`'s manifest, since the sync job
+        // that updates it on `main` only runs after the tag and its release
+        // assets already exist. No `repo_file_at_ref` fixture is configured
+        // here at all, which is exactly what proves this path no longer
+        // depends on it.
         let sidecar =
             format!("{new_checksum}  upd-v0.15.0-x86_64-unknown-linux-gnu.tar.gz\n").into_bytes();
-
-        let registry = SelfPinFixtureRegistry {
-            inner: MockRegistry::new("github-releases")
-                .with_version("rvben/upd", "v0.15.0")
-                .with_resolved_ref("rvben/upd", "v0.14.1", OLD_SHA)
-                .with_resolved_ref("rvben/upd", "v0.15.0", NEW_SHA),
-            manifest,
-            sidecar,
-        };
+        let registry = MockRegistry::new("github-releases")
+            .with_version("rvben/upd", "v0.15.0")
+            .with_resolved_ref("rvben/upd", "v0.14.1", OLD_SHA)
+            .with_resolved_ref("rvben/upd", "v0.15.0", NEW_SHA)
+            .with_release_asset(
+                "rvben/upd",
+                "v0.15.0",
+                "upd-v0.15.0-x86_64-unknown-linux-gnu.tar.gz.sha256",
+                sidecar,
+            );
         let options = UpdateOptions::new(false, false).with_action_sha_updates(true);
 
         let result = GithubActionsUpdater::new()
