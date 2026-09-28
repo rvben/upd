@@ -427,13 +427,20 @@ impl<'a> Session<'a> {
         let settings = &settings;
         let dir = &settings.project_dir;
 
-        if !expected_remote_sha.is_empty()
-            && !branch_is_owned(&git, settings, &default_ref, &expected_remote_sha).await?
-        {
-            if settings.dry_run {
-                return Ok(Outcome::WouldPause);
+        if !expected_remote_sha.is_empty() {
+            match claim(&git, &api, settings, &default_ref, &expected_remote_sha).await? {
+                Claim::Written => {}
+                Claim::Recorded => log.line(format_args!(
+                    "{} holds the commit its merge request records, written before the automation identity or commit message changed; replacing it",
+                    settings.branch
+                )),
+                Claim::Foreign(open) => {
+                    if settings.dry_run {
+                        return Ok(Outcome::WouldPause);
+                    }
+                    return pause(&api, settings, log, &open).await;
+                }
             }
-            return pause(&api, settings, log).await;
         }
 
         git.run([
@@ -550,7 +557,7 @@ impl<'a> Session<'a> {
         }
 
         let existing = single_open_merge_request(&api, settings).await?;
-        let description = presentation.description();
+        let description = presentation.description(&commit);
         write_artifact(settings, "upd-mr-description.md", &description)?;
 
         let created = existing.is_none();
@@ -653,15 +660,49 @@ async fn prepare_artifact_dir(git: &Git, dir: &Path) -> Result<(), Error> {
         .map_err(|error| Error::Io(format!("cannot write {}: {error}", exclude.display())))
 }
 
-/// Whether the remote automation branch holds exactly the one commit this
-/// automation writes: a single commit on top of the default branch, with the
-/// configured author, committer and message.
-async fn branch_is_owned(
+/// Why a run may, or may not, replace the existing automation branch.
+enum Claim {
+    /// One commit on the default branch, with the configured author,
+    /// committer and message.
+    Written,
+    /// One commit on the default branch that upd's open merge request
+    /// records as the one it proposes, written under an earlier identity or
+    /// message.
+    Recorded,
+    /// Work automation did not write, with the open merge requests to pause
+    /// on.
+    Foreign(Vec<Value>),
+}
+
+/// Decides whether the remote automation branch at `tip` holds exactly the
+/// one commit this automation writes. The merge requests are consulted only
+/// when the commit itself does not settle it.
+async fn claim(
     git: &Git,
+    api: &Client,
     settings: &Settings,
     default_ref: &str,
     tip: &str,
-) -> Result<bool, Error> {
+) -> Result<Claim, Error> {
+    let single = is_single_commit_on(git, default_ref, tip).await?;
+    if single && is_written_as_configured(git, settings, tip).await? {
+        return Ok(Claim::Written);
+    }
+    let open = api
+        .open_merge_requests(&settings.branch, &settings.default_branch)
+        .await?;
+    let record = present::commit_record(tip);
+    let recorded = matches!(open.as_slice(), [only]
+        if only["description"].as_str().is_some_and(|text| text.contains(&record)));
+    Ok(if single && recorded {
+        Claim::Recorded
+    } else {
+        Claim::Foreign(open)
+    })
+}
+
+/// Whether `tip` is a single commit on top of the default branch's history.
+async fn is_single_commit_on(git: &Git, default_ref: &str, tip: &str) -> Result<bool, Error> {
     let commits = git
         .read(["rev-list", "--count", &format!("{default_ref}..{tip}")])
         .await?;
@@ -670,13 +711,18 @@ async fn branch_is_owned(
     }
     let parents = git.read(["rev-list", "--parents", "-n", "1", tip]).await?;
     let parents: Vec<&str> = parents.split_whitespace().skip(1).collect();
-    if parents.len() != 1
-        || !git
+    Ok(parents.len() == 1
+        && git
             .test(["merge-base", "--is-ancestor", parents[0], default_ref])
-            .await?
-    {
-        return Ok(false);
-    }
+            .await?)
+}
+
+/// Whether `tip` carries the configured author, committer and message.
+async fn is_written_as_configured(
+    git: &Git,
+    settings: &Settings,
+    tip: &str,
+) -> Result<bool, Error> {
     let identity = git
         .read(["show", "-s", "--format=%ae%x00%ce%x00%B", tip])
         .await?;
@@ -689,9 +735,9 @@ async fn branch_is_owned(
     Ok(identity == expected)
 }
 
-/// Whether `tip`, a branch `branch_is_owned` accepted, already is the commit
+/// Whether `tip`, a branch `claim` accepted, already is the commit
 /// this run would write from the staged result: the same tree, directly on
-/// the current default branch, with the configured name and message.
+/// the current default branch, with the configured identity and message.
 async fn already_proposed(
     git: &Git,
     settings: &Settings,
@@ -710,25 +756,27 @@ async fn already_proposed(
         return Ok(false);
     }
     let identity = git
-        .read(["show", "-s", "--format=%an%x00%cn%x00%B", tip])
+        .read(["show", "-s", "--format=%an%x00%ae%x00%cn%x00%ce%x00%B", tip])
         .await?;
     let expected = format!(
-        "{}\0{}\0{}",
-        settings.git_name,
-        settings.git_name,
-        settings.commit_message.trim_end()
+        "{name}\0{email}\0{name}\0{email}\0{}",
+        settings.commit_message.trim_end(),
+        name = settings.git_name,
+        email = settings.git_email,
     );
     Ok(identity == expected)
 }
 
-async fn pause(api: &Client, settings: &Settings, log: &Log) -> Result<Outcome, Error> {
+async fn pause(
+    api: &Client,
+    settings: &Settings,
+    log: &Log,
+    open: &[Value],
+) -> Result<Outcome, Error> {
     log.line(format_args!(
         "Paused: unexpected commits on {}; leaving the branch untouched",
         settings.branch
     ));
-    let open = api
-        .open_merge_requests(&settings.branch, &settings.default_branch)
-        .await?;
     if open.len() != 1 {
         return Err(Error::Refused(format!(
             "Cannot publish a pause notice: expected one open merge request, found {}",

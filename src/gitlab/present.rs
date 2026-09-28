@@ -22,6 +22,13 @@ use serde_json::Value;
 /// compact summary.
 pub const DESCRIPTION_BUDGET: usize = 32 * 1024;
 
+/// The hidden line naming the commit a merge request proposes. It lets a
+/// later run recognise that commit as automation's own after the configured
+/// commit identity or message has changed.
+pub fn commit_record(commit: &str) -> String {
+    format!("<!-- upd-commit: {commit} -->")
+}
+
 const UNKNOWN_DEPENDENCY: &str = "unknown dependency";
 const UNKNOWN_FILE: &str = "unknown file";
 const UNKNOWN: &str = "unknown";
@@ -293,13 +300,15 @@ impl Presentation {
         clean_str(&title, 72)
     }
 
-    /// The merge-request description: the full review when it fits the
-    /// budget, otherwise a compact summary pointing at the pipeline artifact.
+    /// The merge-request description proposing `commit`: the full review
+    /// when it fits the budget, otherwise a compact summary pointing at the
+    /// pipeline artifact, and either way ending with the commit's record.
     /// Newline-terminated, as written to `upd-mr-description.md`.
-    pub fn description(&self) -> String {
-        let full = format!("{}\n", self.full_description());
+    pub fn description(&self, commit: &str) -> String {
+        let record = commit_record(commit);
+        let full = format!("{}\n\n{record}\n", self.full_description());
         if full.len() > DESCRIPTION_BUDGET {
-            format!("{}\n", self.fallback_description())
+            format!("{}\n\n{record}\n", self.fallback_description())
         } else {
             full
         }

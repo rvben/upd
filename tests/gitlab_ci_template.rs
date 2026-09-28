@@ -894,7 +894,9 @@ async fn assert_rendering_matches_golden(case: &str, run: Run) -> String {
         &(serde_json::to_string_pretty(&presentation).unwrap() + "\n"),
     );
     let description = fixture.description();
-    assert_golden(case, "description.md", &description);
+    // The commit id changes with every run's timestamps.
+    let tip = fixture.remote_tip().expect("rolling branch pushed");
+    assert_golden(case, "description.md", &description.replace(&tip, "<tip>"));
 
     let requests = server.received_requests().await.unwrap();
     let create = requests
@@ -2288,6 +2290,7 @@ async fn an_advanced_default_branch_is_built_on_even_without_new_updates() {
     list_mock(listed(&first.title, &first.description, false))
         .mount(&server)
         .await;
+    expect_description_edit(&server).await;
     let output = fixture.execute_upd(&server, &Run::default(), &["--output", "json"]);
 
     let outcome = outcome_of(&output);
@@ -2297,6 +2300,7 @@ async fn an_advanced_default_branch_is_built_on_even_without_new_updates() {
     assert_eq!(outcome["commit"], tip.as_str(), "{outcome}");
     assert_eq!(fixture.branch_pushes(), 2);
     assert_eq!(fixture.branch_commit_count(), 1);
+    assert_records(&server, &tip).await;
 }
 
 #[tokio::test]
@@ -2304,10 +2308,12 @@ async fn a_changed_automation_name_rewrites_the_commit() {
     let fixture = Fixture::new();
     let first = publish(&fixture, &Run::default()).await;
 
+    // The name is no part of ownership, so no recorded commit is needed.
     let server = MockServer::start().await;
-    list_mock(listed(&first.title, &first.description, false))
+    list_mock(listed(&first.title, "Review notes", false))
         .mount(&server)
         .await;
+    expect_description_edit(&server).await;
     let run = Run {
         git_name: "renamed bot".to_string(),
         ..Run::default()
@@ -2319,6 +2325,7 @@ async fn a_changed_automation_name_rewrites_the_commit() {
         fixture.remote_author(),
         "renamed bot <upd-test@example.com>|renamed bot <upd-test@example.com>|chore(deps): test update"
     );
+    assert_records(&server, &fixture.remote_tip().unwrap()).await;
 }
 
 #[tokio::test]
@@ -2389,4 +2396,228 @@ fn run_git_in_remote(fixture: &Fixture, args: &[&str]) -> String {
         .arg(format!("--git-dir={}", fixture.remote.display()))
         .args(args));
     String::from_utf8(output.stdout).unwrap()
+}
+
+fn commit_marker(commit: &str) -> String {
+    format!("<!-- upd-commit: {commit} -->")
+}
+
+/// Serves merge request 7 as `listed` for every lookup and accepts edits.
+async fn serve_merge_request(server: &MockServer, listed: serde_json::Value) {
+    Mock::given(method("GET"))
+        .and(path("/api/v4/projects/1/merge_requests"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(listed))
+        .mount(server)
+        .await;
+    Mock::given(method("PUT"))
+        .and(path("/api/v4/projects/1/merge_requests/7"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(mr_response(7, false)))
+        .mount(server)
+        .await;
+}
+
+async fn assert_rewrites_the_recorded_commit(changed: Run, author: &str) {
+    let fixture = Fixture::new();
+    let first = publish(&fixture, &Run::default()).await;
+    assert!(
+        first
+            .description
+            .ends_with(&format!("\n\n{}\n", commit_marker(&first.tip))),
+        "the description does not record the commit it proposes:\n{}",
+        first.description
+    );
+
+    let server = MockServer::start().await;
+    serve_merge_request(&server, listed(&first.title, &first.description, false)).await;
+    let output = fixture.execute_upd(&server, &changed, &["--output", "json"]);
+
+    let outcome = outcome_of(&output);
+    assert_eq!(outcome["outcome"], "published", "{outcome}");
+    assert_eq!(outcome["pushed"], true, "{outcome}");
+    let tip = fixture.remote_tip().unwrap();
+    assert_ne!(tip, first.tip);
+    assert_eq!(outcome["commit"], tip.as_str(), "{outcome}");
+    assert_eq!(fixture.remote_author(), author);
+    assert_eq!(fixture.branch_commit_count(), 1);
+    assert_records(&server, &tip).await;
+}
+
+/// Accepts exactly one edit of merge request 7.
+async fn expect_description_edit(server: &MockServer) {
+    Mock::given(method("PUT"))
+        .and(path("/api/v4/projects/1/merge_requests/7"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(mr_response(7, false)))
+        .expect(1)
+        .mount(server)
+        .await;
+}
+
+/// Requires the merge request edit `server` received to record `tip`, and
+/// no other commit.
+async fn assert_records(server: &MockServer, tip: &str) {
+    let requests = server.received_requests().await.unwrap();
+    let edit = requests
+        .iter()
+        .find(|request| request.method.as_str() == "PUT")
+        .expect("the merge request is refreshed");
+    let description = json_body(edit)["description"].as_str().unwrap().to_string();
+    assert!(
+        description.ends_with(&format!("\n\n{}\n", commit_marker(tip))),
+        "{description}"
+    );
+    assert_eq!(
+        description.matches("<!-- upd-commit: ").count(),
+        1,
+        "{description}"
+    );
+}
+
+#[tokio::test]
+async fn a_changed_commit_message_rewrites_the_commit_its_merge_request_records() {
+    assert_rewrites_the_recorded_commit(
+        Run {
+            commit_message: "build(deps): refresh with upd".to_string(),
+            ..Run::default()
+        },
+        "upd test <upd-test@example.com>|upd test <upd-test@example.com>|build(deps): refresh with upd",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn a_changed_automation_email_rewrites_the_commit_its_merge_request_records() {
+    assert_rewrites_the_recorded_commit(
+        Run {
+            git_email: "bot@example.com".to_string(),
+            ..Run::default()
+        },
+        "upd test <bot@example.com>|upd test <bot@example.com>|chore(deps): test update",
+    )
+    .await;
+}
+
+/// Runs `run` against merge request 7 described as `description` and
+/// requires it to pause, leaving the branch at `tip`.
+async fn assert_pauses(fixture: &Fixture, run: &Run, description: &str, tip: &str) {
+    let server = MockServer::start().await;
+    let mut existing = mr_list_response(7, false);
+    existing[0]["description"] = json!(description);
+    list_mock(existing).mount(&server).await;
+    Mock::given(method("PUT"))
+        .and(path("/api/v4/projects/1/merge_requests/7"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(mr_response(7, false)))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let output = fixture.execute_upd(&server, run, &["--output", "json"]);
+
+    let outcome = outcome_of(&output);
+    assert_eq!(outcome["outcome"], "paused", "{outcome}");
+    assert_eq!(outcome["notice_added"], true, "{outcome}");
+    assert_eq!(fixture.remote_tip().as_deref(), Some(tip));
+}
+
+#[tokio::test]
+async fn a_changed_message_without_a_recorded_commit_still_pauses() {
+    let fixture = Fixture::new();
+    let first = publish(&fixture, &Run::default()).await;
+    let changed = Run {
+        commit_message: "build(deps): refresh with upd".to_string(),
+        ..Run::default()
+    };
+
+    // A description that records nothing, as releases before the record wrote.
+    assert_pauses(&fixture, &changed, "Review notes", &first.tip).await;
+}
+
+#[tokio::test]
+async fn a_human_commit_on_the_recorded_commit_still_pauses() {
+    let fixture = Fixture::new();
+    let first = publish(&fixture, &Run::default()).await;
+    let human_tip = push_human_commit(&fixture);
+    let changed = Run {
+        commit_message: "build(deps): refresh with upd".to_string(),
+        ..Run::default()
+    };
+
+    assert_pauses(&fixture, &changed, &first.description, &human_tip).await;
+}
+
+#[tokio::test]
+async fn an_older_recorded_commit_does_not_claim_a_replaced_branch() {
+    let fixture = Fixture::new();
+    let first = publish(&fixture, &Run::default()).await;
+    // Someone replaces the branch with their own single commit.
+    git(
+        &fixture.checkout,
+        &["switch", "--force-create", "human-work", "main"],
+    );
+    fs::write(fixture.checkout.join("dependency.txt"), "by hand\n").unwrap();
+    git(&fixture.checkout, &["add", "dependency.txt"]);
+    git(
+        &fixture.checkout,
+        &[
+            "-c",
+            "user.name=Human Maintainer",
+            "-c",
+            "user.email=human@example.com",
+            "commit",
+            "-m",
+            "fix: pin by hand",
+        ],
+    );
+    git(
+        &fixture.checkout,
+        &[
+            "push",
+            "--force",
+            "origin",
+            &format!("HEAD:refs/heads/{BRANCH}"),
+        ],
+    );
+    git(&fixture.checkout, &["switch", "main"]);
+    let human_tip = fixture.remote_tip().unwrap();
+
+    assert_pauses(&fixture, &Run::default(), &first.description, &human_tip).await;
+}
+
+#[tokio::test]
+async fn a_recorded_commit_off_the_default_branch_history_still_pauses() {
+    let fixture = Fixture::new();
+    let first = publish(&fixture, &Run::default()).await;
+    // The default branch is rewritten under the rolling branch.
+    git(&fixture.checkout, &["switch", "main"]);
+    git(
+        &fixture.checkout,
+        &["commit", "--amend", "-m", "test: initial, rewritten"],
+    );
+    git(&fixture.checkout, &["push", "--force", "origin", "main"]);
+    let changed = Run {
+        commit_message: "build(deps): refresh with upd".to_string(),
+        ..Run::default()
+    };
+
+    assert_pauses(&fixture, &changed, &first.description, &first.tip).await;
+}
+
+#[tokio::test]
+async fn a_dry_run_reports_a_recorded_commit_as_rewritten() {
+    let fixture = Fixture::new();
+    let first = publish(&fixture, &Run::default()).await;
+    let server = MockServer::start().await;
+    serve_merge_request(&server, listed(&first.title, &first.description, false)).await;
+    let changed = Run {
+        commit_message: "build(deps): refresh with upd".to_string(),
+        ..Run::default()
+    };
+
+    let output = fixture.execute_upd(&server, &changed, &["--dry-run", "--output", "json"]);
+
+    let outcome = outcome_of(&output);
+    assert_eq!(outcome["outcome"], "would_publish", "{outcome}");
+    assert_eq!(outcome["push"], true, "{outcome}");
+    assert_eq!(fixture.remote_tip().as_deref(), Some(first.tip.as_str()));
+    let writes = writes(&server.received_requests().await.unwrap());
+    assert!(writes.is_empty(), "a dry run wrote to GitLab: {writes:?}");
 }

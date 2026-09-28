@@ -158,9 +158,16 @@ someone needs to adapt an update, they can commit to the automation branch;
 scheduled runs will leave that work in place. Automation resumes after those
 commits are removed or the merge request is resolved. The check expects the
 existing branch to contain one commit, based on the default branch's history,
-with the configured automation author, committer, and commit message. Changing
-that identity or message while a merge request is open therefore also pauses
-the branch.
+that automation wrote: either a commit with the configured automation author
+and committer email and the exact commit message, or the commit that the
+single open merge request's description records in a hidden
+`<!-- upd-commit: ... -->` line. Every publishing run writes that record, so a
+run can still replace its own commit after the `commit_message` input or
+`UPD_GIT_EMAIL` changes while a merge request is open. A merge request whose
+description lacks the record, such as one last updated by an earlier upd version,
+still pauses after such a change; delete the automation branch to let the
+next run start over. The name is not part of the check, so changing
+`UPD_GIT_NAME` alone never pauses.
 
 Treat the configured branch, generated commit, title, and description as
 automation-owned unless intentionally pausing the branch as above.
