@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.13.5](https://github.com/rvben/upd/compare/v0.13.4...v0.13.5) - 2026-09-28
+
+### Fixed
+
+- **fix-audit**: treat a manifest-blocked precise relock as blocked, not an error ([552b7be](https://github.com/rvben/upd/commit/552b7be787c6773af22f3fda2ac853bd391c28d6))
+
 ## [0.13.4](https://github.com/rvben/upd/compare/v0.13.3...v0.13.4) - 2026-09-28
 
 ### Added
