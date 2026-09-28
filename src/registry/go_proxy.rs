@@ -1,20 +1,14 @@
 #[cfg(test)]
 use super::utils::read_netrc_credentials_from_path;
 use super::utils::{base64_encode, read_netrc_credentials};
-use super::{Registry, VersionMeta, http_error_message};
+use super::{Registry, VersionMeta, get_with_retry, http_error_message};
 use anyhow::{Result, anyhow};
 use async_trait::async_trait;
 use futures::future::join_all;
+use reqwest::Client;
 use reqwest::header::{AUTHORIZATION, HeaderMap, HeaderValue};
-use reqwest::{Client, Response};
 use serde::Deserialize;
 use std::time::Duration;
-
-/// Maximum number of retry attempts for failed HTTP requests
-const MAX_RETRIES: u32 = 3;
-
-/// Base delay for exponential backoff (100ms, 200ms, 400ms)
-const BASE_DELAY_MS: u64 = 100;
 
 /// Configuration for Go private modules from environment variables
 #[derive(Debug, Clone, Default)]
@@ -237,34 +231,12 @@ impl GoProxyRegistry {
         None
     }
 
-    /// Execute a GET request with retry
-    async fn get_with_retry(&self, url: &str) -> anyhow::Result<Response> {
-        let mut last_error = None;
-
-        for attempt in 0..MAX_RETRIES {
-            match self.client.get(url).send().await {
-                Ok(response) => {
-                    if response.status().is_client_error() || response.status().is_success() {
-                        return Ok(response);
-                    }
-                    if response.status().is_server_error() && attempt < MAX_RETRIES - 1 {
-                        let delay = Duration::from_millis(BASE_DELAY_MS * (1 << attempt));
-                        tokio::time::sleep(delay).await;
-                        continue;
-                    }
-                    return Ok(response);
-                }
-                Err(e) => {
-                    last_error = Some(e);
-                    if attempt < MAX_RETRIES - 1 {
-                        let delay = Duration::from_millis(BASE_DELAY_MS * (1 << attempt));
-                        tokio::time::sleep(delay).await;
-                    }
-                }
-            }
-        }
-
-        Err(crate::http::wrap_send_err(last_error.unwrap(), url))
+    /// Execute a GET request with retry, delegating to the shared
+    /// implementation so a 429 gets the same honored-`Retry-After` backoff
+    /// every other registry gets, instead of a copy that treats it as an
+    /// ordinary non-retryable 4xx.
+    async fn get_with_retry(&self, url: &str) -> anyhow::Result<reqwest::Response> {
+        get_with_retry(&self.client, url).await
     }
 
     /// Fetch list of all versions for a module
@@ -837,6 +809,54 @@ mod tests {
                 .iter()
                 .any(|v| v.version == "v1.10.0" && v.published_at.is_some())
         );
+    }
+
+    #[tokio::test]
+    async fn test_go_proxy_list_versions_retries_on_rate_limit() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+        let call_count = Arc::new(AtomicUsize::new(0));
+        let call_count_clone = call_count.clone();
+
+        // First call is rate limited, second succeeds. Before delegating to
+        // the shared get_with_retry, this registry's own retry loop treated
+        // 429 as an ordinary non-retryable 4xx and returned it immediately
+        // instead of backing off and trying again.
+        Mock::given(method("GET"))
+            .and(path("/github.com/stretchr/testify/@v/list"))
+            .respond_with(move |_: &wiremock::Request| {
+                let count = call_count_clone.fetch_add(1, Ordering::SeqCst);
+                if count == 0 {
+                    ResponseTemplate::new(429)
+                } else {
+                    ResponseTemplate::new(200).set_body_string("v1.9.0\n")
+                }
+            })
+            .expect(2)
+            .mount(&mock_server)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path("/github.com/stretchr/testify/@v/v1.9.0.info"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string(r#"{"Version": "v1.9.0", "Time": "2024-01-15T10:00:00Z"}"#),
+            )
+            .mount(&mock_server)
+            .await;
+
+        let registry = GoProxyRegistry::with_proxy_url(mock_server.uri());
+        let versions = registry
+            .list_versions("github.com/stretchr/testify")
+            .await
+            .unwrap();
+
+        assert_eq!(versions.len(), 1);
+        assert_eq!(versions[0].version, "v1.9.0");
     }
 
     /// `/@v/list` is unordered, so the newest release can sit anywhere in the

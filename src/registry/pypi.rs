@@ -1,7 +1,7 @@
 #[cfg(test)]
 use super::utils::read_netrc_credentials_from_path;
 use super::utils::{base64_encode, read_netrc_credentials, read_pip_config};
-use super::{Registry, VersionMeta, VersionQuery, http_error_message};
+use super::{Registry, VersionMeta, VersionQuery, get_with_retry_and_headers, http_error_message};
 use anyhow::{Result, anyhow};
 use async_trait::async_trait;
 use pep440_rs::{Version, VersionSpecifiers};
@@ -13,12 +13,6 @@ use std::hash::{DefaultHasher, Hash, Hasher};
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
-
-/// Maximum number of retry attempts for failed HTTP requests
-const MAX_RETRIES: u32 = 3;
-
-/// Base delay for exponential backoff (100ms, 200ms, 400ms)
-const BASE_DELAY_MS: u64 = 100;
 
 /// Credentials for authenticating with a PyPI registry
 #[derive(Clone)]
@@ -357,49 +351,16 @@ impl PyPiRegistry {
         self.get_with_retry_and_headers(url, None).await
     }
 
-    /// Execute a GET request with retry, authentication, and custom headers
+    /// Execute a GET request with retry, authentication, and custom headers,
+    /// delegating to the shared implementation so a 429 gets the same
+    /// honored-`Retry-After` backoff every other registry gets, instead of a
+    /// copy that treats it as an ordinary non-retryable 4xx.
     async fn get_with_retry_and_headers(
         &self,
         url: &str,
         headers: Option<HeaderMap>,
     ) -> anyhow::Result<Response> {
-        let mut last_error = None;
-
-        for attempt in 0..MAX_RETRIES {
-            let mut request = self.client.get(url);
-            if let Some(ref h) = headers {
-                request = request.headers(h.clone());
-            }
-
-            match request.send().await {
-                Ok(response) => {
-                    // Don't retry client errors (4xx) - they won't succeed on retry
-                    if response.status().is_client_error() || response.status().is_success() {
-                        return Ok(response);
-                    }
-
-                    // Retry server errors (5xx)
-                    if response.status().is_server_error() && attempt < MAX_RETRIES - 1 {
-                        let delay = Duration::from_millis(BASE_DELAY_MS * (1 << attempt));
-                        tokio::time::sleep(delay).await;
-                        continue;
-                    }
-
-                    return Ok(response);
-                }
-                Err(e) => {
-                    last_error = Some(e);
-
-                    // Don't retry on the last attempt
-                    if attempt < MAX_RETRIES - 1 {
-                        let delay = Duration::from_millis(BASE_DELAY_MS * (1 << attempt));
-                        tokio::time::sleep(delay).await;
-                    }
-                }
-            }
-        }
-
-        Err(crate::http::wrap_send_err(last_error.unwrap(), url))
+        get_with_retry_and_headers(&self.client, url, headers.as_ref()).await
     }
 
     fn is_stable_version(version_str: &str) -> bool {
@@ -2391,5 +2352,47 @@ mod tests {
 
         let v_1_0 = versions.iter().find(|v| v.version == "1.0.0").unwrap();
         assert!(v_1_0.yanked);
+    }
+
+    #[tokio::test]
+    async fn test_pypi_list_versions_retries_on_rate_limit() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+        let call_count = Arc::new(AtomicUsize::new(0));
+        let call_count_clone = call_count.clone();
+
+        // First call is rate limited, second succeeds. Before delegating to
+        // the shared get_with_retry_and_headers, this registry's own retry
+        // loop treated 429 as an ordinary non-retryable 4xx and returned it
+        // immediately instead of backing off and trying again.
+        Mock::given(method("GET"))
+            .and(path("/pypi/requests/json"))
+            .respond_with(move |_: &wiremock::Request| {
+                let count = call_count_clone.fetch_add(1, Ordering::SeqCst);
+                if count == 0 {
+                    ResponseTemplate::new(429)
+                } else {
+                    ResponseTemplate::new(200).set_body_string(
+                        r#"{
+                          "releases": {
+                            "2.31.0": [{"yanked": false, "upload_time_iso_8601": "2024-05-20T10:00:00.000000Z"}]
+                          }
+                        }"#,
+                    )
+                }
+            })
+            .expect(2)
+            .mount(&mock_server)
+            .await;
+
+        let registry = PyPiRegistry::with_index_url(mock_server.uri());
+        let versions = registry.list_versions("requests").await.unwrap();
+
+        assert_eq!(versions.len(), 1);
+        assert_eq!(versions[0].version, "2.31.0");
     }
 }

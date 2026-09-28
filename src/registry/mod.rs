@@ -39,6 +39,7 @@ pub(crate) use terraform::matches_terraform_constraint;
 
 use anyhow::{Result, anyhow};
 use async_trait::async_trait;
+use reqwest::header::HeaderMap;
 use reqwest::{Client, Response};
 use std::time::Duration;
 
@@ -57,10 +58,29 @@ const MAX_RETRY_AFTER_SECS: u64 = 10;
 /// Retries on transient errors (network issues, 5xx server errors, and 429
 /// rate limiting).
 pub async fn get_with_retry(client: &Client, url: &str) -> anyhow::Result<Response> {
+    get_with_retry_and_headers(client, url, None).await
+}
+
+/// Execute an HTTP GET request with retry, exponential backoff, and optional
+/// per-request headers merged onto the client's defaults.
+///
+/// A registry that needs one-off headers on top of its client's defaults (PyPI's
+/// PEP 691 `Accept` negotiation, for one) still gets the same 429/5xx retry
+/// behavior as every other registry, rather than a hand-rolled copy that can
+/// drift from it.
+pub async fn get_with_retry_and_headers(
+    client: &Client,
+    url: &str,
+    headers: Option<&HeaderMap>,
+) -> anyhow::Result<Response> {
     let mut last_error = None;
 
     for attempt in 0..MAX_RETRIES {
-        match client.get(url).send().await {
+        let mut request = client.get(url);
+        if let Some(headers) = headers {
+            request = request.headers(headers.clone());
+        }
+        match request.send().await {
             Ok(response) => {
                 let status = response.status();
 
