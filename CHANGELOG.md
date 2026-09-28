@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.14.3](https://github.com/rvben/upd/compare/v0.14.2...v0.14.3) - 2026-09-28
+
+### Added
+
+- **github-actions**: warn prominently on a blocked rvben/upd self-pin ([36b60bd](https://github.com/rvben/upd/commit/36b60bd91631de3b4a3271224f8369801ec37427))
+
+### Fixed
+
+- **gitlab**: leave an up-to-date rolling branch and merge request alone ([011075d](https://github.com/rvben/upd/commit/011075df649b9e5ca4de1cc4d55858a1204c004d))
+- **gitlab**: report a linked org configuration file as a link ([9315c19](https://github.com/rvben/upd/commit/9315c199d77a5de661ddbdd2b6d170b8d68172c6))
+- **github-actions**: stop sourcing the self-pin checksum from release-pins.json at the tag ([f80e361](https://github.com/rvben/upd/commit/f80e36160ae29a9d0c6d63acfa5c468f32bf57c4))
+- **registry**: forward repo_file_at_ref and release_asset through CachedRegistry ([22a3931](https://github.com/rvben/upd/commit/22a39318c63aae2ff754d8a32b52983ec53771ad))
+
 ## [0.14.2](https://github.com/rvben/upd/compare/v0.14.1...v0.14.2) - 2026-09-28
 
 ### Added
