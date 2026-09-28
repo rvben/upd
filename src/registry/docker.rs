@@ -1,7 +1,7 @@
 use super::docker_credentials::{Credential, Credentials};
 use super::{
-    Registry, TagsAtCommit, VersionMeta, get_with_retry, no_ref_names, ref_resolution_unsupported,
-    tags_at_commit_unsupported,
+    GitHubReleasesRegistry, Registry, TagsAtCommit, VersionMeta, get_with_retry, no_ref_names,
+    ref_resolution_unsupported, tags_at_commit_unsupported,
 };
 use anyhow::{Context, Result, anyhow};
 use async_trait::async_trait;
@@ -128,11 +128,27 @@ impl DockerRegistry {
             docker_hub_api,
             oci_base_override,
             credentials: Credentials::new(),
-            github_credentials: std::env::var("GITHUB_ACTOR")
-                .ok()
-                .zip(std::env::var("GITHUB_TOKEN").ok())
-                .filter(|(actor, token)| !actor.is_empty() && !token.is_empty()),
+            github_credentials: Self::detect_github_credentials(),
         }
+    }
+
+    /// Detect credentials for the GHCR token endpoint.
+    ///
+    /// `GITHUB_ACTOR`/`GITHUB_TOKEN` are what a GitHub Actions runner sets
+    /// automatically. Neither is set on a developer's machine, so the token
+    /// half falls back to the same `GITHUB_TOKEN`/`GH_TOKEN`/`gh auth token`
+    /// chain used for the GitHub API registry - a user with an authenticated
+    /// `gh` CLI session gets working GHCR auth instead of silent anonymous
+    /// requests. GHCR's token endpoint accepts any non-empty username
+    /// alongside a valid PAT, so a missing actor becomes a placeholder rather
+    /// than blocking the fallback on knowing the real login.
+    fn detect_github_credentials() -> Option<(String, String)> {
+        let token = GitHubReleasesRegistry::detect_token()?;
+        let actor = std::env::var("GITHUB_ACTOR")
+            .ok()
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "x-access-token".to_string());
+        Some((actor, token))
     }
 
     /// Keep the image name and its current tag together through the generic
@@ -1011,6 +1027,48 @@ mod tests {
             .build()
             .unwrap();
         assert!(wrong_path.headers().get(AUTHORIZATION).is_none());
+    }
+
+    #[test]
+    fn detect_github_credentials_uses_the_actual_actor_when_set() {
+        // With GITHUB_TOKEN and GITHUB_ACTOR both set (a GitHub Actions
+        // runner sets both), the gh CLI fallback is never evaluated, so this
+        // is safe to assert without a real `gh` binary on PATH.
+        // SAFETY: the Makefile runs tests single-threaded.
+        unsafe {
+            std::env::set_var("GITHUB_TOKEN", "env-token");
+            std::env::set_var("GITHUB_ACTOR", "octocat");
+        }
+        assert_eq!(
+            DockerRegistry::detect_github_credentials(),
+            Some(("octocat".to_string(), "env-token".to_string()))
+        );
+        // SAFETY: the Makefile runs tests single-threaded.
+        unsafe {
+            std::env::remove_var("GITHUB_TOKEN");
+            std::env::remove_var("GITHUB_ACTOR");
+        }
+    }
+
+    #[test]
+    fn detect_github_credentials_falls_back_to_a_placeholder_actor() {
+        // A developer's machine has no GITHUB_ACTOR, only a token (here via
+        // the env var, which is evaluated before the gh CLI fallback and so
+        // needs no real `gh` binary). GHCR accepts any non-empty username
+        // alongside a valid token, so a placeholder must not block auth.
+        // SAFETY: the Makefile runs tests single-threaded.
+        unsafe {
+            std::env::remove_var("GITHUB_ACTOR");
+            std::env::set_var("GITHUB_TOKEN", "env-token");
+        }
+        assert_eq!(
+            DockerRegistry::detect_github_credentials(),
+            Some(("x-access-token".to_string(), "env-token".to_string()))
+        );
+        // SAFETY: the Makefile runs tests single-threaded.
+        unsafe {
+            std::env::remove_var("GITHUB_TOKEN");
+        }
     }
 
     #[tokio::test]
