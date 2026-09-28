@@ -29,6 +29,21 @@ struct ScannedShaPin {
     pinned_version: Option<String>,
 }
 
+/// The `upd-version`/`upd-sha256`/`upd-target` inputs beside a `rvben/upd`
+/// self-pin, as found in the `with:` block under its `uses:` line.
+///
+/// `upd-version` and `upd-sha256` name one release together and move as a
+/// pair: a version rewritten without its checksum, or a checksum without its
+/// version, silently breaks a pin whose entire purpose is that the three
+/// values agree. `upd-target` is read-only here, since it says which asset
+/// the checksum belongs to rather than a version that could drift.
+#[derive(Debug, Clone, Default)]
+struct SelfPinSiblings {
+    upd_version_line: Option<(usize, String)>,
+    upd_sha256_line: Option<(usize, String)>,
+    upd_target: Option<String>,
+}
+
 /// A SHA pin with its release established, one way or another.
 #[derive(Debug, Clone)]
 struct ShaAction {
@@ -111,6 +126,114 @@ impl RecoveryFailure {
             Self::Unsupported | Self::Failed(_) => annotate.to_string(),
         }
     }
+}
+
+/// Why `rvben/upd`'s own `upd-version`/`upd-sha256` siblings could not be
+/// safely advanced alongside its self-pin, leaving the whole triple untouched.
+///
+/// The self-pin exemption only ever bypasses `max-bump`; every other safety
+/// condition still applies, and a fetch that cannot establish a trustworthy
+/// checksum is exactly the kind of condition that must refuse the write
+/// rather than guess.
+#[derive(Debug, Clone)]
+enum SelfPinFetchFailure {
+    /// `upd-target` names a target `release-pins.json` has no asset for.
+    TargetUnknown(String),
+    /// `release-pins.json` could not be read, or could not be parsed, at the
+    /// target release tag.
+    ManifestUnavailable(String),
+    /// The release's `<asset>.sha256` sidecar could not be read, or did not
+    /// contain a recognizable digest.
+    ChecksumUnavailable(String),
+    /// The manifest and the sidecar name different checksums for the same
+    /// asset, so neither is trusted on its own.
+    ChecksumMismatch { manifest: String, sidecar: String },
+}
+
+impl SelfPinFetchFailure {
+    /// Stable token for machine-readable output.
+    fn reason(&self) -> &'static str {
+        match self {
+            Self::TargetUnknown(_) => "self-pin-target-unknown",
+            Self::ManifestUnavailable(_) => "self-pin-manifest-unavailable",
+            Self::ChecksumUnavailable(_) => "self-pin-checksum-unavailable",
+            Self::ChecksumMismatch { .. } => "self-pin-checksum-mismatch",
+        }
+    }
+
+    fn message(&self, owner_repo: &str, target_version: &str) -> String {
+        match self {
+            Self::TargetUnknown(target) => format!(
+                "{owner_repo}'s release-pins.json at {target_version} has no asset for target {target}"
+            ),
+            Self::ManifestUnavailable(error) => format!(
+                "could not read {owner_repo}'s release-pins.json at {target_version}: {error}"
+            ),
+            Self::ChecksumUnavailable(error) => format!(
+                "could not read the release checksum sidecar for {owner_repo}@{target_version}: {error}"
+            ),
+            Self::ChecksumMismatch { manifest, sidecar } => format!(
+                "{owner_repo}@{target_version}'s release-pins.json checksum {manifest} disagrees with its release checksum sidecar {sidecar}"
+            ),
+        }
+    }
+}
+
+/// Read the checksum for `target` out of `rvben/upd`'s release assets for
+/// `target_version`, cross-checked between two independent sources.
+///
+/// `release-pins.json` at the target tag names the asset for `target` and its
+/// expected checksum; the release's own `<asset>.sha256` sidecar is fetched
+/// independently and must agree. Reading the manifest only from `main` would
+/// let a self-pin trust a file that can already have moved past the release
+/// being pinned to, so both reads are pinned to `target_version` itself.
+async fn fetch_self_pin_checksum(
+    registry: &dyn Registry,
+    target_version: &str,
+    target: &str,
+) -> std::result::Result<String, SelfPinFetchFailure> {
+    let manifest_bytes = registry
+        .repo_file_at_ref("rvben/upd", target_version, "release-pins.json")
+        .await
+        .map_err(|error| SelfPinFetchFailure::ManifestUnavailable(error.to_string()))?;
+    let manifest: serde_json::Value = serde_json::from_slice(&manifest_bytes)
+        .map_err(|error| SelfPinFetchFailure::ManifestUnavailable(error.to_string()))?;
+    let asset = manifest.get("assets").and_then(|assets| assets.get(target));
+    let manifest_sha256 = asset
+        .and_then(|asset| asset.get("sha256"))
+        .and_then(|value| value.as_str())
+        .ok_or_else(|| SelfPinFetchFailure::TargetUnknown(target.to_string()))?
+        .to_string();
+    let asset_name = asset
+        .and_then(|asset| asset.get("name"))
+        .and_then(|value| value.as_str())
+        .ok_or_else(|| SelfPinFetchFailure::TargetUnknown(target.to_string()))?;
+
+    let sidecar_bytes = registry
+        .release_asset("rvben/upd", target_version, &format!("{asset_name}.sha256"))
+        .await
+        .map_err(|error| SelfPinFetchFailure::ChecksumUnavailable(error.to_string()))?;
+    let sidecar_text = String::from_utf8_lossy(&sidecar_bytes);
+    let sidecar_sha256 = sidecar_text
+        .split_whitespace()
+        .next()
+        .filter(|candidate| {
+            candidate.len() == 64 && candidate.bytes().all(|byte| byte.is_ascii_hexdigit())
+        })
+        .ok_or_else(|| {
+            SelfPinFetchFailure::ChecksumUnavailable(
+                "sidecar did not contain a 64-character hex digest".to_string(),
+            )
+        })?
+        .to_ascii_lowercase();
+
+    if manifest_sha256.to_ascii_lowercase() != sidecar_sha256 {
+        return Err(SelfPinFetchFailure::ChecksumMismatch {
+            manifest: manifest_sha256,
+            sidecar: sidecar_sha256,
+        });
+    }
+    Ok(sidecar_sha256)
 }
 
 /// Resolve a hand-written version string to the commit it names.
@@ -404,6 +527,87 @@ impl GithubActionsUpdater {
         }
     }
 
+    /// Whether an action reference names `rvben/upd`'s own reusable workflows.
+    ///
+    /// A repository consuming `dependency-health.yml` or
+    /// `dependency-remediation.yml` is always eligible to advance that pin to
+    /// this project's own newest release, regardless of the repository's
+    /// configured `max-bump`: the ceiling exists to bound how aggressively
+    /// third-party actions move, not to hold this project's own supply chain
+    /// behind hand-rolled pin rollouts every time it ships.
+    fn is_upd_self_pin(owner_repo: &str) -> bool {
+        owner_repo == "rvben/upd"
+    }
+
+    /// Find the `upd-version`, `upd-sha256`, and `upd-target` lines in the
+    /// `with:` block directly beneath a self-pin's `uses:` line.
+    ///
+    /// The block ends at the first non-blank line indented no deeper than the
+    /// `uses:` line itself, the same rule YAML uses to end any mapping; a key
+    /// at that indent or shallower belongs to a different job and is never
+    /// read. `with:` keys are otherwise unordered, so each one is matched by
+    /// name rather than position.
+    fn scan_self_pin_siblings(all_lines: &[&str], uses_line_idx: usize) -> SelfPinSiblings {
+        let mut siblings = SelfPinSiblings::default();
+        let Some(uses_line) = all_lines.get(uses_line_idx) else {
+            return siblings;
+        };
+        let uses_indent = Self::indent_of(uses_line);
+        let mut in_with_block = false;
+        let mut with_indent = 0usize;
+
+        for (idx, line) in all_lines.iter().enumerate().skip(uses_line_idx + 1) {
+            if line.trim().is_empty() {
+                continue;
+            }
+            let indent = Self::indent_of(line);
+            // `with:` (like `runner:`, `secrets:`, or any other job key) is a
+            // sibling of `uses:`, not a child of it, so it sits at the same
+            // indentation. Only a strictly shallower line means the job
+            // mapping itself has ended.
+            if indent < uses_indent {
+                break;
+            }
+            let trimmed = line.trim_start();
+            if !in_with_block {
+                if trimmed.starts_with("with:") {
+                    in_with_block = true;
+                    with_indent = indent;
+                }
+                continue;
+            }
+            if indent <= with_indent {
+                break;
+            }
+            if let Some(value) = trimmed.strip_prefix("upd-version:") {
+                siblings.upd_version_line = Some((idx, Self::unquote(value.trim())));
+            } else if let Some(value) = trimmed.strip_prefix("upd-sha256:") {
+                siblings.upd_sha256_line = Some((idx, Self::unquote(value.trim())));
+            } else if let Some(value) = trimmed.strip_prefix("upd-target:") {
+                siblings.upd_target = Some(Self::unquote(value.trim()));
+            }
+        }
+
+        siblings
+    }
+
+    fn indent_of(line: &str) -> usize {
+        line.len() - line.trim_start().len()
+    }
+
+    /// Strip one layer of matching quotes a scalar `with:` value may carry.
+    fn unquote(value: &str) -> String {
+        let bytes = value.as_bytes();
+        if bytes.len() >= 2
+            && (value.starts_with('"') && value.ends_with('"')
+                || value.starts_with('\'') && value.ends_with('\''))
+        {
+            value[1..value.len() - 1].to_string()
+        } else {
+            value.to_string()
+        }
+    }
+
     /// Parse dependencies from content string (for testing without file I/O)
     pub fn parse_dependencies_from_content(&self, content: &str) -> Vec<ParsedDependency> {
         let mut deps = Vec::new();
@@ -492,6 +696,10 @@ impl Updater for GithubActionsUpdater {
     ) -> Result<UpdateResult> {
         let content = read_file_safe(path)?;
         let mut result = UpdateResult::default();
+        // Random-access view of the same lines `content.lines()` yields
+        // elsewhere in this function, used to scan forward from a self-pin's
+        // `uses:` line to its `with:` siblings without re-walking the file.
+        let all_lines: Vec<&str> = content.lines().collect();
 
         // Pass 1: Collect actions to check
         // Store: (line_idx, owner_repo, version_ref)
@@ -820,11 +1028,22 @@ impl Updater for GithubActionsUpdater {
 
         // Pass 3: Apply updates
         let mut new_lines: Vec<String> = Vec::new();
+        // Rewrites to `upd-version`/`upd-sha256` sibling lines, staged while
+        // processing a self-pin's `uses:` line and applied here once the
+        // forward loop reaches them. They are lines this pass would otherwise
+        // copy through unchanged, since neither `sha_action_info` nor
+        // `version_map` below has any entry for a plain `with:` input line.
+        let mut pending_self_pin_rewrites: HashMap<usize, String> = HashMap::new();
         in_block_scalar = false;
         block_parent_indent = 0;
 
         for (line_idx, line) in content.lines().enumerate() {
             let line_num = line_idx + 1;
+
+            if let Some(rewritten) = pending_self_pin_rewrites.remove(&line_idx) {
+                new_lines.push(rewritten);
+                continue;
+            }
 
             // Track block scalar context (for correct line output)
             if in_block_scalar {
@@ -930,6 +1149,12 @@ impl Updater for GithubActionsUpdater {
                 };
 
                 let is_config_pinned = action.pinned_version.is_some();
+                // `rvben/upd`'s own reusable workflows are always eligible to
+                // advance to this project's newest release: the ceiling below
+                // bounds third-party actions, not this project's own supply
+                // chain. Cooldown, downgrade checks, and every other safety
+                // condition still apply in full; only `max-bump` is bypassed.
+                let is_self_pin = Self::is_upd_self_pin(&action.owner_repo);
                 let target_result = match &action.pinned_version {
                     Some(version) => Ok(version.clone()),
                     None => repo_versions
@@ -1049,7 +1274,10 @@ impl Updater for GithubActionsUpdater {
                     new_lines.push(kept_line);
                     continue;
                 }
-                if !is_config_pinned && !options.allows_bump(&current_version, &target_version) {
+                if !is_config_pinned
+                    && !is_self_pin
+                    && !options.allows_bump(&current_version, &target_version)
+                {
                     // The update is known and writable; only the ceiling holds it
                     // back, which is `capped` rather than a `Blocked` skip. The
                     // other blocked reasons mean the line cannot be updated at
@@ -1124,6 +1352,86 @@ impl Updater for GithubActionsUpdater {
                     }
                 };
 
+                // A self-pin's `upd-version`/`upd-sha256` siblings, if any,
+                // move with it or the whole line stays put: writing the
+                // workflow pin to a release whose binary version or checksum
+                // was left behind would produce a triple that names three
+                // different things.
+                let mut self_pin_rewrites: Vec<(usize, String)> = Vec::new();
+                if is_self_pin {
+                    let siblings = Self::scan_self_pin_siblings(&all_lines, line_idx);
+                    match (&siblings.upd_version_line, &siblings.upd_sha256_line) {
+                        (None, None) => {}
+                        (Some(_), None) | (None, Some(_)) => {
+                            result.skipped.push(super::SkippedUpdate {
+                                package: action.owner_repo.clone(),
+                                current: current_version.clone(),
+                                status: SkipStatus::Blocked,
+                                reason: "self-pin-partial-triple",
+                                message: "with.upd-version and with.upd-sha256 must both be set, or neither, so the workflow pin, binary version, and checksum stay coupled".to_string(),
+                                line_number: Some(line_num),
+                            });
+                            result.annotations.extend(annotation);
+                            new_lines.push(kept_line);
+                            continue;
+                        }
+                        (Some((version_idx, sibling_version)), Some((sha_idx, _))) => {
+                            let bare = |v: &str| v.strip_prefix('v').unwrap_or(v).to_string();
+                            if bare(sibling_version) != bare(&current_version) {
+                                result.skipped.push(super::SkippedUpdate {
+                                    package: action.owner_repo.clone(),
+                                    current: current_version.clone(),
+                                    status: SkipStatus::Blocked,
+                                    reason: "self-pin-siblings-inconsistent",
+                                    message: format!(
+                                        "with.upd-version is {sibling_version}, which does not match the pin's own version comment {current_version}; fix the mismatch by hand before upd will advance it"
+                                    ),
+                                    line_number: Some(line_num),
+                                });
+                                result.annotations.extend(annotation);
+                                new_lines.push(kept_line);
+                                continue;
+                            }
+
+                            let target = siblings
+                                .upd_target
+                                .clone()
+                                .unwrap_or_else(|| "x86_64-unknown-linux-gnu".to_string());
+                            match fetch_self_pin_checksum(registry, &target_version, &target).await
+                            {
+                                Ok(checksum) => {
+                                    let version_line = format!(
+                                        "{}upd-version: {}",
+                                        " ".repeat(Self::indent_of(all_lines[*version_idx])),
+                                        comment_version
+                                    );
+                                    let sha_line = format!(
+                                        "{}upd-sha256: {}",
+                                        " ".repeat(Self::indent_of(all_lines[*sha_idx])),
+                                        checksum
+                                    );
+                                    self_pin_rewrites.push((*version_idx, version_line));
+                                    self_pin_rewrites.push((*sha_idx, sha_line));
+                                }
+                                Err(failure) => {
+                                    result.skipped.push(super::SkippedUpdate {
+                                        package: action.owner_repo.clone(),
+                                        current: current_version.clone(),
+                                        status: SkipStatus::Blocked,
+                                        reason: failure.reason(),
+                                        message: failure
+                                            .message(&action.owner_repo, &target_version),
+                                        line_number: Some(line_num),
+                                    });
+                                    result.annotations.extend(annotation);
+                                    new_lines.push(kept_line);
+                                    continue;
+                                }
+                            }
+                        }
+                    }
+                }
+
                 // Rewritten from the annotated line rather than the original, so
                 // a recovered pin's comment is written by the same routine that
                 // moves it and the update cannot come out shaped differently
@@ -1144,6 +1452,13 @@ impl Updater for GithubActionsUpdater {
                     continue;
                 };
                 new_lines.push(new_line);
+                // The `uses:` line rewrite above succeeded, so the sibling
+                // rewrites staged for it are now safe to apply: every earlier
+                // failure path returned before reaching here, so nothing is
+                // ever staged for a pin whose own line could not be rewritten.
+                for (idx, rewritten) in self_pin_rewrites {
+                    pending_self_pin_rewrites.insert(idx, rewritten);
+                }
 
                 // The comment goes out as part of the update, which names both
                 // the version the pin was at and the one it moved to. Recording
@@ -2387,6 +2702,293 @@ jobs:
         // target would surface here: the ceiling is honored before resolving.
         assert!(result.errors.is_empty());
         assert!(fs::read_to_string(file.path()).unwrap().contains(OLD_SHA));
+    }
+
+    /// A `MockRegistry` wrapper that also answers a self-pin's
+    /// `repo_file_at_ref`/`release_asset` fetches, which `MockRegistry` itself
+    /// leaves at the trait's unsupported default. Only the tests proving a
+    /// successful checksum fetch need this; the tests proving atomicity on a
+    /// fetch failure use a plain `MockRegistry` and rely on that default.
+    struct SelfPinFixtureRegistry {
+        inner: MockRegistry,
+        manifest: Vec<u8>,
+        sidecar: Vec<u8>,
+    }
+
+    #[async_trait::async_trait]
+    impl Registry for SelfPinFixtureRegistry {
+        async fn python_releases(
+            &self,
+            package: &str,
+        ) -> Result<Vec<crate::registry::PythonRelease>> {
+            self.inner.python_releases(package).await
+        }
+
+        async fn get_latest_version(&self, package: &str) -> Result<String> {
+            self.inner.get_latest_version(package).await
+        }
+
+        async fn list_versions(&self, package: &str) -> Result<Vec<crate::registry::VersionMeta>> {
+            self.inner.list_versions(package).await
+        }
+
+        async fn list_ref_names(&self, package: &str) -> Result<Vec<String>> {
+            self.inner.list_ref_names(package).await
+        }
+
+        async fn resolve_ref_to_commit(&self, package: &str, reference: &str) -> Result<String> {
+            self.inner.resolve_ref_to_commit(package, reference).await
+        }
+
+        async fn tags_at_commit(
+            &self,
+            package: &str,
+            commit: &str,
+        ) -> Result<crate::registry::TagsAtCommit> {
+            self.inner.tags_at_commit(package, commit).await
+        }
+
+        fn name(&self) -> &'static str {
+            self.inner.name()
+        }
+
+        async fn repo_file_at_ref(
+            &self,
+            package: &str,
+            _reference: &str,
+            path: &str,
+        ) -> Result<Vec<u8>> {
+            if package == "rvben/upd" && path == "release-pins.json" {
+                return Ok(self.manifest.clone());
+            }
+            anyhow::bail!("SelfPinFixtureRegistry has no file fixture for {package}:{path}")
+        }
+
+        async fn release_asset(
+            &self,
+            package: &str,
+            _tag: &str,
+            _asset_name: &str,
+        ) -> Result<Vec<u8>> {
+            if package == "rvben/upd" {
+                return Ok(self.sidecar.clone());
+            }
+            anyhow::bail!("SelfPinFixtureRegistry has no asset fixture for {package}")
+        }
+    }
+
+    #[tokio::test]
+    async fn test_self_pin_bypasses_bump_ceiling_for_minor_jump() {
+        use crate::updater::BumpFilter;
+
+        const OLD_SHA: &str = "1111111111111111111111111111111111111111";
+        const NEW_SHA: &str = "2222222222222222222222222222222222222222";
+        let mut file = NamedTempFile::new().unwrap();
+        write!(
+            file,
+            "jobs:\n  update:\n    uses: rvben/upd/.github/workflows/dependency-health.yml@{OLD_SHA} # v0.14.1\n"
+        )
+        .unwrap();
+
+        let registry = MockRegistry::new("github-releases")
+            .with_version("rvben/upd", "v0.15.0")
+            .with_resolved_ref("rvben/upd", "v0.14.1", OLD_SHA)
+            .with_resolved_ref("rvben/upd", "v0.15.0", NEW_SHA);
+        // 0.x is major-sensitive: a 0.14 -> 0.15 jump classifies as a major
+        // bump, so `max-bump: minor` caps it for every ordinary action. This
+        // is exactly the ceiling a self-pin must cross on its own, and it is
+        // the real-world case that motivated the exemption: upd's own
+        // releases are 0.x today.
+        let options = UpdateOptions::new(false, false)
+            .with_action_sha_updates(true)
+            .with_bump_filter(BumpFilter {
+                major: false,
+                minor: true,
+                patch: true,
+            });
+
+        let result = GithubActionsUpdater::new()
+            .update(file.path(), &registry, options)
+            .await
+            .unwrap();
+
+        assert!(result.capped.is_empty(), "capped: {:?}", result.capped);
+        assert!(result.skipped.is_empty(), "skipped: {:?}", result.skipped);
+        assert_eq!(result.updated.len(), 1);
+        assert_eq!(result.updated[0].1, "v0.14.1");
+        assert_eq!(result.updated[0].2, "v0.15.0");
+        let content = fs::read_to_string(file.path()).unwrap();
+        assert!(
+            content.contains(&format!(
+                "rvben/upd/.github/workflows/dependency-health.yml@{NEW_SHA} # v0.15.0"
+            )),
+            "content: {content}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_self_pin_with_partial_with_block_is_left_untouched() {
+        const OLD_SHA: &str = "1111111111111111111111111111111111111111";
+        const NEW_SHA: &str = "2222222222222222222222222222222222222222";
+        let mut file = NamedTempFile::new().unwrap();
+        write!(
+            file,
+            "jobs:\n  update:\n    uses: rvben/upd/.github/workflows/dependency-health.yml@{OLD_SHA} # v0.14.1\n    with:\n      upd-version: v0.14.1\n"
+        )
+        .unwrap();
+
+        let registry = MockRegistry::new("github-releases")
+            .with_version("rvben/upd", "v0.15.0")
+            .with_resolved_ref("rvben/upd", "v0.14.1", OLD_SHA)
+            .with_resolved_ref("rvben/upd", "v0.15.0", NEW_SHA);
+        let options = UpdateOptions::new(false, false).with_action_sha_updates(true);
+
+        let result = GithubActionsUpdater::new()
+            .update(file.path(), &registry, options)
+            .await
+            .unwrap();
+
+        assert!(result.updated.is_empty());
+        assert_eq!(result.skipped.len(), 1, "skipped: {:?}", result.skipped);
+        assert_eq!(result.skipped[0].reason, "self-pin-partial-triple");
+        let content = fs::read_to_string(file.path()).unwrap();
+        assert!(content.contains(OLD_SHA), "content: {content}");
+        assert!(
+            content.contains("upd-version: v0.14.1"),
+            "content: {content}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_self_pin_triple_is_left_untouched_when_checksum_manifest_unavailable() {
+        const OLD_SHA: &str = "1111111111111111111111111111111111111111";
+        const NEW_SHA: &str = "2222222222222222222222222222222222222222";
+        let old_checksum = "a".repeat(64);
+        let mut file = NamedTempFile::new().unwrap();
+        write!(
+            file,
+            "jobs:\n  update:\n    uses: rvben/upd/.github/workflows/dependency-health.yml@{OLD_SHA} # v0.14.1\n    with:\n      upd-version: v0.14.1\n      upd-target: x86_64-unknown-linux-gnu\n      upd-sha256: {old_checksum}\n"
+        )
+        .unwrap();
+
+        // A plain MockRegistry has no fixture for `repo_file_at_ref`, so it
+        // answers the trait's unsupported default: exactly the "manifest
+        // could not be read" case the triple must abort on, leaving the
+        // `uses:` line untouched alongside the `with:` block it did not dare
+        // rewrite half of.
+        let registry = MockRegistry::new("github-releases")
+            .with_version("rvben/upd", "v0.15.0")
+            .with_resolved_ref("rvben/upd", "v0.14.1", OLD_SHA)
+            .with_resolved_ref("rvben/upd", "v0.15.0", NEW_SHA);
+        let options = UpdateOptions::new(false, false).with_action_sha_updates(true);
+
+        let result = GithubActionsUpdater::new()
+            .update(file.path(), &registry, options)
+            .await
+            .unwrap();
+
+        assert!(result.updated.is_empty());
+        assert_eq!(result.skipped.len(), 1, "skipped: {:?}", result.skipped);
+        assert_eq!(result.skipped[0].reason, "self-pin-manifest-unavailable");
+        let content = fs::read_to_string(file.path()).unwrap();
+        assert!(content.contains(OLD_SHA), "content: {content}");
+        assert!(content.contains(&old_checksum), "content: {content}");
+        assert!(
+            content.contains("upd-version: v0.14.1"),
+            "content: {content}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_self_pin_rewrites_two_independent_blocks_atomically() {
+        const OLD_SHA: &str = "1111111111111111111111111111111111111111";
+        const NEW_SHA: &str = "2222222222222222222222222222222222222222";
+        let old_checksum = "a".repeat(64);
+        let new_checksum = "b".repeat(64);
+        let mut file = NamedTempFile::new().unwrap();
+        write!(
+            file,
+            "jobs:\n\
+             \x20 health:\n\
+             \x20   uses: rvben/upd/.github/workflows/dependency-health.yml@{OLD_SHA} # v0.14.1\n\
+             \x20   with:\n\
+             \x20     upd-version: v0.14.1\n\
+             \x20     upd-target: x86_64-unknown-linux-gnu\n\
+             \x20     upd-sha256: {old_checksum}\n\
+             \x20 remediation:\n\
+             \x20   uses: rvben/upd/.github/workflows/dependency-remediation.yml@{OLD_SHA} # v0.14.1\n\
+             \x20   with:\n\
+             \x20     upd-version: v0.14.1\n\
+             \x20     upd-target: x86_64-unknown-linux-gnu\n\
+             \x20     upd-sha256: {old_checksum}\n"
+        )
+        .unwrap();
+
+        let manifest = serde_json::json!({
+            "schema": 1,
+            "version": "v0.15.0",
+            "release_commit": NEW_SHA,
+            "assets": {
+                "x86_64-unknown-linux-gnu": {
+                    "name": "upd-v0.15.0-x86_64-unknown-linux-gnu.tar.gz",
+                    "sha256": new_checksum,
+                }
+            }
+        })
+        .to_string()
+        .into_bytes();
+        let sidecar =
+            format!("{new_checksum}  upd-v0.15.0-x86_64-unknown-linux-gnu.tar.gz\n").into_bytes();
+
+        let registry = SelfPinFixtureRegistry {
+            inner: MockRegistry::new("github-releases")
+                .with_version("rvben/upd", "v0.15.0")
+                .with_resolved_ref("rvben/upd", "v0.14.1", OLD_SHA)
+                .with_resolved_ref("rvben/upd", "v0.15.0", NEW_SHA),
+            manifest,
+            sidecar,
+        };
+        let options = UpdateOptions::new(false, false).with_action_sha_updates(true);
+
+        let result = GithubActionsUpdater::new()
+            .update(file.path(), &registry, options)
+            .await
+            .unwrap();
+
+        assert!(result.errors.is_empty(), "errors: {:?}", result.errors);
+        assert!(result.skipped.is_empty(), "skipped: {:?}", result.skipped);
+        assert_eq!(result.updated.len(), 2, "updated: {:?}", result.updated);
+
+        let content = fs::read_to_string(file.path()).unwrap();
+        assert_eq!(
+            content
+                .matches(&format!("dependency-health.yml@{NEW_SHA} # v0.15.0"))
+                .count(),
+            1,
+            "content: {content}"
+        );
+        assert_eq!(
+            content
+                .matches(&format!("dependency-remediation.yml@{NEW_SHA} # v0.15.0"))
+                .count(),
+            1,
+            "content: {content}"
+        );
+        assert_eq!(
+            content.matches("upd-version: v0.15.0").count(),
+            2,
+            "content: {content}"
+        );
+        assert_eq!(
+            content
+                .matches(&format!("upd-sha256: {new_checksum}"))
+                .count(),
+            2,
+            "content: {content}"
+        );
+        assert!(!content.contains(OLD_SHA), "content: {content}");
+        assert!(!content.contains(&old_checksum), "content: {content}");
+        assert!(!content.contains("v0.14.1"), "content: {content}");
     }
 
     #[tokio::test]

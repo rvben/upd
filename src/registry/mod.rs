@@ -384,6 +384,36 @@ pub trait Registry: Send + Sync {
         anyhow::bail!("registry does not provide pre-commit hook manifests")
     }
 
+    /// Read a repository file's raw bytes at a specific ref (branch, tag, or
+    /// commit), rather than only the latest default-branch content.
+    ///
+    /// Used by the GitHub Actions updater to read `rvben/upd`'s own
+    /// `release-pins.json` at the exact release tag a self-pin is advancing
+    /// to, since the file on the default branch can already have moved past
+    /// that release.
+    async fn repo_file_at_ref(
+        &self,
+        _package: &str,
+        _reference: &str,
+        _path: &str,
+    ) -> Result<Vec<u8>> {
+        anyhow::bail!("registry does not provide repository file contents at an arbitrary ref")
+    }
+
+    /// Download a named asset attached to a specific release tag.
+    ///
+    /// Used by the GitHub Actions updater to fetch a release's `.sha256`
+    /// checksum sidecar as the source of truth for a self-pin's `upd-sha256`
+    /// input, independent of whatever `release-pins.json` says.
+    async fn release_asset(
+        &self,
+        _package: &str,
+        _tag: &str,
+        _asset_name: &str,
+    ) -> Result<Vec<u8>> {
+        anyhow::bail!("registry does not provide release asset downloads")
+    }
+
     /// SHA-256 of an official Gradle distribution; never inferred from a version.
     async fn gradle_distribution_checksum(&self, _version: &str, _kind: &str) -> Result<String> {
         anyhow::bail!("registry does not provide Gradle distribution checksums")

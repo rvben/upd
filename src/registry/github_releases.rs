@@ -508,6 +508,108 @@ impl Registry for GitHubReleasesRegistry {
         )?)
     }
 
+    async fn repo_file_at_ref(
+        &self,
+        package: &str,
+        reference: &str,
+        path: &str,
+    ) -> Result<Vec<u8>> {
+        use base64::Engine;
+        let (owner, repo) = Self::extract_owner_repo(package)?;
+        let mut url = url::Url::parse(&self.api_url)?;
+        {
+            let mut segments = url
+                .path_segments_mut()
+                .map_err(|_| anyhow!("Invalid GitHub API URL"))?;
+            segments
+                .pop_if_empty()
+                .extend(["repos", owner, repo, "contents"]);
+            for segment in path.split('/') {
+                segments.push(segment);
+            }
+        }
+        url.query_pairs_mut().append_pair("ref", reference);
+        let mut response = get_with_retry(&self.client, url.as_str()).await?;
+        if !response.status().is_success() {
+            return Err(anyhow!(
+                "Cannot read {path} for {package}@{reference}: HTTP {}",
+                response.status()
+            ));
+        }
+        let mut bytes = Vec::new();
+        while let Some(chunk) = response.chunk().await? {
+            if bytes.len() + chunk.len() > 2 * 1024 * 1024 {
+                return Err(anyhow!("{path} response exceeds 2 MiB"));
+            }
+            bytes.extend_from_slice(&chunk);
+        }
+        #[derive(Deserialize)]
+        struct Contents {
+            content: String,
+            encoding: String,
+        }
+        let data: Contents = serde_json::from_slice(&bytes)?;
+        if data.encoding != "base64" {
+            return Err(anyhow!("Unsupported content encoding for {path}"));
+        }
+        let encoded: String = data
+            .content
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect();
+        Ok(base64::engine::general_purpose::STANDARD.decode(encoded)?)
+    }
+
+    async fn release_asset(&self, package: &str, tag: &str, asset_name: &str) -> Result<Vec<u8>> {
+        let (owner, repo) = Self::extract_owner_repo(package)?;
+        let mut url = url::Url::parse(&self.api_url)?;
+        url.path_segments_mut()
+            .map_err(|_| anyhow!("Invalid GitHub API URL"))?
+            .pop_if_empty()
+            .extend(["repos", owner, repo, "releases", "tags", tag]);
+        let response = get_with_retry(&self.client, url.as_str()).await?;
+        if !response.status().is_success() {
+            return Err(anyhow!(
+                "Cannot read release {package}@{tag}: HTTP {}",
+                response.status()
+            ));
+        }
+        #[derive(Deserialize)]
+        struct ReleaseWithAssets {
+            assets: Vec<ReleaseAsset>,
+        }
+        #[derive(Deserialize)]
+        struct ReleaseAsset {
+            name: String,
+            url: String,
+        }
+        let release: ReleaseWithAssets = response.json().await?;
+        let asset = release
+            .assets
+            .iter()
+            .find(|a| a.name == asset_name)
+            .ok_or_else(|| anyhow!("release {package}@{tag} has no asset named {asset_name}"))?;
+
+        let mut headers = HeaderMap::new();
+        headers.insert(ACCEPT, HeaderValue::from_static("application/octet-stream"));
+        let mut asset_response =
+            super::get_with_retry_and_headers(&self.client, &asset.url, Some(&headers)).await?;
+        if !asset_response.status().is_success() {
+            return Err(anyhow!(
+                "Cannot download asset {asset_name} for {package}@{tag}: HTTP {}",
+                asset_response.status()
+            ));
+        }
+        let mut bytes = Vec::new();
+        while let Some(chunk) = asset_response.chunk().await? {
+            if bytes.len() + chunk.len() > 2 * 1024 * 1024 {
+                return Err(anyhow!("Release asset {asset_name} response exceeds 2 MiB"));
+            }
+            bytes.extend_from_slice(&chunk);
+        }
+        Ok(bytes)
+    }
+
     async fn python_releases(
         &self,
         _package: &str,

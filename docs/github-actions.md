@@ -379,15 +379,44 @@ every immutable pin is expected to be maintainable automatically.
 Interactive runs report annotations but do not write them; run without
 `--interactive` to apply them.
 
-`max-bump: minor` is a strict ceiling. Bare major references such as `@v4` are
-therefore normally held back; use `max-bump: major` when those updates should be
-eligible. Changed workflows are validated with `actionlint` before publication.
+`max-bump: minor` is a strict ceiling for every third-party action and reusable
+workflow. Bare major references such as `@v4` are therefore normally held back;
+use `max-bump: major` when those updates should be eligible. The one exception
+is `rvben/upd`'s own reusable workflows, described next. Changed workflows are
+validated with `actionlint` before publication.
 
 Configuration pins and package filters use an action's `owner/repo` name. For
 example, `packages: actions/checkout` selects checkout references, subdirectory
 actions, and reusable workflows from that repository. Package filters also
 accept case-sensitive globs, so `packages: actions/*` selects every action in
 that namespace.
+
+### `rvben/upd` self-pins
+
+A pin to `rvben/upd/.github/workflows/dependency-health.yml` or
+`dependency-remediation.yml` is exempt from `max-bump`: it always advances to
+this project's newest release, regardless of the configured ceiling. `upd`'s
+own releases are 0.x, where a minor version bump is classified as a
+major-sensitive change, so `max-bump: minor` would otherwise hold every
+consumer's self-update workflow behind its own newest release indefinitely.
+Cooldown (`min-age`) still applies; only the bump ceiling is exempted.
+
+The pin is a coupled triple: the `uses:` line's commit SHA and version
+comment, and, when present, the sibling `with.upd-version` and
+`with.upd-sha256` inputs. `upd` moves all three together or none at all. If
+`upd-version` and `upd-sha256` are both absent, only the `uses:` line moves.
+If only one of the two is present, or either disagrees with the pin's current
+version comment, the whole pin is left untouched and reported as blocked with
+a machine-readable reason, rather than risk a workflow reference, binary
+version, and checksum that each name a different release. The checksum comes
+from the target release's own `<asset>.sha256` sidecar file, not from
+`release-pins.json` read off the default branch, since that file can already
+have moved past the release a given tag pins to.
+
+Because of this exemption, there is no need to add `rvben/upd` to `ignore` in
+`.updrc.toml` to work around the coupled triple; doing so also stops the pin
+from ever advancing at all, including for security fixes. Remove any existing
+`ignore` entry for `rvben/upd`; `upd` now keeps the triple in sync on its own.
 
 ## Annotated versions in a workflow
 
