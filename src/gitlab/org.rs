@@ -580,13 +580,11 @@ async fn process(
     log: &Log,
 ) -> Result<State, Error> {
     // A cheap read through the API spares cloning projects that have not
-    // opted in; the clone's own copy of the file then decides.
-    match api_consent(api, project).await? {
-        Consent::No(reason) => return Ok(State::NotOptedIn(reason)),
-        Consent::Invalid { config, message } => {
-            return Ok(State::ConfigInvalid { config, message });
-        }
-        Consent::Yes { .. } => {}
+    // opted in. Anything else goes on to the clone, whose own copy of the
+    // file decides: the API follows no symbolic link and answers with the
+    // link's target path, so only the tree can say what is wrong with it.
+    if let Consent::No(reason) = api_consent(api, project).await? {
+        return Ok(State::NotOptedIn(reason));
     }
 
     let work = tempfile::Builder::new()
@@ -651,9 +649,15 @@ async fn tree_consent(git: &Git, default_ref: &str, log: &Log) -> Result<Consent
             return Err(Error::Io(format!("unexpected git ls-tree output: {entry}")));
         };
         if kind != "blob" || !matches!(mode, "100644" | "100755") {
+            let entry = match (mode, kind) {
+                ("120000", _) => "a symbolic link".to_string(),
+                ("160000", _) => "a submodule".to_string(),
+                (_, "tree") => "a directory".to_string(),
+                _ => format!("a {kind} with mode {mode}"),
+            };
             return Ok(Consent::Invalid {
                 config: name.to_string(),
-                message: format!("{name} must be a regular file, not a {kind} with mode {mode}"),
+                message: format!("{name} must be a regular file, not {entry}"),
             });
         }
         let content = git.read(["cat-file", "blob", object]).await?;

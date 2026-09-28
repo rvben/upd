@@ -460,6 +460,35 @@ async fn the_fetched_commit_decides_consent_not_the_file_api() {
 }
 
 #[tokio::test]
+async fn a_linked_configuration_is_reported_as_a_link_not_as_bad_toml() {
+    let mut org = Org::new().await;
+    org.project(
+        33,
+        "acme/linked",
+        &[
+            Entry::File("real.toml", OPTED_IN),
+            Entry::Link(".updrc.toml", "real.toml"),
+        ],
+    );
+    org.serve().await;
+
+    // The file API answers with the link's target path, which does not parse
+    // as TOML; the report still names the actual problem.
+    let (code, report, stderr) = org.run(&[], &[]);
+
+    assert_eq!(code, 2, "{report:#}\n{stderr}");
+    let linked = project(&report, "acme/linked");
+    assert_eq!(linked["state"], "config_invalid", "{report:#}");
+    assert_eq!(
+        linked["message"], ".updrc.toml must be a regular file, not a symbolic link",
+        "{linked}"
+    );
+    assert_eq!(org.updater_args("acme/linked"), None);
+    assert_eq!(org.branch_file(33), None);
+    assert!(org.merge_request_calls(33).await.is_empty());
+}
+
+#[tokio::test]
 async fn a_dry_run_reports_without_pushing_or_writing_to_gitlab() {
     let mut org = Org::new().await;
     org.project(41, "acme/app", &[Entry::File(".updrc.toml", OPTED_IN)]);
