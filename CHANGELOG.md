@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.13.3](https://github.com/rvben/upd/compare/v0.13.2...v0.13.3) - 2026-09-28
+
+### Fixed
+
+- **registry**: back off and retry on HTTP 429 instead of failing fast ([a3b19fd](https://github.com/rvben/upd/commit/a3b19fd273aedb9652bfc7eb976276800197ffee))
+- **registry**: fall back to gh auth token for GitHub API requests ([a2d8487](https://github.com/rvben/upd/commit/a2d848744964bd527ae39b5c39b70dfdc77cdbfc))
+- **fix**: verify a lockfile still needs a relock before trusting it ([57c4920](https://github.com/rvben/upd/commit/57c4920eb3d1af49af1947faafa203da88a80e8d))
+
 ## [0.13.2](https://github.com/rvben/upd/compare/v0.13.1...v0.13.2) - 2026-09-24
 
 ### Fixed
