@@ -34,6 +34,8 @@
 //!
 //! [automation]
 //! security_remediation = true
+//! dependency_updates = true  # GitLab organization rolling merge request
+//! auto_merge = false         # consent to the organization's auto-merge
 //!
 //! # Pin packages to specific versions or constraints - top-level table
 //! [pin]
@@ -105,7 +107,18 @@ pub struct AutomationConfig {
     /// configuration merging can preserve a parent policy.
     #[serde(default)]
     pub security_remediation: Option<bool>,
+    /// Whether a GitLab organization run may keep a rolling dependency merge
+    /// request open in this repository.
+    #[serde(default)]
+    pub dependency_updates: Option<bool>,
+    /// Whether this repository consents to the organization run asking GitLab
+    /// to merge its dependency merge request once the pipeline passes.
+    #[serde(default)]
+    pub auto_merge: Option<bool>,
 }
+
+/// Every key `[automation]` accepts.
+const AUTOMATION_KEYS: &[&str] = &["security_remediation", "dependency_updates", "auto_merge"];
 
 /// Raw cooldown config as written in the TOML file. Parsed into a
 /// `crate::cooldown::CooldownPolicy` at runtime via `UpdConfig::to_cooldown_policy`.
@@ -450,19 +463,7 @@ impl UpdConfig {
             }
         }
 
-        if let toml::Value::Table(table) = &raw
-            && let Some(toml::Value::Table(automation)) = table.get("automation")
-        {
-            for key in automation.keys() {
-                if key != "security_remediation" {
-                    warnings.push(format!(
-                        "unknown key `{}` in [automation] in config file {}; valid keys are: \
-                         security_remediation. Run `upd --show-config` for the expected schema.",
-                        key, source_label
-                    ));
-                }
-            }
-        }
+        warnings.extend(automation_warnings(&raw, source_label));
 
         // Parse into typed struct (uses the already-validated TOML)
         let config: Self = raw
@@ -471,6 +472,24 @@ impl UpdConfig {
 
         config.selected_ecosystems(&[])?;
         Ok((config, warnings))
+    }
+
+    /// Parse config TOML content for a decision to write to the repository,
+    /// where a mistake in `[automation]` must not be read as either answer.
+    ///
+    /// An unknown key inside `[automation]`, which the lenient parse only
+    /// warns about, is an error here: a misspelled opt-in must not silently
+    /// read as `false`. Other warnings are returned as usual.
+    pub fn parse_for_automation(
+        content: &str,
+        source_label: &str,
+    ) -> Result<(Self, Vec<String>), String> {
+        let raw: toml::Value = toml::from_str(content)
+            .map_err(|e| format!("Invalid TOML in config file {}:\n  {}", source_label, e))?;
+        if let Some(problem) = automation_warnings(&raw, source_label).into_iter().next() {
+            return Err(problem);
+        }
+        Self::parse_with_warnings(content, source_label)
     }
 
     /// Return the canonical schema as a TOML string.
@@ -545,10 +564,15 @@ exact-pins = true
 # optional-dependencies = "at-least"
 # dependency-groups = "exact"
 
-# automation: opt-in policy for unattended repository writes. Scheduled
-# security remediation remains disabled when this key is absent or false.
+# automation: opt-in policy for unattended repository writes. Every key is
+# disabled when absent or false.
 [automation]
+# Scheduled security remediation may publish its rolling pull request.
 security_remediation = false
+# A GitLab organization run may keep a rolling dependency merge request open.
+dependency_updates = false
+# The organization run may ask GitLab to auto-merge that merge request.
+auto_merge = false
 "#
     }
 
@@ -632,6 +656,8 @@ security_remediation = false
             || !self.pin.is_empty()
             || self.cooldown.is_some()
             || self.automation.security_remediation.is_some()
+            || self.automation.dependency_updates.is_some()
+            || self.automation.auto_merge.is_some()
             || self.normalize.is_some()
             || self.update.pyproject.is_some()
             || self.ecosystems.enable.is_some()
@@ -683,6 +709,12 @@ security_remediation = false
         if other.automation.security_remediation.is_some() {
             self.automation.security_remediation = other.automation.security_remediation;
         }
+        if other.automation.dependency_updates.is_some() {
+            self.automation.dependency_updates = other.automation.dependency_updates;
+        }
+        if other.automation.auto_merge.is_some() {
+            self.automation.auto_merge = other.automation.auto_merge;
+        }
         if let Some(other_normalize) = other.normalize
             && let Some(other_pyproject) = other_normalize.pyproject
         {
@@ -704,6 +736,40 @@ security_remediation = false
     pub fn security_remediation_enabled(&self) -> bool {
         self.automation.security_remediation.unwrap_or(false)
     }
+
+    /// Whether an organization run may maintain a dependency merge request.
+    pub fn dependency_updates_enabled(&self) -> bool {
+        self.automation.dependency_updates.unwrap_or(false)
+    }
+
+    /// Whether the repository consents to auto-merge by an organization run.
+    pub fn auto_merge_enabled(&self) -> bool {
+        self.automation.auto_merge.unwrap_or(false)
+    }
+}
+
+/// Warnings for `[automation]` keys the schema does not define.
+fn automation_warnings(raw: &toml::Value, source_label: &str) -> Vec<String> {
+    let Some(automation) = raw.get("automation") else {
+        return Vec::new();
+    };
+    let Some(table) = automation.as_table() else {
+        // The typed parse rejects a non-table `automation` with its own error.
+        return Vec::new();
+    };
+    table
+        .keys()
+        .filter(|key| !AUTOMATION_KEYS.contains(&key.as_str()))
+        .map(|key| {
+            format!(
+                "unknown key `{}` in [automation] in config file {}; valid keys are: {}. \
+                 Run `upd --show-config` for the expected schema.",
+                key,
+                source_label,
+                AUTOMATION_KEYS.join(", ")
+            )
+        })
+        .collect()
 }
 
 /// Normalize a package name to PEP 503 canonical form for ignore comparison.
@@ -869,6 +935,14 @@ impl EffectiveConfig<'_> {
             "  security_remediation: {}\n",
             self.config.security_remediation_enabled()
         ));
+        out.push_str(&format!(
+            "  dependency_updates: {}\n",
+            self.config.dependency_updates_enabled()
+        ));
+        out.push_str(&format!(
+            "  auto_merge: {}\n",
+            self.config.auto_merge_enabled()
+        ));
         out.push_str(&render_cooldown_for_show_config(self.cooldown));
 
         out
@@ -917,6 +991,8 @@ impl EffectiveConfig<'_> {
             }),
             "automation": {
                 "security_remediation": self.config.security_remediation_enabled(),
+                "dependency_updates": self.config.dependency_updates_enabled(),
+                "auto_merge": self.config.auto_merge_enabled(),
             },
             "cooldown": {
                 "default_seconds": self.cooldown.default.num_seconds(),
@@ -1659,6 +1735,7 @@ update_action_shas = true
         let mut base = UpdConfig {
             automation: AutomationConfig {
                 security_remediation: Some(true),
+                ..Default::default()
             },
             ..Default::default()
         };
@@ -1668,6 +1745,7 @@ update_action_shas = true
         base.merge(UpdConfig {
             automation: AutomationConfig {
                 security_remediation: Some(false),
+                ..Default::default()
             },
             ..Default::default()
         });
@@ -1686,6 +1764,53 @@ security_remedation = false
         assert_eq!(warnings.len(), 1);
         assert!(warnings[0].contains("security_remedation"));
         assert!(warnings[0].contains("[automation]"));
+    }
+
+    #[test]
+    fn test_organization_automation_keys_are_explicit_and_disabled_by_default() {
+        let (absent, _) = UpdConfig::parse_with_warnings("ignore = []", "test.toml").unwrap();
+        assert!(!absent.dependency_updates_enabled());
+        assert!(!absent.auto_merge_enabled());
+
+        let content = "[automation]\ndependency_updates = true\nauto_merge = true\n";
+        let (enabled, warnings) = UpdConfig::parse_with_warnings(content, "test.toml").unwrap();
+        assert!(warnings.is_empty(), "{warnings:?}");
+        assert!(enabled.dependency_updates_enabled());
+        assert!(enabled.auto_merge_enabled());
+        assert!(!enabled.security_remediation_enabled());
+        assert!(enabled.has_config());
+
+        let mut merged = enabled.clone();
+        merged.merge(UpdConfig::default());
+        assert!(merged.dependency_updates_enabled() && merged.auto_merge_enabled());
+        merged.merge(
+            UpdConfig::parse_with_warnings("[automation]\nauto_merge = false\n", "t")
+                .unwrap()
+                .0,
+        );
+        assert!(merged.dependency_updates_enabled());
+        assert!(!merged.auto_merge_enabled());
+    }
+
+    #[test]
+    fn test_automation_parse_refuses_what_the_lenient_parse_warns_about() {
+        let typo = "[automation]\ndependecy_updates = true\n";
+        let (lenient, warnings) = UpdConfig::parse_with_warnings(typo, "test.toml").unwrap();
+        assert!(!lenient.dependency_updates_enabled());
+        assert_eq!(warnings.len(), 1);
+
+        let error = UpdConfig::parse_for_automation(typo, "test.toml").unwrap_err();
+        assert!(error.contains("dependecy_updates"), "{error}");
+        assert!(error.contains("dependency_updates"), "{error}");
+
+        let wrong_type = "[automation]\ndependency_updates = \"true\"\n";
+        assert!(UpdConfig::parse_for_automation(wrong_type, "test.toml").is_err());
+
+        let elsewhere = "unknown_top = 1\n[automation]\ndependency_updates = true\n";
+        let (config, warnings) = UpdConfig::parse_for_automation(elsewhere, "test.toml").unwrap();
+        assert!(config.dependency_updates_enabled());
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(warnings[0].contains("unknown_top"));
     }
 
     #[test]

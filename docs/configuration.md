@@ -66,6 +66,8 @@ django = "4.2.0"
 | `pin` | `table` | Map of package names to pinned versions |
 | `update_action_shas` | `bool` | Whether SHA-pinned GitHub Actions are checked and updated. Defaults to `true`; `--update-action-shas` and `--no-update-action-shas` override it |
 | `automation.security_remediation` | `bool` | Allow scheduled security remediation to publish or clean up its rolling pull request. Defaults to `false` |
+| `automation.dependency_updates` | `bool` | Allow a GitLab organization run to keep a rolling dependency merge request open in this repository (see [GitLab](gitlab.md#organization-mode)). Defaults to `false` |
+| `automation.auto_merge` | `bool` | Consent to that organization run asking GitLab to merge once the project's pipeline passes; the organization must enable it too. Defaults to `false` |
 | `ecosystems` | `table` | Persistent enable/disable lists using `--lang` names |
 | `update.pyproject.exact-pins` | `bool` | Update concrete `==` pins automatically (default `true`) |
 | `normalize` | `table` | Opt-in `pyproject.toml` specifier normalization, configured per section |
