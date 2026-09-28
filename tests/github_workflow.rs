@@ -1831,7 +1831,7 @@ fn repository_dependency_jobs_share_the_hardened_workflow() {
     // or above the token broker's minimum release, or the workflow is rejected
     // at the token exchange.
     assert!(DEPENDENCIES_WORKFLOW.contains(
-        "uses: rvben/upd/.github/workflows/dependency-health.yml@7e6bee076ba17f80de23d49609ea7f4158045089"
+        "uses: rvben/upd/.github/workflows/dependency-health.yml@b015afc2c81f52fbffd862469203c076e32e6edf"
     ));
     assert!(DEPENDENCIES_WORKFLOW.contains("langs: rust,actions"));
     assert!(DEPENDENCIES_WORKFLOW.contains("lock: true"));
