@@ -203,6 +203,51 @@ esac
         validation_configured: bool,
         has_publishing_token: bool,
     ) {
+        self.run_publish_full(
+            changed,
+            content,
+            auto_merge,
+            report_json,
+            validation_configured,
+            has_publishing_token,
+            None,
+        );
+    }
+
+    /// Exercises the same publish pipeline with a non-empty security-fix
+    /// report, as `upd audit --fix-audit` would produce when the "Apply
+    /// available security fixes" step resolves an advisory. Proves the
+    /// remediation surfaces in the presentation, the step summary, and the
+    /// PR body, the same as any other change.
+    fn run_publish_with_security_report(
+        &self,
+        changed: bool,
+        content: &str,
+        auto_merge: bool,
+        report_json: &str,
+        security_report_json: &str,
+    ) {
+        self.run_publish_full(
+            changed,
+            content,
+            auto_merge,
+            report_json,
+            true,
+            true,
+            Some(security_report_json),
+        );
+    }
+
+    fn run_publish_full(
+        &self,
+        changed: bool,
+        content: &str,
+        auto_merge: bool,
+        report_json: &str,
+        validation_configured: bool,
+        has_publishing_token: bool,
+        security_report_json: Option<&str>,
+    ) {
         git(
             &self.checkout,
             &[
@@ -254,6 +299,17 @@ esac
         fs::write(&output_file, "").unwrap();
         fs::write(&summary_file, "").unwrap();
 
+        // Mirrors the "Apply available security fixes" step's output file.
+        // Left unwritten when the caller has no security report, so the
+        // presentation step's own `-s "$security_report"` check falls back
+        // to the empty-report branch exactly as it does on a real run where
+        // `security-remediation` is disabled or found nothing to fix.
+        let security_report = self.runner_temp.join("upd-security-report.json");
+        let security_remediation = security_report_json.is_some();
+        if let Some(security_json) = security_report_json {
+            fs::write(&security_report, security_json).unwrap();
+        }
+
         let path = format!(
             "{}:{}",
             self.fake_bin.display(),
@@ -272,6 +328,9 @@ esac
             .env("MIN_AGE", "7d")
             .env("PRESENTATION", &presentation)
             .env("REPORT", &report)
+            .env("RUNNER_TEMP", &self.runner_temp)
+            .env("SECURITY_REMEDIATION", security_remediation.to_string())
+            .env("SECURITY_REPORT", &security_report)
             .env("VALIDATION_CONFIGURED", validation_configured.to_string())
             .output()
             .expect("presentation script starts");
@@ -693,6 +752,90 @@ fn github_presentation_reports_normalized_specifiers_as_changes() {
             .log()
             .contains("--title chore(deps): normalize 2 dependency specifiers")
     );
+}
+
+/// The "Apply available security fixes" step runs `upd audit --fix-audit`
+/// before the ordinary update step and writes its own report. This proves
+/// that report's fixes flow all the way through: into the presentation
+/// title and counts, the step summary, and the PR body, exactly like an
+/// ordinary update, and are never silently dropped because min-age held
+/// back the corresponding `upd update` run.
+#[test]
+fn github_presentation_surfaces_an_applied_security_fix() {
+    let fixture = Fixture::new();
+    let report = r#"{"files":[],"summary":{"updates_total":0,"files_with_changes":0,"held_back":0,"capped":0,"skipped":0,"warnings":0}}"#;
+    let security_report = r#"{
+      "fixes": [
+        {"package":"rustls","from_version":"0.23.43","to_version":"0.23.45","path":"Cargo.lock","status":"applied"}
+      ],
+      "summary": {"vulnerabilities": 1}
+    }"#;
+    fixture.run_publish_with_security_report(true, "new", false, report, security_report);
+
+    let presentation = fixture.presentation();
+    assert_eq!(
+        presentation["title"],
+        "fix(security): resolve advisory in rustls"
+    );
+    assert_eq!(presentation["counts"]["security_fixes"], 1);
+    assert_eq!(presentation["counts"]["updates"], 0);
+    assert_eq!(presentation["security_advisories_fixed"], 1);
+    assert_eq!(presentation["security_fixes"][0]["package"], "rustls");
+    assert_eq!(presentation["security_fixes"][0]["from"], "0.23.43");
+    assert_eq!(presentation["security_fixes"][0]["to"], "0.23.45");
+
+    let summary = fixture.summary();
+    assert!(summary.contains("Includes 1 security fix."));
+    assert!(summary.contains("### Security fixes applied (1)"));
+    assert!(summary.contains("<code>rustls</code>"));
+    assert!(summary.contains("<code>0.23.43 → 0.23.45</code>"));
+    assert!(summary.contains("<code>Cargo.lock</code>"));
+
+    let body = fixture.body();
+    assert!(body.contains("## 1 security fix is ready for review"));
+    assert!(body.contains("### Security fixes (1)"));
+    assert!(
+        body.contains(
+            "Resolved 1 OSV advisory record; a security fix is never held back by min-age."
+        )
+    );
+    assert!(body.contains("<code>rustls</code>"));
+    assert!(body.contains("<code>0.23.43 → 0.23.45</code>"));
+    assert!(
+        fixture
+            .log()
+            .contains("--title fix(security): resolve advisory in rustls")
+    );
+}
+
+/// A security report is written even when `security-remediation` finds
+/// nothing to fix (an empty `fixes` array). It must not fabricate a
+/// phantom security section, and the presentation must fall back to
+/// describing the ordinary update exactly as if remediation were disabled.
+#[test]
+fn github_presentation_omits_security_section_when_nothing_was_fixed() {
+    let fixture = Fixture::new();
+    let report = r#"{
+      "files": [{
+        "path": "pyproject.toml",
+        "updates": [{"package":"requests","current":"2.0","latest":"2.1","bump":"patch"}]
+      }],
+      "summary": {"updates_total":1,"files_with_changes":1,"warnings":0}
+    }"#;
+    let security_report = r#"{"fixes": [], "summary": {"vulnerabilities": 0}}"#;
+    fixture.run_publish_with_security_report(true, "new", false, report, security_report);
+
+    let presentation = fixture.presentation();
+    assert_eq!(presentation["counts"]["security_fixes"], 0);
+    assert_eq!(
+        presentation["title"],
+        "chore(deps): refresh requests to 2.1"
+    );
+
+    let body = fixture.body();
+    assert!(!body.contains("Security fixes"));
+    let summary = fixture.summary();
+    assert!(!summary.contains("Security fixes"));
 }
 
 #[test]
