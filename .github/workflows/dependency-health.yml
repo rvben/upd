@@ -746,6 +746,20 @@ jobs:
                   "| \(.package | code) | \(.current | code) | \(.reason | html) | \(.path | code) |"
                 ) | join("\n"))
               end;
+            # A blocked rvben/upd entry means upd could not verify or update
+            # its own pinned reference in the workflows of this repository,
+            # which leaves CI running an unintended upd version. That is easy
+            # to miss as one row in the general blocked table below, so it
+            # also gets a standalone alert placed right after the overview.
+            def self_pin_alert:
+              ([.blocked[]? | select(.package == "rvben/upd")]) as $self_pin
+              | if ($self_pin | length) == 0 then ""
+              else
+                "\n\n> [!WARNING]\n" +
+                "> upd could not update its own pinned reference (\("rvben/upd" | code)) in the workflows of this repository: " +
+                ($self_pin | map(.reason) | join("; ") | html) + ".\n" +
+                "> Review the workflow pin manually; it controls which upd release runs in CI."
+              end;
             def nested_lockfile_section:
               if (.nested_lockfiles | length) == 0 then ""
               else
@@ -777,6 +791,7 @@ jobs:
               "- Maximum version bump: \(.policy.max_bump | code)\n" +
               "- Lockfile regeneration: \(if .policy.lockfile_regeneration then "enabled" else "disabled" end)";
             "## upd dependency report\n\n" + overview +
+            self_pin_alert +
             security_section +
             update_section + normalized_section + annotation_section + hold_section + blocked_section +
             nested_lockfile_section +

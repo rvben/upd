@@ -1046,6 +1046,95 @@ fn publish_summary_step_honors_fail_on_blocked_for_a_blocked_security_fix() {
     );
 }
 
+/// A blocked `rvben/upd` self-pin means upd could not verify or update its
+/// own pinned reference in this repository's workflows, which silently
+/// leaves CI running an unintended upd version. It must not read as just
+/// another row in the general "Could not update safely" table: the summary
+/// carries a standalone `[!WARNING]` alert naming the pin and the reason.
+/// The negative control proves the alert is specific to `rvben/upd`, not to
+/// "any blocked entry" - an unrelated blocked package gets the ordinary
+/// table only.
+#[test]
+fn publish_summary_step_alerts_prominently_on_a_blocked_self_pin() {
+    fn run_summary(blocked_json: &str) -> String {
+        let tmp = tempfile::tempdir().unwrap();
+        let presentation_path = tmp.path().join("upd-presentation.json");
+        let report_path = tmp.path().join("upd-report.json");
+        let summary_path = tmp.path().join("github-summary");
+        fs::write(&report_path, "{}").unwrap();
+        fs::write(&summary_path, "").unwrap();
+        let presentation = format!(
+            r#"{{
+              "state": "blocked_no_change", "changed": false, "updates": [], "annotations": [],
+              "normalized": [], "policy_holds": [],
+              "blocked": [{blocked_json}],
+              "security_fixes": [], "security_advisories_fixed": 0, "changed_paths": [],
+              "counts": {{"updates":0,"updates_major":0,"updates_minor":0,"updates_patch":0,"updates_revision":0,
+                "updates_review_worthy":0,"updates_quiet":0,"annotations":0,"normalized":0,"files_changed":0,
+                "policy_holds":0,"blocked":1,"security_fixes":0,"warnings":0,"not_examined":0}},
+              "policy": {{"min_age":"7d","max_bump":"minor","lockfile_regeneration":false}},
+              "validation": {{"repository_command_configured": true, "proposal_integrity_passed": true}},
+              "auto_merge_requested": false
+            }}"#
+        );
+        fs::write(&presentation_path, presentation).unwrap();
+
+        let output = Command::new("bash")
+            .arg("-c")
+            .arg(workflow_script("Publish dependency summary"))
+            .current_dir(tmp.path())
+            .env(
+                "ARTIFACT_URL",
+                "https://github.example.test/rvben/upd/actions/runs/4242/artifacts/73",
+            )
+            .env("FAIL_ON_BLOCKED", "false")
+            .env("GITHUB_STEP_SUMMARY", &summary_path)
+            .env("PRESENTATION", &presentation_path)
+            .env("REPORT", &report_path)
+            .output()
+            .expect("summary step starts");
+        assert!(
+            output.status.success(),
+            "summary step failed\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        fs::read_to_string(&summary_path).unwrap()
+    }
+
+    let self_pin_summary = run_summary(
+        r#"{"package":"rvben/upd","current":"v0.14.2",
+            "reason":"self-pin-checksum-unavailable",
+            "path":".github/workflows/dependency-health.yml"}"#,
+    );
+    assert!(
+        self_pin_summary.contains("[!WARNING]"),
+        "a blocked rvben/upd self-pin must raise a standalone warning alert\n{self_pin_summary}"
+    );
+    assert!(self_pin_summary.contains("<code>rvben/upd</code>"));
+    assert!(self_pin_summary.contains("self-pin-checksum-unavailable"));
+    assert!(self_pin_summary.contains("### Could not update safely (1)"));
+    let alert_at = self_pin_summary.find("[!WARNING]").unwrap();
+    let table_at = self_pin_summary
+        .find("### Could not update safely")
+        .unwrap();
+    assert!(
+        alert_at < table_at,
+        "the self-pin alert must appear before the general blocked table, not only inside it"
+    );
+
+    let unrelated_summary = run_summary(
+        r#"{"package":"some-other/action","current":"1.0.0",
+            "reason":"floating-major-tag",
+            "path":".github/workflows/ci.yml"}"#,
+    );
+    assert!(
+        !unrelated_summary.contains("[!WARNING]"),
+        "an unrelated blocked package must not raise the self-pin alert\n{unrelated_summary}"
+    );
+    assert!(unrelated_summary.contains("### Could not update safely (1)"));
+}
+
 #[test]
 fn github_presentation_titles_mixed_and_single_normalizations() {
     let fixture = Fixture::new();
