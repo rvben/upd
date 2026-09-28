@@ -838,6 +838,215 @@ fn github_presentation_omits_security_section_when_nothing_was_fixed() {
     assert!(!summary.contains("Security fixes"));
 }
 
+/// A `lru`-under-`ratatui-core`-style manifest block (see
+/// `classify_manifest_blocked_precise` in `src/fix/apply.rs`) makes `upd
+/// audit --fix-audit --apply` exit 6, the same "vulnerabilities found, not
+/// fully resolved" code plain `audit` already uses - never 2. The "Apply
+/// available security fixes" step's own `case "$audit_exit" in 0|6) ;; ...`
+/// already tolerated 6 before this fix; what was missing was upd itself
+/// ever returning it instead of 2 for a manifest-blocked floor. Runs the
+/// step's real script (not upd) against a stub `upd` that reproduces the
+/// fixed exit code and a mixed applied/blocked report, and proves the step
+/// itself exits 0 (the job continues) with `advisories-fixed` counting only
+/// the fix that actually applied.
+#[test]
+fn apply_security_fixes_step_continues_on_a_blocked_fix() {
+    let tmp = tempfile::tempdir().unwrap();
+    let bin_dir = tmp.path().join("bin");
+    fs::create_dir(&bin_dir).unwrap();
+    let report_path = tmp.path().join("upd-security-report.json");
+    let output_path = tmp.path().join("github-output");
+    fs::write(&output_path, "").unwrap();
+
+    write_executable(
+        &bin_dir.join("upd"),
+        r#"#!/usr/bin/env bash
+set -euo pipefail
+cat <<'EOF'
+{"fixes":[
+  {"package":"cratea","from_version":"1.0.0","to_version":"1.1.0","path":"Cargo.lock","status":"applied"},
+  {"package":"crateb","from_version":"1.0.0","to_version":"1.1.0","path":"Cargo.lock","status":"blocked","error":"pinner-core requires crateb ^1.0"}
+],"summary":{"vulnerabilities":2,"errors":0}}
+EOF
+exit 6
+"#,
+    );
+
+    let path = format!("{}:{}", bin_dir.display(), std::env::var("PATH").unwrap());
+    let output = Command::new("bash")
+        .arg("-c")
+        .arg(workflow_script("Apply available security fixes"))
+        .current_dir(tmp.path())
+        .env("GITHUB_TOKEN", "test-token")
+        .env("LOCK", "false")
+        .env("LANGS", "")
+        .env("PATHS", ".")
+        .env("REPORT", &report_path)
+        .env("GITHUB_OUTPUT", &output_path)
+        .env("PATH", path)
+        .output()
+        .expect("security-fix step starts");
+
+    assert!(
+        output.status.success(),
+        "a manifest-blocked advisory must not fail the job\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        fs::read_to_string(&output_path).unwrap(),
+        "advisories-fixed=1\n",
+        "only the applied fix counts; the blocked one is not silently counted as fixed"
+    );
+}
+
+/// The control for the test above: a genuine tool failure (not a manifest
+/// block) must still fail the job, so tolerating exit 6 never widens into
+/// tolerating every failure.
+#[test]
+fn apply_security_fixes_step_still_fails_on_a_genuine_error() {
+    let tmp = tempfile::tempdir().unwrap();
+    let bin_dir = tmp.path().join("bin");
+    fs::create_dir(&bin_dir).unwrap();
+    let report_path = tmp.path().join("upd-security-report.json");
+    let output_path = tmp.path().join("github-output");
+    fs::write(&output_path, "").unwrap();
+
+    write_executable(
+        &bin_dir.join("upd"),
+        r#"#!/usr/bin/env bash
+set -euo pipefail
+cat <<'EOF'
+{"fixes":[],"summary":{"vulnerabilities":1,"errors":1}}
+EOF
+exit 2
+"#,
+    );
+
+    let path = format!("{}:{}", bin_dir.display(), std::env::var("PATH").unwrap());
+    let output = Command::new("bash")
+        .arg("-c")
+        .arg(workflow_script("Apply available security fixes"))
+        .current_dir(tmp.path())
+        .env("GITHUB_TOKEN", "test-token")
+        .env("LOCK", "false")
+        .env("LANGS", "")
+        .env("PATHS", ".")
+        .env("REPORT", &report_path)
+        .env("GITHUB_OUTPUT", &output_path)
+        .env("PATH", path)
+        .output()
+        .expect("security-fix step starts");
+
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "a genuine tool error must still fail the job\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+/// End-to-end: a blocked security fix flows from the security report all the
+/// way through the shared presentation into both publish surfaces. The step
+/// summary carries the per-package detail (same table ordinary blocked
+/// updates use); the PR body carries the aggregate "needs attention" count,
+/// consistent with how an ordinary blocked update already surfaces there.
+#[test]
+fn github_presentation_surfaces_a_blocked_security_fix() {
+    let fixture = Fixture::new();
+    let report = r#"{"files":[],"summary":{"updates_total":0,"files_with_changes":0,"held_back":0,"capped":0,"skipped":0,"warnings":0}}"#;
+    let security_report = r#"{
+      "fixes": [
+        {"package":"cratea","from_version":"1.0.0","to_version":"1.1.0","path":"Cargo.lock","status":"applied"},
+        {"package":"crateb","from_version":"1.0.0","to_version":"1.0.0","path":"Cargo.lock","status":"blocked","error":"pinner-core requires crateb ^1.0"}
+      ],
+      "summary": {"vulnerabilities": 2}
+    }"#;
+    fixture.run_publish_with_security_report(true, "new", false, report, security_report);
+
+    let presentation = fixture.presentation();
+    assert_eq!(presentation["counts"]["security_fixes"], 1);
+    assert_eq!(presentation["counts"]["blocked"], 1);
+    let blocked = presentation["blocked"].as_array().unwrap();
+    assert_eq!(blocked.len(), 1);
+    assert_eq!(blocked[0]["package"], "crateb");
+    assert_eq!(blocked[0]["reason"], "pinner-core requires crateb ^1.0");
+    assert_eq!(blocked[0]["path"], "Cargo.lock");
+
+    let summary = fixture.summary();
+    assert!(summary.contains("### Could not update safely (1)"));
+    assert!(summary.contains("<code>crateb</code>"));
+    assert!(summary.contains("pinner-core requires crateb ^1.0"));
+
+    let body = fixture.body();
+    assert!(
+        body.contains("**Needs attention:** 1 dependency could not be changed safely."),
+        "{body}"
+    );
+}
+
+/// `fail-on-blocked` must fail the job on a blocked SECURITY fix too, not
+/// only on an ordinary blocked update: the gate reads `.counts.blocked` from
+/// the merged presentation (which `blocked_rows` now unions from both
+/// sources), not `.summary.skipped` from the plain update report alone.
+#[test]
+fn publish_summary_step_honors_fail_on_blocked_for_a_blocked_security_fix() {
+    let tmp = tempfile::tempdir().unwrap();
+    let presentation_path = tmp.path().join("upd-presentation.json");
+    let report_path = tmp.path().join("upd-report.json");
+    let summary_path = tmp.path().join("github-summary");
+    fs::write(&report_path, "{}").unwrap();
+    fs::write(&summary_path, "").unwrap();
+    let presentation = r#"{
+      "state": "ready", "changed": true, "updates": [], "annotations": [],
+      "normalized": [], "policy_holds": [],
+      "blocked": [{"package":"crateb","current":"1.0.0","reason":"pinner-core requires crateb ^1.0","path":"Cargo.lock"}],
+      "security_fixes": [], "security_advisories_fixed": 0, "changed_paths": [],
+      "counts": {"updates":0,"updates_major":0,"updates_minor":0,"updates_patch":0,"updates_revision":0,
+        "updates_review_worthy":0,"updates_quiet":0,"annotations":0,"normalized":0,"files_changed":1,
+        "policy_holds":0,"blocked":1,"security_fixes":0,"warnings":0,"not_examined":0},
+      "policy": {"min_age":"7d","max_bump":"minor","lockfile_regeneration":false},
+      "validation": {"repository_command_configured": true, "proposal_integrity_passed": true},
+      "auto_merge_requested": false
+    }"#;
+    fs::write(&presentation_path, presentation).unwrap();
+
+    let run = |fail_on_blocked: &str| {
+        Command::new("bash")
+            .arg("-c")
+            .arg(workflow_script("Publish dependency summary"))
+            .current_dir(tmp.path())
+            .env(
+                "ARTIFACT_URL",
+                "https://github.example.test/rvben/yamldap/actions/runs/4242/artifacts/73",
+            )
+            .env("FAIL_ON_BLOCKED", fail_on_blocked)
+            .env("GITHUB_STEP_SUMMARY", &summary_path)
+            .env("PRESENTATION", &presentation_path)
+            .env("REPORT", &report_path)
+            .output()
+            .expect("summary step starts")
+    };
+
+    let blocking = run("true");
+    assert_eq!(
+        blocking.status.code(),
+        Some(1),
+        "fail-on-blocked must fail the job when a security fix is blocked\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&blocking.stdout),
+        String::from_utf8_lossy(&blocking.stderr)
+    );
+
+    let allowing = run("false");
+    assert!(
+        allowing.status.success(),
+        "fail-on-blocked defaults to surfacing, not failing\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&allowing.stdout),
+        String::from_utf8_lossy(&allowing.stderr)
+    );
+}
+
 #[test]
 fn github_presentation_titles_mixed_and_single_normalizations() {
     let fixture = Fixture::new();

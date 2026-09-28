@@ -496,6 +496,15 @@ jobs:
                     current: (.current // "unknown" | clean(160)),
                     reason: (.error // "upd could not apply this update safely" | clean(240)),
                     path: ($file.path // "unknown file" | clean(160))
+                  }]
+               +
+               [($security.fixes // [])[]
+                | select(.status == "blocked")
+                | {
+                    package: (.package // "unknown dependency" | clean(160)),
+                    current: (.from_version // "unknown" | clean(160)),
+                    reason: (.error // "blocked by a manifest requirement" | clean(240)),
+                    path: (.path // "unknown file" | clean(160))
                   }])
               | unique_by([.package, .current, .reason, .path])
               | sort_by([.package, .path, .reason]);
@@ -752,7 +761,11 @@ jobs:
             "[Download machine-readable JSON archive](\($artifact_url)) · retained for 7 days"
           ' "$PRESENTATION" >> "$GITHUB_STEP_SUMMARY"
 
-          blocked="$(jq --raw-output '.summary.skipped // 0' "$REPORT")"
+          # Reads the merged presentation, not the plain update REPORT: a
+          # security fix cargo could not relock because another crate's own
+          # requirement excludes the patched version is "blocked" too (see
+          # blocked_rows above), and .summary.skipped on its own would miss it.
+          blocked="$(jq --raw-output '.counts.blocked // 0' "$PRESENTATION")"
           if [[ "$FAIL_ON_BLOCKED" == true && "$blocked" -gt 0 ]]; then
             echo "Blocked updates require attention" >&2
             exit 1

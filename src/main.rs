@@ -4725,6 +4725,11 @@ async fn run_audit(cli: &Cli) -> Result<()> {
             // Exit-code contract for --fix-audit:
             // - errors during fix (any Failed/RolledBack outcome) → 2
             // - dry-run with pending fixes and !no_fail → 1
+            // - a manifest requirement blocked a fix (and no genuine error
+            //   or pending dry-run outranks it) and !no_fail → 6, the same
+            //   "vulnerabilities found, not fully resolved" code plain
+            //   audit uses; other fixes in the run still applied, so this
+            //   is not an error
             // - applied successfully (or no_fail) → 0
             let fix_errors: Vec<String> = outcomes
                 .iter()
@@ -4732,10 +4737,13 @@ async fn run_audit(cli: &Cli) -> Result<()> {
                 .filter_map(|o| o.error.clone())
                 .collect();
             let has_planned = outcomes.iter().any(|o| o.status == FixStatus::Planned);
+            let has_blocked = outcomes.iter().any(|o| o.status == FixStatus::Blocked);
             let fix_exit_code = if !fix_errors.is_empty() {
                 2
             } else if effective_dry_run && has_planned && !no_fail {
                 1
+            } else if has_blocked && !no_fail {
+                6
             } else {
                 0
             };
@@ -4914,6 +4922,17 @@ fn print_fix_outcome(outcome: &AppliedFix) {
         }
         (_, FixStatus::AlreadySatisfied) => {
             // Silent in text mode by design: nothing changed.
+        }
+        (_, FixStatus::Blocked) => {
+            println!(
+                "{} {}: blocked - {}",
+                "⚠".yellow().bold(),
+                target.package.bold(),
+                outcome
+                    .error
+                    .as_deref()
+                    .unwrap_or("blocked by a manifest requirement"),
+            );
         }
         (_, FixStatus::Failed) | (_, FixStatus::RolledBack) => {
             // Silent here; these reach the combined fix-errors stderr dump

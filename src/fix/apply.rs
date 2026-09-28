@@ -57,6 +57,12 @@ pub enum FixStatus {
     /// A write succeeded but the group's relock failed; every file the
     /// group's snapshot covered was restored byte-for-byte.
     RolledBack,
+    /// A `CargoPrecise` floor was rejected because another crate's own
+    /// manifest requirement on the same package excludes the version cargo
+    /// was asked to pin to; `error` names the constraining crate and its
+    /// requirement. Not an error: other targets in the same group and run
+    /// still apply, and the group is not rolled back on account of it alone.
+    Blocked,
 }
 
 impl FixStatus {
@@ -70,6 +76,7 @@ impl FixStatus {
             FixStatus::AlreadySatisfied => "already_satisfied",
             FixStatus::Failed => "failed",
             FixStatus::RolledBack => "rolled_back",
+            FixStatus::Blocked => "blocked",
         }
     }
 }
@@ -248,7 +255,7 @@ fn changed_packages(items: &[(FixTarget, Provisional)], lockfile: Option<&Path>)
                     &[(target.package.clone(), target.vulnerable_version.clone())],
                 )
             }),
-            Provisional::Unfixable(_) | Provisional::Failed(_) => false,
+            Provisional::Unfixable(_) | Provisional::Failed(_) | Provisional::Blocked(_) => false,
         };
         if include && !changed.contains(&target.package) {
             changed.push(target.package.clone());
@@ -287,6 +294,10 @@ enum Provisional {
     AlreadySatisfied,
     Unfixable(String),
     Failed(String),
+    /// A `CargoPrecise` floor cargo refused on account of a dependent's own
+    /// requirement; carries the human-readable reason (see
+    /// [`classify_manifest_blocked_precise`]).
+    Blocked(String),
 }
 
 /// Resolve one target's provisional outcome into its final [`AppliedFix`].
@@ -296,9 +307,11 @@ enum Provisional {
 /// Every version floor the run chose, each as the crate and the version it
 /// is floored at. A floor an earlier target's update already reached counts
 /// too: it is just as much a floor no hold may take the lockfile back below.
+/// A `Blocked` target wrote nothing, so it floors nothing to keep.
 fn floors_to_keep(items: &[(FixTarget, Provisional)]) -> Vec<(String, String)> {
     items
         .iter()
+        .filter(|(_, prov)| !matches!(prov, Provisional::Blocked(_)))
         .map(|(target, _)| (target.package.clone(), target.to_version.clone()))
         .collect()
 }
@@ -325,13 +338,18 @@ fn finalize(target: FixTarget, prov: Provisional, wrote_status: FixStatus) -> Ap
             status: FixStatus::Failed,
             error: Some(error),
         },
+        Provisional::Blocked(reason) => AppliedFix {
+            target,
+            status: FixStatus::Blocked,
+            error: Some(reason),
+        },
     }
 }
 
 /// Resolve one target's provisional outcome after a relock failure: targets
 /// that were written or already satisfied lose that progress to the
 /// restore and become `RolledBack`; targets that were already terminal
-/// (`Unfixable`/`Failed`) keep their own status and error (rule 6).
+/// (`Unfixable`/`Failed`/`Blocked`) keep their own status and error (rule 6).
 ///
 /// `RolledBack` promises that every file the snapshot covered is back at its
 /// pre-run bytes. A group with a file that could not be put back is reported
@@ -371,6 +389,11 @@ fn finalize_rolled_back(
             target,
             status: FixStatus::Failed,
             error: Some(error),
+        },
+        Provisional::Blocked(reason) => AppliedFix {
+            target,
+            status: FixStatus::Blocked,
+            error: Some(reason),
         },
     }
 }
@@ -709,16 +732,51 @@ fn apply_edit_group(
     }
 }
 
+/// The stable shape of cargo's rejection when a `cargo update --precise`
+/// target is excluded by another crate's own requirement on the same
+/// package, e.g.:
+///
+/// ```text
+/// error: failed to select a version for the requirement `lru = "^0.16"`
+/// candidate versions found which didn't match: 0.18.2
+/// location searched: crates.io index
+/// required by package `ratatui-core v0.1.0`
+///     ... which satisfies dependency `ratatui-core = "^0.1.0"` (locked to 0.1.0) of package `ratatui v0.30.0`
+/// ```
+///
+/// Returns a human-readable reason naming the constraining crate and its
+/// requirement (e.g. `"ratatui-core requires lru ^0.16"`), or `None` when
+/// `message` is some other cargo or process failure - a genuine error that
+/// must still fail the target and roll back the group.
+fn classify_manifest_blocked_precise(package: &str, message: &str) -> Option<String> {
+    let needle = format!("failed to select a version for the requirement `{package} = \"");
+    let needle_pos = message.find(&needle)?;
+    let after_needle = &message[needle_pos + needle.len()..];
+    let requirement = &after_needle[..after_needle.find('"')?];
+
+    let required_by_needle = "required by package `";
+    let rest = &message[needle_pos..];
+    let after_required_by = &rest[rest.find(required_by_needle)? + required_by_needle.len()..];
+    let constraining_crate = &after_required_by[..after_required_by.find(' ')?];
+
+    Some(format!(
+        "{constraining_crate} requires {package} {requirement}"
+    ))
+}
+
 /// Apply one `CargoPrecise` group: `--no-lock` skips with guidance
 /// regardless of dry-run (a dry run must preview what `--apply` would
 /// actually do, and cargo-precise floors only ever mutate Cargo.lock, so
 /// `--no-lock` leaves nothing for either mode to do), otherwise dry-run
 /// plans and emits a "would regenerate" note (rule 8), and a real run has
 /// each target self-repair (if its vulnerable pair is no longer locked) or
-/// run `cargo update --precise`; any failure restores Cargo.lock and rolls
-/// back the group (rule 7). A group that stands under a cooldown gate reports
-/// its `Cargo.lock` for the read-back check, since `--precise` can lock
-/// companion crates the cooldown never saw.
+/// run `cargo update --precise`. A rejection cargo attributes to another
+/// crate's own requirement on the package (see
+/// `classify_manifest_blocked_precise`) marks only that target `Blocked`
+/// and leaves the rest of the group standing; any other failure restores
+/// Cargo.lock and rolls back the whole group (rule 7). A group that stands
+/// under a cooldown gate reports its `Cargo.lock` for the read-back check,
+/// since `--precise` can lock companion crates the cooldown never saw.
 fn apply_cargo_precise_group(
     group: Group,
     opts: &FixApplyOptions,
@@ -782,7 +840,10 @@ fn apply_cargo_precise_group(
                 let msg = other
                     .error_message()
                     .unwrap_or_else(|| "cargo update --precise failed".to_string());
-                items.push((target, Provisional::Failed(msg)));
+                match classify_manifest_blocked_precise(&target.package, &msg) {
+                    Some(reason) => items.push((target, Provisional::Blocked(reason))),
+                    None => items.push((target, Provisional::Failed(msg))),
+                }
             }
         }
     }
@@ -1485,5 +1546,93 @@ mod tests {
         assert!(outcomes[0].error.is_none());
         assert_eq!(notes, vec!["Cargo.lock: would regenerate".to_string()]);
         assert_eq!(std::fs::read_to_string(&cargo_lock).unwrap(), before);
+    }
+
+    /// The exact cargo rejection text captured from a real `unifi-cli`
+    /// repro: `ratatui-core` pins `lru` to `^0.16`, so a `--precise 0.18.2`
+    /// floor is refused. The reason names both the constraining crate and
+    /// its own requirement, not the version this run tried to pin to.
+    #[test]
+    fn classify_manifest_blocked_precise_names_the_constraining_crate() {
+        let message = "Failed to run `cargo update -p lru@0.16.4 --precise 0.18.2`: Updating crates.io index\nerror: failed to select a version for the requirement `lru = \"^0.16\"`\ncandidate versions found which didn't match: 0.18.2\nlocation searched: crates.io index\nrequired by package `ratatui-core v0.1.0`\n    ... which satisfies dependency `ratatui-core = \"^0.1.0\"` (locked to 0.1.0) of package `ratatui v0.30.0`\n    ... which satisfies dependency `ratatui = \"^0.30\"` (locked to 0.30.0) of package `unifi-cli v0.4.4 (/private/tmp/repro/unifi-cli)`";
+
+        assert_eq!(
+            classify_manifest_blocked_precise("lru", message),
+            Some("ratatui-core requires lru ^0.16".to_string())
+        );
+    }
+
+    /// The control for the test above: an unrelated cargo failure (here, a
+    /// plain network error) must not be misread as a manifest block, since
+    /// that would demote a genuine error into `Blocked` and skip the group
+    /// rollback it needs.
+    #[test]
+    fn classify_manifest_blocked_precise_returns_none_for_unrelated_cargo_error() {
+        let message = "Failed to run `cargo update -p lru@0.16.4 --precise 0.18.2`: Updating crates.io index\nerror: failed to fetch `https://github.com/rust-lang/crates.io-index`\n\nCaused by:\n  network failure seems to have happened";
+
+        assert_eq!(classify_manifest_blocked_precise("lru", message), None);
+    }
+
+    /// A `Blocked` floor wrote nothing, so unlike `Wrote`/`AlreadySatisfied`
+    /// it must not appear among the floors a later cooldown re-check treats
+    /// as chosen by this run.
+    #[test]
+    fn a_blocked_floor_is_not_kept() {
+        let items = vec![
+            (
+                cargo_floor_target("clap_builder", "4.6.6"),
+                Provisional::Wrote,
+            ),
+            (
+                cargo_floor_target("lru", "0.18.2"),
+                Provisional::Blocked("ratatui-core requires lru ^0.16".to_string()),
+            ),
+        ];
+
+        assert_eq!(
+            floors_to_keep(&items),
+            vec![("clap_builder".to_string(), "4.6.6".to_string())]
+        );
+    }
+
+    /// `finalize` (the no-rollback path) reports a `Blocked` target as
+    /// `FixStatus::Blocked` with the constraining-crate reason as its error,
+    /// not folded into `Failed`.
+    #[test]
+    fn finalize_reports_blocked_status_with_reason() {
+        let target = cargo_floor_target("lru", "0.18.2");
+        let fix = finalize(
+            target,
+            Provisional::Blocked("ratatui-core requires lru ^0.16".to_string()),
+            FixStatus::Applied,
+        );
+
+        assert_eq!(fix.status, FixStatus::Blocked);
+        assert_eq!(
+            fix.error.as_deref(),
+            Some("ratatui-core requires lru ^0.16")
+        );
+    }
+
+    /// `finalize_rolled_back` runs when some OTHER target in the group hit a
+    /// genuine failure and the group is being rolled back. A `Blocked`
+    /// target was already terminal before the rollback decision, so it must
+    /// keep reporting `Blocked` with its own reason rather than being swept
+    /// into `RolledBack` alongside the targets that actually wrote files.
+    #[test]
+    fn finalize_rolled_back_keeps_blocked_target_blocked() {
+        let target = cargo_floor_target("lru", "0.18.2");
+        let fix = finalize_rolled_back(
+            target,
+            Provisional::Blocked("ratatui-core requires lru ^0.16".to_string()),
+            "cargo update --precise failed for another target in the group",
+            &[],
+        );
+
+        assert_eq!(fix.status, FixStatus::Blocked);
+        assert_eq!(
+            fix.error.as_deref(),
+            Some("ratatui-core requires lru ^0.16")
+        );
     }
 }

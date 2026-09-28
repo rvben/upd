@@ -1152,6 +1152,104 @@ async fn cargo_precise_group_failure_distinguishes_failed_from_rolled_back() {
     );
 }
 
+/// A cargo rejection cargo itself attributes to another crate's own
+/// manifest requirement (the shape `unifi-cli` hit when `ratatui-core`
+/// pinned `lru` to `^0.16`) must not take the whole group down: `cratea`'s
+/// floor still applies and stays applied, `crateb`'s floor is reported
+/// `blocked` with the constraining crate named, and the process exits 6
+/// (vulnerabilities found, not fully resolved) rather than 2 (error). This
+/// is both the regression for that defect and the positive control that a
+/// fixable advisory alongside a blocked one still gets applied.
+#[cfg(unix)]
+#[tokio::test]
+async fn cargo_precise_manifest_blocked_target_does_not_roll_back_a_fixable_sibling() {
+    let server = wiremock::MockServer::start().await;
+    wiremock::Mock::given(wiremock::matchers::method("POST"))
+        .and(wiremock::matchers::path("/querybatch"))
+        .respond_with(MultiOsvResponder {
+            answers: vec![
+                ("cratea", "1.0.0", "GHSA-floors-blk"),
+                ("crateb", "1.0.0", "GHSA-floors-blk"),
+            ],
+        })
+        .mount(&server)
+        .await;
+    wiremock::Mock::given(wiremock::matchers::method("GET"))
+        .and(wiremock::matchers::path("/vulns/GHSA-floors-blk"))
+        .respond_with(
+            wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "GHSA-floors-blk",
+                "summary": "multi-package advisory",
+                "affected": [
+                    { "package": { "name": "cratea", "ecosystem": "crates.io" },
+                      "ranges": [{ "type": "ECOSYSTEM", "events": [{ "introduced": "0" }, { "fixed": "1.1.0" }] }] },
+                    { "package": { "name": "crateb", "ecosystem": "crates.io" },
+                      "ranges": [{ "type": "ECOSYSTEM", "events": [{ "introduced": "0" }, { "fixed": "1.1.0" }] }] }
+                ]
+            })),
+        )
+        .mount(&server)
+        .await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    fs::write(
+        tmp.path().join("Cargo.toml"),
+        "[package]\nname = \"t\"\nversion = \"0.1.0\"\n",
+    )
+    .unwrap();
+    let cargo_lock_path = tmp.path().join("Cargo.lock");
+    let cargo_lock_original = "version = 4\n\n[[package]]\nname = \"t\"\nversion = \"0.1.0\"\n\n[[package]]\nname = \"cratea\"\nversion = \"1.0.0\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\n\n[[package]]\nname = \"crateb\"\nversion = \"1.0.0\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\n";
+    fs::write(&cargo_lock_path, cargo_lock_original).unwrap();
+
+    let bin_dir = tmp.path().join("fakebin");
+    fs::create_dir(&bin_dir).unwrap();
+    let cargo_lock_after_cratea = "version = 4\n\n[[package]]\nname = \"t\"\nversion = \"0.1.0\"\n\n[[package]]\nname = \"cratea\"\nversion = \"1.1.0\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\n\n[[package]]\nname = \"crateb\"\nversion = \"1.0.0\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\n";
+    write_fake_tool(
+        &bin_dir,
+        "cargo",
+        &format!(
+            "#!/bin/sh\ncase \"$3\" in\ncratea@*) cat > Cargo.lock <<'EOF'\n{cargo_lock_after_cratea}EOF\nexit 0 ;;\ncrateb@*) cat >&2 <<'EOF'\nerror: failed to select a version for the requirement `crateb = \"^1.0\"`\ncandidate versions found which didn't match: 1.1.0\nlocation searched: crates.io index\nrequired by package `pinner-core v0.1.0`\n    ... which satisfies dependency `pinner-core = \"^0.1.0\"` (locked to 0.1.0) of package `pinner v2.0.0`\nEOF\nexit 1 ;;\nesac\n"
+        ),
+    );
+
+    let (stdout, stderr, code) = run_with_env(
+        &[
+            "audit",
+            "--fix-audit",
+            "--apply",
+            "--no-cache",
+            "--format",
+            "json",
+        ],
+        tmp.path(),
+        &[
+            ("OSV_API_URL", &server.uri()),
+            ("PATH", &path_with(&bin_dir)),
+        ],
+    );
+
+    assert_eq!(
+        code, 6,
+        "a manifest-blocked advisory is not an error; stdout: {stdout}\nstderr: {stderr}"
+    );
+    assert_eq!(
+        fs::read_to_string(&cargo_lock_path).unwrap(),
+        cargo_lock_after_cratea,
+        "cratea's write must stand: a blocked sibling is not a group failure"
+    );
+
+    let json: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    let fixes = json["fixes"].as_array().unwrap();
+
+    let cratea = fixes.iter().find(|f| f["package"] == "cratea").unwrap();
+    assert_eq!(cratea["status"], "applied");
+    assert!(cratea["error"].is_null());
+
+    let crateb = fixes.iter().find(|f| f["package"] == "crateb").unwrap();
+    assert_eq!(crateb["status"], "blocked");
+    assert_eq!(crateb["error"], "pinner-core requires crateb ^1.0");
+}
+
 /// (m) An apply-time `Unfixable` outcome (the floor WRITER refuses, as
 /// opposed to a routing-time unfixable) must still surface in default
 /// text-mode `--fix-audit --apply`: `print_fix_outcome` previously swallowed
