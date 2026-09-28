@@ -28,6 +28,10 @@ pub struct MockRegistry {
     unavailable_commit_tags: HashSet<(String, String)>,
     /// Packages whose registry has no tag concept at all
     without_tag_concept: HashSet<String>,
+    /// Map of package + ref + path to the file's bytes at that ref
+    repo_files: HashMap<(String, String, String), Vec<u8>>,
+    /// Map of package + tag + asset name to the release asset's bytes
+    release_assets: HashMap<(String, String, String), Vec<u8>>,
     /// Registry name
     name: &'static str,
 }
@@ -46,6 +50,8 @@ impl MockRegistry {
             unavailable_refs: HashSet::new(),
             unavailable_commit_tags: HashSet::new(),
             without_tag_concept: HashSet::new(),
+            repo_files: HashMap::new(),
+            release_assets: HashMap::new(),
             name,
         }
     }
@@ -155,6 +161,37 @@ impl MockRegistry {
         self.constrained_versions.insert(
             (package.to_string(), constraints.to_string()),
             version.to_string(),
+        );
+        self
+    }
+
+    /// Declare the bytes of a file at a specific ref, as `repo_file_at_ref`
+    /// reports them.
+    pub fn with_repo_file(
+        mut self,
+        package: &str,
+        reference: &str,
+        path: &str,
+        bytes: impl Into<Vec<u8>>,
+    ) -> Self {
+        self.repo_files.insert(
+            (package.to_string(), reference.to_string(), path.to_string()),
+            bytes.into(),
+        );
+        self
+    }
+
+    /// Declare the bytes of a release asset, as `release_asset` reports them.
+    pub fn with_release_asset(
+        mut self,
+        package: &str,
+        tag: &str,
+        asset_name: &str,
+        bytes: impl Into<Vec<u8>>,
+    ) -> Self {
+        self.release_assets.insert(
+            (package.to_string(), tag.to_string(), asset_name.to_string()),
+            bytes.into(),
         );
         self
     }
@@ -293,6 +330,25 @@ impl Registry for MockRegistry {
 
     fn name(&self) -> &'static str {
         self.name
+    }
+
+    async fn repo_file_at_ref(
+        &self,
+        package: &str,
+        reference: &str,
+        path: &str,
+    ) -> Result<Vec<u8>> {
+        self.repo_files
+            .get(&(package.to_string(), reference.to_string(), path.to_string()))
+            .cloned()
+            .ok_or_else(|| anyhow!("no repo file fixture for {package}@{reference}:{path}"))
+    }
+
+    async fn release_asset(&self, package: &str, tag: &str, asset_name: &str) -> Result<Vec<u8>> {
+        self.release_assets
+            .get(&(package.to_string(), tag.to_string(), asset_name.to_string()))
+            .cloned()
+            .ok_or_else(|| anyhow!("no release asset fixture for {package}@{tag}:{asset_name}"))
     }
 }
 

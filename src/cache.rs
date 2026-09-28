@@ -471,6 +471,28 @@ impl<R: Registry> Registry for CachedRegistry<R> {
     async fn pre_commit_manifest(&self, package: &str, reference: &str) -> Result<String> {
         self.inner.pre_commit_manifest(package, reference).await
     }
+
+    /// Forwarded, not cached, for the same reason as `resolve_ref_to_commit`:
+    /// a method left to the trait default here silently answers "unavailable"
+    /// for every wrapped registry rather than surfacing the inner registry's
+    /// real support for it. The self-pin updater reads this file to decide
+    /// whether a checksum can be trusted, so it must reach the real registry.
+    async fn repo_file_at_ref(
+        &self,
+        package: &str,
+        reference: &str,
+        path: &str,
+    ) -> Result<Vec<u8>> {
+        self.inner.repo_file_at_ref(package, reference, path).await
+    }
+
+    /// Forwarded, not cached, for the same reason as `repo_file_at_ref`: the
+    /// self-pin updater downloads a release's own checksum sidecar to verify
+    /// a pin bump, and that answer must come from the real registry rather
+    /// than the trait default.
+    async fn release_asset(&self, package: &str, tag: &str, asset_name: &str) -> Result<Vec<u8>> {
+        self.inner.release_asset(package, tag, asset_name).await
+    }
 }
 
 #[cfg(test)]
@@ -1193,6 +1215,52 @@ mod forwarding_tests {
                 .unwrap(),
             TagsAtCommit::Known(vec!["v4.2.2".to_string(), "v4".to_string()]),
             "the decorator must return the tags the HTTP layer served for this commit"
+        );
+    }
+
+    /// `repo_file_at_ref` and `release_asset` back the self-pin updater's
+    /// checksum verification. They shipped without a forward here once: every
+    /// call fell through to the trait default's "unsupported" error, so the
+    /// self-pin bypass never worked through the production registry, which is
+    /// always wrapped in `CachedRegistry`. Only a hand-rolled test fixture
+    /// that skipped the decorator entirely ever exercised the real code path.
+    #[tokio::test]
+    async fn cached_registry_forwards_repo_file_at_ref() {
+        let inner = MockRegistry::new("github-releases").with_repo_file(
+            "rvben/upd",
+            "v0.14.2",
+            "release-pins.json",
+            b"{\"version\":\"v0.14.2\"}".to_vec(),
+        );
+        let cached = CachedRegistry::new(inner, Cache::new_shared(), true);
+
+        let bytes = cached
+            .repo_file_at_ref("rvben/upd", "v0.14.2", "release-pins.json")
+            .await
+            .unwrap();
+        assert_eq!(
+            bytes, b"{\"version\":\"v0.14.2\"}",
+            "CachedRegistry must forward repo_file_at_ref to the inner registry"
+        );
+    }
+
+    #[tokio::test]
+    async fn cached_registry_forwards_release_asset() {
+        let inner = MockRegistry::new("github-releases").with_release_asset(
+            "rvben/upd",
+            "v0.14.2",
+            "upd-v0.14.2.tar.gz.sha256",
+            b"deadbeef  upd-v0.14.2.tar.gz\n".to_vec(),
+        );
+        let cached = CachedRegistry::new(inner, Cache::new_shared(), true);
+
+        let bytes = cached
+            .release_asset("rvben/upd", "v0.14.2", "upd-v0.14.2.tar.gz.sha256")
+            .await
+            .unwrap();
+        assert_eq!(
+            bytes, b"deadbeef  upd-v0.14.2.tar.gz\n",
+            "CachedRegistry must forward release_asset to the inner registry"
         );
     }
 }

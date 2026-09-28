@@ -1905,4 +1905,100 @@ mod tests {
             .unwrap();
         assert_eq!(resolved, sha);
     }
+
+    /// `repo_file_at_ref` and `release_asset` back the self-pin updater's
+    /// checksum verification and, before this test, had never been exercised
+    /// against an HTTP response of the shape GitHub actually returns: base64
+    /// content from the contents API and a two-hop release/asset lookup.
+    #[tokio::test]
+    async fn repo_file_at_ref_decodes_base64_content_from_the_contents_api() {
+        use base64::Engine;
+        let server = MockServer::start().await;
+        let body = b"{\"version\":\"v0.14.2\"}";
+        let encoded = base64::engine::general_purpose::STANDARD.encode(body);
+
+        Mock::given(method("GET"))
+            .and(path("/repos/rvben/upd/contents/release-pins.json"))
+            .and(query_param("ref", "v0.14.2"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string(format!(r#"{{"content":"{encoded}","encoding":"base64"}}"#)),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let bytes = registry(&server)
+            .repo_file_at_ref("rvben/upd", "v0.14.2", "release-pins.json")
+            .await
+            .unwrap();
+        assert_eq!(bytes, body);
+    }
+
+    #[tokio::test]
+    async fn repo_file_at_ref_errors_when_the_contents_api_returns_not_found() {
+        let server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/repos/rvben/upd/contents/release-pins.json"))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&server)
+            .await;
+
+        let result = registry(&server)
+            .repo_file_at_ref("rvben/upd", "v0.14.2", "release-pins.json")
+            .await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn release_asset_follows_the_release_lookup_to_the_asset_url() {
+        let server = MockServer::start().await;
+        let asset_bytes = b"deadbeefdeadbeefdeadbeefdeadbeefdeadbeef  upd-v0.14.2.tar.gz\n";
+        let asset_url = format!("{}/assets/download-me", server.uri());
+
+        Mock::given(method("GET"))
+            .and(path("/repos/rvben/upd/releases/tags/v0.14.2"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(format!(
+                r#"{{"assets":[{{"name":"upd-v0.14.2.tar.gz.sha256","url":"{asset_url}"}}]}}"#
+            )))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path("/assets/download-me"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_bytes(asset_bytes.to_vec())
+                    .insert_header("content-type", "application/octet-stream"),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let bytes = registry(&server)
+            .release_asset("rvben/upd", "v0.14.2", "upd-v0.14.2.tar.gz.sha256")
+            .await
+            .unwrap();
+        assert_eq!(bytes, asset_bytes);
+    }
+
+    #[tokio::test]
+    async fn release_asset_errors_when_no_asset_matches_the_requested_name() {
+        let server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/repos/rvben/upd/releases/tags/v0.14.2"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                r#"{"assets":[{"name":"some-other-asset.tar.gz","url":"https://example.invalid/x"}]}"#,
+            ))
+            .mount(&server)
+            .await;
+
+        let result = registry(&server)
+            .release_asset("rvben/upd", "v0.14.2", "upd-v0.14.2.tar.gz.sha256")
+            .await;
+        assert!(result.is_err());
+    }
 }
