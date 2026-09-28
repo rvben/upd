@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.14.2](https://github.com/rvben/upd/compare/v0.14.1...v0.14.2) - 2026-09-28
+
+### Added
+
+- **actions**: exempt rvben/upd self-pins from the max-bump ceiling ([ece2e86](https://github.com/rvben/upd/commit/ece2e86d6a59d4f19178a3940448f4dd233516ce))
+- **gitlab**: add `gitlab org run` to keep dependency merge requests across a group ([b6898f0](https://github.com/rvben/upd/commit/b6898f0902ae3d5d2ae28b9d31a33efef25a9bd9))
+- **update**: add --exclude-lang to leave ecosystems out after every other selection ([5ff55ea](https://github.com/rvben/upd/commit/5ff55ea4549f5463a60e840ff8b531ef9155d888))
+- **gitlab**: retry rate-limited and unavailable GitLab API requests ([0394b8e](https://github.com/rvben/upd/commit/0394b8ed458fda3d9d12f5cd6e3053096021538d))
+- **update**: add --min-age-floor to tighten configured cooldowns ([1348318](https://github.com/rvben/upd/commit/134831805b4143ebdc3591d0721df2b47faea0c0))
+- **config**: add organization opt-in keys to [automation] ([0b403fb](https://github.com/rvben/upd/commit/0b403fbcca5622365883fd66c99d8a6a492ecbb9))
+
+### Fixed
+
+- **gitlab**: make `gitlab run --dry-run` report instead of publishing ([ea870ee](https://github.com/rvben/upd/commit/ea870eeaf80859d04e802497160ec2cc7ca55590))
+- **cache**: replace the version cache file atomically ([6cacfdf](https://github.com/rvben/upd/commit/6cacfdfc7e019f2306929a73fe06808cd97b9f22))
+- **gitlab**: delete the obsolete branch before closing its merge request ([b90dff4](https://github.com/rvben/upd/commit/b90dff4b394c9965e34209ba4d3843346b75dc16))
+
 ## [0.14.1](https://github.com/rvben/upd/compare/v0.14.0...v0.14.1) - 2026-09-28
 
 ### Added
