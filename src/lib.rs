@@ -12,6 +12,7 @@ pub mod interactive;
 pub mod lockfile;
 pub mod lockgate;
 pub mod lockscan;
+pub mod nested_lock;
 pub mod normalize;
 pub mod npm_range;
 pub mod output;

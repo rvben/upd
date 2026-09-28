@@ -519,6 +519,14 @@ jobs:
                  }]
               | unique_by([.package, .from, .to, .path])
               | sort_by([.package, .path]);
+            def nested_lockfile_rows:
+              [(.nested_lockfiles // [])[] | {
+                 manifest: (.manifest // "unknown file" | clean(160)),
+                 lockfile: (.lockfile // "unknown file" | clean(160)),
+                 status: (.status // "unknown" | clean(32)),
+                 reason: (.reason // "" | clean(240))
+               }]
+              | sort_by([.manifest]);
             . as $report
             | (update_rows) as $updates
             | (annotation_rows) as $annotations
@@ -526,6 +534,7 @@ jobs:
             | (policy_rows) as $policy_holds
             | (blocked_rows) as $blocked
             | (security_fix_rows) as $security_fixes
+            | (nested_lockfile_rows) as $nested_lockfiles
             | {
                 schema: 1,
                 state: (if $changed then "ready" elif ($blocked | length) > 0 then "blocked_no_change" else "clean" end),
@@ -536,6 +545,7 @@ jobs:
                 policy_holds: $policy_holds,
                 blocked: $blocked,
                 security_fixes: $security_fixes,
+                nested_lockfiles: $nested_lockfiles,
                 security_advisories_fixed: ($security.summary.vulnerabilities // 0),
                 changed_paths: ($changed_paths | map(clean(160)) | unique | sort),
                 counts: {
@@ -552,6 +562,8 @@ jobs:
                   policy_holds: ($policy_holds | length),
                   blocked: ($blocked | length),
                   security_fixes: ($security_fixes | length),
+                  nested_synced: ([$nested_lockfiles[] | select(.status == "synced")] | length),
+                  nested_blocked: ([$nested_lockfiles[] | select(.status == "blocked")] | length),
                   warnings: ($report.summary.warnings // 0),
                   not_examined: ($report.summary.not_examined // 0)
                 },
@@ -734,6 +746,17 @@ jobs:
                   "| \(.package | code) | \(.current | code) | \(.reason | html) | \(.path | code) |"
                 ) | join("\n"))
               end;
+            def nested_lockfile_section:
+              if (.nested_lockfiles | length) == 0 then ""
+              else
+                "\n\n### Nested Cargo workspaces (\(.nested_lockfiles | length))\n\n" +
+                "| Manifest | Lockfile | Status | Reason |\n" +
+                "| --- | --- | --- | --- |\n" +
+                (.nested_lockfiles | map(
+                  "| \(.manifest | code) | \(.lockfile | code) | \(.status | html) | " +
+                  "\(if .reason == "" then "-" else (.reason | html) end) |"
+                ) | join("\n"))
+              end;
             def changed_files_section:
               if (.changed_paths | length) == 0 then ""
               else
@@ -756,6 +779,7 @@ jobs:
             "## upd dependency report\n\n" + overview +
             security_section +
             update_section + normalized_section + annotation_section + hold_section + blocked_section +
+            nested_lockfile_section +
             changed_files_section + validation_section + policy_section +
             "\n\n### Machine-readable evidence\n\n" +
             "[Download machine-readable JSON archive](\($artifact_url)) · retained for 7 days"
@@ -1079,6 +1103,17 @@ jobs:
               (if .counts.blocked > 0 then
                  "\n**Needs attention:** \(.counts.blocked) \(plural(.counts.blocked; "dependency could"; "dependencies could")) not be changed safely."
                else "" end);
+            def nested_lockfile_note:
+              (if .counts.nested_synced > 0 then
+                 "\n\(.counts.nested_synced) nested Cargo \(plural(.counts.nested_synced; "lockfile"; "lockfiles")) " +
+                 "re-synced to match the root update: " +
+                 ([.nested_lockfiles[] | select(.status == "synced") | .lockfile] | .[:3] | map(. | code) | join(", ")) +
+                 (if .counts.nested_synced > 3 then ", and \(.counts.nested_synced - 3) more" else "" end) + "."
+               else "" end) +
+              (if .counts.nested_blocked > 0 then
+                 "\n**Needs attention:** \(.counts.nested_blocked) nested Cargo " +
+                 "\(plural(.counts.nested_blocked; "lockfile"; "lockfiles")) could not be kept in sync."
+               else "" end);
             def attention:
               ([.updates[] | select((.bump | ascii_downcase) != "patch")]) as $review
               | (if ($review | length) > 0 then $review else .updates end) as $items
@@ -1118,7 +1153,7 @@ jobs:
             "<p><a href=\"https://github.com/rvben/upd\"><img src=\"https://raw.githubusercontent.com/rvben/upd/84109eaf36c739dc11af0452c6218abb7e47a8e3/assets/logo-wide.svg\" alt=\"upd\" width=\"96\"></a></p>" +
             "\n\n" + heading +
             "\n\n`\($repository)` · Prepared from the latest `\($base_branch)` · \(merge_intent)" +
-            "\n\n" + summary + policy_note + attention +
+            "\n\n" + summary + policy_note + nested_lockfile_note + attention +
             security_section +
             "\n\n" + validation +
             "\n\n[View the full update report →](\($report_url))"

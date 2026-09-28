@@ -35,6 +35,7 @@ use upd::lockfile::{
 use upd::lockgate::check::{LockCooldownCheck, LockRegistries, check_refreshed_lockfiles};
 use upd::lockgate::{GateReport, ReleaseAgeGate, file_identity};
 use upd::lockscan;
+use upd::nested_lock::{NestedLockSync, NestedSyncStatus, sync_nested_cargo_workspaces};
 use upd::normalize::pep503_normalize;
 use upd::output::LockWriteStatus;
 use upd::package_filter::PackageFilter;
@@ -1190,6 +1191,10 @@ struct LockRefresh {
     /// How far the group's refreshes kept to the cooldown; empty when the
     /// group was put back, since nothing they wrote is left on disk.
     gates: Vec<GateReport>,
+    /// Nested Cargo workspaces (the cargo-fuzz layout) re-synced after a
+    /// successful Cargo refresh in this group; empty for every other
+    /// ecosystem and for a group whose refresh was rolled back.
+    nested: Vec<NestedLockSync>,
 }
 
 struct Rollback {
@@ -1263,11 +1268,21 @@ fn refresh_lock_groups(
         if rollback.is_some() {
             gates.clear();
         }
+        // A nested workspace shares the root's dependency graph through a
+        // path edge, so it only needs re-syncing once the root lockfile it
+        // depends on transitively actually landed; a rolled-back group left
+        // nothing on disk for it to catch up to.
+        let nested = if rollback.is_none() && group.lockfiles.contains(&LockfileType::CargoLock) {
+            sync_nested_cargo_workspaces(&group.dir, &changed, verbose)
+        } else {
+            Vec::new()
+        };
         refreshes.push(LockRefresh {
             manifests,
             outcomes,
             rollback,
             gates,
+            nested,
         });
     }
     refreshes
@@ -1293,14 +1308,16 @@ fn refresh_failed(lock_failures: &LockFailures, path: &Path) -> bool {
 }
 
 /// Print every refresh outcome and describe each failure against the
-/// manifests it hit. Returns the failures by manifest and one error message
-/// per manifest hit, in the order the refreshes ran.
+/// manifests it hit. Returns the failures by manifest, one error message per
+/// manifest hit, and every nested-workspace sync attempted, in the order the
+/// refreshes ran.
 fn report_lock_refreshes(
     refreshes: Vec<LockRefresh>,
     print_progress: bool,
-) -> (LockFailures, Vec<String>) {
+) -> (LockFailures, Vec<String>, Vec<NestedLockSync>) {
     let mut failures = LockFailures::new();
     let mut errors = Vec::new();
+    let mut nested_syncs = Vec::new();
     for refresh in refreshes {
         let mut causes = Vec::new();
         for outcome in &refresh.outcomes {
@@ -1321,6 +1338,24 @@ fn report_lock_refreshes(
                 }
             }
         }
+        for sync in &refresh.nested {
+            let path = display_path(&sync.lockfile);
+            match &sync.status {
+                NestedSyncStatus::Synced => {
+                    if print_progress {
+                        println!("{} Synced nested workspace {}", "✓".green(), path.bold());
+                    }
+                }
+                NestedSyncStatus::Blocked(reason) => {
+                    eprintln!(
+                        "{}",
+                        format!("Warning: could not sync nested workspace {path}: {reason}")
+                            .yellow()
+                    );
+                }
+            }
+        }
+        nested_syncs.extend(refresh.nested.iter().cloned());
         let Some(rollback) = refresh.rollback else {
             continue;
         };
@@ -1357,7 +1392,7 @@ fn report_lock_refreshes(
             );
         }
     }
-    (failures, errors)
+    (failures, errors, nested_syncs)
 }
 
 /// Join names as prose: "a", "a and b", "a, b and c".
@@ -1859,6 +1894,7 @@ async fn run_update(cli: &Cli) -> Result<()> {
                     run_warnings: Vec::new(),
                     lockfile_cooldown: Vec::new(),
                     lockfile_holds: Vec::new(),
+                    nested_lockfiles: Vec::new(),
                 },
                 &BoundedOutputParams::from_cli(cli),
             )?;
@@ -2326,74 +2362,75 @@ async fn run_update(cli: &Cli) -> Result<()> {
     // also erase a floor already written and reported as applied. Running
     // first also lets the floor branch scan the lockfile the refresh wrote.
     let mut lock_gates: Vec<GateReport> = Vec::new();
-    let (lock_failures, lock_errors) = if cli.lock && !dry_run && !updated_files.is_empty() {
-        // Group changed package names by the lockfile their manifest owns.
-        // This keeps unrelated ecosystems in the same directory isolated.
-        let mut changed_by_lockfile = ChangedByLockfile::new();
-        for scanned_file in &scanned {
-            if scanned_file.file_type == FileType::Annotated {
-                continue;
+    let (lock_failures, lock_errors, nested_lockfiles) =
+        if cli.lock && !dry_run && !updated_files.is_empty() {
+            // Group changed package names by the lockfile their manifest owns.
+            // This keeps unrelated ecosystems in the same directory isolated.
+            let mut changed_by_lockfile = ChangedByLockfile::new();
+            for scanned_file in &scanned {
+                if scanned_file.file_type == FileType::Annotated {
+                    continue;
+                }
+                if scanned_file.result.updated.is_empty()
+                    && scanned_file.result.pinned.is_empty()
+                    && scanned_file.result.normalized.is_empty()
+                {
+                    continue;
+                }
+                record_lockfile_changes(
+                    &mut changed_by_lockfile,
+                    &scanned_file.path,
+                    scanned_file
+                        .result
+                        .updated
+                        .iter()
+                        .map(|(name, _, _, _)| name.clone())
+                        .chain(
+                            scanned_file
+                                .result
+                                .pinned
+                                .iter()
+                                .map(|(name, _, _, _)| name.clone()),
+                        )
+                        .chain(
+                            scanned_file
+                                .result
+                                .normalized
+                                .iter()
+                                .map(|entry| entry.package.clone()),
+                        ),
+                );
             }
-            if scanned_file.result.updated.is_empty()
-                && scanned_file.result.pinned.is_empty()
-                && scanned_file.result.normalized.is_empty()
-            {
-                continue;
-            }
-            record_lockfile_changes(
-                &mut changed_by_lockfile,
-                &scanned_file.path,
-                scanned_file
-                    .result
-                    .updated
-                    .iter()
-                    .map(|(name, _, _, _)| name.clone())
-                    .chain(
-                        scanned_file
-                            .result
-                            .pinned
-                            .iter()
-                            .map(|(name, _, _, _)| name.clone()),
-                    )
-                    .chain(
-                        scanned_file
-                            .result
-                            .normalized
-                            .iter()
-                            .map(|entry| entry.package.clone()),
-                    ),
-            );
-        }
 
-        for path in &updated_files {
-            if !lock_groups
-                .iter()
-                .any(|group| group.manifests.contains(path))
-            {
-                print_no_lockfile_note(path);
+            for path in &updated_files {
+                if !lock_groups
+                    .iter()
+                    .any(|group| group.manifests.contains(path))
+                {
+                    print_no_lockfile_note(path);
+                }
             }
-        }
-        let mut refreshes = refresh_lock_groups(
-            lock_groups,
-            &updated_files,
-            &changed_by_lockfile,
-            &manifest_gates,
-            verbose && text_mode,
-        );
-        lock_gates.extend(
-            refreshes
-                .iter_mut()
-                .flat_map(|refresh| std::mem::take(&mut refresh.gates)),
-        );
-        // The header is only printed when there is real work to do.
-        if text_mode && !refreshes.is_empty() && !cli.quiet {
-            println!();
-            println!("{}", "Regenerating lockfiles...".cyan());
-        }
-        report_lock_refreshes(refreshes, text_mode && !cli.quiet)
-    } else {
-        (LockFailures::new(), Vec::new())
-    };
+            let mut refreshes = refresh_lock_groups(
+                lock_groups,
+                &updated_files,
+                &changed_by_lockfile,
+                &manifest_gates,
+                verbose && text_mode,
+            );
+            lock_gates.extend(
+                refreshes
+                    .iter_mut()
+                    .flat_map(|refresh| std::mem::take(&mut refresh.gates)),
+            );
+            // The header is only printed when there is real work to do.
+            if text_mode && !refreshes.is_empty() && !cli.quiet {
+                println!();
+                println!("{}", "Regenerating lockfiles...".cyan());
+            }
+            report_lock_refreshes(refreshes, text_mode && !cli.quiet)
+        } else {
+            (LockFailures::new(), Vec::new(), Vec::new())
+        };
 
     // Version-floor branch for --package lock-only dependencies:
     // lockfiles are parsed only when --package narrows to specific names. A
@@ -3095,6 +3132,7 @@ async fn run_update(cli: &Cli) -> Result<()> {
                 run_warnings,
                 lockfile_cooldown,
                 lockfile_holds,
+                nested_lockfiles,
             },
             &BoundedOutputParams::from_cli(cli),
         )?;
@@ -3149,6 +3187,9 @@ struct UpdateReportInput<'a> {
     /// Crates moved back after a lockfile refresh locked them inside the
     /// cooldown.
     lockfile_holds: Vec<upd::output::LockfileHold>,
+    /// Nested Cargo workspaces re-synced, or an attempt made, after a root
+    /// Cargo lockfile refresh they depend on transitively.
+    nested_lockfiles: Vec<NestedLockSync>,
 }
 
 /// Apply --limit, --offset, and --fields to a JSON document for bounded output.
@@ -3252,6 +3293,7 @@ fn emit_update_json(input: UpdateReportInput<'_>, bounded: &BoundedOutputParams<
         run_warnings,
         lockfile_cooldown,
         lockfile_holds,
+        nested_lockfiles,
     } = input;
 
     let mut files: Vec<_> = scanned
@@ -3342,6 +3384,23 @@ fn emit_update_json(input: UpdateReportInput<'_>, bounded: &BoundedOutputParams<
 
     files.extend(floor_reports);
 
+    let nested_lockfiles = nested_lockfiles
+        .into_iter()
+        .map(|sync| upd::output::NestedLockfileEntry {
+            manifest: display_path(&sync.manifest),
+            lockfile: display_path(&sync.lockfile),
+            status: if sync.is_blocked() {
+                "blocked"
+            } else {
+                "synced"
+            },
+            reason: match sync.status {
+                NestedSyncStatus::Blocked(reason) => Some(reason),
+                NestedSyncStatus::Synced => None,
+            },
+        })
+        .collect();
+
     let report = UpdateReport {
         command: "update",
         mode: if dry_run { "dry-run" } else { "applied" },
@@ -3351,6 +3410,7 @@ fn emit_update_json(input: UpdateReportInput<'_>, bounded: &BoundedOutputParams<
         warnings: run_warnings,
         lockfile_cooldown,
         lockfile_holds,
+        nested_lockfiles,
     };
 
     let doc = serde_json::to_value(&report)?;
@@ -4009,7 +4069,9 @@ async fn run_interactive_update(
             println!();
             println!("{}", "Regenerating lockfiles...".cyan());
         }
-        let (lock_failures, mut errors) = report_lock_refreshes(refreshes, !cli.quiet);
+        // The interactive flow is terminal-only and builds no JSON report;
+        // `report_lock_refreshes` already printed each nested sync's outcome.
+        let (lock_failures, mut errors, _nested) = report_lock_refreshes(refreshes, !cli.quiet);
         if !lock_gates.is_empty() {
             keep_configured_pins(&mut lock_gates, cli, file_configs)?;
             let registries = lock_registries(pypi, npm, crates_io, rubygems);
@@ -9145,6 +9207,7 @@ serde = "1.0.1"
                 failures,
             }),
             gates: Vec::new(),
+            nested: Vec::new(),
         }
     }
 
@@ -9157,9 +9220,11 @@ serde = "1.0.1"
             outcomes: vec![RegenOutcome::Ok(LockfileType::UvLock)],
             rollback: None,
             gates: Vec::new(),
+            nested: Vec::new(),
         };
 
-        let (failures, errors) = report_lock_refreshes(vec![refresh], false);
+        let (failures, errors, nested) = report_lock_refreshes(vec![refresh], false);
+        assert!(nested.is_empty());
 
         assert!(failures.is_empty());
         assert!(errors.is_empty());
@@ -9175,7 +9240,7 @@ serde = "1.0.1"
         let lockfile = PathBuf::from("uv.lock");
         let refresh = failed_refresh(&[&manifest], &[&manifest, &lockfile], Vec::new());
 
-        let (failures, errors) = report_lock_refreshes(vec![refresh], false);
+        let (failures, errors, _nested) = report_lock_refreshes(vec![refresh], false);
 
         let failure = &failures[&manifest];
         assert_eq!(failure.status, LockWriteStatus::RolledBack);
@@ -9225,7 +9290,7 @@ serde = "1.0.1"
             }],
         );
 
-        let (failures, errors) = report_lock_refreshes(vec![refresh], false);
+        let (failures, errors, _nested) = report_lock_refreshes(vec![refresh], false);
 
         for path in [&manifest, &sibling] {
             let failure = &failures[path];

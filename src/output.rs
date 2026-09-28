@@ -424,6 +424,26 @@ pub struct UpdateReport {
     /// Crates a lockfile refresh locked inside the cooldown and upd moved back.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub lockfile_holds: Vec<LockfileHold>,
+    /// Nested Cargo workspaces (the cargo-fuzz layout: their own `[workspace]`
+    /// table and a path dependency back into the root) re-synced, or an
+    /// attempt made, after a root Cargo lockfile refresh they depend on
+    /// transitively.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub nested_lockfiles: Vec<NestedLockfileEntry>,
+}
+
+/// One nested Cargo workspace's lockfile sync, attempted after a root
+/// refresh changed a package it shares through a `path` dependency.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct NestedLockfileEntry {
+    pub manifest: String,
+    pub lockfile: String,
+    /// `"synced"` or `"blocked"`.
+    pub status: &'static str,
+    /// Cargo's own reason the sync could not complete; present only when
+    /// `status` is `"blocked"`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
 }
 
 /// One release a lockfile refresh locked although it was published inside
