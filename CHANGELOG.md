@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.14.0](https://github.com/rvben/upd/compare/v0.13.6...v0.14.0) - 2026-09-28
+
+### Added
+
+- **gitlab**: run the dependency update in upd instead of jq ([417047e](https://github.com/rvben/upd/commit/417047effa5469e0f90a7d86c41dece53a56b4e4))
+
 ## [0.13.6](https://github.com/rvben/upd/compare/v0.13.5...v0.13.6) - 2026-09-28
 
 ### Fixed
