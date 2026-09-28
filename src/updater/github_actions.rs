@@ -2932,6 +2932,123 @@ jobs:
         assert!(!content.contains("v0.14.1"), "content: {content}");
     }
 
+    /// Every self-pin test above goes through `MockRegistry`, whose
+    /// `release_asset` is a hand-written fixture, not the registry `main.rs`
+    /// actually wires up: `CachedRegistry` wrapping `GitHubReleasesRegistry`,
+    /// reached through this same `update()` entry point. Two real bugs hid
+    /// behind that gap. `CachedRegistry` never forwarded
+    /// `repo_file_at_ref`/`release_asset` to the registry it wraps, so both
+    /// fell through to the `Registry` trait's "unsupported" default no
+    /// matter what the underlying registry could do. And the checksum
+    /// lookup used to read `release-pins.json` at the target release's own
+    /// tag to name the asset, which is always the *previous* release's
+    /// manifest, since the job that updates that file on `main` runs only
+    /// after the tag and its release assets already exist. This test wires
+    /// up the real `CachedRegistry<GitHubReleasesRegistry>` stack against a
+    /// mock HTTP server standing in for `api.github.com`, and fails against
+    /// the code either bug shipped in.
+    #[tokio::test]
+    async fn test_self_pin_survives_the_real_cached_registry_and_http_stack() {
+        use crate::cache::{Cache, CachedRegistry};
+        use crate::registry::GitHubReleasesRegistry;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        const OLD_SHA: &str = "1111111111111111111111111111111111111111";
+        const NEW_SHA: &str = "2222222222222222222222222222222222222222";
+        let old_checksum = "a".repeat(64);
+        let new_checksum = "b".repeat(64);
+        let mut file = NamedTempFile::new().unwrap();
+        write!(
+            file,
+            "jobs:\n  update:\n    uses: rvben/upd/.github/workflows/dependency-health.yml@{OLD_SHA} # v0.14.2\n    with:\n      upd-version: v0.14.2\n      upd-target: x86_64-unknown-linux-gnu\n      upd-sha256: {old_checksum}\n"
+        )
+        .unwrap();
+
+        let server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/repos/rvben/upd/releases/latest"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(r#"{"tag_name":"v0.15.0"}"#))
+            .expect(1)
+            .mount(&server)
+            .await;
+        // The pass that confirms the file's existing SHA pin still names
+        // `v0.14.2` before considering it for an update.
+        Mock::given(method("GET"))
+            .and(path("/repos/rvben/upd/commits/v0.14.2"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_string(format!(r#"{{"sha":"{OLD_SHA}"}}"#)),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/repos/rvben/upd/commits/v0.15.0"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_string(format!(r#"{{"sha":"{NEW_SHA}"}}"#)),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        // The release only ever carries the correctly-named `v0.15.0` asset:
+        // at the `v0.15.0` tag itself, `release-pins.json` would still name
+        // `v0.14.2`'s assets, so a lookup that trusted that file would ask
+        // for an asset this release never published.
+        let sidecar =
+            format!("{new_checksum}  upd-v0.15.0-x86_64-unknown-linux-gnu.tar.gz\n").into_bytes();
+        Mock::given(method("GET"))
+            .and(path("/repos/rvben/upd/releases/tags/v0.15.0"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(format!(
+                r#"{{"assets":[{{"name":"upd-v0.15.0-x86_64-unknown-linux-gnu.tar.gz.sha256","url":"{}/assets/sidecar"}}]}}"#,
+                server.uri()
+            )))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/assets/sidecar"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_bytes(sidecar)
+                    .insert_header("content-type", "application/octet-stream"),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        // A fresh, in-memory cache: `Cache::new_shared()` loads this
+        // machine's real on-disk cache, which can already hold a cached
+        // `rvben/upd` version from an unrelated run and mask this test's
+        // fixture entirely.
+        let inner = GitHubReleasesRegistry::with_api_url(server.uri());
+        let cache = std::sync::Arc::new(std::sync::Mutex::new(Cache::default()));
+        let registry = CachedRegistry::new(inner, cache, true);
+        let options = UpdateOptions::new(false, false).with_action_sha_updates(true);
+
+        let result = GithubActionsUpdater::new()
+            .update(file.path(), &registry, options)
+            .await
+            .unwrap();
+
+        assert!(result.errors.is_empty(), "errors: {:?}", result.errors);
+        assert!(result.skipped.is_empty(), "skipped: {:?}", result.skipped);
+        assert_eq!(result.updated.len(), 1, "updated: {:?}", result.updated);
+
+        let content = fs::read_to_string(file.path()).unwrap();
+        assert!(
+            content.contains(&format!("dependency-health.yml@{NEW_SHA} # v0.15.0")),
+            "content: {content}"
+        );
+        assert!(
+            content.contains("upd-version: v0.15.0"),
+            "content: {content}"
+        );
+        assert!(
+            content.contains(&format!("upd-sha256: {new_checksum}")),
+            "content: {content}"
+        );
+    }
+
     #[tokio::test]
     async fn test_sha_pin_refuses_floating_config_target() {
         use crate::config::UpdConfig;
