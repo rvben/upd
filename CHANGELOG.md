@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.13.6](https://github.com/rvben/upd/compare/v0.13.5...v0.13.6) - 2026-09-28
+
+### Fixed
+
+- **gitlab**: publish merge requests for annotation-only changes ([4ba0a1d](https://github.com/rvben/upd/commit/4ba0a1db9c684e6a69d73fe4081763acbce8f667))
+
 ## [0.13.5](https://github.com/rvben/upd/compare/v0.13.4...v0.13.5) - 2026-09-28
 
 ### Fixed
