@@ -280,7 +280,10 @@ a dedicated service user) with `api` and `write_repository` scopes and a role
 that can push branches and create merge requests in every project of the group,
 normally **Developer**. When auto-merge is used, the role must also be allowed to
 merge into the protected target branches. Store it as the masked, protected
-`UPD_GITLAB_TOKEN` variable of the central project.
+`UPD_GITLAB_TOKEN` variable of the central project. GitLab grants a new or
+rotated token its access to the group's projects in the background, so for up
+to a few minutes it can list only some of them; the first run after creating
+or rotating the token may report fewer projects than the group holds.
 
 ```yaml
 include:
