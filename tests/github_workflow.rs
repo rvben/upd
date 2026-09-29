@@ -2,6 +2,8 @@
 
 #![cfg(unix)]
 
+mod isolated;
+
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
@@ -58,7 +60,7 @@ fn run(command: &mut Command) -> Output {
 }
 
 fn git(cwd: &Path, args: &[&str]) -> Output {
-    run(Command::new("git").current_dir(cwd).args(args))
+    run(isolated::command("git").current_dir(cwd).args(args))
 }
 
 struct Fixture {
@@ -257,7 +259,7 @@ esac
             ],
         );
         let branch_ref = format!("refs/heads/{BRANCH}:refs/remotes/origin/{BRANCH}");
-        let fetch = Command::new("git")
+        let fetch = isolated::command("git")
             .current_dir(&self.checkout)
             .args(["fetch", "--no-tags", "origin", &format!("+{branch_ref}")])
             .output()
@@ -314,7 +316,7 @@ esac
             self.fake_bin.display(),
             std::env::var("PATH").unwrap()
         );
-        let presentation_output = Command::new("bash")
+        let presentation_output = isolated::command("bash")
             .arg("-c")
             .arg(workflow_script(
                 "Build provider-neutral review presentation",
@@ -340,7 +342,7 @@ esac
             String::from_utf8_lossy(&presentation_output.stderr)
         );
 
-        let summary_output = Command::new("bash")
+        let summary_output = isolated::command("bash")
             .arg("-c")
             .arg(workflow_script("Publish dependency summary"))
             .current_dir(&self.checkout)
@@ -368,7 +370,7 @@ esac
             );
         }
 
-        let output = Command::new("bash")
+        let output = isolated::command("bash")
             .arg("-c")
             .arg(workflow_script("Publish rolling pull request"))
             .current_dir(&self.checkout)
@@ -413,7 +415,7 @@ esac
     }
 
     fn branch_file(&self) -> Option<String> {
-        let output = Command::new("git")
+        let output = isolated::command("git")
             .arg(format!("--git-dir={}", self.remote.display()))
             .args(["show", &format!("refs/heads/{BRANCH}:dependency.txt")])
             .output()
@@ -425,7 +427,7 @@ esac
     }
 
     fn branch_commit_count(&self) -> usize {
-        let output = run(Command::new("git")
+        let output = run(isolated::command("git")
             .arg(format!("--git-dir={}", self.remote.display()))
             .args([
                 "rev-list",
@@ -520,7 +522,7 @@ chmod 0755 "$directory/upd"
 
     let path = format!("{}:{}", fake_bin.display(), std::env::var("PATH").unwrap());
     let run_install = |version: &str| {
-        Command::new("bash")
+        isolated::command("bash")
             .arg("-c")
             .arg(workflow_script("Install verified upd release"))
             .env("FAKE_CURL_LOG", &log)
@@ -872,7 +874,7 @@ exit 6
     );
 
     let path = format!("{}:{}", bin_dir.display(), std::env::var("PATH").unwrap());
-    let output = Command::new("bash")
+    let output = isolated::command("bash")
         .arg("-c")
         .arg(workflow_script("Apply available security fixes"))
         .current_dir(tmp.path())
@@ -923,7 +925,7 @@ exit 2
     );
 
     let path = format!("{}:{}", bin_dir.display(), std::env::var("PATH").unwrap());
-    let output = Command::new("bash")
+    let output = isolated::command("bash")
         .arg("-c")
         .arg(workflow_script("Apply available security fixes"))
         .current_dir(tmp.path())
@@ -1012,7 +1014,7 @@ fn publish_summary_step_honors_fail_on_blocked_for_a_blocked_security_fix() {
     fs::write(&presentation_path, presentation).unwrap();
 
     let run = |fail_on_blocked: &str| {
-        Command::new("bash")
+        isolated::command("bash")
             .arg("-c")
             .arg(workflow_script("Publish dependency summary"))
             .current_dir(tmp.path())
@@ -1079,7 +1081,7 @@ fn publish_summary_step_alerts_prominently_on_a_blocked_self_pin() {
         );
         fs::write(&presentation_path, presentation).unwrap();
 
-        let output = Command::new("bash")
+        let output = isolated::command("bash")
             .arg("-c")
             .arg(workflow_script("Publish dependency summary"))
             .current_dir(tmp.path())
@@ -1418,7 +1420,7 @@ fn workflow_defaults_to_the_hosted_broker_and_allows_a_pat_override() {
     let output = temp.path().join("output");
     let script = workflow_script("Select a check-triggering publishing credential");
 
-    let configured = Command::new("bash")
+    let configured = isolated::command("bash")
         .arg("-c")
         .arg(&script)
         .env("BASE_SHA", "unused")
@@ -1435,7 +1437,7 @@ fn workflow_defaults_to_the_hosted_broker_and_allows_a_pat_override() {
     );
 
     let pat_output = temp.path().join("pat-output");
-    let pat_configured = Command::new("bash")
+    let pat_configured = isolated::command("bash")
         .arg("-c")
         .arg(&script)
         .env("BASE_SHA", "unused")
@@ -1492,7 +1494,7 @@ fi
         std::env::var("PATH").unwrap_or_default()
     );
 
-    let result = Command::new("bash")
+    let result = isolated::command("bash")
         .arg("-c")
         .arg(workflow_script("Request publication token"))
         .env("ACTIONS_ID_TOKEN_REQUEST_TOKEN", "oidc-request-secret")
@@ -1549,7 +1551,7 @@ fn workflow_change_detection_limits_workflow_permission_to_workflow_proposals() 
     git(&repo, &["add", "dependency.txt"]);
     git(&repo, &["commit", "-m", "test: ordinary proposal"]);
     let ordinary_output = temp.path().join("ordinary-output");
-    let ordinary = Command::new("bash")
+    let ordinary = isolated::command("bash")
         .arg("-c")
         .arg(workflow_script(
             "Select a check-triggering publishing credential",
@@ -1580,7 +1582,7 @@ fn workflow_change_detection_limits_workflow_permission_to_workflow_proposals() 
 
     let output = temp.path().join("output");
     let summary = temp.path().join("summary");
-    let result = Command::new("bash")
+    let result = isolated::command("bash")
         .arg("-c")
         .arg(workflow_script(
             "Select a check-triggering publishing credential",
@@ -1612,7 +1614,7 @@ fn validated_proposal_crosses_the_job_boundary_as_one_commit() {
     fs::write(fixture.checkout.join("dependency.txt"), "new\n").unwrap();
     git(&fixture.checkout, &["add", "dependency.txt"]);
 
-    let package = Command::new("bash")
+    let package = isolated::command("bash")
         .arg("-c")
         .arg(workflow_script("Package validated proposal"))
         .current_dir(&fixture.checkout)
@@ -1628,7 +1630,7 @@ fn validated_proposal_crosses_the_job_boundary_as_one_commit() {
     );
 
     git(&fixture.checkout, &["reset", "--hard", &base]);
-    let restore = Command::new("bash")
+    let restore = isolated::command("bash")
         .arg("-c")
         .arg(workflow_script("Restore validated proposal"))
         .current_dir(&fixture.checkout)
@@ -1706,7 +1708,7 @@ fn isolated_publisher_rejects_a_merge_commit_bundle() {
     .unwrap();
     git(&fixture.checkout, &["reset", "--hard", &base]);
 
-    let restore = Command::new("bash")
+    let restore = isolated::command("bash")
         .arg("-c")
         .arg(workflow_script("Restore validated proposal"))
         .current_dir(&fixture.checkout)

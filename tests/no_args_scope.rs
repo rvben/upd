@@ -9,6 +9,8 @@
 //!   - explicit path + --apply    → mutates
 //!   - -i explicit path, no TTY   → exit 2 with TTY error, NOT "not inside a git repository"
 
+mod isolated;
+
 use std::fs;
 use std::path::Path;
 use std::process::Command;
@@ -67,7 +69,7 @@ fn run_with_null_stdin(args: &[&str], cwd: &Path) -> (String, String, i32) {
 
 /// Initialise a bare git repo in the given directory.
 fn git_init(dir: &Path) {
-    let status = Command::new("git")
+    let status = isolated::command("git")
         .args(["init", "-b", "main"])
         .current_dir(dir)
         .output()

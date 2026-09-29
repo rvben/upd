@@ -2,6 +2,8 @@
 
 #![cfg(unix)]
 
+mod isolated;
+
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
@@ -60,7 +62,7 @@ fn run(command: &mut Command) -> Output {
 }
 
 fn git(cwd: &Path, args: &[&str]) -> Output {
-    run(Command::new("git").current_dir(cwd).args(args))
+    run(isolated::command("git").current_dir(cwd).args(args))
 }
 
 struct Fixture {
@@ -179,7 +181,7 @@ esac
             self.fake_bin.display(),
             std::env::var("PATH").unwrap()
         );
-        Command::new("bash")
+        isolated::command("bash")
             .arg("-c")
             .arg(workflow_script("Publish the rolling security pull request"))
             .current_dir(&self.checkout)
@@ -209,7 +211,7 @@ esac
     }
 
     fn branch_file(&self) -> Option<String> {
-        let output = Command::new("git")
+        let output = isolated::command("git")
             .arg(format!("--git-dir={}", self.remote.display()))
             .args(["show", &format!("refs/heads/{BRANCH}:Cargo.toml")])
             .output()
@@ -221,7 +223,7 @@ esac
     }
 
     fn branch_commit_count(&self) -> usize {
-        let output = run(Command::new("git")
+        let output = run(isolated::command("git")
             .arg(format!("--git-dir={}", self.remote.display()))
             .args([
                 "rev-list",
@@ -341,7 +343,7 @@ fn run_policy(event_name: &str, config: Option<&str>) -> (Output, String) {
     }
     let output_file = fixture.path().join("outputs");
     let summary_file = fixture.path().join("summary");
-    let output = Command::new("bash")
+    let output = isolated::command("bash")
         .arg("-c")
         .arg(workflow_script("Resolve repository automation policy"))
         .current_dir(fixture.path())
@@ -391,7 +393,7 @@ fn invalid_remediation_policy_fails_closed() {
 fn validation_cannot_hide_a_mutation_in_the_git_index() {
     let fixture = Fixture::new();
     fixture.stage_change("1.0.1");
-    let output = Command::new("bash")
+    let output = isolated::command("bash")
         .arg("-c")
         .arg(workflow_script("Constrain and validate the proposal"))
         .current_dir(&fixture.checkout)
@@ -456,7 +458,7 @@ fn classifier_builds_valid_metadata_patch_and_pull_request_body() {
     )
     .unwrap();
 
-    let output = Command::new("bash")
+    let output = isolated::command("bash")
         .arg("-c")
         .arg(workflow_script("Classify the validated result"))
         .current_dir(&fixture.checkout)
@@ -589,7 +591,7 @@ fn presentation_neutralizes_untrusted_markdown_and_control_characters() {
     )
     .unwrap();
 
-    let output = Command::new("bash")
+    let output = isolated::command("bash")
         .arg("-c")
         .arg(workflow_script("Classify the validated result"))
         .current_dir(&fixture.checkout)
@@ -648,7 +650,7 @@ fn presentation_describes_partial_results_without_overclaiming() {
     )
     .unwrap();
 
-    let output = Command::new("bash")
+    let output = isolated::command("bash")
         .arg("-c")
         .arg(workflow_script("Classify the validated result"))
         .current_dir(&fixture.checkout)
@@ -673,7 +675,7 @@ fn presentation_describes_partial_results_without_overclaiming() {
 #[test]
 fn configuration_rejects_an_unknown_merge_method() {
     let fixture = Fixture::new();
-    let output = Command::new("bash")
+    let output = isolated::command("bash")
         .arg("-c")
         .arg(workflow_script("Validate configuration"))
         .current_dir(&fixture.checkout)
@@ -715,7 +717,7 @@ fn presentation_keeps_no_change_states_truthful() {
         fs::write(report_dir.join("pre-fix.json"), pre).unwrap();
         fs::write(report_dir.join("post-fix.json"), post).unwrap();
 
-        let output = Command::new("bash")
+        let output = isolated::command("bash")
             .arg("-c")
             .arg(workflow_script("Classify the validated result"))
             .current_dir(&fixture.checkout)

@@ -2,6 +2,8 @@
 
 #![cfg(unix)]
 
+mod isolated;
+
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
@@ -56,7 +58,7 @@ fn run(command: &mut Command) -> Output {
 }
 
 fn git(cwd: &Path, args: &[&str]) -> Output {
-    run(Command::new("git").current_dir(cwd).args(args))
+    run(isolated::command("git").current_dir(cwd).args(args))
 }
 
 struct Fixture {
@@ -232,7 +234,7 @@ fi
 
     /// Runs the job with the given inputs and returns its outcome unjudged.
     fn execute(&self, server: &MockServer, run: &Run) -> Output {
-        let mut command = Command::new("bash");
+        let mut command = isolated::command("bash");
         command.arg("-c").arg(embedded_script());
         self.job(&mut command, server, run);
         command.output().expect("template starts")
@@ -289,7 +291,7 @@ fi
     }
 
     fn remote_tip(&self) -> Option<String> {
-        let output = Command::new("git")
+        let output = isolated::command("git")
             .arg(format!("--git-dir={}", self.remote.display()))
             .args(["rev-parse", "--verify", "--quiet"])
             .arg(format!("refs/heads/{BRANCH}"))
@@ -311,7 +313,7 @@ fi
     }
 
     fn remote_author(&self) -> String {
-        let output = run(Command::new("git")
+        let output = run(isolated::command("git")
             .arg(format!("--git-dir={}", self.remote.display()))
             .args(["show", "-s", "--format=%an <%ae>|%cn <%ce>|%s"])
             .arg(format!("refs/heads/{BRANCH}")));
@@ -319,7 +321,7 @@ fi
     }
 
     fn branch_file(&self) -> Option<String> {
-        let output = Command::new("git")
+        let output = isolated::command("git")
             .arg(format!("--git-dir={}", self.remote.display()))
             .args(["show", &format!("refs/heads/{BRANCH}:dependency.txt")])
             .output()
@@ -331,7 +333,7 @@ fi
     }
 
     fn branch_commit_count(&self) -> usize {
-        let output = run(Command::new("git")
+        let output = run(isolated::command("git")
             .arg(format!("--git-dir={}", self.remote.display()))
             .args([
                 "rev-list",
@@ -752,7 +754,7 @@ async fn template_preserves_human_commits_even_when_no_updates_remain() {
     fixture.run_template(&cleanup_server, false, "unused", false);
 
     let remote_tip = String::from_utf8(
-        run(Command::new("git")
+        run(isolated::command("git")
             .arg(format!("--git-dir={}", fixture.remote.display()))
             .args(["rev-parse", &format!("refs/heads/{BRANCH}")]))
         .stdout,
@@ -799,7 +801,7 @@ async fn template_does_not_adopt_a_single_human_commit_as_its_own() {
     fixture.run_template(&server, true, "bot change", false);
 
     let remote_tip = String::from_utf8(
-        run(Command::new("git")
+        run(isolated::command("git")
             .arg(format!("--git-dir={}", fixture.remote.display()))
             .args(["rev-parse", &format!("refs/heads/{BRANCH}")]))
         .stdout,
@@ -1952,7 +1954,7 @@ async fn an_unrelated_commit_with_the_automation_identity_pauses() {
     git(&fixture.checkout, &["switch", "--orphan", BRANCH]);
     fs::write(fixture.checkout.join("dependency.txt"), "orphan\n").unwrap();
     git(&fixture.checkout, &["add", "dependency.txt"]);
-    run(Command::new("git")
+    run(isolated::command("git")
         .current_dir(&fixture.checkout)
         .args(["commit", "-m", "chore(deps): test update"])
         .env("GIT_AUTHOR_NAME", "upd test")
@@ -2392,7 +2394,7 @@ async fn a_multi_line_commit_message_keeps_the_branch_owned() {
 }
 
 fn run_git_in_remote(fixture: &Fixture, args: &[&str]) -> String {
-    let output = run(Command::new("git")
+    let output = run(isolated::command("git")
         .arg(format!("--git-dir={}", fixture.remote.display()))
         .args(args));
     String::from_utf8(output.stdout).unwrap()

@@ -2,6 +2,8 @@
 //! GitLab API in front of real bare repositories, one per project, and a fake
 //! updater that records how it was invoked.
 
+mod isolated;
+
 use std::collections::HashMap;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
@@ -45,7 +47,7 @@ JSON
 "#;
 
 fn git(cwd: &Path, args: &[&str]) {
-    let output = Command::new("git")
+    let output = isolated::command("git")
         .current_dir(cwd)
         .args(args)
         .output()
@@ -230,7 +232,7 @@ impl Org {
 
     /// The automation branch's copy of `dependency.txt` in project `id`.
     fn branch_file(&self, id: u64) -> Option<String> {
-        let output = Command::new("git")
+        let output = isolated::command("git")
             .arg(format!("--git-dir={}", self.remotes[&id].display()))
             .args(["show", &format!("refs/heads/{BRANCH}:dependency.txt")])
             .output()
@@ -274,7 +276,7 @@ impl Respond for RawFiles {
         let Some(remote) = self.0.get(&id) else {
             return ResponseTemplate::new(404);
         };
-        let output = Command::new("git")
+        let output = isolated::command("git")
             .arg(format!("--git-dir={}", remote.display()))
             .args(["show", &format!("{reference}:{name}")])
             .output()
