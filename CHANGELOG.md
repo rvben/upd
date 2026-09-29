@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.14.4](https://github.com/rvben/upd/compare/v0.14.3...v0.14.4) - 2026-09-29
+
+### Fixed
+
+- **gitlab**: resume a rolling branch after its commit identity or message changes ([a4a4fbd](https://github.com/rvben/upd/commit/a4a4fbdb1fc630276dd5836664aac3d733d30cad))
+- **gitlab**: keep a rolling branch with a multi-line commit message owned ([475f91b](https://github.com/rvben/upd/commit/475f91b14ba80acb68851cf0d539b032cdbcd6a9))
+
 ## [0.14.3](https://github.com/rvben/upd/compare/v0.14.2...v0.14.3) - 2026-09-28
 
 ### Added
