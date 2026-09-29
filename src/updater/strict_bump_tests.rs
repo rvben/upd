@@ -108,11 +108,13 @@ async fn case(file_type: FileType, with_major: bool) -> Case {
             // shape: `classify_rewrite` then calls them `SameShape` and routes
             // them through the ordinary bump/pin paths (`result.updated` /
             // `result.pinned`) instead of `result.normalized`. Only the two
-            // deliberately-mis-shaped entries (`unanchored`, `reshaped`) are
-            // meant to hit the normalization paths.
+            // deliberately-mis-shaped entries (`unanchored`, `reshaped`,
+            // `respelled`) are meant to hit the normalization paths.
+            // `respelled` keeps its anchored release under a shorter spelling
+            // (PEP 440 `1.0` is `1.0.0`), so it is a reshape, not a bump.
             content: "[project]\nname = \"fixture\"\ndependencies = [\n    \"big==1.2.0\",\n    \
                       \"small==1.2.0\",\n    \"pinned==1.2.0\",\n    \"unanchored\",\n    \
-                      \"reshaped>=2.0.0\",\n]\n"
+                      \"reshaped>=2.0.0\",\n    \"respelled>=1.0.0\",\n]\n"
                 .to_string(),
             config: "[pin]\npinned = \"1.2.5\"\n\n[normalize.pyproject]\ndependencies = \"exact\"\n",
             runner: Runner::Plain(Box::new(PyProjectUpdater::new())),
@@ -122,7 +124,8 @@ async fn case(file_type: FileType, with_major: bool) -> Case {
                     .with_version("small", "1.3.0")
                     .with_version("pinned", "3.0.0")
                     .with_version("unanchored", "1.0.0")
-                    .with_version("reshaped", "2.0.0"),
+                    .with_version("reshaped", "2.0.0")
+                    .with_version("respelled", "1.0"),
             ),
             major: Some("big"),
             extras: vec![
@@ -136,6 +139,10 @@ async fn case(file_type: FileType, with_major: bool) -> Case {
                 },
                 Extra {
                     package: "reshaped",
+                    kind: HeldWrite::Reshape,
+                },
+                Extra {
+                    package: "respelled",
                     kind: HeldWrite::Reshape,
                 },
             ],

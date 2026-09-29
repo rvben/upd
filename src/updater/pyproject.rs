@@ -1582,19 +1582,29 @@ impl PyProjectUpdater {
                 continue;
             }
 
-            if let Some(anchor) = &target.anchor {
-                if compare_versions(&chosen, anchor, Lang::Python) == std::cmp::Ordering::Less {
-                    result
-                        .warnings
-                        .push(downgrade_warning(&target.package, &chosen, anchor));
-                    result.unchanged += 1;
-                    continue;
-                }
-                if chosen != *anchor && !options.allows_bump_for(Lang::Python, anchor, &chosen) {
-                    result.record_capped(&target.package, anchor, &chosen, line_num);
-                    continue;
-                }
-            }
+            // PEP 440 spells one release many ways (`1.0` is `1.0.0`), so
+            // whether the chosen release moves off the anchor is a version
+            // comparison, not a string one.
+            let keeps_anchor = match &target.anchor {
+                Some(anchor) => match compare_versions(&chosen, anchor, Lang::Python) {
+                    std::cmp::Ordering::Less => {
+                        result
+                            .warnings
+                            .push(downgrade_warning(&target.package, &chosen, anchor));
+                        result.unchanged += 1;
+                        continue;
+                    }
+                    std::cmp::Ordering::Equal => true,
+                    std::cmp::Ordering::Greater => {
+                        if !options.allows_bump_for(Lang::Python, anchor, &chosen) {
+                            result.record_capped(&target.package, anchor, &chosen, line_num);
+                            continue;
+                        }
+                        false
+                    }
+                },
+                None => false,
+            };
 
             let spec = format!("{operator}{chosen}");
             let rewrite = classify_rewrite(&target, operator, &chosen);
@@ -1608,7 +1618,7 @@ impl PyProjectUpdater {
                     target.previous_spec.clone().unwrap_or_default(),
                     chosen.clone(),
                 )),
-                Some(anchor) if chosen == *anchor => Some((
+                Some(_) if keeps_anchor => Some((
                     super::WriteKind::Reshape,
                     super::HeldWrite::Reshape,
                     target.previous_spec.clone().unwrap_or_default(),
