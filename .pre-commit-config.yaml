@@ -55,23 +55,15 @@ repos:
       - id: rumdl
         exclude: ^CHANGELOG\.md$
 
-  # Pre-push hooks for comprehensive validation
+  # Pre-push gate: exactly what CI's test job runs, on every push, so a push
+  # to main is checked before it lands rather than after.
   - repo: local
     hooks:
-      - id: cargo-test-full
-        name: cargo test (full suite)
-        entry: cargo test -- --test-threads=1
+      - id: make-ci
+        name: make ci
+        entry: make ci
         language: system
-        types: [rust]
-        pass_filenames: false
-        stages: [pre-push]
-        verbose: true
-
-      - id: cargo-doc-check
-        name: cargo doc (check)
-        entry: cargo doc --no-deps --all-features
-        language: system
-        types: [rust]
+        always_run: true
         pass_filenames: false
         stages: [pre-push]
         verbose: true
