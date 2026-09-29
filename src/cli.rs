@@ -126,6 +126,22 @@ pub struct Cli {
     )]
     pub max_bump: Option<BumpLevel>,
 
+    /// Write only registry-selected updates at the `--only-bump` levels.
+    ///
+    /// Without it, `--only-bump` limits version updates but still writes the
+    /// changes no bump level describes: configured pins, moved Nix flake
+    /// revisions, rewrites with no version to classify, `[normalize]`
+    /// reshapes, the `rvben/upd` self-pin and SHA-pin release comments. With
+    /// it, each of those is reported held (`capped[]` with reason
+    /// `strict-bump`) and nothing else is written. Requires `--only-bump`.
+    #[arg(
+        long = "strict-bump",
+        global = true,
+        requires = "only_bump",
+        conflicts_with = "max_bump"
+    )]
+    pub strict_bump: bool,
+
     /// Use full version precision (e.g., 3.1.5 instead of 3.1)
     #[arg(long, global = true)]
     pub full_precision: bool,

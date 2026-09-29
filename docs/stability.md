@@ -18,6 +18,7 @@ Global flags (accepted on every subcommand):
 | `--check` | | Make `align` exit 1 if misalignments are found (`update` and `audit` already exit non-zero; see exit codes) |
 | `--only-bump <major\|minor\|patch>` | | Restrict to exactly these bump levels (repeatable, comma-separated) |
 | `--max-bump <major\|minor\|patch>` | | Include updates up to and including this level |
+| `--strict-bump` | | With `--only-bump`, write only registry versions at the selected levels and hold every other change (see [Bump levels](#bump-levels)) |
 | `--package <NAME>` | `-p` | Restrict to package names or case-sensitive globs (quote globs; repeatable, comma-separated) |
 | `--lang <LANG>` | `-l` | Filter by ecosystem (repeatable) |
 | `--full-precision` | | Output full versions |
@@ -211,6 +212,22 @@ is reported against every manifest the floor would have been written to. A
 manifest already carrying the floor is one of them, since the floor is not the
 only thing the update moves: the constraint needs no rewrite, the lock below it
 does, and regenerating that lock is the work the ceiling is holding back.
+
+Some writes carry no version step a level can select: a configured `[pin]`, a
+Nix flake revision, a `[normalize.pyproject]` rewrite of a requirement with no
+inclusive lower bound, a reshape that keeps the version, the `rvben/upd`
+self-pin in a workflow, and a release comment written beside a SHA pin. The
+ceiling does not hold these back, so `--only-bump major` still writes them.
+`--strict-bump` (which requires `--only-bump`) holds them too, so the run writes
+exactly the registry-selected versions at the selected levels and nothing else.
+Two runs that split the work by level, such as a major-only run beside a
+`--max-bump minor` run, then never both write the same change. Each held write
+is a `capped` entry with `reason: "strict-bump"` and `write` naming its kind
+(`pin`, `revision`, `unanchored`, `reshape`, `self-pin` or `annotation`).
+`bump` is `"revision"` for a flake revision and is omitted for a reshape, an
+annotation and an unanchored rewrite, none of which steps from one version to
+another. A lock-only version floor taken from `[pin]` is held the same way.
+Without `--strict-bump` none of this changes.
 
 `audit --package NAME` limits both advisory queries and automatic fixes to
 matching package names, including transitive dependencies. Repeatable selectors

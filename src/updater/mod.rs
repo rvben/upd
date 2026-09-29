@@ -633,6 +633,67 @@ impl BumpFilter {
     }
 }
 
+/// A change an updater is about to write, as the strict bump gate sees it.
+///
+/// Only `Bump` carries a version step that a bump level can select. Every
+/// other kind changes the file for a reason no level describes, which is why
+/// `--strict-bump` holds them: a run restricted to one level must not also
+/// carry the changes a run at every other level would make.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WriteKind<'a> {
+    /// A version the registry selected, classified by its ecosystem's rules.
+    Bump {
+        lang: Lang,
+        current: &'a str,
+        new: &'a str,
+    },
+    /// The same reference moved to a newer commit, as a Nix flake input does.
+    Revision,
+    /// A version taken from `[pins]` rather than from the registry.
+    Pin,
+    /// A rewrite with no current version to classify the step against.
+    Unanchored,
+    /// A specifier reshaped to its configured form without its version changing.
+    Reshape,
+    /// The `rvben/upd` self-pin, which follows the latest release at any level.
+    SelfPin,
+    /// A release comment written beside an immutable reference.
+    Annotation,
+}
+
+/// The kind of write `--strict-bump` held back: every [`WriteKind`] but a
+/// registry-selected bump, which the ceiling reports as capped instead.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HeldWrite {
+    Revision,
+    Pin,
+    Unanchored,
+    Reshape,
+    SelfPin,
+    Annotation,
+}
+
+impl HeldWrite {
+    /// Stable token for machine-readable output.
+    pub fn token(self) -> &'static str {
+        match self {
+            Self::Revision => "revision",
+            Self::Pin => "pin",
+            Self::Unanchored => "unanchored",
+            Self::Reshape => "reshape",
+            Self::SelfPin => "self-pin",
+            Self::Annotation => "annotation",
+        }
+    }
+
+    /// Whether the held entry has no version step to name: a reshape and an
+    /// annotation keep the version, and an unanchored rewrite has no version
+    /// to step from.
+    pub fn names_no_step(self) -> bool {
+        matches!(self, Self::Reshape | Self::Annotation | Self::Unanchored)
+    }
+}
+
 /// Options for updating dependencies
 #[derive(Debug, Clone, Default)]
 pub struct UpdateOptions {
@@ -666,6 +727,12 @@ pub struct UpdateOptions {
     /// level, so updates are only skipped when `--only-bump` / `--max-bump`
     /// narrow it.
     pub bump_filter: BumpFilter,
+    /// Write only registry-selected versions at a selected bump level
+    /// (`--strict-bump`). Pins, revisions, unanchored rewrites, reshapes, the
+    /// upd self-pin and annotations are held instead, so a run restricted to
+    /// one level changes nothing a run at the other levels would also change.
+    /// Off by default, which leaves every write kind exactly as it was.
+    pub strict_bump: bool,
     /// Ecosystems selected by `--lang`. Empty means every ecosystem.
     ///
     /// Only `AnnotatedUpdater` reads this. Every other file type was already
@@ -709,6 +776,7 @@ impl UpdateOptions {
             cooldown_unavailable_notes: Arc::default(),
             cooldown_lang: None,
             bump_filter: BumpFilter::default(),
+            strict_bump: false,
             langs: Vec::new(),
             annotation_langs: None,
             update_action_shas: DEFAULT_UPDATE_ACTION_SHAS,
@@ -736,7 +804,31 @@ impl UpdateOptions {
             BumpKind::Major => self.bump_filter.major,
             BumpKind::Minor => self.bump_filter.minor,
             BumpKind::Patch => self.bump_filter.patch,
-            BumpKind::Revision => true,
+            BumpKind::Revision => !self.strict_bump,
+        }
+    }
+
+    /// Restrict writes to registry-selected versions at a selected level.
+    pub fn with_strict_bump(mut self, strict: bool) -> Self {
+        self.strict_bump = strict;
+        self
+    }
+
+    /// Whether an updater may write a change of this kind.
+    ///
+    /// Without `strict_bump` this is exactly the answer each write path gave
+    /// before the gate existed: a `Bump` is checked against the ceiling and
+    /// every other kind is written. Under `strict_bump` only a `Bump` at a
+    /// selected level passes.
+    pub fn allows_write(&self, kind: WriteKind<'_>) -> bool {
+        match kind {
+            WriteKind::Bump { lang, current, new } => self.allows_bump_for(lang, current, new),
+            WriteKind::Revision
+            | WriteKind::Pin
+            | WriteKind::Unanchored
+            | WriteKind::Reshape
+            | WriteKind::SelfPin
+            | WriteKind::Annotation => !self.strict_bump,
         }
     }
 
@@ -929,6 +1021,8 @@ pub struct CappedUpdate {
     pub current: String,
     pub available: String,
     pub line_number: Option<usize>,
+    /// Set when `--strict-bump` held the write rather than the level ceiling.
+    pub strict: Option<HeldWrite>,
 }
 
 /// A dependency whose identity was written into the file without its version
@@ -1116,7 +1210,77 @@ impl UpdateResult {
             current: current.to_string(),
             available: available.to_string(),
             line_number,
+            strict: None,
         });
+    }
+
+    /// Record a write that `--strict-bump` refused to make.
+    ///
+    /// `available` is what the write would have put in the file: the pinned
+    /// or selected version, or for a write that keeps the version (a reshape,
+    /// an annotation) the text it would have written.
+    pub fn record_strict_hold(
+        &mut self,
+        kind: HeldWrite,
+        package: &str,
+        current: &str,
+        available: &str,
+        line_number: Option<usize>,
+    ) {
+        self.capped.push(CappedUpdate {
+            lang: None,
+            package: package.to_string(),
+            current: current.to_string(),
+            available: available.to_string(),
+            line_number,
+            strict: Some(kind),
+        });
+    }
+
+    /// Hold a configured pin under `--strict-bump`.
+    ///
+    /// Every updater calls this at the point where a pin would change the
+    /// file, after it has decided the written version differs from the
+    /// current one, so a pin the file already satisfies is not reported as
+    /// held. Returns `true` when the pin was held and the caller must not
+    /// write it.
+    pub fn hold_strict_pin(
+        &mut self,
+        options: &UpdateOptions,
+        package: &str,
+        current: &str,
+        pinned: &str,
+        line_number: Option<usize>,
+    ) -> bool {
+        if options.allows_write(WriteKind::Pin) {
+            return false;
+        }
+        self.record_strict_hold(HeldWrite::Pin, package, current, pinned, line_number);
+        true
+    }
+
+    /// Report an annotation the caller kept in the file, or under
+    /// `--strict-bump` the one it held back. The caller writes the unannotated
+    /// line whenever `options.allows_write(WriteKind::Annotation)` is false.
+    pub(crate) fn keep_annotation(
+        &mut self,
+        options: &UpdateOptions,
+        annotation: Option<Annotation>,
+    ) {
+        let Some(annotation) = annotation else {
+            return;
+        };
+        if options.allows_write(WriteKind::Annotation) {
+            self.annotations.push(annotation);
+        } else {
+            self.record_strict_hold(
+                HeldWrite::Annotation,
+                &annotation.package,
+                &annotation.commit,
+                &annotation.version,
+                annotation.line_number,
+            );
+        }
     }
 }
 
@@ -2217,6 +2381,9 @@ fn walk_dependency_files(
     result.files = unique.files;
     result
 }
+
+#[cfg(test)]
+mod strict_bump_tests;
 
 #[cfg(test)]
 mod tests {

@@ -383,6 +383,16 @@ impl Updater for GoModUpdater {
                                     Some(line_num),
                                 );
                                 new_lines.push(line.to_string());
+                            } else if *is_pinned
+                                && result.hold_strict_pin(
+                                    &options,
+                                    module,
+                                    current_version,
+                                    &matched_version,
+                                    Some(line_num),
+                                )
+                            {
+                                new_lines.push(line.to_string());
                             } else {
                                 // Replace version in the line, preserving everything else
                                 let new_line = line.replacen(current_version, &matched_version, 1);

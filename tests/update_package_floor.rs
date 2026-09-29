@@ -2114,3 +2114,154 @@ async fn relock_failure_is_reported_once_per_project_with_rollback() {
         assert_eq!(fs::read_to_string(dir.join("uv.lock")).unwrap(), lock);
     }
 }
+
+/// A lock-only floor taken from `[pin]` names no level the run selected, so
+/// `--only-bump major --strict-bump` holds it for every lock mechanism that
+/// can write one: the uv constraint, the npm override and `cargo update
+/// --precise`. Writing it would put the same floor and the same lockfile
+/// change in a major-only run and in the ordinary run beside it.
+///
+/// Each fixture is its own control: the same run without `--strict-bump`
+/// plans the pinned floor, so the held answer is the flag's doing and not a
+/// fixture that never reached the pin.
+#[tokio::test]
+async fn strict_bump_holds_a_pinned_lock_only_floor_for_every_mechanism() {
+    struct Case {
+        name: &'static str,
+        package: &'static str,
+        locked: &'static str,
+        pin: &'static str,
+        report_path: &'static str,
+        files: &'static [(&'static str, &'static str)],
+        lock: fn() -> (&'static str, String),
+        env: &'static str,
+    }
+    let cases = [
+        Case {
+            name: "uv",
+            package: "lockonly",
+            locked: "0.40.0",
+            pin: "0.41.0",
+            report_path: "pyproject.toml",
+            files: &[("pyproject.toml", PYPROJECT_BARE)],
+            lock: || ("uv.lock", uv_lock_at("lockonly", "0.40.0")),
+            env: "UV_INDEX_URL",
+        },
+        Case {
+            name: "npm",
+            package: "examplepkg",
+            locked: "1.2.0",
+            pin: "1.3.0",
+            report_path: "package.json",
+            files: &[("package.json", r#"{"name": "t", "version": "1.0.0"}"#)],
+            lock: || ("package-lock.json", npm_lock_with("examplepkg", "1.2.0")),
+            env: "NPM_REGISTRY",
+        },
+        Case {
+            name: "cargo",
+            package: "dupcrate",
+            locked: "1.2.3",
+            pin: "1.3.0",
+            report_path: "Cargo.lock",
+            files: &[("Cargo.toml", CARGO_TOML)],
+            lock: || ("Cargo.lock", CARGO_LOCK.to_string()),
+            env: "CARGO_REGISTRIES_CRATES_IO_INDEX",
+        },
+    ];
+
+    for case in cases {
+        for strict in [true, false] {
+            let server = wiremock::MockServer::start().await;
+            match case.name {
+                "uv" => mount_pypi_latest(&server, case.package, case.pin).await,
+                "npm" => mount_npm_latest(&server, case.package, case.pin).await,
+                _ => mount_crates_latest(&server, case.package, case.pin).await,
+            }
+            let tmp = tempfile::tempdir().unwrap();
+            for (file, body) in case.files {
+                fs::write(tmp.path().join(file), body).unwrap();
+            }
+            let (lock_name, lock_body) = (case.lock)();
+            fs::write(tmp.path().join(lock_name), lock_body).unwrap();
+            fs::write(
+                tmp.path().join(".updrc.toml"),
+                format!("[pin]\n{} = \"{}\"\n", case.package, case.pin),
+            )
+            .unwrap();
+            let home = tmp.path().join("home");
+            fs::create_dir_all(&home).unwrap();
+
+            let mut args = vec![
+                "update",
+                "--package",
+                case.package,
+                "--only-bump",
+                "major",
+                "--format",
+                "json",
+                "--no-cache",
+                ".",
+            ];
+            // The strict run applies, so "held" is proven on disk; the control
+            // stays a dry run, which needs no package manager to plan a floor.
+            if strict {
+                args.insert(1, "--strict-bump");
+                args.insert(1, "--apply");
+            }
+            let before: Vec<_> = case
+                .files
+                .iter()
+                .map(|(file, _)| *file)
+                .chain([lock_name])
+                .map(|file| (file, fs::read(tmp.path().join(file)).unwrap()))
+                .collect();
+            let (stdout, stderr, _) = run_with_env(
+                &args,
+                tmp.path(),
+                &[
+                    (case.env, &server.uri()),
+                    ("HOME", home.to_str().unwrap()),
+                    ("XDG_CONFIG_HOME", home.to_str().unwrap()),
+                ],
+            );
+
+            let who = format!("{} strict={strict}", case.name);
+            let json: serde_json::Value = serde_json::from_str(&stdout)
+                .unwrap_or_else(|e| panic!("{who}: {e}\nstdout: {stdout}\nstderr: {stderr}"));
+            let files = json["files"].as_array().unwrap().clone();
+            let updates: Vec<_> = collect_for_path(&files, case.report_path, "updates")
+                .into_iter()
+                .filter(|u| u["package"] == case.package)
+                .collect();
+            let capped: Vec<_> = collect_for_path(&files, case.report_path, "capped")
+                .into_iter()
+                .filter(|c| c["package"] == case.package)
+                .collect();
+
+            if !strict {
+                assert_eq!(updates.len(), 1, "{who}: {json}");
+                assert_eq!(updates[0]["status"], "planned", "{who}: {json}");
+                assert!(capped.is_empty(), "{who}: {json}");
+                continue;
+            }
+            assert!(
+                updates.is_empty(),
+                "{who}: a held floor is not planned: {json}"
+            );
+            assert_eq!(capped.len(), 1, "{who}: {json}");
+            assert_eq!(capped[0]["current"], case.locked, "{who}: {json}");
+            assert_eq!(capped[0]["available"], case.pin, "{who}: {json}");
+            assert_eq!(capped[0]["bump"], "minor", "{who}: {json}");
+            assert_eq!(capped[0]["reason"], "strict-bump", "{who}: {json}");
+            assert_eq!(capped[0]["write"], "pin", "{who}: {json}");
+            assert_eq!(json["summary"]["updates_total"], 0, "{who}: {json}");
+            for (file, bytes) in before {
+                assert_eq!(
+                    fs::read(tmp.path().join(file)).unwrap(),
+                    bytes,
+                    "{who}: {file} must be left as it was"
+                );
+            }
+        }
+    }
+}

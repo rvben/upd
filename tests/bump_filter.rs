@@ -781,3 +781,207 @@ async fn a_cargo_requirement_keeps_the_ceiling_its_floor_moves_under() {
         );
     }
 }
+
+#[test]
+fn cli_strict_bump_requires_only_bump() {
+    use clap::Parser;
+    use upd::cli::Cli;
+    assert!(
+        Cli::try_parse_from(["upd", "--strict-bump"]).is_err(),
+        "--strict-bump names no levels on its own; it must be refused without --only-bump"
+    );
+    assert!(
+        Cli::try_parse_from(["upd", "--max-bump", "minor", "--strict-bump"]).is_err(),
+        "--strict-bump restricts writes to the --only-bump levels, so --max-bump cannot stand in"
+    );
+    let cli = Cli::try_parse_from(["upd", "--only-bump", "major", "--strict-bump"]).unwrap();
+    assert!(cli.strict_bump);
+}
+
+/// A registry that offers `requests` 2.0.0 (a major step from 1.0.0) and
+/// `flask` 1.0.0, 1.5.0 and 2.0.0, for the strict-bump tests below. The
+/// `flask` major is there so the pin, not a missing release, is what decides.
+async fn strict_bump_registry() -> wiremock::MockServer {
+    use wiremock::matchers::{method, path_regex};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    for (name, versions) in [
+        ("requests", &["1.0.0", "2.0.0"][..]),
+        ("flask", &["1.0.0", "1.5.0", "2.0.0"][..]),
+    ] {
+        let links: String = versions
+            .iter()
+            .map(|v| format!("<a href=\"{name}-{v}.tar.gz\">{name}-{v}.tar.gz</a>\n"))
+            .collect();
+        Mock::given(method("GET"))
+            .and(path_regex(format!(r"^/simple/{name}/?$")))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(
+                format!("<!DOCTYPE html><html><body>\n{links}</body></html>").into_bytes(),
+                "text/html",
+            ))
+            .mount(&server)
+            .await;
+    }
+    server
+}
+
+/// A workspace with one dependency a major registry release moves and one a
+/// configured `[pin]` moves by a minor step.
+fn strict_bump_workspace() -> tempfile::TempDir {
+    let tmp = tempfile::tempdir().unwrap();
+    fs::write(
+        tmp.path().join("requirements.txt"),
+        "requests==1.0.0\nflask==1.0.0\n",
+    )
+    .unwrap();
+    fs::write(tmp.path().join(".updrc.toml"), "[pin]\nflask = \"1.5.0\"\n").unwrap();
+    tmp
+}
+
+/// `--only-bump major --strict-bump` writes the registry major and holds the
+/// pin. A pin carries no level the run selected, so writing it would put the
+/// same change in a major-only run and in the ordinary run beside it.
+#[tokio::test]
+async fn strict_bump_writes_the_major_and_holds_the_pin() {
+    let server = strict_bump_registry().await;
+    let tmp = strict_bump_workspace();
+    let home = tmp.path().join("home");
+    fs::create_dir_all(&home).unwrap();
+
+    let (stdout, stderr, code) = run_with_env(
+        &[
+            "--apply",
+            "--no-cache",
+            "--no-lock",
+            "--only-bump",
+            "major",
+            "--strict-bump",
+            "-o",
+            "json",
+            ".",
+        ],
+        tmp.path(),
+        &[
+            ("UV_INDEX_URL", &server.uri()),
+            ("HOME", home.to_str().unwrap()),
+            ("XDG_CONFIG_HOME", home.to_str().unwrap()),
+        ],
+    );
+    assert_eq!(code, 0, "stdout: {stdout}\nstderr: {stderr}");
+
+    let after = fs::read_to_string(tmp.path().join("requirements.txt")).unwrap();
+    assert_eq!(
+        after, "requests==2.0.0\nflask==1.0.0\n",
+        "only the registry major may be written; stderr: {stderr}"
+    );
+
+    let report: serde_json::Value = serde_json::from_str(&stdout)
+        .unwrap_or_else(|e| panic!("stdout is not JSON ({e}): {stdout}; stderr: {stderr}"));
+    let file = &report["files"][0];
+    assert_eq!(file["pinned"].as_array().map_or(0, Vec::len), 0, "{report}");
+    let held = file["capped"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["package"] == "flask")
+        .unwrap_or_else(|| panic!("the held pin must be reported; {report}"));
+    assert_eq!(held["current"], "1.0.0", "{held}");
+    assert_eq!(held["available"], "1.5.0", "{held}");
+    assert_eq!(held["bump"], "minor", "{held}");
+    assert_eq!(held["reason"], "strict-bump", "{held}");
+    assert_eq!(held["write"], "pin", "{held}");
+}
+
+/// The control: without `--strict-bump`, `--only-bump major` still writes the
+/// pin, exactly as it did before the flag existed, and a capped entry carries
+/// neither `reason` nor `write`.
+#[tokio::test]
+async fn only_bump_without_strict_still_writes_the_pin() {
+    let server = strict_bump_registry().await;
+    let tmp = strict_bump_workspace();
+    let home = tmp.path().join("home");
+    fs::create_dir_all(&home).unwrap();
+
+    let (stdout, stderr, code) = run_with_env(
+        &[
+            "--apply",
+            "--no-cache",
+            "--no-lock",
+            "--only-bump",
+            "major",
+            "-o",
+            "json",
+            ".",
+        ],
+        tmp.path(),
+        &[
+            ("UV_INDEX_URL", &server.uri()),
+            ("HOME", home.to_str().unwrap()),
+            ("XDG_CONFIG_HOME", home.to_str().unwrap()),
+        ],
+    );
+    assert_eq!(code, 0, "stdout: {stdout}\nstderr: {stderr}");
+
+    let after = fs::read_to_string(tmp.path().join("requirements.txt")).unwrap();
+    assert_eq!(after, "requests==2.0.0\nflask==1.5.0\n", "stderr: {stderr}");
+
+    let report: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    for entry in report["files"][0]["capped"]
+        .as_array()
+        .into_iter()
+        .flatten()
+    {
+        assert!(entry.get("reason").is_none(), "{entry}");
+        assert!(entry.get("write").is_none(), "{entry}");
+    }
+}
+
+/// The text report names the held write and the flag that held it, so a
+/// reader sees why a pin they configured did not land.
+#[tokio::test]
+async fn strict_bump_text_output_names_the_held_write() {
+    let server = strict_bump_registry().await;
+    let tmp = strict_bump_workspace();
+    let home = tmp.path().join("home");
+    fs::create_dir_all(&home).unwrap();
+
+    let (stdout, stderr, _code) = run_with_env(
+        &[
+            "--no-cache",
+            "--no-lock",
+            "--only-bump",
+            "major",
+            "--strict-bump",
+            "-o",
+            "text",
+            ".",
+        ],
+        tmp.path(),
+        &[
+            ("UV_INDEX_URL", &server.uri()),
+            ("HOME", home.to_str().unwrap()),
+            ("XDG_CONFIG_HOME", home.to_str().unwrap()),
+            ("NO_COLOR", "1"),
+        ],
+    );
+    let line = stdout
+        .lines()
+        .find(|l| l.contains("flask"))
+        .unwrap_or_else(|| panic!("flask must be reported; stdout: {stdout}\nstderr: {stderr}"));
+    assert!(line.contains("Held back"), "{line}");
+    assert!(line.contains("1.0.0 → 1.5.0"), "{line}");
+    assert!(line.contains("pin held by --strict-bump"), "{line}");
+
+    // The summary counts the hold under the flag that made it: no ceiling
+    // held anything back here, since the pin is not a version step.
+    assert!(
+        !stdout.contains("bump ceiling"),
+        "a strict hold is not a ceiling hold: {stdout}"
+    );
+    let summary = stdout
+        .lines()
+        .find(|l| l.contains("write(s) held by --strict-bump"))
+        .unwrap_or_else(|| panic!("the strict hold must be summarised; stdout: {stdout}"));
+    assert!(summary.contains(" 1 "), "{summary}");
+}

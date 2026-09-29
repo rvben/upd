@@ -649,6 +649,17 @@ impl Updater for GradleUpdater {
                     result.record_capped(&e.package, &e.version, &target, Some(e.line));
                     continue;
                 }
+                if pin.is_some()
+                    && result.hold_strict_pin(
+                        &options,
+                        &e.package,
+                        &e.version,
+                        &target,
+                        Some(e.line),
+                    )
+                {
+                    continue;
+                }
                 proposals.push((e, target, pin.is_some(), held));
             }
             if proposals.is_empty() {

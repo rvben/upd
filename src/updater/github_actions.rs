@@ -1111,29 +1111,39 @@ impl Updater for GithubActionsUpdater {
                 // writes no update is therefore the annotated one, and the line
                 // an update rewrites is the annotated one too, so both go
                 // through one rewrite rather than two.
-                let (kept_line, annotation) = if matches!(action.version, PinVersion::Recovered(_))
-                {
-                    match self.annotate_sha_pin(line, &action.current_sha, &current_version) {
-                        Some(annotated) => (
-                            annotated,
-                            Some(super::Annotation {
-                                package: action.owner_repo.clone(),
-                                version: current_version.clone(),
-                                commit: action.current_sha.clone(),
-                                line_number: Some(line_num),
-                            }),
-                        ),
-                        None => {
-                            result.errors.push(format!(
-                                "{}: could not safely annotate SHA pin at line {}",
-                                action.owner_repo, line_num
-                            ));
-                            new_lines.push(line.to_string());
-                            continue;
+                //
+                // Under `--strict-bump` the annotation alone is not written, so
+                // the kept line is the original one; an update still rewrites
+                // the annotated line, since its comment has to name the new
+                // release either way.
+                let (rewrite_base, annotation) =
+                    if matches!(action.version, PinVersion::Recovered(_)) {
+                        match self.annotate_sha_pin(line, &action.current_sha, &current_version) {
+                            Some(annotated) => (
+                                annotated,
+                                Some(super::Annotation {
+                                    package: action.owner_repo.clone(),
+                                    version: current_version.clone(),
+                                    commit: action.current_sha.clone(),
+                                    line_number: Some(line_num),
+                                }),
+                            ),
+                            None => {
+                                result.errors.push(format!(
+                                    "{}: could not safely annotate SHA pin at line {}",
+                                    action.owner_repo, line_num
+                                ));
+                                new_lines.push(line.to_string());
+                                continue;
+                            }
                         }
-                    }
+                    } else {
+                        (line.to_string(), None)
+                    };
+                let kept_line = if options.allows_write(super::WriteKind::Annotation) {
+                    rewrite_base.clone()
                 } else {
-                    (line.to_string(), None)
+                    line.to_string()
                 };
 
                 let is_config_pinned = action.pinned_version.is_some();
@@ -1156,7 +1166,7 @@ impl Updater for GithubActionsUpdater {
                         result
                             .errors
                             .push(format!("{}: {}", action.owner_repo, error));
-                        result.annotations.extend(annotation);
+                        result.keep_annotation(&options, annotation);
                         new_lines.push(kept_line);
                         continue;
                     }
@@ -1173,7 +1183,7 @@ impl Updater for GithubActionsUpdater {
                         ),
                         line_number: Some(line_num),
                     });
-                    result.annotations.extend(annotation);
+                    result.keep_annotation(&options, annotation);
                     new_lines.push(kept_line);
                     continue;
                 }
@@ -1211,7 +1221,7 @@ impl Updater for GithubActionsUpdater {
                                 skipped_version,
                                 skipped_published_at,
                             ));
-                            result.annotations.extend(annotation);
+                            result.keep_annotation(&options, annotation);
                             new_lines.push(kept_line);
                             continue;
                         }
@@ -1244,7 +1254,7 @@ impl Updater for GithubActionsUpdater {
                         if annotation.is_none() {
                             result.unchanged += 1;
                         }
-                        result.annotations.extend(annotation);
+                        result.keep_annotation(&options, annotation);
                         new_lines.push(kept_line);
                         continue;
                     }
@@ -1258,7 +1268,7 @@ impl Updater for GithubActionsUpdater {
                     if annotation.is_none() {
                         result.unchanged += 1;
                     }
-                    result.annotations.extend(annotation);
+                    result.keep_annotation(&options, annotation);
                     new_lines.push(kept_line);
                     continue;
                 }
@@ -1276,7 +1286,37 @@ impl Updater for GithubActionsUpdater {
                         &target_version,
                         Some(line_num),
                     );
-                    result.annotations.extend(annotation);
+                    result.keep_annotation(&options, annotation);
+                    new_lines.push(kept_line);
+                    continue;
+                }
+                // `--strict-bump` writes only a bump at a selected level, so a
+                // configured pin waits for a run without it. So does the
+                // self-pin, even at a selected level: a run without the flag
+                // writes it past any ceiling, and holding it here keeps it out
+                // of both runs when the work is split by level.
+                let held = if is_config_pinned {
+                    result.hold_strict_pin(
+                        &options,
+                        &action.owner_repo,
+                        &current_version,
+                        &target_version,
+                        Some(line_num),
+                    )
+                } else if is_self_pin && !options.allows_write(super::WriteKind::SelfPin) {
+                    result.record_strict_hold(
+                        super::HeldWrite::SelfPin,
+                        &action.owner_repo,
+                        &current_version,
+                        &target_version,
+                        Some(line_num),
+                    );
+                    true
+                } else {
+                    false
+                };
+                if held {
+                    result.keep_annotation(&options, annotation);
                     new_lines.push(kept_line);
                     continue;
                 }
@@ -1294,7 +1334,7 @@ impl Updater for GithubActionsUpdater {
                             "{}@{}: failed to resolve target SHA: {}",
                             action.owner_repo, target_version, error
                         ));
-                        result.annotations.extend(annotation);
+                        result.keep_annotation(&options, annotation);
                         new_lines.push(kept_line);
                         continue;
                     }
@@ -1304,7 +1344,7 @@ impl Updater for GithubActionsUpdater {
                         "{}@{}: registry returned an invalid commit SHA",
                         action.owner_repo, target_version
                     ));
-                    result.annotations.extend(annotation);
+                    result.keep_annotation(&options, annotation);
                     new_lines.push(kept_line);
                     continue;
                 }
@@ -1359,7 +1399,7 @@ impl Updater for GithubActionsUpdater {
                                 message: "with.upd-version and with.upd-sha256 must both be set, or neither, so the workflow pin, binary version, and checksum stay coupled".to_string(),
                                 line_number: Some(line_num),
                             });
-                            result.annotations.extend(annotation);
+                            result.keep_annotation(&options, annotation);
                             new_lines.push(kept_line);
                             continue;
                         }
@@ -1376,7 +1416,7 @@ impl Updater for GithubActionsUpdater {
                                     ),
                                     line_number: Some(line_num),
                                 });
-                                result.annotations.extend(annotation);
+                                result.keep_annotation(&options, annotation);
                                 new_lines.push(kept_line);
                                 continue;
                             }
@@ -1411,7 +1451,7 @@ impl Updater for GithubActionsUpdater {
                                             .message(&action.owner_repo, &target_version),
                                         line_number: Some(line_num),
                                     });
-                                    result.annotations.extend(annotation);
+                                    result.keep_annotation(&options, annotation);
                                     new_lines.push(kept_line);
                                     continue;
                                 }
@@ -1425,7 +1465,7 @@ impl Updater for GithubActionsUpdater {
                 // moves it and the update cannot come out shaped differently
                 // from the annotation it would have got on its own.
                 let Some(new_line) = self.replace_sha_pin(
-                    &kept_line,
+                    &rewrite_base,
                     &action.current_sha,
                     &current_version,
                     &new_sha,
@@ -1435,7 +1475,7 @@ impl Updater for GithubActionsUpdater {
                         "{}: could not safely rewrite SHA pin at line {}",
                         action.owner_repo, line_num
                     ));
-                    result.annotations.extend(annotation);
+                    result.keep_annotation(&options, annotation);
                     new_lines.push(kept_line);
                     continue;
                 };
@@ -1572,6 +1612,16 @@ impl Updater for GithubActionsUpdater {
                                     &new_version,
                                     Some(line_num),
                                 );
+                                new_lines.push(line.to_string());
+                            } else if *is_pinned
+                                && result.hold_strict_pin(
+                                    &options,
+                                    owner_repo,
+                                    current_version,
+                                    &new_version,
+                                    Some(line_num),
+                                )
+                            {
                                 new_lines.push(line.to_string());
                             } else {
                                 let new_line = line.replacen(current_version, &new_version, 1);

@@ -295,7 +295,9 @@ the replacement manifest digest, so digest pins are blocked in this release.
   and only the locked commit changes
 - Reports each change with bump `revision` and short commit hashes
   (`nixpkgs 00455b0a3690 -> 4975466d3247`). A revision has no semver level, so
-  `--max-bump` and `--only-bump` never hold it back
+  `--max-bump` and `--only-bump` never hold it back. `--strict-bump` does: it
+  reports the revision in `capped` with reason `strict-bump` and leaves the
+  lock as it is
 - Reads upstream heads straight from the GitHub and GitLab APIs, so checking
   needs no Nix installation. `GITHUB_TOKEN` (or `GH_TOKEN`) raises the GitHub
   rate limit and reaches private repositories, as for GitHub Actions. For a

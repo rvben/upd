@@ -517,7 +517,13 @@ impl Updater for DockerUpdater {
             if let Some(pinned) = options.get_pinned_version(&dependency.image) {
                 if pinned == dependency.tag {
                     result.unchanged += 1;
-                } else {
+                } else if !result.hold_strict_pin(
+                    &options,
+                    &dependency.image,
+                    &dependency.tag,
+                    pinned,
+                    line_number,
+                ) {
                     replacements.push((dependency_idx, pinned.to_string()));
                     result.pinned.push((
                         dependency.image.clone(),

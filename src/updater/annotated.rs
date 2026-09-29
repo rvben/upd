@@ -503,6 +503,16 @@ impl AnnotatedUpdater {
                         result.unchanged += 1;
                         continue;
                     }
+                    if result.hold_strict_pin(
+                        &options,
+                        &line.package,
+                        &line.version,
+                        &target,
+                        Some(line_num),
+                    ) {
+                        result.capped.last_mut().unwrap().lang = Some(lang);
+                        continue;
+                    }
                     result.pinned.push((
                         line.package.clone(),
                         line.version.clone(),
@@ -1896,6 +1906,34 @@ mod tests {
         assert_eq!(result.capped[0].package, "thing");
         assert_eq!(result.capped[0].current, "1.0.0");
         assert_eq!(result.capped[0].available, "1.1.0");
+    }
+
+    #[tokio::test]
+    async fn a_strict_held_pin_keeps_the_annotation_language() {
+        // PEP 440 calls 0.1.0 -> 0.2.0 a minor step where the generic SemVer
+        // reading calls it major, so the held entry must say which one applies.
+        let set = set_with(
+            AnnotationSource::PyPi,
+            MockRegistry::new("pypi").with_version("thing", "0.3.0"),
+        );
+        let options = UpdateOptions::new(false, false)
+            .with_config(config_of(&[], &[("thing", "0.2.0")]))
+            .with_bump_filter(BumpFilter {
+                major: true,
+                minor: false,
+                patch: false,
+            })
+            .with_strict_bump(true);
+        let original = "THING ?= 0.1.0  # upd: pypi thing\n";
+        let (result, written) = run(original, set, options).await;
+
+        assert_eq!(written, original);
+        assert_eq!(result.capped.len(), 1, "capped: {:?}", result.capped);
+        assert_eq!(
+            result.capped[0].strict,
+            Some(crate::updater::HeldWrite::Pin)
+        );
+        assert_eq!(result.capped[0].lang, Some(Lang::Python));
     }
 
     #[tokio::test]

@@ -478,7 +478,18 @@ impl Updater for RequirementsUpdater {
                             } else {
                                 match_version_precision(&parsed.first_version, &pinned_version)
                             };
-                            if matched_version != parsed.first_version {
+                            if matched_version == parsed.first_version {
+                                result.unchanged += 1;
+                                new_lines.push(line.to_string());
+                            } else if result.hold_strict_pin(
+                                &options,
+                                &parsed.package,
+                                &parsed.first_version,
+                                &matched_version,
+                                Some(line_num),
+                            ) {
+                                new_lines.push(line.to_string());
+                            } else {
                                 result.pinned.push((
                                     parsed.package.clone(),
                                     parsed.first_version.clone(),
@@ -487,9 +498,6 @@ impl Updater for RequirementsUpdater {
                                 ));
                                 new_lines.push(self.update_line(line, &matched_version));
                                 modified = true;
-                            } else {
-                                result.unchanged += 1;
-                                new_lines.push(line.to_string());
                             }
                         }
                         PendingVersion::Registry(Ok(latest_version)) => {

@@ -32,7 +32,8 @@ resolution. Use `--apply` in a clean Git checkout to review the resulting diff.
 An active `[cooldown]`, `--min-age` or `--min-age-floor` is currently refused before invoking a
 package manager. Cooldown-aware maintenance needs its own release-age checks
 for the full resolved graph. `--only-bump` and `--package` are not yet supported
-for maintenance; `--lang` and `--max-bump` are supported.
+for maintenance (nor, with them, `--strict-bump`); `--lang` and `--max-bump`
+are supported.
 `--check`, `--interactive`, and `--no-ignore` are also unsupported by this
 command; it rejects them rather than silently changing their meaning.
 `--limit` and `--offset` select which discovered lockfiles to process;

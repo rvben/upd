@@ -289,7 +289,15 @@ impl Updater for CsprojUpdater {
                 match_version_precision(&current_version, &pinned_version)
             };
 
-            if matched_version != current_version {
+            if matched_version == current_version {
+                result.unchanged += 1;
+            } else if !result.hold_strict_pin(
+                &options,
+                &package,
+                &current_version,
+                &matched_version,
+                Some(line_idx + 1),
+            ) {
                 version_map.insert(line_idx, Ok(matched_version.clone()));
                 pinned_lines.insert(line_idx);
                 result.pinned.push((
@@ -298,8 +306,6 @@ impl Updater for CsprojUpdater {
                     matched_version,
                     Some(line_idx + 1),
                 ));
-            } else {
-                result.unchanged += 1;
             }
         }
 

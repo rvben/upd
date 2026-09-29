@@ -13,8 +13,8 @@
 //! against the commits the dry run resolved.
 
 use super::{
-    Lang, ParsedDependency, SkipStatus, SkippedUpdate, UpdateContext, UpdateOptions, UpdateResult,
-    Updater,
+    HeldWrite, Lang, ParsedDependency, SkipStatus, SkippedUpdate, UpdateContext, UpdateOptions,
+    UpdateResult, Updater, WriteKind,
 };
 use crate::registry::Registry;
 use anyhow::{Context, Result, anyhow, bail};
@@ -588,6 +588,17 @@ impl Updater for FlakeLockUpdater {
                     ));
                     continue;
                 }
+            }
+            // A moved revision has no bump level, so `--strict-bump` holds it.
+            if !options.allows_write(WriteKind::Revision) {
+                result.record_strict_hold(
+                    HeldWrite::Revision,
+                    &input.name,
+                    &short(locked),
+                    &short(&head),
+                    None,
+                );
+                continue;
             }
             let index = result.updated.len();
             result

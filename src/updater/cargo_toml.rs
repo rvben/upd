@@ -384,6 +384,13 @@ impl CargoTomlUpdater {
 
             if matched_version == current_release {
                 result.unchanged += 1;
+            } else if result.hold_strict_pin(
+                options,
+                &key,
+                &current_version,
+                &matched_version,
+                line_num,
+            ) {
             } else if let Some(new_version_req) = req.with_version(&matched_version) {
                 if let Some(item) = table.get_mut(&key) {
                     Self::set_version(item, &new_version_req);

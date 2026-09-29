@@ -886,6 +886,9 @@ pub enum FloorResolution {
     /// A newer version exists but sits above the `--max-bump`/`--only-bump`
     /// ceiling. Nothing is written; the caller reports it as held back.
     Capped(String),
+    /// A configured pin would move the floor to this version, and
+    /// `--strict-bump` holds every write that is not a selected bump.
+    HeldPin(String),
 }
 
 /// Resolve the floor version for a lock-only package: config pin if above
@@ -904,10 +907,12 @@ pub async fn resolve_floor_version(
 ) -> anyhow::Result<FloorResolution> {
     if let Some(pinned) = options.get_pinned_version(package) {
         return Ok(
-            if crate::align::compare_versions(pinned, locked, lang) == Ordering::Greater {
+            if crate::align::compare_versions(pinned, locked, lang) != Ordering::Greater {
+                FloorResolution::NotNeeded
+            } else if options.allows_write(crate::updater::WriteKind::Pin) {
                 FloorResolution::Floor(pinned.to_string())
             } else {
-                FloorResolution::NotNeeded
+                FloorResolution::HeldPin(pinned.to_string())
             },
         );
     }

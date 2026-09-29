@@ -48,11 +48,11 @@ use upd::registry::{
 use upd::updater::{
     ActionShaUpdate, AnnotatedUpdater, BumpFilter, BumpKind, CargoTomlUpdater, CsprojUpdater,
     DEFAULT_UPDATE_ACTION_SHAS, DiscoverOptions, DockerUpdater, FileType, FlakeLockUpdater,
-    GemfileUpdater, GithubActionsUpdater, GoModUpdater, GradleUpdater, Lang, MiseUpdater,
-    PackageJsonUpdater, ParseWarnings, PreCommitUpdater, PyProjectUpdater, RegistrySet,
-    RequirementsUpdater, SkipStatus, SkippedUpdate, TerraformUpdater, UpdateOptions, UpdateResult,
-    Updater, classify_bump, discover_files_with, read_file_safe, update_with_annotations,
-    write_file_atomic,
+    GemfileUpdater, GithubActionsUpdater, GoModUpdater, GradleUpdater, HeldWrite, Lang,
+    MiseUpdater, PackageJsonUpdater, ParseWarnings, PreCommitUpdater, PyProjectUpdater,
+    RegistrySet, RequirementsUpdater, SkipStatus, SkippedUpdate, TerraformUpdater, UpdateOptions,
+    UpdateResult, Updater, classify_bump, discover_files_with, read_file_safe,
+    update_with_annotations, write_file_atomic,
 };
 use upd::version::{compare_versions, written_version};
 
@@ -486,7 +486,7 @@ fn build_update_options(
     annotation_langs: Option<&[Lang]>,
     cooldown_policy: Option<&CooldownPolicy>,
     cooldown_notes: Arc<Mutex<BTreeMap<String, String>>>,
-    bump_filter: BumpFilter,
+    filter: UpdateFilter,
 ) -> UpdateOptions {
     // Command line first, then the config file nearest this file, then the
     // built-in default.
@@ -502,7 +502,9 @@ fn build_update_options(
     options = options.with_package_filter(package_filter.clone());
     options = options.with_langs(langs.to_vec());
     options.annotation_langs = annotation_langs.map(<[Lang]>::to_vec);
-    options = options.with_bump_filter(bump_filter);
+    options = options
+        .with_bump_filter(filter.to_bump_filter())
+        .with_strict_bump(filter.strict);
     if let Some(policy) = cooldown_policy {
         options = options.with_cooldown_policy(policy.clone(), Utc::now());
     }
@@ -1951,7 +1953,7 @@ async fn run_update(cli: &Cli) -> Result<()> {
                     lock_failures: &LockFailures::new(),
                     file_count: 0,
                     dry_run: effective_dry_run,
-                    filter: UpdateFilter::from_cli(&cli.only_bump, cli.max_bump),
+                    filter: UpdateFilter::from_cli(&cli.only_bump, cli.max_bump, cli.strict_bump),
                     file_cooldowns: &HashMap::new(),
                     cooldown_notes: Vec::new(),
                     floor_reports: Vec::new(),
@@ -2002,7 +2004,7 @@ async fn run_update(cli: &Cli) -> Result<()> {
     }
 
     // Create filter from CLI flags
-    let filter = UpdateFilter::from_cli(&cli.only_bump, cli.max_bump);
+    let filter = UpdateFilter::from_cli(&cli.only_bump, cli.max_bump, cli.strict_bump);
 
     // Create shared cache and wrap registries with caching layer
     let cache = Cache::new_shared();
@@ -2228,7 +2230,7 @@ async fn run_update(cli: &Cli) -> Result<()> {
                     cli.annotation_langs.as_deref(),
                     cooldown_policy,
                     Arc::clone(&cooldown_notes),
-                    filter.to_bump_filter(),
+                    filter,
                 )
                 .with_cooldown_lang(file_type.lang()),
             )
@@ -2577,6 +2579,11 @@ async fn run_update(cli: &Cli) -> Result<()> {
         // this lock has a floor mechanism at all. Reported as held back only
         // if it does.
         let mut capped_pending: Vec<(&upd::lockscan::LockedPackage, String, PathBuf)> = Vec::new();
+        // Pinned floors `--strict-bump` held, by report path and normalized
+        // package name. They go through the same routing as a capped floor, so
+        // one is reported only where a floor could have been written, and are
+        // told apart from it only when reported.
+        let mut strict_held_floors: HashMap<PathBuf, (Ecosystem, HashSet<String>)> = HashMap::new();
         let mut floor_ignored: HashMap<PathBuf, Vec<upd::output::IgnoredEntry>> = HashMap::new();
         let mut floor_errors: HashMap<PathBuf, Vec<upd::output::ErrorEntry>> = HashMap::new();
         let mut floor_capped: HashMap<PathBuf, Vec<upd::output::CappedEntry>> = HashMap::new();
@@ -2632,7 +2639,7 @@ async fn run_update(cli: &Cli) -> Result<()> {
                     cli.annotation_langs.as_deref(),
                     cooldown_policy.as_ref(),
                     Arc::clone(&cooldown_notes),
-                    filter.to_bump_filter(),
+                    filter,
                 )
                 .with_cooldown_lang(ecosystem_to_lang(lp.ecosystem));
 
@@ -2699,6 +2706,14 @@ async fn run_update(cli: &Cli) -> Result<()> {
                         // here at all, since "held back by the ceiling" promises
                         // that raising the ceiling releases the update.
                         capped_pending.push((*locked, candidate, report_path.clone()));
+                    }
+                    Ok(FloorResolution::HeldPin(pin)) => {
+                        strict_held_floors
+                            .entry(report_path.clone())
+                            .or_insert_with(|| (locked.ecosystem, HashSet::new()))
+                            .1
+                            .insert(normalized_package_name(&locked.name, locked.ecosystem));
+                        capped_pending.push((*locked, pin, report_path.clone()));
                     }
                     Ok(FloorResolution::Floor(candidate)) => {
                         synthetic_vulnerable
@@ -2946,7 +2961,19 @@ async fn run_update(cli: &Cli) -> Result<()> {
         }
 
         for ((path, package), (current, available)) in capped_reports {
-            total_result.record_capped(&package, &current, &available, None);
+            let strict = strict_held_floors
+                .get(&path)
+                .is_some_and(|(ecosystem, names)| {
+                    names.contains(&normalized_package_name(&package, *ecosystem))
+                })
+                .then_some(HeldWrite::Pin);
+            match strict {
+                Some(held) => {
+                    total_result.record_strict_hold(held, &package, &current, &available, None)
+                }
+                None => total_result.record_capped(&package, &current, &available, None),
+            }
+            let bump = classify_path_update(&path, &current, &available);
             if text_mode && !cli.quiet {
                 println!(
                     "{}",
@@ -2956,7 +2983,8 @@ async fn run_update(cli: &Cli) -> Result<()> {
                         &package,
                         &current,
                         &available,
-                        classify_path_update(&path, &current, &available)
+                        bump,
+                        strict,
                     )
                 );
             }
@@ -2967,7 +2995,9 @@ async fn run_update(cli: &Cli) -> Result<()> {
                     package,
                     current: current.clone(),
                     available: available.clone(),
-                    bump: classify_path_update(&path, &current, &available).as_str(),
+                    bump: Some(bump.as_str()),
+                    reason: strict.map(|_| upd::output::STRICT_BUMP_REASON),
+                    write: strict.map(HeldWrite::token),
                     line: None,
                     source: None,
                 });
@@ -3581,7 +3611,7 @@ async fn run_interactive_update(
             cli.annotation_langs.as_deref(),
             cooldown_policy,
             Arc::clone(&cooldown_notes),
-            filter.to_bump_filter(),
+            filter,
         )
         .with_cooldown_lang(file_type.lang());
 
@@ -3845,17 +3875,18 @@ async fn run_interactive_update(
 
     if !has_interactive_changes(&pending_updates, &scanned_results) {
         if !cli.quiet {
-            let capped: usize = scanned_results
+            let (strict, capped): (Vec<_>, Vec<_>) = scanned_results
                 .iter()
-                .map(|scanned| scanned.result.capped.len())
-                .sum();
+                .flat_map(|scanned| &scanned.result.capped)
+                .partition(|c| c.strict.is_some());
             let warning_total: usize = scanned_results
                 .iter()
                 .map(|scanned| scanned.result.warnings.len())
                 .sum();
             if let Some(line) = format_interactive_closing_line(
                 files.len(),
-                capped,
+                capped.len(),
+                strict.len(),
                 annotation_total,
                 blocked_total + not_examined_total,
                 warning_total,
@@ -6301,6 +6332,8 @@ struct UpdateFilter {
     major: bool,
     minor: bool,
     patch: bool,
+    /// `--strict-bump`: only a selected registry bump is written or reported.
+    strict: bool,
 }
 
 impl UpdateFilter {
@@ -6309,12 +6342,14 @@ impl UpdateFilter {
     /// `only_bump` is a list of exact levels to include (empty = all).
     /// `max_bump` is a ceiling level: only updates at or below that level are included.
     /// The two are mutually exclusive; clap enforces this at parse time.
-    fn from_cli(only_bump: &[BumpLevel], max_bump: Option<BumpLevel>) -> Self {
+    /// `strict` is `--strict-bump`, which clap accepts only with `only_bump`.
+    fn from_cli(only_bump: &[BumpLevel], max_bump: Option<BumpLevel>, strict: bool) -> Self {
         if let Some(max) = max_bump {
             return Self {
                 major: matches!(max, BumpLevel::Major),
                 minor: matches!(max, BumpLevel::Major | BumpLevel::Minor),
                 patch: true,
+                strict,
             };
         }
         if only_bump.is_empty() {
@@ -6322,12 +6357,14 @@ impl UpdateFilter {
                 major: true,
                 minor: true,
                 patch: true,
+                strict,
             };
         }
         Self {
             major: only_bump.contains(&BumpLevel::Major),
             minor: only_bump.contains(&BumpLevel::Minor),
             patch: only_bump.contains(&BumpLevel::Patch),
+            strict,
         }
     }
 
@@ -6336,9 +6373,10 @@ impl UpdateFilter {
             UpdateType::Major => self.major,
             UpdateType::Minor => self.minor,
             UpdateType::Patch => self.patch,
-            // A revision has no level to select on, and the write-time
-            // `BumpFilter` never caps one, so reporting agrees with writing.
-            UpdateType::Revision => true,
+            // A revision has no level to select on: the write-time gate
+            // (`UpdateOptions::allows_bump_for`) lets one through unless
+            // `--strict-bump` is set, and reporting agrees with writing.
+            UpdateType::Revision => !self.strict,
         }
     }
 
@@ -6413,20 +6451,38 @@ fn format_capped_line(
     current: &str,
     available: &str,
     bump: UpdateType,
+    strict: Option<HeldWrite>,
 ) -> String {
     let location = match line_number {
         Some(n) => format!("{}:{}:", path, n),
         None => format!("{}:", path),
     };
+    let reason = match strict {
+        Some(held) => format!("{} held by --strict-bump", held.token()),
+        None => format!("{} bump", bump.as_str()),
+    };
+    // An annotation moves nothing: `available` is the release the comment
+    // would name beside the unchanged commit. A bare requirement has no
+    // specifier to draw the arrow from. Neither gets an arrow.
+    if strict == Some(HeldWrite::Annotation) || current.is_empty() {
+        return format!(
+            "{} {} {} {} ({})",
+            location.blue().underline(),
+            "Held back".yellow(),
+            package.bold(),
+            available.cyan(),
+            reason
+        );
+    }
     format!(
-        "{} {} {} {} {} {} ({} bump)",
+        "{} {} {} {} {} {} ({})",
         location.blue().underline(),
         "Held back".yellow(),
         package.bold(),
         current.dimmed(),
         "→".dimmed(),
         available.cyan(),
-        bump.as_str()
+        reason
     )
 }
 
@@ -6629,6 +6685,7 @@ fn format_capped_lines(path: &str, result: &UpdateResult) -> Vec<String> {
                         upd::updater::classify_bump_for(lang, &capped.current, &capped.available)
                     },
                 )),
+                capped.strict,
             )
         })
         .collect()
@@ -6848,23 +6905,38 @@ fn print_file_result(
 ///
 /// A capped update outranks the tick for the same reason it does in the
 /// non-interactive summary: the ceiling, not the registry, decided it, and the
-/// user is the one who set the ceiling.
+/// user is the one who set the ceiling. A write `--strict-bump` held outranks
+/// it too, counted apart because the flag, not the ceiling, held it.
 ///
 /// Produced by a helper rather than printed in place so it can be asserted
 /// without a terminal, the same reason `format_capped_lines` is one.
 fn format_interactive_closing_line(
     file_count: usize,
     capped: usize,
+    strict: usize,
     annotations: usize,
     skipped: usize,
     warnings: usize,
 ) -> Option<String> {
+    let mut held = Vec::new();
     if capped > 0 {
+        held.push(format!(
+            "{} update(s) held back by the bump ceiling (--max-bump/--only-bump)",
+            capped.to_string().yellow().bold()
+        ));
+    }
+    if strict > 0 {
+        held.push(format!(
+            "{} write(s) held by --strict-bump",
+            strict.to_string().yellow().bold()
+        ));
+    }
+    if !held.is_empty() {
         return Some(format!(
-            "{} Scanned {} file(s), {} update(s) held back by the bump ceiling (--max-bump/--only-bump)",
+            "{} Scanned {} file(s), {}",
             "!".yellow().bold(),
             file_count,
-            capped.to_string().yellow().bold()
+            held.join(", ")
         ));
     }
     if annotations > 0 || skipped > 0 || warnings > 0 {
@@ -6956,7 +7028,10 @@ fn print_summary(
         .iter()
         .filter(|s| s.status == SkipStatus::Blocked)
         .count();
-    let capped_count = result.capped.len();
+    // `capped` carries both the bump ceiling's holds and `--strict-bump`'s,
+    // which are different reasons and are counted apart.
+    let strict_count = result.capped.iter().filter(|c| c.strict.is_some()).count();
+    let capped_count = result.capped.len() - strict_count;
     let annotation_count = result.annotations.len();
     let normalized_count = result.normalized.len();
     // A warning is something that did not go the way the run intended: a
@@ -7072,6 +7147,16 @@ fn print_summary(
                 "{} {} package(s) held back by the bump ceiling (--max-bump/--only-bump)",
                 "Held back".yellow(),
                 capped_count.to_string().yellow().bold()
+            );
+        }
+
+        // Writes `--strict-bump` held are waiting on a run without the flag,
+        // and say so for the same reason.
+        if strict_count > 0 {
+            println!(
+                "{} {} write(s) held by --strict-bump",
+                "Held back".yellow(),
+                strict_count.to_string().yellow().bold()
             );
         }
 
@@ -7297,7 +7382,7 @@ mod tests {
 
     #[test]
     fn test_update_filter_defaults_to_all() {
-        let filter = UpdateFilter::from_cli(&[], None);
+        let filter = UpdateFilter::from_cli(&[], None, false);
         assert!(filter.major);
         assert!(filter.minor);
         assert!(filter.patch);
@@ -7305,7 +7390,7 @@ mod tests {
 
     #[test]
     fn test_update_filter_major_only() {
-        let filter = UpdateFilter::from_cli(&[BumpLevel::Major], None);
+        let filter = UpdateFilter::from_cli(&[BumpLevel::Major], None, false);
         assert!(filter.major);
         assert!(!filter.minor);
         assert!(!filter.patch);
@@ -7313,7 +7398,7 @@ mod tests {
 
     #[test]
     fn test_update_filter_minor_only() {
-        let filter = UpdateFilter::from_cli(&[BumpLevel::Minor], None);
+        let filter = UpdateFilter::from_cli(&[BumpLevel::Minor], None, false);
         assert!(!filter.major);
         assert!(filter.minor);
         assert!(!filter.patch);
@@ -7321,7 +7406,7 @@ mod tests {
 
     #[test]
     fn test_update_filter_patch_only() {
-        let filter = UpdateFilter::from_cli(&[BumpLevel::Patch], None);
+        let filter = UpdateFilter::from_cli(&[BumpLevel::Patch], None, false);
         assert!(!filter.major);
         assert!(!filter.minor);
         assert!(filter.patch);
@@ -7329,7 +7414,7 @@ mod tests {
 
     #[test]
     fn test_update_filter_combined() {
-        let filter = UpdateFilter::from_cli(&[BumpLevel::Major, BumpLevel::Minor], None);
+        let filter = UpdateFilter::from_cli(&[BumpLevel::Major, BumpLevel::Minor], None, false);
         assert!(filter.major);
         assert!(filter.minor);
         assert!(!filter.patch);
@@ -7337,12 +7422,12 @@ mod tests {
 
     #[test]
     fn test_update_filter_matches() {
-        let filter = UpdateFilter::from_cli(&[BumpLevel::Major], None);
+        let filter = UpdateFilter::from_cli(&[BumpLevel::Major], None, false);
         assert!(filter.matches(UpdateType::Major));
         assert!(!filter.matches(UpdateType::Minor));
         assert!(!filter.matches(UpdateType::Patch));
 
-        let filter = UpdateFilter::from_cli(&[BumpLevel::Minor, BumpLevel::Patch], None);
+        let filter = UpdateFilter::from_cli(&[BumpLevel::Minor, BumpLevel::Patch], None, false);
         assert!(!filter.matches(UpdateType::Major));
         assert!(filter.matches(UpdateType::Minor));
         assert!(filter.matches(UpdateType::Patch));
@@ -7350,7 +7435,7 @@ mod tests {
 
     #[test]
     fn test_update_filter_max_bump_major_allows_all() {
-        let filter = UpdateFilter::from_cli(&[], Some(BumpLevel::Major));
+        let filter = UpdateFilter::from_cli(&[], Some(BumpLevel::Major), false);
         assert!(filter.major);
         assert!(filter.minor);
         assert!(filter.patch);
@@ -7358,7 +7443,7 @@ mod tests {
 
     #[test]
     fn test_update_filter_max_bump_minor_excludes_major() {
-        let filter = UpdateFilter::from_cli(&[], Some(BumpLevel::Minor));
+        let filter = UpdateFilter::from_cli(&[], Some(BumpLevel::Minor), false);
         assert!(!filter.major);
         assert!(filter.minor);
         assert!(filter.patch);
@@ -7366,7 +7451,7 @@ mod tests {
 
     #[test]
     fn test_update_filter_max_bump_patch_allows_only_patch() {
-        let filter = UpdateFilter::from_cli(&[], Some(BumpLevel::Patch));
+        let filter = UpdateFilter::from_cli(&[], Some(BumpLevel::Patch), false);
         assert!(!filter.major);
         assert!(!filter.minor);
         assert!(filter.patch);
@@ -7375,7 +7460,7 @@ mod tests {
     #[test]
     fn test_count_updates_by_type_empty() {
         let updates: Vec<(String, String, String, Option<usize>)> = vec![];
-        let filter = UpdateFilter::from_cli(&[], None); // show all
+        let filter = UpdateFilter::from_cli(&[], None, false); // show all
 
         let (major, minor, patch, total) = count_updates_by_type(&updates, filter);
         assert_eq!(major, 0);
@@ -7393,7 +7478,7 @@ mod tests {
             ("pkg4".into(), "2.0.0".into(), "3.0.0".into(), Some(4)), // major
             ("pkg5".into(), "1.5.0".into(), "1.5.1".into(), Some(5)), // patch
         ];
-        let filter = UpdateFilter::from_cli(&[], None); // show all
+        let filter = UpdateFilter::from_cli(&[], None, false); // show all
 
         let (major, minor, patch, total) = count_updates_by_type(&updates, filter);
         assert_eq!(major, 2);
@@ -7409,7 +7494,7 @@ mod tests {
             ("pkg2".into(), "1.0.0".into(), "1.1.0".into(), Some(2)), // minor (filtered out)
             ("pkg3".into(), "1.0.0".into(), "1.0.1".into(), Some(3)), // patch (filtered out)
         ];
-        let filter = UpdateFilter::from_cli(&[BumpLevel::Major], None);
+        let filter = UpdateFilter::from_cli(&[BumpLevel::Major], None, false);
 
         let (major, minor, patch, total) = count_updates_by_type(&updates, filter);
         assert_eq!(major, 1);
@@ -7425,7 +7510,7 @@ mod tests {
             ("pkg2".into(), "1.0.0".into(), "1.1.0".into(), Some(2)), // minor
             ("pkg3".into(), "1.0.0".into(), "1.0.1".into(), Some(3)), // patch
         ];
-        let filter = UpdateFilter::from_cli(&[BumpLevel::Minor, BumpLevel::Patch], None);
+        let filter = UpdateFilter::from_cli(&[BumpLevel::Minor, BumpLevel::Patch], None, false);
 
         let (major, minor, patch, total) = count_updates_by_type(&updates, filter);
         assert_eq!(major, 0);
@@ -7440,7 +7525,7 @@ mod tests {
             ("pkg1".into(), "1.0.0".into(), "2.0.0".into(), None), // major, no line
             ("pkg2".into(), "1.0.0".into(), "1.1.0".into(), None), // minor, no line
         ];
-        let filter = UpdateFilter::from_cli(&[], None); // show all
+        let filter = UpdateFilter::from_cli(&[], None, false); // show all
 
         let (major, minor, patch, total) = count_updates_by_type(&updates, filter);
         assert_eq!(major, 1);
@@ -7455,7 +7540,7 @@ mod tests {
             pinned: vec![("react".into(), "18.2.0".into(), "19.0.0".into(), Some(4))],
             ..Default::default()
         };
-        let filter = UpdateFilter::from_cli(&[], None);
+        let filter = UpdateFilter::from_cli(&[], None, false);
 
         assert!(has_checkable_manifest_changes(&result, filter));
     }
@@ -7466,7 +7551,7 @@ mod tests {
             updated: vec![("react".into(), "18.2.0".into(), "19.0.0".into(), Some(4))],
             ..Default::default()
         };
-        let filter = UpdateFilter::from_cli(&[BumpLevel::Minor, BumpLevel::Patch], None);
+        let filter = UpdateFilter::from_cli(&[BumpLevel::Minor, BumpLevel::Patch], None, false);
 
         assert!(!has_checkable_manifest_changes(&result, filter));
     }
@@ -7689,7 +7774,7 @@ mod tests {
         assert!(file_has_manifest_changes(&result));
         assert!(has_checkable_manifest_changes(
             &result,
-            UpdateFilter::from_cli(&[], None)
+            UpdateFilter::from_cli(&[], None, false)
         ));
         assert!(has_interactive_changes(
             &[],
@@ -7832,6 +7917,7 @@ mod tests {
                     current: "0.12.1".into(),
                     available: "0.13.0".into(),
                     line_number: Some(7),
+                    strict: None,
                 },
                 upd::updater::CappedUpdate {
                     lang: None,
@@ -7839,6 +7925,7 @@ mod tests {
                     current: "1.0.1".into(),
                     available: "1.1.0".into(),
                     line_number: None,
+                    strict: None,
                 },
             ],
             ..Default::default()
@@ -7870,34 +7957,34 @@ mod tests {
     /// needs a terminal (see tests/interactive_tty.rs).
     #[test]
     fn the_tick_is_withheld_from_anything_left_unchecked_or_unwritten() {
-        let ticked = format_interactive_closing_line(2, 0, 0, 0, 0)
+        let ticked = format_interactive_closing_line(2, 0, 0, 0, 0, 0)
             .expect("a run that checked everything closes by saying so");
         assert!(ticked.contains("all dependencies up to date"), "{ticked}");
         assert!(ticked.contains("Scanned 2 file(s)"), "{ticked}");
 
         assert_eq!(
-            format_interactive_closing_line(1, 0, 3, 0, 0),
+            format_interactive_closing_line(1, 0, 0, 3, 0, 0),
             None,
             "an annotation is a write still waiting to happen, so the run has \
              not finished and must not claim it has"
         );
         assert_eq!(
-            format_interactive_closing_line(1, 0, 0, 2, 0),
+            format_interactive_closing_line(1, 0, 0, 0, 2, 0),
             None,
             "a skipped pin is a dependency whose version was never read, so \
              calling it up to date claims a check that never happened"
         );
         assert_eq!(
-            format_interactive_closing_line(1, 0, 0, 0, 1),
+            format_interactive_closing_line(1, 0, 0, 0, 0, 1),
             None,
             "a warning is a dependency that did not end where the run meant to \
              leave it, so the tick would be claiming the opposite about it"
         );
         assert_eq!(
-            format_interactive_closing_line(1, 0, 3, 2, 1),
+            format_interactive_closing_line(1, 0, 0, 3, 2, 1),
             None,
             "{:?}",
-            format_interactive_closing_line(1, 0, 3, 2, 1)
+            format_interactive_closing_line(1, 0, 0, 3, 2, 1)
         );
     }
 
@@ -7985,6 +8072,7 @@ mod tests {
                         current: "1.0".into(),
                         available: "2.0".into(),
                         line_number: None,
+                        strict: None,
                     }],
                     ..clean.clone()
                 },
@@ -8029,7 +8117,7 @@ mod tests {
     /// summary does.
     #[test]
     fn a_capped_update_outranks_the_tick_and_the_silence() {
-        let capped = format_interactive_closing_line(1, 4, 0, 0, 0)
+        let capped = format_interactive_closing_line(1, 4, 0, 0, 0, 0)
             .expect("a held-back update is not nothing to report");
         assert!(capped.contains("held back by the bump ceiling"), "{capped}");
         assert!(capped.contains('4'), "{capped}");
@@ -8038,12 +8126,33 @@ mod tests {
             "an update the ceiling refused is not up to date: {capped}"
         );
 
-        let still_capped = format_interactive_closing_line(1, 4, 2, 3, 1)
+        let still_capped = format_interactive_closing_line(1, 4, 0, 2, 3, 1)
             .expect("the ceiling outranks findings that print their own lines");
         assert!(
             still_capped.contains("held back by the bump ceiling"),
             "{still_capped}"
         );
+    }
+
+    /// A write `--strict-bump` held is reported under that flag, never as a
+    /// ceiling hold, and beside one when both happened.
+    #[test]
+    fn a_strict_hold_is_counted_apart_from_the_ceiling() {
+        let strict = format_interactive_closing_line(1, 0, 2, 0, 0, 0)
+            .expect("a held write is not nothing to report");
+        assert!(
+            strict.contains("2 write(s) held by --strict-bump"),
+            "{strict}"
+        );
+        assert!(!strict.contains("ceiling"), "{strict}");
+        assert!(!strict.contains("up to date"), "{strict}");
+
+        let both = format_interactive_closing_line(1, 4, 2, 0, 0, 0).unwrap();
+        assert!(
+            both.contains("4 update(s) held back by the bump ceiling"),
+            "{both}"
+        );
+        assert!(both.contains("2 write(s) held by --strict-bump"), "{both}");
     }
 
     /// A blocked pin is the one kind of finding that needs attention on its own
@@ -9548,7 +9657,7 @@ mod output_tests {
             ..Default::default()
         };
         assert!(
-            has_checkable_manifest_changes(&result, UpdateFilter::from_cli(&[], None)),
+            has_checkable_manifest_changes(&result, UpdateFilter::from_cli(&[], None, false)),
             "held_back entries must count as pending changes for --check"
         );
     }
@@ -9568,7 +9677,7 @@ mod output_tests {
             ..Default::default()
         };
         assert!(
-            !has_checkable_manifest_changes(&result, UpdateFilter::from_cli(&[], None)),
+            !has_checkable_manifest_changes(&result, UpdateFilter::from_cli(&[], None, false)),
             "skipped_by_cooldown entries are steady state and must not count as pending changes"
         );
     }
@@ -9590,7 +9699,7 @@ mod output_tests {
             ..Default::default()
         };
         assert!(
-            !has_checkable_manifest_changes(&result, UpdateFilter::from_cli(&[], None)),
+            !has_checkable_manifest_changes(&result, UpdateFilter::from_cli(&[], None, false)),
             "an unchecked pin is an unknown, not a pending change"
         );
     }
@@ -9610,7 +9719,7 @@ mod output_tests {
             None,
             None,
             Arc::default(),
-            BumpFilter::default(),
+            UpdateFilter::from_cli(&[], None, false),
         )
     }
 
@@ -9643,7 +9752,7 @@ mod output_tests {
     fn test_has_checkable_manifest_changes_empty() {
         let result = UpdateResult::default();
         assert!(
-            !has_checkable_manifest_changes(&result, UpdateFilter::from_cli(&[], None)),
+            !has_checkable_manifest_changes(&result, UpdateFilter::from_cli(&[], None, false)),
             "empty result must not count as pending"
         );
     }

@@ -194,18 +194,33 @@ pub struct NormalizedEntry {
     pub status: Option<&'static str>,
 }
 
+/// `CappedEntry::reason` for a write `--strict-bump` held.
+pub const STRICT_BUMP_REASON: &str = "strict-bump";
+
 /// An available update the bump ceiling refused to write.
 ///
 /// Separate from `skipped`, whose entries could not be updated at all, and from
 /// the up-to-date tally, which counts dependencies with nothing waiting. `bump`
 /// names the step that exceeded the ceiling, so a reader can see what raising
 /// `--max-bump` would let through.
+///
+/// Under `--strict-bump` the same channel carries every write that is not a
+/// selected bump (a configured pin, a moved revision, a reshape): `reason` is
+/// then `strict-bump` and `write` names the kind of write held. Both are
+/// absent for an entry the ceiling held. `bump` is absent only for a held
+/// write that steps from no version to another (a reshape, an annotation or
+/// an unanchored rewrite).
 #[derive(Debug, Serialize)]
 pub struct CappedEntry {
     pub package: String,
     pub current: String,
     pub available: String,
-    pub bump: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bump: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub write: Option<&'static str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub line: Option<usize>,
     /// Annotation source token for an entry whose ecosystem is per-line rather
@@ -793,16 +808,24 @@ pub fn build_update_file_report(
             package: entry.package.clone(),
             current: entry.current.clone(),
             available: entry.available.clone(),
-            bump: entry.lang.map_or_else(
-                || classify(&entry.current, &entry.available),
-                |lang| {
-                    bump_name(crate::updater::classify_bump_for(
-                        lang,
-                        &entry.current,
-                        &entry.available,
-                    ))
-                },
-            ),
+            bump: match entry.strict {
+                Some(held) if held.names_no_step() => None,
+                Some(crate::updater::HeldWrite::Revision) => {
+                    Some(bump_name(crate::updater::BumpKind::Revision))
+                }
+                _ => Some(entry.lang.map_or_else(
+                    || classify(&entry.current, &entry.available),
+                    |lang| {
+                        bump_name(crate::updater::classify_bump_for(
+                            lang,
+                            &entry.current,
+                            &entry.available,
+                        ))
+                    },
+                )),
+            },
+            reason: entry.strict.map(|_| STRICT_BUMP_REASON),
+            write: entry.strict.map(crate::updater::HeldWrite::token),
             line: entry.line_number,
             source: entry
                 .lang

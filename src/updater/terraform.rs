@@ -617,7 +617,18 @@ impl Updater for TerraformUpdater {
                             } else {
                                 match_version_precision(&anchor, &pinned_version)
                             };
-                            if matched_version != anchor {
+                            if matched_version == anchor {
+                                result.unchanged += 1;
+                                new_lines.push(line.to_string());
+                            } else if result.hold_strict_pin(
+                                &options,
+                                &dep.source,
+                                &anchor,
+                                &matched_version,
+                                Some(line_num),
+                            ) {
+                                new_lines.push(line.to_string());
+                            } else {
                                 result.pinned.push((
                                     dep.source.clone(),
                                     anchor.clone(),
@@ -630,9 +641,6 @@ impl Updater for TerraformUpdater {
                                     &matched_version,
                                 ));
                                 modified = true;
-                            } else {
-                                result.unchanged += 1;
-                                new_lines.push(line.to_string());
                             }
                         }
                         PendingVersion::Registry(Ok(latest_version)) => {

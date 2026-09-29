@@ -631,6 +631,16 @@ impl Updater for MiseUpdater {
                                     Some(line_num),
                                 );
                                 new_lines.push(line.to_string());
+                            } else if is_pinned
+                                && result.hold_strict_pin(
+                                    &options,
+                                    tool_name,
+                                    current_version,
+                                    &new_version,
+                                    Some(line_num),
+                                )
+                            {
+                                new_lines.push(line.to_string());
                             } else {
                                 let new_line = line.replacen(current_version, &new_version, 1);
                                 new_lines.push(new_line);

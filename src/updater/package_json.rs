@@ -296,8 +296,16 @@ impl PackageJsonUpdater {
                                         rewrite_lower_bound(version_str, pinned_version)
                                             .filter(|new_spec| holds_its_floor(new_spec))
                                     {
-                                        if new_spec != version_str {
-                                            let line_num = line_index.line_for(section, package);
+                                        let line_num = line_index.line_for(section, package);
+                                        if new_spec == version_str {
+                                            result.unchanged += 1;
+                                        } else if !result.hold_strict_pin(
+                                            &options,
+                                            package,
+                                            version_str,
+                                            &new_spec,
+                                            line_num,
+                                        ) {
                                             result.pinned.push((
                                                 package.clone(),
                                                 version_str.to_string(),
@@ -310,8 +318,6 @@ impl PackageJsonUpdater {
                                                 version_str,
                                                 &new_spec,
                                             );
-                                        } else {
-                                            result.unchanged += 1;
                                         }
                                     } else {
                                         // The pin was configured and could not be
@@ -662,8 +668,16 @@ impl PackageJsonUpdater {
                 match_version_precision(&current_version, &pinned_version)
             };
 
-            if matched_version != current_version {
-                let line_num = line_index.line_for(&section, &package);
+            let line_num = line_index.line_for(&section, &package);
+            if matched_version == current_version {
+                result.unchanged += 1;
+            } else if !result.hold_strict_pin(
+                &options,
+                &package,
+                &current_version,
+                &matched_version,
+                line_num,
+            ) {
                 result.pinned.push((
                     package.clone(),
                     current_version.clone(),
@@ -678,8 +692,6 @@ impl PackageJsonUpdater {
                     &version_str,
                     &format!("{}{}", prefix, matched_version),
                 );
-            } else {
-                result.unchanged += 1;
             }
         }
 

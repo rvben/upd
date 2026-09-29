@@ -181,6 +181,10 @@ upd --max-bump minor
 # Restrict to exactly one level (repeatable, comma-separated)
 upd --only-bump major
 
+# Write nothing but registry versions at that level: pins, flake revisions
+# and other level-less writes are reported as held instead of written
+upd --only-bump major --strict-bump
+
 # One ecosystem at a time: python, node, rust, go, ruby, dot-net,
 # docker, terraform, nix, actions, pre-commit, mise, annotated
 upd --lang python

@@ -1070,14 +1070,20 @@ impl PyProjectUpdater {
                 match_version_precision(&current_version, &pinned_version)
             };
 
-            if matched_version != current_version {
+            if matched_version == current_version {
+                result.unchanged += 1;
+            } else if !result.hold_strict_pin(
+                options,
+                &package,
+                &current_version,
+                &matched_version,
+                line_num,
+            ) {
                 let updated = self.update_dependency(&dep_str, &matched_version);
                 result
                     .pinned
                     .push((package, current_version, matched_version.clone(), line_num));
                 updates.push((i, updated));
-            } else {
-                result.unchanged += 1;
             }
         }
 
@@ -1398,7 +1404,23 @@ impl PyProjectUpdater {
                     continue;
                 }
                 let spec = format!("{operator}{pin}");
-                match classify_rewrite(&target, operator, pin) {
+                let rewrite = classify_rewrite(&target, operator, pin);
+                if !matches!(rewrite, Rewrite::Unchanged)
+                    && result.hold_strict_pin(
+                        options,
+                        &target.package,
+                        target
+                            .anchor
+                            .as_deref()
+                            .or(target.previous_spec.as_deref())
+                            .unwrap_or_default(),
+                        pin,
+                        line_num,
+                    )
+                {
+                    continue;
+                }
+                match rewrite {
                     Rewrite::Unchanged => result.unchanged += 1,
                     Rewrite::SameShape => {
                         let (_, existing) = target.single_clause.clone().unwrap();
@@ -1575,7 +1597,32 @@ impl PyProjectUpdater {
             }
 
             let spec = format!("{operator}{chosen}");
-            match classify_rewrite(&target, operator, &chosen) {
+            let rewrite = classify_rewrite(&target, operator, &chosen);
+            // A rewrite with no anchor names no step a level can select, and one
+            // that keeps the anchored version only reshapes the specifier.
+            let held = match &target.anchor {
+                _ if matches!(rewrite, Rewrite::Unchanged) => None,
+                None => Some((
+                    super::WriteKind::Unanchored,
+                    super::HeldWrite::Unanchored,
+                    target.previous_spec.clone().unwrap_or_default(),
+                    chosen.clone(),
+                )),
+                Some(anchor) if chosen == *anchor => Some((
+                    super::WriteKind::Reshape,
+                    super::HeldWrite::Reshape,
+                    target.previous_spec.clone().unwrap_or_default(),
+                    spec.clone(),
+                )),
+                Some(_) => None,
+            };
+            if let Some((kind, held, current, available)) = held
+                && !options.allows_write(kind)
+            {
+                result.record_strict_hold(held, &target.package, &current, &available, line_num);
+                continue;
+            }
+            match rewrite {
                 Rewrite::Unchanged => {
                     if let Some((skipped_version, _)) = &held_back {
                         result.warnings.push(format!(
@@ -1710,7 +1757,9 @@ impl PyProjectUpdater {
                 match_version_precision(&version, &pinned_version)
             };
 
-            if matched_version != version {
+            if matched_version == version {
+                result.unchanged += 1;
+            } else if !result.hold_strict_pin(options, &key, &version, &matched_version, line_num) {
                 let new_val = format!("{}{}", prefix, matched_version);
                 result
                     .pinned
@@ -1723,8 +1772,6 @@ impl PyProjectUpdater {
                     *new_formatted.decor_mut() = decor;
                     *formatted = new_formatted;
                 }
-            } else {
-                result.unchanged += 1;
             }
         }
 

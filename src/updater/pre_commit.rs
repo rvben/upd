@@ -431,6 +431,9 @@ impl PreCommitUpdater {
             result.record_capped(repo, current, &new, line);
             return (result, None);
         }
+        if pin.is_some() && result.hold_strict_pin(options, repo, current, &new, line) {
+            return (result, None);
+        }
         let entry = (repo.into(), current.clone(), new.clone(), line);
         if pin.is_some() {
             result.pinned.push(entry);
