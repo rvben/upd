@@ -1,6 +1,8 @@
 [global]
 line-length = 160
 disable = ["MD033", "MD041"]
+# Golden files are upd's own output, compared byte for byte by the tests.
+exclude = ["tests/fixtures/**"]
 
 [MD013]
 line-length = 160
