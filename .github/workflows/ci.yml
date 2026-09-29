@@ -22,7 +22,7 @@ jobs:
           install: false
 
       - name: Install Rust
-        run: mise install rust
+        run: mise install rust uv
 
       - name: Install Rust components
         run: rustup component add rustfmt clippy
