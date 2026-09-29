@@ -555,9 +555,9 @@ fn classify(settings: &OrgSettings, raw: Value) -> Result<Project, State> {
     if default_branch.is_empty() {
         return Err(State::Skipped("no_default_branch"));
     }
-    if default_branch == settings.branch {
+    if run::branches_collide(&default_branch, &settings.branch) {
         return Err(State::Failed(Error::Input(format!(
-            "The automation branch {} is the project's default branch",
+            "The automation branch {} cannot sit beside the project's default branch {default_branch}: they are the same branch, or one is nested under the other's name",
             settings.branch
         ))));
     }
@@ -800,6 +800,18 @@ mod tests {
             matches!(state, Err(State::Failed(Error::Input(_)))),
             "{state:?}"
         );
+    }
+
+    #[test]
+    fn an_automation_branch_nested_with_the_default_branch_is_refused() {
+        let settings = settings(&[]).unwrap();
+        for default_branch in ["automation/upd-dependencies", "automation"] {
+            let state = classify(&settings, listed(json!({"default_branch": default_branch})));
+            assert!(
+                matches!(state, Err(State::Failed(Error::Input(_)))),
+                "{default_branch}: {state:?}"
+            );
+        }
     }
 
     #[test]

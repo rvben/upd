@@ -152,9 +152,9 @@ impl Settings {
                 "CI_PROJECT_ID must be a numeric project ID".to_string(),
             ));
         }
-        if settings.branch == settings.default_branch {
+        if branches_collide(&settings.branch, &settings.default_branch) {
             return Err(Error::Input(
-                "The automation branch must differ from the default branch".to_string(),
+                "The automation branch must differ from the default branch, and neither may be nested under the other's name".to_string(),
             ));
         }
         if settings.major_mr {
@@ -1393,6 +1393,15 @@ mod tests {
         }
         // Off, the major inputs are not consulted at all.
         settings(&[("UPD_MAJOR_BRANCH", "automation/upd-dependencies")]).unwrap();
+    }
+
+    #[test]
+    fn an_automation_branch_nested_with_the_default_branch_is_refused() {
+        for branch in ["main", "main/deps"] {
+            let error = settings(&[("UPD_BRANCH", branch)]).unwrap_err();
+            assert_eq!(error.exit_code(), 4, "{branch}: {error}");
+        }
+        settings(&[("UPD_BRANCH", "main-deps")]).unwrap();
     }
 
     #[test]
