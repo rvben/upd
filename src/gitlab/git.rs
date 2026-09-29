@@ -200,7 +200,29 @@ fn make_executable(_file: &fs::File) -> std::io::Result<()> {
     Ok(())
 }
 
-/// A child process in `dir` with the GitLab token removed from its environment.
+/// Variables that point git at a particular repository instead of the one
+/// around its working directory. Inherited from a git hook (or any caller that
+/// exports `GIT_DIR`), they would turn `git init` in a work directory into a
+/// re-initialization of the caller's repository. The `GIT_CONFIG*` variables
+/// are kept: CI jobs legitimately pass `safe.directory` and URL rewrites that
+/// way.
+const REPOSITORY_ENV: &[&str] = &[
+    "GIT_DIR",
+    "GIT_WORK_TREE",
+    "GIT_INDEX_FILE",
+    "GIT_COMMON_DIR",
+    "GIT_OBJECT_DIRECTORY",
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+    "GIT_IMPLICIT_WORK_TREE",
+    "GIT_GRAFT_FILE",
+    "GIT_NO_REPLACE_OBJECTS",
+    "GIT_REPLACE_REF_BASE",
+    "GIT_PREFIX",
+    "GIT_SHALLOW_FILE",
+];
+
+/// A child process in `dir` that acts on the repository found there, with the
+/// GitLab token removed from its environment.
 pub fn child(dir: &Path, program: impl AsRef<OsStr>) -> Command {
     let mut command = Command::new(program);
     command
@@ -208,6 +230,9 @@ pub fn child(dir: &Path, program: impl AsRef<OsStr>) -> Command {
         .env_remove(TOKEN_VAR)
         .stdin(Stdio::null())
         .kill_on_drop(true);
+    for name in REPOSITORY_ENV {
+        command.env_remove(name);
+    }
     command
 }
 

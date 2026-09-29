@@ -681,3 +681,65 @@ fn template_defaults_are_pinned_and_protect_the_report() {
     assert!(TEMPLATE.contains("  resource_group: upd-organization-update\n"));
     assert!(!TEMPLATE.contains("UPD_VERSION: \"latest\""));
 }
+
+/// A git hook in a linked worktree exports `GIT_DIR`, `GIT_WORK_TREE` and
+/// `GIT_INDEX_FILE`. upd started from one must still work in its own
+/// checkouts, and must not re-initialize the caller's repository with them.
+#[tokio::test]
+async fn an_inherited_git_hook_environment_leaves_the_callers_repository_alone() {
+    let mut org = Org::new().await;
+    org.project(CENTRAL, "acme/central", &[]);
+    org.project(11, "acme/app", &[Entry::File(".updrc.toml", OPTED_IN)]);
+    org.serve().await;
+
+    let caller = tempfile::tempdir().expect("tempdir");
+    let repo = caller.path().join("repo");
+    let worktree = caller.path().join("worktree");
+    fs::create_dir(&repo).unwrap();
+    git(&repo, &["init", "--quiet"]);
+    git(
+        &repo,
+        &[
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@example.com",
+            "commit",
+            "--quiet",
+            "--allow-empty",
+            "-m",
+            "x",
+        ],
+    );
+    git(
+        &repo,
+        &["worktree", "add", "--quiet", worktree.to_str().unwrap()],
+    );
+    let config = repo.join(".git/config");
+    let before = fs::read_to_string(&config).unwrap();
+    let admin = repo.join(".git/worktrees/worktree");
+    let hook_env = [
+        ("GIT_DIR", admin.display().to_string()),
+        ("GIT_WORK_TREE", worktree.display().to_string()),
+        ("GIT_INDEX_FILE", admin.join("index").display().to_string()),
+    ];
+    let vars: Vec<(&str, &str)> = hook_env
+        .iter()
+        .map(|(name, value)| (*name, value.as_str()))
+        .collect();
+
+    let (code, report, stderr) = org.run(&vars, &[]);
+
+    assert_eq!(
+        fs::read_to_string(&config).unwrap(),
+        before,
+        "the caller's shared config changed\n{stderr}"
+    );
+    assert_eq!(code, 0, "{report:#}\n{stderr}");
+    assert_eq!(
+        project(&report, "acme/app")["state"],
+        "processed",
+        "{report:#}"
+    );
+    assert_eq!(org.branch_file(11).as_deref(), Some("new\n"));
+}
