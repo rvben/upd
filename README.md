@@ -111,7 +111,8 @@ references and leave a parseable result. See the
 - **Fast**: parallel registry requests, with a 24-hour version cache
 - **Constraint-aware**: respects `>=2.0,<3` (Python), `~> 7.1` (Ruby), and `^2.0.0` / `~2.0.0` (npm, Cargo)
 - **Format-preserving**: keeps formatting, comments, and structure
-- **Update filters**: `--only-bump`, `--max-bump`, `--package` (exact names or quoted globs such as `'shiny*'`), `--lang`, `--exclude-lang`, or approve one by one with `-i`
+- **Update filters**: `--only-bump`, `--max-bump`, `--package` (exact names or quoted globs such as `'shiny*'`),
+  `--lang`, `--exclude-lang`, or approve one by one with `-i`
 - **Major warnings**: breaking changes are flagged with `(MAJOR)`
 - **Pre-release aware**: updates pre-releases to newer pre-releases
 - **Cooldown**: hold back releases younger than N days, against supply-chain attacks

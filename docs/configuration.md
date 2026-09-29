@@ -297,7 +297,6 @@ that writes a version floor included. `upd audit --fix-audit` is different: it
 moves a vulnerable package to the release that fixes it, however young that
 release is, so its refreshes are neither gated nor checked as below.
 
-
 | Lockfile | How the cooldown reaches it |
 | --- | --- |
 | `package-lock.json` | `npm install --before`, at the earlier of the cooldown and the project's own `before` or `min-release-age` |
