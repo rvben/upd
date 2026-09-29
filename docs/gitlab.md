@@ -210,6 +210,14 @@ required pipelines, approvals, resolved discussions, protected branches, and
 merge trains; the job never bypasses those controls. Turning `auto_merge` off
 cancels auto-merge if this job previously enabled it.
 
+GitLab records a push and rechecks the merge request in background jobs, so
+right after pushing, the job waits for the merge request to head the pushed
+commit and for its mergeability check to finish before it requests
+auto-merge, and retries opening a merge request while GitLab does not list the
+new branch yet. Each wait gives up after at most about a minute and a half; a
+job that gives up fails with a network error (exit code 3), and the next run
+picks up where it stopped.
+
 The `auto_merge` API option requires GitLab 17.11 or newer. Creating and updating
 merge requests works on older supported versions without that option.
 

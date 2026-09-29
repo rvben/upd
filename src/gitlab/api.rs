@@ -51,6 +51,17 @@ impl Default for Retry {
 }
 
 impl Retry {
+    /// How long to wait for GitLab to finish processing a push. GitLab
+    /// records a pushed branch and rechecks the merge requests it heads in
+    /// background jobs, so for a while after a push it can still report the
+    /// branch missing or a merge request unchecked; ten attempts backing off
+    /// to 15 seconds wait up to about a minute and a half for that.
+    const SETTLE: Self = Self {
+        attempts: 10,
+        base: Duration::from_secs(1),
+        cap: Duration::from_secs(15),
+    };
+
     /// Full-jitter exponential backoff before retry number `retry` (1-based).
     fn backoff(&self, retry: u32) -> Duration {
         let ceiling = self
@@ -77,6 +88,7 @@ pub struct Client {
     api_url: String,
     merge_requests: String,
     retry: Retry,
+    settle: Retry,
 }
 
 /// A GitLab answer after retries: its status, headers and body text.
@@ -105,6 +117,7 @@ impl Client {
             merge_requests: String::new(),
             api_url,
             retry: Retry::default(),
+            settle: Retry::SETTLE,
         })
     }
 
@@ -119,6 +132,12 @@ impl Client {
     #[cfg(test)]
     fn with_retry(mut self, retry: Retry) -> Self {
         self.retry = retry;
+        self
+    }
+
+    #[cfg(test)]
+    fn with_settle(mut self, settle: Retry) -> Self {
+        self.settle = settle;
         self
     }
 
@@ -157,7 +176,28 @@ impl Client {
             "description": description,
         });
         let url = self.url(&self.merge_requests)?;
-        self.send(Method::POST, url, Some(&body)).await
+        let mut attempt = 0;
+        loop {
+            attempt += 1;
+            let answer = self.execute(Method::POST, url.clone(), Some(&body)).await?;
+            if !source_branch_missing(&answer) {
+                return parse_json(answer);
+            }
+            if attempt >= self.settle.attempts {
+                return Err(Error::Network(format!(
+                    "GitLab still does not list the pushed branch {source}; the merge request was not opened"
+                )));
+            }
+            // A refused POST created nothing, so asking again is safe.
+            let wait = self.settle.backoff(attempt);
+            eprintln!(
+                "GitLab does not list the pushed branch {source} yet; retrying in {:.1}s (attempt {} of {})",
+                wait.as_secs_f64(),
+                attempt + 1,
+                self.settle.attempts
+            );
+            tokio::time::sleep(wait).await;
+        }
     }
 
     pub async fn edit(&self, iid: u64, body: Value) -> Result<Value, Error> {
@@ -165,8 +205,12 @@ impl Client {
         self.send(Method::PUT, url, Some(&body)).await
     }
 
-    /// Asks GitLab to merge once the pipeline for exactly `sha` succeeds.
+    /// Asks GitLab to merge once the pipeline for exactly `sha` succeeds,
+    /// after GitLab has caught up with the push of `sha`: until the merge
+    /// request heads that commit and its mergeability is checked, GitLab
+    /// refuses to arm with a stale-SHA 409 or a 422 that reads as a conflict.
     pub async fn enable_auto_merge(&self, iid: u64, sha: &str) -> Result<(), Error> {
+        self.wait_until_checked(iid, sha).await?;
         let body = json!({
             "auto_merge": true,
             "sha": sha,
@@ -174,6 +218,31 @@ impl Client {
         });
         let url = self.merge_request_url(&format!("{iid}/merge"))?;
         self.send(Method::PUT, url, Some(&body)).await.map(drop)
+    }
+
+    async fn wait_until_checked(&self, iid: u64, sha: &str) -> Result<(), Error> {
+        let url = self.merge_request_url(&iid.to_string())?;
+        let mut attempt = 0;
+        loop {
+            attempt += 1;
+            let merge_request = self.send(Method::GET, url.clone(), None).await?;
+            let Some(pending) = unsettled(&merge_request, sha) else {
+                return Ok(());
+            };
+            if attempt >= self.settle.attempts {
+                return Err(Error::Network(format!(
+                    "GitLab has not caught up with the push of {sha} to merge request !{iid}: {pending}; auto-merge was not requested"
+                )));
+            }
+            let wait = self.settle.backoff(attempt);
+            eprintln!(
+                "Merge request !{iid} is not ready for auto-merge ({pending}); checking again in {:.1}s (attempt {} of {})",
+                wait.as_secs_f64(),
+                attempt + 1,
+                self.settle.attempts
+            );
+            tokio::time::sleep(wait).await;
+        }
     }
 
     pub async fn cancel_auto_merge(&self, iid: u64) -> Result<(), Error> {
@@ -385,6 +454,49 @@ fn parse_json(answer: Answer) -> Result<Value, Error> {
     })
 }
 
+/// Whether GitLab refused a new merge request only because it does not list
+/// the just-pushed source branch yet.
+fn source_branch_missing(answer: &Answer) -> bool {
+    answer.status == StatusCode::BAD_REQUEST
+        && serde_json::from_str::<Value>(&answer.body).is_ok_and(|body| {
+            body["message"]["source_branch"]
+                .as_array()
+                .is_some_and(|reasons| {
+                    reasons
+                        .iter()
+                        .any(|reason| reason.as_str() == Some("does not exist"))
+                })
+        })
+}
+
+/// What GitLab has not yet finished for a merge request that should head
+/// `sha`, or `None` once it heads `sha` and its mergeability is checked.
+/// Only GitLab's transient states count: a settled refusal such as a
+/// conflict or a draft is GitLab's answer to give when auto-merge is asked.
+fn unsettled(merge_request: &Value, sha: &str) -> Option<String> {
+    match merge_request["sha"].as_str() {
+        Some(head) if head == sha => {}
+        Some(head) => return Some(format!("it still heads commit {head}")),
+        None => return Some("it reports no commit".to_string()),
+    }
+    let (field, transient): (&str, &[&str]) = if merge_request["detailed_merge_status"].is_string()
+    {
+        (
+            "detailed_merge_status",
+            &["unchecked", "checking", "preparing", "approvals_syncing"],
+        )
+    } else {
+        (
+            "merge_status",
+            &["unchecked", "checking", "cannot_be_merged_recheck"],
+        )
+    };
+    let status = merge_request[field].as_str()?;
+    transient
+        .contains(&status)
+        .then(|| format!("{field} is {status}"))
+}
+
 /// `Retry-After` in its delta-seconds form; the HTTP-date form falls back
 /// to the backoff.
 fn retry_after(headers: &HeaderMap) -> Option<Duration> {
@@ -492,6 +604,7 @@ mod tests {
             .unwrap()
             .for_project(1)
             .with_retry(FAST)
+            .with_settle(FAST)
     }
 
     async fn failing_then_ok(
@@ -701,6 +814,191 @@ mod tests {
             json!({"auto_merge_enabled": 1, "merge_when_pipeline_succeeds": true})
         ));
         assert!(!state(json!({})));
+    }
+
+    fn branch_missing() -> ResponseTemplate {
+        ResponseTemplate::new(400)
+            .set_body_json(json!({"message": {"source_branch": ["does not exist"]}}))
+    }
+
+    #[tokio::test]
+    async fn creating_waits_for_gitlab_to_list_a_just_pushed_branch() {
+        let server = MockServer::start().await;
+        failing_then_ok(&server, "POST", MR_LIST, branch_missing(), 2).await;
+        let created = client(&server).await.create("b", "main", "t", "d").await;
+        assert!(created.is_ok(), "{created:?}");
+        assert_eq!(server.received_requests().await.unwrap().len(), 3);
+    }
+
+    #[tokio::test]
+    async fn creating_repeats_no_other_refusal() {
+        for refusal in [
+            ResponseTemplate::new(400)
+                .set_body_json(json!({"message": {"target_branch": ["does not exist"]}})),
+            ResponseTemplate::new(400).set_body_json(json!({"message": {"title": ["is blank"]}})),
+            ResponseTemplate::new(409)
+                .set_body_json(json!({"message": {"source_branch": ["does not exist"]}})),
+        ] {
+            let server = MockServer::start().await;
+            failing_then_ok(&server, "POST", MR_LIST, refusal, 100).await;
+            let error = client(&server)
+                .await
+                .create("b", "main", "t", "d")
+                .await
+                .unwrap_err();
+            assert_eq!(error.kind(), "api_error", "{error}");
+            assert_eq!(server.received_requests().await.unwrap().len(), 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn creating_stops_waiting_for_a_branch_after_the_settle_budget() {
+        let server = MockServer::start().await;
+        failing_then_ok(&server, "POST", MR_LIST, branch_missing(), 100).await;
+        let error = client(&server)
+            .await
+            .create("b", "main", "t", "d")
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), "network_error", "{error}");
+        assert!(error.to_string().contains("pushed branch b"), "{error}");
+        assert_eq!(
+            server.received_requests().await.unwrap().len(),
+            FAST.attempts as usize
+        );
+    }
+
+    const PUSHED: &str = "2222222222222222222222222222222222222222";
+    const MR_7_MERGE: &str = "/api/v4/projects/1/merge_requests/7/merge";
+
+    /// Answers `GET` for merge request 7 with each state in turn, the last
+    /// one from then on, and accepts auto-merge.
+    async fn merge_request_states(server: &MockServer, states: &[Value]) {
+        for (priority, state) in states.iter().enumerate() {
+            let mut body = state.clone();
+            body["iid"] = json!(7);
+            body["web_url"] = json!("u");
+            let mock = Mock::given(method("GET"))
+                .and(path(MR_7))
+                .respond_with(ResponseTemplate::new(200).set_body_json(body))
+                .with_priority(priority as u8 + 1);
+            let mock = if priority + 1 < states.len() {
+                mock.up_to_n_times(1)
+            } else {
+                mock
+            };
+            mock.mount(server).await;
+        }
+        Mock::given(method("PUT"))
+            .and(path(MR_7_MERGE))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(json!({"iid": 7, "web_url": "u"})),
+            )
+            .mount(server)
+            .await;
+    }
+
+    async fn requests(server: &MockServer) -> Vec<String> {
+        server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .map(|request| format!("{} {}", request.method, request.url.path()))
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn arming_waits_until_gitlab_has_checked_the_pushed_commit() {
+        let server = MockServer::start().await;
+        merge_request_states(
+            &server,
+            &[
+                json!({"sha": "1111111111111111111111111111111111111111", "detailed_merge_status": "mergeable"}),
+                json!({"sha": PUSHED, "detailed_merge_status": "checking"}),
+                json!({"sha": PUSHED, "detailed_merge_status": "preparing"}),
+                json!({"sha": PUSHED, "detailed_merge_status": "ci_still_running"}),
+            ],
+        )
+        .await;
+        let armed = client(&server).await.enable_auto_merge(7, PUSHED).await;
+        assert!(armed.is_ok(), "{armed:?}");
+        let get = format!("GET {MR_7}");
+        assert_eq!(
+            requests(&server).await,
+            [
+                get.clone(),
+                get.clone(),
+                get.clone(),
+                get,
+                format!("PUT {MR_7_MERGE}")
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn arming_reads_the_legacy_merge_status_when_the_detailed_one_is_absent() {
+        let server = MockServer::start().await;
+        merge_request_states(
+            &server,
+            &[
+                json!({"sha": PUSHED, "merge_status": "unchecked"}),
+                json!({"sha": PUSHED, "merge_status": "cannot_be_merged_recheck"}),
+                json!({"sha": PUSHED, "merge_status": "can_be_merged"}),
+            ],
+        )
+        .await;
+        let armed = client(&server).await.enable_auto_merge(7, PUSHED).await;
+        assert!(armed.is_ok(), "{armed:?}");
+        assert_eq!(requests(&server).await.len(), 4);
+    }
+
+    #[tokio::test]
+    async fn arming_leaves_a_settled_refusal_to_gitlab() {
+        let server = MockServer::start().await;
+        merge_request_states(
+            &server,
+            &[json!({"sha": PUSHED, "detailed_merge_status": "conflict"})],
+        )
+        .await;
+        let armed = client(&server).await.enable_auto_merge(7, PUSHED).await;
+        assert!(armed.is_ok(), "{armed:?}");
+        assert_eq!(
+            requests(&server).await,
+            [format!("GET {MR_7}"), format!("PUT {MR_7_MERGE}")]
+        );
+    }
+
+    #[tokio::test]
+    async fn arming_gives_up_naming_the_state_gitlab_never_left() {
+        for (state, named) in [
+            (
+                json!({"sha": PUSHED, "detailed_merge_status": "checking"}),
+                "detailed_merge_status is checking",
+            ),
+            (
+                json!({"sha": "1111111111111111111111111111111111111111", "detailed_merge_status": "mergeable"}),
+                "1111111111111111111111111111111111111111",
+            ),
+            (json!({"detailed_merge_status": "mergeable"}), "no commit"),
+        ] {
+            let server = MockServer::start().await;
+            merge_request_states(&server, &[state]).await;
+            let error = client(&server)
+                .await
+                .enable_auto_merge(7, PUSHED)
+                .await
+                .unwrap_err();
+            assert_eq!(error.kind(), "network_error", "{error}");
+            assert!(error.to_string().contains(named), "{named}: {error}");
+            assert!(error.to_string().contains(PUSHED), "{error}");
+            let seen = requests(&server).await;
+            assert_eq!(seen.len(), FAST.attempts as usize, "{seen:?}");
+            assert!(
+                seen.iter().all(|request| request.starts_with("GET ")),
+                "{seen:?}"
+            );
+        }
     }
 
     const GROUP_PROJECTS: &str = "/api/v4/groups/acme%2Fplatform/projects";

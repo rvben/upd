@@ -11,8 +11,8 @@ use std::process::{Command, Output};
 
 use serde_json::json;
 use tempfile::TempDir;
-use wiremock::matchers::{method, path, query_param};
-use wiremock::{Mock, MockServer, ResponseTemplate};
+use wiremock::matchers::{method, path, path_regex, query_param};
+use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
 
 const TEMPLATE: &str = include_str!("../ci/gitlab-dependency-update.yml");
 const RELEASE_PINS: &str = include_str!("../release-pins.json");
@@ -55,6 +55,20 @@ fn run(command: &mut Command) -> Output {
         String::from_utf8_lossy(&output.stderr)
     );
     output
+}
+
+/// The commit `branch` points at in the bare `remote`, if it exists.
+fn remote_tip(remote: &Path, branch: &str) -> Option<String> {
+    let output = isolated::command("git")
+        .arg(format!("--git-dir={}", remote.display()))
+        .args(["rev-parse", "--verify", "--quiet"])
+        .arg(format!("refs/heads/{branch}"))
+        .output()
+        .expect("git rev-parse starts");
+    output
+        .status
+        .success()
+        .then(|| String::from_utf8(output.stdout).unwrap().trim().to_string())
 }
 
 fn git(cwd: &Path, args: &[&str]) -> Output {
@@ -291,16 +305,7 @@ fi
     }
 
     fn remote_tip(&self) -> Option<String> {
-        let output = isolated::command("git")
-            .arg(format!("--git-dir={}", self.remote.display()))
-            .args(["rev-parse", "--verify", "--quiet"])
-            .arg(format!("refs/heads/{BRANCH}"))
-            .output()
-            .expect("git rev-parse starts");
-        output
-            .status
-            .success()
-            .then(|| String::from_utf8(output.stdout).unwrap().trim().to_string())
+        remote_tip(&self.remote, BRANCH)
     }
 
     /// How many pushes updated the rolling branch.
@@ -357,6 +362,36 @@ fi
     fn description(&self) -> String {
         fs::read_to_string(self.checkout.join(".upd-ci/upd-mr-description.md")).unwrap()
     }
+}
+
+/// Answers a merge request read as GitLab does once it has processed a push:
+/// merge request 7 heads the rolling branch at the commit the remote holds,
+/// with mergeability checked.
+struct MergeRequestHeads(PathBuf);
+
+impl Respond for MergeRequestHeads {
+    fn respond(&self, request: &Request) -> ResponseTemplate {
+        let iid: u64 = request
+            .url
+            .path()
+            .rsplit('/')
+            .next()
+            .and_then(|segment| segment.parse().ok())
+            .expect("merge request path ends in its iid");
+        assert_eq!(iid, 7, "no merge request {iid} in this fixture");
+        let mut body = mr_response(iid, false);
+        body["sha"] = json!(remote_tip(&self.0, BRANCH));
+        body["detailed_merge_status"] = json!("mergeable");
+        ResponseTemplate::new(200).set_body_json(body)
+    }
+}
+
+async fn serve_merge_request_heads(server: &MockServer, fixture: &Fixture) {
+    Mock::given(method("GET"))
+        .and(path_regex(r"^/api/v4/projects/1/merge_requests/\d+$"))
+        .respond_with(MergeRequestHeads(fixture.remote.clone()))
+        .mount(server)
+        .await;
 }
 
 fn mr_list_response(iid: u64, auto_merge: bool) -> serde_json::Value {
@@ -662,6 +697,7 @@ async fn template_updates_the_rolling_branch_and_enables_sha_bound_automerge() {
         .expect(1)
         .mount(&update_server)
         .await;
+    serve_merge_request_heads(&update_server, &fixture).await;
     Mock::given(method("PUT"))
         .and(path("/api/v4/projects/1/merge_requests/7/merge"))
         .respond_with(ResponseTemplate::new(200).set_body_json(mr_response(7, true)))
@@ -879,6 +915,7 @@ async fn assert_rendering_matches_golden(case: &str, run: Run) -> String {
         .mount(&server)
         .await;
     if run.auto_merge {
+        serve_merge_request_heads(&server, &fixture).await;
         Mock::given(method("PUT"))
             .and(path("/api/v4/projects/1/merge_requests/7/merge"))
             .respond_with(ResponseTemplate::new(200).set_body_json(mr_response(7, true)))
@@ -1473,6 +1510,7 @@ async fn template_binds_auto_merge_to_the_pushed_commit() {
         .expect(1)
         .mount(&server)
         .await;
+    serve_merge_request_heads(&server, &fixture).await;
     Mock::given(method("PUT"))
         .and(path("/api/v4/projects/1/merge_requests/7/merge"))
         .respond_with(ResponseTemplate::new(200).set_body_json(mr_response(7, true)))
@@ -2051,6 +2089,7 @@ async fn publish(fixture: &Fixture, run: &Run) -> Published {
         .expect(1)
         .mount(&server)
         .await;
+    serve_merge_request_heads(&server, &fixture).await;
     Mock::given(method("PUT"))
         .and(path("/api/v4/projects/1/merge_requests/7/merge"))
         .respond_with(ResponseTemplate::new(200).set_body_json(mr_response(7, true)))
@@ -2226,6 +2265,7 @@ async fn an_unchanged_update_rearms_auto_merge_that_keeps_the_source_branch() {
     merge_request[0]["should_remove_source_branch"] = json!(false);
     let server = MockServer::start().await;
     list_mock(merge_request).mount(&server).await;
+    serve_merge_request_heads(&server, &fixture).await;
     Mock::given(method("PUT"))
         .and(path("/api/v4/projects/1/merge_requests/7/merge"))
         .respond_with(ResponseTemplate::new(200).set_body_json(mr_response(7, true)))
@@ -2257,6 +2297,7 @@ async fn an_unchanged_update_arms_auto_merge_on_the_existing_commit() {
     list_mock(listed(&first.title, &first.description, false))
         .mount(&server)
         .await;
+    serve_merge_request_heads(&server, &fixture).await;
     Mock::given(method("PUT"))
         .and(path("/api/v4/projects/1/merge_requests/7/merge"))
         .respond_with(ResponseTemplate::new(200).set_body_json(mr_response(7, true)))

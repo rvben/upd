@@ -153,6 +153,11 @@ impl Org {
             .respond_with(RawFiles(Arc::new(self.remotes.clone())))
             .mount(&self.server)
             .await;
+        Mock::given(method("GET"))
+            .and(path_regex(r"^/api/v4/projects/\d+/merge_requests/\d+$"))
+            .respond_with(MergeRequestHeads(Arc::new(self.remotes.clone())))
+            .mount(&self.server)
+            .await;
         for id in self.remotes.keys() {
             let merge_requests = format!("/api/v4/projects/{id}/merge_requests");
             Mock::given(method("GET"))
@@ -286,6 +291,35 @@ impl Respond for RawFiles {
         } else {
             ResponseTemplate::new(404)
         }
+    }
+}
+
+/// Answers a merge request read as GitLab does once it has processed a push:
+/// the only merge request upd reads back is the one it arms, which heads the
+/// rolling branch at the commit the project's remote holds, with
+/// mergeability checked.
+struct MergeRequestHeads(Arc<HashMap<u64, PathBuf>>);
+
+impl Respond for MergeRequestHeads {
+    fn respond(&self, request: &Request) -> ResponseTemplate {
+        let segments: Vec<&str> = request.url.path().split('/').collect();
+        let id: u64 = segments[4].parse().unwrap();
+        let Some(remote) = self.0.get(&id) else {
+            return ResponseTemplate::new(404);
+        };
+        let output = isolated::command("git")
+            .arg(format!("--git-dir={}", remote.display()))
+            .args(["rev-parse", "--verify", "--quiet"])
+            .arg(format!("refs/heads/{BRANCH}"))
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{BRANCH} was never pushed");
+        ResponseTemplate::new(200).set_body_json(json!({
+            "iid": id,
+            "web_url": format!("https://gitlab.example.test/{id}/-/merge_requests/{id}"),
+            "sha": String::from_utf8(output.stdout).unwrap().trim(),
+            "detailed_merge_status": "mergeable",
+        }))
     }
 }
 
