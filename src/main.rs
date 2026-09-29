@@ -1745,30 +1745,61 @@ async fn run_gitlab(cli: &Cli) -> Result<()> {
     let result = match run::Settings::from_env(cli.dry_run) {
         Ok(settings) => run::run(&settings, &run::Log::direct())
             .await
-            .map(|outcome| (outcome, settings.branch)),
+            .map(|lanes| (lanes, settings)),
         Err(error) => Err(error),
     };
+    let print_error = |error: &upd::gitlab::Error| {
+        eprintln!(
+            "{}",
+            serde_json::json!({"error": {
+                "kind": error.kind(),
+                "message": error.message(),
+                "exit_code": error.exit_code(),
+            }})
+        );
+    };
     match result {
-        Ok((outcome, branch)) => {
+        // Without a major lane the output is the ordinary lane's alone.
+        Ok((
+            run::Lanes {
+                ordinary,
+                major: None,
+            },
+            settings,
+        )) => match ordinary {
+            Ok(outcome) => {
+                if effective_json_mode(cli) {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&outcome.to_json(&settings.branch))?
+                    );
+                } else {
+                    println!("{}", outcome.render_text(&settings.branch));
+                }
+                Ok(())
+            }
+            Err(error) => {
+                print_error(&error);
+                std::process::exit(error.exit_code());
+            }
+        },
+        Ok((lanes, settings)) => {
             if effective_json_mode(cli) {
                 println!(
                     "{}",
-                    serde_json::to_string_pretty(&outcome.to_json(&branch))?
+                    serde_json::to_string_pretty(&lanes.to_json(&settings))?
                 );
             } else {
-                println!("{}", outcome.render_text(&branch));
+                println!("{}", lanes.render_text(&settings));
+            }
+            if let Some(error) = lanes.failure() {
+                print_error(error);
+                std::process::exit(error.exit_code());
             }
             Ok(())
         }
         Err(error) => {
-            eprintln!(
-                "{}",
-                serde_json::json!({"error": {
-                    "kind": error.kind(),
-                    "message": error.message(),
-                    "exit_code": error.exit_code(),
-                }})
-            );
+            print_error(&error);
             std::process::exit(error.exit_code());
         }
     }

@@ -11,12 +11,13 @@ use std::process::{Command, Output};
 
 use serde_json::json;
 use tempfile::TempDir;
-use wiremock::matchers::{method, path, path_regex, query_param};
+use wiremock::matchers::{body_partial_json, method, path, path_regex, query_param};
 use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
 
 const TEMPLATE: &str = include_str!("../ci/gitlab-dependency-update.yml");
 const RELEASE_PINS: &str = include_str!("../release-pins.json");
 const BRANCH: &str = "automation/upd-dependencies";
+const MAJOR_BRANCH: &str = "automation/upd-dependencies-major";
 
 fn release_version() -> String {
     serde_json::from_str::<serde_json::Value>(RELEASE_PINS).unwrap()["version"]
@@ -106,6 +107,20 @@ struct Run {
     commit_message: String,
     git_name: String,
     git_email: String,
+    major_mr: bool,
+    major_branch: String,
+    major_commit_message: String,
+    /// What the fake updater does when the major lane invokes it: the same
+    /// controls as above, for that invocation only. An empty `major_report`
+    /// selects a report of one major upgrade in `major_file`.
+    major_change: bool,
+    major_content: String,
+    major_file: String,
+    major_report: String,
+    major_exit: Option<i32>,
+    /// An npm registry to run the real updater against, in place of the fake
+    /// one; the fake updater's controls above then go unused.
+    npm_registry: Option<String>,
 }
 
 impl Default for Run {
@@ -127,8 +142,39 @@ impl Default for Run {
             commit_message: "chore(deps): test update".to_string(),
             git_name: "upd test".to_string(),
             git_email: "upd-test@example.com".to_string(),
+            major_mr: false,
+            major_branch: MAJOR_BRANCH.to_string(),
+            major_commit_message: "chore(deps): test major update".to_string(),
+            major_change: true,
+            major_content: "major".to_string(),
+            major_file: "major.txt".to_string(),
+            major_report: String::new(),
+            major_exit: None,
+            npm_registry: None,
         }
     }
+}
+
+/// A report of one major upgrade in `file`, as the major lane's updater
+/// prints it.
+fn major_report(file: &str) -> String {
+    json!({
+        "command": "update",
+        "mode": "applied",
+        "files": [{
+            "path": file,
+            "file_type": "test",
+            "lang": "test",
+            "updates": [{"package": "breaking", "current": "1.4.0", "latest": "2.0.0", "bump": "major"}],
+            "pinned": [], "ignored": [], "errors": [], "warnings": [],
+        }],
+        "summary": {
+            "files_scanned": 1, "files_with_changes": 1, "updates_total": 1,
+            "updates_major": 1, "updates_minor": 0, "updates_patch": 0,
+            "pinned": 0, "ignored": 0, "errors": 0, "warnings": 0,
+        },
+    })
+    .to_string()
 }
 
 impl Fixture {
@@ -174,6 +220,16 @@ if [ -n "${UPD_GITLAB_TOKEN+set}" ]; then
   echo "fake upd received the GitLab token" >&2
   exit 9
 fi
+printf '%s\n' "$*" >> "$FAKE_UPD_ARGV_LOG"
+case " $* " in
+  *" --only-bump major "*)
+    FAKE_UPD_EXIT="${FAKE_UPD_MAJOR_EXIT:-}"
+    FAKE_UPD_CHANGE="$FAKE_UPD_MAJOR_CHANGE"
+    FAKE_UPD_CONTENT="$FAKE_UPD_MAJOR_CONTENT"
+    FAKE_UPD_FILE="$FAKE_UPD_MAJOR_FILE"
+    FAKE_UPD_REPORT_FILE="$FAKE_UPD_MAJOR_REPORT_FILE"
+    ;;
+esac
 if [ -n "${FAKE_UPD_EXIT:-}" ]; then
   echo "fake upd failure" >&2
   exit "$FAKE_UPD_EXIT"
@@ -266,6 +322,13 @@ fi
     fn job(&self, command: &mut Command, server: &MockServer, run: &Run) {
         let report_file = self._temp.path().join("fake-upd-report.json");
         fs::write(&report_file, &run.report).expect("fixture report");
+        let major_report_file = self._temp.path().join("fake-upd-major-report.json");
+        let major = if run.major_report.is_empty() && run.major_change {
+            major_report(&run.major_file)
+        } else {
+            run.major_report.clone()
+        };
+        fs::write(&major_report_file, major).expect("fixture major report");
         command
             .current_dir(&self.checkout)
             .env("UPD_GITLAB_TOKEN", "test-token")
@@ -298,14 +361,68 @@ fi
             .env("FAKE_UPD_CONTENT", &run.content)
             .env("FAKE_UPD_FILE", &run.file)
             .env("FAKE_UPD_REPORT_FILE", report_file)
+            .env("UPD_MAJOR_MR", run.major_mr.to_string())
+            .env("UPD_MAJOR_BRANCH", &run.major_branch)
+            .env("UPD_MAJOR_COMMIT_MESSAGE", &run.major_commit_message)
+            .env("FAKE_UPD_MAJOR_CHANGE", run.major_change.to_string())
+            .env("FAKE_UPD_MAJOR_CONTENT", &run.major_content)
+            .env("FAKE_UPD_MAJOR_FILE", &run.major_file)
+            .env("FAKE_UPD_MAJOR_REPORT_FILE", major_report_file)
+            .env("FAKE_UPD_ARGV_LOG", self.argv_log())
             .env("FIXTURE_REMOTE", &self.remote);
         if let Some(code) = run.upd_exit {
             command.env("FAKE_UPD_EXIT", code.to_string());
         }
+        if let Some(code) = run.major_exit {
+            command.env("FAKE_UPD_MAJOR_EXIT", code.to_string());
+        }
+        if let Some(registry) = &run.npm_registry {
+            command
+                .env("UPD_EXECUTABLE", env!("CARGO_BIN_EXE_upd"))
+                .env("NPM_REGISTRY", registry)
+                .env("UPD_CACHE_DIR", self._temp.path().join("cache"));
+        }
+    }
+
+    fn argv_log(&self) -> PathBuf {
+        self._temp.path().join("fake-upd-argv.log")
+    }
+
+    /// The arguments of every updater invocation so far, one per line.
+    fn updater_invocations(&self) -> Vec<String> {
+        fs::read_to_string(self.argv_log())
+            .unwrap_or_default()
+            .lines()
+            .map(str::to_string)
+            .collect()
+    }
+
+    /// The tip of `branch` on the remote, if it exists.
+    fn tip_of(&self, branch: &str) -> Option<String> {
+        remote_tip(&self.remote, branch)
+    }
+
+    /// `file` as `branch` on the remote has it, if it does.
+    fn file_on(&self, branch: &str, file: &str) -> Option<String> {
+        let output = isolated::command("git")
+            .arg(format!("--git-dir={}", self.remote.display()))
+            .args(["show", &format!("refs/heads/{branch}:{file}")])
+            .output()
+            .expect("git show starts");
+        output
+            .status
+            .success()
+            .then(|| String::from_utf8(output.stdout).unwrap())
+    }
+
+    /// A pipeline artifact the last run wrote.
+    fn artifact(&self, name: &str) -> String {
+        fs::read_to_string(self.checkout.join(".upd-ci").join(name))
+            .unwrap_or_else(|error| panic!("artifact {name}: {error}"))
     }
 
     fn remote_tip(&self) -> Option<String> {
-        remote_tip(&self.remote, BRANCH)
+        self.tip_of(BRANCH)
     }
 
     /// How many pushes updated the rolling branch.
@@ -326,15 +443,7 @@ fi
     }
 
     fn branch_file(&self) -> Option<String> {
-        let output = isolated::command("git")
-            .arg(format!("--git-dir={}", self.remote.display()))
-            .args(["show", &format!("refs/heads/{BRANCH}:dependency.txt")])
-            .output()
-            .expect("git show starts");
-        output
-            .status
-            .success()
-            .then(|| String::from_utf8(output.stdout).unwrap())
+        self.file_on(BRANCH, "dependency.txt")
     }
 
     fn branch_commit_count(&self) -> usize {
@@ -365,8 +474,8 @@ fi
 }
 
 /// Answers a merge request read as GitLab does once it has processed a push:
-/// merge request 7 heads the rolling branch at the commit the remote holds,
-/// with mergeability checked.
+/// merge request 7 heads the rolling branch and 8 the major branch, each at
+/// the commit the remote holds, with mergeability checked.
 struct MergeRequestHeads(PathBuf);
 
 impl Respond for MergeRequestHeads {
@@ -378,9 +487,13 @@ impl Respond for MergeRequestHeads {
             .next()
             .and_then(|segment| segment.parse().ok())
             .expect("merge request path ends in its iid");
-        assert_eq!(iid, 7, "no merge request {iid} in this fixture");
+        let branch = match iid {
+            7 => BRANCH,
+            8 => MAJOR_BRANCH,
+            other => panic!("no merge request {other} in this fixture"),
+        };
         let mut body = mr_response(iid, false);
-        body["sha"] = json!(remote_tip(&self.0, BRANCH));
+        body["sha"] = json!(remote_tip(&self.0, branch));
         body["detailed_merge_status"] = json!("mergeable");
         ResponseTemplate::new(200).set_body_json(body)
     }
@@ -411,10 +524,15 @@ fn mr_response(iid: u64, auto_merge: bool) -> serde_json::Value {
 }
 
 fn list_mock(response: serde_json::Value) -> Mock {
+    list_mock_for(BRANCH, response)
+}
+
+/// Answers the one lookup of `branch`'s open merge requests.
+fn list_mock_for(branch: &str, response: serde_json::Value) -> Mock {
     Mock::given(method("GET"))
         .and(path("/api/v4/projects/1/merge_requests"))
         .and(query_param("state", "opened"))
-        .and(query_param("source_branch", BRANCH))
+        .and(query_param("source_branch", branch))
         .and(query_param("target_branch", "main"))
         .respond_with(ResponseTemplate::new(200).set_body_json(response))
         .expect(1)
@@ -905,11 +1023,23 @@ fn json_body(request: &wiremock::Request) -> serde_json::Value {
 }
 
 async fn assert_rendering_matches_golden(case: &str, run: Run) -> String {
+    assert_lane_matches_golden(case, run, false).await
+}
+
+/// Pins the presentation and description of one lane: the major lane's when
+/// `major`, the ordinary lane's otherwise.
+async fn assert_lane_matches_golden(case: &str, run: Run, major: bool) -> String {
+    let (branch, artifact_prefix) = if major {
+        (MAJOR_BRANCH, "upd-major-")
+    } else {
+        (BRANCH, "upd-")
+    };
     let server = MockServer::start().await;
     let fixture = Fixture::new();
     list_mock(json!([])).mount(&server).await;
     Mock::given(method("POST"))
         .and(path("/api/v4/projects/1/merge_requests"))
+        .and(body_partial_json(json!({"source_branch": BRANCH})))
         .respond_with(ResponseTemplate::new(201).set_body_json(mr_response(7, false)))
         .expect(1)
         .mount(&server)
@@ -923,26 +1053,47 @@ async fn assert_rendering_matches_golden(case: &str, run: Run) -> String {
             .mount(&server)
             .await;
     }
+    if run.major_mr {
+        list_mock_for(MAJOR_BRANCH, json!([])).mount(&server).await;
+        Mock::given(method("POST"))
+            .and(path("/api/v4/projects/1/merge_requests"))
+            .and(body_partial_json(json!({"source_branch": MAJOR_BRANCH})))
+            .respond_with(ResponseTemplate::new(201).set_body_json(mr_response(8, false)))
+            .expect(u64::from(run.major_change))
+            .mount(&server)
+            .await;
+    }
 
     fixture.run(&server, &run);
 
-    let presentation = fixture.presentation();
+    let presentation: serde_json::Value =
+        serde_json::from_str(&fixture.artifact(&format!("{artifact_prefix}presentation.json")))
+            .unwrap();
+    // The fixture's server lives in a fresh temporary directory.
+    let stable = |text: &str| text.replace(&fixture.server_url, "<server>");
     assert_golden(
         case,
         "presentation.json",
-        &(serde_json::to_string_pretty(&presentation).unwrap() + "\n"),
+        &stable(&(serde_json::to_string_pretty(&presentation).unwrap() + "\n")),
     );
-    let description = fixture.description();
+    let description = fixture.artifact(&format!("{artifact_prefix}mr-description.md"));
     // The commit id changes with every run's timestamps.
-    let tip = fixture.remote_tip().expect("rolling branch pushed");
-    assert_golden(case, "description.md", &description.replace(&tip, "<tip>"));
+    let tip = fixture.tip_of(branch).expect("rolling branch pushed");
+    assert_golden(
+        case,
+        "description.md",
+        &stable(&description.replace(&tip, "<tip>")),
+    );
 
     let requests = server.received_requests().await.unwrap();
     let create = requests
         .iter()
-        .find(|request| request.method.as_str() == "POST")
+        .find(|request| {
+            request.method.as_str() == "POST" && json_body(request)["source_branch"] == branch
+        })
         .expect("merge request created");
-    let title = if run.mr_title.is_empty() {
+    // The title override belongs to the ordinary lane alone.
+    let title = if run.mr_title.is_empty() || major {
         presentation["title"].as_str().unwrap().to_string()
     } else {
         run.mr_title.clone()
@@ -952,7 +1103,7 @@ async fn assert_rendering_matches_golden(case: &str, run: Run) -> String {
         json!({
             "title": title,
             "description": description,
-            "source_branch": BRANCH,
+            "source_branch": branch,
             "target_branch": "main",
             "remove_source_branch": true,
         })
@@ -2663,4 +2814,776 @@ async fn a_dry_run_reports_a_recorded_commit_as_rewritten() {
     assert_eq!(fixture.remote_tip().as_deref(), Some(first.tip.as_str()));
     let writes = writes(&server.received_requests().await.unwrap());
     assert!(writes.is_empty(), "a dry run wrote to GitLab: {writes:?}");
+}
+
+// The major lane: a second rolling merge request, on its own branch, that
+// proposes only major-version upgrades and is never merged by upd.
+
+/// Serves both lanes' first run: no open merge requests, the ordinary lane's
+/// created as 7 and the major lane's as 8.
+async fn serve_both_lanes(server: &MockServer) {
+    list_mock(json!([])).mount(server).await;
+    list_mock_for(MAJOR_BRANCH, json!([])).mount(server).await;
+    for (branch, iid) in [(BRANCH, 7), (MAJOR_BRANCH, 8)] {
+        Mock::given(method("POST"))
+            .and(path("/api/v4/projects/1/merge_requests"))
+            .and(body_partial_json(json!({"source_branch": branch})))
+            .respond_with(ResponseTemplate::new(201).set_body_json(mr_response(iid, false)))
+            .expect(1)
+            .mount(server)
+            .await;
+    }
+}
+
+fn created_on<'a>(requests: &'a [wiremock::Request], branch: &str) -> &'a wiremock::Request {
+    requests
+        .iter()
+        .find(|request| {
+            request.method.as_str() == "POST"
+                && request.url.path() == "/api/v4/projects/1/merge_requests"
+                && json_body(request)["source_branch"] == branch
+        })
+        .unwrap_or_else(|| panic!("no merge request created for {branch}"))
+}
+
+fn major_run() -> Run {
+    Run {
+        major_mr: true,
+        ..Run::default()
+    }
+}
+
+#[tokio::test]
+async fn the_major_lane_proposes_its_own_merge_request_that_upd_never_merges() {
+    let server = MockServer::start().await;
+    let fixture = Fixture::new();
+    serve_both_lanes(&server).await;
+    serve_merge_request_heads(&server, &fixture).await;
+    Mock::given(method("PUT"))
+        .and(path("/api/v4/projects/1/merge_requests/7/merge"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(mr_response(7, true)))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("PUT"))
+        .and(path("/api/v4/projects/1/merge_requests/8/merge"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(mr_response(8, true)))
+        .expect(0)
+        .mount(&server)
+        .await;
+
+    fixture.run(
+        &server,
+        &Run {
+            auto_merge: true,
+            mr_title: "Ordinary title override".to_string(),
+            ..major_run()
+        },
+    );
+
+    // Each lane's branch starts from the default branch and carries only its
+    // own lane's change.
+    assert_eq!(
+        fixture.file_on(BRANCH, "dependency.txt").as_deref(),
+        Some("new\n")
+    );
+    assert_eq!(fixture.file_on(BRANCH, "major.txt"), None);
+    assert_eq!(
+        fixture.file_on(MAJOR_BRANCH, "major.txt").as_deref(),
+        Some("major\n")
+    );
+    assert_eq!(
+        fixture.file_on(MAJOR_BRANCH, "dependency.txt").as_deref(),
+        Some("old\n")
+    );
+    let subject = run(isolated::command("git")
+        .arg(format!("--git-dir={}", fixture.remote.display()))
+        .args(["show", "-s", "--format=%s"])
+        .arg(format!("refs/heads/{MAJOR_BRANCH}")));
+    assert_eq!(
+        String::from_utf8(subject.stdout).unwrap().trim(),
+        "chore(deps): test major update"
+    );
+
+    let requests = server.received_requests().await.unwrap();
+    let ordinary = json_body(created_on(&requests, BRANCH));
+    let major = json_body(created_on(&requests, MAJOR_BRANCH));
+    assert_eq!(ordinary["title"], "Ordinary title override");
+    assert_eq!(major["title"], "chore(deps): upgrade breaking to 2.0.0");
+    let major_description = major["description"].as_str().unwrap();
+    assert!(major_description.contains("upd never merges this merge request"));
+    assert!(
+        !ordinary["description"]
+            .as_str()
+            .unwrap()
+            .contains("upd never merges")
+    );
+
+    // Each lane keeps its own evidence.
+    assert_eq!(
+        fixture.artifact("upd-major-mr-description.md"),
+        major_description
+    );
+    assert_eq!(
+        fixture.artifact("upd-mr-description.md"),
+        ordinary["description"].as_str().unwrap()
+    );
+    let major_report: serde_json::Value =
+        serde_json::from_str(&fixture.artifact("upd-major-report.json")).unwrap();
+    assert_eq!(
+        major_report["files"][0]["updates"][0]["package"],
+        "breaking"
+    );
+}
+
+#[tokio::test]
+async fn the_major_lane_asks_the_updater_for_major_upgrades_alone() {
+    let server = MockServer::start().await;
+    let fixture = Fixture::new();
+    serve_both_lanes(&server).await;
+
+    fixture.run(&server, &major_run());
+
+    let invocations = fixture.updater_invocations();
+    assert_eq!(invocations.len(), 2, "{invocations:?}");
+    let ordinary = format!(" {} ", invocations[0]);
+    let major = format!(" {} ", invocations[1]);
+    assert!(ordinary.contains(" --max-bump minor "), "{ordinary}");
+    assert!(!ordinary.contains("--only-bump"), "{ordinary}");
+    assert!(!ordinary.contains("--strict-bump"), "{ordinary}");
+    assert!(
+        major.contains(" --only-bump major --strict-bump "),
+        "{major}"
+    );
+    assert!(!major.contains("--max-bump"), "{major}");
+    // Every other input reaches both lanes alike.
+    assert!(major.contains(" --min-age 7d "), "{major}");
+}
+
+#[tokio::test]
+async fn without_the_major_lane_the_major_branch_is_never_touched() {
+    let server = MockServer::start().await;
+    let fixture = Fixture::new();
+    list_mock(json!([])).mount(&server).await;
+    Mock::given(method("POST"))
+        .and(path("/api/v4/projects/1/merge_requests"))
+        .respond_with(ResponseTemplate::new(201).set_body_json(mr_response(7, false)))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    fixture.run(&server, &Run::default());
+
+    assert_eq!(fixture.updater_invocations().len(), 1);
+    assert_eq!(fixture.tip_of(MAJOR_BRANCH), None);
+    let requests = server.received_requests().await.unwrap();
+    assert!(
+        requests
+            .iter()
+            .all(|request| !request.url.query().unwrap_or_default().contains("major")),
+        "a run without the major lane looked it up"
+    );
+    assert!(
+        !fixture
+            .checkout
+            .join(".upd-ci/upd-major-report.json")
+            .exists()
+    );
+}
+
+/// Reruns the major lane against its merge request 8, found with auto-merge
+/// armed, with the updater now writing `major_content`; requires the run to
+/// cancel the auto-merge and never merge. Returns the fixture and the major
+/// branch's tip before the rerun.
+async fn rerun_against_an_armed_major_merge_request(major_content: &str) -> (Fixture, String) {
+    let fixture = Fixture::new();
+    let first = MockServer::start().await;
+    serve_both_lanes(&first).await;
+    fixture.run(&first, &major_run());
+    let first_tip = fixture.tip_of(MAJOR_BRANCH).expect("major branch");
+
+    let server = MockServer::start().await;
+    list_mock(mr_list_response(7, false)).mount(&server).await;
+    list_mock_for(MAJOR_BRANCH, mr_list_response(8, true))
+        .mount(&server)
+        .await;
+    // GitLab answers the description edit with the merge request as it now
+    // stands: still armed.
+    for (iid, armed) in [(7, false), (8, true)] {
+        Mock::given(method("PUT"))
+            .and(path(format!("/api/v4/projects/1/merge_requests/{iid}")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(mr_response(iid, armed)))
+            .mount(&server)
+            .await;
+    }
+    Mock::given(method("POST"))
+        .and(path(
+            "/api/v4/projects/1/merge_requests/8/cancel_merge_when_pipeline_succeeds",
+        ))
+        .respond_with(ResponseTemplate::new(201).set_body_json(mr_response(8, false)))
+        .expect(1)
+        .mount(&server)
+        .await;
+    serve_merge_request_heads(&server, &fixture).await;
+    Mock::given(method("PUT"))
+        .and(path("/api/v4/projects/1/merge_requests/7/merge"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(mr_response(7, true)))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("PUT"))
+        .and(path("/api/v4/projects/1/merge_requests/8/merge"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(mr_response(8, true)))
+        .expect(0)
+        .mount(&server)
+        .await;
+
+    let output = fixture.run(
+        &server,
+        &Run {
+            auto_merge: true,
+            major_content: major_content.to_string(),
+            ..major_run()
+        },
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("upd never merges a major upgrade"),
+        "{}",
+        describe(&output)
+    );
+    (fixture, first_tip)
+}
+
+#[tokio::test]
+async fn the_major_lane_cancels_an_armed_auto_merge_when_it_pushes() {
+    let (fixture, first_tip) = rerun_against_an_armed_major_merge_request("major again").await;
+    assert_ne!(fixture.tip_of(MAJOR_BRANCH), Some(first_tip));
+    assert_eq!(
+        fixture.file_on(MAJOR_BRANCH, "major.txt").as_deref(),
+        Some("major again\n")
+    );
+}
+
+#[tokio::test]
+async fn the_major_lane_cancels_an_armed_auto_merge_with_nothing_to_push() {
+    let (fixture, first_tip) = rerun_against_an_armed_major_merge_request("major").await;
+    assert_eq!(fixture.tip_of(MAJOR_BRANCH), Some(first_tip));
+}
+
+#[tokio::test]
+async fn the_major_lane_closes_its_merge_request_once_no_major_upgrade_remains() {
+    let fixture = Fixture::new();
+    let first = MockServer::start().await;
+    serve_both_lanes(&first).await;
+    fixture.run(&first, &major_run());
+    let ordinary_tip = fixture.tip_of(BRANCH).expect("ordinary branch");
+
+    let server = MockServer::start().await;
+    list_mock(mr_list_response(7, false)).mount(&server).await;
+    list_mock_for(MAJOR_BRANCH, mr_list_response(8, false))
+        .mount(&server)
+        .await;
+    Mock::given(method("PUT"))
+        .and(path("/api/v4/projects/1/merge_requests/7"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(mr_response(7, false)))
+        .mount(&server)
+        .await;
+    Mock::given(method("PUT"))
+        .and(path("/api/v4/projects/1/merge_requests/8"))
+        .and(body_partial_json(json!({"state_event": "close"})))
+        .respond_with(ResponseTemplate::new(200).set_body_json(mr_response(8, false)))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    fixture.run(
+        &server,
+        &Run {
+            major_change: false,
+            ..major_run()
+        },
+    );
+
+    assert_eq!(fixture.tip_of(MAJOR_BRANCH), None);
+    assert_eq!(
+        fixture.tip_of(BRANCH).as_deref(),
+        Some(ordinary_tip.as_str())
+    );
+}
+
+#[tokio::test]
+async fn a_human_commit_pauses_only_the_lane_it_landed_on() {
+    let fixture = Fixture::new();
+    let first = MockServer::start().await;
+    serve_both_lanes(&first).await;
+    fixture.run(&first, &major_run());
+
+    git(&fixture.checkout, &["fetch", "origin", MAJOR_BRANCH]);
+    git(
+        &fixture.checkout,
+        &["switch", "--force-create", "human-work", "FETCH_HEAD"],
+    );
+    fs::write(fixture.checkout.join("migration.txt"), "adapted\n").unwrap();
+    git(&fixture.checkout, &["add", "migration.txt"]);
+    git(
+        &fixture.checkout,
+        &[
+            "-c",
+            "user.name=Human Maintainer",
+            "-c",
+            "user.email=human@example.com",
+            "commit",
+            "-m",
+            "fix: adapt to breaking 2.0",
+        ],
+    );
+    git(
+        &fixture.checkout,
+        &["push", "origin", &format!("HEAD:refs/heads/{MAJOR_BRANCH}")],
+    );
+    let human_tip = String::from_utf8(git(&fixture.checkout, &["rev-parse", "HEAD"]).stdout)
+        .unwrap()
+        .trim()
+        .to_string();
+    git(&fixture.checkout, &["switch", "main"]);
+
+    let server = MockServer::start().await;
+    list_mock(mr_list_response(7, false)).mount(&server).await;
+    let mut major = mr_list_response(8, false);
+    major[0]["description"] = json!("Major review work");
+    list_mock_for(MAJOR_BRANCH, major).mount(&server).await;
+    for iid in [7, 8] {
+        Mock::given(method("PUT"))
+            .and(path(format!("/api/v4/projects/1/merge_requests/{iid}")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(mr_response(iid, false)))
+            .expect(1)
+            .mount(&server)
+            .await;
+    }
+
+    fixture.run(
+        &server,
+        &Run {
+            content: "newer".to_string(),
+            major_content: "major again".to_string(),
+            ..major_run()
+        },
+    );
+
+    assert_eq!(
+        fixture.tip_of(MAJOR_BRANCH).as_deref(),
+        Some(human_tip.as_str())
+    );
+    assert_eq!(
+        fixture.file_on(BRANCH, "dependency.txt").as_deref(),
+        Some("newer\n")
+    );
+    let requests = server.received_requests().await.unwrap();
+    let pause_edit = requests
+        .iter()
+        .find(|request| {
+            request.method.as_str() == "PUT"
+                && request.url.path() == "/api/v4/projects/1/merge_requests/8"
+        })
+        .expect("major merge request edited");
+    assert!(String::from_utf8_lossy(&pause_edit.body).contains("upd-human-commit-pause"));
+    let ordinary_edit = requests
+        .iter()
+        .find(|request| {
+            request.method.as_str() == "PUT"
+                && request.url.path() == "/api/v4/projects/1/merge_requests/7"
+        })
+        .expect("ordinary merge request edited");
+    assert!(!String::from_utf8_lossy(&ordinary_edit.body).contains("upd-human-commit-pause"));
+}
+
+#[tokio::test]
+async fn a_failed_major_lane_fails_the_job_after_the_ordinary_lane_published() {
+    let server = MockServer::start().await;
+    let fixture = Fixture::new();
+    list_mock(json!([])).mount(&server).await;
+    Mock::given(method("POST"))
+        .and(path("/api/v4/projects/1/merge_requests"))
+        .and(body_partial_json(json!({"source_branch": BRANCH})))
+        .respond_with(ResponseTemplate::new(201).set_body_json(mr_response(7, false)))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let output = fixture.execute_upd(
+        &server,
+        &Run {
+            major_exit: Some(3),
+            ..major_run()
+        },
+        &["--format", "json"],
+    );
+
+    assert!(!output.status.success(), "{}", describe(&output));
+    assert_eq!(
+        fixture.file_on(BRANCH, "dependency.txt").as_deref(),
+        Some("new\n")
+    );
+    assert_eq!(fixture.tip_of(MAJOR_BRANCH), None);
+    let outcome: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(outcome["command"], "gitlab run");
+    assert_eq!(outcome["outcome"], "published", "{outcome}");
+    assert_eq!(outcome["major"]["outcome"], "failed", "{outcome}");
+    assert_eq!(outcome["major"]["branch"], MAJOR_BRANCH, "{outcome}");
+    assert!(outcome["major"].get("command").is_none(), "{outcome}");
+}
+
+#[tokio::test]
+async fn a_failed_ordinary_lane_still_lets_the_major_lane_publish() {
+    let server = MockServer::start().await;
+    let fixture = Fixture::new();
+    list_mock_for(MAJOR_BRANCH, json!([])).mount(&server).await;
+    Mock::given(method("POST"))
+        .and(path("/api/v4/projects/1/merge_requests"))
+        .and(body_partial_json(json!({"source_branch": MAJOR_BRANCH})))
+        .respond_with(ResponseTemplate::new(201).set_body_json(mr_response(8, false)))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let output = fixture.execute_upd(
+        &server,
+        &Run {
+            upd_exit: Some(3),
+            ..major_run()
+        },
+        &["--format", "json"],
+    );
+
+    assert!(!output.status.success(), "{}", describe(&output));
+    assert_eq!(fixture.tip_of(BRANCH), None);
+    assert_eq!(
+        fixture.file_on(MAJOR_BRANCH, "major.txt").as_deref(),
+        Some("major\n")
+    );
+    let outcome: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(outcome["outcome"], "failed", "{outcome}");
+    assert_eq!(outcome["major"]["outcome"], "published", "{outcome}");
+}
+
+#[tokio::test]
+async fn a_major_lane_that_would_repeat_the_ordinary_one_is_refused_before_any_work() {
+    for (max_bump, major_branch) in [
+        ("major", MAJOR_BRANCH),
+        ("", MAJOR_BRANCH),
+        ("minor", BRANCH),
+        ("minor", "main"),
+    ] {
+        let server = MockServer::start().await;
+        let fixture = Fixture::new();
+        let output = fixture.execute(
+            &server,
+            &Run {
+                max_bump: max_bump.to_string(),
+                major_branch: major_branch.to_string(),
+                ..major_run()
+            },
+        );
+        assert!(
+            failed_with(&output, 4),
+            "{max_bump:?} {major_branch}: {}",
+            describe(&output)
+        );
+        assert!(fixture.updater_invocations().is_empty());
+        assert!(server.received_requests().await.unwrap().is_empty());
+    }
+}
+
+#[tokio::test]
+async fn golden_major_lane() {
+    assert_lane_matches_golden(
+        "major-lane",
+        Run {
+            auto_merge: true,
+            ..major_run()
+        },
+        true,
+    )
+    .await;
+}
+
+/// An ordinary report whose ceiling held a major release, a cooldown hold and,
+/// under a patch ceiling, a minor release.
+fn held_report(minor_capped: bool) -> String {
+    let mut capped = vec![json!({
+        "package": "breaking", "current": "1.4.0", "available": "2.0.0", "bump": "major"
+    })];
+    if minor_capped {
+        capped.push(json!({
+            "package": "featureful", "current": "3.1.0", "available": "3.2.0", "bump": "minor"
+        }));
+    }
+    json!({
+        "command": "update",
+        "mode": "applied",
+        "files": [{
+            "path": "dependency.txt",
+            "file_type": "test",
+            "lang": "test",
+            "updates": [{"package": "example", "current": "1.0.0", "latest": "1.0.1", "bump": "patch"}],
+            "held_back": [{"package": "fresh", "current": "1.0.0", "chosen": "1.0.0", "skipped_latest": "1.1.0"}],
+            "capped": capped,
+            "pinned": [], "ignored": [], "errors": [], "warnings": [],
+        }],
+        "summary": {
+            "files_scanned": 1, "files_with_changes": 1, "updates_total": 1,
+            "updates_major": 0, "updates_minor": 0, "updates_patch": 1,
+            "pinned": 0, "ignored": 0, "errors": 0, "warnings": 0,
+        },
+    })
+    .to_string()
+}
+
+#[tokio::test]
+async fn golden_ordinary_lane_links_the_majors_its_ceiling_held() {
+    let description = assert_lane_matches_golden(
+        "held-linked",
+        Run {
+            report: held_report(false),
+            ..major_run()
+        },
+        false,
+    )
+    .await;
+    assert!(
+        description.contains(
+            "merge_requests?state=opened&source_branch=automation%2Fupd-dependencies-major"
+        )
+    );
+}
+
+#[tokio::test]
+async fn golden_ordinary_lane_under_a_patch_ceiling_keeps_its_minor_hold() {
+    let description = assert_lane_matches_golden(
+        "held-linked-patch-cap",
+        Run {
+            report: held_report(true),
+            max_bump: "patch".to_string(),
+            ..major_run()
+        },
+        false,
+    )
+    .await;
+    assert!(description.contains("<code>featureful</code>"));
+}
+
+#[tokio::test]
+async fn the_major_lane_starts_clean_after_the_ordinary_lane_stopped_midway() {
+    let server = MockServer::start().await;
+    let fixture = Fixture::new();
+    list_mock_for(MAJOR_BRANCH, json!([])).mount(&server).await;
+    Mock::given(method("POST"))
+        .and(path("/api/v4/projects/1/merge_requests"))
+        .and(body_partial_json(json!({"source_branch": MAJOR_BRANCH})))
+        .respond_with(ResponseTemplate::new(201).set_body_json(mr_response(8, false)))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    // Validation rejects the ordinary lane's update, leaving that update in
+    // the tree and an untracked file beside it; the major lane's tree
+    // passes it untouched.
+    let output =
+        fixture.execute(
+            &server,
+            &Run {
+                validation_command:
+                    "if grep -q new dependency.txt; then echo stray > stray.txt; exit 1; fi"
+                        .to_string(),
+                ..major_run()
+            },
+        );
+
+    assert!(!output.status.success(), "{}", describe(&output));
+    assert_eq!(fixture.tip_of(BRANCH), None);
+    assert_eq!(
+        fixture.file_on(MAJOR_BRANCH, "dependency.txt").as_deref(),
+        Some("old\n")
+    );
+    assert_eq!(fixture.file_on(MAJOR_BRANCH, "stray.txt"), None);
+    assert_eq!(
+        fixture.file_on(MAJOR_BRANCH, "major.txt").as_deref(),
+        Some("major\n")
+    );
+}
+
+#[tokio::test]
+async fn a_checkout_with_local_changes_is_refused_before_either_lane_touches_it() {
+    let server = MockServer::start().await;
+    let fixture = Fixture::new();
+    fs::write(fixture.checkout.join("dependency.txt"), "edited by hand\n").unwrap();
+    fs::write(fixture.checkout.join("notes.txt"), "not committed yet\n").unwrap();
+
+    for args in [&["--dry-run"][..], &[]] {
+        let output = fixture.execute_upd(&server, &major_run(), args);
+
+        assert_eq!(output.status.code(), Some(2), "{}", describe(&output));
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("uncommitted changes"),
+            "{}",
+            describe(&output)
+        );
+        assert_eq!(
+            fs::read_to_string(fixture.checkout.join("dependency.txt")).unwrap(),
+            "edited by hand\n",
+            "{args:?}"
+        );
+        assert_eq!(
+            fs::read_to_string(fixture.checkout.join("notes.txt")).unwrap(),
+            "not committed yet\n",
+            "{args:?}"
+        );
+    }
+    assert_eq!(fixture.tip_of(BRANCH), None);
+    assert_eq!(fixture.tip_of(MAJOR_BRANCH), None);
+    assert!(server.received_requests().await.unwrap().is_empty());
+}
+
+// Lane separation with the real updater: the ordinary lane carries every
+// change that is not a major upgrade, and the major lane carries nothing
+// else.
+
+/// An npm registry document for `name` publishing `versions`, each old enough
+/// to clear any cooldown.
+fn npm_document(name: &str, versions: &[&str]) -> serde_json::Value {
+    let latest = versions.last().expect("at least one version");
+    json!({
+        "name": name,
+        "dist-tags": {"latest": latest},
+        "versions": versions
+            .iter()
+            .map(|version| (version.to_string(), json!({"name": name, "version": version})))
+            .collect::<serde_json::Map<_, _>>(),
+        "time": versions
+            .iter()
+            .map(|version| (version.to_string(), json!("2025-01-01T00:00:00.000Z")))
+            .collect::<serde_json::Map<_, _>>(),
+    })
+}
+
+/// Serves `packages` as an npm registry.
+async fn npm_registry(packages: &[(&str, &[&str])]) -> MockServer {
+    let registry = MockServer::start().await;
+    for (name, versions) in packages {
+        Mock::given(method("GET"))
+            .and(path(format!("/{name}")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(npm_document(name, versions)))
+            .mount(&registry)
+            .await;
+    }
+    registry
+}
+
+/// Commits a `package.json` depending on `pinned` 1.0.0 and `breaking`
+/// 1.4.0, with `pinned` configured to 1.2.0, to the default branch.
+fn commit_pinned_project(fixture: &Fixture) {
+    fs::write(
+        fixture.checkout.join("package.json"),
+        "{\n  \"name\": \"lanes\",\n  \"private\": true,\n  \"dependencies\": {\n    \"breaking\": \"1.4.0\",\n    \"pinned\": \"1.0.0\"\n  }\n}\n",
+    )
+    .expect("package.json");
+    fs::write(
+        fixture.checkout.join(".updrc.toml"),
+        "[pin]\npinned = \"1.2.0\"\n",
+    )
+    .expect("upd config");
+    git(&fixture.checkout, &["add", "package.json", ".updrc.toml"]);
+    git(&fixture.checkout, &["commit", "-m", "test: npm project"]);
+    git(&fixture.checkout, &["push", "origin", "main"]);
+}
+
+/// `git diff --numstat` from the default branch to `branch` on the remote.
+fn numstat_from_main(fixture: &Fixture, branch: &str) -> String {
+    let output = run(isolated::command("git")
+        .arg(format!("--git-dir={}", fixture.remote.display()))
+        .args(["diff", "--numstat", "refs/heads/main"])
+        .arg(format!("refs/heads/{branch}")));
+    String::from_utf8(output.stdout).unwrap()
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_configured_pin_alone_reaches_only_the_ordinary_lane() {
+    let registry = npm_registry(&[
+        ("breaking", &["1.4.0"]),
+        ("pinned", &["1.0.0", "1.2.0", "1.3.0"]),
+    ])
+    .await;
+    let server = MockServer::start().await;
+    let fixture = Fixture::new();
+    commit_pinned_project(&fixture);
+    list_mock(json!([])).mount(&server).await;
+    list_mock_for(MAJOR_BRANCH, json!([])).mount(&server).await;
+    Mock::given(method("POST"))
+        .and(path("/api/v4/projects/1/merge_requests"))
+        .and(body_partial_json(json!({"source_branch": BRANCH})))
+        .respond_with(ResponseTemplate::new(201).set_body_json(mr_response(7, false)))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/api/v4/projects/1/merge_requests"))
+        .and(body_partial_json(json!({"source_branch": MAJOR_BRANCH})))
+        .respond_with(ResponseTemplate::new(201).set_body_json(mr_response(8, false)))
+        .expect(0)
+        .mount(&server)
+        .await;
+
+    fixture.run(
+        &server,
+        &Run {
+            npm_registry: Some(registry.uri()),
+            ..major_run()
+        },
+    );
+
+    let ordinary = fixture.file_on(BRANCH, "package.json").unwrap();
+    assert!(ordinary.contains("\"pinned\": \"1.2.0\""), "{ordinary}");
+    assert_eq!(numstat_from_main(&fixture, BRANCH), "1\t1\tpackage.json\n");
+    assert_eq!(fixture.tip_of(MAJOR_BRANCH), None);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_major_lane_carries_the_held_major_and_nothing_else() {
+    let registry = npm_registry(&[
+        ("breaking", &["1.4.0", "2.0.0"]),
+        ("pinned", &["1.0.0", "1.2.0", "1.3.0"]),
+    ])
+    .await;
+    let server = MockServer::start().await;
+    let fixture = Fixture::new();
+    commit_pinned_project(&fixture);
+    serve_both_lanes(&server).await;
+
+    fixture.run(
+        &server,
+        &Run {
+            npm_registry: Some(registry.uri()),
+            ..major_run()
+        },
+    );
+
+    let ordinary = fixture.file_on(BRANCH, "package.json").unwrap();
+    assert!(ordinary.contains("\"breaking\": \"1.4.0\""), "{ordinary}");
+    assert!(ordinary.contains("\"pinned\": \"1.2.0\""), "{ordinary}");
+    let major = fixture.file_on(MAJOR_BRANCH, "package.json").unwrap();
+    assert!(major.contains("\"breaking\": \"2.0.0\""), "{major}");
+    assert!(major.contains("\"pinned\": \"1.0.0\""), "{major}");
+    assert_eq!(numstat_from_main(&fixture, BRANCH), "1\t1\tpackage.json\n");
+    assert_eq!(
+        numstat_from_main(&fixture, MAJOR_BRANCH),
+        "1\t1\tpackage.json\n"
+    );
+
+    let requests = server.received_requests().await.unwrap();
+    let description = json_body(created_on(&requests, MAJOR_BRANCH))["description"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(description.contains("breaking"), "{description}");
+    assert!(!description.contains("pinned"), "{description}");
 }

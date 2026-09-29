@@ -18,6 +18,7 @@ use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
 
 const TEMPLATE: &str = include_str!("../ci/gitlab-organization-update.yml");
 const BRANCH: &str = "automation/upd-dependencies";
+const MAJOR_BRANCH: &str = "automation/upd-dependencies-major";
 const CENTRAL: u64 = 10;
 const OPTED_IN: &str = "[automation]\ndependency_updates = true\n";
 
@@ -31,6 +32,20 @@ if [ -n "${UPD_GITLAB_TOKEN+set}" ]; then
   exit 9
 fi
 name="$(cat project.txt)"
+case " $* " in
+  *" --only-bump major "*)
+    printf '%s\n' "$*" > "$FAKE_LOG/$name.major.args"
+    if [ -e fail-major ]; then
+      echo "$name major updater failure" >&2
+      exit 1
+    fi
+    printf 'major\n' > major.txt
+    cat <<JSON
+{"command":"update","mode":"applied","files":[{"path":"major.txt","file_type":"test","lang":"test","updates":[{"package":"breaking","current":"1.4.0","latest":"2.0.0","bump":"major"}],"pinned":[],"ignored":[],"errors":[],"warnings":[]}],"summary":{"files_scanned":1,"files_with_changes":1,"updates_total":1,"updates_major":1,"updates_minor":0,"updates_patch":0,"pinned":0,"ignored":0,"errors":0,"warnings":0}}
+JSON
+    exit 0
+    ;;
+esac
 printf '%s\n' "$*" > "$FAKE_LOG/$name.args"
 for step in 1 2 3; do
   echo "$name progress $step" >&2
@@ -235,11 +250,26 @@ impl Org {
         fs::read_to_string(self.log.join(format!("{}.args", path.replace('/', "-")))).ok()
     }
 
+    /// The major lane's updater arguments for the project at `path`, if it
+    /// ran.
+    fn major_updater_args(&self, path: &str) -> Option<String> {
+        fs::read_to_string(
+            self.log
+                .join(format!("{}.major.args", path.replace('/', "-"))),
+        )
+        .ok()
+    }
+
     /// The automation branch's copy of `dependency.txt` in project `id`.
     fn branch_file(&self, id: u64) -> Option<String> {
+        self.file_on(id, BRANCH, "dependency.txt")
+    }
+
+    /// `file` on `branch` in project `id`'s remote, if it is there.
+    fn file_on(&self, id: u64, branch: &str, file: &str) -> Option<String> {
         let output = isolated::command("git")
             .arg(format!("--git-dir={}", self.remotes[&id].display()))
-            .args(["show", &format!("refs/heads/{BRANCH}:dependency.txt")])
+            .args(["show", &format!("refs/heads/{branch}:{file}")])
             .output()
             .expect("git show starts");
         output
@@ -776,4 +806,130 @@ async fn an_inherited_git_hook_environment_leaves_the_callers_repository_alone()
         "{report:#}"
     );
     assert_eq!(org.branch_file(11).as_deref(), Some("new\n"));
+}
+
+const MAJOR_OPTED_IN: &str = "[automation]\ndependency_updates = true\nmajor_mr = true\n";
+
+#[tokio::test]
+async fn the_major_lane_needs_both_the_group_and_the_project_to_ask_for_it() {
+    let mut org = Org::new().await;
+    org.project(
+        61,
+        "acme/both",
+        &[Entry::File(".updrc.toml", MAJOR_OPTED_IN)],
+    );
+    org.project(
+        62,
+        "acme/group-only",
+        &[Entry::File(".updrc.toml", OPTED_IN)],
+    );
+    org.serve().await;
+
+    let (code, report, stderr) = org.run(&[("UPD_MAJOR_MR", "true")], &[]);
+
+    assert_eq!(code, 0, "{report:#}\n{stderr}");
+    assert_eq!(report["major_branch"], MAJOR_BRANCH, "{report:#}");
+    assert_eq!(report["counts"]["major_failed"], 0, "{report:#}");
+    let both = project(&report, "acme/both");
+    assert_eq!(both["state"], "processed", "{report:#}");
+    assert_eq!(both["major"]["outcome"], "published", "{report:#}");
+    assert_eq!(both["major"]["branch"], MAJOR_BRANCH, "{report:#}");
+    assert_eq!(
+        org.file_on(61, MAJOR_BRANCH, "major.txt").as_deref(),
+        Some("major\n")
+    );
+    assert_eq!(org.file_on(61, BRANCH, "major.txt"), None);
+    assert_eq!(org.branch_file(61).as_deref(), Some("new\n"));
+    let args = org.major_updater_args("acme/both").expect("major lane ran");
+    assert!(args.contains("--only-bump major --strict-bump"), "{args}");
+    assert!(!args.contains("--max-bump"), "{args}");
+
+    let group_only = project(&report, "acme/group-only");
+    assert_eq!(group_only["state"], "processed", "{report:#}");
+    assert!(group_only.get("major").is_none(), "{report:#}");
+    assert_eq!(org.major_updater_args("acme/group-only"), None);
+    assert_eq!(org.file_on(62, MAJOR_BRANCH, "major.txt"), None);
+    assert_eq!(org.branch_file(62).as_deref(), Some("new\n"));
+
+    let mut org = Org::new().await;
+    org.project(
+        63,
+        "acme/project-only",
+        &[Entry::File(".updrc.toml", MAJOR_OPTED_IN)],
+    );
+    org.serve().await;
+    let (code, report, stderr) = org.run(&[], &[]);
+    assert_eq!(code, 0, "{report:#}\n{stderr}");
+    assert!(report.get("major_branch").is_none(), "{report:#}");
+    assert!(report["counts"].get("major_failed").is_none(), "{report:#}");
+    assert!(project(&report, "acme/project-only").get("major").is_none());
+    assert_eq!(org.major_updater_args("acme/project-only"), None);
+    assert_eq!(org.file_on(63, MAJOR_BRANCH, "major.txt"), None);
+}
+
+#[tokio::test]
+async fn a_failed_major_lane_fails_the_run_but_not_the_ordinary_lane() {
+    let mut org = Org::new().await;
+    org.project(
+        71,
+        "acme/major-fails",
+        &[
+            Entry::File(".updrc.toml", MAJOR_OPTED_IN),
+            Entry::File("fail-major", ""),
+        ],
+    );
+    org.project(
+        72,
+        "acme/fine",
+        &[Entry::File(".updrc.toml", MAJOR_OPTED_IN)],
+    );
+    org.serve().await;
+
+    let (code, report, stderr) = org.run(&[("UPD_MAJOR_MR", "true")], &[]);
+
+    assert_eq!(code, 2, "{report:#}\n{stderr}");
+    assert_eq!(report["counts"]["processed"], 2, "{report:#}");
+    assert_eq!(report["counts"]["failed"], 0, "{report:#}");
+    assert_eq!(report["counts"]["major_failed"], 1, "{report:#}");
+    let failing = project(&report, "acme/major-fails");
+    assert_eq!(failing["major"]["outcome"], "failed", "{report:#}");
+    assert!(failing["major"].get("command").is_none(), "{report:#}");
+    assert_eq!(org.branch_file(71).as_deref(), Some("new\n"));
+    assert_eq!(org.file_on(71, MAJOR_BRANCH, "major.txt"), None);
+    assert_eq!(
+        org.file_on(72, MAJOR_BRANCH, "major.txt").as_deref(),
+        Some("major\n")
+    );
+    assert!(
+        stderr.contains("acme/major-fails: major lane: Failed on"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("1 major lane(s) failed"), "{stderr}");
+}
+
+#[tokio::test]
+async fn an_invalid_major_lane_is_refused_before_any_project_is_listed() {
+    for vars in [
+        &[("UPD_MAJOR_MR", "true"), ("UPD_MAX_BUMP", "major")][..],
+        &[("UPD_MAJOR_MR", "true"), ("UPD_MAJOR_BRANCH", BRANCH)][..],
+        &[("UPD_MAJOR_MR", "true"), ("UPD_MAJOR_BRANCH", "bad..name")][..],
+    ] {
+        let org = Org::new().await;
+        org.serve().await;
+        let output = org
+            .command(env!("CARGO_BIN_EXE_upd"), vars)
+            .args(["gitlab", "org", "run", "--output", "json"])
+            .output()
+            .expect("upd starts");
+        assert_eq!(
+            output.status.code(),
+            Some(4),
+            "{vars:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            org.server.received_requests().await.unwrap().is_empty(),
+            "{vars:?}"
+        );
+    }
 }

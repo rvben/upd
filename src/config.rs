@@ -36,6 +36,7 @@
 //! security_remediation = true
 //! dependency_updates = true  # GitLab organization rolling merge request
 //! auto_merge = false         # consent to the organization's auto-merge
+//! major_mr = false           # consent to the organization's major-upgrade merge request
 //!
 //! # Pin packages to specific versions or constraints - top-level table
 //! [pin]
@@ -115,10 +116,19 @@ pub struct AutomationConfig {
     /// to merge its dependency merge request once the pipeline passes.
     #[serde(default)]
     pub auto_merge: Option<bool>,
+    /// Whether this repository consents to the organization run keeping a
+    /// separate merge request for major-version upgrades open.
+    #[serde(default)]
+    pub major_mr: Option<bool>,
 }
 
 /// Every key `[automation]` accepts.
-const AUTOMATION_KEYS: &[&str] = &["security_remediation", "dependency_updates", "auto_merge"];
+const AUTOMATION_KEYS: &[&str] = &[
+    "security_remediation",
+    "dependency_updates",
+    "auto_merge",
+    "major_mr",
+];
 
 /// Raw cooldown config as written in the TOML file. Parsed into a
 /// `crate::cooldown::CooldownPolicy` at runtime via `UpdConfig::to_cooldown_policy`.
@@ -578,6 +588,8 @@ security_remediation = false
 dependency_updates = false
 # The organization run may ask GitLab to auto-merge that merge request.
 auto_merge = false
+# The organization run may keep a separate major-upgrade merge request open.
+major_mr = false
 "#
     }
 
@@ -680,6 +692,7 @@ auto_merge = false
             || self.automation.security_remediation.is_some()
             || self.automation.dependency_updates.is_some()
             || self.automation.auto_merge.is_some()
+            || self.automation.major_mr.is_some()
             || self.normalize.is_some()
             || self.update.pyproject.is_some()
             || self.ecosystems.enable.is_some()
@@ -737,6 +750,9 @@ auto_merge = false
         if other.automation.auto_merge.is_some() {
             self.automation.auto_merge = other.automation.auto_merge;
         }
+        if other.automation.major_mr.is_some() {
+            self.automation.major_mr = other.automation.major_mr;
+        }
         if let Some(other_normalize) = other.normalize
             && let Some(other_pyproject) = other_normalize.pyproject
         {
@@ -767,6 +783,12 @@ auto_merge = false
     /// Whether the repository consents to auto-merge by an organization run.
     pub fn auto_merge_enabled(&self) -> bool {
         self.automation.auto_merge.unwrap_or(false)
+    }
+
+    /// Whether the repository consents to a major-upgrade merge request kept
+    /// by an organization run.
+    pub fn major_mr_enabled(&self) -> bool {
+        self.automation.major_mr.unwrap_or(false)
     }
 }
 
@@ -969,6 +991,7 @@ impl EffectiveConfig<'_> {
             "  auto_merge: {}\n",
             self.config.auto_merge_enabled()
         ));
+        out.push_str(&format!("  major_mr: {}\n", self.config.major_mr_enabled()));
         out.push_str(&render_cooldown_for_show_config(self.cooldown));
 
         out
@@ -1019,6 +1042,7 @@ impl EffectiveConfig<'_> {
                 "security_remediation": self.config.security_remediation_enabled(),
                 "dependency_updates": self.config.dependency_updates_enabled(),
                 "auto_merge": self.config.auto_merge_enabled(),
+                "major_mr": self.config.major_mr_enabled(),
             },
             "cooldown": {
                 "default_seconds": self.cooldown.default.num_seconds(),
@@ -1816,6 +1840,40 @@ security_remedation = false
         );
         assert!(merged.dependency_updates_enabled());
         assert!(!merged.auto_merge_enabled());
+    }
+
+    #[test]
+    fn test_major_mr_is_an_explicit_automation_key_merged_like_the_others() {
+        let (absent, _) = UpdConfig::parse_with_warnings("ignore = []", "test.toml").unwrap();
+        assert!(!absent.major_mr_enabled());
+
+        let content = "[automation]\ndependency_updates = true\nmajor_mr = true\n";
+        let (enabled, warnings) = UpdConfig::parse_for_automation(content, "test.toml").unwrap();
+        assert!(warnings.is_empty(), "{warnings:?}");
+        assert!(enabled.major_mr_enabled());
+        assert!(!enabled.auto_merge_enabled());
+        let (only, _) =
+            UpdConfig::parse_with_warnings("[automation]\nmajor_mr = true\n", "t").unwrap();
+        assert!(only.has_config());
+
+        let mut merged = enabled.clone();
+        merged.merge(UpdConfig::default());
+        assert!(merged.major_mr_enabled());
+        merged.merge(
+            UpdConfig::parse_with_warnings("[automation]\nmajor_mr = false\n", "t")
+                .unwrap()
+                .0,
+        );
+        assert!(merged.dependency_updates_enabled() && !merged.major_mr_enabled());
+
+        // Anywhere but [automation] it is not a key upd knows.
+        let elsewhere = "major_mr = true\n[automation]\ndependency_updates = true\n";
+        let (config, warnings) = UpdConfig::parse_for_automation(elsewhere, "t").unwrap();
+        assert!(!config.major_mr_enabled());
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(
+            UpdConfig::parse_for_automation("[automation]\nmajor_mr = \"yes\"\n", "t").is_err()
+        );
     }
 
     #[test]

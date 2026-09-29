@@ -1,0 +1,52 @@
+{
+  "annotations": [],
+  "auto_merge_requested": false,
+  "blocked": [],
+  "changed": true,
+  "changed_paths": [
+    "major.txt"
+  ],
+  "counts": {
+    "annotations": 0,
+    "blocked": 0,
+    "files_changed": 1,
+    "normalized": 0,
+    "not_examined": 0,
+    "policy_holds": 0,
+    "updates": 1,
+    "updates_major": 1,
+    "updates_minor": 0,
+    "updates_patch": 0,
+    "updates_quiet": 0,
+    "updates_review_worthy": 1,
+    "updates_revision": 0,
+    "warnings": 0
+  },
+  "major_lane": {
+    "role": "proposal"
+  },
+  "normalized": [],
+  "policy": {
+    "lockfile_regeneration": false,
+    "max_bump": "major only",
+    "min_age": "7d"
+  },
+  "policy_holds": [],
+  "schema": 1,
+  "state": "ready",
+  "title": "chore(deps): upgrade breaking to 2.0.0",
+  "updates": [
+    {
+      "bump": "major",
+      "current": "1.4.0",
+      "latest": "2.0.0",
+      "package": "breaking",
+      "path": "major.txt",
+      "status": "applied"
+    }
+  ],
+  "validation": {
+    "proposal_integrity_passed": true,
+    "repository_command_configured": false
+  }
+}

@@ -68,6 +68,7 @@ django = "4.2.0"
 | `automation.security_remediation` | `bool` | Allow scheduled security remediation to publish or clean up its rolling pull request. Defaults to `false` |
 | `automation.dependency_updates` | `bool` | Allow a GitLab organization run to keep a rolling dependency merge request open in this repository (see [GitLab](gitlab.md#organization-mode)). Defaults to `false` |
 | `automation.auto_merge` | `bool` | Consent to that organization run asking GitLab to merge once the project's pipeline passes; the organization must enable it too. Defaults to `false` |
+| `automation.major_mr` | `bool` | Consent to that organization run keeping a separate merge request for major-version upgrades open (see [GitLab](gitlab.md#major-upgrades)); the organization must enable it too, and upd never merges it. Defaults to `false` |
 | `ecosystems` | `table` | Persistent enable/disable lists using `--lang` names |
 | `update.pyproject.exact-pins` | `bool` | Update concrete `==` pins automatically (default `true`) |
 | `normalize` | `table` | Opt-in `pyproject.toml` specifier normalization, configured per section |

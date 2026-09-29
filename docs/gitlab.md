@@ -108,6 +108,9 @@ but must leave the repository clean; dependency updates belong exclusively to
 | `commit_message` | `chore(deps): update dependencies with upd` | Generated commit message |
 | `mr_title` | derived from update evidence | Optional merge-request title override |
 | `auto_merge` | `false` | Ask GitLab to merge after project checks pass |
+| `major_mr` | `false` | Keep a second rolling merge request for the major-version upgrades `max_bump` holds back (see [Major upgrades](#major-upgrades)) |
+| `major_branch` | `automation/upd-dependencies-major` | Automation-owned rolling branch of the major merge request |
+| `major_commit_message` | `chore(deps): update major dependencies with upd` | Generated commit message of the major merge request |
 
 Input types and formats are checked while GitLab creates the pipeline. The job
 runs `upd gitlab run`, so `upd_version` must name a release that provides that
@@ -221,6 +224,69 @@ picks up where it stopped.
 The `auto_merge` API option requires GitLab 17.11 or newer. Creating and updating
 merge requests works on older supported versions without that option.
 
+## Major upgrades
+
+`max_bump` keeps the rolling merge request small enough to merge routinely, which
+leaves major-version upgrades waiting. Setting `major_mr` proposes them in a
+second rolling merge request of their own:
+
+```yaml
+include:
+  - remote: "https://raw.githubusercontent.com/rvben/upd/<FULL_COMMIT_SHA>/ci/gitlab-dependency-update.yml"
+    inputs:
+      max_bump: "minor"
+      auto_merge: true
+      major_mr: true
+
+upd-dependency-update:
+  extends: .upd-dependency-update
+```
+
+After the usual merge request, the same job starts again from the default
+branch on `major_branch` and asks `upd` for major-version upgrades alone
+(`--only-bump major --strict-bump`). The two merge requests never carry the
+same change:
+
+- The major merge request holds only version upgrades that cross a major
+  version. Configured pins, Nix flake revisions, and other rewrites that are
+  not a major upgrade stay in the ordinary merge request, even when no major
+  upgrade is available.
+- The ordinary merge request still lists the minor and patch releases its
+  ceiling held, and replaces the held majors with a link to the open major
+  merge request.
+- `major_mr` needs `max_bump` set to `minor` or `patch`; with no lower ceiling
+  the ordinary merge request already carries major upgrades, and the job
+  refuses to start. `major_branch` must differ from `branch` and from the
+  default branch, and neither may be nested under the other's name (`deps`
+  and `deps/major`), since git cannot hold both.
+
+upd never merges the major merge request. Its description says so, `auto_merge`
+does not apply to it, and a run that publishes to it and finds auto-merge armed
+(enabled by hand, say) cancels it. It is meant for a person to review the
+breaking changes and merge by hand.
+
+Everything else works as in the ordinary lane, per branch:
+
+- `prepare_command` and `validation_command` run again for the major lane, in a
+  checkout reset to the default branch, so nothing from the ordinary lane leaks
+  into it.
+- A commit someone pushes to one lane's branch pauses only that lane.
+- When no major upgrade remains, the branch is deleted and its merge request
+  closed.
+- `mr_title` applies to the ordinary merge request only; the major merge
+  request's title is always derived from its updates.
+- Its evidence is kept beside the ordinary lane's in the `.upd-ci` artifact,
+  as `upd-major-report.json`, `upd-major-presentation.json`, and
+  `upd-major-mr-description.md`.
+
+Both merge requests start from the same default branch, so merging one can
+leave the other conflicting, for example when both change the same lockfile.
+The next scheduled run rebuilds each branch from the new default branch, which
+clears the conflict; there is no need to resolve it by hand.
+
+The lanes fail independently: a failed ordinary lane still lets the major lane
+run, and the job fails if either lane failed.
+
 ## Running `upd gitlab run` directly
 
 The template is a thin wrapper: it installs and verifies `upd`, then runs
@@ -238,7 +304,13 @@ command from its own job instead. It reads the GitLab CI job environment:
 | `UPD_PREPARE_COMMAND`, `UPD_VALIDATION_COMMAND` | no | Bash commands run with `set -euo pipefail` in the checkout |
 | `UPD_COMMIT_MESSAGE`, `UPD_MR_TITLE` | no | Commit message and title override |
 | `UPD_GIT_NAME`, `UPD_GIT_EMAIL` | no | Automation commit identity (`upd automation`, `upd-automation@noreply.invalid`) |
+| `UPD_MAJOR_MR` | no | `true` or `false` (`false`); enables the [major lane](#major-upgrades) |
+| `UPD_MAJOR_BRANCH`, `UPD_MAJOR_COMMIT_MESSAGE` | no | Major lane branch (`automation/upd-dependencies-major`) and commit message (`chore(deps): update major dependencies with upd`) |
 | `UPD_EXECUTABLE` | no | `upd` binary that performs the update (the running `upd`) |
+
+The run switches the checkout between branches and resets it, so it needs a
+clean checkout: one with uncommitted changes or untracked files is refused
+(exit code 2) before either lane starts.
 
 Progress goes to stderr. The outcome goes to stdout, as one line of text or, with
 `--output json`, an object whose `outcome` is `clean`, `closed`, `published`, or
@@ -248,6 +320,10 @@ update, validation and ownership checks still run, but nothing is pushed and
 nothing is written to GitLab; the outcome is then `would_publish` (with `push`
 saying whether the branch would change), `would_close`, or `would_pause` in
 place of the last three.
+With the major lane enabled, its result follows on a second line of text, or
+under `major` in the JSON object with the same fields. A lane that failed
+reports the outcome `failed` with its `error` (`kind`, `message`, `exit_code`)
+while the other lane's result is still reported.
 Failures print a JSON error to stderr and exit with the code listed in
 `upd schema`: 4 for missing or invalid settings, 3 for network and GitLab
 server errors (retryable), 5 when the branch moved during the run, and 2 for
@@ -273,6 +349,7 @@ default branch says so:
 [automation]
 dependency_updates = true
 auto_merge = true   # optional; the central job must allow it too
+major_mr = true     # optional; the central job must enable it too
 ```
 
 The file is found the way `upd` finds configuration (`.updrc.toml`, then
@@ -330,6 +407,8 @@ release: `upd_version` must name a release that provides `upd gitlab org run`.
 | `max_bump` | `minor` | Highest applied bump; empty uses each project's configuration |
 | `branch`, `commit_message` | as above | Rolling branch and generated commit message in every project |
 | `auto_merge` | `false` | Allow auto-merge in projects that also set `auto_merge = true` |
+| `major_mr` | `false` | Keep a [major-upgrade merge request](#major-upgrades) in projects that also set `major_mr = true`; needs `max_bump` set to `minor` or `patch` |
+| `major_branch`, `major_commit_message` | as above | Rolling branch and generated commit message of the major merge request in every project |
 | `concurrency` | `4` | Projects processed at the same time (1 to 16) |
 | `dry_run` | `false` | Report what each project would get without pushing or writing to GitLab |
 
@@ -349,6 +428,11 @@ run` reports, or failed. A failing project does not stop the others. The job
 fails when any project failed or had an invalid opt-in, so a scheduled run
 surfaces problems without hiding the projects that succeeded.
 
+With `major_mr` enabled, a project that also set `major_mr = true` gets a second
+line for its major lane. That lane runs even when the project's ordinary lane
+failed, and a failed major lane fails the job too; the report counts those
+projects separately as `major_failed`.
+
 The full JSON report, including each project's merge request URL or error, is
 kept for one week as the `.upd-ci/upd-org-report.json` artifact. Its shape is
 described by `upd schema` under `gitlab org run`.
@@ -356,5 +440,5 @@ described by `upd schema` under `gitlab org run`.
 ## Scope
 
 This integration intentionally produces one policy-constrained rolling merge
-request. It does not provide Renovate-style per-package branches, dependency
+request, plus the optional major-upgrade merge request. It does not provide Renovate-style per-package branches, dependency
 dashboards, reviewer assignment, conflict resolution, or automatic rebasing.

@@ -32,6 +32,7 @@ pub fn commit_record(commit: &str) -> String {
 const UNKNOWN_DEPENDENCY: &str = "unknown dependency";
 const UNKNOWN_FILE: &str = "unknown file";
 const UNKNOWN: &str = "unknown";
+const BUMP_CEILING: &str = "bump ceiling";
 
 const BRAND: &str = "<p><a href=\"https://github.com/rvben/upd\"><img src=\"https://raw.githubusercontent.com/rvben/upd/84109eaf36c739dc11af0452c6218abb7e47a8e3/assets/logo-wide.svg\" alt=\"upd\" width=\"96\"></a></p>";
 
@@ -49,9 +50,26 @@ impl std::error::Error for ReportShapeError {}
 
 type Shaped<T> = Result<T, ReportShapeError>;
 
+/// Which merge request a presentation describes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Lane<'a> {
+    /// The only merge request.
+    Ordinary,
+    /// The ordinary merge request of a project whose major-version upgrades
+    /// have a merge request of their own, whose open merge requests
+    /// `merge_requests` lists.
+    BesideMajor {
+        branch: &'a str,
+        merge_requests: &'a str,
+    },
+    /// The major-upgrade merge request, which upd never merges.
+    Major,
+}
+
 /// Job facts the presentation needs beyond the report itself.
 #[derive(Debug, Clone)]
 pub struct Context<'a> {
+    pub lane: Lane<'a>,
     /// Freshness input as configured; empty defers to repository configuration.
     pub min_age: &'a str,
     /// Bump ceiling as configured; empty defers to repository configuration.
@@ -100,6 +118,24 @@ pub struct PolicyRow {
     pub selected: String,
     pub available: String,
     pub path: String,
+    /// A major-version release the bump ceiling held back.
+    #[serde(skip)]
+    pub capped_major: bool,
+}
+
+/// How a merge request relates to the major-upgrade lane.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(tag = "role", rename_all = "snake_case")]
+pub enum MajorLane {
+    /// This merge request proposes the major-version upgrades.
+    Proposal,
+    /// This is the ordinary merge request; the major-version releases its
+    /// ceiling held back, `held`, are left to the major lane on `branch`.
+    Linked {
+        branch: String,
+        merge_requests: String,
+        held: Vec<PolicyRow>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -122,6 +158,7 @@ pub struct Counts {
     pub annotations: usize,
     pub normalized: usize,
     pub files_changed: usize,
+    /// Every policy hold, including those left to the major lane.
     pub policy_holds: usize,
     pub blocked: usize,
     /// Copied from the report summary as found.
@@ -160,6 +197,9 @@ pub struct Presentation {
     pub validation: Validation,
     pub auto_merge_requested: bool,
     pub title: String,
+    /// Absent when the project has no major lane.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub major_lane: Option<MajorLane>,
 }
 
 impl Presentation {
@@ -168,8 +208,33 @@ impl Presentation {
         let updates = update_rows(report)?;
         let annotations = annotation_rows(report)?;
         let normalized = normalized_rows(report)?;
-        let policy_holds = policy_rows(report)?;
+        let mut policy_holds = policy_rows(report)?;
         let blocked = blocked_rows(report)?;
+        let major_lane = match context.lane {
+            Lane::Ordinary => None,
+            Lane::BesideMajor {
+                branch,
+                merge_requests,
+            } => {
+                let (held, kept) = policy_holds.into_iter().partition(|row| row.capped_major);
+                policy_holds = kept;
+                Some(MajorLane::Linked {
+                    branch: clean_str(branch, 160),
+                    merge_requests: merge_requests.to_string(),
+                    held,
+                })
+            }
+            // Everything this lane's level held back is the ordinary lane's
+            // to propose, so none of it is saved for later here.
+            Lane::Major => {
+                policy_holds.retain(|row| row.kind != BUMP_CEILING);
+                Some(MajorLane::Proposal)
+            }
+        };
+        let linked_holds = match &major_lane {
+            Some(MajorLane::Linked { held, .. }) => held.len(),
+            _ => 0,
+        };
 
         let mut changed_paths: Vec<String> = context
             .changed_paths
@@ -198,7 +263,7 @@ impl Presentation {
             annotations: annotations.len(),
             normalized: normalized.len(),
             files_changed: context.changed_paths.len(),
-            policy_holds: policy_holds.len(),
+            policy_holds: policy_holds.len() + linked_holds,
             blocked: blocked.len(),
             warnings: or_else(field(summary, "warnings")?, Value::from(0)),
             not_examined: or_else(field(summary, "not_examined")?, Value::from(0)),
@@ -225,7 +290,10 @@ impl Presentation {
             counts,
             policy: Policy {
                 min_age: configured_or_repository(context.min_age, 80),
-                max_bump: configured_or_repository(context.max_bump, 32),
+                max_bump: match context.lane {
+                    Lane::Major => "major only".to_string(),
+                    _ => configured_or_repository(context.max_bump, 32),
+                },
                 lockfile_regeneration: context.lock,
             },
             validation: Validation {
@@ -234,6 +302,7 @@ impl Presentation {
             },
             auto_merge_requested: context.auto_merge,
             title: String::new(),
+            major_lane,
         };
         presentation.title = presentation.derive_title();
         Ok(presentation)
@@ -259,6 +328,20 @@ impl Presentation {
             "chore(deps)"
         };
         let counts = &self.counts;
+        if self.major_lane == Some(MajorLane::Proposal) {
+            let title = match self.updates.as_slice() {
+                [] => format!("{prefix}: upgrade dependencies across a major version"),
+                [only] if is_title_package(&only.package) && is_title_version(&only.latest) => {
+                    format!("{prefix}: upgrade {} to {}", only.package, only.latest)
+                }
+                [_] => format!("{prefix}: upgrade a dependency across a major version"),
+                rows => format!(
+                    "{prefix}: upgrade {} dependencies across a major version",
+                    rows.len()
+                ),
+            };
+            return clean_str(&title, 72);
+        }
         let title = if counts.updates == 1 && counts.normalized == 0 {
             let update = &self.updates[0];
             if is_title_package(&update.package) && is_title_version(&update.latest) {
@@ -316,8 +399,9 @@ impl Presentation {
 
     fn full_description(&self) -> String {
         format!(
-            "{BRAND}\n\n{}\n\n{}\n\n{}\n\n{}{}{}\n\n{}\n\n> Rebuilt from the latest default branch. The project pipeline remains the final merge boundary.\n\n---\nPrepared by [upd](https://github.com/rvben/upd).",
+            "{BRAND}\n\n{}{}\n\n{}\n\n{}\n\n{}{}{}\n\n{}\n\n> Rebuilt from the latest default branch. The project pipeline remains the final merge boundary.\n\n---\nPrepared by [upd](https://github.com/rvben/upd).",
             self.header(),
+            self.never_merged_notice(),
             self.facts(),
             self.changes(),
             self.confidence(),
@@ -390,8 +474,27 @@ impl Presentation {
         format!("{files} {}", plural(files, "file", "files"))
     }
 
+    /// For the major lane, the paragraph saying the merge request waits for a
+    /// person; empty otherwise.
+    fn never_merged_notice(&self) -> &'static str {
+        if self.major_lane == Some(MajorLane::Proposal) {
+            "\n\n> **upd never merges this merge request.** Each change crosses a major version, so it waits for a person to review the breaking changes and merge it by hand. A run that finds auto-merge armed on it cancels it."
+        } else {
+            ""
+        }
+    }
+
     fn header(&self) -> String {
         let counts = &self.counts;
+        if counts.blocked == 0 && self.major_lane == Some(MajorLane::Proposal) {
+            return format!(
+                "> **A major upgrade, prepared for a deliberate review.** upd prepared {} across {} and {}. {}",
+                self.result_summary(),
+                self.files_phrase(),
+                self.validation_phrase(),
+                self.version_boundary(),
+            );
+        }
         if counts.blocked > 0 {
             format!(
                 "> **A careful upgrade, with follow-up.** upd prepared {} across {} and {}. It stopped short of {} {} it could not change safely.",
@@ -574,7 +677,30 @@ impl Presentation {
             return String::new();
         }
         let mut out = format!(
-            "\n\n<details>\n<summary><strong>Saved for a deliberate upgrade ({holds})</strong></summary>\n\nupd left these releases unchanged because they sit outside this project\u{2019}s current update policy.\n\n| Dependency | Selected | Available | Policy | File |\n|---|---:|---:|---|---|\n"
+            "\n\n<details>\n<summary><strong>Saved for a deliberate upgrade ({holds})</strong></summary>\n\n"
+        );
+        if let Some(MajorLane::Linked {
+            branch,
+            merge_requests,
+            held,
+        }) = &self.major_lane
+            && !held.is_empty()
+        {
+            out.push_str(&format!(
+                "{} major-version {} above this merge request\u{2019}s bump ceiling {} left to the major-upgrade lane on {}, whose merge request upd never merges: [open major-upgrade merge requests]({merge_requests}).",
+                held.len(),
+                plural(held.len(), "release", "releases"),
+                plural(held.len(), "is", "are"),
+                code(branch),
+            ));
+            if self.policy_holds.is_empty() {
+                out.push_str("\n\n</details>");
+                return out;
+            }
+            out.push_str("\n\n");
+        }
+        out.push_str(
+            "upd left these releases unchanged because they sit outside this project\u{2019}s current update policy.\n\n| Dependency | Selected | Available | Policy | File |\n|---|---:|---:|---|---|\n",
         );
         out.push_str(&table(&self.policy_holds, 20, |row| {
             format!(
@@ -586,10 +712,10 @@ impl Presentation {
                 code(&row.path)
             )
         }));
-        if holds > 20 {
+        if self.policy_holds.len() > 20 {
             out.push_str(&format!(
                 "\n\n_{} more policy decisions are preserved in the pipeline artifact._",
-                holds - 20
+                self.policy_holds.len() - 20
             ));
         }
         out.push_str("\n\n</details>");
@@ -624,7 +750,9 @@ impl Presentation {
 
     fn evidence(&self) -> String {
         let counts = &self.counts;
-        let auto_merge = if self.auto_merge_requested {
+        let auto_merge = if self.major_lane == Some(MajorLane::Proposal) {
+            "never; a run that finds it armed cancels it"
+        } else if self.auto_merge_requested {
             "requested; project requirements still control readiness"
         } else {
             "off"
@@ -733,9 +861,25 @@ impl Presentation {
         } else {
             "proposal integrity passed; no project-specific command was configured"
         };
+        let major_lane = match &self.major_lane {
+            Some(MajorLane::Linked {
+                branch,
+                merge_requests,
+                held,
+            }) if !held.is_empty() => format!(
+                "\n- Left to the major-upgrade lane on {}: {} ([open major-upgrade merge requests]({merge_requests}))",
+                code(branch),
+                held.len(),
+            ),
+            _ => String::new(),
+        };
         format!(
-            "{BRAND}\n\n{header}\n\n- Major-version jumps: {}\n- Normalized specifiers: {}\n- Saved for a deliberate upgrade: {}\n- Needs attention: {}\n- Validation: {validation}\n\nThe detailed presentation exceeded the configured body budget, so complete decisions and evidence are retained in the pipeline artifact.\n\n> Review the project pipeline before merging.",
-            counts.updates_major, counts.normalized, counts.policy_holds, counts.blocked,
+            "{BRAND}\n\n{header}{}\n\n- Major-version jumps: {}\n- Normalized specifiers: {}\n- Saved for a deliberate upgrade: {}{major_lane}\n- Needs attention: {}\n- Validation: {validation}\n\nThe detailed presentation exceeded the configured body budget, so complete decisions and evidence are retained in the pipeline artifact.\n\n> Review the project pipeline before merging.",
+            self.never_merged_notice(),
+            counts.updates_major,
+            counts.normalized,
+            counts.policy_holds,
+            counts.blocked,
         )
     }
 }
@@ -867,6 +1011,7 @@ fn policy_rows(report: &Value) -> Shaped<Vec<PolicyRow>> {
                 selected: clean_or(selected, UNKNOWN, 160),
                 available: clean_or(field(held, "skipped_latest")?, UNKNOWN, 160),
                 path: path.clone(),
+                capped_major: false,
             });
         }
         for skipped in each_or_empty(field(file, "skipped_by_cooldown")?)? {
@@ -876,15 +1021,21 @@ fn policy_rows(report: &Value) -> Shaped<Vec<PolicyRow>> {
                 selected: clean_or(field(skipped, "current")?, UNKNOWN, 160),
                 available: clean_or(field(skipped, "skipped_latest")?, UNKNOWN, 160),
                 path: path.clone(),
+                capped_major: false,
             });
         }
         for capped in each_or_empty(field(file, "capped")?)? {
             rows.push(PolicyRow {
-                kind: "bump ceiling".to_string(),
+                kind: BUMP_CEILING.to_string(),
                 package: clean_or(field(capped, "package")?, UNKNOWN_DEPENDENCY, 160),
                 selected: clean_or(field(capped, "current")?, UNKNOWN, 160),
                 available: clean_or(field(capped, "available")?, UNKNOWN, 160),
                 path: path.clone(),
+                // The report classifies the step by the ecosystem's own
+                // rules; a hold `--strict-bump` made is never a major the
+                // ceiling held.
+                capped_major: field(capped, "bump")?.as_str() == Some("major")
+                    && field(capped, "reason")?.is_null(),
             });
         }
     }
@@ -910,6 +1061,7 @@ fn policy_rows(report: &Value) -> Shaped<Vec<PolicyRow>> {
                 selected: clean_or(field(entry, "version")?, UNKNOWN, 160),
                 available: clean(skipped_latest, 160),
                 path: path.clone(),
+                capped_major: false,
             });
         }
     }
@@ -1321,6 +1473,7 @@ mod tests {
             validation_configured: false,
             changed: true,
             changed_paths: &[],
+            lane: Lane::Ordinary,
         };
         let report = json!({"files": ["dependency.txt"], "summary": {}});
         assert!(Presentation::from_report(&report, &context).is_err());
@@ -1338,6 +1491,7 @@ mod tests {
             validation_configured: false,
             changed: false,
             changed_paths: &[],
+            lane: Lane::Ordinary,
         };
         let report = json!({"files": "none", "summary": {"warnings": 2}});
         let presentation = Presentation::from_report(&report, &context).unwrap();

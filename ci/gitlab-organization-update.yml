@@ -48,6 +48,16 @@ spec:
       description: Allow auto-merge in projects that also set [automation] auto_merge = true
       type: boolean
       default: false
+    major_mr:
+      description: Also propose major-version upgrades, in projects that also set [automation] major_mr = true, on a second merge request upd never merges
+      type: boolean
+      default: false
+    major_branch:
+      description: Automation-owned rolling branch for the major-upgrade merge request
+      default: "automation/upd-dependencies-major"
+    major_commit_message:
+      description: Conventional Commits message for the major-upgrade commit
+      default: "chore(deps): update major dependencies with upd"
     concurrency:
       description: Projects processed at the same time (1 to 16)
       type: number
@@ -84,6 +94,9 @@ spec:
     UPD_GIT_NAME: "upd automation"
     UPD_GIT_EMAIL: "upd-automation@noreply.invalid"
     UPD_AUTO_MERGE: "$[[ inputs.auto_merge ]]"
+    UPD_MAJOR_MR: "$[[ inputs.major_mr ]]"
+    UPD_MAJOR_BRANCH: "$[[ inputs.major_branch ]]"
+    UPD_MAJOR_COMMIT_MESSAGE: "$[[ inputs.major_commit_message ]]"
     UPD_CONCURRENCY: "$[[ inputs.concurrency ]]"
     UPD_DRY_RUN: "$[[ inputs.dry_run ]]"
     # Test/advanced escape hatch. Normal jobs always install a released binary.

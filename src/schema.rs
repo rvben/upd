@@ -323,7 +323,7 @@ fn build_schema() -> Value {
             },
             {
                 "name": "gitlab run",
-                "description": "Run one GitLab CI dependency update for the current project: update dependencies on the rolling automation branch, push it with a lease, and create, refresh or close its merge request. Configured by the GitLab CI job environment: requires UPD_GITLAB_TOKEN, CI_API_V4_URL, CI_DEFAULT_BRANCH, CI_PROJECT_DIR, CI_PROJECT_ID, CI_PROJECT_PATH and CI_SERVER_URL; reads UPD_BRANCH, UPD_PATHS, UPD_LANGS, UPD_PACKAGES, UPD_MIN_AGE, UPD_MAX_BUMP, UPD_LOCK, UPD_PREPARE_COMMAND, UPD_VALIDATION_COMMAND, UPD_COMMIT_MESSAGE, UPD_MR_TITLE, UPD_GIT_NAME, UPD_GIT_EMAIL and UPD_AUTO_MERGE. The token is passed only to upd's own git and API calls, never to the prepare command, the validation command or the updater. With --dry-run the update and its checks still run, but nothing is pushed and nothing is written to GitLab; the outcome names what would have happened. Progress goes to stderr",
+                "description": "Run one GitLab CI dependency update for the current project: update dependencies on the rolling automation branch, push it with a lease, and create, refresh or close its merge request. Configured by the GitLab CI job environment: requires UPD_GITLAB_TOKEN, CI_API_V4_URL, CI_DEFAULT_BRANCH, CI_PROJECT_DIR, CI_PROJECT_ID, CI_PROJECT_PATH and CI_SERVER_URL; reads UPD_BRANCH, UPD_PATHS, UPD_LANGS, UPD_PACKAGES, UPD_MIN_AGE, UPD_MAX_BUMP, UPD_LOCK, UPD_PREPARE_COMMAND, UPD_VALIDATION_COMMAND, UPD_COMMIT_MESSAGE, UPD_MR_TITLE, UPD_GIT_NAME, UPD_GIT_EMAIL, UPD_AUTO_MERGE, UPD_MAJOR_MR, UPD_MAJOR_BRANCH and UPD_MAJOR_COMMIT_MESSAGE. With UPD_MAJOR_MR=true (which needs UPD_MAX_BUMP set to minor or patch) a second lane then runs on UPD_MAJOR_BRANCH, proposing only the major-version upgrades the ceiling held (updater run with --only-bump major --strict-bump) in a merge request upd never merges: auto-merge does not apply to it and is cancelled when found armed. A lane that fails does not stop the other; the exit code is that of the first failure, ordinary lane first. The token is passed only to upd's own git and API calls, never to the prepare command, the validation command or the updater. With --dry-run the update and its checks still run, but nothing is pushed and nothing is written to GitLab; the outcome names what would have happened. Progress goes to stderr",
                 "effects": "non_idempotent",
                 "mutating": true,
                 "cardinality": "single",
@@ -331,7 +331,7 @@ fn build_schema() -> Value {
                 "output_fields": [
                     {"name": "command", "type": "string", "description": "Always \"gitlab run\""},
                     {"name": "branch", "type": "string", "description": "The rolling automation branch"},
-                    {"name": "outcome", "type": "string", "description": "\"clean\" (nothing to propose or clean up), \"closed\" (nothing to propose; the obsolete merge request and/or branch was removed), \"published\" (the update is on the branch and its merge request created or refreshed), \"paused\" (the branch holds commits automation did not write and was left untouched), or under --dry-run \"would_publish\", \"would_close\" or \"would_pause\" in place of the last three"},
+                    {"name": "outcome", "type": "string", "description": "\"clean\" (nothing to propose or clean up), \"closed\" (nothing to propose; the obsolete merge request and/or branch was removed), \"published\" (the update is on the branch and its merge request created or refreshed), \"paused\" (the branch holds commits automation did not write and was left untouched), or under --dry-run \"would_publish\", \"would_close\" or \"would_pause\" in place of the last three. With the major lane enabled, also \"failed\" (this lane failed; see error)"},
                     {"name": "merge_request", "type": "string", "description": "Web URL of the merge request; present for published and paused, and for closed and would_close when one was or would be closed (null otherwise)"},
                     {"name": "created", "type": "boolean", "description": "published only: whether the merge request was created by this run"},
                     {"name": "pushed", "type": "boolean", "description": "published only: whether this run pushed a new commit; false when the branch already held exactly this update, on the current default branch, and was left as it was"},
@@ -341,12 +341,14 @@ fn build_schema() -> Value {
                     {"name": "notice_added", "type": "boolean", "description": "paused only: whether this run added the pause notice to the merge request description"},
                     {"name": "title", "type": "string", "description": "would_publish only: the merge request title the update would be published under"},
                     {"name": "push", "type": "boolean", "description": "would_publish only: whether a commit would be pushed; false when the branch already holds this update"},
-                    {"name": "delete_branch", "type": "boolean", "description": "would_close only: whether the rolling branch would be deleted"}
+                    {"name": "delete_branch", "type": "boolean", "description": "would_close only: whether the rolling branch would be deleted"},
+                    {"name": "error", "type": "object", "description": "failed only: the lane's error, with kind, message and exit_code"},
+                    {"name": "major", "type": "object", "description": "Present only with the major lane enabled: the major lane's result, with the fields above except command, for UPD_MAJOR_BRANCH"}
                 ]
             },
             {
                 "name": "gitlab org run",
-                "description": "Run the GitLab dependency update for every project in a group that opted in, from one central CI job. Lists the group's projects (subgroups included), skips (with reason) the central project itself, projects matching UPD_EXCLUDE, and archived, pending-deletion, empty, repository-disabled and branchless projects, and processes a project only when the configuration file on its default branch commit sets [automation] dependency_updates = true; each such project then gets the same rolling branch and merge request as gitlab run. Auto-merge is enabled only when both UPD_AUTO_MERGE and the project's [automation] auto_merge allow it. The ecosystem nix is always left out, and cannot be selected through UPD_LANGS. Configured by the environment: requires UPD_GITLAB_TOKEN, CI_SERVER_URL and UPD_GROUP; reads CI_API_V4_URL, CI_PROJECT_ID (the central project, which is skipped), UPD_EXCLUDE (space-separated path globs), UPD_LANGS, UPD_MIN_AGE (a floor under each project's configured cooldown), UPD_MAX_BUMP, UPD_BRANCH, UPD_COMMIT_MESSAGE, UPD_GIT_NAME, UPD_GIT_EMAIL, UPD_AUTO_MERGE and UPD_CONCURRENCY (1 to 16, default 4). The token is never passed to the updater. A project that fails is reported and the others still run; the command then exits 2. With --dry-run nothing is pushed and nothing is written to GitLab. Progress goes to stderr, and in JSON mode a one-line summary is written to stderr before the report",
+                "description": "Run the GitLab dependency update for every project in a group that opted in, from one central CI job. Lists the group's projects (subgroups included), skips (with reason) the central project itself, projects matching UPD_EXCLUDE, and archived, pending-deletion, empty, repository-disabled and branchless projects, and processes a project only when the configuration file on its default branch commit sets [automation] dependency_updates = true; each such project then gets the same rolling branch and merge request as gitlab run. Auto-merge is enabled only when both UPD_AUTO_MERGE and the project's [automation] auto_merge allow it. The ecosystem nix is always left out, and cannot be selected through UPD_LANGS. Configured by the environment: requires UPD_GITLAB_TOKEN, CI_SERVER_URL and UPD_GROUP; reads CI_API_V4_URL, CI_PROJECT_ID (the central project, which is skipped), UPD_EXCLUDE (space-separated path globs), UPD_LANGS, UPD_MIN_AGE (a floor under each project's configured cooldown), UPD_MAX_BUMP, UPD_BRANCH, UPD_COMMIT_MESSAGE, UPD_GIT_NAME, UPD_GIT_EMAIL, UPD_AUTO_MERGE, UPD_MAJOR_MR, UPD_MAJOR_BRANCH, UPD_MAJOR_COMMIT_MESSAGE and UPD_CONCURRENCY (1 to 16, default 4). A project gets the gitlab run major lane only when both UPD_MAJOR_MR and the project's [automation] major_mr allow it; the lane runs even when the project's ordinary lane failed. The token is never passed to the updater. A project that fails is reported and the others still run; the command then exits 2. With --dry-run nothing is pushed and nothing is written to GitLab. Progress goes to stderr, and in JSON mode a one-line summary is written to stderr before the report",
                 "effects": "non_idempotent",
                 "mutating": true,
                 "cardinality": "single",
@@ -356,8 +358,9 @@ fn build_schema() -> Value {
                     {"name": "group", "type": "string", "description": "The group that was listed"},
                     {"name": "branch", "type": "string", "description": "The rolling automation branch used in every project"},
                     {"name": "dry_run", "type": "boolean", "description": "Whether the run was a dry run"},
-                    {"name": "counts", "type": "object", "description": "Number of projects listed (projects) and in each state (skipped, not_opted_in, config_invalid, processed, failed)"},
-                    {"name": "projects", "type": "array", "items": {"type": "object"}, "description": "One entry per listed project with id, path and state. skipped carries reason (central_project, excluded, archived, pending_deletion, repository_disabled, empty_repository or no_default_branch) and not_opted_in carries reason; config_invalid carries config (the file) and message; processed carries the gitlab run outcome fields (outcome, merge_request, ...); failed carries error with kind, message and exit_code. config_invalid and failed entries make the command exit 2"}
+                    {"name": "major_branch", "type": "string", "description": "Present only with the major lane enabled: the major lane's rolling branch in every project"},
+                    {"name": "counts", "type": "object", "description": "Number of projects listed (projects) and in each state (skipped, not_opted_in, config_invalid, processed, failed). With the major lane enabled, also major_failed: projects whose major lane failed, which make the command exit 2"},
+                    {"name": "projects", "type": "array", "items": {"type": "object"}, "description": "One entry per listed project with id, path and state. skipped carries reason (central_project, excluded, archived, pending_deletion, repository_disabled, empty_repository or no_default_branch) and not_opted_in carries reason; config_invalid carries config (the file) and message; processed carries the gitlab run outcome fields (outcome, merge_request, ...); failed carries error with kind, message and exit_code. config_invalid and failed entries make the command exit 2. A project whose major lane ran also carries major: that lane's gitlab run result, without command, including outcome \"failed\" with its error"}
                 ]
             },
             {
@@ -634,8 +637,23 @@ mod tests {
         let command = find_command(&s, "gitlab run");
         assert_eq!(command["mutating"], true);
         let fields = output_field_names(command);
-        for field in ["command", "branch", "outcome", "merge_request"] {
+        for field in [
+            "command",
+            "branch",
+            "outcome",
+            "merge_request",
+            "error",
+            "major",
+        ] {
             assert!(fields.iter().any(|f| f == field), "{field}");
+        }
+        let description = command["description"].as_str().unwrap();
+        for variable in [
+            "UPD_MAJOR_MR",
+            "UPD_MAJOR_BRANCH",
+            "UPD_MAJOR_COMMIT_MESSAGE",
+        ] {
+            assert!(description.contains(variable), "{variable}");
         }
     }
 
@@ -646,9 +664,23 @@ mod tests {
         assert_eq!(command["mutating"], true);
         let fields = output_field_names(command);
         for field in [
-            "command", "group", "branch", "dry_run", "counts", "projects",
+            "command",
+            "group",
+            "branch",
+            "dry_run",
+            "counts",
+            "projects",
+            "major_branch",
         ] {
             assert!(fields.iter().any(|f| f == field), "{field}");
+        }
+        let description = command["description"].as_str().unwrap();
+        for variable in [
+            "UPD_MAJOR_MR",
+            "UPD_MAJOR_BRANCH",
+            "UPD_MAJOR_COMMIT_MESSAGE",
+        ] {
+            assert!(description.contains(variable), "{variable}");
         }
     }
 

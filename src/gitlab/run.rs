@@ -58,6 +58,23 @@ pub struct Settings {
     pub config: Option<PathBuf>,
     /// Report what the run would do without pushing or writing to GitLab.
     pub dry_run: bool,
+    /// Whether a second lane proposes major-version upgrades on their own
+    /// branch and merge request.
+    pub major_mr: bool,
+    pub major_branch: String,
+    pub major_commit_message: String,
+    /// Which lane these settings drive.
+    pub lane: Lane,
+}
+
+/// The two merge requests a project can have.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Lane {
+    /// Every update the bump ceiling allows; the only lane unless
+    /// `major_mr` is set.
+    Ordinary,
+    /// Major-version upgrades only, never merged by upd.
+    Major,
 }
 
 impl Settings {
@@ -122,6 +139,13 @@ impl Settings {
             updater,
             config: None,
             dry_run,
+            major_mr: flag("UPD_MAJOR_MR")?,
+            major_branch: optional("UPD_MAJOR_BRANCH", "automation/upd-dependencies-major"),
+            major_commit_message: optional(
+                "UPD_MAJOR_COMMIT_MESSAGE",
+                "chore(deps): update major dependencies with upd",
+            ),
+            lane: Lane::Ordinary,
         };
         if settings.project_id.contains('/') {
             return Err(Error::Input(
@@ -133,7 +157,51 @@ impl Settings {
                 "The automation branch must differ from the default branch".to_string(),
             ));
         }
+        if settings.major_mr {
+            check_major_lane(
+                &settings.max_bump,
+                "UPD_MAX_BUMP",
+                &settings.branch,
+                &settings.major_branch,
+            )?;
+            if branches_collide(&settings.major_branch, &settings.default_branch) {
+                return Err(Error::Input(
+                    "The major automation branch must differ from the default branch, and neither may be nested under the other's name".to_string(),
+                ));
+            }
+        }
         Ok(settings)
+    }
+
+    /// The settings of the major lane, when it is enabled: its own branch
+    /// and commit message, no bump ceiling, no auto-merge, and a title upd
+    /// derives rather than the ordinary lane's configured one.
+    pub fn major_lane(&self) -> Option<Self> {
+        if !self.major_mr || self.lane == Lane::Major {
+            return None;
+        }
+        Some(Self {
+            branch: self.major_branch.clone(),
+            commit_message: self.major_commit_message.clone(),
+            mr_title: String::new(),
+            max_bump: String::new(),
+            auto_merge: false,
+            lane: Lane::Major,
+            ..self.clone()
+        })
+    }
+
+    /// The project's open merge requests from the major branch. The link
+    /// holds whatever the major lane did this run, and whichever merge
+    /// request it keeps open.
+    pub fn major_merge_requests_url(&self) -> String {
+        let branch: String =
+            url::form_urlencoded::byte_serialize(self.major_branch.as_bytes()).collect();
+        format!(
+            "{}/{}/-/merge_requests?state=opened&source_branch={branch}",
+            self.server_url.trim_end_matches('/'),
+            self.project_path
+        )
     }
 
     pub(super) fn git_url(&self) -> String {
@@ -144,9 +212,48 @@ impl Settings {
         )
     }
 
+    /// Where the artifact `name` goes; the major lane writes beside the
+    /// ordinary lane's artifacts rather than over them.
     fn artifact(&self, name: &str) -> PathBuf {
+        let name = match self.lane {
+            Lane::Ordinary => name.to_string(),
+            Lane::Major => name.replacen("upd-", "upd-major-", 1),
+        };
         self.project_dir.join(ARTIFACT_DIR).join(name)
     }
+}
+
+/// Refuses a major lane that would propose what the ordinary lane already
+/// does, or share its branch.
+pub(super) fn check_major_lane(
+    max_bump: &str,
+    max_bump_name: &str,
+    branch: &str,
+    major_branch: &str,
+) -> Result<(), Error> {
+    if !matches!(max_bump, "minor" | "patch") {
+        return Err(Error::Input(format!(
+            "The major merge request needs {max_bump_name} set to minor or patch, not '{max_bump}': without a lower ceiling the ordinary merge request already carries major upgrades"
+        )));
+    }
+    if branches_collide(major_branch, branch) {
+        return Err(Error::Input(
+            "The major automation branch must differ from the automation branch, and neither may be nested under the other's name".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+/// Whether git could not hold both branches: the same name, or one nested
+/// under the other's (`deps` and `deps/major`), since a ref cannot be both a
+/// branch and a directory of branches.
+pub(super) fn branches_collide(a: &str, b: &str) -> bool {
+    let nested = |outer: &str, inner: &str| {
+        inner
+            .strip_prefix(outer)
+            .is_some_and(|rest| rest.starts_with('/'))
+    };
+    a == b || nested(a, b) || nested(b, a)
 }
 
 /// What a run did.
@@ -361,8 +468,149 @@ pub struct Session<'a> {
     expected_remote_sha: String,
 }
 
-pub async fn run(settings: &Settings, log: &Log) -> Result<Outcome, Error> {
-    Session::open(settings.clone(), log).await?.propose().await
+/// What each lane of a run did. A lane that failed does not stop the other.
+#[derive(Debug)]
+pub struct Lanes {
+    pub ordinary: Result<Outcome, Error>,
+    /// Absent unless the major lane is enabled.
+    pub major: Option<Result<Outcome, Error>>,
+}
+
+impl Lanes {
+    /// The first failure, ordinary lane first: it decides the exit code.
+    pub fn failure(&self) -> Option<&Error> {
+        self.ordinary
+            .as_ref()
+            .err()
+            .or_else(|| self.major.as_ref().and_then(|major| major.as_ref().err()))
+    }
+
+    /// Both lanes' results: the ordinary lane's at the top level, as a run
+    /// without a major lane reports it, and the major lane's under `major`.
+    /// A lane that failed has the outcome `failed` and its `error`.
+    pub fn to_json(&self, settings: &Settings) -> Value {
+        let mut value = lane_json(&self.ordinary, &settings.branch);
+        value["command"] = json!("gitlab run");
+        if let Some(major) = &self.major {
+            value["major"] = major_lane_json(major, &settings.major_branch);
+        }
+        value
+    }
+
+    /// One line per lane.
+    pub fn render_text(&self, settings: &Settings) -> String {
+        let mut lines = vec![lane_text(&self.ordinary, &settings.branch)];
+        if let Some(major) = &self.major {
+            lines.push(format!(
+                "Major lane: {}",
+                lane_text(major, &settings.major_branch)
+            ));
+        }
+        lines.join("\n")
+    }
+}
+
+fn lane_json(result: &Result<Outcome, Error>, branch: &str) -> Value {
+    match result {
+        Ok(outcome) => outcome.to_json(branch),
+        Err(error) => json!({
+            "branch": branch,
+            "outcome": "failed",
+            "error": {
+                "kind": error.kind(),
+                "message": error.message(),
+                "exit_code": error.exit_code(),
+            },
+        }),
+    }
+}
+
+/// The major lane's result as it nests under its parent's `major` field,
+/// which already names the command.
+pub(super) fn major_lane_json(result: &Result<Outcome, Error>, branch: &str) -> Value {
+    let mut value = lane_json(result, branch);
+    if let Value::Object(fields) = &mut value {
+        fields.remove("command");
+    }
+    value
+}
+
+pub(super) fn lane_text(result: &Result<Outcome, Error>, branch: &str) -> String {
+    match result {
+        Ok(outcome) => outcome.render_text(branch),
+        Err(error) => format!("Failed on {branch} ({}): {}", error.kind(), error.message()),
+    }
+}
+
+/// Runs the ordinary lane and then, when enabled, the major lane. Only a
+/// malformed branch name or a checkout with local changes stops the run
+/// before either lane starts.
+pub async fn run(settings: &Settings, log: &Log) -> Result<Lanes, Error> {
+    check_branch_name(&settings.project_dir, &settings.branch).await?;
+    let major = settings.major_lane();
+    if let Some(major) = &major {
+        check_branch_name(&settings.project_dir, &major.branch).await?;
+    }
+    check_clean_checkout(&settings.project_dir).await?;
+    let ordinary = match Session::open(settings.clone(), log).await {
+        Ok(session) => session.propose().await,
+        Err(error) => Err(error),
+    };
+    let major = match major {
+        Some(major) => Some(propose_major(major, log).await),
+        None => None,
+    };
+    Ok(Lanes { ordinary, major })
+}
+
+/// Runs the major lane in the checkout the ordinary lane used.
+pub async fn propose_major(settings: Settings, log: &Log) -> Result<Outcome, Error> {
+    log.line(format_args!(
+        "Major lane: proposing major-version upgrades on {}",
+        settings.branch
+    ));
+    Session::open(settings, log).await?.propose().await
+}
+
+/// Refuses a checkout holding edits or untracked files. Each lane resets the
+/// checkout to the default branch, and the major lane discards whatever it
+/// finds there, so anything not committed would be lost. The artifact
+/// directory a previous run left behind is not a local change.
+async fn check_clean_checkout(dir: &Path) -> Result<(), Error> {
+    let output = git::child(dir, "git")
+        .args(["status", "--porcelain", "--untracked-files=all", "--", "."])
+        .arg(format!(":(exclude,top){ARTIFACT_DIR}/"))
+        .stderr(Stdio::inherit())
+        .output()
+        .await
+        .map_err(|error| Error::Io(format!("cannot start git: {error}")))?;
+    if !output.status.success() {
+        return Err(Error::Io(format!("git status failed in {}", dir.display())));
+    }
+    if output.stdout.is_empty() {
+        Ok(())
+    } else {
+        Err(Error::Refused(format!(
+            "The checkout in {} has uncommitted changes or untracked files; upd gitlab run resets it to the default branch, so it needs a clean checkout",
+            dir.display()
+        )))
+    }
+}
+
+pub(super) async fn check_branch_name(dir: &Path, branch: &str) -> Result<(), Error> {
+    if git::child(dir, "git")
+        .args(["check-ref-format", "--branch", branch])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .await
+        .map_err(|error| Error::Io(format!("cannot start git: {error}")))?
+        .success()
+    {
+        Ok(())
+    } else {
+        Err(Error::Input(format!("Invalid automation branch: {branch}")))
+    }
 }
 
 impl<'a> Session<'a> {
@@ -371,20 +619,7 @@ impl<'a> Session<'a> {
     pub async fn open(settings: Settings, log: &'a Log) -> Result<Self, Error> {
         let dir = &settings.project_dir;
         let git = Git::new(dir, &settings.token)?;
-        if !git::child(dir, "git")
-            .args(["check-ref-format", "--branch", &settings.branch])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .await
-            .map_err(|error| Error::Io(format!("cannot start git: {error}")))?
-            .success()
-        {
-            return Err(Error::Input(format!(
-                "Invalid automation branch: {}",
-                settings.branch
-            )));
-        }
+        check_branch_name(dir, &settings.branch).await?;
 
         prepare_artifact_dir(&git, dir).await?;
         let api =
@@ -443,14 +678,33 @@ impl<'a> Session<'a> {
             }
         }
 
-        git.run([
-            "switch",
-            "--quiet",
-            "--force-create",
-            &settings.branch,
-            &default_ref,
-        ])
-        .await?;
+        match settings.lane {
+            Lane::Ordinary => {
+                git.run([
+                    "switch",
+                    "--quiet",
+                    "--force-create",
+                    &settings.branch,
+                    &default_ref,
+                ])
+                .await?;
+            }
+            // The ordinary lane ran first in this checkout and may have left
+            // its update staged, or its untracked output behind when it
+            // stopped early. Neither belongs in this lane's commit.
+            Lane::Major => {
+                git.run([
+                    "switch",
+                    "--quiet",
+                    "--discard-changes",
+                    "--force-create",
+                    &settings.branch,
+                    &default_ref,
+                ])
+                .await?;
+                git.run(["clean", "--quiet", "--force", "-d"]).await?;
+            }
+        }
 
         if !settings.prepare_command.is_empty() {
             git::shell(dir, "prepare command", &settings.prepare_command).await?;
@@ -474,9 +728,19 @@ impl<'a> Session<'a> {
         let changed = !git.test(["diff", "--cached", "--quiet"]).await?;
         let changed_paths = staged_paths(&git).await?;
         let min_age = policy_min_age(settings);
+        let merge_requests = settings.major_merge_requests_url();
+        let lane = match settings.lane {
+            Lane::Ordinary if settings.major_mr => present::Lane::BesideMajor {
+                branch: &settings.major_branch,
+                merge_requests: &merge_requests,
+            },
+            Lane::Ordinary => present::Lane::Ordinary,
+            Lane::Major => present::Lane::Major,
+        };
         let mut presentation = Presentation::from_report(
             &report,
             &present::Context {
+                lane,
                 min_age: &min_age,
                 max_bump: &settings.max_bump,
                 lock: settings.lock,
@@ -599,6 +863,16 @@ impl<'a> Session<'a> {
             AutoMerge::Enabled
         } else if merge_request.auto_merge_enabled() {
             api.cancel_auto_merge(merge_request.iid).await?;
+            log.line(match settings.lane {
+                Lane::Ordinary => format!(
+                    "Cancelled auto-merge on {}: auto-merge is off",
+                    merge_request.web_url
+                ),
+                Lane::Major => format!(
+                    "Cancelled auto-merge on {}: upd never merges a major upgrade",
+                    merge_request.web_url
+                ),
+            });
             AutoMerge::Disabled
         } else {
             AutoMerge::Off
@@ -810,22 +1084,33 @@ async fn run_updater(settings: &Settings, log: &Log) -> Result<Value, Error> {
     if settings.lock {
         args.push("--lock");
     }
+    // The ordinary lane's ceiling and the major lane's level are exclusive,
+    // so which one the updater gets follows from the lane alone.
+    let max_bump = match settings.lane {
+        Lane::Ordinary => settings.max_bump.as_str(),
+        // `--strict-bump` also holds the pins, revisions and rewrites that
+        // name no level, which the ordinary lane already carries.
+        Lane::Major => {
+            args.extend(["--only-bump", "major", "--strict-bump"]);
+            ""
+        }
+    };
     let config = settings
         .config
         .as_ref()
         .map(|path| path.to_string_lossy().into_owned())
         .unwrap_or_default();
     for (flag, value) in [
-        ("--config", &config),
+        ("--config", config.as_str()),
         ("--min-age", &settings.min_age),
         ("--min-age-floor", &settings.min_age_floor),
-        ("--max-bump", &settings.max_bump),
+        ("--max-bump", max_bump),
         ("--lang", &settings.langs),
         ("--exclude-lang", &settings.exclude_langs),
         ("--package", &settings.packages),
     ] {
         if !value.is_empty() {
-            args.extend([flag, value.as_str()]);
+            args.extend([flag, value]);
         }
     }
     args.extend(settings.paths.iter().map(String::as_str));
@@ -1021,6 +1306,126 @@ mod tests {
             let error = settings(overrides).unwrap_err();
             assert_eq!(error.exit_code(), 4, "{overrides:?}: {error}");
         }
+    }
+
+    #[test]
+    fn the_major_lane_is_off_unless_asked_for_and_has_its_own_defaults() {
+        let off = settings(&[]).unwrap();
+        assert!(!off.major_mr);
+        assert!(off.major_lane().is_none());
+
+        let on = settings(&[("UPD_MAJOR_MR", "true"), ("UPD_MAX_BUMP", "minor")]).unwrap();
+        assert_eq!(on.major_branch, "automation/upd-dependencies-major");
+        assert_eq!(
+            on.major_commit_message,
+            "chore(deps): update major dependencies with upd"
+        );
+        let major = on.major_lane().unwrap();
+        assert_eq!(major.branch, "automation/upd-dependencies-major");
+        assert_eq!(
+            major.commit_message,
+            "chore(deps): update major dependencies with upd"
+        );
+        assert_eq!(major.lane, Lane::Major);
+        assert!(major.major_lane().is_none());
+        assert_eq!(on.lane, Lane::Ordinary);
+    }
+
+    #[test]
+    fn the_major_lane_never_auto_merges_and_ignores_the_ordinary_title() {
+        let on = settings(&[
+            ("UPD_MAJOR_MR", "true"),
+            ("UPD_MAX_BUMP", "patch"),
+            ("UPD_AUTO_MERGE", "true"),
+            ("UPD_MR_TITLE", "chore: dependencies"),
+            ("UPD_MAJOR_BRANCH", "deps/major"),
+            ("UPD_MAJOR_COMMIT_MESSAGE", "chore(deps): majors"),
+        ])
+        .unwrap();
+        assert!(on.auto_merge);
+        let major = on.major_lane().unwrap();
+        assert!(!major.auto_merge);
+        assert!(major.mr_title.is_empty());
+        assert_eq!(major.branch, "deps/major");
+        assert_eq!(major.commit_message, "chore(deps): majors");
+        assert_eq!(major.max_bump, "", "the major lane passes no ceiling");
+    }
+
+    #[test]
+    fn a_major_lane_that_would_repeat_the_ordinary_lane_is_refused() {
+        for overrides in [
+            &[("UPD_MAJOR_MR", "true")][..],
+            &[("UPD_MAJOR_MR", "true"), ("UPD_MAX_BUMP", "major")],
+            &[
+                ("UPD_MAJOR_MR", "true"),
+                ("UPD_MAX_BUMP", "minor"),
+                ("UPD_MAJOR_BRANCH", "automation/upd-dependencies"),
+            ],
+            &[
+                ("UPD_MAJOR_MR", "true"),
+                ("UPD_MAX_BUMP", "minor"),
+                ("UPD_MAJOR_BRANCH", "main"),
+            ],
+            // Git cannot hold a branch and another nested under its name.
+            &[
+                ("UPD_MAJOR_MR", "true"),
+                ("UPD_MAX_BUMP", "minor"),
+                ("UPD_MAJOR_BRANCH", "automation/upd-dependencies/major"),
+            ],
+            &[
+                ("UPD_MAJOR_MR", "true"),
+                ("UPD_MAX_BUMP", "minor"),
+                ("UPD_MAJOR_BRANCH", "automation"),
+            ],
+            &[
+                ("UPD_MAJOR_MR", "true"),
+                ("UPD_MAX_BUMP", "minor"),
+                ("UPD_MAJOR_BRANCH", "main/major"),
+            ],
+            &[("UPD_MAJOR_MR", "yes"), ("UPD_MAX_BUMP", "minor")],
+            // The ordinary lane would refuse a ceiling it cannot read, so the
+            // major lane must not run beside it.
+            &[("UPD_MAJOR_MR", "true"), ("UPD_MAX_BUMP", "minro")],
+            &[("UPD_MAJOR_MR", "true"), ("UPD_MAX_BUMP", "Minor")],
+        ] {
+            let error = settings(overrides).unwrap_err();
+            assert_eq!(error.exit_code(), 4, "{overrides:?}: {error}");
+        }
+        // Off, the major inputs are not consulted at all.
+        settings(&[("UPD_MAJOR_BRANCH", "automation/upd-dependencies")]).unwrap();
+    }
+
+    #[test]
+    fn branches_collide_only_when_git_could_not_hold_both() {
+        for (a, b) in [("deps", "deps"), ("deps", "deps/major"), ("a/b", "a/b/c/d")] {
+            assert!(branches_collide(a, b), "{a} and {b}");
+            assert!(branches_collide(b, a), "{b} and {a}");
+        }
+        for (a, b) in [
+            ("deps", "deps-major"),
+            ("deps/a", "deps/b"),
+            (
+                "automation/upd-dependencies",
+                "automation/upd-dependencies-major",
+            ),
+        ] {
+            assert!(!branches_collide(a, b), "{a} and {b}");
+            assert!(!branches_collide(b, a), "{b} and {a}");
+        }
+    }
+
+    #[test]
+    fn the_major_merge_requests_link_names_the_encoded_branch() {
+        let on = settings(&[
+            ("UPD_MAJOR_MR", "true"),
+            ("UPD_MAX_BUMP", "minor"),
+            ("CI_SERVER_URL", "https://gitlab.example.test/"),
+        ])
+        .unwrap();
+        assert_eq!(
+            on.major_merge_requests_url(),
+            "https://gitlab.example.test/group/project/-/merge_requests?state=opened&source_branch=automation%2Fupd-dependencies-major"
+        );
     }
 
     #[test]

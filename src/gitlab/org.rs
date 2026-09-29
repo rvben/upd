@@ -9,7 +9,6 @@
 
 use std::env;
 use std::path::PathBuf;
-use std::process::Stdio;
 use std::str::FromStr;
 
 use clap::ValueEnum;
@@ -20,7 +19,7 @@ use serde_json::{Value, json};
 use super::Error;
 use super::api::Client;
 use super::git::{self, Git};
-use super::run::{Log, Outcome, Session, Settings};
+use super::run::{self, Lane, Log, Outcome, Session, Settings};
 use crate::config::{CONFIG_FILE_NAMES, UpdConfig};
 use crate::updater::Lang;
 
@@ -47,6 +46,11 @@ pub struct OrgSettings {
     pub max_bump: String,
     /// Whether auto-merge is allowed at all; each project must also consent.
     pub auto_merge: bool,
+    /// Whether a major-upgrade merge request is allowed at all; each project
+    /// must also consent.
+    pub major_mr: bool,
+    pub major_branch: String,
+    pub major_commit_message: String,
     pub concurrency: usize,
     pub exclude: Vec<(String, GlobMatcher)>,
     pub updater: PathBuf,
@@ -76,15 +80,13 @@ impl OrgSettings {
                 Error::Input("CI_PROJECT_ID must be a numeric project ID".to_string())
             })?),
         };
-        let auto_merge = match value("UPD_AUTO_MERGE").as_deref() {
-            None | Some("false") => false,
-            Some("true") => true,
-            Some(_) => {
-                return Err(Error::Input(
-                    "UPD_AUTO_MERGE must be true or false".to_string(),
-                ));
-            }
+        let flag = |name: &str| match value(name).as_deref() {
+            None | Some("false") => Ok(false),
+            Some("true") => Ok(true),
+            Some(_) => Err(Error::Input(format!("{name} must be true or false"))),
         };
+        let auto_merge = flag("UPD_AUTO_MERGE")?;
+        let major_mr = flag("UPD_MAJOR_MR")?;
         let concurrency = match value("UPD_CONCURRENCY") {
             None => DEFAULT_CONCURRENCY,
             Some(text) => text
@@ -143,6 +145,10 @@ impl OrgSettings {
                 .map_err(|error| Error::Io(format!("cannot locate the upd executable: {error}")))?,
         };
         let branch = optional("UPD_BRANCH", "automation/upd-dependencies");
+        let major_branch = optional("UPD_MAJOR_BRANCH", "automation/upd-dependencies-major");
+        if major_mr {
+            run::check_major_lane(&max_bump, "UPD_MAX_BUMP", &branch, &major_branch)?;
+        }
 
         Ok(Self {
             token: required(
@@ -167,6 +173,12 @@ impl OrgSettings {
             min_age_floor,
             max_bump,
             auto_merge,
+            major_mr,
+            major_branch,
+            major_commit_message: optional(
+                "UPD_MAJOR_COMMIT_MESSAGE",
+                "chore(deps): update major dependencies with upd",
+            ),
             concurrency,
             exclude,
             updater,
@@ -206,6 +218,11 @@ impl OrgSettings {
             updater: self.updater.clone(),
             config: None,
             dry_run: self.dry_run,
+            // The project's own consent, read from its tree, enables it.
+            major_mr: false,
+            major_branch: self.major_branch.clone(),
+            major_commit_message: self.major_commit_message.clone(),
+            lane: Lane::Ordinary,
         }
     }
 }
@@ -240,6 +257,9 @@ pub struct ProjectReport {
     pub id: u64,
     pub path: String,
     pub state: State,
+    /// The major lane's result; absent unless both the organization and the
+    /// project enabled it.
+    pub major: Option<Result<Outcome, Error>>,
 }
 
 impl State {
@@ -263,8 +283,11 @@ impl State {
 }
 
 impl ProjectReport {
-    fn to_json(&self, branch: &str) -> Value {
+    fn to_json(&self, branch: &str, major_branch: &str) -> Value {
         let mut value = json!({"id": self.id, "path": self.path, "state": self.state.name()});
+        if let Some(major) = &self.major {
+            value["major"] = run::major_lane_json(major, major_branch);
+        }
         match &self.state {
             State::Skipped(reason) => {
                 value["reason"] = json!(reason);
@@ -297,7 +320,7 @@ impl ProjectReport {
         value
     }
 
-    fn render_text(&self, branch: &str) -> String {
+    fn render_text(&self, branch: &str, major_branch: &str) -> String {
         let detail = match &self.state {
             State::Skipped(reason) => format!("skipped ({reason})"),
             State::NotOptedIn(reason) => format!("not opted in ({reason})"),
@@ -307,13 +330,22 @@ impl ProjectReport {
             State::Processed(outcome) => outcome.render_text(branch),
             State::Failed(error) => format!("failed ({}): {}", error.kind(), error.message()),
         };
-        format!("{}: {detail}", self.path)
+        let major = match &self.major {
+            Some(major) => format!(
+                "\n{}: major lane: {}",
+                self.path,
+                run::lane_text(major, major_branch)
+            ),
+            None => String::new(),
+        };
+        format!("{}: {detail}{major}", self.path)
     }
 
     /// Whether the project needs someone's attention for the run to count
-    /// as successful.
+    /// as successful: either lane failed, or its opt-in could not be read.
     fn is_failure(&self) -> bool {
         matches!(self.state, State::Failed(_) | State::ConfigInvalid { .. })
+            || matches!(self.major, Some(Err(_)))
     }
 }
 
@@ -322,6 +354,9 @@ impl ProjectReport {
 pub struct Report {
     pub group: String,
     pub branch: String,
+    /// The major lane's branch; absent when the organization did not enable
+    /// the lane.
+    pub major_branch: Option<String>,
     pub dry_run: bool,
     pub projects: Vec<ProjectReport>,
 }
@@ -330,6 +365,18 @@ impl Report {
     /// Projects that failed or whose opt-in could not be read.
     pub fn failures(&self) -> usize {
         self.projects.iter().filter(|p| p.is_failure()).count()
+    }
+
+    /// Projects whose major lane failed, whatever their ordinary lane did.
+    fn major_failures(&self) -> usize {
+        self.projects
+            .iter()
+            .filter(|project| matches!(project.major, Some(Err(_))))
+            .count()
+    }
+
+    fn major_branch(&self) -> &str {
+        self.major_branch.as_deref().unwrap_or_default()
     }
 
     fn count(&self, state: &str) -> usize {
@@ -345,19 +392,26 @@ impl Report {
         for state in State::NAMES {
             counts.insert(state.to_string(), json!(self.count(state)));
         }
+        if self.major_branch.is_some() {
+            counts.insert("major_failed".to_string(), json!(self.major_failures()));
+        }
         let projects: Vec<Value> = self
             .projects
             .iter()
-            .map(|project| project.to_json(&self.branch))
+            .map(|project| project.to_json(&self.branch, self.major_branch()))
             .collect();
-        json!({
+        let mut value = json!({
             "command": "gitlab org run",
             "group": self.group,
             "branch": self.branch,
             "dry_run": self.dry_run,
             "counts": counts,
             "projects": projects,
-        })
+        });
+        if let Some(major_branch) = &self.major_branch {
+            value["major_branch"] = json!(major_branch);
+        }
+        value
     }
 
     /// One line per project that was considered, then a summary.
@@ -366,7 +420,7 @@ impl Report {
             .projects
             .iter()
             .filter(|project| !matches!(project.state, State::Skipped(_)))
-            .map(|project| project.render_text(&self.branch))
+            .map(|project| project.render_text(&self.branch, self.major_branch()))
             .collect();
         lines.push(self.summary());
         lines.join("\n")
@@ -375,8 +429,12 @@ impl Report {
     /// One line counting the projects in each state.
     pub fn summary(&self) -> String {
         let count = |state| self.count(state);
+        let major = match self.major_branch {
+            Some(_) => format!(", {} major lane(s) failed", self.major_failures()),
+            None => String::new(),
+        };
         format!(
-            "{}{} projects in {}: {} processed, {} not opted in, {} with invalid configuration, {} failed, {} skipped.",
+            "{}{} projects in {}: {} processed, {} not opted in, {} with invalid configuration, {} failed, {} skipped{major}.",
             if self.dry_run { "Dry run: " } else { "" },
             self.projects.len(),
             self.group,
@@ -390,19 +448,9 @@ impl Report {
 }
 
 pub async fn run(settings: &OrgSettings) -> Result<Report, Error> {
-    if !git::child(&env::temp_dir(), "git")
-        .args(["check-ref-format", "--branch", &settings.branch])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .await
-        .map_err(|error| Error::Io(format!("cannot start git: {error}")))?
-        .success()
-    {
-        return Err(Error::Input(format!(
-            "Invalid automation branch: {}",
-            settings.branch
-        )));
+    run::check_branch_name(&env::temp_dir(), &settings.branch).await?;
+    if settings.major_mr {
+        run::check_branch_name(&env::temp_dir(), &settings.major_branch).await?;
     }
     let api = Client::new(&settings.api_url, &settings.token)?;
     let listed = api.group_projects(&settings.group).await?;
@@ -422,7 +470,7 @@ pub async fn run(settings: &OrgSettings) -> Result<Report, Error> {
                 eprint!(
                     "==> {}\n{buffered}{}\n",
                     report.path,
-                    report.render_text(&settings.branch)
+                    report.render_text(&settings.branch, &settings.major_branch)
                 );
             }
             report
@@ -436,6 +484,7 @@ pub async fn run(settings: &OrgSettings) -> Result<Report, Error> {
     Ok(Report {
         group: settings.group.clone(),
         branch: settings.branch.clone(),
+        major_branch: settings.major_mr.then(|| settings.major_branch.clone()),
         dry_run: settings.dry_run,
         projects,
     })
@@ -447,18 +496,19 @@ async fn handle(settings: &OrgSettings, api: &Client, raw: Value, log: &Log) -> 
         .as_str()
         .unwrap_or_default()
         .to_string();
-    let report = |state| ProjectReport {
+    let report = |state, major| ProjectReport {
         id,
         path: path.clone(),
         state,
+        major,
     };
     let project = match classify(settings, raw) {
         Ok(project) => project,
-        Err(state) => return report(state),
+        Err(state) => return report(state, None),
     };
     match process(settings, api, &project, log).await {
-        Ok(state) => report(state),
-        Err(error) => report(State::Failed(error)),
+        Ok((state, major)) => report(state, major),
+        Err(error) => report(State::Failed(error), None),
     }
 }
 
@@ -511,6 +561,12 @@ fn classify(settings: &OrgSettings, raw: Value) -> Result<Project, State> {
             settings.branch
         ))));
     }
+    if settings.major_mr && run::branches_collide(&default_branch, &settings.major_branch) {
+        return Err(State::Failed(Error::Input(format!(
+            "The major automation branch {} cannot sit beside the project's default branch {default_branch}: they are the same branch, or one is nested under the other's name",
+            settings.major_branch
+        ))));
+    }
     Ok(Project {
         id,
         path,
@@ -536,8 +592,15 @@ fn is_project_path(path: &str) -> bool {
 /// The repository's answer to whether automation may update it.
 enum Consent {
     No(String),
-    Invalid { config: String, message: String },
-    Yes { config: String, auto_merge: bool },
+    Invalid {
+        config: String,
+        message: String,
+    },
+    Yes {
+        config: String,
+        auto_merge: bool,
+        major_mr: bool,
+    },
 }
 
 impl Consent {
@@ -555,6 +618,7 @@ impl Consent {
                     Self::Yes {
                         config: config.to_string(),
                         auto_merge: parsed.auto_merge_enabled(),
+                        major_mr: parsed.major_mr_enabled(),
                     }
                 } else {
                     Self::No(format!(
@@ -573,18 +637,20 @@ impl Consent {
     }
 }
 
+/// The project's state, and the major lane's result when the project
+/// consented to one. The major lane runs even when the ordinary lane failed.
 async fn process(
     settings: &OrgSettings,
     api: &Client,
     project: &Project,
     log: &Log,
-) -> Result<State, Error> {
+) -> Result<(State, Option<Result<Outcome, Error>>), Error> {
     // A cheap read through the API spares cloning projects that have not
     // opted in. Anything else goes on to the clone, whose own copy of the
     // file decides: the API follows no symbolic link and answers with the
     // link's target path, so only the tree can say what is wrong with it.
     if let Consent::No(reason) = api_consent(api, project).await? {
-        return Ok(State::NotOptedIn(reason));
+        return Ok((State::NotOptedIn(reason), None));
     }
 
     let work = tempfile::Builder::new()
@@ -609,16 +675,32 @@ async fn process(
 
     let mut session = Session::open(settings.for_project(project, dir), log).await?;
     match tree_consent(&session.git, &session.default_ref, log).await? {
-        Consent::No(reason) => return Ok(State::NotOptedIn(reason)),
+        Consent::No(reason) => return Ok((State::NotOptedIn(reason), None)),
         Consent::Invalid { config, message } => {
-            return Ok(State::ConfigInvalid { config, message });
+            return Ok((State::ConfigInvalid { config, message }, None));
         }
-        Consent::Yes { config, auto_merge } => {
+        Consent::Yes {
+            config,
+            auto_merge,
+            major_mr,
+        } => {
             session.settings.config = Some(PathBuf::from(config));
             session.settings.auto_merge = settings.auto_merge && auto_merge;
+            session.settings.major_mr = settings.major_mr && major_mr;
         }
     }
-    Ok(State::Processed(session.propose().await?))
+    // The major lane reads the same configuration and consent the ordinary
+    // lane was given, from the same checkout.
+    let major = session.settings.major_lane();
+    let state = match session.propose().await {
+        Ok(outcome) => State::Processed(outcome),
+        Err(error) => State::Failed(error),
+    };
+    let major = match major {
+        Some(major) => Some(run::propose_major(major, log).await),
+        None => None,
+    };
+    Ok((state, major))
 }
 
 async fn api_consent(api: &Client, project: &Project) -> Result<Consent, Error> {
@@ -693,6 +775,48 @@ mod tests {
         assert!(settings.exclude.is_empty() && settings.min_age_floor.is_empty());
         let accepted = self::settings(&[("UPD_LANGS", "python, rust")]).unwrap();
         assert_eq!(accepted.langs, "python,rust");
+        assert!(!settings.major_mr);
+        assert_eq!(settings.major_branch, "automation/upd-dependencies-major");
+        assert_eq!(
+            settings.major_commit_message,
+            "chore(deps): update major dependencies with upd"
+        );
+    }
+
+    #[test]
+    fn a_project_starts_with_the_major_lane_off_until_it_consents() {
+        let settings = settings(&[("UPD_MAJOR_MR", "true"), ("UPD_MAX_BUMP", "minor")]).unwrap();
+        assert!(settings.major_mr);
+        let project = classify(&settings, listed(json!({}))).unwrap();
+        let single = settings.for_project(&project, PathBuf::from("/tmp/checkout"));
+        assert!(!single.major_mr && single.major_lane().is_none());
+        assert_eq!(single.major_branch, "automation/upd-dependencies-major");
+
+        let state = classify(
+            &settings,
+            listed(json!({"default_branch": "automation/upd-dependencies-major"})),
+        );
+        assert!(
+            matches!(state, Err(State::Failed(Error::Input(_)))),
+            "{state:?}"
+        );
+    }
+
+    #[test]
+    fn a_major_branch_nested_under_the_default_branch_is_refused() {
+        let settings = settings(&[
+            ("UPD_MAJOR_MR", "true"),
+            ("UPD_MAX_BUMP", "minor"),
+            ("UPD_MAJOR_BRANCH", "main/major"),
+        ])
+        .unwrap();
+        let state = classify(&settings, listed(json!({"default_branch": "main"})));
+        assert!(
+            matches!(state, Err(State::Failed(Error::Input(_)))),
+            "{state:?}"
+        );
+        // A project that keeps a different default branch is unaffected.
+        classify(&settings, listed(json!({"default_branch": "develop"}))).unwrap();
     }
 
     #[test]
@@ -711,6 +835,21 @@ mod tests {
             &[("UPD_EXCLUDE", "acme/[")],
             &[("UPD_LANGS", "python,nix")],
             &[("UPD_LANGS", "python,pypi")],
+            &[("UPD_MAJOR_MR", "yes"), ("UPD_MAX_BUMP", "minor")],
+            &[("UPD_MAJOR_MR", "true")],
+            &[("UPD_MAJOR_MR", "true"), ("UPD_MAX_BUMP", "major")],
+            &[
+                ("UPD_MAJOR_MR", "true"),
+                ("UPD_MAX_BUMP", "minor"),
+                ("UPD_MAJOR_BRANCH", "automation/upd-dependencies"),
+            ],
+            &[
+                ("UPD_MAJOR_MR", "true"),
+                ("UPD_MAX_BUMP", "minor"),
+                ("UPD_MAJOR_BRANCH", "automation/upd-dependencies/major"),
+            ],
+            &[("UPD_MAJOR_MR", "true"), ("UPD_MAX_BUMP", "minro")],
+            &[("UPD_MAJOR_MR", "true"), ("UPD_MAX_BUMP", "Minor")],
         ] {
             let error = settings(overrides).unwrap_err();
             assert_eq!(error.exit_code(), 4, "{overrides:?}: {error}");
