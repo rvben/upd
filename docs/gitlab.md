@@ -214,6 +214,12 @@ that carries only security fixes is still published. Advisories are looked up
 through [OSV](https://osv.dev), so the runner needs outbound HTTPS access to
 `api.osv.dev`.
 
+A fix's relock can lock other releases besides the fix, such as a new
+transitive dependency the fixed version requires. The security step reads each
+relocked lockfile back against `min_age`, and lists every release it finds
+inside the freshness window, other than the fixes themselves, under "Needs
+attention". upd leaves them locked, since holding one back could undo the fix.
+
 With `lock: false`, a fix rewrites the manifest only and is marked as awaiting
 lockfile regeneration: until a lockfile is regenerated it still records the
 vulnerable version. A fix that can only be made in a lockfile (a Cargo
@@ -360,7 +366,9 @@ nothing is written to GitLab; the outcome is then `would_publish` (with `push`
 saying whether the branch would change), `would_close`, or `would_pause` in
 place of the last three. When the security step ran, the JSON object also
 carries `security` with the number of `fixes`, `pending_relock`, `blocked`,
-`skipped`, `not_applied` and `unfixable` entries and of `advisories` resolved.
+`skipped`, `not_applied` and `unfixable` entries and of `advisories` resolved,
+plus `young`, the releases a fix's relock locked inside the freshness window,
+when there are any.
 With the major lane enabled, its result follows on a second line of text, or
 under `major` in the JSON object with the same fields. A lane that failed
 reports the outcome `failed` with its `error` (`kind`, `message`, `exit_code`)

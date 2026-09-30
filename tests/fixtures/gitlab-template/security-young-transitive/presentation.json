@@ -1,0 +1,76 @@
+{
+  "annotations": [],
+  "auto_merge_requested": false,
+  "blocked": [],
+  "changed": true,
+  "changed_paths": [
+    "dependency.txt"
+  ],
+  "counts": {
+    "annotations": 0,
+    "blocked": 0,
+    "files_changed": 1,
+    "normalized": 0,
+    "not_examined": 0,
+    "policy_holds": 0,
+    "updates": 0,
+    "updates_major": 0,
+    "updates_minor": 0,
+    "updates_patch": 0,
+    "updates_quiet": 0,
+    "updates_review_worthy": 0,
+    "updates_revision": 0,
+    "warnings": 0
+  },
+  "normalized": [],
+  "policy": {
+    "lockfile_regeneration": true,
+    "max_bump": "minor",
+    "min_age": "7d"
+  },
+  "policy_holds": [],
+  "schema": 1,
+  "security": {
+    "counts": {
+      "advisories": 2,
+      "blocked": 0,
+      "fixes": 1,
+      "not_applied": 0,
+      "pending_relock": 0,
+      "skipped": 0,
+      "unfixable": 0,
+      "young": 1
+    },
+    "fixes": [
+      {
+        "advisories": [
+          "GHSA-29mw-wpgm-hmr9",
+          "GHSA-35jh-r3h4-6jhm"
+        ],
+        "from": "4.17.20",
+        "package": "lodash",
+        "path": "dependency.txt",
+        "severity": "High",
+        "status": "applied",
+        "to": "4.17.21"
+      }
+    ],
+    "unfixable": [],
+    "young": [
+      {
+        "cooldown": "7d",
+        "lockfile": "package-lock.json",
+        "package": "lodash-helper",
+        "published_at": "2026-09-28T14:02:11Z",
+        "version": "2.1.0"
+      }
+    ]
+  },
+  "state": "ready",
+  "title": "fix(security): resolve 2 advisories in lodash",
+  "updates": [],
+  "validation": {
+    "proposal_integrity_passed": true,
+    "repository_command_configured": false
+  }
+}

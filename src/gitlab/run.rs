@@ -1199,8 +1199,10 @@ async fn run_updater(settings: &Settings, log: &Log) -> Result<Value, Error> {
 
 /// Moves every dependency with a published advisory to the lowest release
 /// that resolves it. The step answers to the advisories, not to the update
-/// policy, so the freshness window, bump ceiling and package filter are
-/// never passed on.
+/// policy, so the bump ceiling and package filter are never passed on. The
+/// freshness window is, but only to read each relock back against: a fix is
+/// written however young, and what else its relock locked inside the window
+/// is reported rather than held.
 async fn run_security_fixes(settings: &Settings, log: &Log) -> Result<Value, Error> {
     let mut args: Vec<&str> = vec![
         "audit",
@@ -1222,6 +1224,8 @@ async fn run_security_fixes(settings: &Settings, log: &Log) -> Result<Value, Err
         .unwrap_or_default();
     for (flag, value) in [
         ("--config", config.as_str()),
+        ("--min-age", &settings.min_age),
+        ("--min-age-floor", &settings.min_age_floor),
         ("--lang", &settings.langs),
         ("--exclude-lang", &settings.exclude_langs),
     ] {

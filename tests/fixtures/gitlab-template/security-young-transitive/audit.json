@@ -1,0 +1,16 @@
+{
+  "command": "audit",
+  "status": "complete",
+  "vulnerabilities": [
+    {"package": "lodash", "version": "4.17.20", "ecosystem": "npm", "id": "GHSA-35jh-r3h4-6jhm", "summary": "Command injection in lodash", "severity": "High", "fixed_version": "4.17.21", "url": "https://osv.dev/vulnerability/GHSA-35jh-r3h4-6jhm", "aliases": ["CVE-2021-23337"], "source": "GHSA"},
+    {"package": "lodash", "version": "4.17.20", "ecosystem": "npm", "id": "GHSA-29mw-wpgm-hmr9", "summary": "Regular expression denial of service in lodash", "severity": "Medium", "fixed_version": "4.17.21", "url": "https://osv.dev/vulnerability/GHSA-29mw-wpgm-hmr9", "aliases": ["CVE-2020-28500"], "source": "GHSA"}
+  ],
+  "errors": [],
+  "summary": {"packages_checked": 12, "vulnerable_packages": 1, "vulnerabilities": 2, "errors": 0},
+  "fixes": [
+    {"package": "lodash", "ecosystem": "npm", "from_version": "4.17.20", "to_version": "4.17.21", "method": "manifest", "path": "dependency.txt", "status": "applied"}
+  ],
+  "lockfile_cooldown": [
+    {"lockfile": "package-lock.json", "package": "lodash-helper", "version": "2.1.0", "published_at": "2026-09-28T14:02:11Z", "cooldown": "7d"}
+  ]
+}

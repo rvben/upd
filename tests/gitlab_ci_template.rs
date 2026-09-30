@@ -3782,9 +3782,11 @@ async fn security_fixes_run_before_the_update_and_without_its_policy() {
 
     let invocations = fixture.updater_invocations();
     assert_eq!(invocations.len(), 2, "{invocations:?}");
+    // The cooldown reaches the security step only to read its relocks back
+    // against; the bump ceiling and package filter never do.
     assert_eq!(
         invocations[0],
-        "audit --fix-audit --apply --full-precision --format json --no-lock ."
+        "audit --fix-audit --apply --full-precision --format json --no-lock --min-age 7d ."
     );
     // The update keeps the policy the security step leaves out.
     let update = format!(" {} ", invocations[1]);
@@ -3815,7 +3817,7 @@ async fn security_fixes_relock_when_lockfile_regeneration_is_on() {
     let invocations = fixture.updater_invocations();
     assert_eq!(
         invocations[0],
-        "audit --fix-audit --apply --full-precision --format json ."
+        "audit --fix-audit --apply --full-precision --format json --min-age 7d ."
     );
     assert!(
         format!(" {} ", invocations[1]).contains(" --lock "),
@@ -4130,6 +4132,24 @@ async fn golden_security_fix_alone() {
             audit_file: "dependency.txt".to_string(),
             audit_content: "lodash 4.17.21".to_string(),
             audit_report: golden_audit("security-only"),
+            ..Run::default()
+        },
+    )
+    .await;
+}
+
+/// A young release the fix's relock locked besides the fix is listed for
+/// review, and the fix still stands.
+#[tokio::test]
+async fn golden_security_fix_pulling_in_a_young_release() {
+    assert_rendering_matches_golden(
+        "security-young-transitive",
+        Run {
+            lock: "true".to_string(),
+            change: false,
+            audit_file: "dependency.txt".to_string(),
+            audit_content: "lodash 4.17.21".to_string(),
+            audit_report: golden_audit("security-young-transitive"),
             ..Run::default()
         },
     )

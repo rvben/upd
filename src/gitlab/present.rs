@@ -445,6 +445,26 @@ impl Presentation {
             .map_or(0, |security| security.counts.fixes)
     }
 
+    /// Releases the security fixes' relocks locked inside the cooldown.
+    fn young_releases(&self) -> usize {
+        self.security
+            .as_ref()
+            .map_or(0, |security| security.counts.young)
+    }
+
+    /// The header's pointer to the young releases a fix's relock locked,
+    /// starting with its separating space; empty when there are none.
+    fn young_note(&self) -> String {
+        let young = self.young_releases();
+        if young == 0 {
+            return String::new();
+        }
+        format!(
+            " A fix's relock also locked {young} {} inside the freshness window, listed under Needs attention.",
+            plural(young, "release", "releases"),
+        )
+    }
+
     /// The merge-request description proposing `commit`: the full review
     /// when it fits the budget, otherwise a compact summary pointing at the
     /// pipeline artifact, and either way ending with the commit's record.
@@ -595,7 +615,7 @@ impl Presentation {
         let security = self.security_fixes();
         if counts.blocked == 0 && security > 0 {
             return format!(
-                "> **{}, already prepared.** upd prepared {} across {} and {}. {}",
+                "> **{}, already prepared.** upd prepared {} across {} and {}. {}{}",
                 if security == 1 {
                     "A security fix"
                 } else {
@@ -605,16 +625,18 @@ impl Presentation {
                 self.files_phrase(),
                 self.validation_phrase(),
                 self.version_boundary(),
+                self.young_note(),
             );
         }
         if counts.blocked > 0 {
             format!(
-                "> **A careful upgrade, with follow-up.** upd prepared {} across {} and {}. It stopped short of {} {} it could not change safely.",
+                "> **A careful upgrade, with follow-up.** upd prepared {} across {} and {}. It stopped short of {} {} it could not change safely.{}",
                 self.result_summary(),
                 self.files_phrase(),
                 self.validation_phrase(),
                 counts.blocked,
                 plural(counts.blocked, "dependency", "dependencies"),
+                self.young_note(),
             )
         } else {
             format!(
@@ -662,6 +684,10 @@ impl Presentation {
                 counts.blocked,
                 plural(counts.blocked, "needs", "need")
             ));
+        }
+        let young = self.young_releases();
+        if young > 0 {
+            facts.push(format!("{young} inside the freshness window"));
         }
         let unfixable = self
             .security
@@ -858,8 +884,17 @@ impl Presentation {
 
     fn blocked_section(&self) -> String {
         let blocked = self.counts.blocked;
+        let young = self
+            .security
+            .as_ref()
+            .map(Security::young_section)
+            .unwrap_or_default();
         if blocked == 0 {
-            return String::new();
+            return if young.is_empty() {
+                String::new()
+            } else {
+                format!("\n\n### Needs attention{young}")
+            };
         }
         let mut out = String::from(
             "\n\n### Needs attention\n\n> These dependencies were not changed because upd could not do so safely.\n\n| Dependency | Current | Reason | File |\n|---|---:|---|---|\n",
@@ -879,6 +914,7 @@ impl Presentation {
                 blocked - 12
             ));
         }
+        out.push_str(&young);
         out
     }
 
@@ -938,7 +974,11 @@ impl Presentation {
     fn confidence(&self) -> String {
         let counts = &self.counts;
         let configured = self.validation.repository_command_configured;
-        let heading = if counts.blocked == 0 && counts.updates_major == 0 && configured {
+        let heading = if counts.blocked == 0
+            && self.young_releases() == 0
+            && counts.updates_major == 0
+            && configured
+        {
             "Why this is a comfortable review"
         } else {
             "What upd verified"
@@ -1048,7 +1088,7 @@ impl Presentation {
             counts.updates_major,
             counts.normalized,
             counts.policy_holds,
-            counts.blocked,
+            counts.blocked + self.young_releases(),
         )
     }
 }

@@ -24,6 +24,10 @@ use super::{
 /// lockfile was regenerated.
 const FIXED: [&str; 2] = ["applied", "pending_relock"];
 
+fn is_zero(count: &usize) -> bool {
+    *count == 0
+}
+
 /// Advisory ids shown in a table cell before the rest are summarized.
 const SHOWN_ADVISORIES: usize = 3;
 
@@ -51,6 +55,17 @@ pub struct UnfixableRow {
     pub reason: String,
 }
 
+/// A release a fix's relock locked besides the fix, published inside the
+/// cooldown. It stays locked, since holding it back could undo the fix.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct YoungRow {
+    pub package: String,
+    pub version: String,
+    pub published_at: String,
+    pub cooldown: String,
+    pub lockfile: String,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub struct SecurityCounts {
     /// Every fix that moved a dependency, including those awaiting a relock.
@@ -64,6 +79,10 @@ pub struct SecurityCounts {
     pub unfixable: usize,
     /// Distinct advisories of the packages every fix for which applied.
     pub advisories: usize,
+    /// Releases the fixes' relocks locked inside the cooldown; absent when
+    /// there are none.
+    #[serde(skip_serializing_if = "is_zero")]
+    pub young: usize,
 }
 
 /// The security step's part of the review model.
@@ -71,6 +90,9 @@ pub struct SecurityCounts {
 pub struct Security {
     pub fixes: Vec<SecurityFixRow>,
     pub unfixable: Vec<UnfixableRow>,
+    /// Absent when no fix's relock locked a release inside the cooldown.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub young: Vec<YoungRow>,
     pub counts: SecurityCounts,
     /// Fixes a requirement blocked, lockfile regeneration being off
     /// skipped, or upd could not write; the presentation lists them with
@@ -191,6 +213,26 @@ impl Security {
                 }
             }
         }
+        // A fix is written however young; what its relock locked besides,
+        // inside the cooldown, is left for review rather than held back.
+        let mut young = Vec::new();
+        for entry in each_or_empty(field(report, "lockfile_cooldown")?)? {
+            young.push(YoungRow {
+                package: clean_or(field(entry, "package")?, UNKNOWN_DEPENDENCY, 160),
+                version: clean_or(field(entry, "version")?, UNKNOWN, 160),
+                published_at: clean_or(field(entry, "published_at")?, UNKNOWN, 64),
+                cooldown: clean_or(field(entry, "cooldown")?, UNKNOWN, 32),
+                lockfile: clean_or(field(entry, "lockfile")?, UNKNOWN_FILE, 160),
+            });
+        }
+        unique_by(&mut young, |row| {
+            (
+                row.package.clone(),
+                row.version.clone(),
+                row.lockfile.clone(),
+            )
+        });
+        young.sort_by(|a, b| (&a.package, &a.lockfile).cmp(&(&b.package, &b.lockfile)));
         unique_by(&mut fixes, |row| {
             (
                 row.package.clone(),
@@ -233,10 +275,12 @@ impl Security {
             not_applied,
             unfixable: unfixable.len(),
             advisories: advisories.len(),
+            young: young.len(),
         };
         Ok(Self {
             fixes,
             unfixable,
+            young,
             counts,
             attention,
             resolved,
@@ -245,7 +289,10 @@ impl Security {
 
     /// Whether the step found anything to report.
     pub fn is_empty(&self) -> bool {
-        self.fixes.is_empty() && self.unfixable.is_empty() && self.attention.is_empty()
+        self.fixes.is_empty()
+            && self.unfixable.is_empty()
+            && self.attention.is_empty()
+            && self.young.is_empty()
     }
 
     /// Distinct packages the fixes moved, in order.
@@ -265,8 +312,16 @@ impl Security {
     /// fallback description so neither drops a caveat the other states.
     pub fn evidence_lines(&self) -> String {
         let counts = &self.counts;
+        let young = if counts.young > 0 {
+            format!(
+                "- Released inside the freshness window, locked by a fix's relock: {}\n",
+                counts.young
+            )
+        } else {
+            String::new()
+        };
         format!(
-            "- Security fixes: {} ({} awaiting lockfile regeneration)\n- Advisories resolved: {}\n- Advisories without a fix: {}\n",
+            "- Security fixes: {} ({} awaiting lockfile regeneration)\n- Advisories resolved: {}\n- Advisories without a fix: {}\n{young}",
             counts.fixes, counts.pending_relock, counts.advisories, counts.unfixable,
         )
     }
@@ -288,7 +343,8 @@ impl Security {
         ))
     }
 
-    /// A job-log warning for each dependency left vulnerable.
+    /// A job-log warning for each dependency left vulnerable, and for each
+    /// release a fix's relock locked inside the cooldown.
     pub fn warnings(&self) -> Vec<String> {
         let attention = self.attention.iter().map(|row| {
             format!(
@@ -302,7 +358,42 @@ impl Security {
                 row.package, row.version, row.reason
             )
         });
-        attention.chain(unfixable).collect()
+        let young = self.young.iter().map(|row| {
+            format!(
+                "warning: {} locks {} {}, released {}, inside the {} cooldown; a security fix's relock locked it",
+                row.lockfile, row.package, row.version, row.published_at, row.cooldown
+            )
+        });
+        attention.chain(unfixable).chain(young).collect()
+    }
+
+    /// The part of Needs attention for releases the fixes' relocks locked
+    /// inside the cooldown, starting with its separating blank line; empty
+    /// when there are none.
+    pub fn young_section(&self) -> String {
+        if self.young.is_empty() {
+            return String::new();
+        }
+        let mut out = String::from(
+            "\n\n> A security fix's relock also locked these releases, published inside the freshness window. upd leaves them locked, since holding them back could undo the fix; review them before merging.\n\n| Dependency | Version | Released | Cooldown | File |\n|---|---:|---|---|---|\n",
+        );
+        out.push_str(&table(&self.young, 12, |row| {
+            format!(
+                "| {} | {} | {} | {} | {} |",
+                code(&row.package),
+                code(&row.version),
+                code(&row.published_at),
+                md(&row.cooldown),
+                code(&row.lockfile)
+            )
+        }));
+        if self.young.len() > 12 {
+            out.push_str(&format!(
+                "\n\n_{} more releases inside the freshness window are preserved in the pipeline artifact._",
+                self.young.len() - 12
+            ));
+        }
+        out
     }
 
     /// The Security fixes section; empty without fixes.
@@ -614,6 +705,62 @@ mod tests {
             security.attention[0].reason,
             "security fix to 2.28.0 not applied: pinned to 1.0.0 by configuration; the fix needs 2.28.0 or later"
         );
+    }
+
+    #[test]
+    fn a_young_release_a_fix_relock_pulled_in_is_listed_without_reopening_the_fix() {
+        let security = Security::from_report(
+            &json!({
+                "vulnerabilities": [vulnerability("lodash", "GHSA-1", "High")],
+                "fixes": [fix("lodash", "4.17.21", "package.json", "applied")],
+                "lockfile_cooldown": [
+                    {"lockfile": "package-lock.json", "package": "newdep", "version": "1.0.0",
+                     "published_at": "2026-09-29T08:00:00Z", "cooldown": "7d"},
+                ],
+                "summary": {"errors": 0},
+            }),
+            true,
+        )
+        .unwrap();
+        assert_eq!(security.counts.fixes, 1);
+        assert_eq!(security.counts.advisories, 1, "the fix still resolves");
+        assert_eq!(security.resolved_packages(), ["lodash"]);
+        assert!(
+            security.attention.is_empty(),
+            "a young release was changed, not blocked"
+        );
+        assert_eq!(security.counts.young, 1);
+        assert_eq!(
+            security.young,
+            [YoungRow {
+                package: "newdep".to_string(),
+                version: "1.0.0".to_string(),
+                published_at: "2026-09-29T08:00:00Z".to_string(),
+                cooldown: "7d".to_string(),
+                lockfile: "package-lock.json".to_string(),
+            }]
+        );
+        assert!(!security.is_empty());
+        assert_eq!(
+            security.warnings(),
+            ["warning: package-lock.json locks newdep 1.0.0, released 2026-09-29T08:00:00Z, inside the 7d cooldown; a security fix's relock locked it"]
+        );
+    }
+
+    #[test]
+    fn a_report_without_young_releases_lists_none() {
+        let security = Security::from_report(
+            &json!({
+                "vulnerabilities": [vulnerability("lodash", "GHSA-1", "High")],
+                "fixes": [fix("lodash", "4.17.21", "package.json", "applied")],
+                "summary": {"errors": 0},
+            }),
+            true,
+        )
+        .unwrap();
+        assert!(security.attention.is_empty());
+        assert!(security.young.is_empty());
+        assert_eq!(security.young_section(), "");
     }
 
     #[test]
