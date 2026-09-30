@@ -138,6 +138,12 @@ impl AuditCache {
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs();
+        Self::is_expired_at(fetched_at, now)
+    }
+
+    /// Returns `true` when `fetched_at` is older than the 24-hour TTL at
+    /// `now`, both in seconds since the Unix epoch.
+    fn is_expired_at(fetched_at: u64, now: u64) -> bool {
         let ttl = Duration::from_secs(CACHE_TTL_HOURS * 3600).as_secs();
         now.saturating_sub(fetched_at) > ttl
     }
@@ -207,15 +213,16 @@ mod tests {
     #[test]
     fn is_expired_boundary_exactly_24h_is_not_expired() {
         // Exactly at 24h boundary: now - (24*3600) is NOT > ttl, so not expired.
-        let exactly_24h_ago = fresh_timestamp() - (24 * 3600);
-        assert!(!AuditCache::is_expired(exactly_24h_ago));
+        // `now` is fixed so a second ticking over mid-test cannot move it.
+        let now = 1_700_000_000;
+        assert!(!AuditCache::is_expired_at(now - 24 * 3600, now));
     }
 
     #[test]
     fn is_expired_one_second_past_boundary_is_expired() {
         // 24h + 1 second crosses the boundary.
-        let just_past = fresh_timestamp() - (24 * 3600) - 1;
-        assert!(AuditCache::is_expired(just_past));
+        let now = 1_700_000_000;
+        assert!(AuditCache::is_expired_at(now - 24 * 3600 - 1, now));
     }
 
     // ── get / set ─────────────────────────────────────────────────────────────
