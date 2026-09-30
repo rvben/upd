@@ -4924,7 +4924,13 @@ async fn run_audit(cli: &Cli) -> Result<()> {
         for note in &release_notes {
             eprintln!("note: {note}");
         }
-        let routing = route_fix_targets(&audit_result, &prov, &packages, &releases);
+        // The `ignore` and `pin` settings `update` honors hold a fix back the
+        // same way, resolved from the config governing each target's file.
+        let file_configs = load_update_configs(cli, &files)?;
+        let routing = upd::fix::hold_configured_targets(
+            route_fix_targets(&audit_result, &prov, &packages, &releases),
+            |path| resolve_floor_config(cli, &file_configs, path),
+        )?;
 
         // Diagnostics always go to stderr regardless of output mode, so
         // agents can detect them even in JSON/SARIF mode.

@@ -1152,6 +1152,81 @@ pub fn route_fix_targets(
     route_targets(audit, prov, packages, releases, true)
 }
 
+/// Moves every target the configuration governing its file holds back into
+/// `unfixable`, keeping the known fix visible. An ignored package is never
+/// written, and a pin below the fix would be reverted by the next update, so
+/// neither is a fix. A pin at or above the fix already satisfies it, so that
+/// target stays.
+pub fn hold_configured_targets(
+    routing: FixRouting,
+    mut config_for: impl FnMut(
+        &Path,
+    ) -> anyhow::Result<Option<std::sync::Arc<crate::config::UpdConfig>>>,
+) -> anyhow::Result<FixRouting> {
+    let FixRouting {
+        targets,
+        mut unfixable,
+    } = routing;
+    let mut kept = Vec::with_capacity(targets.len());
+    for target in targets {
+        match config_for(&target.path)?.and_then(|config| configured_hold(&target, &config)) {
+            Some(reason) => unfixable.push(UnfixableTarget {
+                package: target.package,
+                dependency_key: target.dependency_key,
+                from_version: target.from_version,
+                to_version: Some(target.to_version),
+                method: Some(target.kind.method()),
+                path: Some(target.path),
+                reason,
+                no_fixed_version: false,
+            }),
+            None => kept.push(target),
+        }
+    }
+    Ok(FixRouting {
+        targets: kept,
+        unfixable,
+    })
+}
+
+/// Why `config` keeps `target` from being written, if it does.
+fn configured_hold(target: &FixTarget, config: &crate::config::UpdConfig) -> Option<String> {
+    let names = std::iter::once(target.package.as_str()).chain(target.dependency_key.as_deref());
+    let to = &target.to_version;
+    for name in names {
+        if config.should_ignore(name) {
+            return Some(format!(
+                "ignored by configuration; the fix needs {to} or later"
+            ));
+        }
+        if let Some(pinned) = config.get_pinned_version(name) {
+            // Only a pin naming a release at or above the fix satisfies it. A
+            // constraint pin or an unknown ordering is treated as below the
+            // fix, so the fix is never written past what the pin allows.
+            let satisfies = target_lang(target)
+                .and_then(|lang| crate::align::release_at_least(pinned, to, lang))
+                == Some(true);
+            if !satisfies {
+                return Some(format!(
+                    "pinned to {pinned} by configuration; the fix needs {to} or later"
+                ));
+            }
+        }
+    }
+    None
+}
+
+/// The ecosystem a target's versions are compared in: a floor's mechanism
+/// names it, and a manifest edit carries its file type.
+fn target_lang(target: &FixTarget) -> Option<Lang> {
+    match target.kind {
+        FixKind::UvConstraint => Some(Lang::Python),
+        FixKind::NpmOverride => Some(Lang::Node),
+        FixKind::CargoPrecise => Some(Lang::Rust),
+        FixKind::ManifestEdit => target.file_type.map(|file_type| file_type.lang()),
+    }
+}
+
 /// Route explicitly requested version updates. Unlike automatic audit repairs,
 /// these retain the user's chosen bump policy, including major upgrades.
 pub fn route_update_targets(
@@ -3570,5 +3645,219 @@ mod tests {
             );
             assert!(notes.is_empty(), "{notes:?}");
         }
+    }
+
+    fn config_target(
+        package: &str,
+        key: Option<&str>,
+        kind: FixKind,
+        file_type: Option<FileType>,
+    ) -> FixTarget {
+        FixTarget {
+            package: package.to_string(),
+            dependency_key: key.map(str::to_string),
+            from_version: "1.0.0".to_string(),
+            to_version: "2.28.0".to_string(),
+            vulnerable_version: "1.0.0".to_string(),
+            kind,
+            path: PathBuf::from("app/manifest"),
+            file_type,
+            lockfile: None,
+            line_number: None,
+            npm_form: None,
+        }
+    }
+
+    fn held(targets: Vec<FixTarget>, config: &str) -> FixRouting {
+        let config = std::sync::Arc::new(
+            crate::config::UpdConfig::parse_with_warnings(config, "test")
+                .unwrap()
+                .0,
+        );
+        hold_configured_targets(
+            FixRouting {
+                targets,
+                unfixable: Vec::new(),
+            },
+            |_| Ok(Some(std::sync::Arc::clone(&config))),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn a_pin_equal_to_the_fix_satisfies_it() {
+        let target = config_target(
+            "requests",
+            None,
+            FixKind::ManifestEdit,
+            Some(FileType::Requirements),
+        );
+        let routing = held(vec![target], "[pin]\nrequests = \"2.28\"\n");
+        assert_eq!(routing.targets.len(), 1, "{:?}", routing.unfixable);
+        assert!(routing.unfixable.is_empty());
+    }
+
+    #[test]
+    fn a_pin_below_a_floor_holds_it_in_the_floor_ecosystem() {
+        // Semver orders 1.10.0 above 1.9.0; a string comparison would not.
+        let mut target = config_target("lru", None, FixKind::CargoPrecise, None);
+        target.to_version = "1.10.0".to_string();
+        let routing = held(vec![target.clone()], "[pin]\nlru = \"1.9.0\"\n");
+        assert!(routing.targets.is_empty());
+        assert_eq!(
+            routing.unfixable[0].reason,
+            "pinned to 1.9.0 by configuration; the fix needs 1.10.0 or later"
+        );
+        assert_eq!(routing.unfixable[0].method, Some("cargo-precise"));
+        assert!(
+            !routing.unfixable[0].no_fixed_version,
+            "a fix exists; configuration holds it"
+        );
+
+        let routing = held(vec![target], "[pin]\nlru = \"1.10.0\"\n");
+        assert_eq!(routing.targets.len(), 1);
+    }
+
+    #[test]
+    fn configuration_naming_the_manifest_key_holds_a_renamed_dependency() {
+        let target = config_target(
+            "tokio",
+            Some("rt"),
+            FixKind::ManifestEdit,
+            Some(FileType::CargoToml),
+        );
+        let routing = held(vec![target.clone()], "ignore = [\"rt\"]\n");
+        assert!(routing.targets.is_empty());
+        assert_eq!(routing.unfixable[0].dependency_key.as_deref(), Some("rt"));
+
+        let routing = held(vec![target], "ignore = [\"serde\"]\n");
+        assert_eq!(
+            routing.targets.len(),
+            1,
+            "an unrelated ignore holds nothing"
+        );
+    }
+
+    #[test]
+    fn a_pin_that_cannot_be_compared_holds_the_fix() {
+        let target = config_target("requests", None, FixKind::ManifestEdit, None);
+        let routing = held(vec![target], "[pin]\nrequests = \"9.0.0\"\n");
+        assert!(
+            routing.targets.is_empty(),
+            "an unknown ordering never writes past a pin"
+        );
+    }
+
+    /// A constraint pin names no single release, so upd cannot show that the
+    /// next update keeps the fix. Operators sort above digits, which is why
+    /// these are compared as constraints rather than as text.
+    #[test]
+    fn a_constraint_pin_holds_the_fix() {
+        for (kind, file_type, pin) in [
+            (
+                FixKind::ManifestEdit,
+                Some(FileType::Requirements),
+                ">=1.0,<2",
+            ),
+            (FixKind::UvConstraint, None, "~=1.0"),
+            (FixKind::NpmOverride, None, "<3"),
+            (FixKind::CargoPrecise, None, ">=1, <2"),
+            // A prerelease tag leads each of these, and what follows it is
+            // still a range, not part of the tag.
+            (FixKind::NpmOverride, None, "3.0.0-alpha || 1.0.0"),
+            (FixKind::CargoPrecise, None, "3.0.0-rc.1, <2"),
+            (
+                FixKind::ManifestEdit,
+                Some(FileType::PackageJson),
+                "3.0.0-beta 1.0.0",
+            ),
+        ] {
+            let target = config_target("requests", None, kind, file_type);
+            let routing = held(vec![target], &format!("[pin]\nrequests = \"{pin}\"\n"));
+            assert!(
+                routing.targets.is_empty(),
+                "{kind:?} pin {pin} must hold a fix to 2.28.0"
+            );
+            assert!(
+                routing.unfixable[0]
+                    .reason
+                    .starts_with(&format!("pinned to {pin} by configuration")),
+                "{}",
+                routing.unfixable[0].reason
+            );
+        }
+    }
+
+    #[test]
+    fn a_plain_pin_above_the_fix_satisfies_it_in_every_floor_ecosystem() {
+        for (kind, file_type, pin) in [
+            (FixKind::ManifestEdit, Some(FileType::Requirements), "2.29"),
+            (FixKind::UvConstraint, None, "3.0.0"),
+            (FixKind::NpmOverride, None, "2.28.1"),
+            (FixKind::CargoPrecise, None, "2.28.0"),
+            (FixKind::ManifestEdit, Some(FileType::GoMod), "v2.30.0"),
+        ] {
+            let target = config_target("requests", None, kind, file_type);
+            let routing = held(vec![target], &format!("[pin]\nrequests = \"{pin}\"\n"));
+            assert_eq!(
+                routing.targets.len(),
+                1,
+                "{kind:?} pin {pin}: {:?}",
+                routing.unfixable
+            );
+        }
+    }
+
+    /// An exact-equality pin names a single release, spelled as Python and
+    /// Cargo or npm spell one, so it satisfies a fix it is at or above.
+    #[test]
+    fn an_exact_equality_pin_names_its_release() {
+        for (kind, file_type, pin) in [
+            (
+                FixKind::ManifestEdit,
+                Some(FileType::Requirements),
+                "==2.28.0",
+            ),
+            (FixKind::UvConstraint, None, "== 2.29"),
+            (FixKind::CargoPrecise, None, "=2.28.0"),
+            (FixKind::NpmOverride, None, "=2.28.1"),
+        ] {
+            let target = config_target("requests", None, kind, file_type);
+            let routing = held(vec![target], &format!("[pin]\nrequests = \"{pin}\"\n"));
+            assert_eq!(
+                routing.targets.len(),
+                1,
+                "{kind:?} pin {pin}: {:?}",
+                routing.unfixable
+            );
+        }
+        for (kind, pin) in [
+            (FixKind::UvConstraint, "==2.27.0"),
+            (FixKind::UvConstraint, "==2.28.*"),
+            (FixKind::CargoPrecise, "=2.27.0"),
+        ] {
+            let target = config_target("requests", None, kind, None);
+            let routing = held(vec![target], &format!("[pin]\nrequests = \"{pin}\"\n"));
+            assert!(routing.targets.is_empty(), "{kind:?} pin {pin} must hold");
+        }
+    }
+
+    #[test]
+    fn a_file_without_configuration_keeps_its_targets() {
+        let target = config_target(
+            "requests",
+            None,
+            FixKind::ManifestEdit,
+            Some(FileType::Requirements),
+        );
+        let routing = hold_configured_targets(
+            FixRouting {
+                targets: vec![target],
+                unfixable: Vec::new(),
+            },
+            |_| Ok(None),
+        )
+        .unwrap();
+        assert_eq!(routing.targets.len(), 1);
     }
 }

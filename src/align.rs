@@ -333,6 +333,43 @@ pub fn names_release_at_least(declared: &str, requested: &str, lang: Lang) -> bo
     compare_versions(declared, requested, lang) != std::cmp::Ordering::Less
 }
 
+/// Whether `declared` names a release no older than `requested`, when both
+/// name a single release in `lang`.
+///
+/// An exact-equality operator (`==2.28.0` in Python, `=1.2.3` in Cargo and
+/// npm) still names a single release. `None` when either is a range
+/// (`>=1.0,<2`, `^1.2`, `==2.28.*`) or otherwise not a version: the
+/// comparator orders such strings as text, and operators sort above digits,
+/// so its answer there says nothing about the releases involved.
+pub fn release_at_least(declared: &str, requested: &str, lang: Lang) -> Option<bool> {
+    let (declared, requested) = (
+        single_release(declared, lang)?,
+        single_release(requested, lang)?,
+    );
+    Some(names_release_at_least(declared, requested, lang))
+}
+
+/// The release `version` names, without an exact-equality operator, when it
+/// names exactly one.
+fn single_release(version: &str, lang: Lang) -> Option<&str> {
+    let exact = if lang == Lang::Python { "==" } else { "=" };
+    let version = version.strip_prefix(exact).unwrap_or(version).trim();
+    let names_release = match lang {
+        Lang::Python => pep440_rs::Version::from_str(version).is_ok(),
+        Lang::Gradle | Lang::Nix => false,
+        // `TagVersion` reads anything after a prerelease hyphen as the tag,
+        // so a range behind one (`3.0.0-alpha || 1.0.0`) would pass it;
+        // a single release has no characters beyond a version's own.
+        _ => {
+            version
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '+'))
+                && TagVersion::parse(version).is_some()
+        }
+    };
+    names_release.then_some(version)
+}
+
 /// Compare PEP 440 versions
 fn compare_pep440(a: &str, b: &str) -> std::cmp::Ordering {
     match (

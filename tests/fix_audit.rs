@@ -627,3 +627,167 @@ async fn fix_audit_reports_pseudo_version_as_unbumpable_not_lock_only() {
         "a commit-pinned manifest entry is not a lock-only transitive dependency: {stderr}"
     );
 }
+
+/// An OSV mock reporting `requests` below 2.28.0 as vulnerable.
+async fn requests_advisory_server() -> wiremock::MockServer {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/querybatch"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "results": [{ "vulns": [{ "id": "GHSA-fix-001" }] }]
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/vulns/GHSA-fix-001"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "id": "GHSA-fix-001",
+            "summary": "vuln in requests",
+            "database_specific": { "severity": "HIGH" },
+            "affected": [{
+                "ranges": [{ "events": [{ "introduced": "0" }, { "fixed": "2.28.0" }] }]
+            }]
+        })))
+        .mount(&server)
+        .await;
+    server
+}
+
+/// Runs `audit --fix-audit --apply` in `dir`, returning the JSON report and
+/// the exit code.
+fn apply_fix_audit(
+    dir: &std::path::Path,
+    server: &wiremock::MockServer,
+) -> (serde_json::Value, i32) {
+    let (stdout, stderr, code) = run_with_env(
+        &[
+            "audit",
+            "--fix-audit",
+            "--apply",
+            "--no-cache",
+            "--full-precision",
+            "--format",
+            "json",
+        ],
+        dir,
+        &[("OSV_API_URL", &server.uri())],
+    );
+    let report = serde_json::from_str(&stdout)
+        .unwrap_or_else(|e| panic!("audit must print a JSON report ({e}); stderr: {stderr}"));
+    (report, code)
+}
+
+/// Runs `audit --fix-audit --apply` on `requests==1.0.0` (fixed in 2.28.0)
+/// under `config`, returning the rewritten requirements file, the single fix
+/// row, and the exit code.
+async fn fix_requests_under_config(config: &str) -> (String, serde_json::Value, i32) {
+    let server = requests_advisory_server().await;
+    let tmp = tempfile::tempdir().unwrap();
+    fs::write(tmp.path().join("requirements.txt"), "requests==1.0.0\n").unwrap();
+    fs::write(tmp.path().join(".updrc.toml"), config).unwrap();
+    let (report, code) = apply_fix_audit(tmp.path(), &server);
+    let fixes = report["fixes"].as_array().expect("fixes array");
+    assert_eq!(fixes.len(), 1, "one vulnerable occurrence: {report}");
+    let written = fs::read_to_string(tmp.path().join("requirements.txt")).unwrap();
+    (written, fixes[0].clone(), code)
+}
+
+#[tokio::test]
+async fn fix_audit_holds_a_fix_only_where_the_governing_configuration_says_so() {
+    let server = requests_advisory_server().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let held = tmp.path().join("held");
+    fs::create_dir(&held).unwrap();
+    fs::write(tmp.path().join("requirements.txt"), "requests==1.0.0\n").unwrap();
+    fs::write(held.join("requirements.txt"), "requests==1.0.0\n").unwrap();
+    fs::write(held.join(".updrc.toml"), "ignore = [\"requests\"]\n").unwrap();
+
+    let (report, code) = apply_fix_audit(tmp.path(), &server);
+    assert_eq!(code, 0, "{report}");
+    assert_eq!(
+        fs::read_to_string(tmp.path().join("requirements.txt")).unwrap(),
+        "requests==2.28.0\n",
+        "the root file has no ignore: {report}"
+    );
+    assert_eq!(
+        fs::read_to_string(held.join("requirements.txt")).unwrap(),
+        "requests==1.0.0\n",
+        "the nested config ignores requests for its own file: {report}"
+    );
+    let statuses: Vec<(String, String)> = report["fixes"]
+        .as_array()
+        .expect("fixes array")
+        .iter()
+        .map(|fix| {
+            (
+                fix["path"].as_str().unwrap_or_default().to_string(),
+                fix["status"].as_str().unwrap_or_default().to_string(),
+            )
+        })
+        .collect();
+    assert_eq!(statuses.len(), 2, "{report}");
+    assert!(
+        statuses
+            .iter()
+            .any(|(path, status)| path.contains("held") && status == "unfixable"),
+        "{report}"
+    );
+    assert!(
+        statuses
+            .iter()
+            .any(|(path, status)| !path.contains("held") && status == "applied"),
+        "{report}"
+    );
+}
+
+#[tokio::test]
+async fn fix_audit_writes_the_fix_when_configuration_allows_it() {
+    let (written, fix, code) = fix_requests_under_config("").await;
+    assert_eq!(written, "requests==2.28.0\n");
+    assert_eq!(fix["status"], "applied", "{fix}");
+    assert_eq!(code, 0);
+
+    // A pin at or above the fix already satisfies it, so the fix is written.
+    let (written, fix, code) = fix_requests_under_config("[pin]\nrequests = \"2.30.0\"\n").await;
+    assert_eq!(written, "requests==2.28.0\n");
+    assert_eq!(fix["status"], "applied", "{fix}");
+    assert_eq!(code, 0);
+}
+
+#[tokio::test]
+async fn fix_audit_leaves_a_configured_ignore_untouched_and_says_why() {
+    let (written, fix, code) = fix_requests_under_config("ignore = [\"Requests\"]\n").await;
+    assert_eq!(
+        written, "requests==1.0.0\n",
+        "an ignored package is never written"
+    );
+    assert_eq!(fix["status"], "unfixable", "{fix}");
+    assert_eq!(
+        fix["to_version"], "2.28.0",
+        "the known fix stays visible: {fix}"
+    );
+    assert_eq!(
+        fix["error"], "ignored by configuration; the fix needs 2.28.0 or later",
+        "{fix}"
+    );
+    assert_eq!(code, 0);
+}
+
+#[tokio::test]
+async fn fix_audit_does_not_write_past_a_pin_below_the_fix_and_says_why() {
+    let (written, fix, code) = fix_requests_under_config("[pin]\nrequests = \"1.0.0\"\n").await;
+    assert_eq!(
+        written, "requests==1.0.0\n",
+        "a pin below the fix holds the package; writing the fix would be reverted by the next update"
+    );
+    assert_eq!(fix["status"], "unfixable", "{fix}");
+    assert_eq!(fix["to_version"], "2.28.0", "{fix}");
+    assert_eq!(
+        fix["error"], "pinned to 1.0.0 by configuration; the fix needs 2.28.0 or later",
+        "{fix}"
+    );
+    assert_eq!(code, 0);
+}

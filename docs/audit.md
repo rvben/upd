@@ -75,6 +75,17 @@ package's releases:
 
 Go modules and the other ecosystems use the advisory's version as named.
 
+`--fix-audit` honors the same [`ignore` and `pin`](configuration.md)
+settings as `upd update`, read from the configuration that governs each file.
+An ignored package is left as it is, and so is a package pinned below the
+fix, since the next update would move it back to the pin. Both are reported
+`unfixable` with the fix they need, for example `pinned to 1.0.0 by
+configuration; the fix needs 2.28.0 or later`. A pin naming a release at or
+above the fix, bare or exact (`2.28.0`, `==2.28.0`, `=2.28.0`), already
+satisfies it, so that fix is written. A constraint pin
+such as `>=1.0,<2` names no single release, so it holds the fix the same way
+a pin below it does.
+
 ## Example output
 
 ```text
