@@ -10,7 +10,7 @@ use crate::lockfile::{
     LockfileType, RegenOutcome, RestoreFailure, Snapshot, cargo_update_precise, containing_dir,
     detect_lockfiles, regenerate_lockfile, regenerate_lockfiles,
 };
-use crate::lockgate::{GateReport, GateStatus, ReleaseAgeGate};
+use crate::lockgate::{GateReport, GateStatus, RefreshGate};
 use crate::lockscan::cargo::scan_cargo_lock;
 use crate::lockscan::npm::scan_npm_lock;
 use crate::lockscan::poetry::scan_poetry_lock;
@@ -101,9 +101,10 @@ pub struct FixApplyOptions {
     /// a floor without a relock is a no-op).
     pub relock_floors: bool,
     pub verbose: bool,
-    /// The cooldown each relock keeps to, by the path of the file a group
+    /// The cooldown in force for each relock, and whether the relock keeps
+    /// to it or only reports what it locks, by the path of the file a group
     /// edits. A path without an entry relocks without one.
-    pub gates: HashMap<PathBuf, ReleaseAgeGate>,
+    pub gates: HashMap<PathBuf, RefreshGate>,
 }
 
 /// What [`apply_fix_targets`] did.
@@ -307,11 +308,12 @@ enum Provisional {
 /// Every version floor the run chose, each as the crate and the version it
 /// is floored at. A floor an earlier target's update already reached counts
 /// too: it is just as much a floor no hold may take the lockfile back below.
-/// A `Blocked` target wrote nothing, so it floors nothing to keep.
+/// A `Blocked`, `Failed` or `Unfixable` target wrote nothing, so it floors
+/// nothing to keep.
 fn floors_to_keep(items: &[(FixTarget, Provisional)]) -> Vec<(String, String)> {
     items
         .iter()
-        .filter(|(_, prov)| !matches!(prov, Provisional::Blocked(_)))
+        .filter(|(_, prov)| matches!(prov, Provisional::Wrote | Provisional::AlreadySatisfied))
         .map(|(target, _)| (target.package.clone(), target.to_version.clone()))
         .collect()
 }
@@ -687,6 +689,11 @@ fn apply_edit_group(
 
     match relock_result {
         Ok(()) => {
+            for report in &mut relock_gates {
+                if report.status == GateStatus::Exempt {
+                    report.keep = floors_to_keep(&items);
+                }
+            }
             gates.append(&mut relock_gates);
             for (target, prov) in items {
                 let recheckable =
@@ -859,13 +866,17 @@ fn apply_cargo_precise_group(
     if failure_messages.is_empty() {
         let keep = floors_to_keep(&items);
         if let Some(gate) = gate.filter(|_| !keep.is_empty()) {
+            let status = match gate {
+                RefreshGate::Keep(_) => GateStatus::Unenforced {
+                    reason: "cargo has no release-age setting".to_string(),
+                },
+                RefreshGate::Report(_) => GateStatus::Exempt,
+            };
             gates.push(GateReport {
                 lockfile: lock,
                 lockfile_type: LockfileType::CargoLock,
-                gate,
-                status: GateStatus::Unenforced {
-                    reason: "cargo has no release-age setting".to_string(),
-                },
+                gate: gate.gate(),
+                status,
                 before,
                 keep,
             });
@@ -1586,11 +1597,12 @@ mod tests {
         assert_eq!(classify_manifest_blocked_precise("lru", message), None);
     }
 
-    /// A `Blocked` floor wrote nothing, so unlike `Wrote`/`AlreadySatisfied`
-    /// it must not appear among the floors a later cooldown re-check treats
-    /// as chosen by this run.
+    /// A `Blocked`, `Failed` or `Unfixable` floor wrote nothing, so unlike
+    /// `Wrote`/`AlreadySatisfied` it must not appear among the floors a
+    /// later cooldown re-check treats as chosen by this run: its name would
+    /// hide a young release the relock locked for it.
     #[test]
-    fn a_blocked_floor_is_not_kept() {
+    fn a_floor_that_wrote_nothing_is_not_kept() {
         let items = vec![
             (
                 cargo_floor_target("clap_builder", "4.6.6"),
@@ -1599,6 +1611,14 @@ mod tests {
             (
                 cargo_floor_target("lru", "0.18.2"),
                 Provisional::Blocked("ratatui-core requires lru ^0.16".to_string()),
+            ),
+            (
+                cargo_floor_target("serde", "1.0.200"),
+                Provisional::Failed("write failed".to_string()),
+            ),
+            (
+                cargo_floor_target("time", "0.3.47"),
+                Provisional::Unfixable("no override form fits".to_string()),
             ),
         ];
 

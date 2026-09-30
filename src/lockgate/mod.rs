@@ -74,6 +74,26 @@ impl ReleaseAgeGate {
     }
 }
 
+/// How a lockfile refresh treats the cooldown in force for its manifests.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RefreshGate {
+    /// The refresh keeps to the cooldown as far as its tool can, and what it
+    /// locks is read back and held or reported.
+    Keep(ReleaseAgeGate),
+    /// The refresh applies security fixes, which do not wait for the
+    /// cooldown, so it runs without it. What it locks besides the fixes is
+    /// read back and reported, never held, since a hold could undo a fix.
+    Report(ReleaseAgeGate),
+}
+
+impl RefreshGate {
+    pub fn gate(self) -> ReleaseAgeGate {
+        match self {
+            RefreshGate::Keep(gate) | RefreshGate::Report(gate) => gate,
+        }
+    }
+}
+
 /// How far a refresh under a gate kept to it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GateStatus {
@@ -88,6 +108,10 @@ pub enum GateStatus {
     /// The tool failed under the gate and the lockfile was refreshed without
     /// it; `reason` is what the gated run said.
     Bypassed { reason: String },
+    /// The refresh applied security fixes and ran without the gate on
+    /// purpose ([`RefreshGate::Report`]). The entries it introduced other than
+    /// the fixes (`keep`) are reported, and none is held.
+    Exempt,
 }
 
 impl GateStatus {
@@ -96,6 +120,7 @@ impl GateStatus {
             GateStatus::Enforced => 0,
             GateStatus::Unenforced { .. } => 1,
             GateStatus::Bypassed { .. } => 2,
+            GateStatus::Exempt => 3,
         }
     }
 }
@@ -112,6 +137,8 @@ pub struct GateReport {
     pub before: Option<Vec<u8>>,
     /// The version floors the run locked on purpose, as `(name, floor)`: a
     /// hold never moves an entry at its floor, nor a crate below its floor.
+    /// Under [`GateStatus::Exempt`] they are the security fixes, and no
+    /// release of a package named here is reported.
     pub keep: Vec<LockEntry>,
 }
 

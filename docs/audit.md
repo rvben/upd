@@ -87,6 +87,18 @@ satisfies it, so that fix is written. A constraint pin
 such as `>=1.0,<2` names no single release, so it holds the fix the same way
 a pin below it does.
 
+A fix is written however young its release is, but the relock that writes it
+can also lock other new releases: a transitive dependency the fixed release
+requires, or a companion crate `cargo update --precise` moves with it. Under a
+[cooldown](configuration.md#lockfiles) (`--min-age`, or the one the
+configuration governing the fixed file sets), each refreshed lockfile is read
+back and every release it locked inside the cooldown, other than the fixes, is
+reported as a warning, in JSON an entry in `lockfile_cooldown`. A second copy
+of a fixed package below its fix (Cargo and npm lock semver-incompatible copies
+side by side) is not a fix and is reported like any other release. Nothing is held
+back, since that could undo the fix, and the exit code does not change.
+`--offline` checks nothing and says so in `warnings`.
+
 ## Example output
 
 ```text

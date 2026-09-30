@@ -20,6 +20,7 @@ use crate::lockscan::{npm::parse_npm_lock, poetry::parse_poetry_lock, uv::parse_
 use crate::output::{LockfileCooldownEntry, LockfileHold};
 use crate::path_display::display_path;
 use crate::registry::{PyPiRegistry, Registry, VersionMeta};
+use crate::updater::Lang;
 use crate::updater::declared_index_urls;
 
 /// How many registry lookups one lockfile check runs at once.
@@ -118,6 +119,16 @@ enum Source {
 }
 
 impl Source {
+    /// The language whose version ordering the registry's releases follow.
+    fn lang(self) -> Lang {
+        match self {
+            Source::PyPI => Lang::Python,
+            Source::Npm => Lang::Node,
+            Source::CratesIo => Lang::Rust,
+            Source::RubyGems => Lang::Ruby,
+        }
+    }
+
     fn of(lockfile_type: LockfileType) -> Option<Self> {
         match lockfile_type {
             LockfileType::UvLock | LockfileType::PoetryLock => Some(Source::PyPI),
@@ -380,10 +391,12 @@ pub async fn check_refreshed_lockfiles(
         let lockfile = display_path(&report.lockfile);
         let cooldown = report.gate.humanized();
         let source = Source::of(report.lockfile_type);
+        let exempt = report.status == GateStatus::Exempt;
         let dropped = match &report.status {
             GateStatus::Enforced => None,
-            GateStatus::Unenforced { reason } => source.is_none().then_some(reason),
-            GateStatus::Bypassed { reason } => Some(reason),
+            GateStatus::Unenforced { reason } => source.is_none().then_some(reason.as_str()),
+            GateStatus::Bypassed { reason } => Some(reason.as_str()),
+            GateStatus::Exempt => source.is_none().then_some("it applied security fixes"),
         };
         if let Some(reason) = dropped {
             let unchecked = if source.is_none() {
@@ -420,7 +433,7 @@ pub async fn check_refreshed_lockfiles(
             .collect();
 
         let mut metas = MetaCache::new(source.registry(&registries));
-        let notes = if report.lockfile_type == LockfileType::CargoLock {
+        let notes = if report.lockfile_type == LockfileType::CargoLock && !exempt {
             let held = cargo::hold_young_crates(&report, &mut metas, verbose).await;
             check.holds.extend(held.holds);
             check
@@ -479,8 +492,42 @@ pub async fn check_refreshed_lockfiles(
                     .collect()
             })
             .unwrap_or_default();
+        // A security fix is locked on purpose whatever its age, so only
+        // what it pulled in besides is reported: a release of a fixed name at
+        // or above its fix. A lower release of that name is a separate copy
+        // (Cargo and npm lock semver-incompatible copies side by side) and is
+        // checked like any other. PyPI spells one name several ways, so its
+        // names are compared in their canonical form.
+        let canonical = |name: &str| match source {
+            Source::PyPI => crate::config::normalize_package_name(name),
+            _ => name.to_string(),
+        };
+        let fixed: HashMap<String, Vec<&str>> = if exempt {
+            report
+                .keep
+                .iter()
+                .fold(HashMap::new(), |mut fixed, (name, version)| {
+                    fixed
+                        .entry(canonical(name))
+                        .or_default()
+                        .push(version.as_str());
+                    fixed
+                })
+        } else {
+            HashMap::new()
+        };
+        let lang = source.lang();
+        let is_fix = |(name, version): &LockEntry| {
+            fixed.get(&canonical(name)).is_some_and(|floors| {
+                floors
+                    .iter()
+                    .any(|floor| crate::align::names_release_at_least(version, floor, lang))
+            })
+        };
         let mut seen = HashSet::new();
-        let mut is_new = |entry: &Located| !before.contains(entry) && seen.insert(entry.clone());
+        let mut is_new = |entry: &Located| {
+            !before.contains(entry) && !is_fix(&entry.0) && seen.insert(entry.clone())
+        };
         let introduced: Vec<(Located, Option<usize>)> = current
             .read
             .into_iter()
@@ -1224,5 +1271,47 @@ mod tests {
         let mut packages: Vec<&str> = check.findings.iter().map(|f| f.package.as_str()).collect();
         packages.sort_unstable();
         assert_eq!(packages, ["a", "b"]);
+    }
+
+    /// A fix relock that locked `time` 0.3.36 and, besides it, a young
+    /// `time` release below the fix: Cargo holds semver-incompatible copies
+    /// of one crate side by side, so the second copy is an unrelated
+    /// release the fix did not choose.
+    fn time_fix_relock(young_version: &str, extra: &str) -> (Project, MockRegistry, GateReport) {
+        let before = "version = 4\n\n\
+             [[package]]\nname = \"time\"\nversion = \"0.3.20\"\n\
+             source = \"registry+https://github.com/rust-lang/crates.io-index\"\n";
+        let after = format!(
+            "version = 4\n\n\
+             [[package]]\nname = \"time\"\nversion = \"0.3.36\"\n\
+             source = \"registry+https://github.com/rust-lang/crates.io-index\"\n{extra}"
+        );
+        let lock = project("Cargo.lock", &after);
+        let registry = young(&["time"], young_version);
+        let mut report = report(
+            &lock,
+            LockfileType::CargoLock,
+            GateStatus::Exempt,
+            Some(before.to_string()),
+        );
+        report.keep = vec![("time".to_string(), "0.3.36".to_string())];
+        (lock, registry, report)
+    }
+
+    #[tokio::test]
+    async fn a_young_release_a_fix_locked_is_not_reported() {
+        let (_lock, registry, report) = time_fix_relock("0.3.36", "");
+        let check = run(vec![report], &registry).await;
+        assert!(check.findings.is_empty(), "{:?}", check.findings);
+    }
+
+    #[tokio::test]
+    async fn a_young_duplicate_below_a_fixed_crate_is_still_reported() {
+        let duplicate = "\n[[package]]\nname = \"time\"\nversion = \"0.1.5\"\n\
+             source = \"registry+https://github.com/rust-lang/crates.io-index\"\n";
+        let (_lock, registry, report) = time_fix_relock("0.1.5", duplicate);
+        let check = run(vec![report], &registry).await;
+        assert_eq!(found(&check), ["time"], "{:?}", check.findings);
+        assert_eq!(check.findings[0].version, "0.1.5");
     }
 }

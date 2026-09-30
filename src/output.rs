@@ -592,6 +592,10 @@ pub struct AuditReport {
     /// not requested.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub fixes: Vec<FixEntry>,
+    /// Releases published inside the cooldown that a `--fix-audit` relock
+    /// locked besides the fixes; empty (and omitted) when there are none.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub lockfile_cooldown: Vec<LockfileCooldownEntry>,
 }
 
 /// Map `apply_fix_targets` outcomes and routing's unfixable targets into the
@@ -1210,6 +1214,7 @@ pub fn build_audit_report(
             errors: audit.errors.len(),
         },
         fixes,
+        lockfile_cooldown: Vec::new(),
     }
     .with_ecosystem_noop(ecosystems_audited)
 }

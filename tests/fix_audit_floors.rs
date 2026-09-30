@@ -676,7 +676,10 @@ async fn poetry_lock_only_is_unfixable_and_exits_6() {
         tmp.path(),
         &[("OSV_API_URL", &server.uri())],
     );
-    assert_eq!(no_fail_code, 0, "--no-fail reports it without failing: {no_fail_stderr}");
+    assert_eq!(
+        no_fail_code, 0,
+        "--no-fail reports it without failing: {no_fail_stderr}"
+    );
 
     let json: serde_json::Value = serde_json::from_str(&stdout).unwrap();
     let fixes = json["fixes"].as_array().unwrap();
@@ -2494,4 +2497,259 @@ async fn npm_parallel_major_fixes_write_separate_bounded_overrides() {
         assert_eq!(fixes.len(), 2);
         assert!(fixes.iter().all(|fix| fix["status"] == "applied"));
     }
+}
+
+/// A publish time `days` before now, as registries spell it.
+fn days_ago(days: i64) -> String {
+    (chrono::Utc::now() - chrono::Duration::days(days))
+        .format("%Y-%m-%dT%H:%M:%SZ")
+        .to_string()
+}
+
+/// PyPI releases of `name` under `/pypi/{name}/json`, each `(version, days
+/// since it was published)`.
+async fn mount_pypi_dated(server: &wiremock::MockServer, name: &str, releases: &[(&str, i64)]) {
+    let releases: serde_json::Map<String, serde_json::Value> = releases
+        .iter()
+        .map(|(version, age)| {
+            (
+                version.to_string(),
+                serde_json::json!([{ "yanked": false, "upload_time_iso_8601": days_ago(*age) }]),
+            )
+        })
+        .collect();
+    wiremock::Mock::given(wiremock::matchers::method("GET"))
+        .and(wiremock::matchers::path(format!("/pypi/{name}/json")))
+        .respond_with(
+            wiremock::ResponseTemplate::new(200)
+                .set_body_json(serde_json::json!({ "releases": releases })),
+        )
+        .mount(server)
+        .await;
+}
+
+/// crates.io releases of `name`, each `(version, days since it was
+/// published)`.
+async fn mount_crate_dated(server: &wiremock::MockServer, name: &str, releases: &[(&str, i64)]) {
+    let versions: Vec<serde_json::Value> = releases
+        .iter()
+        .map(|(num, age)| serde_json::json!({ "num": num, "yanked": false, "created_at": days_ago(*age) }))
+        .collect();
+    wiremock::Mock::given(wiremock::matchers::method("GET"))
+        .and(wiremock::matchers::path(format!("/api/v1/crates/{name}")))
+        .respond_with(
+            wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "crate": { "max_stable_version": releases.last().map(|r| r.0) },
+                "versions": versions
+            })),
+        )
+        .mount(server)
+        .await;
+}
+
+/// Runs a uv security fix whose relock also locks `newdep` (published a day
+/// ago) and `olddep` (a year ago) beside the fix, under `cooldown` when
+/// given, and answers the JSON report.
+#[cfg(unix)]
+async fn fix_pulling_in_transitives(cooldown: Option<&str>) -> (serde_json::Value, String, i32) {
+    let server = wiremock::MockServer::start().await;
+    mount_osv_single(&server, "GHSA-floors-young", "lockonly", "PyPI", "0.49.1").await;
+    mount_pypi_dated(&server, "lockonly", &[("0.40.0", 400), ("0.49.1", 1)]).await;
+    mount_pypi_dated(&server, "newdep", &[("1.0.0", 1)]).await;
+    mount_pypi_dated(&server, "olddep", &[("2.0.0", 365)]).await;
+    let index = format!("{}/simple", server.uri());
+    let entry = |name: &str, version: &str| {
+        format!(
+            "[[package]]\nname = \"{name}\"\nversion = \"{version}\"\nsource = {{ registry = \"{index}\" }}\n\n"
+        )
+    };
+
+    let tmp = tempfile::tempdir().unwrap();
+    fs::write(tmp.path().join("pyproject.toml"), PYPROJECT_BARE).unwrap();
+    fs::write(
+        tmp.path().join("uv.lock"),
+        format!("version = 1\n\n{}", entry("lockonly", "0.40.0")),
+    )
+    .unwrap();
+    let relocked = format!(
+        "version = 1\n\n{}{}{}",
+        entry("lockonly", "0.49.1"),
+        entry("newdep", "1.0.0"),
+        entry("olddep", "2.0.0")
+    );
+    let bin_dir = tmp.path().join("fakebin");
+    fs::create_dir(&bin_dir).unwrap();
+    write_fake_tool(
+        &bin_dir,
+        "uv",
+        &format!(
+            "#!/bin/sh\n[ \"$1\" = lock ] || exit 0\ncat > uv.lock <<'EOF'\n{relocked}EOF\nexit 0\n"
+        ),
+    );
+
+    let mut args = vec![
+        "audit",
+        "--fix-audit",
+        "--apply",
+        "--no-cache",
+        "--format",
+        "json",
+    ];
+    if let Some(cooldown) = cooldown {
+        args.extend(["--min-age", cooldown]);
+    }
+    let (stdout, stderr, code) = run_with_env(
+        &args,
+        tmp.path(),
+        &[
+            ("OSV_API_URL", &server.uri()),
+            ("UV_INDEX_URL", &index),
+            ("PATH", &path_with(&bin_dir)),
+        ],
+    );
+    assert_eq!(
+        fs::read_to_string(tmp.path().join("uv.lock")).unwrap(),
+        relocked,
+        "the relock stands as the tool wrote it\nstderr: {stderr}"
+    );
+    let report = serde_json::from_str(&stdout)
+        .unwrap_or_else(|e| panic!("{e}\nstdout: {stdout}\nstderr: {stderr}"));
+    (report, stderr, code)
+}
+
+/// A security fix does not wait for the cooldown, but the relock that
+/// writes it can also lock young releases the fix never asked for. Those are
+/// reported, and the fix itself, however young, is not.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_fix_relock_reports_young_releases_it_pulled_in_besides_the_fix() {
+    let (report, stderr, code) = fix_pulling_in_transitives(Some("7d")).await;
+    assert_eq!(
+        code, 0,
+        "the fix applied and nothing is left vulnerable: {report}"
+    );
+    let young = report["lockfile_cooldown"]
+        .as_array()
+        .unwrap_or_else(|| panic!("young transitives are reported: {report}\nstderr: {stderr}"));
+    let named: Vec<(&str, &str)> = young
+        .iter()
+        .map(|entry| {
+            (
+                entry["package"].as_str().unwrap(),
+                entry["version"].as_str().unwrap(),
+            )
+        })
+        .collect();
+    assert_eq!(named, [("newdep", "1.0.0")], "{report}");
+    assert_eq!(young[0]["cooldown"], "7d", "{report}");
+    assert_eq!(young[0]["lockfile"], "uv.lock", "{report}");
+}
+
+/// Without a cooldown there is nothing to read the relock back against.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_fix_relock_without_a_cooldown_reports_no_young_releases() {
+    let (report, stderr, code) = fix_pulling_in_transitives(None).await;
+    assert_eq!(code, 0, "{report}\nstderr: {stderr}");
+    assert!(report.get("lockfile_cooldown").is_none(), "{report}");
+}
+
+/// A cargo security fix's `--precise` can lock a young companion crate. It is
+/// reported, never moved back: holding it could undo the fix.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_cargo_fix_reports_a_young_companion_crate_without_holding_it() {
+    let server = wiremock::MockServer::start().await;
+    wiremock::Mock::given(wiremock::matchers::method("POST"))
+        .and(wiremock::matchers::path("/querybatch"))
+        .respond_with(MultiOsvResponder {
+            answers: vec![("livecrate", "1.0.0", "RUSTSEC-floors-companion")],
+        })
+        .mount(&server)
+        .await;
+    mount_vuln_get(
+        &server,
+        "RUSTSEC-floors-companion",
+        "livecrate",
+        "crates.io",
+        "1.1.0",
+    )
+    .await;
+    mount_crate_dated(&server, "livecrate", &[("1.0.0", 400), ("1.1.0", 1)]).await;
+    mount_crate_dated(&server, "compcrate", &[("1.0.0", 400), ("1.0.1", 1)]).await;
+
+    // The canonical crates.io source, whose API `run_with_env` points at the
+    // mock server.
+    let source = "registry+https://github.com/rust-lang/crates.io-index";
+    let lock = |live: &str, companion: &str| {
+        format!(
+            "version = 4\n\n[[package]]\nname = \"t\"\nversion = \"0.1.0\"\n\n[[package]]\nname = \"compcrate\"\nversion = \"{companion}\"\nsource = \"{source}\"\n\n[[package]]\nname = \"livecrate\"\nversion = \"{live}\"\nsource = \"{source}\"\n"
+        )
+    };
+    let tmp = tempfile::tempdir().unwrap();
+    fs::write(
+        tmp.path().join("Cargo.toml"),
+        "[package]\nname = \"t\"\nversion = \"0.1.0\"\n",
+    )
+    .unwrap();
+    fs::write(tmp.path().join("Cargo.lock"), lock("1.0.0", "1.0.0")).unwrap();
+    let bin_dir = tmp.path().join("fakebin");
+    fs::create_dir(&bin_dir).unwrap();
+    let log = tmp.path().join("cargo-invocations.log");
+    write_fake_tool(
+        &bin_dir,
+        "cargo",
+        &format!(
+            "#!/bin/sh\necho \"$@\" >> {}\ncat > Cargo.lock <<'EOF'\n{}EOF\nexit 0\n",
+            log.display(),
+            lock("1.1.0", "1.0.1")
+        ),
+    );
+
+    let (stdout, stderr, code) = run_with_env(
+        &[
+            "audit",
+            "--fix-audit",
+            "--apply",
+            "--no-cache",
+            "--min-age",
+            "7d",
+            "--format",
+            "json",
+        ],
+        tmp.path(),
+        &[
+            ("OSV_API_URL", &server.uri()),
+            ("PATH", &path_with(&bin_dir)),
+        ],
+    );
+
+    assert_eq!(code, 0, "stdout: {stdout}\nstderr: {stderr}");
+    let calls = fs::read_to_string(&log).unwrap();
+    assert_eq!(
+        calls
+            .lines()
+            .filter(|call| call.starts_with("update"))
+            .count(),
+        1,
+        "only the fix's own --precise runs, no hold: {calls}"
+    );
+    assert!(calls.contains("livecrate@1.0.0 --precise 1.1.0"), "{calls}");
+    assert_eq!(
+        fs::read_to_string(tmp.path().join("Cargo.lock")).unwrap(),
+        lock("1.1.0", "1.0.1")
+    );
+    let report: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    let young: Vec<(&str, &str)> = report["lockfile_cooldown"]
+        .as_array()
+        .unwrap_or_else(|| panic!("the companion is reported: {report}\nstderr: {stderr}"))
+        .iter()
+        .map(|entry| {
+            (
+                entry["package"].as_str().unwrap(),
+                entry["version"].as_str().unwrap(),
+            )
+        })
+        .collect();
+    assert_eq!(young, [("compcrate", "1.0.1")], "{report}");
 }

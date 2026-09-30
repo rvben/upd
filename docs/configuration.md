@@ -295,7 +295,10 @@ the cooldown too, in whatever form the tool understands.
 This covers the refreshes `upd update` runs, interactive ones and the relock
 that writes a version floor included. `upd audit --fix-audit` is different: it
 moves a vulnerable package to the release that fixes it, however young that
-release is, so its refreshes are neither gated nor checked as below.
+release is, so its refreshes are not gated and nothing in them is held, since
+holding a release back could undo the fix. They are still read back as below,
+and every young release a refresh locked besides the fixes themselves is
+reported; the fixes never are.
 
 | Lockfile | How the cooldown reaches it |
 | --- | --- |

@@ -10,7 +10,9 @@ use std::process::Command;
 
 use colored::Colorize;
 
-use crate::lockgate::{GateReport, GateStatus, ReleaseAgeGate, condense, native, run_query, uv};
+use crate::lockgate::{
+    GateReport, GateStatus, RefreshGate, ReleaseAgeGate, condense, native, run_query, uv,
+};
 use crate::updater::specifier_floor;
 
 /// The outcome of attempting to regenerate a single lockfile.
@@ -682,15 +684,17 @@ impl Invocation {
 /// ecosystems that support targeted commands (e.g. `cargo update -p …`) only
 /// touch the packages that actually changed.
 ///
-/// Under a `gate` the refresh is handed the tool's own release-age setting
-/// where it has one. When the tool refuses to resolve under it, the lockfile
-/// is put back and refreshed without it, and the returned [`GateReport`] says
-/// so, so the caller can read the result back against the cooldown.
+/// Under [`RefreshGate::Keep`] the refresh is handed the tool's own
+/// release-age setting where it has one. When the tool refuses to resolve
+/// under it, the lockfile is put back and refreshed without it, and the
+/// returned [`GateReport`] says so, so the caller can read the result back
+/// against the cooldown. Under [`RefreshGate::Report`] the refresh runs
+/// without the cooldown and its report is [`GateStatus::Exempt`].
 pub fn regenerate_lockfile(
     manifest_path: &Path,
     lockfile_type: LockfileType,
     changed: &[String],
-    gate: Option<ReleaseAgeGate>,
+    gate: Option<RefreshGate>,
     verbose: bool,
 ) -> Relock {
     let dir = containing_dir(manifest_path);
@@ -722,21 +726,47 @@ pub fn regenerate_lockfile(
 
     // `go.sum` records checksums for the versions `go.mod` already names, so
     // its refresh introduces no release of its own choosing.
-    let Some(gate) = gate.filter(|_| lockfile_type != LockfileType::GoSum) else {
-        let outcome = match plain.run(lockfile_type, dir, verbose) {
-            Ok(()) => RegenOutcome::Ok(lockfile_type),
-            Err(failure) => RegenOutcome::Failed {
-                lockfile: lockfile_type,
-                message: failure.message,
-            },
-        };
-        return Relock {
-            outcome,
-            gate: None,
-        };
+    let lock_path = dir.join(lockfile_type.filename());
+    let gate = match gate.filter(|_| lockfile_type != LockfileType::GoSum) {
+        Some(RefreshGate::Keep(gate)) => gate,
+        Some(RefreshGate::Report(gate)) => {
+            let before = std::fs::read(&lock_path).ok();
+            return match plain.run(lockfile_type, dir, verbose) {
+                Ok(()) => Relock {
+                    outcome: RegenOutcome::Ok(lockfile_type),
+                    gate: Some(GateReport {
+                        lockfile: lock_path,
+                        lockfile_type,
+                        gate,
+                        status: GateStatus::Exempt,
+                        before,
+                        keep: Vec::new(),
+                    }),
+                },
+                Err(failure) => Relock {
+                    outcome: RegenOutcome::Failed {
+                        lockfile: lockfile_type,
+                        message: failure.message,
+                    },
+                    gate: None,
+                },
+            };
+        }
+        None => {
+            let outcome = match plain.run(lockfile_type, dir, verbose) {
+                Ok(()) => RegenOutcome::Ok(lockfile_type),
+                Err(failure) => RegenOutcome::Failed {
+                    lockfile: lockfile_type,
+                    message: failure.message,
+                },
+            };
+            return Relock {
+                outcome,
+                gate: None,
+            };
+        }
     };
 
-    let lock_path = dir.join(lockfile_type.filename());
     let refresh = GatedRefresh {
         lockfile_type,
         dir,
@@ -1310,7 +1340,7 @@ impl LockfileRegenResult {
 pub fn regenerate_lockfiles(
     manifest_path: &Path,
     changed: &[String],
-    gate: Option<ReleaseAgeGate>,
+    gate: Option<RefreshGate>,
     verbose: bool,
 ) -> LockfileRegenResult {
     let lockfiles = detect_lockfiles(manifest_path);

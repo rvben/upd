@@ -33,7 +33,7 @@ use upd::lockfile::{
     regenerate_lockfile,
 };
 use upd::lockgate::check::{LockCooldownCheck, LockRegistries, check_refreshed_lockfiles};
-use upd::lockgate::{GateReport, ReleaseAgeGate, file_identity};
+use upd::lockgate::{GateReport, RefreshGate, ReleaseAgeGate, file_identity};
 use upd::lockscan;
 use upd::nested_lock::{NestedLockSync, NestedSyncStatus, sync_nested_cargo_workspaces};
 use upd::normalize::pep503_normalize;
@@ -1058,6 +1058,19 @@ fn plan_lock_groups(files: &[(PathBuf, FileType)]) -> Result<Vec<LockGroup>> {
     Ok(groups)
 }
 
+/// The cooldown policy `config` sets, overridden by `--min-age` or raised by
+/// `--min-age-floor`, or `None` when it sets no cooldown at all.
+fn cooldown_policy(cli: &Cli, config: Option<&UpdConfig>) -> Result<Option<CooldownPolicy>> {
+    let default_config = UpdConfig::default();
+    let policy = config
+        .unwrap_or(&default_config)
+        .to_cooldown_policy(cli.min_age.as_deref(), cli.min_age_floor.as_deref())?;
+    let is_noop = policy.force_override.is_none()
+        && policy.default <= Duration::zero()
+        && policy.per_ecosystem.is_empty();
+    Ok((!is_noop).then_some(policy))
+}
+
 /// The cooldown each file's lockfile refresh keeps to, for the files that
 /// have one, measured from `now`.
 fn release_age_gates(
@@ -1086,6 +1099,78 @@ fn floor_manifest_type(kind: lockscan::discover::LockKind) -> Option<FileType> {
         lockscan::discover::LockKind::Cargo => Some(FileType::CargoToml),
         lockscan::discover::LockKind::Poetry | lockscan::discover::LockKind::Gradle => None,
     }
+}
+
+/// The cooldown each security fix's lockfile refresh is read back against,
+/// keyed by the path its group relocks, measured from `now`. A fix refresh is
+/// never held to the cooldown, since a hold could undo the fix; what it pulls
+/// in besides the fix is only reported.
+fn fix_refresh_gates(
+    cli: &Cli,
+    file_configs: &HashMap<PathBuf, Option<Arc<UpdConfig>>>,
+    targets: &[FixTarget],
+    now: DateTime<Utc>,
+) -> Result<HashMap<PathBuf, RefreshGate>> {
+    let mut gates = HashMap::new();
+    for target in targets {
+        if gates.contains_key(&target.path) {
+            continue;
+        }
+        let file_type = target.file_type.or(match target.ecosystem {
+            Ecosystem::PyPI => Some(FileType::PyProject),
+            Ecosystem::Npm => Some(FileType::PackageJson),
+            Ecosystem::CratesIo => Some(FileType::CargoToml),
+            Ecosystem::RubyGems => Some(FileType::Gemfile),
+            _ => None,
+        });
+        let Some(file_type) = file_type else {
+            continue;
+        };
+        let config = resolve_floor_config(cli, file_configs, &target.path)?;
+        let policy = cooldown_policy(cli, config.as_deref())?;
+        let min_age = upd::output::entry_cooldown(policy.as_ref(), None, file_type);
+        if let Some(gate) = ReleaseAgeGate::new(min_age, now) {
+            gates.insert(target.path.clone(), RefreshGate::Report(gate));
+        }
+    }
+    Ok(gates)
+}
+
+/// Read back the lockfiles the security fixes refreshed, reporting each young
+/// release a refresh pulled in besides the fixes themselves.
+async fn check_fix_refreshes(
+    cli: &Cli,
+    gates: Vec<GateReport>,
+    offline: bool,
+) -> LockCooldownCheck {
+    if gates.is_empty() {
+        return LockCooldownCheck::default();
+    }
+    if offline {
+        return LockCooldownCheck {
+            warnings: vec![
+                "--offline: the lockfiles the fixes refreshed were not checked against the cooldown"
+                    .to_string(),
+            ],
+            ..LockCooldownCheck::default()
+        };
+    }
+    let cache = Cache::new_shared();
+    let cache_enabled = !cli.no_cache;
+    let pypi_registry = pypi_registry(false);
+    let pypi_cache_namespace = pypi_registry.cache_namespace();
+    let pypi = CachedRegistry::with_namespace(
+        pypi_registry,
+        Arc::clone(&cache),
+        cache_enabled,
+        pypi_cache_namespace,
+    );
+    let npm = CachedRegistry::new(npm_registry(false), Arc::clone(&cache), cache_enabled);
+    let crates_io =
+        CachedRegistry::new(crates_io_registry(false), Arc::clone(&cache), cache_enabled);
+    let rubygems = CachedRegistry::new(RubyGemsRegistry::new(), Arc::clone(&cache), cache_enabled);
+    let registries = lock_registries(&pypi, &npm, &crates_io, &rubygems);
+    check_refreshed_lockfiles(gates, registries, cli.verbose).await
 }
 
 /// The registries a refreshed lockfile is read back against, and where each
@@ -1241,7 +1326,13 @@ fn refresh_lock_groups(
         let mut outcomes: Vec<RegenOutcome> = Vec::new();
         let mut gates = Vec::new();
         for lockfile in &group.lockfiles {
-            let relock = regenerate_lockfile(anchor, *lockfile, &changed, gate, verbose);
+            let relock = regenerate_lockfile(
+                anchor,
+                *lockfile,
+                &changed,
+                gate.map(RefreshGate::Keep),
+                verbose,
+            );
             outcomes.push(relock.outcome);
             gates.extend(relock.gate);
         }
@@ -2010,19 +2101,7 @@ async fn run_update(cli: &Cli) -> Result<()> {
     // CLI --min-age always wins over per-file config values.
     let file_cooldowns: HashMap<PathBuf, Option<CooldownPolicy>> = file_configs
         .iter()
-        .map(|(path, config)| {
-            let raw = match config.as_ref() {
-                Some(cfg) => {
-                    cfg.to_cooldown_policy(cli.min_age.as_deref(), cli.min_age_floor.as_deref())?
-                }
-                None => UpdConfig::default()
-                    .to_cooldown_policy(cli.min_age.as_deref(), cli.min_age_floor.as_deref())?,
-            };
-            let is_noop = raw.force_override.is_none()
-                && raw.default <= Duration::zero()
-                && raw.per_ecosystem.is_empty();
-            Ok::<_, anyhow::Error>((path.clone(), if is_noop { None } else { Some(raw) }))
-        })
+        .map(|(path, config)| Ok((path.clone(), cooldown_policy(cli, config.as_deref())?)))
         .collect::<Result<HashMap<_, _>>>()?;
     let cooldown_notes: Arc<Mutex<BTreeMap<String, String>>> =
         Arc::new(Mutex::new(BTreeMap::new()));
@@ -2506,7 +2585,7 @@ async fn run_update(cli: &Cli) -> Result<()> {
     let mut floor_reports: Vec<upd::output::UpdateFileReport> = Vec::new();
     // The cooldown each floor's relock keeps to, by the file the floor is
     // written to.
-    let mut floor_gates: HashMap<PathBuf, ReleaseAgeGate> = HashMap::new();
+    let mut floor_gates: HashMap<PathBuf, RefreshGate> = HashMap::new();
     let mut run_warnings: Vec<String> = Vec::new();
     let mut floor_has_planned = false;
 
@@ -2610,20 +2689,7 @@ async fn run_update(cli: &Cli) -> Result<()> {
                 let lookup_path = floor_config_lookup_path(&lp.lockfile_path, kind);
                 let config = resolve_floor_config(cli, &file_configs, &lookup_path)?;
 
-                let raw_policy = match config.as_ref() {
-                    Some(cfg) => cfg
-                        .to_cooldown_policy(cli.min_age.as_deref(), cli.min_age_floor.as_deref())?,
-                    None => UpdConfig::default()
-                        .to_cooldown_policy(cli.min_age.as_deref(), cli.min_age_floor.as_deref())?,
-                };
-                let is_noop_cooldown = raw_policy.force_override.is_none()
-                    && raw_policy.default <= Duration::zero()
-                    && raw_policy.per_ecosystem.is_empty();
-                let cooldown_policy = if is_noop_cooldown {
-                    None
-                } else {
-                    Some(raw_policy)
-                };
+                let cooldown_policy = cooldown_policy(cli, config.as_deref())?;
 
                 let options = build_update_options(
                     dry_run,
@@ -2644,7 +2710,7 @@ async fn run_update(cli: &Cli) -> Result<()> {
                     let min_age =
                         upd::output::entry_cooldown(cooldown_policy.as_ref(), None, file_type);
                     if let Some(gate) = ReleaseAgeGate::new(min_age, run_started) {
-                        floor_gates.insert(report_path.clone(), gate);
+                        floor_gates.insert(report_path.clone(), RefreshGate::Keep(gate));
                     }
                 }
                 holders.push((*lp, report_path, options, ignored));
@@ -4671,6 +4737,7 @@ async fn run_audit(cli: &Cli) -> Result<()> {
                 &AuditResult::default(),
                 "complete",
                 Vec::new(),
+                LockCooldownCheck::default(),
                 &BoundedOutputParams::from_cli(cli),
             )?;
         }
@@ -4737,6 +4804,7 @@ async fn run_audit(cli: &Cli) -> Result<()> {
                 &empty_result,
                 status_str,
                 Vec::new(),
+                LockCooldownCheck::default(),
                 &BoundedOutputParams::from_cli(cli),
             )?;
         }
@@ -4851,6 +4919,7 @@ async fn run_audit(cli: &Cli) -> Result<()> {
                 &audit_result,
                 status_str,
                 Vec::new(),
+                LockCooldownCheck::default(),
                 &BoundedOutputParams::from_cli(cli),
             )?;
         }
@@ -4949,18 +5018,21 @@ async fn run_audit(cli: &Cli) -> Result<()> {
             routing.targets.is_empty() && routing.unfixable.iter().all(|u| u.no_fixed_version);
         let effective_dry_run = cli.is_effective_dry_run();
 
-        let (outcomes, notes): (Vec<AppliedFix>, Vec<String>) = if all_blocked {
-            (Vec::new(), Vec::new())
-        } else {
-            let opts = FixApplyOptions {
-                dry_run: effective_dry_run,
-                relock_manifests: !cli.no_lock,
-                relock_floors: !cli.no_lock,
-                verbose: cli.verbose && text_mode,
-                gates: HashMap::new(),
-            };
-            let manifest_editor =
-                |path: &Path, file_type: FileType, targets: &[&FixTarget]| -> Result<bool> {
+        let (outcomes, notes, refresh_gates): (Vec<AppliedFix>, Vec<String>, Vec<GateReport>) =
+            if all_blocked {
+                (Vec::new(), Vec::new(), Vec::new())
+            } else {
+                let opts = FixApplyOptions {
+                    dry_run: effective_dry_run,
+                    relock_manifests: !cli.no_lock,
+                    relock_floors: !cli.no_lock,
+                    verbose: cli.verbose && text_mode,
+                    gates: fix_refresh_gates(cli, &file_configs, &routing.targets, Utc::now())?,
+                };
+                let manifest_editor = |path: &Path,
+                                       file_type: FileType,
+                                       targets: &[&FixTarget]|
+                 -> Result<bool> {
                     let content = read_file_safe(path)?;
                     let updates: Vec<VersionEdit<'_>> = targets
                         .iter()
@@ -4984,11 +5056,17 @@ async fn run_audit(cli: &Cli) -> Result<()> {
                         Ok(false)
                     }
                 };
-            let FixApplyReport {
-                outcomes, notes, ..
-            } = apply_fix_targets(routing.targets, &opts, &manifest_editor);
-            (outcomes, notes)
-        };
+                let FixApplyReport {
+                    outcomes,
+                    notes,
+                    gates,
+                } = apply_fix_targets(routing.targets, &opts, &manifest_editor);
+                (outcomes, notes, gates)
+            };
+        let lock_cooldown = check_fix_refreshes(cli, refresh_gates, offline).await;
+        if text_mode {
+            print_lock_cooldown(&lock_cooldown, false);
+        }
 
         if !all_blocked {
             for note in &notes {
@@ -5032,6 +5110,7 @@ async fn run_audit(cli: &Cli) -> Result<()> {
                 &audit_result,
                 status_str,
                 fix_entries,
+                lock_cooldown,
                 &BoundedOutputParams::from_cli(cli),
             )?;
         }
@@ -5111,10 +5190,13 @@ fn emit_audit_json(
     audit: &AuditResult,
     status: &'static str,
     fixes: Vec<upd::output::FixEntry>,
+    lock_cooldown: LockCooldownCheck,
     bounded: &BoundedOutputParams<'_>,
 ) -> Result<()> {
     use upd::output::build_audit_report;
-    let report = build_audit_report(audit, 0, status, fixes);
+    let mut report = build_audit_report(audit, 0, status, fixes);
+    report.lockfile_cooldown = lock_cooldown.findings;
+    report.warnings.extend(lock_cooldown.warnings);
     let doc = serde_json::to_value(&report)?;
     let doc = apply_bounded_output(doc, "vulnerabilities", bounded);
     println!("{}", serde_json::to_string_pretty(&doc)?);
