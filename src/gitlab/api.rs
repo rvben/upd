@@ -18,6 +18,9 @@ const BODY_EXCERPT: usize = 500;
 /// answering with a next page.
 const MAX_PAGES: u32 = 1000;
 
+/// The largest answer read from GitLab other than a job's artifacts.
+const MAX_ANSWER: u64 = 64 * 1024 * 1024;
+
 /// An open merge request as the run needs to see it.
 #[derive(Debug, Clone)]
 pub struct MergeRequest {
@@ -84,6 +87,8 @@ impl Retry {
 #[derive(Clone)]
 pub struct Client {
     http: reqwest::Client,
+    /// The header the token travels in.
+    credential: &'static str,
     token: String,
     api_url: String,
     merge_requests: String,
@@ -91,21 +96,42 @@ pub struct Client {
     settle: Retry,
 }
 
-/// A GitLab answer after retries: its status, headers and body text.
+/// A GitLab answer after retries: its status, headers and body.
 struct Answer {
     status: StatusCode,
     headers: HeaderMap,
     url: String,
-    body: String,
+    body: Vec<u8>,
+}
+
+impl Answer {
+    fn text(&self) -> std::borrow::Cow<'_, str> {
+        String::from_utf8_lossy(&self.body)
+    }
 }
 
 impl Client {
     /// A client for group-level calls; [`Client::for_project`] addresses a
     /// project's merge requests.
     pub fn new(api_url: &str, token: &str) -> Result<Self, Error> {
+        Self::build(
+            api_url,
+            "PRIVATE-TOKEN",
+            token,
+            reqwest::redirect::Policy::default(),
+        )
+    }
+
+    fn build(
+        api_url: &str,
+        credential: &'static str,
+        token: &str,
+        redirect: reqwest::redirect::Policy,
+    ) -> Result<Self, Error> {
         let builder = reqwest::Client::builder()
             .connect_timeout(Duration::from_secs(15))
             .timeout(Duration::from_secs(60))
+            .redirect(redirect)
             .user_agent(concat!("upd/", env!("CARGO_PKG_VERSION")));
         let http = crate::http::apply(builder)
             .build()
@@ -113,6 +139,7 @@ impl Client {
         let api_url = api_url.trim_end_matches('/').to_string();
         Ok(Self {
             http,
+            credential,
             token: token.to_string(),
             merge_requests: String::new(),
             api_url,
@@ -179,7 +206,9 @@ impl Client {
         let mut attempt = 0;
         loop {
             attempt += 1;
-            let answer = self.execute(Method::POST, url.clone(), Some(&body)).await?;
+            let answer = self
+                .execute(Method::POST, url.clone(), Some(&body), MAX_ANSWER)
+                .await?;
             if !source_branch_missing(&answer) {
                 return parse_json(answer);
             }
@@ -254,25 +283,60 @@ impl Client {
     /// excluding projects merely shared with it, in project-id order and
     /// without duplicates. `group` is a numeric id or a full path.
     pub async fn group_projects(&self, group: &str) -> Result<Vec<Value>, Error> {
-        let base = self.url(&format!(
+        let mut base = self.url(&format!(
             "{}/groups/{}/projects",
             self.api_url,
             encode_segment(group)
         ))?;
+        base.query_pairs_mut()
+            .append_pair("include_subgroups", "true")
+            .append_pair("with_shared", "false")
+            .append_pair("archived", "false")
+            .append_pair("order_by", "id")
+            .append_pair("sort", "asc");
         let mut projects: Vec<Value> = Vec::new();
         let mut seen = std::collections::HashSet::new();
+        for item in self
+            .every_page(base, &format!("projects for {group}"))
+            .await?
+        {
+            let Some(id) = item["id"].as_u64() else {
+                return Err(Error::Refused(format!(
+                    "GitLab listed a project without a numeric id: {}",
+                    excerpt(&item.to_string())
+                )));
+            };
+            if seen.insert(id) {
+                projects.push(item);
+            }
+        }
+        Ok(projects)
+    }
+
+    /// The jobs of `pipeline` in `project`, the latest attempt of each.
+    /// Listed with this client's token: GitLab's job token permissions do
+    /// not include this endpoint.
+    pub async fn pipeline_jobs(&self, project: u64, pipeline: &str) -> Result<Vec<Value>, Error> {
+        let base = self.url(&format!(
+            "{}/projects/{project}/pipelines/{}/jobs",
+            self.api_url,
+            encode_segment(pipeline)
+        ))?;
+        self.every_page(base, &format!("jobs of pipeline {pipeline}"))
+            .await
+    }
+
+    /// Every item of the list `base` addresses, page by page, following
+    /// GitLab's X-Next-Page header. `what` names the items in errors.
+    async fn every_page(&self, base: Url, what: &str) -> Result<Vec<Value>, Error> {
+        let mut items: Vec<Value> = Vec::new();
         let mut page: u32 = 1;
         for _ in 0..MAX_PAGES {
             let mut url = base.clone();
             url.query_pairs_mut()
-                .append_pair("include_subgroups", "true")
-                .append_pair("with_shared", "false")
-                .append_pair("archived", "false")
-                .append_pair("order_by", "id")
-                .append_pair("sort", "asc")
                 .append_pair("per_page", "100")
                 .append_pair("page", &page.to_string());
-            let answer = self.execute(Method::GET, url, None).await?;
+            let answer = self.execute(Method::GET, url, None, MAX_ANSWER).await?;
             let next = answer
                 .headers
                 .get("x-next-page")
@@ -281,41 +345,29 @@ impl Client {
                 .unwrap_or_default()
                 .to_string();
             match parse_json(answer)? {
-                Value::Array(items) => {
-                    for item in items {
-                        let Some(id) = item["id"].as_u64() else {
-                            return Err(Error::Refused(format!(
-                                "GitLab listed a project without a numeric id: {}",
-                                excerpt(&item.to_string())
-                            )));
-                        };
-                        if seen.insert(id) {
-                            projects.push(item);
-                        }
-                    }
-                }
+                Value::Array(page_items) => items.extend(page_items),
                 other => {
                     return Err(Error::Refused(format!(
-                        "GitLab returned a project list that is not a list: {}",
+                        "GitLab returned a list of {what} that is not a list: {}",
                         excerpt(&other.to_string())
                     )));
                 }
             }
             if next.is_empty() {
-                return Ok(projects);
+                return Ok(items);
             }
             match next.parse::<u32>() {
                 Ok(following) if following > page => page = following,
                 _ => {
                     return Err(Error::Refused(format!(
-                        "GitLab sent an X-Next-Page header of {} after page {page}",
+                        "GitLab sent an X-Next-Page header of {} after page {page} of {what}",
                         excerpt(&next)
                     )));
                 }
             }
         }
         Err(Error::Refused(format!(
-            "GitLab kept paginating past {MAX_PAGES} pages of projects for {group}"
+            "GitLab kept paginating past {MAX_PAGES} pages of {what}"
         )))
     }
 
@@ -363,12 +415,12 @@ impl Client {
             encode_segment(path)
         ))?;
         url.query_pairs_mut().append_pair("ref", reference);
-        let answer = self.execute(Method::GET, url, None).await?;
+        let answer = self.execute(Method::GET, url, None, MAX_ANSWER).await?;
         if answer.status == StatusCode::NOT_FOUND {
             return Ok(None);
         }
         check_status(&answer)?;
-        Ok(Some(answer.body))
+        Ok(Some(answer.text().into_owned()))
     }
 
     fn url(&self, text: &str) -> Result<Url, Error> {
@@ -381,16 +433,17 @@ impl Client {
     }
 
     async fn send(&self, method: Method, url: Url, body: Option<&Value>) -> Result<Value, Error> {
-        parse_json(self.execute(method, url, body).await?)
+        parse_json(self.execute(method, url, body, MAX_ANSWER).await?)
     }
 
     /// Sends one request, retrying under [`Retry`]'s rules, and returns the
-    /// final answer whatever its status.
+    /// final answer whatever its status. Refuses a body over `limit` bytes.
     async fn execute(
         &self,
         method: Method,
         url: Url,
         body: Option<&Value>,
+        limit: u64,
     ) -> Result<Answer, Error> {
         let repeatable = matches!(method, Method::GET | Method::PUT);
         let shown = redact_query(&url);
@@ -401,7 +454,7 @@ impl Client {
             let mut request = self
                 .http
                 .request(method.clone(), url.clone())
-                .header("PRIVATE-TOKEN", &self.token);
+                .header(self.credential, &self.token);
             if let Some(body) = body {
                 request = request.json(body);
             }
@@ -418,9 +471,7 @@ impl Client {
                             ));
                     let headers = response.headers().clone();
                     if !retryable || last {
-                        let body = response.text().await.map_err(|error| {
-                            Error::Network(format!("GitLab response could not be read: {error}"))
-                        })?;
+                        let body = read_limited(response, limit, &shown).await?;
                         return Ok(Answer {
                             status,
                             headers,
@@ -452,6 +503,74 @@ impl Client {
     }
 }
 
+/// A client that authenticates as the running CI job, with its job token.
+///
+/// It reads only a job's artifacts, through the endpoint runners download
+/// dependencies from. It never follows a redirect, so the job token reaches
+/// no host but the API's.
+pub struct JobClient {
+    client: Client,
+}
+
+impl JobClient {
+    pub fn new(api_url: &str, job_token: &str) -> Result<Self, Error> {
+        Ok(Self {
+            client: Client::build(
+                api_url,
+                "JOB-TOKEN",
+                job_token,
+                reqwest::redirect::Policy::none(),
+            )?,
+        })
+    }
+
+    #[cfg(test)]
+    fn with_retry(self, retry: Retry) -> Self {
+        Self {
+            client: self.client.with_retry(retry),
+        }
+    }
+
+    /// The artifacts archive of `job`, refused over `limit` bytes. Reads
+    /// through the endpoint runners download dependencies from, which
+    /// admits the job token of any job in the same project.
+    pub async fn job_artifacts(&self, job: u64, limit: u64) -> Result<Vec<u8>, Error> {
+        let url = self
+            .client
+            .url(&format!("{}/jobs/{job}/artifacts", self.client.api_url))?;
+        let answer = self.client.execute(Method::GET, url, None, limit).await?;
+        check_status(&answer)?;
+        Ok(answer.body)
+    }
+}
+
+/// The body of `response`, refused once it passes `limit` bytes.
+async fn read_limited(
+    mut response: reqwest::Response,
+    limit: u64,
+    shown: &str,
+) -> Result<Vec<u8>, Error> {
+    let too_large = || Error::Refused(format!("GitLab sent more than {limit} bytes for {shown}"));
+    if response
+        .content_length()
+        .is_some_and(|length| length > limit)
+    {
+        return Err(too_large());
+    }
+    let mut body = Vec::new();
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(|error| Error::Network(format!("GitLab response could not be read: {error}")))?
+    {
+        if (body.len() + chunk.len()) as u64 > limit {
+            return Err(too_large());
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(body)
+}
+
 fn check_status(answer: &Answer) -> Result<(), Error> {
     let status = answer.status;
     if status.is_success() {
@@ -460,7 +579,7 @@ fn check_status(answer: &Answer) -> Result<(), Error> {
     let message = format!(
         "GitLab answered {status} for {}: {}",
         answer.url,
-        excerpt(&answer.body)
+        excerpt(&answer.text())
     );
     Err(
         if status == StatusCode::TOO_MANY_REQUESTS || status.is_server_error() {
@@ -473,10 +592,10 @@ fn check_status(answer: &Answer) -> Result<(), Error> {
 
 fn parse_json(answer: Answer) -> Result<Value, Error> {
     check_status(&answer)?;
-    if answer.body.trim().is_empty() {
+    if answer.body.trim_ascii().is_empty() {
         return Ok(Value::Null);
     }
-    serde_json::from_str(&answer.body).map_err(|error| {
+    serde_json::from_slice(&answer.body).map_err(|error| {
         Error::Refused(format!(
             "GitLab returned a response that is not JSON ({error}) for {}",
             answer.url
@@ -488,7 +607,7 @@ fn parse_json(answer: Answer) -> Result<Value, Error> {
 /// the just-pushed source branch yet.
 fn source_branch_missing(answer: &Answer) -> bool {
     answer.status == StatusCode::BAD_REQUEST
-        && serde_json::from_str::<Value>(&answer.body).is_ok_and(|body| {
+        && serde_json::from_slice::<Value>(&answer.body).is_ok_and(|body| {
             body["message"]["source_branch"]
                 .as_array()
                 .is_some_and(|reasons| {
@@ -620,7 +739,7 @@ fn excerpt(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use wiremock::matchers::{method, path, query_param};
+    use wiremock::matchers::{header, header_exists, method, path, query_param};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     const FAST: Retry = Retry {
@@ -1211,5 +1330,112 @@ mod tests {
             base.for_project(99).merge_requests,
             "https://gitlab.example.test/api/v4/projects/99/merge_requests"
         );
+    }
+
+    fn job_client(server: &MockServer) -> JobClient {
+        JobClient::new(&format!("{}/api/v4", server.uri()), "job-token")
+            .unwrap()
+            .with_retry(FAST)
+    }
+
+    #[tokio::test]
+    async fn pipeline_jobs_are_listed_with_the_token_page_by_page() {
+        let server = MockServer::start().await;
+        let jobs = "/api/v4/projects/7/pipelines/981/jobs";
+        for (page, ids, next) in [("1", [1, 2], "2"), ("2", [3, 4], "")] {
+            let body: Vec<Value> = ids.iter().map(|id| json!({"id": id})).collect();
+            Mock::given(method("GET"))
+                .and(path(jobs))
+                .and(query_param("page", page))
+                .and(header("PRIVATE-TOKEN", "group-token"))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .set_body_json(body)
+                        .insert_header("X-Next-Page", next),
+                )
+                .expect(1)
+                .mount(&server)
+                .await;
+        }
+        Mock::given(header_exists("JOB-TOKEN"))
+            .respond_with(ResponseTemplate::new(500))
+            .expect(0)
+            .mount(&server)
+            .await;
+        let listed = Client::new(&format!("{}/api/v4", server.uri()), "group-token")
+            .unwrap()
+            .with_retry(FAST)
+            .pipeline_jobs(7, "981")
+            .await
+            .unwrap();
+        let ids: Vec<u64> = listed
+            .iter()
+            .map(|job| job["id"].as_u64().unwrap())
+            .collect();
+        assert_eq!(ids, [1, 2, 3, 4]);
+    }
+
+    #[tokio::test]
+    async fn job_artifacts_are_refused_past_the_limit() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/v4/jobs/5/artifacts"))
+            .and(header("JOB-TOKEN", "job-token"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"0123456789".to_vec()))
+            .mount(&server)
+            .await;
+        let client = job_client(&server);
+        assert_eq!(client.job_artifacts(5, 10).await.unwrap(), b"0123456789");
+        let error = client.job_artifacts(5, 9).await.unwrap_err();
+        assert_eq!(error.kind(), "refused", "{error}");
+        assert!(error.to_string().contains("more than 9 bytes"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn the_limit_applies_to_the_decoded_body() {
+        // "0123456789" a hundred times, gzip-compressed to 39 bytes: the
+        // decoded body carries no length to check up front.
+        const GZIP: [u8; 39] = [
+            31, 139, 8, 0, 0, 0, 0, 0, 2, 255, 51, 48, 52, 50, 54, 49, 53, 51, 183, 176, 52, 24,
+            101, 141, 178, 70, 89, 195, 148, 5, 0, 241, 143, 133, 124, 232, 3, 0, 0,
+        ];
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/v4/jobs/5/artifacts"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("Content-Encoding", "gzip")
+                    .set_body_bytes(GZIP.to_vec()),
+            )
+            .mount(&server)
+            .await;
+        let client = job_client(&server);
+        assert_eq!(client.job_artifacts(5, 1000).await.unwrap().len(), 1000);
+        let error = client.job_artifacts(5, 999).await.unwrap_err();
+        assert!(error.to_string().contains("more than 999 bytes"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn a_job_client_follows_no_redirect() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/v4/jobs/5/artifacts"))
+            .respond_with(
+                ResponseTemplate::new(302)
+                    .insert_header("Location", format!("{}/elsewhere", server.uri())),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(path("/elsewhere"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"archive".to_vec()))
+            .expect(0)
+            .mount(&server)
+            .await;
+        let error = job_client(&server)
+            .job_artifacts(5, 1024)
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), "api_error", "{error}");
+        assert!(error.to_string().contains("302"), "{error}");
     }
 }

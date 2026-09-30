@@ -78,6 +78,7 @@ jiff = "0.2"
 saphyr-parser = "0.0.12"
 hmac = "0.13"
 sha2 = "0.11"
+zip = { version = "8.6", default-features = false, features = ["deflate-flate2-zlib-rs"] }
 
 [dev-dependencies]
 wiremock = "0.6"

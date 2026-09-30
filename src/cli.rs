@@ -451,6 +451,18 @@ pub enum GitlabOrgCommand {
     /// or writing to GitLab.
     Run,
 
+    /// Lock mode, planning job: write the child pipeline of lock jobs.
+    ///
+    /// Reads each group project's opt-in through the API, without cloning,
+    /// and writes .upd-ci/upd-lock-pipeline.yml: prepare, lock and publish
+    /// jobs for every lane of each project that consents to lockfile
+    /// regeneration, and one organization-run job for all other projects.
+    /// Copies this binary to .upd-ci/bin/upd for those jobs. Configured as
+    /// `gitlab org run` is, with UPD_LOCK=true, plus the placement variables
+    /// the template sets. With --dry-run, the child pipeline previews every
+    /// project in one organization-run job.
+    Plan,
+
     /// Lock mode, first job: open one project lane and hand its lockfiles on.
     ///
     /// Holds the token. Applies the security fixes and the update to
@@ -472,11 +484,21 @@ pub enum GitlabOrgCommand {
 
     /// Lock mode, third job: verify the lock job's result and publish it.
     ///
-    /// Holds the token. Verifies the seal on prepare's work, admits only the
+    /// Holds the token. Verifies the seal on prepare's work, downloads the
+    /// lock job's result with the job's own CI_JOB_TOKEN, admits only the
     /// planned manifest edits and in-place edits of existing lockfiles that
     /// add no new place to fetch code from, and publishes with the lease
-    /// prepare observed.
-    Publish(GitlabOrgLaneArgs),
+    /// prepare observed. Configured as `gitlab org run` is, plus
+    /// CI_PIPELINE_ID, CI_PROJECT_ID and CI_JOB_TOKEN.
+    Publish {
+        #[command(flatten)]
+        lane: GitlabOrgLaneArgs,
+        /// The name of the lock job in this pipeline whose result to
+        /// publish. Read from its artifacts archive in memory, never
+        /// unpacked.
+        #[arg(long, value_name = "JOB")]
+        lock_job: String,
+    },
 }
 
 /// The project lane a lock mode job handles.

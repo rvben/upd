@@ -2,6 +2,11 @@
 # in every project of a group that opts in. Include this file from a pinned upd
 # commit in one central project, configure its typed inputs, then extend
 # `.upd-organization-update`. See docs/gitlab.md#organization-mode.
+#
+# With the lock input on, also extend `.upd-organization-lock-plan` and
+# `.upd-organization-lock`: the organization job then only plans, and a child pipeline regenerates
+# lockfiles in jobs that never hold the token (GitLab 18.2 or later). See
+# docs/gitlab.md#lockfiles-in-organization-mode.
 
 spec:
   inputs:
@@ -70,6 +75,34 @@ spec:
       description: Report what each project would get without pushing or writing to GitLab
       type: boolean
       default: false
+    environment:
+      description: Environment the token variable is scoped to; only jobs that need the token declare it
+      default: "upd-organization"
+      regex: '^[0-9A-Za-z_-][0-9A-Za-z _/-]*$'
+    lock:
+      description: Regenerate lockfiles, in projects that also set [automation] lock = true, in a child pipeline whose lock jobs never hold the token; requires extending .upd-organization-lock-plan and .upd-organization-lock
+      type: boolean
+      default: false
+    lock_runner_tags:
+      description: Comma-separated tags of the runners reserved for lock jobs, which run project code; required with lock
+      default: ""
+      regex: '^[^$]*$'
+    runner_tags:
+      description: Comma-separated tags of the runners for the child pipeline's jobs that hold the token; empty for any runner
+      default: ""
+      regex: '^[^$]*$'
+    lock_image:
+      description: Job image carrying the lock tools (uv, npm, cargo) for lock jobs; empty uses image
+      default: ""
+      regex: '^[^$ ]*$'
+    organization_job:
+      description: Name of the job that extends .upd-organization-update, whose artifacts the lock pipeline runs from
+      default: "upd-organization-update"
+      regex: '^[0-9A-Za-z_.-][0-9A-Za-z_. /-]*$'
+    lock_plan_job:
+      description: Name of the job that extends .upd-organization-lock-plan, whose artifacts the lock pipeline is included from
+      default: "upd-organization-lock-plan"
+      regex: '^[0-9A-Za-z_.-][0-9A-Za-z_. /-]*$'
 ---
 
 .upd-organization-update:
@@ -78,6 +111,9 @@ spec:
   timeout: 2h
   interruptible: false
   resource_group: upd-organization-update
+  environment:
+    name: "$[[ inputs.environment ]]"
+    action: access
   artifacts:
     when: always
     expire_in: 1 week
@@ -104,6 +140,13 @@ spec:
     UPD_MAJOR_COMMIT_MESSAGE: "$[[ inputs.major_commit_message ]]"
     UPD_CONCURRENCY: "$[[ inputs.concurrency ]]"
     UPD_DRY_RUN: "$[[ inputs.dry_run ]]"
+    UPD_LOCK: "$[[ inputs.lock ]]"
+    UPD_ENVIRONMENT: "$[[ inputs.environment ]]"
+    UPD_IMAGE: "$[[ inputs.image ]]"
+    UPD_LOCK_IMAGE: "$[[ inputs.lock_image ]]"
+    UPD_RUNNER_TAGS: "$[[ inputs.runner_tags ]]"
+    UPD_LOCK_RUNNER_TAGS: "$[[ inputs.lock_runner_tags ]]"
+    UPD_ORGANIZATION_JOB: "$[[ inputs.organization_job ]]"
     # Test/advanced escape hatch. Normal jobs always install a released binary.
     UPD_EXECUTABLE: ""
   rules:
@@ -199,13 +242,96 @@ spec:
       # upd owns the rest of the job: discovery, opt-in, and for each opted-in
       # project the branch ownership check, update, lease-protected push and
       # merge request. Progress goes to the job log; the JSON report is kept
-      # as an artifact.
-      args=(gitlab org run --output json)
+      # as an artifact. In lock mode this job only plans: it writes the child
+      # pipeline, which .upd-organization-lock-plan passes on for
+      # .upd-organization-lock to start, and the binary its jobs run.
+      if [ "$UPD_LOCK" = "true" ]; then
+        # A release from before lock mode has no plan command, and reads
+        # `plan` as a project path: it prints the help of `gitlab org`
+        # itself. Asking the binary holds for the default release and an
+        # overridden one.
+        plan_help="$("$upd_bin" gitlab org plan --help 2>&1 || true)"
+        case "$plan_help" in
+          *" gitlab org plan "*) ;;
+          *)
+            echo "upd ${version} has no lock mode; set upd_version and upd_sha256 to a release that has 'upd gitlab org plan'" >&2
+            exit 4
+            ;;
+        esac
+        args=(gitlab org plan --output json)
+        report=.upd-ci/upd-org-plan.json
+      else
+        args=(gitlab org run --output json)
+        report=.upd-ci/upd-org-report.json
+      fi
       if [ "$UPD_DRY_RUN" = "true" ]; then
         args+=(--dry-run)
       fi
       mkdir -p .upd-ci
       status=0
-      "$upd_bin" "${args[@]}" > .upd-ci/upd-org-report.json || status=$?
+      "$upd_bin" "${args[@]}" > "$report" || status=$?
       exit "$status"
       UPD_JOB
+
+# Keeps the lock pipeline the organization job planned as an artifact of
+# its own. GitLab includes a pipeline only from an artifact archive of at
+# most 5 MiB by default, and the organization job's archive also carries the
+# upd binary the child jobs run.
+.upd-organization-lock-plan:
+  image: "$[[ inputs.image ]]"
+  stage: "$[[ inputs.stage ]]"
+  needs:
+    - job: "$[[ inputs.organization_job ]]"
+      artifacts: true
+  artifacts:
+    expire_in: 1 day
+    access: developer
+    paths:
+      - .upd-ci/upd-lock-pipeline.yml
+  variables:
+    GIT_STRATEGY: empty
+    UPD_LOCK: "$[[ inputs.lock ]]"
+    UPD_LOCK_PLAN_JOB: "$[[ inputs.lock_plan_job ]]"
+  rules:
+    - if: '$UPD_LOCK != "true"'
+      when: never
+    - if: '$CI_PIPELINE_SOURCE == "schedule"'
+    - if: '$CI_PIPELINE_SOURCE == "web"'
+    - when: never
+  script:
+    - |
+      if [ "$CI_JOB_NAME" != "$UPD_LOCK_PLAN_JOB" ]; then
+        echo "The lock_plan_job input names $UPD_LOCK_PLAN_JOB, but this job is $CI_JOB_NAME; set lock_plan_job to the name of the job that extends .upd-organization-lock-plan, so the trigger job finds its artifacts" >&2
+        exit 2
+      fi
+      if [ ! -f .upd-ci/upd-lock-pipeline.yml ]; then
+        echo "The organization job wrote no lock pipeline" >&2
+        exit 2
+      fi
+
+# Starts the lock pipeline the organization job planned. It holds the
+# organization's resource group until that pipeline finishes, so runs never
+# overlap, and forwards no variables: each child job sets the settings the
+# plan read in its own script, where no CI/CD variable can override them.
+.upd-organization-lock:
+  stage: "$[[ inputs.stage ]]"
+  needs:
+    - job: "$[[ inputs.lock_plan_job ]]"
+      artifacts: true
+  resource_group: upd-organization-update
+  variables:
+    UPD_LOCK: "$[[ inputs.lock ]]"
+  rules:
+    - if: '$UPD_LOCK != "true"'
+      when: never
+    - if: '$CI_PIPELINE_SOURCE == "schedule"'
+    - if: '$CI_PIPELINE_SOURCE == "web"'
+    - when: never
+  trigger:
+    include:
+      - artifact: .upd-ci/upd-lock-pipeline.yml
+        job: "$[[ inputs.lock_plan_job ]]"
+    strategy: mirror
+    forward:
+      yaml_variables: false
+      pipeline_variables: false

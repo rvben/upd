@@ -63,6 +63,9 @@ pub struct OrgSettings {
     /// The pipeline running the job, which lock mode seals each project's
     /// work to; absent outside GitLab CI.
     pub pipeline_id: Option<String>,
+    /// The running job's own token, which lock mode's publish reads the lock
+    /// job's result with; absent outside GitLab CI.
+    pub job_token: Option<String>,
     pub major_branch: String,
     pub major_commit_message: String,
     pub concurrency: usize,
@@ -116,7 +119,10 @@ impl OrgSettings {
         Self::from_lookup(|name| env::var(name).ok(), dry_run)
     }
 
-    fn from_lookup(lookup: impl Fn(&str) -> Option<String>, dry_run: bool) -> Result<Self, Error> {
+    pub(super) fn from_lookup(
+        lookup: impl Fn(&str) -> Option<String>,
+        dry_run: bool,
+    ) -> Result<Self, Error> {
         let value = |name: &str| lookup(name).filter(|value| !value.is_empty());
         let required = |name: &str, hint: &str| {
             value(name).ok_or_else(|| Error::Input(format!("{name} is not set: {hint}")))
@@ -263,6 +269,7 @@ impl OrgSettings {
             security_remediation,
             lock,
             pipeline_id: value("CI_PIPELINE_ID"),
+            job_token: value("CI_JOB_TOKEN"),
             major_branch,
             major_commit_message: optional(
                 "UPD_MAJOR_COMMIT_MESSAGE",

@@ -1803,6 +1803,7 @@ async fn run() -> Result<()> {
             command: upd::cli::GitlabCommand::Org { command },
         }) => match command {
             upd::cli::GitlabOrgCommand::Run => run_gitlab_org(&cli).await?,
+            upd::cli::GitlabOrgCommand::Plan => run_gitlab_org_plan(&cli).await?,
             step => run_gitlab_org_step(&cli, step).await?,
         },
         Some(Command::Schema) => {
@@ -1905,7 +1906,9 @@ async fn run_gitlab_org_step(cli: &Cli, command: &upd::cli::GitlabOrgCommand) ->
             ));
         }
         match command {
-            GitlabOrgCommand::Run => unreachable!("gitlab org run is dispatched separately"),
+            GitlabOrgCommand::Run | GitlabOrgCommand::Plan => {
+                unreachable!("gitlab org run and plan are dispatched separately")
+            }
             GitlabOrgCommand::Prepare(args) => {
                 let settings = org::OrgSettings::from_env(false)?;
                 split::prepare(&settings, args.project, lane(args.lane), &args.dir, &log).await
@@ -1919,9 +1922,17 @@ async fn run_gitlab_org_step(cli: &Cli, command: &upd::cli::GitlabOrgCommand) ->
                 };
                 split::lock_worker(dir, updater, &log).await
             }
-            GitlabOrgCommand::Publish(args) => {
+            GitlabOrgCommand::Publish { lane: args, lock_job } => {
                 let settings = org::OrgSettings::from_env(false)?;
-                split::publish(&settings, args.project, lane(args.lane), &args.dir, &log).await
+                split::publish(
+                    &settings,
+                    args.project,
+                    lane(args.lane),
+                    &args.dir,
+                    lock_job,
+                    &log,
+                )
+                .await
             }
         }
     }
@@ -1936,6 +1947,40 @@ async fn run_gitlab_org_step(cli: &Cli, command: &upd::cli::GitlabOrgCommand) ->
             }
             if report.is_failure() {
                 std::process::exit(2);
+            }
+            Ok(())
+        }
+        Err(error) => {
+            eprintln!(
+                "{}",
+                serde_json::json!({"error": {
+                    "kind": error.kind(),
+                    "message": error.message(),
+                    "exit_code": error.exit_code(),
+                }})
+            );
+            std::process::exit(error.exit_code());
+        }
+    }
+}
+
+/// Plans a lock mode organization run: writes its child pipeline.
+async fn run_gitlab_org_plan(cli: &Cli) -> Result<()> {
+    use upd::gitlab::plan;
+
+    init_tls(cli)?;
+    let result = async {
+        let settings = plan::PlanSettings::from_env(cli.dry_run)?;
+        plan::plan(&settings, std::path::Path::new(plan::PLAN_DIR)).await
+    }
+    .await;
+    match result {
+        Ok(plan) => {
+            if effective_json_mode(cli) {
+                eprintln!("{}", plan.render_text());
+                println!("{}", serde_json::to_string_pretty(&plan.to_json())?);
+            } else {
+                println!("{}", plan.render_text());
             }
             Ok(())
         }

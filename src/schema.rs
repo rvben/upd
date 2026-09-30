@@ -350,7 +350,7 @@ fn build_schema() -> Value {
             },
             {
                 "name": "gitlab org run",
-                "description": "Run the GitLab dependency update for every project in a group that opted in, from one central CI job. Lists the group's projects (subgroups included), skips (with reason) the central project itself, projects matching UPD_EXCLUDE, and archived, pending-deletion, empty, repository-disabled and branchless projects, and processes a project only when the configuration file on its default branch commit sets [automation] dependency_updates = true; each such project then gets the same rolling branch and merge request as gitlab run. Auto-merge is enabled only when both UPD_AUTO_MERGE and the project's [automation] auto_merge allow it. The ecosystem nix is always left out, and cannot be selected through UPD_LANGS. Configured by the environment: requires UPD_GITLAB_TOKEN, CI_SERVER_URL and UPD_GROUP; reads CI_API_V4_URL, CI_PROJECT_ID (the central project, which is skipped), UPD_EXCLUDE (space-separated path globs), UPD_LANGS, UPD_MIN_AGE (a floor under each project's configured cooldown), UPD_MAX_BUMP, UPD_BRANCH, UPD_COMMIT_MESSAGE, UPD_GIT_NAME, UPD_GIT_EMAIL, UPD_AUTO_MERGE, UPD_MAJOR_MR, UPD_MAJOR_BRANCH, UPD_MAJOR_COMMIT_MESSAGE and UPD_CONCURRENCY (1 to 16, default 4). A project gets the gitlab run major lane only when both UPD_MAJOR_MR and the project's [automation] major_mr allow it; the lane runs even when the project's ordinary lane failed. The token is never passed to the updater. A project that fails is reported and the others still run; the command then exits 2. With --dry-run nothing is pushed and nothing is written to GitLab. Progress goes to stderr, and in JSON mode a one-line summary is written to stderr before the report",
+                "description": "Run the GitLab dependency update for every project in a group that opted in, from one central CI job. Lists the group's projects (subgroups included), skips (with reason) the central project itself, projects matching UPD_EXCLUDE, and archived, pending-deletion, empty, repository-disabled and branchless projects, and processes a project only when the configuration file on its default branch commit sets [automation] dependency_updates = true; each such project then gets the same rolling branch and merge request as gitlab run. Auto-merge is enabled only when both UPD_AUTO_MERGE and the project's [automation] auto_merge allow it. The ecosystem nix is always left out, and cannot be selected through UPD_LANGS. Configured by the environment: requires UPD_GITLAB_TOKEN, CI_SERVER_URL and UPD_GROUP; reads CI_API_V4_URL, CI_PROJECT_ID (the central project, which is skipped), UPD_EXCLUDE (space-separated path globs), UPD_LANGS, UPD_MIN_AGE (a floor under each project's configured cooldown), UPD_MAX_BUMP, UPD_BRANCH, UPD_COMMIT_MESSAGE, UPD_GIT_NAME, UPD_GIT_EMAIL, UPD_AUTO_MERGE, UPD_MAJOR_MR, UPD_MAJOR_BRANCH, UPD_MAJOR_COMMIT_MESSAGE, UPD_CONCURRENCY (1 to 16, default 4), UPD_SHARD (k/n: only the projects whose id modulo n is k-1, so n jobs with shards 1/n to n/n cover the group once) and UPD_LOCK_HANDED_OFF (comma-separated ids the lock pipeline gave to their own jobs, skipped with reason handed_off; set by gitlab org plan's child pipeline and needs UPD_LOCK=true). A project gets the gitlab run major lane only when both UPD_MAJOR_MR and the project's [automation] major_mr allow it; the lane runs even when the project's ordinary lane failed. The token is never passed to the updater. A project that fails is reported and the others still run; the command then exits 2. With --dry-run nothing is pushed and nothing is written to GitLab. Progress goes to stderr, and in JSON mode a one-line summary is written to stderr before the report",
                 "effects": "non_idempotent",
                 "mutating": true,
                 "cardinality": "single",
@@ -360,10 +360,30 @@ fn build_schema() -> Value {
                     {"name": "group", "type": "string", "description": "The group that was listed"},
                     {"name": "branch", "type": "string", "description": "The rolling automation branch used in every project"},
                     {"name": "dry_run", "type": "boolean", "description": "Whether the run was a dry run"},
+                    {"name": "shard", "type": "string", "description": "Present only with UPD_SHARD set: the shard this run covered, as k/n"},
                     {"name": "major_branch", "type": "string", "description": "Present only with the major lane enabled: the major lane's rolling branch in every project"},
-                    {"name": "counts", "type": "object", "description": "Number of projects listed (projects) and in each state (skipped, not_opted_in, config_invalid, processed, failed). With the major lane enabled, also major_failed: projects whose major lane failed, which make the command exit 2"},
-                    {"name": "projects", "type": "array", "items": {"type": "object"}, "description": "One entry per listed project with id, path and state. skipped carries reason (central_project, excluded, archived, pending_deletion, repository_disabled, empty_repository or no_default_branch) and not_opted_in carries reason; config_invalid carries config (the file) and message; processed carries the gitlab run outcome fields (outcome, merge_request, ...); failed carries error with kind, message and exit_code. config_invalid and failed entries make the command exit 2. A project whose major lane ran also carries major: that lane's gitlab run result, without command, including outcome \"failed\" with its error. A project that opted in also carries security_remediation: enabled (whether its ordinary lane applies security fixes, which needs both the organization and the project to allow them) and, when false, reason (the side that did not)"}
+                    {"name": "counts", "type": "object", "description": "Number of projects listed (projects) and in each state (skipped, not_opted_in, config_invalid, processed, deferred, failed). With the major lane enabled, also major_failed: projects whose major lane failed, which make the command exit 2"},
+                    {"name": "projects", "type": "array", "items": {"type": "object"}, "description": "One entry per listed project with id, path and state. skipped carries reason (central_project, excluded, handed_off, archived, pending_deletion, repository_disabled, empty_repository or no_default_branch); deferred carries reason (in a lock run, a project that consented to lock = true after gitlab org plan planned the run: the next run gives it lock jobs) and not_opted_in carries reason; config_invalid carries config (the file) and message; processed carries the gitlab run outcome fields (outcome, merge_request, ...); failed carries error with kind, message and exit_code. config_invalid and failed entries make the command exit 2. A project whose major lane ran also carries major: that lane's gitlab run result, without command, including outcome \"failed\" with its error. A project that opted in also carries security_remediation: enabled (whether its ordinary lane applies security fixes, which needs both the organization and the project to allow them) and, when false, reason (the side that did not)"}
                 ]
+            },
+            {
+                "name": "gitlab org plan",
+                "description": "Lock mode, planning job of an organization run: holds the token but runs no project code and clones nothing. Requires UPD_LOCK=true, CI_PIPELINE_ID, CI_JOB_NAME, UPD_ORGANIZATION_JOB (equal to CI_JOB_NAME), UPD_IMAGE and UPD_LOCK_RUNNER_TAGS (comma-separated tags of the runners reserved for lock jobs), and reads UPD_LOCK_IMAGE (default UPD_IMAGE), UPD_RUNNER_TAGS and UPD_ENVIRONMENT (the environment the token is scoped to, default upd-organization), besides everything gitlab org run reads. Unless --dry-run, refuses (exit 2) a central project (CI_PROJECT_ID, required) that lets CI/CD job tokens push to it, or that does not show the token whether it does (GitLab shows it only to the Maintainer role), since every lock job holds that project's job token. Lists the group (or its UPD_SHARD shard) as gitlab org run does and reads each candidate project's opt-in through the API. Writes .upd-ci/upd-lock-pipeline.yml, a child pipeline with gitlab org prepare, lock-worker and publish jobs for each lane of every project whose opt-in sets lock = true (the major lane too when both UPD_MAJOR_MR and the project allow it), and one organization-run job that runs gitlab org run for the rest with UPD_LOCK_HANDED_OFF naming those projects. Only prepare, publish and organization-run declare the environment; lock jobs run on the lock runners and lock image without it. Copies this executable to .upd-ci/bin/upd, which every child job runs. Each child job sets the organization settings the plan read in its own script, above any CI/CD variable of the central project or its groups, and unsets those the plan did not have; never UPD_GITLAB_TOKEN. With --dry-run, the child pipeline is a single organization-run job running gitlab org run --dry-run. A project whose opt-in cannot be read is left to organization-run and listed under unplanned. Refuses (exit 2, writing no child pipeline) one whose artifact archive would exceed the 5 MiB GitLab includes a pipeline from by default; UPD_SHARD splits such a group. Progress goes to stderr",
+                "effects": "non_idempotent",
+                "mutating": true,
+                "cardinality": "single",
+                "args": [],
+                "output_fields": [
+                    {"name": "command", "type": "string", "description": "Always \"gitlab org plan\""},
+                    {"name": "group", "type": "string", "description": "The group that was listed"},
+                    {"name": "dry_run", "type": "boolean", "description": "Whether the child pipeline is a dry run"},
+                    {"name": "shard", "type": "string", "description": "Present only with UPD_SHARD set: the shard planned, as k/n"},
+                    {"name": "pipeline", "type": "string", "description": "The child pipeline file, .upd-ci/upd-lock-pipeline.yml"},
+                    {"name": "counts", "type": "object", "description": "projects (listed in the group or shard), handed_off (projects given lock jobs), lanes (their lanes), jobs (child pipeline jobs: three per lane and organization-run) and unplanned"},
+                    {"name": "handed_off", "type": "array", "items": {"type": "object"}, "description": "One entry per project given lock jobs, with id, path and lanes (ordinary, and major when that lane runs)"},
+                    {"name": "unplanned", "type": "array", "items": {"type": "object"}, "description": "One entry per project whose opt-in could not be read, with id, path and error (kind, message and exit_code); organization-run handles it"}
+                ],
+                "example": {"args": ["gitlab", "org", "plan", "--output", "json"]}
             },
             {
                 "name": "gitlab org prepare",
@@ -377,16 +397,18 @@ fn build_schema() -> Value {
                     {"name": "--dir", "description": "The directory the three jobs exchange their work through", "type": "path", "required": true}
                 ],
                 "output_fields": [
-                    {"name": "command", "type": "string", "description": "\"gitlab org prepare\", \"gitlab org lock-worker\" or \"gitlab org publish\""},
+                    {"name": "command", "type": "string", "description": "Always \"gitlab org prepare\""},
                     {"name": "project", "type": "integer", "description": "The project id"},
                     {"name": "path", "type": "string", "description": "The project's full path"},
                     {"name": "lane", "type": "string", "description": "ordinary or major"},
                     {"name": "branch", "type": "string", "description": "The lane's rolling automation branch"},
-                    {"name": "step", "type": "string", "description": "stopped (the project has not opted in, or its opt-in cannot be read; see state), lane_off (the major lane is not enabled for this project), finished (the lane published, closed or paused; see result), locking (prepare handed lockfiles to the lock job), locked (the lock job regenerated them), or nothing_to_do (lock-worker and publish, when prepare already finished the lane)"},
+                    {"name": "step", "type": "string", "description": "stopped (the project has not opted in, or its opt-in cannot be read; see state), lane_off (the major lane is not enabled for this project), finished (the lane published, closed or paused; see result), or locking (prepare handed lockfiles to the lock job)"},
                     {"name": "state", "type": "string", "description": "stopped only: not_opted_in (with reason) or config_invalid (with config and message; the command exits 2)"},
+                    {"name": "reason", "type": "string", "description": "not_opted_in only: why the project does not count as opted in"},
+                    {"name": "config", "type": "string", "description": "config_invalid only: the configuration file that failed to load"},
+                    {"name": "message", "type": "string", "description": "config_invalid only: why it failed to load"},
                     {"name": "result", "type": "object", "description": "finished only: the gitlab run result without command and branch (outcome, merge_request, created, pushed, commit, auto_merge, ..., and security when the security step ran)"},
-                    {"name": "lockfiles", "type": "array", "items": {"type": "string"}, "description": "locking only: the lockfiles the lock job regenerates"},
-                    {"name": "tools", "type": "object", "description": "locked only: each lock tool the lock job used, with the version it reported (null when it reported none)"}
+                    {"name": "lockfiles", "type": "array", "items": {"type": "string"}, "description": "locking only: the lockfiles the lock job regenerates"}
                 ],
                 "example": {"args": ["gitlab", "org", "prepare", "--project", "42", "--dir", "upd-work"]}
             },
@@ -400,29 +422,38 @@ fn build_schema() -> Value {
                     {"name": "--dir", "description": "The directory gitlab org prepare wrote its work into", "type": "path", "required": true}
                 ],
                 "output_fields": [
-                    {"name": "command", "type": "string", "description": "Always \"gitlab org lock-worker\"; the other fields are those of gitlab org prepare"},
-                    {"name": "step", "type": "string", "description": "locked, or nothing_to_do when prepare finished the lane"},
-                    {"name": "tools", "type": "object", "description": "locked only: each lock tool used, with the version it reported"}
+                    {"name": "command", "type": "string", "description": "Always \"gitlab org lock-worker\""},
+                    {"name": "project", "type": "integer", "description": "The project id"},
+                    {"name": "path", "type": "string", "description": "The project's full path"},
+                    {"name": "lane", "type": "string", "description": "ordinary or major"},
+                    {"name": "branch", "type": "string", "description": "The lane's rolling automation branch"},
+                    {"name": "step", "type": "string", "description": "locked (the lock job regenerated the lockfiles), or nothing_to_do (prepare already finished the lane)"},
+                    {"name": "tools", "type": "object", "description": "locked only: each lock tool used, with the version it reported (null when it reported none)"}
                 ],
                 "example": {"args": ["gitlab", "org", "lock-worker", "--dir", "upd-work"]}
             },
             {
                 "name": "gitlab org publish",
-                "description": "Lock mode, third job: holds the token again. Verifies that the work in --dir carries this pipeline's seal and was prepared for this project and lane, and that the planned patch and the lock job's result are the ones they claim to be. Admits from the lock job's patch only the planned manifest edits and in-place edits of lockfiles under the scanned paths that fetch from no place the original lockfile does not (no new index, download host, repository, archive or local path); anything else (a created, deleted or binary file, another file, a manifest that differs from the plan) refuses the lane and nothing is published. Then publishes as gitlab run does, on the commit prepare started from, with the push lease prepare observed: a branch that moved since exits 5, as does a default branch that no longer contains that commit; a default branch that only moved on is noted in the merge request. Configured as gitlab org prepare is. Progress goes to stderr",
+                "description": "Lock mode, third job: holds the token again. Verifies that the work in --dir carries this pipeline's seal and was prepared for this project and lane, and that the planned patch is the one prepare sealed. Finds the job --lock-job names in this pipeline with UPD_GITLAB_TOKEN (exactly one such job, and it succeeded) and downloads its artifacts archive with its own CI_JOB_TOKEN, reads only result/result.json and result/result.patch under --dir from it, in memory and at most 64 MiB each, and checks they answer this work. Takes no artifacts from the lock job as a dependency, so nothing the lock job uploaded is unpacked into this job or loaded as its variables. Admits from the lock job's patch only the planned manifest edits and in-place edits of lockfiles under the scanned paths that fetch from no place the original lockfile does not (no new registry or index, compared by its full URL, no new download host, repository, archive or local path, and no npm package left without a resolved URL unless the original lockfile has one); anything else (a created, deleted or binary file, another file, a manifest that differs from the plan) refuses the lane and nothing is published. Then publishes as gitlab run does, on the commit prepare started from, with the push lease prepare observed: a branch that moved since exits 5, as does a default branch that no longer contains that commit; a default branch that only moved on is noted in the merge request. Configured as gitlab org prepare is, plus CI_PROJECT_ID and CI_JOB_TOKEN. Progress goes to stderr",
                 "effects": "non_idempotent",
                 "mutating": true,
                 "cardinality": "single",
                 "args": [
                     {"name": "--project", "description": "The project's numeric id", "type": "integer", "required": true},
                     {"name": "--lane", "description": "ordinary (default) or major", "type": "string", "required": false},
-                    {"name": "--dir", "description": "The directory the three jobs exchange their work through", "type": "path", "required": true}
+                    {"name": "--dir", "description": "The directory the three jobs exchange their work through", "type": "path", "required": true},
+                    {"name": "--lock-job", "description": "The name of the lock job in this pipeline whose result to publish", "type": "string", "required": true}
                 ],
                 "output_fields": [
-                    {"name": "command", "type": "string", "description": "Always \"gitlab org publish\"; the other fields are those of gitlab org prepare"},
-                    {"name": "step", "type": "string", "description": "finished, or nothing_to_do when prepare finished the lane"},
+                    {"name": "command", "type": "string", "description": "Always \"gitlab org publish\""},
+                    {"name": "project", "type": "integer", "description": "The project id"},
+                    {"name": "path", "type": "string", "description": "The project's full path"},
+                    {"name": "lane", "type": "string", "description": "ordinary or major"},
+                    {"name": "branch", "type": "string", "description": "The lane's rolling automation branch"},
+                    {"name": "step", "type": "string", "description": "finished (the lane published, closed or paused; see result), or nothing_to_do (prepare already finished the lane)"},
                     {"name": "result", "type": "object", "description": "finished only: the gitlab run result without command and branch, and security when the security step ran"}
                 ],
-                "example": {"args": ["gitlab", "org", "publish", "--project", "42", "--dir", "upd-work"]}
+                "example": {"args": ["gitlab", "org", "publish", "--project", "42", "--dir", "upd-work", "--lock-job", "lock-42"]}
             },
             {
                 "name": "capabilities",
@@ -494,7 +525,7 @@ fn build_schema() -> Value {
             },
             {
                 "kind": "api_error",
-                "description": "gitlab run, gitlab org run, gitlab org prepare, gitlab org publish: the GitLab API rejected a request (a 4xx other than 429, e.g. an invalid or under-scoped token)",
+                "description": "gitlab run, gitlab org run, gitlab org plan, gitlab org prepare, gitlab org publish: the GitLab API rejected a request (a 4xx other than 429, e.g. an invalid or under-scoped token)",
                 "exit_code": 2,
                 "retryable": false
             },
@@ -748,12 +779,112 @@ mod tests {
     }
 
     #[test]
+    fn schema_declares_the_plan_output_it_writes() {
+        use crate::gitlab::plan::{HandedOff, Plan, Unplanned};
+        use crate::gitlab::{Error, org::Shard, run::Lane};
+
+        let s = build_schema();
+        let command = find_command(&s, "gitlab org plan");
+        assert_eq!(command["mutating"], true);
+        assert_eq!(command["args"], json!([]));
+        let plan = Plan {
+            group: "acme".to_string(),
+            dry_run: false,
+            shard: Some(Shard { index: 1, count: 2 }),
+            projects: 2,
+            handed_off: vec![HandedOff {
+                id: 1,
+                path: "acme/a".to_string(),
+                lanes: vec![Lane::Ordinary],
+            }],
+            unplanned: vec![Unplanned {
+                id: 3,
+                path: "acme/b".to_string(),
+                error: Error::Network("timed out".to_string()),
+            }],
+        };
+        let mut written: Vec<String> = plan
+            .to_json()
+            .as_object()
+            .unwrap()
+            .keys()
+            .cloned()
+            .collect();
+        let mut declared = output_field_names(command);
+        written.sort();
+        declared.sort();
+        assert_eq!(declared, written);
+    }
+
+    #[test]
+    fn schema_declares_the_lock_mode_output_each_job_writes() {
+        use crate::gitlab::run::{Lane, Outcome, Proposal};
+        use crate::gitlab::split::{Step, StepReport, Stop};
+        use std::collections::BTreeSet;
+
+        let finished = || {
+            Step::Finished(Proposal {
+                outcome: Outcome::Clean,
+                security: None,
+            })
+        };
+        let s = build_schema();
+        for (command, steps) in [
+            (
+                "gitlab org prepare",
+                vec![
+                    Step::Stopped(Stop::NotOptedIn("no opt-in".to_string())),
+                    Step::Stopped(Stop::ConfigInvalid {
+                        config: ".upd.toml".to_string(),
+                        message: "bad".to_string(),
+                    }),
+                    Step::LaneOff,
+                    finished(),
+                    Step::Locking {
+                        lockfiles: vec!["uv.lock".to_string()],
+                    },
+                ],
+            ),
+            (
+                "gitlab org lock-worker",
+                vec![
+                    Step::Locked {
+                        tools: Default::default(),
+                    },
+                    Step::NothingToDo,
+                ],
+            ),
+            ("gitlab org publish", vec![finished(), Step::NothingToDo]),
+        ] {
+            let mut written = BTreeSet::new();
+            for step in steps {
+                let report = StepReport {
+                    command,
+                    project: 1,
+                    path: "acme/a".to_string(),
+                    lane: Lane::Ordinary,
+                    branch: "upd/update".to_string(),
+                    step,
+                };
+                written.extend(report.to_json().as_object().unwrap().keys().cloned());
+            }
+            let declared: BTreeSet<String> = output_field_names(find_command(&s, command))
+                .into_iter()
+                .collect();
+            assert_eq!(declared, written, "{command}");
+        }
+    }
+
+    #[test]
     fn schema_declares_the_lock_mode_jobs() {
         let s = build_schema();
         for (name, args) in [
             ("gitlab org prepare", &["--project", "--lane", "--dir"][..]),
             ("gitlab org lock-worker", &["--dir"][..]),
-            ("gitlab org publish", &["--project", "--lane", "--dir"][..]),
+            (
+                "gitlab org publish",
+                &["--project", "--lane", "--dir", "--lock-job"][..],
+            ),
         ] {
             let command = find_command(&s, name);
             assert_eq!(command["mutating"], true, "{name}");
@@ -768,24 +899,29 @@ mod tests {
             assert!(fields.iter().any(|f| f == "command"), "{name}");
             assert!(fields.iter().any(|f| f == "step"), "{name}");
         }
-        let steps = find_command(&s, "gitlab org prepare")["output_fields"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .find(|field| field["name"] == "step")
-            .unwrap()["description"]
-            .as_str()
-            .unwrap()
-            .to_string();
-        for step in [
-            "stopped",
-            "lane_off",
-            "finished",
-            "locking",
-            "locked",
-            "nothing_to_do",
+        for (name, described) in [
+            (
+                "gitlab org prepare",
+                &["stopped", "lane_off", "finished", "locking"][..],
+            ),
+            ("gitlab org lock-worker", &["locked", "nothing_to_do"][..]),
+            ("gitlab org publish", &["finished", "nothing_to_do"][..]),
         ] {
-            assert!(steps.contains(step), "{step} is not described: {steps}");
+            let steps = find_command(&s, name)["output_fields"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|field| field["name"] == "step")
+                .unwrap()["description"]
+                .as_str()
+                .unwrap()
+                .to_string();
+            for step in described {
+                assert!(
+                    steps.contains(step),
+                    "{name}: {step} is not described: {steps}"
+                );
+            }
         }
     }
 

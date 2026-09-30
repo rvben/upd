@@ -10,6 +10,7 @@ mod api;
 mod git;
 pub mod org;
 mod patch;
+pub mod plan;
 pub mod present;
 pub mod run;
 pub mod sources;

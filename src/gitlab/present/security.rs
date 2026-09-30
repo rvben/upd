@@ -149,8 +149,9 @@ pub struct Security {
     resolved: Vec<String>,
     /// The files of fixes that wait on a lockfile regeneration: written
     /// pending a relock, or skipped because only a relock can apply them.
+    /// `None` for such a fix the report names no file for.
     #[serde(skip)]
-    relock: BTreeSet<String>,
+    relock: BTreeSet<Option<String>>,
     /// How many of `audit_warnings` the audit applying the fixes reported;
     /// the rest came from the audit after the update.
     #[serde(skip)]
@@ -200,7 +201,12 @@ impl Security {
                 status.as_str(),
                 "pending_relock" | "skipped" | "already_satisfied"
             ) {
-                relock.insert(path.clone());
+                // The relock reads this file from disk, so it takes the path
+                // as reported, not as shown.
+                let reported = field(fix, "path")?
+                    .as_str()
+                    .filter(|reported| !reported.is_empty());
+                relock.insert(reported.map(str::to_string));
             }
             match status.as_str() {
                 fixed if FIXED.contains(&fixed) || (lock && fixed == "already_satisfied") => {
@@ -386,9 +392,10 @@ impl Security {
         })
     }
 
-    /// The files of fixes that only a lockfile regeneration completes.
-    pub fn relock_paths(&self) -> impl Iterator<Item = &str> {
-        self.relock.iter().map(String::as_str)
+    /// The files of fixes that only a lockfile regeneration completes, as
+    /// the report gives them; `None` for such a fix it names no file for.
+    pub fn relock_paths(&self) -> impl Iterator<Item = Option<&str>> {
+        self.relock.iter().map(Option::as_deref)
     }
 
     /// Whether any resolved fix is worth re-auditing once the update has
@@ -914,6 +921,30 @@ mod tests {
         assert_eq!(security.counts.pending_relock, 1);
         assert_eq!(security.counts.advisories, 3);
         assert!(security.unfixable.is_empty() && security.attention.is_empty());
+    }
+
+    /// The files a relock regenerates are read from disk, so they keep the
+    /// exact paths the report gives, not the shortened, collapsed text the
+    /// merge request shows.
+    #[test]
+    fn files_to_relock_keep_their_exact_paths() {
+        let long = format!("{}package-lock.json", "nested-directory/".repeat(12));
+        let spaced = "two  spaces\tapart/package.json";
+        let security = read(
+            json!([vulnerability("a", "GHSA-a", "Low")]),
+            json!([
+                fix("a", "1.0.1", &long, "pending_relock"),
+                fix("b", "1.0.1", spaced, "skipped"),
+                fix("c", "1.0.1", "written/package.json", "applied"),
+                fix("d", "1.0.1", "", "pending_relock"),
+            ]),
+        );
+        assert!(long.chars().count() > 160, "longer than a shown path");
+        // An empty path names no file; as a path it would name the checkout.
+        assert_eq!(
+            security.relock_paths().collect::<Vec<_>>(),
+            [None, Some(long.as_str()), Some(spaced)]
+        );
     }
 
     /// Two ecosystems can each publish a package of the same name. Each fix

@@ -27,7 +27,7 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
 use super::Error;
-use super::api::Client;
+use super::api::{Client, JobClient};
 use super::git::{self, Git};
 use super::org::{self, Consented, OrgSettings, Project, State};
 use super::patch;
@@ -48,6 +48,8 @@ const RESULT_PATCH: &str = "result.patch";
 const BASE_REF: &str = "refs/upd/base";
 /// The largest file `publish` reads from the lock job.
 const MAX_FILE: u64 = 64 * 1024 * 1024;
+/// The largest artifacts archive `publish` downloads from the lock job.
+const MAX_ARCHIVE: u64 = 256 * 1024 * 1024;
 /// Separates the seal from every other use of the token as a key.
 const SEAL_DOMAIN: &[u8] = b"upd gitlab org work v1\0";
 
@@ -543,6 +545,7 @@ pub async fn publish(
     project_id: u64,
     lane: Lane,
     dir: &Path,
+    lock_job: &str,
     log: &Log,
 ) -> Result<StepReport, Error> {
     let pipeline = pipeline(settings)?;
@@ -579,12 +582,10 @@ pub async fn publish(
             "{PLANNED} is not the patch prepare sealed"
         )));
     }
-    let result_dir = dir.join(RESULT_DIR);
-    let result: LockResult = serde_json::from_slice(&read_regular(&result_dir.join(RESULT))?)
-        .map_err(|error| {
-            Error::Refused(format!("The lock job's {RESULT} cannot be read: {error}"))
-        })?;
-    let result_patch = read_regular(&result_dir.join(RESULT_PATCH))?;
+    let (result, result_patch) = lock_result(settings, pipeline, lock_job, dir).await?;
+    let result: LockResult = serde_json::from_slice(&result).map_err(|error| {
+        Error::Refused(format!("The lock job's {RESULT} cannot be read: {error}"))
+    })?;
     if result.format != FORMAT {
         return Err(Error::Refused(format!(
             "The lock job wrote format {}, not {FORMAT}",
@@ -713,6 +714,127 @@ fn proposal(outcome: Outcome, security: Option<&Security>) -> Proposal {
     }
 }
 
+/// The result and the patch the job `lock_job` of this pipeline wrote into
+/// `dir`, read from its artifacts archive.
+///
+/// `publish` takes no artifacts from the lock job as a dependency: GitLab
+/// would unpack whatever archive the lock job uploaded into this job's
+/// directory, and load any dotenv report in it as this job's variables,
+/// before upd runs. It finds the lock job with the token, since GitLab's job
+/// token permissions do not cover listing a pipeline's jobs, then downloads
+/// the archive with its own job token and reads the two entries in memory,
+/// unpacking nothing.
+async fn lock_result(
+    settings: &OrgSettings,
+    pipeline: &str,
+    lock_job: &str,
+    dir: &Path,
+) -> Result<(Vec<u8>, Vec<u8>), Error> {
+    let project = settings.central_project.ok_or_else(|| {
+        Error::Input("CI_PROJECT_ID is not set: GitLab CI provides it".to_string())
+    })?;
+    let job_token = settings.job_token.as_deref().ok_or_else(|| {
+        Error::Input("CI_JOB_TOKEN is not set: GitLab CI provides it".to_string())
+    })?;
+    let prefix = archive_dir(dir)?;
+    let jobs = Client::new(&settings.api_url, &settings.token)?
+        .pipeline_jobs(project, pipeline)
+        .await?;
+    let named: Vec<&Value> = jobs
+        .iter()
+        .filter(|job| job["name"].as_str() == Some(lock_job))
+        .collect();
+    let [job] = named[..] else {
+        return Err(Error::Refused(format!(
+            "Pipeline {pipeline} has {} jobs named {lock_job}, not one",
+            named.len()
+        )));
+    };
+    match job["status"].as_str() {
+        Some("success") => {}
+        status => {
+            return Err(Error::Refused(format!(
+                "The lock job {lock_job} has not succeeded: its status is {}",
+                status.unwrap_or("not given")
+            )));
+        }
+    }
+    let Some(id) = job["id"].as_u64() else {
+        return Err(Error::Refused(format!(
+            "GitLab listed the lock job {lock_job} without a numeric id"
+        )));
+    };
+    let archive = JobClient::new(&settings.api_url, job_token)?
+        .job_artifacts(id, MAX_ARCHIVE)
+        .await?;
+    let mut archive = zip::ZipArchive::new(std::io::Cursor::new(archive)).map_err(|error| {
+        Error::Refused(format!(
+            "The artifacts of the lock job {lock_job} are not a readable archive: {error}"
+        ))
+    })?;
+    let result = archive_entry(&mut archive, &format!("{prefix}/{RESULT_DIR}/{RESULT}"))?;
+    let patch = archive_entry(
+        &mut archive,
+        &format!("{prefix}/{RESULT_DIR}/{RESULT_PATCH}"),
+    )?;
+    Ok((result, patch))
+}
+
+/// `dir` as the archive names it: relative, with `/` between its parts.
+fn archive_dir(dir: &Path) -> Result<String, Error> {
+    let parts = dir
+        .components()
+        .map(|part| match part {
+            std::path::Component::Normal(part) => part.to_str(),
+            _ => None,
+        })
+        .collect::<Option<Vec<&str>>>()
+        .filter(|parts| !parts.is_empty());
+    match parts {
+        Some(parts) => Ok(parts.join("/")),
+        None => Err(Error::Input(format!(
+            "--dir {} must be a relative path below the job's directory, as the plan writes it",
+            dir.display()
+        ))),
+    }
+}
+
+/// The file `name` in `archive`, refused unless it is a regular file of at
+/// most [`MAX_FILE`] bytes.
+fn archive_entry(
+    archive: &mut zip::ZipArchive<std::io::Cursor<Vec<u8>>>,
+    name: &str,
+) -> Result<Vec<u8>, Error> {
+    let entry = archive.by_name(name).map_err(|error| match error {
+        zip::result::ZipError::FileNotFound => {
+            Error::Refused(format!("The lock job's artifacts carry no {name}"))
+        }
+        error => Error::Refused(format!(
+            "{name} in the lock job's artifacts cannot be read: {error}"
+        )),
+    })?;
+    if !entry.is_file() {
+        return Err(Error::Refused(format!(
+            "{name} in the lock job's artifacts is not a regular file"
+        )));
+    }
+    let mut content = Vec::new();
+    entry
+        .take(MAX_FILE + 1)
+        .read_to_end(&mut content)
+        .map_err(|error| {
+            Error::Refused(format!(
+                "{name} in the lock job's artifacts cannot be read: {error}"
+            ))
+        })?;
+    if content.len() as u64 > MAX_FILE {
+        return Err(Error::Refused(format!(
+            "{name} in the lock job's artifacts is larger than {MAX_FILE} bytes"
+        )));
+    }
+    Ok(content)
+}
+
 /// The pipeline the work is sealed to.
 fn pipeline(settings: &OrgSettings) -> Result<&str, Error> {
     settings
@@ -774,7 +896,22 @@ async fn lockfiles_to_refresh(
         .filter(|path| !path.is_empty())
         .map(|path| String::from_utf8_lossy(path).into_owned())
         .collect::<Vec<_>>();
-    let relock = security.into_iter().flat_map(Security::relock_paths);
+    let relock = security
+        .into_iter()
+        .flat_map(Security::relock_paths)
+        .map(|path| {
+            path.ok_or_else(|| {
+                Error::Refused(
+                    "A security fix waits on a lockfile regeneration, but the audit names no file for it"
+                        .to_string(),
+                )
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    // A uv workspace root is found by the member's real path, so the
+    // checkout is compared by its real path too.
+    let checkout = fs::canonicalize(checkout)
+        .map_err(|error| Error::Io(format!("cannot resolve {}: {error}", checkout.display())))?;
     let mut lockfiles = BTreeMap::new();
     for path in staged.iter().map(String::as_str).chain(relock) {
         let path = path.trim_start_matches("./");
@@ -796,7 +933,7 @@ async fn lockfiles_to_refresh(
         let owner_dir = lockfile::containing_dir(&owner);
         for kind in kinds {
             let lockfile = owner_dir.join(kind.filename());
-            let relative = lockfile.strip_prefix(checkout).map_err(|_| {
+            let relative = lockfile.strip_prefix(&checkout).map_err(|_| {
                 Error::Refused(format!(
                     "{} lies outside the checkout; refusing to regenerate it",
                     lockfile.display()
@@ -922,7 +1059,7 @@ fn verify_seal(token: &str, pipeline: &str, work: &[u8], seal: &[u8]) -> Result<
         .map_err(|_| refused())
 }
 
-fn sha256(bytes: &[u8]) -> String {
+pub(super) fn sha256(bytes: &[u8]) -> String {
     hex(&Sha256::digest(bytes))
 }
 
@@ -1096,5 +1233,213 @@ mod tests {
         let error = create_empty_dir(&fresh).unwrap_err();
         assert!(error.message().contains("not empty"), "{error:?}");
         assert!(fresh.join(WORK).exists());
+    }
+
+    /// A zip archive of `entries`: a name, and file content or a directory
+    /// (`None`).
+    fn archive(entries: &[(&str, Option<&[u8]>)]) -> zip::ZipArchive<std::io::Cursor<Vec<u8>>> {
+        use std::io::Write;
+        let options = zip::write::SimpleFileOptions::default();
+        let mut writer = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        for (name, content) in entries {
+            match content {
+                Some(content) => {
+                    writer.start_file(*name, options).unwrap();
+                    writer.write_all(content).unwrap();
+                }
+                None => writer.add_directory(*name, options).unwrap(),
+            }
+        }
+        let bytes = writer.finish().unwrap().into_inner();
+        zip::ZipArchive::new(std::io::Cursor::new(bytes)).unwrap()
+    }
+
+    #[test]
+    fn only_the_two_result_files_are_read_from_the_lock_archive() {
+        let result = "w/x/result/result.json";
+        let mut lock = archive(&[
+            ("w/x/", None),
+            ("w/x/result/", None),
+            (result, Some(b"{}")),
+            (".upd-ci/bin/upd", Some(b"#!/bin/sh\n")),
+        ]);
+        assert_eq!(archive_entry(&mut lock, result).unwrap(), b"{}");
+        let error = archive_entry(&mut lock, "w/x/result/result.patch").unwrap_err();
+        assert!(error.message().contains("carry no"), "{error:?}");
+
+        let mut archive = archive(&[(&format!("{result}/"), None)]);
+        let error = archive_entry(&mut archive, result).unwrap_err();
+        assert!(error.message().contains("carry no"), "{error:?}");
+    }
+
+    #[test]
+    fn a_symlink_in_the_lock_archive_is_not_read() {
+        let options = zip::write::SimpleFileOptions::default();
+        let mut writer = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        writer
+            .add_symlink("w/result/result.json", "/etc/passwd", options)
+            .unwrap();
+        let bytes = writer.finish().unwrap().into_inner();
+        let mut archive = zip::ZipArchive::new(std::io::Cursor::new(bytes)).unwrap();
+        let error = archive_entry(&mut archive, "w/result/result.json").unwrap_err();
+        assert!(error.message().contains("not a regular file"), "{error:?}");
+    }
+
+    #[test]
+    fn a_result_file_past_the_cap_is_refused() {
+        use std::io::Write;
+        let options = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Stored)
+            .large_file(false);
+        let mut writer = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        for (name, size) in [("at", MAX_FILE), ("past", MAX_FILE + 1)] {
+            writer.start_file(name, options).unwrap();
+            writer.write_all(&vec![b'0'; size as usize]).unwrap();
+        }
+        let bytes = writer.finish().unwrap().into_inner();
+        let mut archive = zip::ZipArchive::new(std::io::Cursor::new(bytes)).unwrap();
+        assert_eq!(
+            archive_entry(&mut archive, "at").unwrap().len() as u64,
+            MAX_FILE
+        );
+        let error = archive_entry(&mut archive, "past").unwrap_err();
+        assert!(error.message().contains("larger than"), "{error:?}");
+    }
+
+    #[test]
+    fn the_archive_names_the_work_directory_as_the_plan_writes_it() {
+        assert_eq!(
+            archive_dir(Path::new(".upd-ci/work/12-major")).unwrap(),
+            ".upd-ci/work/12-major"
+        );
+        for dir in ["", "/abs/work", "../work", "work/../other"] {
+            let error = archive_dir(Path::new(dir)).unwrap_err();
+            assert!(matches!(error, Error::Input(_)), "{dir}: {error:?}");
+        }
+    }
+
+    /// A security fix's relock regenerates the lockfile beside the file the
+    /// audit names, found by its exact path; a fix the audit names no file
+    /// for refuses the lane rather than regenerating the checkout's own.
+    #[tokio::test]
+    async fn a_security_relock_regenerates_the_lockfile_of_the_file_the_audit_names() {
+        let dir = tempfile::tempdir().unwrap();
+        let checkout = dir.path();
+        let git = Git::new(checkout, "").unwrap();
+        git.run(["init", "--quiet", "--initial-branch=main"])
+            .await
+            .unwrap();
+        git.run(["config", "commit.gpgsign", "false"])
+            .await
+            .unwrap();
+        let deep = format!("{}app", "nested  directory/".repeat(10));
+        for file in [
+            "package.json".to_string(),
+            "package-lock.json".to_string(),
+            format!("{deep}/package.json"),
+            format!("{deep}/package-lock.json"),
+        ] {
+            let file = checkout.join(file);
+            fs::create_dir_all(file.parent().unwrap()).unwrap();
+            fs::write(file, "{}").unwrap();
+        }
+        git.run(["add", "--all"]).await.unwrap();
+        git.commit("base", "upd", "upd@example.test").await.unwrap();
+        let report = |path: Value| {
+            json!({
+                "fixes": [{"package": "a", "ecosystem": "npm", "from_version": "1.0.0",
+                           "to_version": "1.0.1", "path": path, "status": "pending_relock"}],
+                "summary": {"errors": 0},
+            })
+        };
+
+        let named =
+            Security::from_report(&report(json!(format!("{deep}/package.json"))), true).unwrap();
+        assert_eq!(
+            lockfiles_to_refresh(&git, checkout, Some(&named))
+                .await
+                .unwrap(),
+            BTreeMap::from([(
+                format!("{deep}/package-lock.json"),
+                LockfileType::PackageLockJson
+            )])
+        );
+
+        let unnamed = Security::from_report(&report(Value::Null), true).unwrap();
+        let error = lockfiles_to_refresh(&git, checkout, Some(&unnamed))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&error, Error::Refused(message) if message.contains("names no file")),
+            "{error:?}"
+        );
+    }
+
+    /// A checkout reached through a symlink still owns the lockfile of a uv
+    /// workspace, whose root is found by the member's real path; a member
+    /// linked from a workspace outside the checkout is still refused.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_workspace_lockfile_is_found_through_a_symlinked_checkout() {
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("real");
+        let outside = dir.path().join("outside");
+        let checkout = dir.path().join("checkout");
+        fs::create_dir_all(real.join("member")).unwrap();
+        fs::create_dir_all(outside.join("member")).unwrap();
+        std::os::unix::fs::symlink(&real, &checkout).unwrap();
+        let git = Git::new(&checkout, "").unwrap();
+        git.run(["init", "--quiet", "--initial-branch=main"])
+            .await
+            .unwrap();
+        git.run(["config", "commit.gpgsign", "false"])
+            .await
+            .unwrap();
+        let workspace = "[project]\nname = \"root\"\nversion = \"0\"\n\n\
+                         [tool.uv.workspace]\nmembers = [\"member\", \"linked\"]\n";
+        let member = |name: &str| format!("[project]\nname = \"{name}\"\nversion = \"0\"\n");
+        fs::write(checkout.join("pyproject.toml"), workspace).unwrap();
+        fs::write(checkout.join("uv.lock"), "version = 1\n").unwrap();
+        fs::write(checkout.join("member/pyproject.toml"), member("member")).unwrap();
+        fs::write(outside.join("pyproject.toml"), workspace).unwrap();
+        fs::write(outside.join("member/pyproject.toml"), member("linked")).unwrap();
+        fs::write(outside.join("uv.lock"), "version = 1\n").unwrap();
+        git.run(["add", "--all"]).await.unwrap();
+        git.commit("base", "upd", "upd@example.test").await.unwrap();
+        let report = |path: &str| {
+            let report = json!({
+                "fixes": [{"package": "a", "ecosystem": "pypi", "from_version": "1.0.0",
+                           "to_version": "1.0.1", "path": path, "status": "pending_relock"}],
+                "summary": {"errors": 0},
+            });
+            Security::from_report(&report, true).unwrap()
+        };
+        let workspace_lock = BTreeMap::from([("uv.lock".to_string(), LockfileType::UvLock)]);
+
+        let relocked =
+            lockfiles_to_refresh(&git, &checkout, Some(&report("member/pyproject.toml")))
+                .await
+                .unwrap();
+        assert_eq!(relocked, workspace_lock);
+
+        fs::write(
+            checkout.join("member/pyproject.toml"),
+            format!("{}dependencies = [\"a>=1\"]\n", member("member")),
+        )
+        .unwrap();
+        git.run(["add", "member/pyproject.toml"]).await.unwrap();
+        assert_eq!(
+            lockfiles_to_refresh(&git, &checkout, None).await.unwrap(),
+            workspace_lock
+        );
+
+        std::os::unix::fs::symlink(outside.join("member"), checkout.join("linked")).unwrap();
+        let error = lockfiles_to_refresh(&git, &checkout, Some(&report("linked/pyproject.toml")))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&error, Error::Refused(message) if message.contains("outside the checkout")),
+            "{error:?}"
+        );
     }
 }

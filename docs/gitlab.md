@@ -484,15 +484,27 @@ release: `upd_version` must name a release that provides `upd gitlab org run`.
 | `major_branch`, `major_commit_message` | as above | Rolling branch and generated commit message of the major merge request in every project |
 | `concurrency` | `4` | Projects processed at the same time (1 to 16) |
 | `dry_run` | `false` | Report what each project would get without pushing or writing to GitLab |
+| `environment` | `upd-organization` | Environment the token variable is scoped to; only jobs that need the token declare it |
+| `lock` | `false` | Regenerate lockfiles in [lock jobs that hold no token](#lockfiles-in-organization-mode), in projects that also set `lock = true` |
+| `lock_runner_tags` | empty | Comma-separated tags of the runners reserved for lock jobs; required with `lock` |
+| `runner_tags` | empty | Comma-separated tags of the runners for the lock pipeline's jobs that hold the token; empty for any runner |
+| `lock_image` | `image` | Job image carrying the lock tools (uv, npm, cargo) for lock jobs |
+| `organization_job` | `upd-organization-update` | Name of the job that extends `.upd-organization-update` |
+| `lock_plan_job` | `upd-organization-lock-plan` | Name of the job that extends `.upd-organization-lock-plan` |
 
 `min_age` is a floor rather than an override: a project that configures a
 longer cooldown keeps it. Organization mode never runs `nix flake update`, which
 would evaluate repository content in a job holding a group-wide token, so Nix
-is always left out and `langs` cannot select it. Lockfile regeneration,
-preparation and validation commands are not offered here for the same reason:
-each runs a program the repository controls (a build backend, an install
-script, the command itself), and none of them belongs in a job holding a
-group-wide token.
+is always left out and `langs` cannot select it. Preparation and validation
+commands are not offered here for the same reason: each runs a program the
+repository controls, and none of them belongs in a job holding a group-wide
+token. Lockfile regeneration can run such programs too (a build backend, for
+example), so it is offered only in [lock mode](#lockfiles-in-organization-mode),
+where it runs in jobs that never hold the token.
+
+The organization job declares the `environment` input's environment (without
+deploying to it), so the token variable can be scoped to it. Scoping is
+optional without lock mode and required with it.
 
 ### Security fixes in organization mode
 
@@ -501,17 +513,184 @@ them: the central `security_remediation` input, on unless set to `false`, and
 `security_remediation = true` in the project's `[automation]` table. The
 central default therefore changes nothing for a project that has not opted
 in. Without lockfile regeneration, each fix rewrites the manifest and is
-listed as awaiting it, exactly as with `lock: false` in a single project.
+listed as awaiting it, exactly as with `lock: false` in a single project. In
+[lock mode](#lockfiles-in-organization-mode), a project that consents to
+lockfile regeneration gets its fixes relocked by its lock job.
 Each opted-in project's report entry, `security_remediation`, says whether its fixes were
 enabled and, when not, which side turned them off; the job log prints that
 reason under the project's line.
 
+### Lockfiles in organization mode
+
+Regenerating a lockfile can run code the repository controls, such as a Python
+build backend or tool configuration committed to the repository. A job that runs such code must never hold the group-wide token,
+because the code could read it and push to every project in the group. Lock
+mode therefore splits each project's update across jobs so that the job
+running repository code holds no token, and the jobs holding the token run
+only upd.
+
+A project takes part only when both sides allow it: the central `lock` input,
+and `lock = true` in the project's `[automation]` table. Supported lockfiles
+are `uv.lock`, `package-lock.json`, `npm-shrinkwrap.json` and `Cargo.lock`.
+npm runs with `--ignore-scripts`; uv refuses to build source distributions
+unless the project also sets `lock_build = true`.
+
+```yaml
+include:
+  - remote: "https://raw.githubusercontent.com/rvben/upd/<FULL_COMMIT_SHA>/ci/gitlab-organization-update.yml"
+    inputs:
+      group: "my-group"
+      lock: true
+      lock_runner_tags: "upd-lock"
+      lock_image: "registry.example.com/tools/lock@sha256:<IMAGE_DIGEST>"
+
+upd-organization-update:
+  extends: .upd-organization-update
+
+upd-organization-lock-plan:
+  extends: .upd-organization-lock-plan
+
+upd-organization-lock:
+  extends: .upd-organization-lock
+```
+
+In lock mode the organization job only plans. It reads each project's opt-in
+through the API, without cloning or writing anything, and writes a child
+pipeline plus the upd binary its jobs run, as artifacts. The
+`.upd-organization-lock-plan` job keeps just the child pipeline as an artifact
+of its own, because GitLab includes a pipeline only from an artifact archive of
+at most 5 MiB by default and the binary alone is larger. The
+`.upd-organization-lock` job starts the child pipeline from that archive. A
+group whose child pipeline would not fit is refused at planning time; split it
+across schedules with `UPD_SHARD`. The child pipeline has:
+
+- `organization-run`, which holds the token and updates every project not
+  handed to lock jobs, exactly as `upd gitlab org run` does without lock mode.
+- For each project that consents to lockfile regeneration (and again for its
+  major lane, when both sides enable [major upgrades](#major-upgrades)):
+  - `prepare-<id>`, which holds the token. It applies the update to manifests
+    only and hands the lock job the starting commit as a Git bundle, with the
+    planned edits sealed so no later job can alter them. When nothing needs
+    relocking it finishes the project itself.
+  - `lock-<id>`, which holds no token and refuses to run if it finds one. It
+    regenerates the lockfiles, which may run repository code, and writes its
+    change as a patch.
+  - `publish-<id>`, which holds the token. It checks the seal, admits from the
+    lock job's patch only the planned manifest edits and in-place lockfile
+    edits that fetch from no place the original lockfile does not, gates on
+    the lock job's reports as a run gates on its own, and pushes with the
+    same lease protection as any run.
+
+Repository code in a lock job can upload any archive as that job's artifacts,
+whatever its `paths`, including a dotenv report. GitLab would unpack such an
+archive into every job that takes the lock job's artifacts, and load its dotenv
+variables into that job's environment. So `publish` waits for the lock job but
+takes none of its artifacts. It finds the one job of that name in its pipeline
+with the token, and only once that job has succeeded downloads the archive
+itself with its own job token. It reads just the result and the patch from it
+in memory, each at most 64 MiB. Nothing the lock job uploaded is unpacked into
+a job that holds the token, or becomes one of its variables. Every such job
+also checks the upd binary against the digest the plan recorded, and refuses to
+run any other.
+
+A regenerated lockfile may name no registry, download host, repository, archive
+or local path that the original does not. A registry is compared by its full
+URL, so another project's package registry on the same GitLab is a new place.
+An npm `resolved` URL that does not follow a registry's tarball layout is
+compared in full, so a regenerated lockfile that changes it is refused rather
+than trusted for its host. An npm package spec in the lockfile, a package's
+`version` or an entry of its dependency lists, counts as a place when it names a
+repository, archive or local path, GitHub `user/repo` shorthand included; a
+spec with an unrecognised scheme is refused. An npm package installed without a
+`resolved` URL comes from whatever registry npm is configured with, so a
+regenerated lockfile that leaves one out is refused unless the original already
+did.
+
+A malicious lock job can therefore fail its own project's update, or propose
+lockfile contents that the project's merge request shows for review: other
+versions, another package from a registry the project already uses, or another
+file from a host it already downloads Python distributions from. It cannot
+obtain the group token or publish anything else.
+
+Since GitLab 19.0 a project can also accept Git pushes from the job tokens of
+projects on its job token allowlist. Do not give the central project that
+access to any other project: every lock job holds its job token.
+
+#### Requirements
+
+- **An upd release with lock mode**, chosen by `upd_version` and
+  `upd_sha256`. The organization job asks the binary for
+  `upd gitlab org plan` first and stops with exit status 4 when the release
+  has no such command.
+- **GitLab 18.2 or later**, for `trigger:strategy: mirror`: the trigger job
+  holds the organization's resource group until the child pipeline finishes,
+  so runs never overlap, and the central pipeline reports the child's result.
+- **A token scoped to the environment.** Give the `UPD_GITLAB_TOKEN` variable
+  the environment scope named by the `environment` input (`upd-organization`
+  by default). Only the organization job and the child's `organization-run`,
+  `prepare-*` and `publish-*` jobs declare that environment, so the lock jobs
+  never receive the token. A token left unscoped reaches the lock jobs, which
+  then refuse to run: the misconfiguration fails every lock job instead of
+  exposing the token.
+- **A central project that refuses job token pushes, and a token with the
+  Maintainer role there.** Every lock job holds the central project's
+  `CI_JOB_TOKEN`. With **Settings > CI/CD > Job token permissions > Allow Git
+  push requests to the repository** turned on, repository code in a lock job
+  could push a change to the pipeline that holds the group token, so
+  `gitlab org plan` refuses to hand any project off while it is on. GitLab
+  shows that setting only to a Maintainer, and a plan that cannot read it
+  refuses too. The same role lets `publish-*` list the child pipeline's jobs
+  to find the lock job, which GitLab's job token permissions do not allow.
+- **Runners reserved for lock jobs**, named by `lock_runner_tags`. A lock job
+  runs repository code, so its runner must not also run jobs that hold the
+  token, and should use an executor that starts every job from a fresh
+  container or machine. `runner_tags` places the token-holding jobs; leave it
+  empty to use any runner.
+- **One architecture.** Every child job runs the upd binary the organization
+  job downloaded, so the runners for `lock_runner_tags` and `runner_tags` must
+  match the organization job's architecture and C library. The token-holding
+  jobs run in `image`, which already provides `sha256sum` for the
+  organization job.
+- **A lock image with the tools.** `lock_image` must provide uv, npm or cargo
+  for the lockfiles the group uses, plus Git (or `apt-get`/`apk` to install
+  it). The child jobs use the `empty` Git strategy, so the runner must support
+  it; they never clone the central project.
+
+#### Confidentiality
+
+Lock mode protects the token and what gets published. It does not keep one
+project's code from another project's lock job. Every child job runs in the
+central project, and GitLab lets a job's token download the other jobs'
+artifacts through the runner API whatever their `artifacts:access` setting, so
+a malicious lock job can read the Git bundles that `prepare` hands to the other
+lock jobs. upd keeps these artifacts for one day and hides them from the UI and
+API (`access: none`). Where the group's projects must stay confidential from
+one another, do not enable lock mode for projects whose authors you do not
+trust with the rest of the group's code, and set the central project's CI/CD
+visibility to **Only project members**, which keeps jobs in other projects out.
+
+#### Large groups
+
+GitLab refuses a pipeline with more jobs than the instance's limit, and a lock
+pipeline has three jobs per consenting project lane plus `organization-run`.
+The plan report (`.upd-ci/upd-org-plan.json`) counts them. To split a group,
+schedule the central pipeline several times with the `UPD_SHARD` variable set
+to `1/3`, `2/3` and `3/3`: each run plans and updates only the projects whose
+ID falls in its part, so the schedules together cover the group once.
+
+A dry run in lock mode starts a child pipeline with a single
+`organization-run` job that runs with `--dry-run`: it previews every project,
+lock-consenting ones included, without regenerating lockfiles.
+
 ### Results
 
 Every listed project gets one line in the job log: skipped (archived, empty,
-excluded, pending deletion, repository disabled, or the central project), not
-opted in, invalid configuration, processed with the same outcome `upd gitlab
-run` reports, or failed. A failing project does not stop the others. The job
+excluded, pending deletion, repository disabled, the central project, or
+handed to lock jobs), not opted in, invalid configuration, deferred, processed
+with the same outcome `upd gitlab run` reports, or failed. In lock mode, a
+project that consented to lockfile regeneration after the run was planned is
+deferred rather than updated with stale lockfiles; the next run hands it to
+lock jobs. A failing project does not stop the others. The job
 fails when any project failed or had an invalid opt-in, so a scheduled run
 surfaces problems without hiding the projects that succeeded.
 
@@ -522,7 +701,11 @@ projects separately as `major_failed`.
 
 The full JSON report, including each project's merge request URL or error, is
 kept for one week as the `.upd-ci/upd-org-report.json` artifact. Its shape is
-described by `upd schema` under `gitlab org run`.
+described by `upd schema` under `gitlab org run`. In lock mode that report
+belongs to the child pipeline's `organization-run` job, and the organization
+job keeps the plan as `.upd-ci/upd-org-plan.json` (`gitlab org plan` in
+`upd schema`); each `prepare`, `lock` and `publish` job prints its project's
+outcome in its own log.
 
 ## Scope
 

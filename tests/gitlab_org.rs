@@ -9,7 +9,7 @@ use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use serde_json::{Value, json};
 use tempfile::TempDir;
@@ -94,6 +94,11 @@ struct Org {
     log: PathBuf,
     listing: Vec<Value>,
     remotes: HashMap<u64, PathBuf>,
+    /// The CI jobs that ran, as GitLab's job API serves them.
+    jobs: CiJobs,
+    /// What each child pipeline job, by name, uploads besides its declared
+    /// artifacts in [`run_lock_pipeline`].
+    uploads: HashMap<String, Upload>,
 }
 
 impl Org {
@@ -116,6 +121,8 @@ impl Org {
             log,
             listing: Vec::new(),
             remotes: HashMap::new(),
+            jobs: CiJobs::default(),
+            uploads: HashMap::new(),
         }
     }
 
@@ -189,6 +196,22 @@ impl Org {
             .mount(&self.server)
             .await;
         Mock::given(method("GET"))
+            .and(path_regex(
+                r"^/api/v4/(projects/\d+/pipelines/\d+/jobs|jobs/\d+/artifacts)$",
+            ))
+            .respond_with(JobApi(self.jobs.clone()))
+            .mount(&self.server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(format!("/api/v4/projects/{CENTRAL}").as_str()))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": CENTRAL,
+                "path_with_namespace": "acme/central",
+                "ci_push_repository_for_job_token_allowed": false,
+            })))
+            .mount(&self.server)
+            .await;
+        Mock::given(method("GET"))
             .and(path("/api/v4/groups/acme"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({"full_path": "acme"})))
             .mount(&self.server)
@@ -239,6 +262,7 @@ impl Org {
             )
             .env("CI_API_V4_URL", format!("{}/api/v4", self.server.uri()))
             .env("CI_PROJECT_ID", CENTRAL.to_string())
+            .env("CI_JOB_TOKEN", "job-token")
             .env("UPD_GROUP", "acme")
             .env("UPD_MIN_AGE", "7d")
             .env("UPD_MAX_BUMP", "minor")
@@ -359,6 +383,168 @@ impl Respond for RawFiles {
             ResponseTemplate::new(404)
         }
     }
+}
+
+/// A CI job that ran, and what it left for GitLab to serve.
+#[derive(Clone)]
+struct CiJob {
+    id: u64,
+    pipeline: String,
+    name: String,
+    status: &'static str,
+    /// The directory the job ran in, which its artifact paths are relative to.
+    root: PathBuf,
+    /// The artifact paths the job declared.
+    paths: Vec<String>,
+    /// What the job uploaded besides.
+    upload: Upload,
+}
+
+/// What a job's own code uploads with its job token besides the artifacts
+/// it declares, which GitLab accepts from any job.
+#[derive(Clone, Default)]
+struct Upload {
+    /// Files added to the job's artifacts archive, by archive name.
+    files: Vec<(String, Vec<u8>)>,
+    /// The variables of a dotenv report, which GitLab loads into every job
+    /// taking the job's artifacts.
+    dotenv: Vec<(String, String)>,
+}
+
+impl CiJob {
+    /// The job's artifacts archive, as the runner would have uploaded it at
+    /// the end of the job (built when read, so a test can alter the files
+    /// first).
+    fn archive(&self) -> Vec<u8> {
+        zip_paths(&self.root, &self.paths, &self.upload.files)
+    }
+}
+
+/// The CI jobs that ran, shared with the mock job API.
+#[derive(Clone, Default)]
+struct CiJobs(Arc<Mutex<Vec<CiJob>>>);
+
+impl CiJobs {
+    /// Records `job` with the next free id, replacing an earlier run of the
+    /// same job, as a retry does. Returns the id.
+    fn record(&self, mut job: CiJob) -> u64 {
+        let mut jobs = self.0.lock().unwrap();
+        job.id = 5000 + jobs.iter().map(|job| job.id - 5000 + 1).max().unwrap_or(0);
+        jobs.retain(|other| (&other.pipeline, &other.name) != (&job.pipeline, &job.name));
+        jobs.push(job);
+        jobs.last().unwrap().id
+    }
+
+    fn named(&self, pipeline: &str, name: &str) -> CiJob {
+        self.0
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|job| job.pipeline == pipeline && job.name == name)
+            .unwrap_or_else(|| panic!("no job {name} ran in pipeline {pipeline}"))
+            .clone()
+    }
+
+    /// Changes the recorded job `name` of `pipeline` as `change` says.
+    fn alter(&self, pipeline: &str, name: &str, change: impl FnOnce(&mut CiJob)) {
+        let mut jobs = self.0.lock().unwrap();
+        let job = jobs
+            .iter_mut()
+            .find(|job| job.pipeline == pipeline && job.name == name)
+            .unwrap_or_else(|| panic!("no job {name} ran in pipeline {pipeline}"));
+        change(job);
+    }
+}
+
+/// Answers the reads publish makes about the lock job, as GitLab does. The
+/// jobs of a pipeline in the central project are listed for the group token
+/// only: GitLab's job token permissions do not include that endpoint. A
+/// job's artifacts archive is served for a job token, and here for nothing
+/// else, so the group token never goes there.
+struct JobApi(CiJobs);
+
+impl Respond for JobApi {
+    fn respond(&self, request: &Request) -> ResponseTemplate {
+        let header = |name: &str| {
+            request
+                .headers
+                .get(name)
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_string)
+        };
+        let segments: Vec<&str> = request.url.path().split('/').collect();
+        let allowed = match segments[3] {
+            "projects" => header("PRIVATE-TOKEN").as_deref() == Some("test-token"),
+            _ => {
+                header("PRIVATE-TOKEN").is_none()
+                    && header("JOB-TOKEN").is_some_and(|token| token.starts_with("job-token"))
+            }
+        };
+        if !allowed {
+            return ResponseTemplate::new(403);
+        }
+        let jobs = self.0.0.lock().unwrap();
+        match segments[3] {
+            "projects" if segments[4] == CENTRAL.to_string() => {
+                let listed: Vec<Value> = jobs
+                    .iter()
+                    .filter(|job| job.pipeline == segments[6])
+                    .map(|job| json!({"id": job.id, "name": job.name, "status": job.status}))
+                    .collect();
+                ResponseTemplate::new(200)
+                    .set_body_json(listed)
+                    .insert_header("X-Next-Page", "")
+            }
+            "jobs" => match jobs.iter().find(|job| job.id.to_string() == segments[4]) {
+                Some(job) => ResponseTemplate::new(200).set_body_bytes(job.archive()),
+                None => ResponseTemplate::new(404),
+            },
+            _ => ResponseTemplate::new(404),
+        }
+    }
+}
+
+/// A zip archive of `paths` under `root`, named relative to `root`, as the
+/// runner uploads a job's declared artifacts, followed by `extra` files.
+fn zip_paths(root: &Path, paths: &[String], extra: &[(String, Vec<u8>)]) -> Vec<u8> {
+    use std::io::Write;
+    fn add(writer: &mut zip::ZipWriter<std::io::Cursor<Vec<u8>>>, root: &Path, path: &Path) {
+        let name = path
+            .strip_prefix(root)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
+        let options = zip::write::SimpleFileOptions::default();
+        if path.is_dir() {
+            writer.add_directory(format!("{name}/"), options).unwrap();
+            let mut entries: Vec<PathBuf> = fs::read_dir(path)
+                .unwrap()
+                .map(|entry| entry.unwrap().path())
+                .collect();
+            entries.sort();
+            for entry in entries {
+                add(writer, root, &entry);
+            }
+        } else {
+            writer.start_file(name, options).unwrap();
+            writer.write_all(&fs::read(path).unwrap()).unwrap();
+        }
+    }
+    let mut writer = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+    for artifact in paths {
+        let path = root.join(artifact.trim_end_matches('/'));
+        if path.exists() {
+            add(&mut writer, root, &path);
+        }
+    }
+    for (name, content) in extra {
+        writer
+            .start_file(name.as_str(), zip::write::SimpleFileOptions::default())
+            .unwrap();
+        writer.write_all(content).unwrap();
+    }
+    writer.finish().unwrap().into_inner()
 }
 
 /// Answers a merge request read as GitLab does once it has processed a push:
@@ -794,9 +980,70 @@ fn embedded_script() -> String {
         .expect("template has one literal script block")
         .1
         .lines()
+        .take_while(|line| line.is_empty() || line.starts_with("      "))
         .map(|line| line.strip_prefix("      ").unwrap_or(line).to_string())
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+/// The top-level YAML block of `key` in the organization template, up to
+/// the next top-level line.
+fn template_block(key: &str) -> String {
+    let start = TEMPLATE
+        .find(&format!("\n{key}:\n"))
+        .unwrap_or_else(|| panic!("template has no {key}"));
+    TEMPLATE[start + 1..]
+        .lines()
+        .enumerate()
+        .take_while(|(index, line)| *index == 0 || line.is_empty() || line.starts_with(' '))
+        .map(|(_, line)| format!("{line}\n"))
+        .collect()
+}
+
+/// The variables `.upd-organization-update` sets, with each input
+/// interpolated from `inputs` or else from its declared default.
+fn template_variables(inputs: &[(&str, &str)]) -> Vec<(String, String)> {
+    let (spec, _) = TEMPLATE.split_once("\n---\n").expect("spec header");
+    let mut defaults = HashMap::new();
+    let mut input = "";
+    for line in spec.lines() {
+        if let Some(name) = line
+            .strip_prefix("    ")
+            .and_then(|line| line.strip_suffix(':'))
+        {
+            if !name.starts_with(' ') {
+                input = name;
+            }
+        } else if let Some(value) = line.strip_prefix("      default: ") {
+            defaults.insert(input, value.trim_matches('"').to_string());
+        }
+    }
+    let block = template_block(".upd-organization-update");
+    let variables = block
+        .split_once("\n  variables:\n")
+        .expect("the job sets variables")
+        .1;
+    variables
+        .lines()
+        .take_while(|line| line.starts_with("    "))
+        .filter(|line| !line.trim_start().starts_with('#'))
+        .map(|line| {
+            let (name, value) = line.trim().split_once(": ").expect("NAME: value");
+            let mut value = value.trim_matches('"').to_string();
+            while let Some(start) = value.find("$[[ inputs.") {
+                let end = start + value[start..].find(" ]]").unwrap() + 3;
+                let name = &value[start + "$[[ inputs.".len()..end - 3];
+                let with = inputs
+                    .iter()
+                    .find(|(input, _)| *input == name)
+                    .map(|(_, value)| value.to_string())
+                    .or_else(|| defaults.get(name).cloned())
+                    .unwrap_or_else(|| panic!("input {name} has no value"));
+                value.replace_range(start..end, &with);
+            }
+            (name.to_string(), value)
+        })
+        .collect()
 }
 
 #[tokio::test]
@@ -814,7 +1061,11 @@ async fn the_template_keeps_the_report_and_the_exit_status() {
         let output: Output = org
             .command(
                 "bash",
-                &[("UPD_DRY_RUN", dry_run), ("UPD_VERSION", "v0.0.0")],
+                &[
+                    ("UPD_DRY_RUN", dry_run),
+                    ("UPD_LOCK", "false"),
+                    ("UPD_VERSION", "v0.0.0"),
+                ],
             )
             .args(["-c", &embedded_script()])
             .output()
@@ -830,6 +1081,49 @@ async fn the_template_keeps_the_report_and_the_exit_status() {
         assert_eq!(org.branch_file(61).as_deref(), expected_branch);
         assert!(stderr.contains("2 projects in acme"), "{stderr}");
     }
+}
+
+/// Lock mode on an upd release without it stops before planning, naming
+/// the inputs that choose the release. Such a release reads `plan` as a
+/// project path and answers `--help` with the help of `gitlab org`, exit 0.
+#[tokio::test]
+async fn lock_mode_on_a_release_without_it_names_the_inputs_to_change() {
+    let org = Org::new().await;
+    let old = org.temp.path().join("old-upd");
+    fs::write(
+        &old,
+        "#!/usr/bin/env bash\n\
+         printf '%s\\n' \"$*\" >> \"$FAKE_LOG/old-upd.args\"\n\
+         echo 'Usage: upd gitlab org [OPTIONS] [PATHS]... <COMMAND>'\n\
+         echo 'Commands:'\n\
+         echo '  run   Run `gitlab run` for every group project that opts in'\n",
+    )
+    .unwrap();
+    fs::set_permissions(&old, fs::Permissions::from_mode(0o755)).unwrap();
+    let output = org
+        .command(
+            "bash",
+            &[
+                ("UPD_DRY_RUN", "false"),
+                ("UPD_LOCK", "true"),
+                ("UPD_VERSION", "v0.0.0"),
+                ("UPD_EXECUTABLE", old.to_str().unwrap()),
+            ],
+        )
+        .current_dir(org.temp.path())
+        .args(["-c", &embedded_script()])
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(4), "{stderr}");
+    assert!(
+        stderr.contains("upd v0.0.0 has no lock mode")
+            && stderr.contains("upd_version")
+            && stderr.contains("upd_sha256"),
+        "{stderr}"
+    );
+    let calls = fs::read_to_string(org.log.join("old-upd.args")).unwrap();
+    assert_eq!(calls, "gitlab org plan --help\n");
 }
 
 /// Every input a template declares is used, and every interpolation names a
@@ -1092,6 +1386,9 @@ checksum = "00"
 /// changes; every invocation is logged with the `UV_NO_BUILD` it saw.
 const LOCK_UPDATER: &str = r##"#!/usr/bin/env bash
 set -euo pipefail
+if [ "${1:-}" = gitlab ]; then
+  exec "$REAL_UPD" "$@"
+fi
 if [ -n "${UPD_GITLAB_TOKEN+set}" ]; then
   echo "fake upd received the GitLab token" >&2
   exit 9
@@ -1224,7 +1521,7 @@ impl Toolbox {
     fn new(root: &Path) -> Self {
         let base = root.join("tools");
         fs::create_dir(&base).unwrap();
-        for program in ["git", "bash", "cat", "mkdir", "cp"] {
+        for program in ["git", "bash", "cat", "mkdir", "cp", "chmod"] {
             std::os::unix::fs::symlink(on_path(program), base.join(program)).unwrap();
         }
         let lock_tools = root.join("lock-tools");
@@ -1249,7 +1546,7 @@ impl Org {
     /// The directory the jobs of project `id`'s `lane` share, as the
     /// pipeline's artifacts carry it from job to job.
     fn job_dir(&self, id: u64, lane: &str) -> PathBuf {
-        self.temp.path().join("jobs").join(format!("{id}-{lane}"))
+        self.temp.path().join(job_dir_arg(id, lane))
     }
 
     /// Runs `upd gitlab org <job>` (prepare or publish) for project `id`'s
@@ -1264,9 +1561,11 @@ impl Org {
         }
         command
             .args(["gitlab", "org", job, "--project", &id.to_string()])
-            .args(["--lane", lane, "--dir"])
-            .arg(self.job_dir(id, lane))
+            .args(["--lane", lane, "--dir", &job_dir_arg(id, lane)])
             .args(["--output", "json"]);
+        if job == "publish" {
+            command.args(["--lock-job", &lock_job_name(id, lane)]);
+        }
         finish(command)
     }
 
@@ -1285,10 +1584,25 @@ impl Org {
         command
             .env_remove("UPD_GITLAB_TOKEN")
             .env("PATH", std::env::join_paths(path).unwrap())
-            .args(["gitlab", "org", "lock-worker", "--dir"])
-            .arg(self.job_dir(id, lane))
+            .args([
+                "gitlab",
+                "org",
+                "lock-worker",
+                "--dir",
+                &job_dir_arg(id, lane),
+            ])
             .args(["--output", "json"]);
-        finish(command)
+        let outcome = finish(command);
+        self.jobs.record(CiJob {
+            id: 0,
+            pipeline: PIPELINE.to_string(),
+            name: lock_job_name(id, lane),
+            status: if outcome.0 == 0 { "success" } else { "failed" },
+            root: self.temp.path().to_path_buf(),
+            paths: vec![format!("{}/result/", job_dir_arg(id, lane))],
+            upload: Upload::default(),
+        });
+        outcome
     }
 
     /// Every updater invocation for the project at `path`, one per line.
@@ -1314,9 +1628,51 @@ impl Org {
             .map(|request| serde_json::from_slice(&request.body).unwrap())
     }
 
+    /// Each read of the job API: its path and the job token it carried, or
+    /// the group token as `PRIVATE-TOKEN <token>`.
+    async fn job_api_reads(&self) -> Vec<(String, String)> {
+        self.server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .filter(|request| {
+                let path = request.url.path();
+                path.starts_with("/api/v4/jobs/") || path.contains("/pipelines/")
+            })
+            .map(|request| {
+                let header = |name: &str| {
+                    request
+                        .headers
+                        .get(name)
+                        .map(|value| value.to_str().unwrap().to_string())
+                };
+                let token = match header("PRIVATE-TOKEN") {
+                    Some(token) => format!("PRIVATE-TOKEN {token}"),
+                    None => header("JOB-TOKEN").unwrap_or_default(),
+                };
+                (request.url.path().to_string(), token)
+            })
+            .collect()
+    }
+
     /// The work tree `project` pushed project `path`'s `main` from.
     fn work_tree(&self, path: &str) -> PathBuf {
         self.temp.path().join("work").join(path.replace('/', "-"))
+    }
+}
+
+/// The `--dir` of project `id`'s `lane` jobs, relative to the directory they
+/// run in, as the plan writes it.
+fn job_dir_arg(id: u64, lane: &str) -> String {
+    format!("jobs/{id}-{lane}")
+}
+
+/// The lock job of project `id`'s `lane`, named as the plan names it.
+fn lock_job_name(id: u64, lane: &str) -> String {
+    match lane {
+        "major" => format!("lock-{id}-major"),
+        _ => format!("lock-{id}"),
     }
 }
 
@@ -1550,6 +1906,62 @@ async fn publish_refuses_work_it_did_not_seal_or_a_result_that_does_not_match() 
     );
     assert_eq!(org.file_on(87, BRANCH, "pyproject.toml"), None);
 
+    let (code, report, stderr) = org.publish(87, "ordinary");
+    assert_eq!(code, 0, "{report:#}\n{stderr}");
+    assert_eq!(report["result"]["outcome"], "published", "{report:#}");
+}
+
+#[tokio::test]
+async fn publish_reads_the_result_of_the_one_lock_job_that_succeeded() {
+    let (mut org, toolbox) = Org::locking().await;
+    uv_project(&mut org, 87, "acme/sealed", LOCK_OPTED_IN, "uv");
+    org.serve().await;
+    let (code, report, stderr) = org.prepare(87, "ordinary");
+    assert_eq!(code, 0, "{report:#}\n{stderr}");
+
+    let (code, _, stderr) = org.publish(87, "ordinary");
+    assert_eq!(code, 2, "{stderr}");
+    assert!(
+        stderr.contains("Pipeline 981 has 0 jobs named lock-87, not one"),
+        "{stderr}"
+    );
+
+    let (code, report, stderr) =
+        org.lock_worker(87, "ordinary", &[&toolbox.lock_tools, &toolbox.base]);
+    assert_eq!(code, 0, "{report:#}\n{stderr}");
+
+    // A lock job that did not succeed is not read, whatever its archive.
+    org.jobs
+        .alter(PIPELINE, "lock-87", |job| job.status = "failed");
+    let (code, _, stderr) = org.publish(87, "ordinary");
+    assert_eq!(code, 2, "{stderr}");
+    assert!(
+        stderr.contains("The lock job lock-87 has not succeeded: its status is failed"),
+        "{stderr}"
+    );
+    org.jobs
+        .alter(PIPELINE, "lock-87", |job| job.status = "success");
+
+    let twin = org.jobs.named(PIPELINE, "lock-87");
+    org.jobs.0.lock().unwrap().push(CiJob { id: 9999, ..twin });
+    let (code, _, stderr) = org.publish(87, "ordinary");
+    assert_eq!(code, 2, "{stderr}");
+    assert!(
+        stderr.contains("Pipeline 981 has 2 jobs named lock-87, not one"),
+        "{stderr}"
+    );
+    org.jobs.0.lock().unwrap().retain(|job| job.id != 9999);
+
+    // A lock job of another pipeline is not this pipeline's.
+    org.jobs
+        .alter(PIPELINE, "lock-87", |job| job.pipeline = "980".to_string());
+    let (code, _, stderr) = org.publish(87, "ordinary");
+    assert_eq!(code, 2, "{stderr}");
+    assert!(stderr.contains("has 0 jobs named lock-87"), "{stderr}");
+    org.jobs
+        .alter("980", "lock-87", |job| job.pipeline = PIPELINE.to_string());
+
+    assert_eq!(org.file_on(87, BRANCH, "pyproject.toml"), None);
     let (code, report, stderr) = org.publish(87, "ordinary");
     assert_eq!(code, 0, "{report:#}\n{stderr}");
     assert_eq!(report["result"]["outcome"], "published", "{report:#}");
@@ -2084,4 +2496,850 @@ async fn shards_split_the_group_by_project_id() {
             "{shard:?}"
         );
     }
+}
+
+/// The ID GitLab gives the child pipeline in [`run_lock_pipeline`].
+const CHILD_PIPELINE: &str = "982";
+
+/// GitLab's default `max_artifacts_content_include_size`: the largest
+/// artifact archive `trigger: include: artifact` reads a pipeline from.
+const MAX_INCLUDED_ARCHIVE: usize = 5 * 1024 * 1024;
+
+/// The child pipeline as the template's trigger job includes it: from the
+/// artifact archive of the job its `include` names, which GitLab refuses
+/// past [`MAX_INCLUDED_ARCHIVE`] whatever the included file's own size. A
+/// job between the organization job and the trigger runs as the template
+/// defines it, in a fresh directory holding the organization job's
+/// artifacts.
+fn included_pipeline(org: &Org, parent: &Path) -> Value {
+    let trigger = template_block(".upd-organization-lock");
+    let (_, include) = trigger
+        .split_once("      - artifact: .upd-ci/upd-lock-pipeline.yml\n        job: \"$[[ inputs.")
+        .expect("the trigger includes the pipeline file from a job's artifacts");
+    let input = include.split_once(" ]]\"\n").unwrap().0;
+    let (root, block) = match input {
+        "organization_job" => (
+            parent.to_path_buf(),
+            template_block(".upd-organization-update"),
+        ),
+        "lock_plan_job" => {
+            let block = template_block(".upd-organization-lock-plan");
+            assert!(
+                block.contains("  needs:\n    - job: \"$[[ inputs.organization_job ]]\"\n      artifacts: true\n"),
+                "{block}"
+            );
+            let dir = org.temp.path().join("lock-plan");
+            fs::create_dir(&dir).unwrap();
+            copy_tree(&parent.join(".upd-ci"), &dir.join(".upd-ci"));
+            let script = lock_plan_script();
+            let output = org
+                .command("bash", &[])
+                .current_dir(&dir)
+                .env("CI_JOB_NAME", "upd-organization-lock-plan")
+                .env("UPD_LOCK_PLAN_JOB", "upd-organization-lock-plan")
+                .args(["-c", &script])
+                .output()
+                .unwrap();
+            assert_eq!(
+                output.status.code(),
+                Some(0),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            (dir, block)
+        }
+        other => panic!("the trigger includes from an unknown input {other}"),
+    };
+    let paths: Vec<String> = block
+        .split_once("    paths:\n")
+        .expect("the included job keeps artifacts")
+        .1
+        .lines()
+        .map_while(|line| line.strip_prefix("      - "))
+        .map(str::to_string)
+        .collect();
+    let archive = zip_paths(&root, &paths, &[]);
+    assert!(
+        archive.len() <= MAX_INCLUDED_ARCHIVE,
+        "Artifacts archive for job {input} is too large: {} bytes exceeds maximum of {MAX_INCLUDED_ARCHIVE}",
+        archive.len()
+    );
+    let mut archive = zip::ZipArchive::new(std::io::Cursor::new(archive)).unwrap();
+    let mut file = archive.by_name(".upd-ci/upd-lock-pipeline.yml").unwrap();
+    let mut text = String::new();
+    std::io::Read::read_to_string(&mut file, &mut text).unwrap();
+    serde_json::from_str(&text).unwrap()
+}
+
+/// The script of the template's `.upd-organization-lock-plan` job.
+fn lock_plan_script() -> String {
+    template_block(".upd-organization-lock-plan")
+        .split_once("  script:\n    - |\n")
+        .expect("the lock plan job has one literal script")
+        .1
+        .lines()
+        .take_while(|line| line.is_empty() || line.starts_with("      "))
+        .map(|line| line.strip_prefix("      ").unwrap_or(line))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+#[test]
+fn the_lock_plan_job_refuses_a_name_the_trigger_does_not_include_from() {
+    let dir = tempfile::tempdir().unwrap();
+    let run = |job: &str| {
+        isolated::command("bash")
+            .current_dir(dir.path())
+            .env("CI_JOB_NAME", job)
+            .env("UPD_LOCK_PLAN_JOB", "upd-organization-lock-plan")
+            .args(["-c", &lock_plan_script()])
+            .output()
+            .unwrap()
+    };
+    let output = run("lock-plan");
+    assert_eq!(output.status.code(), Some(2));
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains(
+            "The lock_plan_job input names upd-organization-lock-plan, but this job is lock-plan"
+        ),
+        "{output:?}"
+    );
+    let output = run("upd-organization-lock-plan");
+    assert_eq!(output.status.code(), Some(2));
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .contains("The organization job wrote no lock pipeline"),
+        "{output:?}"
+    );
+    fs::create_dir(dir.path().join(".upd-ci")).unwrap();
+    fs::write(dir.path().join(".upd-ci/upd-lock-pipeline.yml"), "{}").unwrap();
+    assert_eq!(run("upd-organization-lock-plan").status.code(), Some(0));
+}
+
+/// What one job of the simulated lock pipeline did.
+struct ChildJob {
+    code: i32,
+    held_token: bool,
+    stdout: String,
+    stderr: String,
+}
+
+/// Runs an organization job in lock mode as the template does, then every
+/// job of the child pipeline it writes, as GitLab would: in `needs` order,
+/// each in a fresh directory holding only the artifacts it needs, with the
+/// child's variables and its own, and the token only in jobs that declare
+/// the environment it is scoped to. Returns the plan report, the child
+/// pipeline and each job's outcome.
+///
+/// Variables follow GitLab's precedence: `project` variables (the central
+/// project's CI/CD settings) reach every job and outrank YAML variables;
+/// `pipeline` variables (a schedule's or a manual run's) outrank them in the
+/// organization job and do not reach the child, whose trigger forwards
+/// nothing.
+fn run_lock_pipeline(
+    org: &Org,
+    toolbox: &Toolbox,
+    inputs: &[(&str, &str)],
+    project: &[(&str, &str)],
+    pipeline_variables: &[(&str, &str)],
+) -> (Value, Value, HashMap<String, ChildJob>) {
+    let parent = org.temp.path().join("parent");
+    fs::create_dir(&parent).unwrap();
+    let mut command = org.command("bash", &[]);
+    for name in [
+        "UPD_GROUP",
+        "UPD_MIN_AGE",
+        "UPD_MAX_BUMP",
+        "UPD_GIT_NAME",
+        "UPD_GIT_EMAIL",
+    ] {
+        command.env_remove(name);
+    }
+    for (name, value) in template_variables(inputs) {
+        if name != "UPD_EXECUTABLE" {
+            command.env(name, value);
+        }
+    }
+    for (name, value) in project.iter().chain(pipeline_variables) {
+        command.env(name, value);
+    }
+    let output = command
+        .current_dir(&parent)
+        .env("CI_PIPELINE_ID", PIPELINE)
+        .env("CI_JOB_NAME", "upd-organization-update")
+        .env("UPD_VERSION", "v0.0.0")
+        .args(["-c", &embedded_script()])
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(0), "{stderr}");
+    let plan: Value = serde_json::from_str(
+        &fs::read_to_string(parent.join(".upd-ci/upd-org-plan.json")).unwrap(),
+    )
+    .unwrap();
+    // The organization job keeps .upd-ci/ as its artifact.
+    assert!(template_block(".upd-organization-update").contains("    paths:\n      - .upd-ci/\n"));
+    let pipeline = included_pipeline(org, &parent);
+
+    let jobs: Vec<(&String, &Value)> = pipeline
+        .as_object()
+        .unwrap()
+        .iter()
+        .filter(|(name, _)| *name != "variables")
+        .collect();
+    let mut done: HashMap<String, ChildJob> = HashMap::new();
+    while done.len() < jobs.len() {
+        let ready = jobs
+            .iter()
+            .find(|(name, job)| {
+                !done.contains_key(*name)
+                    && job["needs"].as_array().unwrap().iter().all(|need| {
+                        need.get("pipeline").is_some()
+                            || done.contains_key(need["job"].as_str().unwrap())
+                    })
+            })
+            .unwrap_or_else(|| panic!("no job can start; done: {:?}", done.keys()));
+        let (name, job) = (ready.0.clone(), ready.1);
+        let dir = org.temp.path().join("child").join(&name);
+        fs::create_dir_all(&dir).unwrap();
+        let mut dotenv: Vec<(String, String)> = Vec::new();
+        for need in job["needs"].as_array().unwrap() {
+            if need.get("pipeline").is_some() {
+                assert_eq!(need["pipeline"], PIPELINE, "{name}");
+                assert_eq!(need["job"], "upd-organization-update", "{name}");
+                copy_tree(&parent.join(".upd-ci"), &dir.join(".upd-ci"));
+                continue;
+            }
+            let needed = need["job"].as_str().unwrap();
+            // A failed job's artifacts cannot be fetched.
+            let failed = &done[needed];
+            assert_eq!(
+                failed.code, 0,
+                "{name} needs {needed}, which failed:\n{}\n{}",
+                failed.stdout, failed.stderr
+            );
+            // The job waits for the jobs it needs either way; it takes
+            // their artifacts, unpacked over its directory, and the
+            // variables of their dotenv reports unless `artifacts` is false.
+            if need.get("artifacts") == Some(&Value::Bool(false)) {
+                continue;
+            }
+            let needed = org.jobs.named(CHILD_PIPELINE, needed);
+            zip::ZipArchive::new(std::io::Cursor::new(needed.archive()))
+                .unwrap()
+                .extract(&dir)
+                .unwrap();
+            dotenv.extend(needed.upload.dotenv);
+        }
+        let held_token = job.get("environment").is_some();
+        let mut command = org.command(on_path("bash"), &[]);
+        command.current_dir(&dir);
+        for name in [
+            "UPD_GITLAB_TOKEN",
+            "UPD_GROUP",
+            "UPD_MIN_AGE",
+            "UPD_MAX_BUMP",
+            "UPD_GIT_NAME",
+            "UPD_GIT_EMAIL",
+        ] {
+            command.env_remove(name);
+        }
+        if held_token {
+            assert_eq!(job["environment"]["name"], "upd-organization", "{name}");
+            command.env("UPD_GITLAB_TOKEN", "test-token");
+        } else {
+            command.env(
+                "PATH",
+                std::env::join_paths([&toolbox.lock_tools, &toolbox.base]).unwrap(),
+            );
+        }
+        let variables = pipeline["variables"].as_object().unwrap().iter();
+        for (variable, value) in variables.chain(job["variables"].as_object().into_iter().flatten())
+        {
+            let value = match value {
+                Value::String(value) => value.clone(),
+                value => {
+                    assert_eq!(value["expand"], false, "{name}: {variable}");
+                    value["value"].as_str().unwrap().to_string()
+                }
+            };
+            command.env(variable, value);
+        }
+        let id = org.jobs.record(CiJob {
+            id: 0,
+            pipeline: CHILD_PIPELINE.to_string(),
+            name: name.clone(),
+            status: "running",
+            root: dir.clone(),
+            paths: Vec::new(),
+            upload: Upload::default(),
+        });
+        // Predefined variables, then dotenv reports, which outrank them, then
+        // the project's CI/CD variables, which outrank both.
+        command
+            .env("CI_PIPELINE_ID", CHILD_PIPELINE)
+            .env("CI_JOB_NAME", &name)
+            .env("CI_JOB_ID", id.to_string())
+            .env("CI_JOB_TOKEN", format!("job-token-{id}"))
+            .env("CI_PROJECT_DIR", &dir);
+        for (variable, value) in dotenv {
+            command.env(variable, value);
+        }
+        for (variable, value) in project {
+            command.env(variable, value);
+        }
+        let mut script: Vec<String> = vec!["set -eo pipefail".to_string()];
+        for part in ["before_script", "script"] {
+            for line in job[part].as_array().unwrap() {
+                script.push(line.as_str().unwrap().to_string());
+            }
+        }
+        let output = command.args(["-c", &script.join("\n")]).output().unwrap();
+        let code = output.status.code().unwrap();
+        org.jobs.alter(CHILD_PIPELINE, &name, |ci_job| {
+            ci_job.status = if code == 0 { "success" } else { "failed" };
+            ci_job.paths = job["artifacts"]["paths"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .map(|path| path.as_str().unwrap().to_string())
+                .collect();
+            ci_job.upload = org.uploads.get(&name).cloned().unwrap_or_default();
+        });
+        done.insert(
+            name,
+            ChildJob {
+                code,
+                held_token,
+                stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+                stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+            },
+        );
+    }
+    (plan, pipeline, done)
+}
+
+fn copy_tree(from: &Path, to: &Path) {
+    if from.is_dir() {
+        fs::create_dir_all(to).unwrap();
+        for entry in fs::read_dir(from).unwrap() {
+            let entry = entry.unwrap();
+            copy_tree(&entry.path(), &to.join(entry.file_name()));
+        }
+    } else {
+        fs::create_dir_all(to.parent().unwrap()).unwrap();
+        fs::copy(from, to).unwrap();
+    }
+}
+
+#[tokio::test]
+async fn the_template_regenerates_lockfiles_in_a_child_pipeline_without_the_token() {
+    let (mut org, toolbox) = Org::locking().await;
+    uv_project(&mut org, 81, "acme/python", LOCK_OPTED_IN, "uv");
+    uv_project(&mut org, 82, "acme/unlocked", OPTED_IN, "uv");
+    org.serve().await;
+
+    let (plan, pipeline, jobs) = run_lock_pipeline(
+        &org,
+        &toolbox,
+        &[
+            ("group", "acme"),
+            ("lock", "true"),
+            ("lock_runner_tags", "upd-lock"),
+        ],
+        &[],
+        &[],
+    );
+
+    assert_eq!(plan["command"], "gitlab org plan", "{plan:#}");
+    assert_eq!(
+        plan["handed_off"],
+        json!([{"id": 81, "path": "acme/python", "lanes": ["ordinary"]}]),
+        "{plan:#}"
+    );
+    assert_eq!(plan["counts"]["jobs"], 4, "{plan:#}");
+    let mut names: Vec<&String> = jobs.keys().collect();
+    names.sort();
+    assert_eq!(
+        names,
+        ["lock-81", "organization-run", "prepare-81", "publish-81"]
+    );
+    for (name, job) in &jobs {
+        assert_eq!(job.code, 0, "{name}\n{}\n{}", job.stdout, job.stderr);
+        assert_eq!(job.held_token, name != "lock-81", "{name}");
+    }
+    assert_eq!(pipeline["lock-81"]["tags"], json!(["upd-lock"]));
+    // organization-run does what the organization job does without lock
+    // mode, so it gets the same time.
+    let timeout = pipeline["organization-run"]["timeout"]
+        .as_str()
+        .unwrap_or("none");
+    assert!(
+        template_block(".upd-organization-update").contains(&format!("\n  timeout: {timeout}\n")),
+        "organization-run timeout {timeout}"
+    );
+    // The child runs with the settings the organization job read.
+    let settings = pipeline["prepare-81"]["script"][0].as_str().unwrap();
+    assert!(settings.contains("export UPD_GROUP='acme'\n"), "{settings}");
+    assert!(
+        settings.contains("export UPD_MAX_BUMP='minor'\n"),
+        "{settings}"
+    );
+
+    let lock: Value = serde_json::from_str(&jobs["lock-81"].stdout).unwrap();
+    assert_eq!(lock["step"], "locked", "{lock:#}");
+    let lock = org
+        .file_on(81, BRANCH, "uv.lock")
+        .expect("the lock job's lockfile was published");
+    assert!(lock.contains("version = \"1.1.0\""), "{lock}");
+    assert!(org.created_merge_request(81).await.is_some());
+
+    let report: Value = serde_json::from_str(
+        &fs::read_to_string(
+            org.temp
+                .path()
+                .join("child/organization-run/.upd-ci/upd-org-report.json"),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        project(&report, "acme/python")["reason"],
+        "handed_off",
+        "{report:#}"
+    );
+    let unlocked = project(&report, "acme/unlocked");
+    assert_eq!(unlocked["state"], "processed", "{report:#}");
+    assert_eq!(unlocked["lockfiles"]["regenerated"], false, "{report:#}");
+    assert!(org.file_on(82, BRANCH, "pyproject.toml").is_some());
+
+    // Publish found the lock job with the group token, which GitLab's job
+    // token permissions require, and read its archive with its own job
+    // token; the group token never went to the artifacts.
+    let reads = org.job_api_reads().await;
+    assert!(
+        reads
+            .iter()
+            .any(|(path, token)| path.ends_with("/jobs") && token == "PRIVATE-TOKEN test-token"),
+        "{reads:?}"
+    );
+    assert!(
+        reads
+            .iter()
+            .any(|(path, token)| path.ends_with("/artifacts") && token.starts_with("job-token-")),
+        "{reads:?}"
+    );
+    assert!(
+        reads
+            .iter()
+            .filter(|(path, _)| path.ends_with("/artifacts"))
+            .all(|(_, token)| token.starts_with("job-token-")),
+        "{reads:?}"
+    );
+}
+
+#[tokio::test]
+async fn publish_takes_nothing_the_lock_job_uploads_but_its_result() {
+    let hostile = |org: &Org| {
+        let marker = org.temp.path().join("hostile-binary-ran");
+        [
+            Upload {
+                files: vec![(
+                    ".upd-ci/bin/upd".to_string(),
+                    format!("#!/bin/sh\ntouch {}\n", marker.display()).into_bytes(),
+                )],
+                dotenv: Vec::new(),
+            },
+            Upload {
+                files: Vec::new(),
+                dotenv: vec![(
+                    "CI_API_V4_URL".to_string(),
+                    format!("{}/hostile/api/v4", org.server.uri()),
+                )],
+            },
+        ]
+    };
+    for case in 0..2 {
+        let (mut org, toolbox) = Org::locking().await;
+        uv_project(&mut org, 81, "acme/python", LOCK_OPTED_IN, "uv");
+        org.serve().await;
+        let upload = hostile(&org)[case].clone();
+        org.uploads.insert("lock-81".to_string(), upload);
+
+        let (_, _, jobs) = run_lock_pipeline(
+            &org,
+            &toolbox,
+            &[
+                ("group", "acme"),
+                ("lock", "true"),
+                ("lock_runner_tags", "upd-lock"),
+            ],
+            &[],
+            &[],
+        );
+
+        let publish = &jobs["publish-81"];
+        assert_eq!(
+            publish.code, 0,
+            "case {case}\n{}\n{}",
+            publish.stdout, publish.stderr
+        );
+        assert!(!org.temp.path().join("hostile-binary-ran").exists());
+        let requests = org.server.received_requests().await.unwrap();
+        let hostile: Vec<&str> = requests
+            .iter()
+            .map(|request| request.url.path())
+            .filter(|path| path.starts_with("/hostile"))
+            .collect();
+        assert_eq!(hostile, Vec::<&str>::new(), "case {case}");
+        let lock = org
+            .file_on(81, BRANCH, "uv.lock")
+            .expect("the lock job's lockfile was published");
+        assert!(lock.contains("version = \"1.1.0\""), "{lock}");
+    }
+}
+
+#[tokio::test]
+async fn a_lock_mode_dry_run_previews_every_project_in_one_job() {
+    let (mut org, toolbox) = Org::locking().await;
+    uv_project(&mut org, 81, "acme/python", LOCK_OPTED_IN, "uv");
+    org.serve().await;
+
+    let (plan, _, jobs) = run_lock_pipeline(
+        &org,
+        &toolbox,
+        &[
+            ("group", "acme"),
+            ("lock", "true"),
+            ("lock_runner_tags", "upd-lock"),
+            ("dry_run", "true"),
+        ],
+        &[],
+        &[],
+    );
+
+    assert_eq!(plan["dry_run"], true, "{plan:#}");
+    assert_eq!(plan["handed_off"], json!([]), "{plan:#}");
+    assert_eq!(jobs.keys().collect::<Vec<_>>(), ["organization-run"]);
+    let run = &jobs["organization-run"];
+    assert_eq!(run.code, 0, "{}", run.stderr);
+    let report: Value = serde_json::from_str(
+        &fs::read_to_string(
+            org.temp
+                .path()
+                .join("child/organization-run/.upd-ci/upd-org-report.json"),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(report["dry_run"], true, "{report:#}");
+    assert_eq!(
+        project(&report, "acme/python")["lockfiles"]["regenerated"],
+        true,
+        "{report:#}"
+    );
+    assert_eq!(
+        org.file_on(81, BRANCH, "pyproject.toml"),
+        None,
+        "a dry run pushed"
+    );
+}
+
+#[test]
+fn the_lock_trigger_serializes_runs_and_forwards_nothing() {
+    let trigger = template_block(".upd-organization-lock");
+    for expected in [
+        "  resource_group: upd-organization-update\n",
+        "    strategy: mirror\n",
+        "      - artifact: .upd-ci/upd-lock-pipeline.yml\n        job: \"$[[ inputs.lock_plan_job ]]\"\n",
+        "    - job: \"$[[ inputs.lock_plan_job ]]\"\n      artifacts: true\n",
+        "    forward:\n      yaml_variables: false\n      pipeline_variables: false\n",
+        "    - if: '$UPD_LOCK != \"true\"'\n      when: never\n",
+    ] {
+        assert!(trigger.contains(expected), "{expected}\n{trigger}");
+    }
+    let update = template_block(".upd-organization-update");
+    assert!(update.contains("  resource_group: upd-organization-update\n"));
+    assert!(
+        update.contains(
+            "  environment:\n    name: \"$[[ inputs.environment ]]\"\n    action: access\n"
+        )
+    );
+    // The trigger runs in lock mode whenever the organization job runs.
+    let rules = |block: &str| -> String {
+        block
+            .split_once("  rules:\n")
+            .unwrap()
+            .1
+            .lines()
+            .take_while(|line| line.starts_with("    "))
+            .map(|line| format!("{line}\n"))
+            .collect()
+    };
+    assert_eq!(
+        rules(&trigger),
+        format!(
+            "    - if: '$UPD_LOCK != \"true\"'\n      when: never\n{}",
+            rules(&update)
+        )
+    );
+    // The job the trigger includes from runs whenever the trigger does,
+    // holds no token, and keeps nothing but the pipeline file.
+    let plan = template_block(".upd-organization-lock-plan");
+    assert_eq!(rules(&plan), rules(&trigger));
+    assert!(!plan.contains("environment:"), "{plan}");
+    let paths: Vec<&str> = plan
+        .split_once("    paths:\n")
+        .unwrap()
+        .1
+        .lines()
+        .map_while(|line| line.strip_prefix("      - "))
+        .collect();
+    assert_eq!(paths, [".upd-ci/upd-lock-pipeline.yml"], "{plan}");
+}
+
+impl Org {
+    /// Runs `upd gitlab org plan --output json` as the organization job
+    /// named `upd-organization-update` of pipeline [`PIPELINE`] would.
+    fn plan(&self, vars: &[(&str, &str)]) -> (i32, Value, String) {
+        finish(self.plan_command(vars))
+    }
+
+    /// The command [`Org::plan`] runs, for a test to change first.
+    fn plan_command(&self, vars: &[(&str, &str)]) -> Command {
+        let mut command = self.command(
+            env!("CARGO_BIN_EXE_upd"),
+            &[
+                ("UPD_LOCK", "true"),
+                ("CI_PIPELINE_ID", PIPELINE),
+                ("CI_JOB_NAME", "upd-organization-update"),
+                ("UPD_ORGANIZATION_JOB", "upd-organization-update"),
+                ("UPD_IMAGE", "debian:bookworm-slim"),
+                ("UPD_LOCK_RUNNER_TAGS", "upd-lock"),
+            ],
+        );
+        for (name, value) in vars {
+            command.env(name, value);
+        }
+        command.args(["gitlab", "org", "plan", "--output", "json"]);
+        command
+    }
+}
+
+/// Lock jobs run repository code with the central project's job token,
+/// which GitLab lets push to the central project when the project allows
+/// it: such a push could rewrite the pipeline that holds the group token.
+/// Planning therefore needs to see that the central project refuses job
+/// token pushes, and a dry run, which hands nothing off, does not.
+#[tokio::test]
+async fn lock_mode_needs_a_central_project_that_refuses_job_token_pushes() {
+    /// An organization with one lock project, whose central project GitLab
+    /// describes as `central`, or as the default organization does.
+    async fn org(central: Option<&Value>) -> Org {
+        let mut org = Org::new().await;
+        locked_project(&mut org, 96, "acme/locks", LOCK_OPTED_IN);
+        org.serve().await;
+        if let Some(central) = central {
+            Mock::given(method("GET"))
+                .and(path(format!("/api/v4/projects/{CENTRAL}").as_str()))
+                .respond_with(ResponseTemplate::new(200).set_body_json(central))
+                .with_priority(1)
+                .mount(&org.server)
+                .await;
+        }
+        org
+    }
+
+    let refusing = org(None).await;
+    let (code, plan, stderr) = refusing.plan(&[]);
+    assert_eq!(code, 0, "{plan:#}\n{stderr}");
+    assert_eq!(plan["handed_off"].as_array().unwrap().len(), 1, "{plan:#}");
+
+    for (central, expected) in [
+        (
+            json!({"id": CENTRAL, "ci_push_repository_for_job_token_allowed": true}),
+            "Allow Git push requests to the repository",
+        ),
+        (json!({"id": CENTRAL}), "Maintainer"),
+        (
+            json!({"id": CENTRAL, "ci_push_repository_for_job_token_allowed": "false"}),
+            "Maintainer",
+        ),
+    ] {
+        let org = org(Some(&central)).await;
+        let (code, report, stderr) = org.plan(&[]);
+        assert_eq!(code, 2, "{central}\n{report:#}\n{stderr}");
+        assert!(stderr.contains(expected), "{central}\n{stderr}");
+        assert!(report.get("handed_off").is_none(), "{report:#}");
+        let mut dry_run = org.plan_command(&[]);
+        dry_run.arg("--dry-run");
+        let (code, preview, stderr) = finish(dry_run);
+        assert_eq!(
+            code, 0,
+            "a dry run hands nothing off\n{preview:#}\n{stderr}"
+        );
+    }
+
+    let mut command = refusing.plan_command(&[]);
+    command.env_remove("CI_PROJECT_ID");
+    let (code, report, stderr) = finish(command);
+    assert_eq!(code, 4, "{report:#}\n{stderr}");
+    assert!(stderr.contains("CI_PROJECT_ID"), "{stderr}");
+    assert!(report.get("handed_off").is_none(), "{report:#}");
+}
+
+#[tokio::test]
+async fn plan_gives_each_lock_consenting_lane_its_own_jobs() {
+    let mut org = Org::new().await;
+    let lock_and_major = "[automation]\ndependency_updates = true\nlock = true\nmajor_mr = true\n";
+    locked_project(&mut org, 91, "acme/both", lock_and_major);
+    locked_project(&mut org, 92, "acme/locks", LOCK_OPTED_IN);
+    locked_project(&mut org, 93, "acme/unlocked", OPTED_IN);
+    locked_project(&mut org, 94, "acme/unreadable", LOCK_OPTED_IN);
+    org.project(
+        95,
+        "acme/archived",
+        &[Entry::File(".updrc.toml", LOCK_OPTED_IN)],
+    )["archived"] = json!(true);
+    org.serve().await;
+    Mock::given(method("GET"))
+        .and(path_regex(r"^/api/v4/projects/94/repository/files/"))
+        .respond_with(ResponseTemplate::new(403))
+        .with_priority(1)
+        .mount(&org.server)
+        .await;
+
+    let (code, plan, stderr) = org.plan(&[("UPD_MAJOR_MR", "true")]);
+
+    assert_eq!(
+        code, 0,
+        "an unreadable opt-in is not a planning failure\n{plan:#}\n{stderr}"
+    );
+    assert_eq!(
+        plan["handed_off"],
+        json!([
+            {"id": 91, "path": "acme/both", "lanes": ["ordinary", "major"]},
+            {"id": 92, "path": "acme/locks", "lanes": ["ordinary"]},
+        ]),
+        "{plan:#}"
+    );
+    assert_eq!(plan["unplanned"][0]["id"], 94, "{plan:#}");
+    assert_eq!(
+        plan["unplanned"][0]["error"]["kind"], "api_error",
+        "{plan:#}"
+    );
+    assert_eq!(
+        plan["counts"],
+        json!({"projects": 5, "handed_off": 2, "lanes": 3, "jobs": 10, "unplanned": 1}),
+        "{plan:#}"
+    );
+    assert!(
+        stderr.contains("acme/unreadable: opt-in unreadable, left to organization-run"),
+        "{stderr}"
+    );
+    let pipeline: Value = serde_json::from_str(
+        &fs::read_to_string(org.temp.path().join(".upd-ci/upd-lock-pipeline.yml")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        pipeline.as_object().unwrap().len(),
+        11,
+        "the jobs and the variables"
+    );
+    assert_eq!(
+        pipeline["organization-run"]["script"][1],
+        "export UPD_LOCK_HANDED_OFF='91,92'"
+    );
+    let copied = org.temp.path().join(".upd-ci/bin/upd");
+    let version = Command::new(&copied).arg("--version").output().unwrap();
+    assert!(version.status.success(), "the copied binary does not run");
+    // Planning only reads GitLab.
+    for request in org.server.received_requests().await.unwrap() {
+        assert_eq!(request.method.as_str(), "GET", "{}", request.url);
+    }
+    for id in [91, 92, 93] {
+        assert_eq!(org.branch_file(id), None, "planning pushed to {id}");
+    }
+
+    // The major lane needs the organization's consent too.
+    let (code, plan, stderr) = org.plan(&[]);
+    assert_eq!(code, 0, "{stderr}");
+    assert_eq!(
+        plan["handed_off"][0]["lanes"],
+        json!(["ordinary"]),
+        "{plan:#}"
+    );
+    assert_eq!(plan["counts"]["jobs"], 7, "{plan:#}");
+
+    // A shard plans only its own projects.
+    let (code, plan, stderr) = org.plan(&[("UPD_SHARD", "1/2")]);
+    assert_eq!(code, 0, "{stderr}");
+    assert_eq!(plan["shard"], "1/2", "{plan:#}");
+    assert_eq!(plan["counts"]["projects"], 2, "{plan:#}");
+    assert_eq!(
+        plan["handed_off"],
+        json!([{"id": 92, "path": "acme/locks", "lanes": ["ordinary"]}])
+    );
+    assert_eq!(plan["unplanned"][0]["id"], 94, "{plan:#}");
+
+    // Without lock mode there is nothing to plan.
+    let (code, _, stderr) = org.plan(&[("UPD_LOCK", "false")]);
+    assert_eq!(code, 4, "{stderr}");
+    assert!(
+        stderr.contains("gitlab org plan plans lock mode"),
+        "{stderr}"
+    );
+}
+
+#[tokio::test]
+async fn the_child_runs_with_the_planned_settings_whatever_the_project_variables_say() {
+    let (mut org, toolbox) = Org::locking().await;
+    uv_project(&mut org, 81, "acme/python", LOCK_OPTED_IN, "uv");
+    uv_project(&mut org, 82, "acme/unlocked", OPTED_IN, "uv");
+    org.serve().await;
+
+    // The central project's own variables would hold every project back and
+    // exclude them all; this run's schedule overrides both, and the plan
+    // reads the schedule's values. The child, which the schedule's variables
+    // do not reach, must run with the planned ones: a set value replaced,
+    // and an unset one removed.
+    let (plan, _, jobs) = run_lock_pipeline(
+        &org,
+        &toolbox,
+        &[
+            ("group", "acme"),
+            ("lock", "true"),
+            ("lock_runner_tags", "upd-lock"),
+        ],
+        &[("UPD_MAX_BUMP", "patch"), ("UPD_EXCLUDE", "acme/*")],
+        &[("UPD_MAX_BUMP", "minor"), ("UPD_EXCLUDE", "")],
+    );
+
+    assert_eq!(
+        plan["handed_off"],
+        json!([{"id": 81, "path": "acme/python", "lanes": ["ordinary"]}]),
+        "{plan:#}"
+    );
+    for (name, job) in &jobs {
+        assert_eq!(job.code, 0, "{name}\n{}\n{}", job.stdout, job.stderr);
+    }
+    let lock = org
+        .file_on(81, BRANCH, "uv.lock")
+        .expect("the lock job's lockfile was published");
+    assert!(lock.contains("version = \"1.1.0\""), "{lock}");
+    let report: Value = serde_json::from_str(
+        &fs::read_to_string(
+            org.temp
+                .path()
+                .join("child/organization-run/.upd-ci/upd-org-report.json"),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        project(&report, "acme/unlocked")["state"],
+        "processed",
+        "{report:#}"
+    );
+    assert!(org.file_on(82, BRANCH, "pyproject.toml").is_some());
 }
