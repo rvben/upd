@@ -32,6 +32,49 @@ Gradle auditing reads adjacent `gradle.lockfile` and `buildscript-gradle.lockfil
 files and reports coverage limitations. Automatic Maven fixes are not supported;
 see [Maven audit coverage](ecosystems.md#maven-audit-coverage).
 
+An advisory's fixed version is the edge of its affected range, which is not
+always a release. RustSec's notices for unmaintained crates, for one, name a
+version one past the last release (`0.4.21-0` for a crate whose last release is
+`0.4.20`). An advisory can also cover several branches, so the release just
+above the first fixed version may still sit inside a later affected range.
+
+Before `--fix-audit` writes a fix for a PyPI, npm or crates.io package, it
+asks the registry the package resolves from which releases exist: the index
+or registry its lockfile records, when that is one upd is configured with
+(`UV_INDEX_URL` and `UV_EXTRA_INDEX_URL` or their pip equivalents, the npm
+registry or the one `.npmrc` names for the package's scope, and crates.io or
+the index `CARGO_REGISTRIES_CRATES_IO_INDEX` or Cargo's `registry.default`
+names).
+The fix moves to the lowest release, at or above the advisory's fixed
+version, that none of the package's advisories still covers: the fixed
+version itself when it is published, else a stable release above it. For
+crates.io and PyPI the release must also be installable, so a yanked release
+is passed over, and so is a PyPI release whose files have all been deleted.
+An advisory range's `limit` ends every affected window in that range.
+
+- When every such release is still affected, the package is reported
+  `unfixable`, and the reason names the lowest release and the advisory that
+  covers it.
+- When no such release is published, the package is reported `unfixable`,
+  the same as an advisory with no fixed version. Writing the unpublished
+  version would make the directory's relock fail, which rolls back every
+  other fix in that directory too.
+
+The fix goes to the version the advisory names, with a `note:` on stderr
+saying it was not confirmed, when no configured registry can vouch for the
+package's releases:
+
+- the lockfile records an index or registry upd is not configured with;
+- the lockfiles record the same package and version from more than one
+  registry;
+- a pin no lockfile records sits in a `pyproject.toml` or requirements file
+  that declares its own package index, or upd is configured with more than
+  one Python index, so it could resolve from any of them;
+- the registry cannot be reached, or lists no release of the package;
+- the run is `--offline`, which asks no registry at all.
+
+Go modules and the other ecosystems use the advisory's version as named.
+
 ## Example output
 
 ```text

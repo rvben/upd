@@ -128,7 +128,7 @@ fn gradle_locked_maven_audit_is_offline_and_does_not_apply_unsafe_fixes() {
         .duration_since(UNIX_EPOCH)
         .unwrap()
         .as_secs();
-    std::fs::write(dir.path().join("cache/audit.json"),json!({"entries":{"Maven::g:transitive::1.0":{"vulnerabilities":[{"id":"GHSA-gradle-test","summary":"test","severity":"High","url":"https://example.com/advisory","fixed_version":"1.1"}],"fetched_at":now,"schema_version":2}}}).to_string()).unwrap();
+    std::fs::write(dir.path().join("cache/audit.json"),json!({"entries":{"Maven::g:transitive::1.0":{"vulnerabilities":[{"id":"GHSA-gradle-test","summary":"test","severity":"High","url":"https://example.com/advisory","fixed_version":"1.1"}],"fetched_at":now,"schema_version":3}}}).to_string()).unwrap();
     let output = Command::new(env!("CARGO_BIN_EXE_upd"))
         .current_dir(dir.path())
         .env("UPD_CACHE_DIR", dir.path().join("cache"))

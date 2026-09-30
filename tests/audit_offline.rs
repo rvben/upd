@@ -46,7 +46,7 @@ fn write_pre_populated_cache(cache_dir: &Path) {
             "PyPI::requests::2.31.0": {
                 "vulnerabilities": [],
                 "fetched_at": now,
-                "schema_version": 2
+                "schema_version": 3
             },
             "PyPI::django::3.2.0": {
                 "vulnerabilities": [
@@ -59,7 +59,7 @@ fn write_pre_populated_cache(cache_dir: &Path) {
                     }
                 ],
                 "fetched_at": now,
-                "schema_version": 2
+                "schema_version": 3
             }
         }
     });
@@ -100,8 +100,8 @@ fn audit_offline_reads_from_cache_and_does_not_contact_osv() {
 
     // The vulnerable django package must be reported.
     assert!(
-        stdout.contains("GHSA-offline-test") || code != 0,
-        "expected vulnerability from cache to be reported or non-zero exit; \
+        stdout.contains("GHSA-offline-test") && !stderr.contains("cache miss"),
+        "expected the vulnerability to be reported from the cache; \
          stdout={stdout:?} stderr={stderr:?} code={code}"
     );
 }

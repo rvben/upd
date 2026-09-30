@@ -13,6 +13,21 @@ fn run_with_env(
 ) -> (String, String, i32) {
     let mut cmd = Command::new(upd_bin());
     cmd.args(args).current_dir(cwd);
+    // `--fix-audit` asks the PyPI, npm and crates.io registries whether a
+    // fix is published. They default to the test's own OSV server, which
+    // answers 404 for anything it has not mounted, so no run reaches a live
+    // registry; a test that mounts releases points them there explicitly.
+    if let Some((_, osv)) = env.iter().find(|(k, _)| *k == "OSV_API_URL") {
+        cmd.env_remove("UV_EXTRA_INDEX_URL")
+            .env_remove("PIP_EXTRA_INDEX_URL");
+        for key in [
+            "UV_INDEX_URL",
+            "NPM_REGISTRY",
+            "CARGO_REGISTRIES_CRATES_IO_INDEX",
+        ] {
+            cmd.env(key, osv);
+        }
+    }
     for (k, v) in env {
         cmd.env(k, v);
     }

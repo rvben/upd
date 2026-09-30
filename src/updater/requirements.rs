@@ -128,6 +128,12 @@ impl RequirementsUpdater {
         (primary_index, extra_indexes)
     }
 
+    /// True when the requirements file names an index of its own
+    /// (`--index-url`/`-i` or `--extra-index-url`).
+    pub fn declares_package_index(content: &str) -> bool {
+        !Self::declared_indexes(content).is_empty()
+    }
+
     /// The indexes a requirements file declares for itself, in lookup order,
     /// following pip: `--index-url` replaces the default index and is consulted
     /// first, `--extra-index-url` entries are added after it. A file that only

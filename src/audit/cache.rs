@@ -17,8 +17,9 @@ const CACHE_TTL_HOURS: u64 = 24;
 
 /// Bump when the entry shape or key normalization changes. Entries written
 /// under another schema version are treated as expired and refetched once -
-/// v2 added Vulnerability aliases/source and PEP 503-normalized PyPI keys.
-const AUDIT_CACHE_SCHEMA_VERSION: u32 = 2;
+/// v2 added Vulnerability aliases/source and PEP 503-normalized PyPI keys;
+/// v3 added the advisory's affected windows, which fix confirmation reads.
+const AUDIT_CACHE_SCHEMA_VERSION: u32 = 3;
 
 /// Composite key that uniquely identifies a package version within an ecosystem.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -175,6 +176,7 @@ mod tests {
             fixed_version: None,
             aliases: Vec::new(),
             source: String::new(),
+            affected: Vec::new(),
         }
     }
 
@@ -327,6 +329,7 @@ mod tests {
                 fixed_version: Some("3.2.1".to_string()),
                 aliases: vec!["CVE-2026-1".to_string()],
                 source: "GHSA".to_string(),
+                affected: Vec::new(),
             }],
         );
 

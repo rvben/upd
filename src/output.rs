@@ -1826,6 +1826,7 @@ mod tests {
                         fixed_version: Some("4.17.21".into()),
                         aliases: Vec::new(),
                         source: String::new(),
+                        affected: Vec::new(),
                     },
                     Vulnerability {
                         id: "CVE-2020-1234".into(),
@@ -1835,6 +1836,7 @@ mod tests {
                         fixed_version: None,
                         aliases: Vec::new(),
                         source: String::new(),
+                        affected: Vec::new(),
                     },
                 ],
             }],
@@ -1895,6 +1897,7 @@ mod tests {
                         fixed_version: Some("2.28.0".into()),
                         aliases: Vec::new(),
                         source: String::new(),
+                        affected: Vec::new(),
                     },
                     Vulnerability {
                         id: "CVE-2023-99999".into(),
@@ -1904,6 +1907,7 @@ mod tests {
                         fixed_version: None,
                         aliases: Vec::new(),
                         source: String::new(),
+                        affected: Vec::new(),
                     },
                 ],
             }],
@@ -1956,6 +1960,7 @@ mod tests {
                         fixed_version: None,
                         aliases: Vec::new(),
                         source: String::new(),
+                        affected: Vec::new(),
                     }],
                 },
                 PackageAuditResult {
@@ -1972,6 +1977,7 @@ mod tests {
                         fixed_version: None,
                         aliases: Vec::new(),
                         source: String::new(),
+                        affected: Vec::new(),
                     }],
                 },
             ],

@@ -990,7 +990,10 @@ impl Registry for PyPiRegistry {
         let data: PyPiResponse = response.json().await?;
         let mut out = Vec::new();
         for (version_str, files) in data.releases.iter() {
-            let all_yanked = !files.is_empty() && files.iter().all(|f| f.yanked);
+            // A release whose files were all yanked or deleted installs
+            // nothing, so it is flagged the way a yanked release is: PyPI
+            // keeps the version key with an empty file list after deletion.
+            let all_yanked = files.iter().all(|f| f.yanked);
             // `releases` deserialises into a HashMap, so file order is
             // non-deterministic. Use the earliest upload timestamp across all
             // files - that's when the version first became fetchable.
@@ -2352,6 +2355,36 @@ mod tests {
 
         let v_1_0 = versions.iter().find(|v| v.version == "1.0.0").unwrap();
         assert!(v_1_0.yanked);
+    }
+
+    #[tokio::test]
+    async fn a_pypi_release_with_no_files_left_is_not_a_candidate() {
+        // PyPI keeps a release's version key after its files are deleted:
+        // requests 2.15.0 lists `[]`, and nothing installs from it.
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/pypi/requests/json"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                r#"{
+              "releases": {
+                "2.15.0": [],
+                "2.15.1": [{"yanked": false, "upload_time_iso_8601": "2017-06-08T10:00:00.000000Z"}]
+              }
+            }"#,
+            ))
+            .mount(&mock_server)
+            .await;
+
+        let registry = PyPiRegistry::with_index_url(mock_server.uri());
+        let versions = registry.list_versions("requests").await.unwrap();
+
+        let emptied = versions.iter().find(|v| v.version == "2.15.0").unwrap();
+        assert!(emptied.yanked, "a release with no files installs nothing");
+        let live = versions.iter().find(|v| v.version == "2.15.1").unwrap();
+        assert!(!live.yanked);
     }
 
     #[tokio::test]

@@ -305,22 +305,23 @@ impl CratesIoRegistry {
 
     /// Detect custom registry URL from environment or config.toml
     pub fn detect_registry_url() -> Option<String> {
-        // Check environment variable first
+        Self::detect_index_url().map(|url| sparse_index_to_api_url(&url))
+    }
+
+    /// The index URL `detect_registry_url` lists crates from, as configured
+    /// (environment first, then config.toml's default registry), before it
+    /// becomes an API URL.
+    pub fn detect_index_url() -> Option<String> {
         if let Ok(url) = std::env::var("CARGO_REGISTRIES_CRATES_IO_INDEX")
             && !url.is_empty()
         {
-            return Some(sparse_index_to_api_url(&url));
+            return Some(url);
         }
 
-        // Check config.toml for default registry
         let config = read_cargo_config();
-        if let Some(default_name) = config.default_registry
-            && let Some(index_url) = config.registries.get(&default_name)
-        {
-            return Some(sparse_index_to_api_url(index_url));
-        }
-
-        None
+        config
+            .default_registry
+            .and_then(|default_name| config.registries.get(&default_name).cloned())
     }
 
     /// Get the registry URL for a named registry from config.toml

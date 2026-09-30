@@ -8,6 +8,7 @@ pub mod uv;
 
 use crate::align::PackageOccurrence;
 use crate::audit::{AuditResult, Ecosystem, Package, manifest_fix_version};
+use crate::lockscan::LockedPackage;
 use crate::lockscan::discover::LockKind;
 use crate::lockscan::provenance::{Owner, Provenance, ProvenanceIndex};
 use crate::normalize::pep503_normalize;
@@ -103,6 +104,30 @@ pub struct FixRouting {
     pub targets: Vec<FixTarget>,
     pub unfixable: Vec<UnfixableTarget>,
 }
+
+/// What a registry says about the release a vulnerable pair's advisories
+/// name as fixed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FixRelease {
+    /// The release a fix moves to: the lowest installable release at or
+    /// above the advisories' bound (stable, unless it is the bound itself)
+    /// that no window of the pair's advisories covers.
+    Release(String),
+    /// No installable release is at or above the bound, so there is nothing
+    /// to move to. RustSec's unmaintained notices carry such a bound: one
+    /// past the last release (`0.4.21-0` for a crate whose last is `0.4.20`).
+    Unpublished,
+    /// Releases exist at or above the bound, but an advisory still covers
+    /// every one of them: a bound on one branch whose release never shipped,
+    /// followed by a branch that is itself affected. `release` is the lowest
+    /// such release and `advisory` one that covers it.
+    StillAffected { release: String, advisory: String },
+}
+
+/// Registry answers keyed like [`ProvenanceIndex`]: (normalized name,
+/// vulnerable version, OSV ecosystem). A pair without an entry is routed to
+/// the bound its advisories name.
+pub type FixReleases = HashMap<(String, String, &'static str), FixRelease>;
 
 /// Accumulator for the per-pair walk. `manifest_edits` and `npm_companions`
 /// are tracked in separate `Vec`s only to keep their producers readable;
@@ -750,10 +775,366 @@ fn compare_versions(a: &str, b: &str) -> Ordering {
     crate::version::compare::compare_versions(a, b)
 }
 
+/// The fix a vulnerable pair's advisories name together.
+enum FixBound<'a> {
+    /// The pair carries no advisory.
+    None,
+    /// This advisory names no fixed version, so no release clears the pair.
+    Missing(&'a str),
+    /// The highest fixed version any advisory names, which clears them all,
+    /// and the advisory naming it.
+    Named { bound: &'a str, advisory: &'a str },
+}
+
+fn fix_bound(vulnerabilities: &[crate::audit::Vulnerability]) -> FixBound<'_> {
+    if let Some(v) = vulnerabilities.iter().find(|v| v.fixed_version.is_none()) {
+        return FixBound::Missing(&v.id);
+    }
+    vulnerabilities
+        .iter()
+        .filter_map(|v| Some((v.fixed_version.as_deref()?, v.id.as_str())))
+        .max_by(|a, b| compare_versions(a.0, b.0))
+        .map_or(FixBound::None, |(bound, advisory)| FixBound::Named {
+            bound,
+            advisory,
+        })
+}
+
+fn no_fix(pkg: &Package, reason: String) -> UnfixableTarget {
+    UnfixableTarget {
+        package: pkg.name.clone(),
+        dependency_key: None,
+        from_version: pkg.version.clone(),
+        to_version: None,
+        method: None,
+        path: None,
+        reason,
+        no_fixed_version: true,
+    }
+}
+
+/// How releases of an ecosystem's packages are compared, for an ecosystem
+/// whose registry lists every release it has published, and whether that
+/// listing's `yanked` flag means a release cannot be installed. npm reports
+/// deprecation there, which leaves a release installable. The Go proxy
+/// listing is capped, so a release missing from it proves nothing.
+fn listed_ecosystem(ecosystem: Ecosystem) -> Option<(Lang, bool)> {
+    match ecosystem {
+        Ecosystem::CratesIo => Some((Lang::Rust, true)),
+        Ecosystem::PyPI => Some((Lang::Python, true)),
+        Ecosystem::Npm => Some((Lang::Node, false)),
+        Ecosystem::Go | Ecosystem::RubyGems | Ecosystem::NuGet | Ecosystem::Maven => None,
+    }
+}
+
+/// The release to move to for `bound`: the lowest installable release at
+/// or above it that none of `vulnerabilities`' windows covers, spelled as
+/// the advisory spells the bound when it is the bound. A release above the
+/// bound must be stable; the bound itself is taken as named.
+fn select_fix_release(
+    versions: &[crate::registry::VersionMeta],
+    bound: &str,
+    vulnerabilities: &[crate::audit::Vulnerability],
+    lang: Lang,
+    honors_yanked: bool,
+) -> FixRelease {
+    let compare = |a: &str, b: &str| crate::align::compare_versions(a, b, lang);
+    let mut candidates: Vec<&str> = versions
+        .iter()
+        .filter(|v| !(honors_yanked && v.yanked))
+        .filter(|v| match compare(&v.version, bound) {
+            Ordering::Equal => true,
+            Ordering::Greater => !v.prerelease,
+            Ordering::Less => false,
+        })
+        .map(|v| v.version.as_str())
+        .collect();
+    candidates.sort_by(|a, b| compare(a, b));
+    let covering = |release: &str| {
+        vulnerabilities
+            .iter()
+            .find(|vuln| vuln.affected.iter().any(|w| w.contains(release, compare)))
+    };
+    let mut lowest_affected = None;
+    for release in candidates {
+        match covering(release) {
+            None if compare(release, bound).is_eq() => {
+                return FixRelease::Release(bound.to_string());
+            }
+            None => return FixRelease::Release(release.to_string()),
+            Some(vuln) => {
+                lowest_affected.get_or_insert_with(|| (release.to_string(), vuln.id.clone()));
+            }
+        }
+    }
+    match lowest_affected {
+        Some((release, advisory)) => FixRelease::StillAffected { release, advisory },
+        None => FixRelease::Unpublished,
+    }
+}
+
+/// A registry upd can list a package's releases from, with the source URL
+/// it lists: an index URL for PyPI and crates.io, the registry URL for npm.
+pub struct ReleaseSource<'r> {
+    pub url: String,
+    pub registry: &'r dyn crate::registry::Registry,
+}
+
+/// Where the ecosystem's tool resolves a package from when nothing
+/// configures otherwise, as a lockfile records it.
+fn public_source(ecosystem: Ecosystem) -> &'static str {
+    match ecosystem {
+        Ecosystem::CratesIo => "registry+https://github.com/rust-lang/crates.io-index",
+        Ecosystem::PyPI => "https://pypi.org/simple",
+        Ecosystem::Npm => "https://registry.npmjs.org",
+        Ecosystem::Go | Ecosystem::RubyGems | Ecosystem::NuGet | Ecosystem::Maven => "",
+    }
+}
+
+/// `url` in one spelling per source, so a lockfile's record and a
+/// configured registry compare equal when they name the same source: no
+/// Cargo `registry+`/`sparse+` prefix, no credentials, no trailing slash,
+/// no PyPI `/simple` suffix, and each public registry's aliases folded
+/// together. Only the scheme and host are case-folded; a path can tell two
+/// repositories on one server apart by case alone.
+fn canonical_source(ecosystem: Ecosystem, url: &str) -> String {
+    let url = url.trim();
+    let url = url
+        .strip_prefix("registry+")
+        .or_else(|| url.strip_prefix("sparse+"))
+        .unwrap_or(url);
+    let url = match url::Url::parse(url) {
+        Ok(mut parsed) => {
+            let _ = parsed.set_username("");
+            let _ = parsed.set_password(None);
+            parsed.to_string()
+        }
+        Err(_) => url.to_string(),
+    };
+    let url = url.trim_end_matches('/');
+    let url = match ecosystem {
+        Ecosystem::PyPI => url.strip_suffix("/simple").unwrap_or(url),
+        _ => url,
+    };
+    match (ecosystem, url) {
+        (Ecosystem::CratesIo, "https://github.com/rust-lang/crates.io-index")
+        | (Ecosystem::CratesIo, "https://index.crates.io") => "crates.io".to_string(),
+        (Ecosystem::PyPI, "https://pypi.org") => "pypi.org".to_string(),
+        _ => url.to_string(),
+    }
+}
+
+/// True when `recorded`, a lockfile's record of where it resolved a
+/// package from, names the source `configured` lists. npm records the
+/// tarball URL, which sits under its registry's URL; the other lockfiles
+/// record the index itself. No record is the ecosystem's public registry.
+fn same_source(ecosystem: Ecosystem, configured: &str, recorded: Option<&str>) -> bool {
+    let recorded = recorded.unwrap_or(public_source(ecosystem));
+    match ecosystem {
+        Ecosystem::Npm => {
+            let registry = canonical_source(ecosystem, configured);
+            let recorded = canonical_source(ecosystem, recorded);
+            recorded == registry || recorded.starts_with(&format!("{registry}/"))
+        }
+        _ => canonical_source(ecosystem, configured) == canonical_source(ecosystem, recorded),
+    }
+}
+
+/// Which of `sources` lists the releases `pkg` actually resolves from, or
+/// why none can be trusted to. A lockfile's record of where it resolved
+/// the pair decides, and every record must name the same configured
+/// source. A pair no lockfile records resolves wherever the environment
+/// says, which only a single configured source answers for, and a Python
+/// pin whose manifest names its own index resolves from that index.
+fn release_source<'s, 'r>(
+    pkg: &Package,
+    locked: &[LockedPackage],
+    packages: &HashMap<(String, Lang), Vec<PackageOccurrence>>,
+    sources: &'s [ReleaseSource<'r>],
+) -> Result<&'s ReleaseSource<'r>, String> {
+    let norm = normalized_name(&pkg.name, pkg.ecosystem);
+    let recorded = locked.iter().filter(|l| {
+        l.ecosystem == pkg.ecosystem
+            && l.version == pkg.version
+            && normalized_name(&l.name, l.ecosystem) == norm
+    });
+    let mut chosen: Option<&ReleaseSource<'r>> = None;
+    for entry in recorded {
+        let index = entry.index.as_deref();
+        let Some(source) = sources
+            .iter()
+            .find(|source| same_source(pkg.ecosystem, &source.url, index))
+        else {
+            return Err(format!(
+                "{} resolves {} from {}, which is not a registry upd is configured to list releases from",
+                crate::path_display::display_path(&entry.lockfile_path),
+                pkg.name,
+                index.unwrap_or(public_source(pkg.ecosystem))
+            ));
+        };
+        if chosen.is_some_and(|c| !std::ptr::eq(c, source)) {
+            return Err(format!(
+                "the lockfiles resolve {} from more than one registry",
+                pkg.name
+            ));
+        }
+        chosen = Some(source);
+    }
+    if let Some(source) = chosen {
+        return Ok(source);
+    }
+    if pkg.ecosystem == Ecosystem::PyPI
+        && let Some(reason) = manifest_index(&norm, pkg.ecosystem, packages)
+    {
+        return Err(reason);
+    }
+    match sources {
+        [source] => Ok(source),
+        _ => Err(format!(
+            "{} may resolve from any of the {} package indexes upd is configured with",
+            pkg.name,
+            sources.len()
+        )),
+    }
+}
+
+/// Why a Python pin no lockfile records may resolve from an index of its
+/// own: a manifest declaring it `norm` names a package index, or cannot be
+/// read to tell.
+fn manifest_index(
+    norm: &str,
+    ecosystem: Ecosystem,
+    packages: &HashMap<(String, Lang), Vec<PackageOccurrence>>,
+) -> Option<String> {
+    matching_occurrences(packages, norm, ecosystem)
+        .into_iter()
+        .find_map(|occ| {
+            let path = crate::path_display::display_path(&occ.file_path);
+            let declares = match occ.file_type {
+                FileType::PyProject => {
+                    crate::updater::PyProjectUpdater::declares_package_index(&occ.file_path)
+                }
+                FileType::Requirements => std::fs::read_to_string(&occ.file_path)
+                    .map(|content| {
+                        crate::updater::RequirementsUpdater::declares_package_index(&content)
+                    })
+                    .map_err(anyhow::Error::from),
+                _ => Ok(false),
+            };
+            match declares {
+                Ok(false) => None,
+                Ok(true) => Some(format!("{path} declares its own package index")),
+                Err(error) => Some(format!("{path} could not be read ({error:#})")),
+            }
+        })
+}
+
+/// Ask each vulnerable pair's registry which release its advisories' fix
+/// is, before routing turns the fix into a write. An advisory's `fixed`
+/// event is a range bound, not a promise that the release exists: a floor
+/// at an unpublished version fails in the package manager and rolls back
+/// every sibling fix sharing its relock. Only ecosystems whose registry
+/// lists every release are asked, each pair only through the one of the
+/// sources `sources_for` gives its ecosystem and name that its lockfile
+/// says it resolves from (see `release_source`). A pair left unasked, or whose lookup fails or lists
+/// no release, gets no entry and is fixed to the bound as named, with a
+/// note saying the bound went unconfirmed. `offline` asks nothing and says
+/// so once.
+pub async fn confirm_fix_releases<'r>(
+    audit: &AuditResult,
+    locked: &[LockedPackage],
+    packages: &HashMap<(String, Lang), Vec<PackageOccurrence>>,
+    offline: bool,
+    sources_for: &dyn Fn(Ecosystem, &str) -> Vec<ReleaseSource<'r>>,
+) -> (FixReleases, Vec<String>) {
+    const UNCONFIRMED: &str =
+        "so its fix is written to the version its advisory names, unconfirmed";
+    let mut releases = FixReleases::new();
+    let mut notes = Vec::new();
+    let mut offline_skipped = false;
+    let mut listings: HashMap<
+        (&'static str, String, String),
+        Option<Vec<crate::registry::VersionMeta>>,
+    > = HashMap::new();
+    for pkg_result in &audit.vulnerable {
+        let pkg = &pkg_result.package;
+        let FixBound::Named { bound, .. } = fix_bound(&pkg_result.vulnerabilities) else {
+            continue;
+        };
+        let Some((lang, honors_yanked)) = listed_ecosystem(pkg.ecosystem) else {
+            continue;
+        };
+        if offline {
+            offline_skipped = true;
+            continue;
+        }
+        let configured = sources_for(pkg.ecosystem, &pkg.name);
+        if configured.is_empty() {
+            continue;
+        }
+        let source = match release_source(pkg, locked, packages, &configured) {
+            Ok(source) => source,
+            Err(reason) => {
+                notes.push(format!("{reason}, {UNCONFIRMED}"));
+                continue;
+            }
+        };
+        let registry = source.registry;
+        let norm = normalized_name(&pkg.name, pkg.ecosystem);
+        let listing_key = (
+            pkg.ecosystem.as_str(),
+            canonical_source(pkg.ecosystem, &source.url),
+            norm.clone(),
+        );
+        if !listings.contains_key(&listing_key) {
+            let listing = match registry.list_versions(&pkg.name).await {
+                Ok(versions) if !versions.is_empty() => Some(versions),
+                Ok(_) => {
+                    notes.push(format!(
+                        "{} lists no release of {}, {UNCONFIRMED}",
+                        registry.name(),
+                        pkg.name
+                    ));
+                    None
+                }
+                Err(error) => {
+                    notes.push(format!(
+                        "could not list the releases of {} ({error:#}), {UNCONFIRMED}",
+                        pkg.name
+                    ));
+                    None
+                }
+            };
+            listings.insert(listing_key.clone(), listing);
+        }
+        if let Some(versions) = &listings[&listing_key] {
+            releases.insert(
+                (norm, pkg.version.clone(), pkg.ecosystem.as_str()),
+                select_fix_release(
+                    versions,
+                    bound,
+                    &pkg_result.vulnerabilities,
+                    lang,
+                    honors_yanked,
+                ),
+            );
+        }
+    }
+    if offline_skipped {
+        notes.push(
+            "--offline asks no registry whether a fix is published, so each fix is written to the version its advisory names, unconfirmed"
+                .to_string(),
+        );
+    }
+    (releases, notes)
+}
+
 /// Route every vulnerable (name, version) pair in `audit` into explicit
 /// manifest-edit and version-floor targets, or into `unfixable` with a
-/// human-readable reason. A pair with no fix at all is unfixable; a
-/// Manifest-covered pair
+/// human-readable reason. A pair with no fix at all is unfixable, and so
+/// is one whose fix `releases` found no published release for; a pair
+/// `releases` confirmed moves to the release it names. A Manifest-covered
+/// pair
 /// gets one edit per occurrence when its manifest declares a single owner
 /// key, or one edit per owner (never a cross product) when it declares
 /// several (see [`route_manifest_covered`]); a LockOnly pair floors by lock
@@ -766,8 +1147,9 @@ pub fn route_fix_targets(
     audit: &AuditResult,
     prov: &ProvenanceIndex,
     packages: &HashMap<(String, Lang), Vec<PackageOccurrence>>,
+    releases: &FixReleases,
 ) -> FixRouting {
-    route_targets(audit, prov, packages, true)
+    route_targets(audit, prov, packages, releases, true)
 }
 
 /// Route explicitly requested version updates. Unlike automatic audit repairs,
@@ -777,13 +1159,14 @@ pub fn route_update_targets(
     prov: &ProvenanceIndex,
     packages: &HashMap<(String, Lang), Vec<PackageOccurrence>>,
 ) -> FixRouting {
-    route_targets(audit, prov, packages, false)
+    route_targets(audit, prov, packages, &FixReleases::new(), false)
 }
 
 fn route_targets(
     audit: &AuditResult,
     prov: &ProvenanceIndex,
     packages: &HashMap<(String, Lang), Vec<PackageOccurrence>>,
+    releases: &FixReleases,
     preserve_npm_compatibility: bool,
 ) -> FixRouting {
     let mut sink = Sink {
@@ -794,36 +1177,47 @@ fn route_targets(
     for pkg_result in &audit.vulnerable {
         let pkg = &pkg_result.package;
 
-        let blocker = pkg_result
-            .vulnerabilities
-            .iter()
-            .find(|v| v.fixed_version.is_none());
-        if let Some(v) = blocker {
-            sink.unfixable.push(UnfixableTarget {
-                package: pkg.name.clone(),
-                dependency_key: None,
-                from_version: pkg.version.clone(),
-                to_version: None,
-                method: None,
-                path: None,
-                reason: format!("{} has no fixed version", v.id),
-                no_fixed_version: true,
-            });
-            continue;
-        }
-
-        let Some(fixed) = pkg_result
-            .vulnerabilities
-            .iter()
-            .filter_map(|v| v.fixed_version.as_deref())
-            .max_by(|a, b| compare_versions(a, b))
-        else {
-            continue;
+        let (bound, advisory) = match fix_bound(&pkg_result.vulnerabilities) {
+            FixBound::Missing(advisory) => {
+                sink.unfixable
+                    .push(no_fix(pkg, format!("{advisory} has no fixed version")));
+                continue;
+            }
+            FixBound::None => continue,
+            FixBound::Named { bound, advisory } => (bound, advisory),
         };
-        let to_version = manifest_fix_version(pkg, fixed);
 
         let norm = normalized_name(&pkg.name, pkg.ecosystem);
         let pair_key = (norm, pkg.version.clone(), pkg.ecosystem.as_str());
+
+        let fixed = match releases.get(&pair_key) {
+            Some(FixRelease::Release(release)) => release.as_str(),
+            Some(FixRelease::Unpublished) => {
+                sink.unfixable.push(no_fix(
+                    pkg,
+                    format!(
+                        "{advisory} names {bound} as fixed, but no release of {} at or above it is published",
+                        pkg.name
+                    ),
+                ));
+                continue;
+            }
+            Some(FixRelease::StillAffected {
+                release,
+                advisory: covering,
+            }) => {
+                sink.unfixable.push(no_fix(
+                    pkg,
+                    format!(
+                        "{advisory} names {bound} as fixed, but every published release of {} at or above it is still affected (the lowest, {release}, by {covering})",
+                        pkg.name
+                    ),
+                ));
+                continue;
+            }
+            None => bound,
+        };
+        let to_version = manifest_fix_version(pkg, fixed);
 
         match prov.map.get(&pair_key) {
             Some(entries) if !entries.is_empty() => {
@@ -954,6 +1348,7 @@ mod tests {
             fixed_version: fixed.map(str::to_string),
             aliases: Vec::new(),
             source: String::new(),
+            affected: Vec::new(),
         }
     }
 
@@ -1087,7 +1482,7 @@ mod tests {
             ],
             vec![("proj/package.json", vec![direct("pkg", "pkg", "^5.0.9")])],
         );
-        let routing = route_fix_targets(&audit, &prov, &HashMap::new());
+        let routing = route_fix_targets(&audit, &prov, &HashMap::new(), &FixReleases::new());
         assert!(routing.targets.is_empty());
         assert_eq!(routing.unfixable.len(), 1);
         assert!(
@@ -1130,7 +1525,7 @@ mod tests {
             ],
             vec![],
         );
-        let routing = route_fix_targets(&audit, &prov, &HashMap::new());
+        let routing = route_fix_targets(&audit, &prov, &HashMap::new(), &FixReleases::new());
         assert!(routing.unfixable.is_empty());
         assert_eq!(routing.targets.len(), 2);
         let mut fixes: Vec<_> = routing
@@ -1155,7 +1550,7 @@ mod tests {
             )],
             vec![],
         );
-        let routing = route_fix_targets(&audit, &prov, &HashMap::new());
+        let routing = route_fix_targets(&audit, &prov, &HashMap::new(), &FixReleases::new());
         assert!(routing.targets.is_empty());
         assert_eq!(routing.unfixable.len(), 1);
         assert!(routing.unfixable[0].reason.contains("parent dependency"));
@@ -1170,7 +1565,7 @@ mod tests {
         let prov = ProvenanceIndex::default();
         let packages = HashMap::new();
 
-        let routing = route_fix_targets(&audit, &prov, &packages);
+        let routing = route_fix_targets(&audit, &prov, &packages, &FixReleases::new());
 
         assert!(routing.targets.is_empty());
         assert_eq!(routing.unfixable.len(), 1);
@@ -1195,7 +1590,7 @@ mod tests {
         );
         let packages = HashMap::new();
 
-        let routing = route_fix_targets(&audit, &prov, &packages);
+        let routing = route_fix_targets(&audit, &prov, &packages, &FixReleases::new());
 
         assert!(routing.unfixable.is_empty());
         assert_eq!(routing.targets.len(), 1);
@@ -1223,7 +1618,7 @@ mod tests {
         );
         let packages = HashMap::new();
 
-        let routing = route_fix_targets(&audit, &prov, &packages);
+        let routing = route_fix_targets(&audit, &prov, &packages, &FixReleases::new());
 
         assert!(routing.targets.is_empty());
         assert_eq!(routing.unfixable.len(), 1);
@@ -1260,7 +1655,7 @@ mod tests {
         );
         let packages = HashMap::new();
 
-        let routing = route_fix_targets(&audit, &prov, &packages);
+        let routing = route_fix_targets(&audit, &prov, &packages, &FixReleases::new());
 
         assert!(routing.unfixable.is_empty());
         assert_eq!(routing.targets.len(), 2);
@@ -1301,7 +1696,7 @@ mod tests {
         );
         let packages = HashMap::new();
 
-        let routing = route_fix_targets(&audit, &prov, &packages);
+        let routing = route_fix_targets(&audit, &prov, &packages, &FixReleases::new());
 
         assert!(routing.unfixable.is_empty());
         assert_eq!(routing.targets.len(), 1);
@@ -1340,7 +1735,7 @@ mod tests {
             )],
         )]);
 
-        let routing = route_fix_targets(&audit, &prov, &packages);
+        let routing = route_fix_targets(&audit, &prov, &packages, &FixReleases::new());
 
         assert!(routing.unfixable.is_empty());
         assert_eq!(routing.targets.len(), 2);
@@ -1382,7 +1777,7 @@ mod tests {
         );
         let packages = HashMap::new();
 
-        let routing = route_fix_targets(&audit, &prov, &packages);
+        let routing = route_fix_targets(&audit, &prov, &packages, &FixReleases::new());
 
         assert!(routing.targets.is_empty());
         assert_eq!(routing.unfixable.len(), 1);
@@ -1415,7 +1810,7 @@ mod tests {
         );
         let packages = HashMap::new();
 
-        let routing = route_fix_targets(&audit, &prov, &packages);
+        let routing = route_fix_targets(&audit, &prov, &packages, &FixReleases::new());
 
         assert!(routing.targets.is_empty());
         assert_eq!(routing.unfixable.len(), 1);
@@ -1458,7 +1853,7 @@ mod tests {
             )],
         )]);
 
-        let routing = route_fix_targets(&audit, &prov, &packages);
+        let routing = route_fix_targets(&audit, &prov, &packages, &FixReleases::new());
 
         assert!(routing.unfixable.is_empty());
         assert_eq!(routing.targets.len(), 1);
@@ -1494,7 +1889,7 @@ mod tests {
             )],
         )]);
 
-        let routing = route_fix_targets(&audit, &prov, &packages);
+        let routing = route_fix_targets(&audit, &prov, &packages, &FixReleases::new());
 
         assert!(routing.targets.is_empty());
         assert_eq!(routing.unfixable.len(), 1);
@@ -1531,7 +1926,7 @@ mod tests {
         );
         let packages = HashMap::new();
 
-        let routing = route_fix_targets(&audit, &prov, &packages);
+        let routing = route_fix_targets(&audit, &prov, &packages, &FixReleases::new());
 
         assert!(routing.unfixable.is_empty());
         assert_eq!(routing.targets.len(), 1);
@@ -1560,7 +1955,7 @@ mod tests {
             )],
         )]);
 
-        let routing = route_fix_targets(&audit, &prov, &packages);
+        let routing = route_fix_targets(&audit, &prov, &packages, &FixReleases::new());
 
         assert!(routing.unfixable.is_empty());
         assert_eq!(routing.targets.len(), 1);
@@ -1615,7 +2010,7 @@ mod tests {
             )],
         )]);
 
-        let routing = route_fix_targets(&audit, &prov, &packages);
+        let routing = route_fix_targets(&audit, &prov, &packages, &FixReleases::new());
 
         assert!(routing.unfixable.is_empty());
         assert_eq!(routing.targets.len(), 2);
@@ -1656,7 +2051,7 @@ mod tests {
         );
         let packages = HashMap::new();
 
-        let routing = route_fix_targets(&audit, &prov, &packages);
+        let routing = route_fix_targets(&audit, &prov, &packages, &FixReleases::new());
 
         assert!(routing.targets.is_empty());
         assert_eq!(routing.unfixable.len(), 1);
@@ -1702,7 +2097,7 @@ mod tests {
             )],
         )]);
 
-        let routing = route_fix_targets(&audit, &prov, &packages);
+        let routing = route_fix_targets(&audit, &prov, &packages, &FixReleases::new());
 
         assert!(routing.unfixable.is_empty());
         assert_eq!(routing.targets.len(), 2);
@@ -1772,7 +2167,7 @@ mod tests {
             ],
         )]);
 
-        let routing = route_fix_targets(&audit, &prov, &packages);
+        let routing = route_fix_targets(&audit, &prov, &packages, &FixReleases::new());
 
         assert!(routing.unfixable.is_empty());
         assert_eq!(
@@ -1848,7 +2243,7 @@ mod tests {
             ],
         )]);
 
-        let routing = route_fix_targets(&audit, &prov, &packages);
+        let routing = route_fix_targets(&audit, &prov, &packages, &FixReleases::new());
 
         assert!(routing.unfixable.is_empty());
         assert_eq!(
@@ -1911,7 +2306,7 @@ mod tests {
             )],
         )]);
 
-        let routing = route_fix_targets(&audit, &prov, &packages);
+        let routing = route_fix_targets(&audit, &prov, &packages, &FixReleases::new());
 
         assert!(routing.unfixable.is_empty());
         assert_eq!(
@@ -1974,7 +2369,7 @@ mod tests {
             )],
         )]);
 
-        let routing = route_fix_targets(&audit, &prov, &packages);
+        let routing = route_fix_targets(&audit, &prov, &packages, &FixReleases::new());
 
         assert!(routing.targets.is_empty());
         assert_eq!(routing.unfixable.len(), 1);
@@ -2062,7 +2457,7 @@ mod tests {
             packages.entry(key).or_default().extend(occurrences);
         }
 
-        let routing = route_fix_targets(&audit, &prov, &packages);
+        let routing = route_fix_targets(&audit, &prov, &packages, &FixReleases::new());
 
         assert_eq!(routing.targets.len(), 1, "{:?}", routing.targets);
         assert_eq!(routing.targets[0].path, PathBuf::from("pyproject.toml"));
@@ -2192,6 +2587,988 @@ mod tests {
             .await;
 
             assert!(result.is_err());
+        }
+    }
+
+    /// Whether an advisory's fix bound is a release the package manager can
+    /// install. The bound is a range edge: RustSec writes one past the last
+    /// release for an unmaintained crate, and a floor at it fails the relock
+    /// it shares with every sibling fix.
+    mod fix_release_confirmation {
+        use super::*;
+        use crate::registry::Registry;
+        use crate::registry::mock::MockRegistry;
+
+        fn cargo_lock_only(name: &str, version: &str) -> ProvenanceIndex {
+            prov_index(
+                vec![(
+                    (name, version, "crates.io"),
+                    vec![lock_only_prov("proj/Cargo.lock", LockKind::Cargo)],
+                )],
+                vec![],
+            )
+        }
+
+        fn crate_release(registry: MockRegistry, name: &str, version: &str) -> MockRegistry {
+            registry.with_version_meta(name, version, None, false, false)
+        }
+
+        async fn confirm(
+            audit: &AuditResult,
+            registry: &MockRegistry,
+            ecosystem: Ecosystem,
+        ) -> (FixReleases, Vec<String>) {
+            confirm_from(audit, registry, ecosystem, &[], &HashMap::new(), false).await
+        }
+
+        async fn confirm_from(
+            audit: &AuditResult,
+            registry: &MockRegistry,
+            ecosystem: Ecosystem,
+            locked: &[LockedPackage],
+            packages: &HashMap<(String, Lang), Vec<PackageOccurrence>>,
+            offline: bool,
+        ) -> (FixReleases, Vec<String>) {
+            confirm_via(
+                audit,
+                &[(public_source(ecosystem), registry)],
+                ecosystem,
+                locked,
+                packages,
+                offline,
+            )
+            .await
+        }
+
+        /// `confirm_fix_releases` with `ecosystem` listed from `sources`,
+        /// each a configured source URL and the registry answering for it.
+        async fn confirm_via(
+            audit: &AuditResult,
+            sources: &[(&str, &MockRegistry)],
+            ecosystem: Ecosystem,
+            locked: &[LockedPackage],
+            packages: &HashMap<(String, Lang), Vec<PackageOccurrence>>,
+            offline: bool,
+        ) -> (FixReleases, Vec<String>) {
+            let sources_for = |asked: Ecosystem, _: &str| -> Vec<ReleaseSource<'_>> {
+                if asked != ecosystem {
+                    return Vec::new();
+                }
+                sources
+                    .iter()
+                    .map(|(url, registry)| ReleaseSource {
+                        url: url.to_string(),
+                        registry: *registry as &dyn Registry,
+                    })
+                    .collect()
+            };
+            confirm_fix_releases(audit, locked, packages, offline, &sources_for).await
+        }
+
+        fn vuln_in(id: &str, fixed: &str, windows: &[(&str, Option<&str>)]) -> Vulnerability {
+            Vulnerability {
+                affected: windows
+                    .iter()
+                    .map(|(introduced, fixed)| crate::audit::AffectedRange {
+                        introduced: introduced.to_string(),
+                        fixed: fixed.map(str::to_string),
+                        last_affected: None,
+                        limit: None,
+                    })
+                    .collect(),
+                ..vuln(id, Some(fixed))
+            }
+        }
+
+        fn locked_at(
+            name: &str,
+            version: &str,
+            lockfile: &str,
+            index: Option<&str>,
+        ) -> LockedPackage {
+            LockedPackage {
+                name: name.to_string(),
+                version: version.to_string(),
+                ecosystem: Ecosystem::PyPI,
+                lockfile_path: PathBuf::from(lockfile),
+                line_number: None,
+                locator: None,
+                index: index.map(str::to_string),
+            }
+        }
+
+        fn release_of(
+            releases: &FixReleases,
+            name: &str,
+            version: &str,
+            eco: &'static str,
+        ) -> Option<FixRelease> {
+            releases
+                .get(&(name.to_string(), version.to_string(), eco))
+                .cloned()
+        }
+
+        #[test]
+        fn an_unpublished_fix_is_unfixable_rather_than_a_write() {
+            let audit = audit_of(vec![vulnerable(
+                pkg("stalecrate", "0.4.20", Ecosystem::CratesIo),
+                vec![vuln("RUSTSEC-2020-0001", Some("0.4.21-0"))],
+            )]);
+            let releases = FixReleases::from([(
+                ("stalecrate".to_string(), "0.4.20".to_string(), "crates.io"),
+                FixRelease::Unpublished,
+            )]);
+
+            let routing = route_fix_targets(
+                &audit,
+                &cargo_lock_only("stalecrate", "0.4.20"),
+                &HashMap::new(),
+                &releases,
+            );
+
+            assert!(routing.targets.is_empty(), "{:?}", routing.targets);
+            assert_eq!(routing.unfixable.len(), 1);
+            let u = &routing.unfixable[0];
+            assert!(
+                u.no_fixed_version,
+                "no release fixes it, like a missing bound"
+            );
+            assert_eq!(u.to_version, None);
+            assert_eq!(
+                u.reason,
+                "RUSTSEC-2020-0001 names 0.4.21-0 as fixed, but no release of stalecrate at or above it is published"
+            );
+        }
+
+        #[test]
+        fn a_confirmed_release_replaces_the_bound_in_the_write() {
+            let audit = audit_of(vec![vulnerable(
+                pkg("examplecrate", "1.0.0", Ecosystem::CratesIo),
+                vec![vuln("RUSTSEC-1", Some("1.2.0-0"))],
+            )]);
+            let releases = FixReleases::from([(
+                ("examplecrate".to_string(), "1.0.0".to_string(), "crates.io"),
+                FixRelease::Release("1.2.1".to_string()),
+            )]);
+
+            let routing = route_fix_targets(
+                &audit,
+                &cargo_lock_only("examplecrate", "1.0.0"),
+                &HashMap::new(),
+                &releases,
+            );
+
+            assert!(routing.unfixable.is_empty(), "{:?}", routing.unfixable);
+            assert_eq!(routing.targets.len(), 1);
+            assert_eq!(routing.targets[0].kind, FixKind::CargoPrecise);
+            assert_eq!(routing.targets[0].to_version, "1.2.1");
+        }
+
+        #[tokio::test]
+        async fn a_bound_past_the_last_release_is_unpublished() {
+            let registry = crate_release(
+                crate_release(MockRegistry::new("crates.io"), "stalecrate", "0.4.19"),
+                "stalecrate",
+                "0.4.20",
+            );
+            let audit = audit_of(vec![vulnerable(
+                pkg("stalecrate", "0.4.20", Ecosystem::CratesIo),
+                vec![vuln("RUSTSEC-2020-0001", Some("0.4.21-0"))],
+            )]);
+
+            let (releases, notes) = confirm(&audit, &registry, Ecosystem::CratesIo).await;
+
+            assert_eq!(
+                release_of(&releases, "stalecrate", "0.4.20", "crates.io"),
+                Some(FixRelease::Unpublished)
+            );
+            assert!(notes.is_empty(), "{notes:?}");
+        }
+
+        #[tokio::test]
+        async fn a_published_bound_is_kept_as_the_advisory_spells_it() {
+            // PEP 440 reads 2.0 and 2.0.0 as one release; the advisory's
+            // spelling is what the fix writes.
+            let registry = MockRegistry::new("PyPI")
+                .with_version_meta("Example_Pkg", "2.0.0", None, false, false)
+                .with_version_meta("Example_Pkg", "2.1.0", None, false, false);
+            let audit = audit_of(vec![vulnerable(
+                pkg("Example_Pkg", "1.0.0", Ecosystem::PyPI),
+                vec![vuln("PYSEC-1", Some("2.0"))],
+            )]);
+
+            let (releases, _) = confirm(&audit, &registry, Ecosystem::PyPI).await;
+
+            assert_eq!(
+                release_of(&releases, "example-pkg", "1.0.0", "PyPI"),
+                Some(FixRelease::Release("2.0".to_string()))
+            );
+        }
+
+        #[tokio::test]
+        async fn an_unpublished_bound_moves_to_the_lowest_installable_stable_release_above_it() {
+            let registry = MockRegistry::new("crates.io")
+                .with_version_meta("examplecrate", "1.1.0", None, false, false)
+                .with_version_meta("examplecrate", "1.2.0-rc.1", None, false, true)
+                .with_version_meta("examplecrate", "1.2.0", None, true, false)
+                .with_version_meta("examplecrate", "1.3.0", None, false, false)
+                .with_version_meta("examplecrate", "1.2.1", None, false, false);
+            let audit = audit_of(vec![vulnerable(
+                pkg("examplecrate", "1.1.0", Ecosystem::CratesIo),
+                vec![vuln("RUSTSEC-1", Some("1.2.0-0"))],
+            )]);
+
+            let (releases, _) = confirm(&audit, &registry, Ecosystem::CratesIo).await;
+
+            assert_eq!(
+                release_of(&releases, "examplecrate", "1.1.0", "crates.io"),
+                Some(FixRelease::Release("1.2.1".to_string())),
+                "skips the prerelease and the yanked 1.2.0, and takes 1.2.1 over 1.3.0"
+            );
+        }
+
+        #[tokio::test]
+        async fn a_yanked_only_successor_leaves_the_crate_unpublished() {
+            let registry = MockRegistry::new("crates.io")
+                .with_version_meta("examplecrate", "1.1.0", None, false, false)
+                .with_version_meta("examplecrate", "1.2.0", None, true, false);
+            let audit = audit_of(vec![vulnerable(
+                pkg("examplecrate", "1.1.0", Ecosystem::CratesIo),
+                vec![vuln("RUSTSEC-1", Some("1.1.1-0"))],
+            )]);
+
+            let (releases, _) = confirm(&audit, &registry, Ecosystem::CratesIo).await;
+
+            assert_eq!(
+                release_of(&releases, "examplecrate", "1.1.0", "crates.io"),
+                Some(FixRelease::Unpublished)
+            );
+        }
+
+        #[tokio::test]
+        async fn a_deprecated_npm_release_still_fixes() {
+            // npm's listing flags deprecation where others flag a yank, and
+            // a deprecated release installs.
+            let registry = MockRegistry::new("npm")
+                .with_version_meta("examplepkg", "1.0.0", None, true, false)
+                .with_version_meta("examplepkg", "1.0.5", None, true, false);
+            let audit = audit_of(vec![vulnerable(
+                pkg("examplepkg", "1.0.0", Ecosystem::Npm),
+                vec![vuln("GHSA-aaaa-bbbb-cccc", Some("1.0.1-0"))],
+            )]);
+
+            let (releases, _) = confirm(&audit, &registry, Ecosystem::Npm).await;
+
+            assert_eq!(
+                release_of(&releases, "examplepkg", "1.0.0", "npm"),
+                Some(FixRelease::Release("1.0.5".to_string()))
+            );
+        }
+
+        #[tokio::test]
+        async fn the_highest_bound_across_advisories_is_the_one_confirmed() {
+            let registry = MockRegistry::new("crates.io")
+                .with_version_meta("examplecrate", "1.0.0", None, false, false)
+                .with_version_meta("examplecrate", "1.1.0", None, false, false);
+            let audit = audit_of(vec![vulnerable(
+                pkg("examplecrate", "1.0.0", Ecosystem::CratesIo),
+                vec![
+                    vuln("RUSTSEC-1", Some("1.1.0")),
+                    vuln("RUSTSEC-2", Some("1.1.1-0")),
+                ],
+            )]);
+
+            let (releases, _) = confirm(&audit, &registry, Ecosystem::CratesIo).await;
+
+            assert_eq!(
+                release_of(&releases, "examplecrate", "1.0.0", "crates.io"),
+                Some(FixRelease::Unpublished),
+                "1.1.0 clears RUSTSEC-1 but not RUSTSEC-2"
+            );
+        }
+
+        #[tokio::test]
+        async fn a_failed_listing_leaves_the_bound_unconfirmed_and_says_so() {
+            let registry = MockRegistry::new("crates.io").with_unavailable_versions("examplecrate");
+            let audit = audit_of(vec![vulnerable(
+                pkg("examplecrate", "1.0.0", Ecosystem::CratesIo),
+                vec![vuln("RUSTSEC-1", Some("1.1.0"))],
+            )]);
+
+            let (releases, notes) = confirm(&audit, &registry, Ecosystem::CratesIo).await;
+
+            assert!(releases.is_empty(), "{releases:?}");
+            assert_eq!(notes.len(), 1, "{notes:?}");
+            assert!(
+                notes[0].starts_with("could not list the releases of examplecrate (")
+                    && notes[0].ends_with("unconfirmed"),
+                "{notes:?}"
+            );
+        }
+
+        #[tokio::test]
+        async fn an_empty_listing_leaves_the_bound_unconfirmed_and_says_so() {
+            // A package the registry lists nothing for was looked up in the
+            // wrong place, not proven to have no fix.
+            let registry = MockRegistry::new("crates.io");
+            let audit = audit_of(vec![vulnerable(
+                pkg("examplecrate", "1.0.0", Ecosystem::CratesIo),
+                vec![vuln("RUSTSEC-1", Some("1.1.0"))],
+            )]);
+
+            let (releases, notes) = confirm(&audit, &registry, Ecosystem::CratesIo).await;
+
+            assert!(releases.is_empty(), "{releases:?}");
+            assert_eq!(
+                notes,
+                vec![
+                    "crates.io lists no release of examplecrate, so its fix is written to the version its advisory names, unconfirmed"
+                        .to_string()
+                ]
+            );
+        }
+
+        #[tokio::test]
+        async fn a_capped_listing_is_never_asked() {
+            // The Go proxy listing stops at the newest releases, so a fix
+            // missing from it is not evidence of anything.
+            let registry = MockRegistry::new("go").with_unavailable_versions("example.com/mod");
+            let audit = audit_of(vec![vulnerable(
+                pkg("example.com/mod", "v1.0.0", Ecosystem::Go),
+                vec![vuln("GO-2026-0001", Some("1.0.1"))],
+            )]);
+
+            let (releases, notes) = confirm(&audit, &registry, Ecosystem::Go).await;
+
+            assert!(releases.is_empty(), "{releases:?}");
+            assert!(
+                notes.is_empty(),
+                "a listing that fails was asked: {notes:?}"
+            );
+        }
+
+        #[tokio::test]
+        async fn a_pair_without_a_fix_is_never_asked() {
+            let registry = MockRegistry::new("crates.io").with_unavailable_versions("examplecrate");
+            let audit = audit_of(vec![vulnerable(
+                pkg("examplecrate", "1.0.0", Ecosystem::CratesIo),
+                vec![vuln("RUSTSEC-1", Some("1.1.0")), vuln("RUSTSEC-2", None)],
+            )]);
+
+            let (releases, notes) = confirm(&audit, &registry, Ecosystem::CratesIo).await;
+
+            assert!(releases.is_empty(), "{releases:?}");
+            assert!(
+                notes.is_empty(),
+                "a listing that fails was asked: {notes:?}"
+            );
+        }
+        #[tokio::test]
+        async fn a_successor_inside_another_affected_branch_is_passed_over() {
+            // 1.2.5 never shipped, and the 1.3 branch the advisory also
+            // covers is still affected until 1.3.2.
+            let registry = MockRegistry::new("crates.io")
+                .with_version_meta("examplecrate", "1.2.4", None, false, false)
+                .with_version_meta("examplecrate", "1.3.0", None, false, false)
+                .with_version_meta("examplecrate", "1.3.1", None, false, false)
+                .with_version_meta("examplecrate", "1.3.2", None, false, false);
+            let audit = audit_of(vec![vulnerable(
+                pkg("examplecrate", "1.2.4", Ecosystem::CratesIo),
+                vec![vuln_in(
+                    "RUSTSEC-1",
+                    "1.2.5",
+                    &[("0", Some("1.2.5")), ("1.3.0", Some("1.3.2"))],
+                )],
+            )]);
+
+            let (releases, _) = confirm(&audit, &registry, Ecosystem::CratesIo).await;
+
+            assert_eq!(
+                release_of(&releases, "examplecrate", "1.2.4", "crates.io"),
+                Some(FixRelease::Release("1.3.2".to_string()))
+            );
+        }
+
+        #[tokio::test]
+        async fn a_release_another_advisory_covers_is_passed_over() {
+            let registry = MockRegistry::new("crates.io")
+                .with_version_meta("examplecrate", "1.0.0", None, false, false)
+                .with_version_meta("examplecrate", "1.1.0", None, false, false)
+                .with_version_meta("examplecrate", "1.1.1", None, false, false);
+            let audit = audit_of(vec![vulnerable(
+                pkg("examplecrate", "1.0.0", Ecosystem::CratesIo),
+                vec![
+                    vuln_in("RUSTSEC-1", "1.1.0", &[("0", Some("1.1.0"))]),
+                    vuln_in(
+                        "RUSTSEC-2",
+                        "1.0.1",
+                        &[("0", Some("1.0.1")), ("1.1.0", Some("1.1.1"))],
+                    ),
+                ],
+            )]);
+
+            let (releases, _) = confirm(&audit, &registry, Ecosystem::CratesIo).await;
+
+            assert_eq!(
+                release_of(&releases, "examplecrate", "1.0.0", "crates.io"),
+                Some(FixRelease::Release("1.1.1".to_string())),
+                "the published bound 1.1.0 is inside RUSTSEC-2's second window"
+            );
+        }
+
+        #[tokio::test]
+        async fn every_release_still_affected_names_the_lowest_and_its_advisory() {
+            let registry = MockRegistry::new("crates.io")
+                .with_version_meta("examplecrate", "1.2.4", None, false, false)
+                .with_version_meta("examplecrate", "1.4.0", None, false, false)
+                .with_version_meta("examplecrate", "1.3.0", None, false, false);
+            let audit = audit_of(vec![vulnerable(
+                pkg("examplecrate", "1.2.4", Ecosystem::CratesIo),
+                vec![vuln_in(
+                    "RUSTSEC-1",
+                    "1.2.5",
+                    &[("0", Some("1.2.5")), ("1.3.0", None)],
+                )],
+            )]);
+
+            let (releases, _) = confirm(&audit, &registry, Ecosystem::CratesIo).await;
+
+            assert_eq!(
+                release_of(&releases, "examplecrate", "1.2.4", "crates.io"),
+                Some(FixRelease::StillAffected {
+                    release: "1.3.0".to_string(),
+                    advisory: "RUSTSEC-1".to_string(),
+                })
+            );
+        }
+
+        #[test]
+        fn a_fix_every_release_is_still_affected_by_is_unfixable_and_says_why() {
+            let audit = audit_of(vec![vulnerable(
+                pkg("examplecrate", "1.2.4", Ecosystem::CratesIo),
+                vec![vuln("RUSTSEC-1", Some("1.2.5"))],
+            )]);
+            let releases = FixReleases::from([(
+                ("examplecrate".to_string(), "1.2.4".to_string(), "crates.io"),
+                FixRelease::StillAffected {
+                    release: "1.3.0".to_string(),
+                    advisory: "RUSTSEC-1".to_string(),
+                },
+            )]);
+
+            let routing = route_fix_targets(
+                &audit,
+                &cargo_lock_only("examplecrate", "1.2.4"),
+                &HashMap::new(),
+                &releases,
+            );
+
+            assert!(routing.targets.is_empty(), "{:?}", routing.targets);
+            assert_eq!(routing.unfixable.len(), 1);
+            assert!(routing.unfixable[0].no_fixed_version);
+            assert_eq!(
+                routing.unfixable[0].reason,
+                "RUSTSEC-1 names 1.2.5 as fixed, but every published release of examplecrate at or above it is still affected (the lowest, 1.3.0, by RUSTSEC-1)"
+            );
+        }
+
+        #[tokio::test]
+        async fn a_yanked_bound_moves_to_the_next_installable_release() {
+            let registry = MockRegistry::new("crates.io")
+                .with_version_meta("examplecrate", "1.0.0", None, false, false)
+                .with_version_meta("examplecrate", "1.1.0", None, true, false)
+                .with_version_meta("examplecrate", "1.1.1", None, false, false);
+            let audit = audit_of(vec![vulnerable(
+                pkg("examplecrate", "1.0.0", Ecosystem::CratesIo),
+                vec![vuln("RUSTSEC-1", Some("1.1.0"))],
+            )]);
+
+            let (releases, _) = confirm(&audit, &registry, Ecosystem::CratesIo).await;
+
+            assert_eq!(
+                release_of(&releases, "examplecrate", "1.0.0", "crates.io"),
+                Some(FixRelease::Release("1.1.1".to_string()))
+            );
+        }
+
+        #[tokio::test]
+        async fn offline_asks_no_registry_and_says_so_once() {
+            let registry = MockRegistry::new("PyPI")
+                .with_unavailable_versions("firstpkg")
+                .with_unavailable_versions("secondpkg");
+            let audit = audit_of(vec![
+                vulnerable(
+                    pkg("firstpkg", "1.0.0", Ecosystem::PyPI),
+                    vec![vuln("PYSEC-1", Some("1.1.0"))],
+                ),
+                vulnerable(
+                    pkg("secondpkg", "1.0.0", Ecosystem::PyPI),
+                    vec![vuln("PYSEC-2", Some("1.1.0"))],
+                ),
+            ]);
+
+            let (releases, notes) = confirm_from(
+                &audit,
+                &registry,
+                Ecosystem::PyPI,
+                &[],
+                &HashMap::new(),
+                true,
+            )
+            .await;
+
+            assert!(releases.is_empty(), "{releases:?}");
+            assert_eq!(
+                notes,
+                vec![
+                    "--offline asks no registry whether a fix is published, so each fix is written to the version its advisory names, unconfirmed"
+                        .to_string()
+                ],
+                "a failing listing would add its own note if it were asked"
+            );
+        }
+
+        #[tokio::test]
+        async fn a_pair_locked_from_another_index_is_never_asked() {
+            let registry = MockRegistry::new("PyPI").with_unavailable_versions("examplepkg");
+            let audit = audit_of(vec![vulnerable(
+                pkg("examplepkg", "1.0.0", Ecosystem::PyPI),
+                vec![vuln("PYSEC-1", Some("1.1.0"))],
+            )]);
+            let locked = [
+                locked_at(
+                    "examplepkg",
+                    "1.0.0",
+                    "a/uv.lock",
+                    Some("https://pypi.org/simple"),
+                ),
+                locked_at(
+                    "examplepkg",
+                    "1.0.0",
+                    "b/uv.lock",
+                    Some("https://packages.example.test/simple"),
+                ),
+            ];
+
+            let (releases, notes) = confirm_from(
+                &audit,
+                &registry,
+                Ecosystem::PyPI,
+                &locked,
+                &HashMap::new(),
+                false,
+            )
+            .await;
+
+            assert!(releases.is_empty(), "{releases:?}");
+            assert_eq!(
+                notes,
+                vec![format!(
+                    "{} resolves examplepkg from https://packages.example.test/simple, which is not a registry upd is configured to list releases from, so its fix is written to the version its advisory names, unconfirmed",
+                    crate::path_display::display_path(Path::new("b/uv.lock"))
+                )]
+            );
+        }
+
+        #[tokio::test]
+        async fn a_pair_locked_from_the_public_registry_is_asked() {
+            let registry = MockRegistry::new("PyPI")
+                .with_version_meta("examplepkg", "1.0.0", None, false, false)
+                .with_version_meta("examplepkg", "1.1.0", None, false, false);
+            let audit = audit_of(vec![vulnerable(
+                pkg("examplepkg", "1.0.0", Ecosystem::PyPI),
+                vec![vuln("PYSEC-1", Some("1.1.0"))],
+            )]);
+            let locked = [
+                locked_at(
+                    "examplepkg",
+                    "1.0.0",
+                    "a/uv.lock",
+                    Some("https://pypi.org/simple/"),
+                ),
+                locked_at("examplepkg", "1.0.0", "b/poetry.lock", None),
+            ];
+
+            let (releases, notes) = confirm_from(
+                &audit,
+                &registry,
+                Ecosystem::PyPI,
+                &locked,
+                &HashMap::new(),
+                false,
+            )
+            .await;
+
+            assert_eq!(
+                release_of(&releases, "examplepkg", "1.0.0", "PyPI"),
+                Some(FixRelease::Release("1.1.0".to_string()))
+            );
+            assert!(notes.is_empty(), "{notes:?}");
+        }
+
+        #[tokio::test]
+        async fn each_pair_is_asked_through_the_source_its_lockfile_records() {
+            let private = MockRegistry::new("PyPI").with_version_meta(
+                "examplepkg",
+                "1.0.0",
+                None,
+                false,
+                false,
+            );
+            let public = MockRegistry::new("PyPI")
+                .with_version_meta("examplepkg", "1.0.0", None, false, false)
+                .with_version_meta("examplepkg", "1.1.0", None, false, false)
+                .with_version_meta("examplepkg", "2.0.0", None, false, false)
+                .with_version_meta("examplepkg", "2.1.0", None, false, false);
+            let audit = audit_of(vec![
+                vulnerable(
+                    pkg("examplepkg", "1.0.0", Ecosystem::PyPI),
+                    vec![vuln("PYSEC-1", Some("1.1.0"))],
+                ),
+                vulnerable(
+                    pkg("examplepkg", "2.0.0", Ecosystem::PyPI),
+                    vec![vuln("PYSEC-2", Some("2.1.0"))],
+                ),
+            ]);
+            let locked = [
+                locked_at(
+                    "examplepkg",
+                    "1.0.0",
+                    "a/uv.lock",
+                    Some("https://packages.example.test/simple/"),
+                ),
+                locked_at(
+                    "examplepkg",
+                    "2.0.0",
+                    "b/uv.lock",
+                    Some("https://pypi.org/simple"),
+                ),
+            ];
+
+            let (releases, notes) = confirm_via(
+                &audit,
+                &[
+                    ("https://pypi.org", &public),
+                    ("https://packages.example.test/simple", &private),
+                ],
+                Ecosystem::PyPI,
+                &locked,
+                &HashMap::new(),
+                false,
+            )
+            .await;
+
+            assert_eq!(
+                release_of(&releases, "examplepkg", "1.0.0", "PyPI"),
+                Some(FixRelease::Unpublished),
+                "the private index lists no 1.1.0"
+            );
+            assert_eq!(
+                release_of(&releases, "examplepkg", "2.0.0", "PyPI"),
+                Some(FixRelease::Release("2.1.0".to_string())),
+                "the same name from another source is listed on its own"
+            );
+            assert!(notes.is_empty(), "{notes:?}");
+        }
+
+        #[tokio::test]
+        async fn a_pair_its_lockfiles_record_from_two_sources_is_never_asked() {
+            let public = MockRegistry::new("PyPI").with_unavailable_versions("examplepkg");
+            let private = MockRegistry::new("PyPI").with_unavailable_versions("examplepkg");
+            let audit = audit_of(vec![vulnerable(
+                pkg("examplepkg", "1.0.0", Ecosystem::PyPI),
+                vec![vuln("PYSEC-1", Some("1.1.0"))],
+            )]);
+            let locked = [
+                locked_at("examplepkg", "1.0.0", "a/uv.lock", None),
+                locked_at(
+                    "examplepkg",
+                    "1.0.0",
+                    "b/uv.lock",
+                    Some("https://packages.example.test/simple"),
+                ),
+            ];
+
+            let (releases, notes) = confirm_via(
+                &audit,
+                &[
+                    ("https://pypi.org", &public),
+                    ("https://packages.example.test/simple", &private),
+                ],
+                Ecosystem::PyPI,
+                &locked,
+                &HashMap::new(),
+                false,
+            )
+            .await;
+
+            assert!(releases.is_empty(), "{releases:?}");
+            assert_eq!(
+                notes,
+                vec![
+                    "the lockfiles resolve examplepkg from more than one registry, so its fix is written to the version its advisory names, unconfirmed"
+                        .to_string()
+                ]
+            );
+        }
+
+        #[tokio::test]
+        async fn an_unlocked_pin_with_several_configured_indexes_is_never_asked() {
+            let public = MockRegistry::new("PyPI").with_unavailable_versions("examplepkg");
+            let private = MockRegistry::new("PyPI").with_unavailable_versions("examplepkg");
+            let audit = audit_of(vec![vulnerable(
+                pkg("examplepkg", "1.0.0", Ecosystem::PyPI),
+                vec![vuln("PYSEC-1", Some("1.1.0"))],
+            )]);
+
+            let (releases, notes) = confirm_via(
+                &audit,
+                &[
+                    ("https://pypi.org", &public),
+                    ("https://packages.example.test/simple", &private),
+                ],
+                Ecosystem::PyPI,
+                &[],
+                &HashMap::new(),
+                false,
+            )
+            .await;
+
+            assert!(releases.is_empty(), "{releases:?}");
+            assert_eq!(
+                notes,
+                vec![
+                    "examplepkg may resolve from any of the 2 package indexes upd is configured with, so its fix is written to the version its advisory names, unconfirmed"
+                        .to_string()
+                ]
+            );
+        }
+
+        #[test]
+        fn a_recorded_source_matches_the_configured_source_it_names() {
+            let cases: &[(Ecosystem, &str, Option<&str>, bool)] = &[
+                (
+                    Ecosystem::CratesIo,
+                    "registry+https://github.com/rust-lang/crates.io-index",
+                    Some("sparse+https://index.crates.io/"),
+                    true,
+                ),
+                (
+                    Ecosystem::CratesIo,
+                    "sparse+https://index.crates.io/",
+                    None,
+                    true,
+                ),
+                (
+                    Ecosystem::CratesIo,
+                    "sparse+https://crates.example.test/index/",
+                    Some("registry+https://github.com/rust-lang/crates.io-index"),
+                    false,
+                ),
+                (
+                    Ecosystem::CratesIo,
+                    "sparse+https://crates.example.test/index/",
+                    Some("sparse+https://crates.example.test/index/"),
+                    true,
+                ),
+                (
+                    Ecosystem::PyPI,
+                    "https://pypi.org",
+                    Some("https://PyPI.org/simple/"),
+                    true,
+                ),
+                (Ecosystem::PyPI, "https://pypi.org", None, true),
+                (
+                    Ecosystem::PyPI,
+                    "https://packages.example.test/simple",
+                    None,
+                    false,
+                ),
+                (
+                    Ecosystem::PyPI,
+                    "https://packages.example.test/simple",
+                    Some("https://pypi.org/simple"),
+                    false,
+                ),
+                (
+                    Ecosystem::PyPI,
+                    "https://user:secret@packages.example.test/simple",
+                    Some("https://packages.example.test/simple"),
+                    true,
+                ),
+                (
+                    Ecosystem::PyPI,
+                    "https://Packages.Example.test/repo/simple",
+                    Some("https://packages.example.test/repo/simple/"),
+                    true,
+                ),
+                (
+                    Ecosystem::PyPI,
+                    "https://packages.example.test/Repo/simple",
+                    Some("https://packages.example.test/repo/simple"),
+                    false,
+                ),
+                (
+                    Ecosystem::CratesIo,
+                    "sparse+https://crates.example.test/Team/index/",
+                    Some("sparse+https://crates.example.test/team/index/"),
+                    false,
+                ),
+                (
+                    Ecosystem::Npm,
+                    "https://user:token@npm.example.test/remote",
+                    Some("https://npm.example.test/remote/x/-/x-1.0.0.tgz"),
+                    true,
+                ),
+                (
+                    Ecosystem::Npm,
+                    "https://npm.example.test/Remote",
+                    Some("https://npm.example.test/remote/x/-/x-1.0.0.tgz"),
+                    false,
+                ),
+                (
+                    Ecosystem::Npm,
+                    "https://registry.npmjs.org/",
+                    Some("https://registry.npmjs.org/left-pad/-/left-pad-1.0.0.tgz"),
+                    true,
+                ),
+                (Ecosystem::Npm, "https://registry.npmjs.org", None, true),
+                (
+                    Ecosystem::Npm,
+                    "https://npm.example.test/api/npm/remote",
+                    Some("https://registry.npmjs.org/left-pad/-/left-pad-1.0.0.tgz"),
+                    false,
+                ),
+                (
+                    Ecosystem::Npm,
+                    "https://npm.example.test/api/npm/remote/",
+                    Some("https://npm.example.test/api/npm/remote/left-pad/-/left-pad-1.0.0.tgz"),
+                    true,
+                ),
+                (
+                    Ecosystem::Npm,
+                    "https://npm.example.test/api/npm/remote",
+                    Some("https://npm.example.test/api/npm/remote-other/x/-/x-1.0.0.tgz"),
+                    false,
+                ),
+            ];
+            for (ecosystem, configured, recorded, expected) in cases {
+                assert_eq!(
+                    same_source(*ecosystem, configured, *recorded),
+                    *expected,
+                    "{ecosystem:?} configured {configured} recorded {recorded:?}"
+                );
+            }
+        }
+
+        #[tokio::test]
+        async fn an_unlocked_pin_whose_manifest_names_an_index_is_never_asked() {
+            let dir = tempfile::tempdir().unwrap();
+            let requirements = dir.path().join("requirements.txt");
+            std::fs::write(
+                &requirements,
+                "--extra-index-url https://packages.example.test/simple\nexamplepkg==1.0.0\n",
+            )
+            .unwrap();
+            let project = dir.path().join("svc");
+            std::fs::create_dir(&project).unwrap();
+            let pyproject = project.join("pyproject.toml");
+            std::fs::write(
+                &pyproject,
+                "[project]\nname = \"svc\"\nversion = \"0.1.0\"\ndependencies = [\"otherpkg==2.0.0\"]\n\n[[tool.uv.index]]\nname = \"internal\"\nurl = \"https://packages.example.test/simple\"\n",
+            )
+            .unwrap();
+            let registry = MockRegistry::new("PyPI")
+                .with_unavailable_versions("examplepkg")
+                .with_unavailable_versions("otherpkg");
+            let audit = audit_of(vec![
+                vulnerable(
+                    pkg("examplepkg", "1.0.0", Ecosystem::PyPI),
+                    vec![vuln("PYSEC-1", Some("1.1.0"))],
+                ),
+                vulnerable(
+                    pkg("otherpkg", "2.0.0", Ecosystem::PyPI),
+                    vec![vuln("PYSEC-2", Some("2.1.0"))],
+                ),
+            ]);
+            let mut packages = HashMap::new();
+            packages.insert(
+                ("examplepkg".to_string(), Lang::Python),
+                vec![PackageOccurrence {
+                    file_path: requirements.clone(),
+                    ..occ(
+                        "",
+                        FileType::Requirements,
+                        "1.0.0",
+                        None,
+                        "examplepkg",
+                        true,
+                    )
+                }],
+            );
+            packages.insert(
+                ("otherpkg".to_string(), Lang::Python),
+                vec![PackageOccurrence {
+                    file_path: pyproject.clone(),
+                    ..occ("", FileType::PyProject, "2.0.0", None, "otherpkg", true)
+                }],
+            );
+
+            let (releases, mut notes) =
+                confirm_from(&audit, &registry, Ecosystem::PyPI, &[], &packages, false).await;
+            notes.sort();
+
+            assert!(releases.is_empty(), "{releases:?}");
+            let mut expected = vec![
+                format!(
+                    "{} declares its own package index, so its fix is written to the version its advisory names, unconfirmed",
+                    crate::path_display::display_path(&requirements)
+                ),
+                format!(
+                    "{} declares its own package index, so its fix is written to the version its advisory names, unconfirmed",
+                    crate::path_display::display_path(&pyproject)
+                ),
+            ];
+            expected.sort();
+            assert_eq!(notes, expected);
+        }
+
+        #[tokio::test]
+        async fn an_unlocked_pin_whose_manifest_names_no_index_is_asked() {
+            let dir = tempfile::tempdir().unwrap();
+            let requirements = dir.path().join("requirements.txt");
+            std::fs::write(&requirements, "examplepkg==1.0.0\n").unwrap();
+            let registry = MockRegistry::new("PyPI")
+                .with_version_meta("examplepkg", "1.0.0", None, false, false)
+                .with_version_meta("examplepkg", "1.1.0", None, false, false);
+            let audit = audit_of(vec![vulnerable(
+                pkg("examplepkg", "1.0.0", Ecosystem::PyPI),
+                vec![vuln("PYSEC-1", Some("1.1.0"))],
+            )]);
+            let mut packages = HashMap::new();
+            packages.insert(
+                ("examplepkg".to_string(), Lang::Python),
+                vec![PackageOccurrence {
+                    file_path: requirements,
+                    ..occ(
+                        "",
+                        FileType::Requirements,
+                        "1.0.0",
+                        None,
+                        "examplepkg",
+                        true,
+                    )
+                }],
+            );
+
+            let (releases, notes) =
+                confirm_from(&audit, &registry, Ecosystem::PyPI, &[], &packages, false).await;
+
+            assert_eq!(
+                release_of(&releases, "examplepkg", "1.0.0", "PyPI"),
+                Some(FixRelease::Release("1.1.0".to_string()))
+            );
+            assert!(notes.is_empty(), "{notes:?}");
         }
     }
 }

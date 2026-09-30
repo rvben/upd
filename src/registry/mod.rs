@@ -251,7 +251,9 @@ pub fn http_error_message(
 ///
 /// `published_at` is `None` when the registry did not expose a timestamp for
 /// this version; the cooldown layer treats that as a signal to report the
-/// ecosystem as unsupported.
+/// ecosystem as unsupported. `yanked` marks a version that is not a
+/// candidate to move to: yanked, a PyPI release with no installable files
+/// left, or an npm release its maintainers deprecated.
 #[derive(Debug, Clone)]
 pub struct VersionMeta {
     pub version: String,

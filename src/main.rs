@@ -2042,26 +2042,7 @@ async fn run_update(cli: &Cli) -> Result<()> {
     let cache_enabled = !cli.no_cache;
 
     // Create PyPI registry with optional credentials and extra index URLs
-    let pypi_registry = {
-        let index_url =
-            PyPiRegistry::detect_index_url().unwrap_or_else(|| "https://pypi.org".to_string());
-        let credentials = PyPiRegistry::detect_credentials(&index_url);
-        if cli.verbose && credentials.is_some() {
-            eprintln!("{}", "Using authenticated PyPI access".cyan());
-        }
-        let primary = PyPiRegistry::with_index_url_and_credentials(index_url, credentials);
-
-        // Check for extra index URLs (UV_EXTRA_INDEX_URL, PIP_EXTRA_INDEX_URL)
-        let extra_urls = PyPiRegistry::detect_extra_index_urls();
-        if cli.verbose && !extra_urls.is_empty() {
-            eprintln!(
-                "{}",
-                format!("Using {} extra PyPI index(es)", extra_urls.len()).cyan()
-            );
-        }
-
-        MultiPyPiRegistry::from_primary_and_extras(primary, extra_urls)
-    };
+    let pypi_registry = pypi_registry(cli.verbose);
 
     let pypi_cache_namespace = pypi_registry.cache_namespace();
     let pypi = CachedRegistry::with_namespace(
@@ -2072,29 +2053,13 @@ async fn run_update(cli: &Cli) -> Result<()> {
     );
 
     // Create npm registry with optional credentials
-    let npm_registry = {
-        let registry_url = NpmRegistry::detect_registry_url()
-            .unwrap_or_else(|| "https://registry.npmjs.org".to_string());
-        let credentials = NpmRegistry::detect_credentials(&registry_url);
-        if cli.verbose && credentials.is_some() {
-            eprintln!("{}", "Using authenticated npm access".cyan());
-        }
-        NpmRegistry::with_registry_url_and_credentials(registry_url, credentials)
-    };
+    let npm_registry = npm_registry(cli.verbose);
 
     let npm = CachedRegistry::new(npm_registry, Arc::clone(&cache), cache_enabled);
 
     // Create Cargo registry with optional credentials
-    let crates_io_registry = {
-        let registry_url = CratesIoRegistry::detect_registry_url()
-            .unwrap_or_else(|| "https://crates.io/api/v1/crates".to_string());
-        let credentials = CratesIoRegistry::detect_credentials("crates-io");
-        let has_cargo_files = files.iter().any(|(_, ft)| *ft == FileType::CargoToml);
-        if cli.verbose && credentials.is_some() && has_cargo_files {
-            eprintln!("{}", "Using authenticated crates.io access".cyan());
-        }
-        CratesIoRegistry::with_registry_url_and_credentials(registry_url, credentials)
-    };
+    let crates_io_registry =
+        crates_io_registry(cli.verbose && files.iter().any(|(_, ft)| *ft == FileType::CargoToml));
 
     let crates_io = CachedRegistry::new(crates_io_registry, Arc::clone(&cache), cache_enabled);
 
@@ -2764,6 +2729,7 @@ async fn run_update(cli: &Cli) -> Result<()> {
                                     fixed_version: Some(candidate),
                                     aliases: Vec::new(),
                                     source: String::new(),
+                                    affected: Vec::new(),
                                 }],
                             });
                     }
@@ -2907,6 +2873,7 @@ async fn run_update(cli: &Cli) -> Result<()> {
                         fixed_version: Some(candidate.clone()),
                         aliases: Vec::new(),
                         source: String::new(),
+                        affected: Vec::new(),
                     }],
                 }],
                 safe_count: 0,
@@ -4604,6 +4571,54 @@ pub(crate) fn build_audit_packages(
     audit_packages
 }
 
+/// The PyPI registry the configured index and any extra indexes
+/// (UV_EXTRA_INDEX_URL, PIP_EXTRA_INDEX_URL) answer for, with the
+/// credentials configured for the index. `announce` says whether
+/// authenticated access and extra indexes are worth a verbose line.
+fn pypi_registry(announce: bool) -> MultiPyPiRegistry {
+    let index_url =
+        PyPiRegistry::detect_index_url().unwrap_or_else(|| "https://pypi.org".to_string());
+    let credentials = PyPiRegistry::detect_credentials(&index_url);
+    if announce && credentials.is_some() {
+        eprintln!("{}", "Using authenticated PyPI access".cyan());
+    }
+    let primary = PyPiRegistry::with_index_url_and_credentials(index_url, credentials);
+
+    let extra_urls = PyPiRegistry::detect_extra_index_urls();
+    if announce && !extra_urls.is_empty() {
+        eprintln!(
+            "{}",
+            format!("Using {} extra PyPI index(es)", extra_urls.len()).cyan()
+        );
+    }
+
+    MultiPyPiRegistry::from_primary_and_extras(primary, extra_urls)
+}
+
+/// The npm registry configured for this directory, with its credentials.
+/// `announce` says whether authenticated access is worth a verbose line.
+fn npm_registry(announce: bool) -> NpmRegistry {
+    let registry_url = NpmRegistry::detect_registry_url()
+        .unwrap_or_else(|| "https://registry.npmjs.org".to_string());
+    let credentials = NpmRegistry::detect_credentials(&registry_url);
+    if announce && credentials.is_some() {
+        eprintln!("{}", "Using authenticated npm access".cyan());
+    }
+    NpmRegistry::with_registry_url_and_credentials(registry_url, credentials)
+}
+
+/// The Cargo registry configured for crates-io, with its credentials.
+/// `announce` says whether authenticated access is worth a verbose line.
+fn crates_io_registry(announce: bool) -> CratesIoRegistry {
+    let registry_url = CratesIoRegistry::detect_registry_url()
+        .unwrap_or_else(|| "https://crates.io/api/v1/crates".to_string());
+    let credentials = CratesIoRegistry::detect_credentials("crates-io");
+    if announce && credentials.is_some() {
+        eprintln!("{}", "Using authenticated crates.io access".cyan());
+    }
+    CratesIoRegistry::with_registry_url_and_credentials(registry_url, credentials)
+}
+
 async fn run_audit(cli: &Cli) -> Result<()> {
     let no_fail = matches!(&cli.command, Some(Command::Audit { no_fail, .. }) if *no_fail);
     let fix_audit = matches!(&cli.command, Some(Command::Audit { fix_audit, .. }) if *fix_audit);
@@ -4849,7 +4864,67 @@ async fn run_audit(cli: &Cli) -> Result<()> {
     if fix_audit {
         let prov =
             upd::lockscan::provenance::classify(&lock_scan.locks, &lock_scan.packages, &packages);
-        let routing = route_fix_targets(&audit_result, &prov, &packages);
+        // Every vulnerable pair's fix is confirmed as a published release
+        // before it is routed, so a bound no release sits at is reported as
+        // having no fix rather than failing its relock. `--offline` builds
+        // no registry client, as it contacts no network. Only an ecosystem
+        // with a vulnerable pair is asked, so only its access is announced.
+        let asks = |ecosystem: Ecosystem| {
+            cli.verbose
+                && audit_result
+                    .vulnerable
+                    .iter()
+                    .any(|v| v.package.ecosystem == ecosystem)
+        };
+        let registries = (!offline).then(|| {
+            (
+                pypi_registry(asks(Ecosystem::PyPI)),
+                npm_registry(asks(Ecosystem::Npm)),
+                crates_io_registry(asks(Ecosystem::CratesIo)),
+                CratesIoRegistry::detect_index_url().unwrap_or_else(|| {
+                    "registry+https://github.com/rust-lang/crates.io-index".to_string()
+                }),
+            )
+        });
+        let sources_for = |ecosystem: Ecosystem, name: &str| -> Vec<upd::fix::ReleaseSource<'_>> {
+            let Some((pypi, npm, crates_io, crates_io_index)) = registries.as_ref() else {
+                return Vec::new();
+            };
+            match ecosystem {
+                Ecosystem::PyPI => pypi
+                    .registries()
+                    .iter()
+                    .map(|index| upd::fix::ReleaseSource {
+                        url: index.index_url().to_string(),
+                        registry: index.as_ref(),
+                    })
+                    .collect(),
+                // A scoped package is read from its scope's registry when
+                // `.npmrc` names one, so that is the source it is matched to.
+                Ecosystem::Npm => vec![upd::fix::ReleaseSource {
+                    url: NpmRegistry::get_scoped_registry_url(name)
+                        .unwrap_or_else(|| npm.registry_url().to_string()),
+                    registry: npm,
+                }],
+                Ecosystem::CratesIo => vec![upd::fix::ReleaseSource {
+                    url: crates_io_index.clone(),
+                    registry: crates_io,
+                }],
+                _ => Vec::new(),
+            }
+        };
+        let (releases, release_notes) = upd::fix::confirm_fix_releases(
+            &audit_result,
+            &lock_scan.packages,
+            &packages,
+            offline,
+            &sources_for,
+        )
+        .await;
+        for note in &release_notes {
+            eprintln!("note: {note}");
+        }
+        let routing = route_fix_targets(&audit_result, &prov, &packages, &releases);
 
         // Diagnostics always go to stderr regardless of output mode, so
         // agents can detect them even in JSON/SARIF mode.
@@ -8333,6 +8408,7 @@ mod tests {
                 fixed_version: None,
                 aliases: Vec::new(),
                 source: String::new(),
+                affected: Vec::new(),
             }],
         });
 
@@ -8356,6 +8432,7 @@ mod tests {
                 fixed_version: None,
                 aliases: Vec::new(),
                 source: String::new(),
+                affected: Vec::new(),
             }],
         });
         result.errors.push("network timeout".into());

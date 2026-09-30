@@ -45,6 +45,20 @@ pub fn declared_index_urls(lockfile: &Path) -> Vec<String> {
         .collect()
 }
 
+/// The pyproject.toml of the uv workspace `path` is a member of, when that is
+/// a different file: uv reads a member's indexes from the workspace root.
+fn workspace_root_document(path: &Path) -> Result<Option<DocumentMut>> {
+    crate::lockfile::uv_workspace_root(path)?
+        .map(|root| root.join("pyproject.toml"))
+        .filter(|root| std::fs::canonicalize(path).ok().as_ref() != Some(root))
+        .map(|root| {
+            read_file_safe(&root)?
+                .parse::<DocumentMut>()
+                .map_err(anyhow::Error::from)
+        })
+        .transpose()
+}
+
 fn table_str<'t>(table: &'t dyn TableLike, key: &str) -> Option<&'t str> {
     match table.get(key) {
         Some(Item::Value(Value::String(s))) if !s.value().is_empty() => Some(s.value()),
@@ -512,15 +526,7 @@ impl PyProjectUpdater {
         };
         let path = manifest_path.as_path();
         let doc: DocumentMut = read_file_safe(path)?.parse()?;
-        let root_doc = crate::lockfile::uv_workspace_root(path)?
-            .map(|root| root.join("pyproject.toml"))
-            .filter(|root| std::fs::canonicalize(path).ok().as_ref() != Some(root))
-            .map(|root| {
-                read_file_safe(&root)?
-                    .parse::<DocumentMut>()
-                    .map_err(anyhow::Error::from)
-            })
-            .transpose()?;
+        let root_doc = workspace_root_document(path)?;
         let policy_doc = root_doc.as_ref().unwrap_or(&doc);
         let declared = Self::declared_indexes(policy_doc);
         let chain = IndexChain::new(declared.chain, &declared.pins, registry);
@@ -711,6 +717,16 @@ impl PyProjectUpdater {
             key.trim().trim_matches('"').trim_matches('\'').to_string(),
             value.trim(),
         ))
+    }
+
+    /// True when the project at `path` resolves packages through an index
+    /// it declares (uv, Poetry or PDM), read from the file updates read it
+    /// from: the uv workspace root for a member, else the manifest itself.
+    pub fn declares_package_index(path: &Path) -> Result<bool> {
+        let doc: DocumentMut = read_file_safe(path)?.parse()?;
+        let root_doc = workspace_root_document(path)?;
+        let policy_doc = root_doc.as_ref().unwrap_or(&doc);
+        Ok(!Self::declared_indexes(policy_doc).chain.is_empty())
     }
 
     /// The package indexes a pyproject.toml declares, in query order, plus the
@@ -2353,15 +2369,7 @@ impl Updater for PyProjectUpdater {
         // Indexes the manifest declares (uv/Poetry/PDM) are layered over the
         // registry we were handed; only the tool's own replace-the-default rule
         // takes PyPI out of the chain.
-        let workspace_doc = crate::lockfile::uv_workspace_root(path)?
-            .map(|root| root.join("pyproject.toml"))
-            .filter(|root| std::fs::canonicalize(path).ok().as_ref() != Some(root))
-            .map(|root| {
-                read_file_safe(&root)?
-                    .parse::<DocumentMut>()
-                    .map_err(anyhow::Error::from)
-            })
-            .transpose()?;
+        let workspace_doc = workspace_root_document(path)?;
         let policy_doc = workspace_doc.as_ref().unwrap_or(&doc);
         let mut declared = Self::declared_indexes(policy_doc);
         if workspace_doc.is_some() {

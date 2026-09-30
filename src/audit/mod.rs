@@ -7,6 +7,7 @@ use anyhow::Result;
 use futures::stream::{self, StreamExt};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
+use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -105,6 +106,46 @@ pub struct Vulnerability {
     /// Advisory database prefix of `id` (GHSA, PYSEC, GO, RUSTSEC, CVE, ...).
     #[serde(default)]
     pub source: String,
+    /// Every version window the advisory marks affected for this package,
+    /// so a candidate fix can be checked against each branch the advisory
+    /// covers, not only the one the queried version sits on. Empty when the
+    /// record carries no window upd can compare.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub affected: Vec<AffectedRange>,
+}
+
+/// One window of versions an advisory marks affected: from `introduced`
+/// (`"0"` for every version) up to but excluding `fixed`, or up to and
+/// including `last_affected`, and open-ended when it names neither. A
+/// range's `limit` caps each of its windows, exclusively. A version the
+/// advisory lists explicitly is the window from it to itself.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AffectedRange {
+    pub introduced: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fixed: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_affected: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<String>,
+}
+
+impl AffectedRange {
+    /// True when `version` falls inside this window under `compare`, the
+    /// ecosystem's version ordering.
+    pub fn contains(&self, version: &str, compare: impl Fn(&str, &str) -> Ordering) -> bool {
+        let started = self.introduced == "0" || compare(version, &self.introduced).is_ge();
+        started
+            && match (&self.fixed, &self.last_affected) {
+                (Some(fixed), _) => compare(version, fixed).is_lt(),
+                (None, Some(last)) => compare(version, last).is_le(),
+                (None, None) => true,
+            }
+            && self
+                .limit
+                .as_deref()
+                .is_none_or(|limit| compare(version, limit).is_lt())
+    }
 }
 
 /// Result of checking a package for vulnerabilities
@@ -386,6 +427,7 @@ impl OsvClient {
                             fixed_version: None,
                             aliases: Vec::new(),
                             source: advisory_source(&vuln_ref.id),
+                            affected: Vec::new(),
                         }
                     }
                 }
@@ -446,6 +488,11 @@ impl OsvClient {
             .affected
             .as_deref()
             .and_then(|affected| fixed_version_for(affected, package));
+        let affected = vuln
+            .affected
+            .as_deref()
+            .map(|affected| affected_ranges_for(affected, package))
+            .unwrap_or_default();
 
         // Get reference URL
         let url = vuln
@@ -464,6 +511,7 @@ impl OsvClient {
             fixed_version,
             aliases: vuln.aliases.unwrap_or_default(),
             source,
+            affected,
         })
     }
 }
@@ -536,6 +584,10 @@ struct OsvAffected {
     #[serde(default)]
     package: Option<OsvAffectedPackage>,
     ranges: Option<Vec<OsvRange>>,
+    /// Versions the advisory enumerates as affected, alongside or instead
+    /// of `ranges`.
+    #[serde(default)]
+    versions: Option<Vec<String>>,
 }
 
 /// The `affected[].package` field of an OSV record: identifies which package
@@ -576,6 +628,8 @@ struct OsvEvent {
     fixed: Option<String>,
     #[serde(default)]
     last_affected: Option<String>,
+    #[serde(default)]
+    limit: Option<String>,
 }
 
 /// True when an `affected[]` entry applies to the queried package. Entries
@@ -612,7 +666,6 @@ fn affected_matches(affected_pkg: Option<&OsvAffectedPackage>, package: &Package
 /// branch has no installable fix.
 fn fixed_version_for(affected: &[OsvAffected], package: &Package) -> Option<String> {
     use crate::version::compare::compare_versions;
-    use std::cmp::Ordering;
     for entry in affected
         .iter()
         .filter(|a| affected_matches(a.package.as_ref(), package))
@@ -650,6 +703,72 @@ fn fixed_version_for(affected: &[OsvAffected], package: &Package) -> Option<Stri
         }
     }
     None
+}
+
+/// Every window an advisory's `affected[]` entries mark affected for
+/// `package`, across all of its branches, so that a release chosen as a fix
+/// can be checked against the whole advisory rather than the one branch
+/// `fixed_version_for` reads. Events are read in order, as there; a window
+/// still open when its events run out, or closed by a Git commit rather
+/// than a version, stays open-ended up to the range's `limit` (`*` is no
+/// limit), since nothing else bounds it that upd can compare.
+fn affected_ranges_for(affected: &[OsvAffected], package: &Package) -> Vec<AffectedRange> {
+    let mut windows = Vec::new();
+    for entry in affected
+        .iter()
+        .filter(|a| affected_matches(a.package.as_ref(), package))
+    {
+        for range in entry.ranges.iter().flatten() {
+            let version_typed = match range.range_type.as_deref() {
+                Some(t) => t.eq_ignore_ascii_case("ECOSYSTEM") || t.eq_ignore_ascii_case("SEMVER"),
+                None => true,
+            };
+            if !version_typed {
+                continue;
+            }
+            let limit = range
+                .events
+                .iter()
+                .flatten()
+                .find_map(|event| event.limit.as_deref())
+                .filter(|limit| *limit != "*" && !looks_like_git_sha(limit));
+            let mut open: Option<&str> = None;
+            let close = |introduced: &str, fixed: Option<&str>, last: Option<&str>| AffectedRange {
+                introduced: introduced.to_string(),
+                fixed: fixed.map(str::to_string),
+                last_affected: last.map(str::to_string),
+                limit: limit.map(str::to_string),
+            };
+            for event in range.events.iter().flatten() {
+                if let Some(intro) = event.introduced.as_deref() {
+                    if let Some(start) = open.replace(intro) {
+                        windows.push(close(start, None, None));
+                    }
+                } else if let Some(fix) = event.fixed.as_deref() {
+                    if let Some(start) = open.take() {
+                        let fix = (!looks_like_git_sha(fix)).then_some(fix);
+                        windows.push(close(start, fix, None));
+                    }
+                } else if let Some(last) = event.last_affected.as_deref()
+                    && let Some(start) = open.take()
+                {
+                    windows.push(close(start, None, Some(last)));
+                }
+            }
+            if let Some(start) = open {
+                windows.push(close(start, None, None));
+            }
+        }
+        for version in entry.versions.iter().flatten() {
+            windows.push(AffectedRange {
+                introduced: version.clone(),
+                fixed: None,
+                last_affected: Some(version.clone()),
+                limit: None,
+            });
+        }
+    }
+    windows
 }
 
 #[cfg(test)]
@@ -712,6 +831,7 @@ mod tests {
                     fixed_version: Some("1.0.1".to_string()),
                     aliases: Vec::new(),
                     source: String::new(),
+                    affected: Vec::new(),
                 },
                 Vulnerability {
                     id: "CVE-2024-002".to_string(),
@@ -721,6 +841,7 @@ mod tests {
                     fixed_version: None,
                     aliases: Vec::new(),
                     source: String::new(),
+                    affected: Vec::new(),
                 },
             ],
         });
@@ -992,6 +1113,7 @@ mod tests {
                     fixed_version: None,
                     aliases: Vec::new(),
                     source: String::new(),
+                    affected: Vec::new(),
                 }],
             );
         }
@@ -1280,6 +1402,7 @@ mod tests {
             introduced: Some(v.to_string()),
             fixed: None,
             last_affected: None,
+            limit: None,
         }
     }
 
@@ -1288,6 +1411,7 @@ mod tests {
             introduced: None,
             fixed: Some(v.to_string()),
             last_affected: None,
+            limit: None,
         }
     }
 
@@ -1296,6 +1420,16 @@ mod tests {
             introduced: None,
             fixed: None,
             last_affected: Some(v.to_string()),
+            limit: None,
+        }
+    }
+
+    fn limit(v: &str) -> OsvEvent {
+        OsvEvent {
+            introduced: None,
+            fixed: None,
+            last_affected: None,
+            limit: Some(v.to_string()),
         }
     }
 
@@ -1306,6 +1440,7 @@ mod tests {
                 ecosystem: Some(ecosystem.to_string()),
             }),
             ranges: Some(ranges),
+            versions: None,
         }
     }
 
@@ -1421,6 +1556,145 @@ mod tests {
         assert_eq!(got, None);
     }
 
+    fn window(introduced: &str, fixed: Option<&str>, last: Option<&str>) -> AffectedRange {
+        AffectedRange {
+            introduced: introduced.to_string(),
+            fixed: fixed.map(str::to_string),
+            last_affected: last.map(str::to_string),
+            limit: None,
+        }
+    }
+
+    #[test]
+    fn affected_ranges_keep_every_branch_not_only_the_queried_one() {
+        let affected = vec![affected_for(
+            "mypkg",
+            "PyPI",
+            vec![range(vec![
+                introduced("1.0.0"),
+                fixed("1.2.5"),
+                introduced("2.0.0"),
+                fixed("2.1.3"),
+            ])],
+        )];
+        assert_eq!(
+            affected_ranges_for(&affected, &pypi_pkg("mypkg", "1.1.0")),
+            vec![
+                window("1.0.0", Some("1.2.5"), None),
+                window("2.0.0", Some("2.1.3"), None),
+            ]
+        );
+    }
+
+    #[test]
+    fn affected_ranges_close_on_last_affected_and_leave_unbounded_windows_open() {
+        let sha = "0123456789abcdef0123456789abcdef01234567";
+        let affected = vec![affected_for(
+            "mypkg",
+            "PyPI",
+            vec![
+                range(vec![
+                    introduced("1.0.0"),
+                    last_affected("1.9.9"),
+                    introduced("3.0.0"),
+                ]),
+                range(vec![introduced("2.0.0"), fixed(sha)]),
+            ],
+        )];
+        assert_eq!(
+            affected_ranges_for(&affected, &pypi_pkg("mypkg", "1.0.0")),
+            vec![
+                window("1.0.0", None, Some("1.9.9")),
+                window("3.0.0", None, None),
+                window("2.0.0", None, None),
+            ],
+            "a window with no version to end it stays open-ended"
+        );
+    }
+
+    #[test]
+    fn a_range_limit_ends_every_window_it_bounds() {
+        let affected = vec![affected_for(
+            "mypkg",
+            "PyPI",
+            vec![
+                range(vec![
+                    introduced("0"),
+                    fixed("1.0.1"),
+                    introduced("2.0.0"),
+                    limit("3.0.0"),
+                ]),
+                range(vec![introduced("5.0.0"), limit("*")]),
+            ],
+        )];
+        let windows = affected_ranges_for(&affected, &pypi_pkg("mypkg", "1.0.0"));
+        let affected_at = |version: &str| {
+            windows.iter().any(|w| {
+                w.contains(version, |a, b| {
+                    crate::align::compare_versions(a, b, crate::Lang::Python)
+                })
+            })
+        };
+        assert!(affected_at("2.9.9"), "{windows:?}");
+        assert!(!affected_at("3.0.0"), "a limit is exclusive: {windows:?}");
+        assert!(!affected_at("4.0.0"), "{windows:?}");
+        assert!(
+            affected_at("9.0.0"),
+            "a limit of * bounds nothing: {windows:?}"
+        );
+    }
+
+    #[test]
+    fn affected_ranges_add_listed_versions_and_skip_other_packages_and_git_ranges() {
+        let affected = vec![
+            affected_for(
+                "otherpkg",
+                "PyPI",
+                vec![range(vec![introduced("0"), fixed("9.9.9")])],
+            ),
+            OsvAffected {
+                package: Some(OsvAffectedPackage {
+                    name: Some("mypkg".to_string()),
+                    ecosystem: Some("PyPI".to_string()),
+                }),
+                ranges: Some(vec![OsvRange {
+                    range_type: Some("GIT".to_string()),
+                    events: Some(vec![introduced("0")]),
+                }]),
+                versions: Some(vec!["1.4.0".to_string()]),
+            },
+        ];
+        assert_eq!(
+            affected_ranges_for(&affected, &pypi_pkg("mypkg", "1.4.0")),
+            vec![window("1.4.0", None, Some("1.4.0"))]
+        );
+    }
+
+    #[test]
+    fn a_window_holds_from_introduced_up_to_its_end() {
+        let cmp = crate::version::compare::compare_versions;
+        let fixed = window("1.0.0", Some("1.2.5"), None);
+        assert!(!fixed.contains("0.9.0", cmp));
+        assert!(fixed.contains("1.0.0", cmp));
+        assert!(fixed.contains("1.2.4", cmp));
+        assert!(
+            !fixed.contains("1.2.5", cmp),
+            "fixed is the first clear release"
+        );
+
+        let last = window("0", None, Some("1.9.9"));
+        assert!(last.contains("0.0.1", cmp), "introduced 0 is every version");
+        assert!(
+            last.contains("1.9.9", cmp),
+            "last_affected is still affected"
+        );
+        assert!(!last.contains("2.0.0", cmp));
+
+        let open = window("3.0.0", None, None);
+        assert!(!open.contains("2.9.9", cmp));
+        assert!(open.contains("99.0.0", cmp));
+    }
+
     #[test]
     fn fixed_version_matches_pypi_names_pep503_normalized() {
         let affected = vec![affected_for(
@@ -1437,6 +1711,7 @@ mod tests {
         let affected = vec![OsvAffected {
             package: None,
             ranges: Some(vec![range(vec![introduced("0"), fixed("3.1.0")])]),
+            versions: None,
         }];
         let got = fixed_version_for(&affected, &pypi_pkg("mypkg", "3.0.0"));
         assert_eq!(got.as_deref(), Some("3.1.0"));

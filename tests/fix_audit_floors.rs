@@ -17,6 +17,21 @@ fn run_with_env(
 ) -> (String, String, i32) {
     let mut cmd = Command::new(upd_bin());
     cmd.args(args).current_dir(cwd);
+    // `--fix-audit` asks the PyPI, npm and crates.io registries whether a
+    // fix is published. They default to the test's own OSV server, which
+    // answers 404 for anything it has not mounted, so no run reaches a live
+    // registry; a test that mounts releases points them there explicitly.
+    if let Some((_, osv)) = env.iter().find(|(k, _)| *k == "OSV_API_URL") {
+        cmd.env_remove("UV_EXTRA_INDEX_URL")
+            .env_remove("PIP_EXTRA_INDEX_URL");
+        for key in [
+            "UV_INDEX_URL",
+            "NPM_REGISTRY",
+            "CARGO_REGISTRIES_CRATES_IO_INDEX",
+        ] {
+            cmd.env(key, osv);
+        }
+    }
     for (k, v) in env {
         cmd.env(k, v);
     }
@@ -59,6 +74,24 @@ async fn mount_vuln_get(
     ecosystem: &str,
     fixed: &str,
 ) {
+    mount_vuln_events(
+        server,
+        id,
+        name,
+        ecosystem,
+        serde_json::json!([{ "introduced": "0" }, { "fixed": fixed }]),
+    )
+    .await;
+}
+
+/// The GET detail for `id`, with one ECOSYSTEM range carrying `events`.
+async fn mount_vuln_events(
+    server: &wiremock::MockServer,
+    id: &str,
+    name: &str,
+    ecosystem: &str,
+    events: serde_json::Value,
+) {
     wiremock::Mock::given(wiremock::matchers::method("GET"))
         .and(wiremock::matchers::path(format!("/vulns/{id}")))
         .respond_with(
@@ -67,8 +100,7 @@ async fn mount_vuln_get(
                 "summary": "test vulnerability",
                 "affected": [{
                     "package": { "name": name, "ecosystem": ecosystem },
-                    "ranges": [{ "type": "ECOSYSTEM",
-                        "events": [{ "introduced": "0" }, { "fixed": fixed }] }]
+                    "ranges": [{ "type": "ECOSYSTEM", "events": events }]
                 }]
             })),
         )
@@ -698,6 +730,638 @@ async fn cargo_precise_invoked_with_versioned_spec() {
             && f["method"] == "cargo-precise"
             && f["status"] == "applied"),
         "{fixes:?}"
+    );
+}
+
+/// Mounts the crates.io API endpoint `CARGO_REGISTRIES_CRATES_IO_INDEX`
+/// resolves to (`{index}/api/v1/crates/{name}`), listing `releases` as
+/// `(version, yanked)`.
+async fn mount_crate_releases(
+    server: &wiremock::MockServer,
+    name: &str,
+    releases: &[(&str, bool)],
+) {
+    let versions: Vec<serde_json::Value> = releases
+        .iter()
+        .map(|(num, yanked)| {
+            serde_json::json!({
+                "num": num, "yanked": yanked, "created_at": "2024-01-01T00:00:00Z"
+            })
+        })
+        .collect();
+    wiremock::Mock::given(wiremock::matchers::method("GET"))
+        .and(wiremock::matchers::path(format!("/api/v1/crates/{name}")))
+        .respond_with(
+            wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "crate": { "max_stable_version": releases.last().map(|r| r.0) },
+                "versions": versions
+            })),
+        )
+        .mount(server)
+        .await;
+}
+
+/// An advisory's fixed version is a range edge, and RustSec's unmaintained
+/// notices put it one past the last release (`0.4.21-0`). No
+/// `cargo update --precise` can reach it, so the crate is unfixable and
+/// cargo is never asked, while a sibling whose edge is also unpublished but
+/// has a stable release above it moves to that release, in the same relock.
+#[cfg(unix)]
+#[tokio::test]
+async fn cargo_fix_to_an_unpublished_version_is_unfixable_and_spares_its_sibling() {
+    let server = wiremock::MockServer::start().await;
+    wiremock::Mock::given(wiremock::matchers::method("POST"))
+        .and(wiremock::matchers::path("/querybatch"))
+        .respond_with(MultiOsvResponder {
+            answers: vec![
+                ("stalecrate", "0.4.20", "RUSTSEC-floors-stale"),
+                ("livecrate", "1.0.0", "RUSTSEC-floors-live"),
+            ],
+        })
+        .mount(&server)
+        .await;
+    mount_vuln_get(
+        &server,
+        "RUSTSEC-floors-stale",
+        "stalecrate",
+        "crates.io",
+        "0.4.21-0",
+    )
+    .await;
+    mount_vuln_get(
+        &server,
+        "RUSTSEC-floors-live",
+        "livecrate",
+        "crates.io",
+        "1.1.0-0",
+    )
+    .await;
+    mount_crate_releases(
+        &server,
+        "stalecrate",
+        &[("0.4.19", false), ("0.4.20", false)],
+    )
+    .await;
+    mount_crate_releases(
+        &server,
+        "livecrate",
+        &[
+            ("1.0.0", false),
+            ("1.1.0", true),
+            ("1.1.1", false),
+            ("1.2.0", false),
+        ],
+    )
+    .await;
+
+    // Cargo.lock records the registry the crates were listed from.
+    let source = format!("registry+{}", server.uri());
+    let tmp = tempfile::tempdir().unwrap();
+    fs::write(
+        tmp.path().join("Cargo.toml"),
+        "[package]\nname = \"t\"\nversion = \"0.1.0\"\n",
+    )
+    .unwrap();
+    let lock = |live: &str| {
+        format!(
+            "version = 4\n\n[[package]]\nname = \"t\"\nversion = \"0.1.0\"\n\n[[package]]\nname = \"livecrate\"\nversion = \"{live}\"\nsource = \"{source}\"\n\n[[package]]\nname = \"stalecrate\"\nversion = \"0.4.20\"\nsource = \"{source}\"\n"
+        )
+    };
+    fs::write(tmp.path().join("Cargo.lock"), lock("1.0.0")).unwrap();
+
+    let bin_dir = tmp.path().join("fakebin");
+    fs::create_dir(&bin_dir).unwrap();
+    let log = tmp.path().join("cargo-invocations.log");
+    write_fake_tool(
+        &bin_dir,
+        "cargo",
+        &format!(
+            "#!/bin/sh\necho \"$@\" >> {}\ncat > Cargo.lock <<'EOF'\n{}EOF\nexit 0\n",
+            log.display(),
+            lock("1.1.1")
+        ),
+    );
+
+    let (stdout, stderr, code) = run_with_env(
+        &[
+            "audit",
+            "--fix-audit",
+            "--apply",
+            "--no-cache",
+            "--format",
+            "json",
+        ],
+        tmp.path(),
+        &[
+            ("OSV_API_URL", &server.uri()),
+            ("PATH", &path_with(&bin_dir)),
+        ],
+    );
+
+    assert_eq!(
+        code, 0,
+        "an unpublished fix is unfixable like a missing one, never a failed relock\nstdout: {stdout}\nstderr: {stderr}"
+    );
+    let log_content = fs::read_to_string(&log).unwrap();
+    assert!(
+        log_content.contains("update -p livecrate@1.0.0 --precise 1.1.1"),
+        "{log_content}"
+    );
+    assert!(!log_content.contains("stalecrate"), "{log_content}");
+    assert!(
+        stderr.contains("Cannot auto-fix stalecrate: RUSTSEC-floors-stale names 0.4.21-0 as fixed, but no release of stalecrate at or above it is published"),
+        "{stderr}"
+    );
+
+    let json: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    let fixes = json["fixes"].as_array().unwrap();
+    let live = fixes.iter().find(|f| f["package"] == "livecrate").unwrap();
+    assert_eq!(live["status"], "applied", "{fixes:?}");
+    assert_eq!(live["to_version"], "1.1.1", "{fixes:?}");
+    let stale = fixes.iter().find(|f| f["package"] == "stalecrate").unwrap();
+    assert_eq!(stale["status"], "unfixable", "{fixes:?}");
+    assert!(stale.get("to_version").is_none(), "{fixes:?}");
+}
+
+/// An advisory covering two branches names the first branch's fix, which
+/// never shipped; the next releases up sit on the second branch and are
+/// still affected. The fix moves past them to the first release the
+/// advisory leaves clear, read from the OSV record's own windows.
+#[cfg(unix)]
+#[tokio::test]
+async fn cargo_fix_passes_over_releases_the_advisory_still_covers() {
+    let server = wiremock::MockServer::start().await;
+    wiremock::Mock::given(wiremock::matchers::method("POST"))
+        .and(wiremock::matchers::path("/querybatch"))
+        .respond_with(MultiOsvResponder {
+            answers: vec![("branchcrate", "1.2.4", "RUSTSEC-floors-branch")],
+        })
+        .mount(&server)
+        .await;
+    mount_vuln_events(
+        &server,
+        "RUSTSEC-floors-branch",
+        "branchcrate",
+        "crates.io",
+        serde_json::json!([
+            { "introduced": "0" }, { "fixed": "1.2.5" },
+            { "introduced": "1.3.0" }, { "fixed": "1.3.2" }
+        ]),
+    )
+    .await;
+    mount_crate_releases(
+        &server,
+        "branchcrate",
+        &[
+            ("1.2.4", false),
+            ("1.3.0", false),
+            ("1.3.1", false),
+            ("1.3.2", false),
+        ],
+    )
+    .await;
+
+    // Cargo.lock records the registry the crates were listed from.
+    let source = format!("registry+{}", server.uri());
+    let tmp = tempfile::tempdir().unwrap();
+    fs::write(
+        tmp.path().join("Cargo.toml"),
+        "[package]\nname = \"t\"\nversion = \"0.1.0\"\n",
+    )
+    .unwrap();
+    let lock = |version: &str| {
+        format!(
+            "version = 4\n\n[[package]]\nname = \"t\"\nversion = \"0.1.0\"\n\n[[package]]\nname = \"branchcrate\"\nversion = \"{version}\"\nsource = \"{source}\"\n"
+        )
+    };
+    fs::write(tmp.path().join("Cargo.lock"), lock("1.2.4")).unwrap();
+
+    let bin_dir = tmp.path().join("fakebin");
+    fs::create_dir(&bin_dir).unwrap();
+    let log = tmp.path().join("cargo-invocations.log");
+    write_fake_tool(
+        &bin_dir,
+        "cargo",
+        &format!(
+            "#!/bin/sh\necho \"$@\" >> {}\ncat > Cargo.lock <<'EOF'\n{}EOF\nexit 0\n",
+            log.display(),
+            lock("1.3.2")
+        ),
+    );
+
+    let (stdout, stderr, code) = run_with_env(
+        &[
+            "audit",
+            "--fix-audit",
+            "--apply",
+            "--no-cache",
+            "--format",
+            "json",
+        ],
+        tmp.path(),
+        &[
+            ("OSV_API_URL", &server.uri()),
+            ("PATH", &path_with(&bin_dir)),
+        ],
+    );
+
+    assert_eq!(code, 0, "stdout: {stdout}\nstderr: {stderr}");
+    let log_content = fs::read_to_string(&log).unwrap();
+    assert!(
+        log_content.contains("update -p branchcrate@1.2.4 --precise 1.3.2"),
+        "1.3.0 and 1.3.1 are inside the advisory's second window: {log_content}"
+    );
+}
+
+/// One crate whose advisory names an unpublished edge, locked from
+/// `source`. Returns the project dir, the fake-cargo log and the bin dir
+/// holding the fake cargo.
+fn stalecrate_project(source: &str) -> (tempfile::TempDir, std::path::PathBuf, std::path::PathBuf) {
+    let tmp = tempfile::tempdir().unwrap();
+    fs::write(
+        tmp.path().join("Cargo.toml"),
+        "[package]\nname = \"t\"\nversion = \"0.1.0\"\n",
+    )
+    .unwrap();
+    let lock = |version: &str| {
+        format!(
+            "version = 4\n\n[[package]]\nname = \"t\"\nversion = \"0.1.0\"\n\n[[package]]\nname = \"stalecrate\"\nversion = \"{version}\"\nsource = \"{source}\"\n"
+        )
+    };
+    fs::write(tmp.path().join("Cargo.lock"), lock("0.4.20")).unwrap();
+    let bin_dir = tmp.path().join("fakebin");
+    fs::create_dir(&bin_dir).unwrap();
+    let log = tmp.path().join("cargo-invocations.log");
+    write_fake_tool(
+        &bin_dir,
+        "cargo",
+        &format!(
+            "#!/bin/sh\necho \"$@\" >> {}\ncat > Cargo.lock <<'EOF'\n{}EOF\nexit 0\n",
+            log.display(),
+            lock("0.4.21")
+        ),
+    );
+    (tmp, log, bin_dir)
+}
+
+async fn mount_stalecrate_advisory(server: &wiremock::MockServer) {
+    wiremock::Mock::given(wiremock::matchers::method("POST"))
+        .and(wiremock::matchers::path("/querybatch"))
+        .respond_with(MultiOsvResponder {
+            answers: vec![("stalecrate", "0.4.20", "RUSTSEC-floors-stale")],
+        })
+        .mount(server)
+        .await;
+    mount_vuln_get(
+        server,
+        "RUSTSEC-floors-stale",
+        "stalecrate",
+        "crates.io",
+        "0.4.21-0",
+    )
+    .await;
+}
+
+/// A crate locked from an alternative registry is not on crates.io, so
+/// crates.io's release list says nothing about it: upd never asks, and
+/// writes the advisory's version as named, saying why it is unconfirmed.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_crate_locked_from_another_registry_is_fixed_to_its_advisory_version_unconfirmed() {
+    let server = wiremock::MockServer::start().await;
+    mount_stalecrate_advisory(&server).await;
+    mount_crate_releases(&server, "stalecrate", &[("0.4.20", false)]).await;
+
+    let (tmp, log, bin_dir) = stalecrate_project("registry+https://example.test/index");
+    let (stdout, stderr, code) = run_with_env(
+        &["audit", "--fix-audit", "--apply", "--no-cache"],
+        tmp.path(),
+        &[
+            ("OSV_API_URL", &server.uri()),
+            ("PATH", &path_with(&bin_dir)),
+        ],
+    );
+
+    assert_eq!(code, 0, "stdout: {stdout}\nstderr: {stderr}");
+    let log_content = fs::read_to_string(&log).unwrap();
+    assert!(
+        log_content.contains("update -p stalecrate@0.4.20 --precise 0.4.21-0"),
+        "{log_content}"
+    );
+    assert!(
+        stderr.contains("resolves stalecrate from registry+https://example.test/index, which is not a registry upd is configured to list releases from, so its fix is written to the version its advisory names, unconfirmed"),
+        "{stderr}"
+    );
+    let asked = server
+        .received_requests()
+        .await
+        .unwrap()
+        .iter()
+        .filter(|r| r.url.path().starts_with("/api/v1/crates/"))
+        .count();
+    assert_eq!(
+        asked, 0,
+        "crates.io must not be asked about another registry's crate"
+    );
+}
+
+/// A crate Cargo.lock records from crates.io, while upd is configured to
+/// list crates from another registry: that registry's list is no evidence
+/// about crates.io, so upd does not ask it and writes the advisory's
+/// version, saying why it is unconfirmed.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_crate_locked_from_crates_io_is_not_confirmed_against_another_configured_registry() {
+    let server = wiremock::MockServer::start().await;
+    mount_stalecrate_advisory(&server).await;
+    mount_crate_releases(&server, "stalecrate", &[("0.4.20", false)]).await;
+
+    let (tmp, log, bin_dir) =
+        stalecrate_project("registry+https://github.com/rust-lang/crates.io-index");
+    let (stdout, stderr, code) = run_with_env(
+        &["audit", "--fix-audit", "--apply", "--no-cache"],
+        tmp.path(),
+        &[
+            ("OSV_API_URL", &server.uri()),
+            ("PATH", &path_with(&bin_dir)),
+        ],
+    );
+
+    assert_eq!(code, 0, "stdout: {stdout}\nstderr: {stderr}");
+    let log_content = fs::read_to_string(&log).unwrap();
+    assert!(
+        log_content.contains("update -p stalecrate@0.4.20 --precise 0.4.21-0"),
+        "{log_content}"
+    );
+    assert!(
+        stderr.contains("resolves stalecrate from registry+https://github.com/rust-lang/crates.io-index, which is not a registry upd is configured to list releases from, so its fix is written to the version its advisory names, unconfirmed"),
+        "{stderr}"
+    );
+    let asked = server
+        .received_requests()
+        .await
+        .unwrap()
+        .iter()
+        .filter(|r| r.url.path().starts_with("/api/v1/crates/"))
+        .count();
+    assert_eq!(
+        asked, 0,
+        "the configured registry is not where Cargo.lock resolves the crate from"
+    );
+}
+
+/// PyPI releases served under `prefix` on `server`, each with one file.
+async fn mount_pypi_releases(
+    server: &wiremock::MockServer,
+    prefix: &str,
+    name: &str,
+    versions: &[&str],
+) {
+    let releases: serde_json::Map<String, serde_json::Value> = versions
+        .iter()
+        .map(|v| {
+            (
+                v.to_string(),
+                serde_json::json!([{ "yanked": false, "upload_time_iso_8601": "2026-01-01T00:00:00Z" }]),
+            )
+        })
+        .collect();
+    wiremock::Mock::given(wiremock::matchers::method("GET"))
+        .and(wiremock::matchers::path(format!(
+            "{prefix}/pypi/{name}/json"
+        )))
+        .respond_with(
+            wiremock::ResponseTemplate::new(200)
+                .set_body_json(serde_json::json!({ "releases": releases })),
+        )
+        .mount(server)
+        .await;
+}
+
+/// A pin uv locked from an extra index is confirmed against that index,
+/// not the primary one: the extra index never published the advisory's
+/// version, so the fix moves to the release above it that it did publish.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_pin_locked_from_an_extra_index_is_confirmed_against_that_index() {
+    let server = wiremock::MockServer::start().await;
+    mount_osv_single(&server, "GHSA-floors-extra", "lockonly", "PyPI", "0.49.1").await;
+    mount_pypi_releases(&server, "/primary", "lockonly", &["0.40.0", "0.49.1"]).await;
+    mount_pypi_releases(&server, "/extra", "lockonly", &["0.40.0", "0.50.0"]).await;
+    let primary = format!("{}/primary/simple", server.uri());
+    let extra = format!("{}/extra/simple", server.uri());
+    let lock_at = |version: &str| {
+        format!(
+            "version = 1\n\n[[package]]\nname = \"lockonly\"\nversion = \"{version}\"\nsource = {{ registry = \"{extra}\" }}\n"
+        )
+    };
+
+    let tmp = tempfile::tempdir().unwrap();
+    fs::write(tmp.path().join("pyproject.toml"), PYPROJECT_BARE).unwrap();
+    fs::write(tmp.path().join("uv.lock"), lock_at("0.40.0")).unwrap();
+    let bin_dir = tmp.path().join("fakebin");
+    fs::create_dir(&bin_dir).unwrap();
+    write_fake_tool(
+        &bin_dir,
+        "uv",
+        &format!(
+            "#!/bin/sh\ncat > uv.lock <<'EOF'\n{}EOF\nexit 0\n",
+            lock_at("0.50.0")
+        ),
+    );
+
+    let (stdout, stderr, code) = run_with_env(
+        &["audit", "--fix-audit", "--apply", "--no-cache"],
+        tmp.path(),
+        &[
+            ("OSV_API_URL", &server.uri()),
+            ("UV_INDEX_URL", &primary),
+            ("UV_EXTRA_INDEX_URL", &extra),
+            ("PATH", &path_with(&bin_dir)),
+        ],
+    );
+
+    assert_eq!(code, 0, "stdout: {stdout}\nstderr: {stderr}");
+    let pyproject = fs::read_to_string(tmp.path().join("pyproject.toml")).unwrap();
+    assert!(
+        pyproject.contains("lockonly>=0.50.0"),
+        "{pyproject}\n{stderr}"
+    );
+    assert!(!stderr.contains("unconfirmed"), "{stderr}");
+    let asked_primary = server
+        .received_requests()
+        .await
+        .unwrap()
+        .iter()
+        .filter(|r| r.url.path().starts_with("/primary/"))
+        .count();
+    assert_eq!(asked_primary, 0, "the primary index does not serve the pin");
+}
+
+/// A scoped npm package is read from the registry `.npmrc` gives its scope,
+/// and its fix is confirmed there: the scope's registry never published the
+/// advisory's version, so the fix moves to the release above it that it did.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_scoped_npm_package_is_confirmed_against_its_scope_registry() {
+    let server = wiremock::MockServer::start().await;
+    wiremock::Mock::given(wiremock::matchers::method("POST"))
+        .and(wiremock::matchers::path("/querybatch"))
+        .respond_with(MultiOsvResponder {
+            answers: vec![("@acme/widget", "1.0.0", "GHSA-floors-scope")],
+        })
+        .mount(&server)
+        .await;
+    mount_vuln_get(&server, "GHSA-floors-scope", "@acme/widget", "npm", "1.0.1").await;
+    let listing = |versions: &[&str]| {
+        let versions: serde_json::Map<String, serde_json::Value> = versions
+            .iter()
+            .map(|v| (v.to_string(), serde_json::json!({ "version": v })))
+            .collect();
+        wiremock::ResponseTemplate::new(200)
+            .set_body_json(serde_json::json!({ "name": "@acme/widget", "versions": versions }))
+    };
+    let scope_server = wiremock::MockServer::start().await;
+    wiremock::Mock::given(wiremock::matchers::method("GET"))
+        .and(wiremock::matchers::path("/scoped/@acme/widget"))
+        .respond_with(listing(&["1.0.0", "1.1.0"]))
+        .mount(&scope_server)
+        .await;
+    wiremock::Mock::given(wiremock::matchers::method("GET"))
+        .and(wiremock::matchers::path("/@acme/widget"))
+        .respond_with(listing(&["1.0.0", "1.0.1"]))
+        .mount(&server)
+        .await;
+
+    let scoped = format!("{}/scoped", scope_server.uri());
+    let lock_at = |version: &str| {
+        format!(
+            r#"{{ "name": "t", "lockfileVersion": 3, "packages": {{
+            "": {{}},
+            "node_modules/@acme/widget": {{ "version": "{version}", "resolved": "{scoped}/@acme/widget/-/widget-{version}.tgz" }}
+        }} }}"#
+        )
+    };
+    let tmp = tempfile::tempdir().unwrap();
+    fs::write(
+        tmp.path().join("package.json"),
+        "{\n  \"name\": \"t\",\n  \"version\": \"1.0.0\",\n  \"dependencies\": {\n    \"@acme/widget\": \"^1.0.0\"\n  }\n}\n",
+    )
+    .unwrap();
+    fs::write(tmp.path().join("package-lock.json"), lock_at("1.0.0")).unwrap();
+    fs::write(
+        tmp.path().join(".npmrc"),
+        format!("@acme:registry={scoped}/\n"),
+    )
+    .unwrap();
+    let bin_dir = tmp.path().join("fakebin");
+    fs::create_dir(&bin_dir).unwrap();
+    write_fake_tool(
+        &bin_dir,
+        "npm",
+        &format!(
+            "#!/bin/sh\ncat > package-lock.json <<'EOF'\n{}\nEOF\nexit 0\n",
+            lock_at("1.1.0")
+        ),
+    );
+
+    let (stdout, stderr, code) = run_with_env(
+        &["audit", "--fix-audit", "--apply", "--no-cache"],
+        tmp.path(),
+        &[
+            ("OSV_API_URL", &server.uri()),
+            ("HOME", tmp.path().to_str().unwrap()),
+            ("PATH", &path_with(&bin_dir)),
+        ],
+    );
+
+    assert_eq!(code, 0, "stdout: {stdout}\nstderr: {stderr}");
+    let package_json = fs::read_to_string(tmp.path().join("package.json")).unwrap();
+    assert!(package_json.contains("^1.1.0"), "{package_json}\n{stderr}");
+    assert!(!stderr.contains("unconfirmed"), "{stderr}");
+}
+
+/// `--fix-audit` asks a registry only about the ecosystems the audit found
+/// vulnerable, so `--verbose` announces authenticated access only to those.
+#[cfg(unix)]
+#[tokio::test]
+async fn fix_audit_announces_authenticated_access_only_to_registries_it_asks() {
+    let server = wiremock::MockServer::start().await;
+    mount_stalecrate_advisory(&server).await;
+    mount_crate_releases(&server, "stalecrate", &[("0.4.20", false)]).await;
+    let (tmp, _log, bin_dir) = stalecrate_project(&format!("registry+{}", server.uri()));
+    let env = [
+        ("OSV_API_URL", server.uri()),
+        ("PATH", path_with(&bin_dir)),
+        (
+            "CARGO_REGISTRIES_CRATES_IO_TOKEN",
+            "example-token".to_string(),
+        ),
+        ("NPM_TOKEN", "example-token".to_string()),
+    ];
+    let env: Vec<(&str, &str)> = env.iter().map(|(k, v)| (*k, v.as_str())).collect();
+
+    let (_, stderr, _) = run_with_env(
+        &["audit", "--fix-audit", "--no-cache", "--verbose"],
+        tmp.path(),
+        &env,
+    );
+
+    assert!(
+        stderr.contains("Using authenticated crates.io access"),
+        "the crates.io registry is asked about stalecrate: {stderr}"
+    );
+    assert!(
+        !stderr.contains("Using authenticated npm access"),
+        "nothing vulnerable comes from npm: {stderr}"
+    );
+}
+
+/// `--offline` answers the audit from the cache and asks no registry
+/// whether a fix is published: the fix keeps the advisory's version and the
+/// run says once that it is unconfirmed.
+#[cfg(unix)]
+#[tokio::test]
+async fn offline_fix_audit_asks_no_registry_and_says_its_fixes_are_unconfirmed() {
+    let server = wiremock::MockServer::start().await;
+    mount_stalecrate_advisory(&server).await;
+    let cache = tempfile::tempdir().unwrap();
+    let cache_dir = cache.path().to_str().unwrap();
+    let (tmp, log, bin_dir) =
+        stalecrate_project("registry+https://github.com/rust-lang/crates.io-index");
+
+    let (stdout, stderr, code) = run_with_env(
+        &["audit"],
+        tmp.path(),
+        &[("OSV_API_URL", &server.uri()), ("UPD_CACHE_DIR", cache_dir)],
+    );
+    assert!(
+        code != 0 && stdout.contains("RUSTSEC-floors-stale"),
+        "the online run fills the cache\nstdout: {stdout}\nstderr: {stderr}"
+    );
+
+    let (stdout, stderr, code) = run_with_env(
+        &["audit", "--offline", "--fix-audit", "--apply"],
+        tmp.path(),
+        &[
+            ("OSV_API_URL", "http://127.0.0.1:0"),
+            ("UPD_CACHE_DIR", cache_dir),
+            ("PATH", &path_with(&bin_dir)),
+        ],
+    );
+
+    assert_eq!(code, 0, "stdout: {stdout}\nstderr: {stderr}");
+    let log_content = fs::read_to_string(&log).unwrap();
+    assert!(
+        log_content.contains("update -p stalecrate@0.4.20 --precise 0.4.21-0"),
+        "{log_content}"
+    );
+    assert_eq!(
+        stderr
+            .matches("--offline asks no registry whether a fix is published, so each fix is written to the version its advisory names, unconfirmed")
+            .count(),
+        1,
+        "{stderr}"
     );
 }
 
