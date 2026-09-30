@@ -102,6 +102,7 @@ but must leave the repository clean; dependency updates belong exclusively to
 | `min_age` | `7d` | Minimum eligible release age; empty uses project configuration |
 | `max_bump` | `minor` | Highest applied bump; empty uses project configuration |
 | `lock` | `false` | Regenerate lockfiles; requires ecosystem tools in the image |
+| `security_remediation` | `true` | First move dependencies with a published advisory to the lowest release that resolves it (see [Security fixes](#security-fixes)) |
 | `prepare_command` | empty | Prepare project tooling without modifying repository files |
 | `validation_command` | empty | Check updates before publishing |
 | `branch` | `automation/upd-dependencies` | Automation-owned rolling branch |
@@ -150,7 +151,11 @@ The template:
   request only when its title or description differ;
 - refuses ambiguous duplicate open merge requests;
 - fails if preparation or validation leaves unexpected repository changes;
-- retains the machine-readable update report as a one-week CI artifact;
+- applies security fixes in a separate step before the update, from the same
+  checkout and with the same token isolation, and stops before the update if
+  one fails;
+- retains the machine-readable update and security reports as a one-week CI
+  artifact;
 - creates or updates one automation-owned merge request; and
 - lease-deletes the obsolete branch and then closes its merge request when no
   eligible updates remain, so a commit pushed during the run keeps the merge
@@ -192,6 +197,39 @@ Registry and manifest text is stripped of control characters and escaped before
 rendering. The complete update report, presentation JSON, and rendered merge
 request description are retained under the `.upd-ci` pipeline artifact even when
 the description reaches its display budget.
+
+## Security fixes
+
+Before the update, each run applies `upd audit --fix-audit`: every dependency
+with a published advisory moves to the lowest release that resolves it. The
+fix follows the advisory, not the update policy, so `min_age`, `max_bump` and
+`packages` do not hold it back; `paths`, `langs` and the repository
+configuration still apply, so a package the configuration ignores, or pins
+below the fix, is left as it is. The update then runs on top, under its usual
+policy.
+
+The merge request lists the fixes first, with their advisories and severity, and
+its title says so (`fix(security): resolve advisory in lodash`). A merge request
+that carries only security fixes is still published. Advisories are looked up
+through [OSV](https://osv.dev), so the runner needs outbound HTTPS access to
+`api.osv.dev`.
+
+With `lock: false`, a fix rewrites the manifest only and is marked as awaiting
+lockfile regeneration: until a lockfile is regenerated it still records the
+vulnerable version. A fix that can only be made in a lockfile (a Cargo
+transitive dependency, for example) needs `lock: true` and is listed under
+"Needs attention" meanwhile, and so is a dependency whose manifest already
+requires the fix while its lockfile still records the vulnerable version.
+With `lock: true`, a fix a manifest requirement excludes is listed there too,
+with the requirement that blocks it, as is a fix upd did not write, with the
+reason: the configuration ignores or pins the package, for example. Advisories
+no release resolves have their own section. None of these stop the run; a
+security fix that fails, or a security report with errors, stops it before the
+update, since publishing a partial result would hide the gap.
+
+The security report is kept beside the update report as
+`.upd-ci/upd-security-report.json`. Set `security_remediation: false` to leave
+advisories to another process.
 
 ## Auto-merge
 
@@ -301,6 +339,7 @@ command from its own job instead. It reads the GitLab CI job environment:
 | `UPD_PATHS` | no | Whitespace-separated paths (`.`) |
 | `UPD_LANGS`, `UPD_PACKAGES`, `UPD_MIN_AGE`, `UPD_MAX_BUMP` | no | Update filters and policy; empty defers to project configuration |
 | `UPD_LOCK`, `UPD_AUTO_MERGE` | no | `true` or `false` (`false`) |
+| `UPD_SECURITY_REMEDIATION` | no | `true` or `false` (`true`); applies [security fixes](#security-fixes) first |
 | `UPD_PREPARE_COMMAND`, `UPD_VALIDATION_COMMAND` | no | Bash commands run with `set -euo pipefail` in the checkout |
 | `UPD_COMMIT_MESSAGE`, `UPD_MR_TITLE` | no | Commit message and title override |
 | `UPD_GIT_NAME`, `UPD_GIT_EMAIL` | no | Automation commit identity (`upd automation`, `upd-automation@noreply.invalid`) |
@@ -319,7 +358,9 @@ held the update and only the merge request was checked. With `--dry-run` the
 update, validation and ownership checks still run, but nothing is pushed and
 nothing is written to GitLab; the outcome is then `would_publish` (with `push`
 saying whether the branch would change), `would_close`, or `would_pause` in
-place of the last three.
+place of the last three. When the security step ran, the JSON object also
+carries `security` with the number of `fixes`, `pending_relock`, `blocked`,
+`skipped`, `not_applied` and `unfixable` entries and of `advisories` resolved.
 With the major lane enabled, its result follows on a second line of text, or
 under `major` in the JSON object with the same fields. A lane that failed
 reports the outcome `failed` with its `error` (`kind`, `message`, `exit_code`)

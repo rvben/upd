@@ -4,12 +4,13 @@
   "blocked": [],
   "changed": true,
   "changed_paths": [
-    "dependency.txt"
+    "dependency.txt",
+    "requirements.txt"
   ],
   "counts": {
     "annotations": 0,
     "blocked": 0,
-    "files_changed": 1,
+    "files_changed": 2,
     "normalized": 0,
     "not_examined": 0,
     "policy_holds": 0,
@@ -32,19 +33,31 @@
   "schema": 1,
   "security": {
     "counts": {
-      "advisories": 0,
+      "advisories": 1,
       "blocked": 0,
-      "fixes": 0,
+      "fixes": 1,
       "not_applied": 0,
       "pending_relock": 0,
       "skipped": 0,
       "unfixable": 0
     },
-    "fixes": [],
+    "fixes": [
+      {
+        "advisories": [
+          "GHSA-9wx4-h78v-vm56"
+        ],
+        "from": "==2.31.0",
+        "package": "requests",
+        "path": "requirements.txt",
+        "severity": "Medium",
+        "status": "applied",
+        "to": "2.32.0"
+      }
+    ],
     "unfixable": []
   },
   "state": "ready",
-  "title": "chore(deps): refresh example to 1.1.0",
+  "title": "fix(security): resolve an advisory and refresh dependencies",
   "updates": [
     {
       "bump": "minor",

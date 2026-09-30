@@ -1,0 +1,12 @@
+{
+  "command": "audit",
+  "status": "complete",
+  "vulnerabilities": [
+    {"package": "requests", "version": "2.31.0", "ecosystem": "PyPI", "id": "GHSA-9wx4-h78v-vm56", "summary": "Session verification bypass in requests", "severity": "Medium", "fixed_version": "2.32.0", "aliases": ["CVE-2024-35195"], "source": "GHSA"}
+  ],
+  "errors": [],
+  "summary": {"packages_checked": 8, "vulnerable_packages": 1, "vulnerabilities": 1, "errors": 0},
+  "fixes": [
+    {"package": "requests", "ecosystem": "PyPI", "from_version": "==2.31.0", "to_version": "2.32.0", "method": "manifest", "path": "requirements.txt", "status": "applied"}
+  ]
+}

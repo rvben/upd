@@ -1,0 +1,16 @@
+{
+  "command": "audit",
+  "status": "complete",
+  "vulnerabilities": [
+    {"package": "serde_yaml", "version": "0.8.0", "ecosystem": "crates.io", "id": "RUSTSEC-2024-0001", "summary": "Stack overflow in serde_yaml", "severity": "High", "fixed_version": "0.8.4", "source": "RUSTSEC"},
+    {"package": "lru", "version": "0.12.0", "ecosystem": "crates.io", "id": "RUSTSEC-2024-0002", "summary": "Use after free in lru", "severity": "Critical", "fixed_version": "0.12.5", "source": "RUSTSEC"},
+    {"package": "abandoned", "version": "1.0.0", "ecosystem": "crates.io", "id": "RUSTSEC-2024-0003", "summary": "Unsound API in abandoned", "source": "RUSTSEC"}
+  ],
+  "errors": [],
+  "summary": {"packages_checked": 40, "vulnerable_packages": 3, "vulnerabilities": 3, "errors": 0},
+  "fixes": [
+    {"package": "serde_yaml", "ecosystem": "crates.io", "from_version": "0.8", "to_version": "0.8.4", "method": "manifest", "path": "Cargo.toml", "status": "pending_relock"},
+    {"package": "lru", "ecosystem": "crates.io", "from_version": "0.12.0", "to_version": "0.12.5", "method": "cargo-precise", "path": "Cargo.lock", "status": "skipped"},
+    {"package": "abandoned", "ecosystem": "crates.io", "from_version": "1.0.0", "status": "unfixable", "error": "no fixed version is published"}
+  ]
+}

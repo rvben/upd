@@ -13,12 +13,12 @@
     "normalized": 0,
     "not_examined": 0,
     "policy_holds": 0,
-    "updates": 1,
+    "updates": 0,
     "updates_major": 0,
-    "updates_minor": 1,
+    "updates_minor": 0,
     "updates_patch": 0,
     "updates_quiet": 0,
-    "updates_review_worthy": 1,
+    "updates_review_worthy": 0,
     "updates_revision": 0,
     "warnings": 0
   },
@@ -32,29 +32,33 @@
   "schema": 1,
   "security": {
     "counts": {
-      "advisories": 0,
+      "advisories": 2,
       "blocked": 0,
-      "fixes": 0,
+      "fixes": 1,
       "not_applied": 0,
       "pending_relock": 0,
       "skipped": 0,
       "unfixable": 0
     },
-    "fixes": [],
+    "fixes": [
+      {
+        "advisories": [
+          "GHSA-29mw-wpgm-hmr9",
+          "GHSA-35jh-r3h4-6jhm"
+        ],
+        "from": "4.17.20",
+        "package": "lodash",
+        "path": "dependency.txt",
+        "severity": "High",
+        "status": "applied",
+        "to": "4.17.21"
+      }
+    ],
     "unfixable": []
   },
   "state": "ready",
-  "title": "chore(deps): refresh example to 1.1.0",
-  "updates": [
-    {
-      "bump": "minor",
-      "current": "1.0.0",
-      "latest": "1.1.0",
-      "package": "example",
-      "path": "dependency.txt",
-      "status": "applied"
-    }
-  ],
+  "title": "fix(security): resolve 2 advisories in lodash",
+  "updates": [],
   "validation": {
     "proposal_integrity_passed": true,
     "repository_command_configured": false

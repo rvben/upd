@@ -1,0 +1,82 @@
+{
+  "annotations": [],
+  "auto_merge_requested": false,
+  "blocked": [
+    {
+      "current": "0.12.0",
+      "package": "lru",
+      "path": "Cargo.lock",
+      "reason": "security fix needs lockfile regeneration (lock: true): it pins a lockfile entry"
+    }
+  ],
+  "changed": true,
+  "changed_paths": [
+    "Cargo.toml"
+  ],
+  "counts": {
+    "annotations": 0,
+    "blocked": 1,
+    "files_changed": 1,
+    "normalized": 0,
+    "not_examined": 0,
+    "policy_holds": 0,
+    "updates": 0,
+    "updates_major": 0,
+    "updates_minor": 0,
+    "updates_patch": 0,
+    "updates_quiet": 0,
+    "updates_review_worthy": 0,
+    "updates_revision": 0,
+    "warnings": 0
+  },
+  "normalized": [],
+  "policy": {
+    "lockfile_regeneration": false,
+    "max_bump": "minor",
+    "min_age": "7d"
+  },
+  "policy_holds": [],
+  "schema": 1,
+  "security": {
+    "counts": {
+      "advisories": 1,
+      "blocked": 0,
+      "fixes": 1,
+      "not_applied": 0,
+      "pending_relock": 1,
+      "skipped": 1,
+      "unfixable": 1
+    },
+    "fixes": [
+      {
+        "advisories": [
+          "RUSTSEC-2024-0001"
+        ],
+        "from": "0.8",
+        "package": "serde_yaml",
+        "path": "Cargo.toml",
+        "severity": "High",
+        "status": "pending_relock",
+        "to": "0.8.4"
+      }
+    ],
+    "unfixable": [
+      {
+        "advisories": [
+          "RUSTSEC-2024-0003"
+        ],
+        "package": "abandoned",
+        "reason": "no fixed version is published",
+        "severity": "unknown",
+        "version": "1.0.0"
+      }
+    ]
+  },
+  "state": "ready",
+  "title": "fix(security): resolve advisory in serde_yaml",
+  "updates": [],
+  "validation": {
+    "proposal_integrity_passed": true,
+    "repository_command_configured": false
+  }
+}

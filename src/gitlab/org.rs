@@ -213,6 +213,7 @@ impl OrgSettings {
             max_bump: self.max_bump.clone(),
             lock: false,
             auto_merge: false,
+            security_remediation: false,
             prepare_command: String::new(),
             validation_command: String::new(),
             updater: self.updater.clone(),
@@ -693,7 +694,7 @@ async fn process(
     // lane was given, from the same checkout.
     let major = session.settings.major_lane();
     let state = match session.propose().await {
-        Ok(outcome) => State::Processed(outcome),
+        Ok(proposal) => State::Processed(proposal.outcome),
         Err(error) => State::Failed(error),
     };
     let major = match major {

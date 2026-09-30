@@ -1,0 +1,14 @@
+{
+  "command": "audit",
+  "status": "complete",
+  "vulnerabilities": [
+    {"package": "time", "version": "0.3.20", "ecosystem": "crates.io", "id": "RUSTSEC-2024-0010", "summary": "Segfault in time", "severity": "Low", "fixed_version": "0.3.36", "source": "RUSTSEC"},
+    {"package": "lru", "version": "0.16.0", "ecosystem": "crates.io", "id": "RUSTSEC-2024-0011", "summary": "Use after free in lru", "severity": "High", "fixed_version": "0.16.3", "source": "RUSTSEC"}
+  ],
+  "errors": [],
+  "summary": {"packages_checked": 40, "vulnerable_packages": 2, "vulnerabilities": 2, "errors": 0},
+  "fixes": [
+    {"package": "time", "ecosystem": "crates.io", "from_version": "0.3.20", "to_version": "0.3.36", "method": "cargo-precise", "path": "Cargo.lock", "status": "applied"},
+    {"package": "lru", "ecosystem": "crates.io", "from_version": "0.16.0", "to_version": "0.16.3", "method": "cargo-precise", "path": "Cargo.lock", "status": "blocked", "error": "ratatui-core requires lru ^0.16.0, <0.16.2 | see <b>Cargo.toml</b>"}
+  ]
+}

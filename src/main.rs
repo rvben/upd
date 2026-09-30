@@ -1767,14 +1767,14 @@ async fn run_gitlab(cli: &Cli) -> Result<()> {
             },
             settings,
         )) => match ordinary {
-            Ok(outcome) => {
+            Ok(proposal) => {
                 if effective_json_mode(cli) {
                     println!(
                         "{}",
-                        serde_json::to_string_pretty(&outcome.to_json(&settings.branch))?
+                        serde_json::to_string_pretty(&proposal.to_json(&settings.branch))?
                     );
                 } else {
-                    println!("{}", outcome.render_text(&settings.branch));
+                    println!("{}", proposal.outcome.render_text(&settings.branch));
                 }
                 Ok(())
             }

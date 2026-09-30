@@ -1,30 +1,37 @@
 {
   "annotations": [],
   "auto_merge_requested": false,
-  "blocked": [],
+  "blocked": [
+    {
+      "current": "0.16.0",
+      "package": "lru",
+      "path": "Cargo.lock",
+      "reason": "security fix blocked: ratatui-core requires lru ^0.16.0, <0.16.2 | see <b>Cargo.toml</b>"
+    }
+  ],
   "changed": true,
   "changed_paths": [
-    "dependency.txt"
+    "Cargo.lock"
   ],
   "counts": {
     "annotations": 0,
-    "blocked": 0,
+    "blocked": 1,
     "files_changed": 1,
     "normalized": 0,
     "not_examined": 0,
     "policy_holds": 0,
-    "updates": 1,
+    "updates": 0,
     "updates_major": 0,
     "updates_minor": 0,
-    "updates_patch": 1,
-    "updates_quiet": 1,
+    "updates_patch": 0,
+    "updates_quiet": 0,
     "updates_review_worthy": 0,
     "updates_revision": 0,
     "warnings": 0
   },
   "normalized": [],
   "policy": {
-    "lockfile_regeneration": false,
+    "lockfile_regeneration": true,
     "max_bump": "minor",
     "min_age": "7d"
   },
@@ -32,29 +39,32 @@
   "schema": 1,
   "security": {
     "counts": {
-      "advisories": 0,
-      "blocked": 0,
-      "fixes": 0,
+      "advisories": 1,
+      "blocked": 1,
+      "fixes": 1,
       "not_applied": 0,
       "pending_relock": 0,
       "skipped": 0,
       "unfixable": 0
     },
-    "fixes": [],
+    "fixes": [
+      {
+        "advisories": [
+          "RUSTSEC-2024-0010"
+        ],
+        "from": "0.3.20",
+        "package": "time",
+        "path": "Cargo.lock",
+        "severity": "Low",
+        "status": "applied",
+        "to": "0.3.36"
+      }
+    ],
     "unfixable": []
   },
   "state": "ready",
-  "title": "chore(deps): refresh example to 1.0.1",
-  "updates": [
-    {
-      "bump": "patch",
-      "current": "1.0.0",
-      "latest": "1.0.1",
-      "package": "example",
-      "path": "dependency.txt",
-      "status": "applied"
-    }
-  ],
+  "title": "fix(security): resolve advisory in time",
+  "updates": [],
   "validation": {
     "proposal_integrity_passed": true,
     "repository_command_configured": false

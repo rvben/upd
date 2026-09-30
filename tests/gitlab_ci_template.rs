@@ -121,6 +121,19 @@ struct Run {
     /// An npm registry to run the real updater against, in place of the fake
     /// one; the fake updater's controls above then go unused.
     npm_registry: Option<String>,
+    /// OSV server the real updater queries; without one it is pointed at the
+    /// npm registry, which knows no advisories.
+    osv: Option<String>,
+    security_remediation: String,
+    packages: String,
+    /// What the fake updater does when asked for security fixes: the report
+    /// it prints (empty selects a report with no advisories), the exit status
+    /// it ends with, and `audit_content` it writes to `audit_file` first
+    /// when `audit_file` is set.
+    audit_report: String,
+    audit_exit: Option<i32>,
+    audit_file: String,
+    audit_content: String,
 }
 
 impl Default for Run {
@@ -151,6 +164,13 @@ impl Default for Run {
             major_report: String::new(),
             major_exit: None,
             npm_registry: None,
+            osv: None,
+            security_remediation: "true".to_string(),
+            packages: String::new(),
+            audit_report: String::new(),
+            audit_exit: None,
+            audit_file: String::new(),
+            audit_content: String::new(),
         }
     }
 }
@@ -221,6 +241,20 @@ if [ -n "${UPD_GITLAB_TOKEN+set}" ]; then
   exit 9
 fi
 printf '%s\n' "$*" >> "$FAKE_UPD_ARGV_LOG"
+if [ "${1:-}" = audit ]; then
+  if [ -n "${FAKE_AUDIT_FILE:-}" ]; then
+    mkdir -p "$(dirname "$FAKE_AUDIT_FILE")"
+    printf '%s\n' "$FAKE_AUDIT_CONTENT" > "$FAKE_AUDIT_FILE"
+  fi
+  if [ -s "${FAKE_AUDIT_REPORT_FILE:-}" ]; then
+    cat "$FAKE_AUDIT_REPORT_FILE"
+  else
+    cat <<JSON
+{"command":"audit","errors":[],"fixes":[],"status":"complete","summary":{"errors":0,"packages_checked":1,"vulnerabilities":0,"vulnerable_packages":0},"vulnerabilities":[]}
+JSON
+  fi
+  exit "${FAKE_AUDIT_EXIT:-0}"
+fi
 case " $* " in
   *" --only-bump major "*)
     FAKE_UPD_EXIT="${FAKE_UPD_MAJOR_EXIT:-}"
@@ -329,6 +363,8 @@ fi
             run.major_report.clone()
         };
         fs::write(&major_report_file, major).expect("fixture major report");
+        let audit_report_file = self._temp.path().join("fake-upd-audit-report.json");
+        fs::write(&audit_report_file, &run.audit_report).expect("fixture audit report");
         command
             .current_dir(&self.checkout)
             .env("UPD_GITLAB_TOKEN", "test-token")
@@ -343,7 +379,7 @@ fi
             .env("UPD_TARGET", "")
             .env("UPD_PATHS", ".")
             .env("UPD_LANGS", "")
-            .env("UPD_PACKAGES", "")
+            .env("UPD_PACKAGES", &run.packages)
             .env("UPD_MIN_AGE", &run.min_age)
             .env("UPD_MAX_BUMP", &run.max_bump)
             .env("UPD_LOCK", &run.lock)
@@ -369,6 +405,9 @@ fi
             .env("FAKE_UPD_MAJOR_FILE", &run.major_file)
             .env("FAKE_UPD_MAJOR_REPORT_FILE", major_report_file)
             .env("FAKE_UPD_ARGV_LOG", self.argv_log())
+            .env("UPD_SECURITY_REMEDIATION", &run.security_remediation)
+            .env("FAKE_AUDIT_REPORT_FILE", audit_report_file)
+            .env("FAKE_AUDIT_CONTENT", &run.audit_content)
             .env("FIXTURE_REMOTE", &self.remote);
         if let Some(code) = run.upd_exit {
             command.env("FAKE_UPD_EXIT", code.to_string());
@@ -376,10 +415,17 @@ fi
         if let Some(code) = run.major_exit {
             command.env("FAKE_UPD_MAJOR_EXIT", code.to_string());
         }
+        if let Some(code) = run.audit_exit {
+            command.env("FAKE_AUDIT_EXIT", code.to_string());
+        }
+        if !run.audit_file.is_empty() {
+            command.env("FAKE_AUDIT_FILE", &run.audit_file);
+        }
         if let Some(registry) = &run.npm_registry {
             command
                 .env("UPD_EXECUTABLE", env!("CARGO_BIN_EXE_upd"))
                 .env("NPM_REGISTRY", registry)
+                .env("OSV_API_URL", run.osv.as_deref().unwrap_or(registry))
                 .env("UPD_CACHE_DIR", self._temp.path().join("cache"));
         }
     }
@@ -2032,6 +2078,15 @@ async fn run_reports_its_outcome_as_json() {
             "pushed": true,
             "commit": fixture.remote_tip().unwrap(),
             "auto_merge": "off",
+            "security": {
+                "fixes": 0,
+                "pending_relock": 0,
+                "blocked": 0,
+                "skipped": 0,
+                "not_applied": 0,
+                "unfixable": 0,
+                "advisories": 0,
+            },
         })
     );
 }
@@ -2311,6 +2366,15 @@ async fn rerunning_an_unchanged_update_leaves_branch_and_merge_request_alone() {
             "pushed": false,
             "commit": first.tip,
             "auto_merge": "off",
+            "security": {
+                "fixes": 0,
+                "pending_relock": 0,
+                "blocked": 0,
+                "skipped": 0,
+                "not_applied": 0,
+                "unfixable": 0,
+                "advisories": 0,
+            },
         })
     );
     assert_eq!(fixture.remote_tip().as_deref(), Some(first.tip.as_str()));
@@ -2945,9 +3009,13 @@ async fn the_major_lane_asks_the_updater_for_major_upgrades_alone() {
     fixture.run(&server, &major_run());
 
     let invocations = fixture.updater_invocations();
-    assert_eq!(invocations.len(), 2, "{invocations:?}");
-    let ordinary = format!(" {} ", invocations[0]);
-    let major = format!(" {} ", invocations[1]);
+    assert_eq!(invocations.len(), 3, "{invocations:?}");
+    // Security fixes belong to the ordinary lane, which runs first.
+    assert!(invocations[0].starts_with("audit "), "{invocations:?}");
+    let ordinary = format!(" {} ", invocations[1]);
+    let major = format!(" {} ", invocations[2]);
+    assert!(ordinary.starts_with(" update "), "{ordinary}");
+    assert!(major.starts_with(" update "), "{major}");
     assert!(ordinary.contains(" --max-bump minor "), "{ordinary}");
     assert!(!ordinary.contains("--only-bump"), "{ordinary}");
     assert!(!ordinary.contains("--strict-bump"), "{ordinary}");
@@ -2974,7 +3042,15 @@ async fn without_the_major_lane_the_major_branch_is_never_touched() {
 
     fixture.run(&server, &Run::default());
 
-    assert_eq!(fixture.updater_invocations().len(), 1);
+    let invocations = fixture.updater_invocations();
+    assert_eq!(
+        invocations
+            .iter()
+            .filter(|args| args.starts_with("update "))
+            .count(),
+        1,
+        "{invocations:?}"
+    );
     assert_eq!(fixture.tip_of(MAJOR_BRANCH), None);
     let requests = server.received_requests().await.unwrap();
     assert!(
@@ -3466,9 +3542,27 @@ fn npm_document(name: &str, versions: &[&str]) -> serde_json::Value {
     })
 }
 
-/// Serves `packages` as an npm registry.
+/// Answers an OSV batch query with one empty result per query: no package
+/// has an advisory.
+struct NoAdvisories;
+
+impl Respond for NoAdvisories {
+    fn respond(&self, request: &Request) -> ResponseTemplate {
+        let queries = json_body(request)["queries"].as_array().map_or(0, Vec::len);
+        ResponseTemplate::new(200)
+            .set_body_json(json!({"results": vec![json!({"vulns": []}); queries]}))
+    }
+}
+
+/// Serves `packages` as an npm registry, which also answers OSV batch
+/// queries with no advisories.
 async fn npm_registry(packages: &[(&str, &[&str])]) -> MockServer {
     let registry = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/querybatch"))
+        .respond_with(NoAdvisories)
+        .mount(&registry)
+        .await;
     for (name, versions) in packages {
         Mock::given(method("GET"))
             .and(path(format!("/{name}")))
@@ -3586,4 +3680,608 @@ async fn the_major_lane_carries_the_held_major_and_nothing_else() {
         .to_string();
     assert!(description.contains("breaking"), "{description}");
     assert!(!description.contains("pinned"), "{description}");
+}
+
+// Security remediation: before the update, the ordinary lane asks the
+// updater to fix every dependency with a published advisory, whatever the
+// update policy would allow.
+
+/// The report `upd audit --fix-audit` prints for `vulnerabilities` and
+/// `fixes`, recording `errors` errors.
+fn audit_report(
+    vulnerabilities: serde_json::Value,
+    fixes: serde_json::Value,
+    errors: u64,
+) -> String {
+    let count = vulnerabilities.as_array().map_or(0, Vec::len);
+    json!({
+        "command": "audit",
+        "status": if errors == 0 { "complete" } else { "incomplete" },
+        "vulnerabilities": vulnerabilities,
+        "errors": (0..errors).map(|n| format!("osv query {n} failed")).collect::<Vec<_>>(),
+        "summary": {
+            "packages_checked": 3,
+            "vulnerable_packages": count,
+            "vulnerabilities": count,
+            "errors": errors,
+        },
+        "fixes": fixes,
+    })
+    .to_string()
+}
+
+/// One RustSec advisory for the crate `package` at `version`.
+fn crate_advisory(package: &str, version: &str, id: &str, severity: &str) -> serde_json::Value {
+    let mut advisory = advisory(package, version, id, severity);
+    advisory["ecosystem"] = json!("crates.io");
+    advisory["source"] = json!("RUSTSEC");
+    advisory
+}
+
+/// One npm advisory for `package` at `version`.
+fn advisory(package: &str, version: &str, id: &str, severity: &str) -> serde_json::Value {
+    json!({
+        "package": package,
+        "version": version,
+        "ecosystem": "npm",
+        "id": id,
+        "severity": severity,
+        "summary": format!("advisory for {package}"),
+        "source": "GHSA",
+    })
+}
+
+/// A run whose update changes nothing and whose security step fixes one
+/// advisory in `lodash`, writing the fix to `security.txt`.
+fn security_fix_run() -> Run {
+    Run {
+        change: false,
+        audit_file: "security.txt".to_string(),
+        audit_content: "lodash 4.17.21".to_string(),
+        audit_report: audit_report(
+            json!([advisory("lodash", "4.17.20", "GHSA-35jh-r3h4-6jhm", "High")]),
+            json!([{
+                "package": "lodash", "ecosystem": "npm", "from_version": "4.17.20", "to_version": "4.17.21",
+                "method": "manifest", "path": "security.txt", "status": "pending_relock",
+            }]),
+            0,
+        ),
+        ..Run::default()
+    }
+}
+
+fn golden_audit(case: &str) -> String {
+    fs::read_to_string(Path::new(GOLDEN_DIR).join(case).join("audit.json"))
+        .expect("golden case audit report")
+}
+
+/// Mounts the merge request list and creation for the ordinary lane.
+async fn serve_ordinary_lane(server: &MockServer) {
+    list_mock(json!([])).mount(server).await;
+    Mock::given(method("POST"))
+        .and(path("/api/v4/projects/1/merge_requests"))
+        .respond_with(ResponseTemplate::new(201).set_body_json(mr_response(7, false)))
+        .expect(1)
+        .mount(server)
+        .await;
+}
+
+#[tokio::test]
+async fn security_fixes_run_before_the_update_and_without_its_policy() {
+    let server = MockServer::start().await;
+    let fixture = Fixture::new();
+    serve_ordinary_lane(&server).await;
+
+    fixture.run(
+        &server,
+        &Run {
+            packages: "example".to_string(),
+            ..Run::default()
+        },
+    );
+
+    let invocations = fixture.updater_invocations();
+    assert_eq!(invocations.len(), 2, "{invocations:?}");
+    assert_eq!(
+        invocations[0],
+        "audit --fix-audit --apply --full-precision --format json --no-lock ."
+    );
+    // The update keeps the policy the security step leaves out.
+    let update = format!(" {} ", invocations[1]);
+    assert!(update.starts_with(" update "), "{update}");
+    for policy in [
+        " --min-age 7d ",
+        " --max-bump minor ",
+        " --package example ",
+    ] {
+        assert!(update.contains(policy), "{policy} missing from {update}");
+    }
+}
+
+#[tokio::test]
+async fn security_fixes_relock_when_lockfile_regeneration_is_on() {
+    let server = MockServer::start().await;
+    let fixture = Fixture::new();
+    serve_ordinary_lane(&server).await;
+
+    fixture.run(
+        &server,
+        &Run {
+            lock: "true".to_string(),
+            ..Run::default()
+        },
+    );
+
+    let invocations = fixture.updater_invocations();
+    assert_eq!(
+        invocations[0],
+        "audit --fix-audit --apply --full-precision --format json ."
+    );
+    assert!(
+        format!(" {} ", invocations[1]).contains(" --lock "),
+        "{invocations:?}"
+    );
+}
+
+#[tokio::test]
+async fn disabled_security_remediation_never_audits() {
+    let server = MockServer::start().await;
+    let fixture = Fixture::new();
+    serve_ordinary_lane(&server).await;
+
+    let output = fixture.execute_upd(
+        &server,
+        &Run {
+            security_remediation: "false".to_string(),
+            change: true,
+            ..security_fix_run()
+        },
+        &["--output", "json"],
+    );
+
+    let outcome = outcome_of(&output);
+    let invocations = fixture.updater_invocations();
+    assert_eq!(invocations.len(), 1, "{invocations:?}");
+    assert!(invocations[0].starts_with("update "), "{invocations:?}");
+    assert!(outcome.get("security").is_none(), "{outcome}");
+}
+
+#[tokio::test]
+async fn template_rejects_a_non_boolean_security_remediation_input() {
+    assert_rejects_input(Run {
+        security_remediation: "yes".to_string(),
+        ..Run::default()
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn a_security_fix_alone_is_published_as_a_fix() {
+    let server = MockServer::start().await;
+    let fixture = Fixture::new();
+    serve_ordinary_lane(&server).await;
+
+    let output = fixture.execute_upd(&server, &security_fix_run(), &["--output", "json"]);
+
+    let outcome = outcome_of(&output);
+    assert_eq!(outcome["outcome"], "published", "{outcome}");
+    assert_eq!(
+        outcome["security"],
+        json!({
+            "fixes": 1,
+            "pending_relock": 1,
+            "blocked": 0,
+            "skipped": 0,
+            "not_applied": 0,
+            "unfixable": 0,
+            "advisories": 1,
+        })
+    );
+    assert_eq!(
+        fixture.file_on(BRANCH, "security.txt").as_deref(),
+        Some("lodash 4.17.21\n")
+    );
+    let requests = server.received_requests().await.unwrap();
+    let create = json_body(created_on(&requests, BRANCH));
+    assert_eq!(
+        create["title"], "fix(security): resolve advisory in lodash",
+        "{create}"
+    );
+    let description = create["description"].as_str().unwrap();
+    assert!(description.contains("GHSA-35jh-r3h4-6jhm"), "{description}");
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains(
+            "upd audit: 1 fixed, 1 pending relock, 0 skipped, 0 blocked, 0 not applied, 0 without a fix, 0 error(s)"
+        ),
+        "{}",
+        describe(&output)
+    );
+}
+
+#[tokio::test]
+async fn a_dry_run_applies_security_fixes_and_names_them_in_the_title() {
+    let server = MockServer::start().await;
+    let fixture = Fixture::new();
+    Mock::given(method("GET"))
+        .and(path("/api/v4/projects/1/merge_requests"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([])))
+        .mount(&server)
+        .await;
+
+    let output = fixture.execute_upd(
+        &server,
+        &security_fix_run(),
+        &["--dry-run", "--output", "json"],
+    );
+
+    let outcome = outcome_of(&output);
+    assert_eq!(outcome["outcome"], "would_publish", "{outcome}");
+    assert_eq!(
+        outcome["title"], "fix(security): resolve advisory in lodash",
+        "{outcome}"
+    );
+    assert_eq!(outcome["security"]["fixes"], 1, "{outcome}");
+    assert_eq!(fixture.remote_tip(), None);
+    assert!(only_reads(&server.received_requests().await.unwrap()));
+}
+
+#[tokio::test]
+async fn the_security_report_is_kept_as_a_pipeline_artifact() {
+    let server = MockServer::start().await;
+    let fixture = Fixture::new();
+    serve_ordinary_lane(&server).await;
+    let run = security_fix_run();
+
+    fixture.run(&server, &run);
+
+    let kept: serde_json::Value =
+        serde_json::from_str(&fixture.artifact("upd-security-report.json")).unwrap();
+    let printed: serde_json::Value = serde_json::from_str(&run.audit_report).unwrap();
+    assert_eq!(kept, printed);
+}
+
+#[tokio::test]
+async fn a_blocked_security_fix_publishes_the_rest_and_says_what_needs_attention() {
+    let server = MockServer::start().await;
+    let fixture = Fixture::new();
+    serve_ordinary_lane(&server).await;
+    let report = audit_report(
+        json!([
+            crate_advisory("time", "0.3.20", "RUSTSEC-2024-0010", "Low"),
+            crate_advisory("lru", "0.16.0", "RUSTSEC-2024-0011", "High"),
+        ]),
+        json!([
+            {"package": "time", "ecosystem": "crates.io", "from_version": "0.3.20", "to_version": "0.3.36",
+             "method": "cargo-precise", "path": "Cargo.lock", "status": "applied"},
+            {"package": "lru", "ecosystem": "crates.io", "from_version": "0.16.0", "to_version": "0.16.3",
+             "method": "cargo-precise", "path": "Cargo.lock", "status": "blocked",
+             "error": "ratatui-core requires lru ^0.16.0, <0.16.2"},
+        ]),
+        0,
+    );
+
+    let output = fixture.execute_upd(
+        &server,
+        &Run {
+            lock: "true".to_string(),
+            audit_file: "Cargo.lock".to_string(),
+            audit_content: "time 0.3.36".to_string(),
+            audit_report: report,
+            audit_exit: Some(6),
+            ..Run::default()
+        },
+        &["--output", "json"],
+    );
+
+    let outcome = outcome_of(&output);
+    assert_eq!(outcome["outcome"], "published", "{outcome}");
+    assert_eq!(outcome["security"]["fixes"], 1, "{outcome}");
+    assert_eq!(outcome["security"]["blocked"], 1, "{outcome}");
+    // Only advisories whose package was fixed entirely count as resolved.
+    assert_eq!(outcome["security"]["advisories"], 1, "{outcome}");
+    assert_eq!(
+        fixture.file_on(BRANCH, "Cargo.lock").as_deref(),
+        Some("time 0.3.36\n")
+    );
+    assert_eq!(fixture.branch_file().as_deref(), Some("new\n"));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("lru") && stderr.contains("ratatui-core requires lru ^0.16.0, <0.16.2"),
+        "{}",
+        describe(&output)
+    );
+    let requests = server.received_requests().await.unwrap();
+    let description = json_body(created_on(&requests, BRANCH))["description"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(description.contains("### Needs attention"), "{description}");
+}
+
+#[tokio::test]
+async fn a_failed_security_fix_stops_the_run_before_the_update() {
+    let server = MockServer::start().await;
+    let fixture = Fixture::new();
+    let report = audit_report(
+        json!([advisory("lodash", "4.17.20", "GHSA-35jh-r3h4-6jhm", "High")]),
+        json!([{
+            "package": "lodash", "ecosystem": "npm", "from_version": "4.17.20", "to_version": "4.17.21",
+            "method": "manifest", "path": "package.json", "status": "rolled_back",
+            "error": "npm install failed",
+        }]),
+        0,
+    );
+
+    let output = fixture.execute(
+        &server,
+        &Run {
+            audit_report: report,
+            audit_exit: Some(2),
+            ..Run::default()
+        },
+    );
+
+    assert!(failed_with(&output, 2), "{}", describe(&output));
+    let invocations = fixture.updater_invocations();
+    assert_eq!(invocations.len(), 1, "{invocations:?}");
+    assert_eq!(fixture.remote_tip(), None);
+    assert!(server.received_requests().await.unwrap().is_empty());
+    // What the updater reported is kept for diagnosis all the same.
+    assert!(
+        fixture
+            .artifact("upd-security-report.json")
+            .contains("rolled_back")
+    );
+}
+
+#[tokio::test]
+async fn a_security_step_that_cannot_reach_its_advisories_is_a_network_failure() {
+    let server = MockServer::start().await;
+    let fixture = Fixture::new();
+
+    let output = fixture.execute(
+        &server,
+        &Run {
+            audit_exit: Some(3),
+            ..Run::default()
+        },
+    );
+
+    assert!(failed_with(&output, 3), "{}", describe(&output));
+    assert_eq!(fixture.updater_invocations().len(), 1);
+    assert_eq!(fixture.remote_tip(), None);
+    assert!(server.received_requests().await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn a_security_report_with_errors_is_refused() {
+    let server = MockServer::start().await;
+    let fixture = Fixture::new();
+    // Partial advisory data: the fix that did apply cannot be trusted to be
+    // the whole story, and the exit status alone does not say so.
+    let report = audit_report(
+        json!([advisory("lodash", "4.17.20", "GHSA-35jh-r3h4-6jhm", "High")]),
+        json!([{
+            "package": "lodash", "ecosystem": "npm", "from_version": "4.17.20", "to_version": "4.17.21",
+            "method": "manifest", "path": "security.txt", "status": "pending_relock",
+        }]),
+        1,
+    );
+
+    let output = fixture.execute(
+        &server,
+        &Run {
+            audit_report: report,
+            ..security_fix_run()
+        },
+    );
+
+    assert!(failed_with(&output, 2), "{}", describe(&output));
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("while applying security fixes"),
+        "{}",
+        describe(&output)
+    );
+    assert_eq!(fixture.updater_invocations().len(), 1);
+    assert_eq!(fixture.remote_tip(), None);
+    assert!(server.received_requests().await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn a_security_report_that_is_not_json_is_refused() {
+    let server = MockServer::start().await;
+    let fixture = Fixture::new();
+
+    let output = fixture.execute(
+        &server,
+        &Run {
+            audit_report: "not json".to_string(),
+            ..Run::default()
+        },
+    );
+
+    assert!(failed_with(&output, 2), "{}", describe(&output));
+    assert_eq!(fixture.updater_invocations().len(), 1);
+    assert_eq!(fixture.remote_tip(), None);
+}
+
+#[tokio::test]
+async fn the_major_lane_never_applies_security_fixes() {
+    let server = MockServer::start().await;
+    let fixture = Fixture::new();
+    serve_both_lanes(&server).await;
+
+    fixture.run(&server, &major_run());
+
+    let audits = fixture
+        .updater_invocations()
+        .into_iter()
+        .filter(|args| args.starts_with("audit "))
+        .count();
+    assert_eq!(audits, 1);
+}
+
+#[tokio::test]
+async fn golden_security_fix_alone() {
+    assert_rendering_matches_golden(
+        "security-only",
+        Run {
+            change: false,
+            audit_file: "dependency.txt".to_string(),
+            audit_content: "lodash 4.17.21".to_string(),
+            audit_report: golden_audit("security-only"),
+            ..Run::default()
+        },
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn golden_security_fix_and_updates() {
+    assert_rendering_matches_golden(
+        "security-and-updates",
+        Run {
+            audit_file: "requirements.txt".to_string(),
+            audit_content: "requests==2.32.0".to_string(),
+            audit_report: golden_audit("security-and-updates"),
+            ..Run::default()
+        },
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn golden_security_fixes_without_lockfile_regeneration() {
+    assert_rendering_matches_golden(
+        "security-no-lock",
+        Run {
+            change: false,
+            audit_file: "Cargo.toml".to_string(),
+            audit_content: "serde_yaml = \"0.8.4\"".to_string(),
+            audit_report: golden_audit("security-no-lock"),
+            audit_exit: Some(6),
+            ..Run::default()
+        },
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn golden_security_fix_blocked_by_a_requirement() {
+    assert_rendering_matches_golden(
+        "security-blocked",
+        Run {
+            lock: "true".to_string(),
+            change: false,
+            audit_file: "Cargo.lock".to_string(),
+            audit_content: "time 0.3.36".to_string(),
+            audit_report: golden_audit("security-blocked"),
+            audit_exit: Some(6),
+            ..Run::default()
+        },
+    )
+    .await;
+}
+
+/// Answers an OSV batch query with `id` for every query about `package`,
+/// and nothing for any other.
+struct AdvisoryFor {
+    package: &'static str,
+    id: &'static str,
+}
+
+impl Respond for AdvisoryFor {
+    fn respond(&self, request: &Request) -> ResponseTemplate {
+        let results: Vec<serde_json::Value> = json_body(request)["queries"]
+            .as_array()
+            .map(|queries| {
+                queries
+                    .iter()
+                    .map(|query| {
+                        if query["package"]["name"] == self.package {
+                            json!({"vulns": [{"id": self.id}]})
+                        } else {
+                            json!({"vulns": []})
+                        }
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        ResponseTemplate::new(200).set_body_json(json!({"results": results}))
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_real_updater_applies_a_security_fix_the_cooldown_would_hold_back() {
+    let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+    let registry = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/vulnerable"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "name": "vulnerable",
+            "dist-tags": {"latest": "1.0.1"},
+            "versions": {
+                "1.0.0": {"name": "vulnerable", "version": "1.0.0"},
+                "1.0.1": {"name": "vulnerable", "version": "1.0.1"},
+            },
+            "time": {"1.0.0": "2025-01-01T00:00:00.000Z", "1.0.1": now},
+        })))
+        .mount(&registry)
+        .await;
+    let osv = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/querybatch"))
+        .respond_with(AdvisoryFor {
+            package: "vulnerable",
+            id: "GHSA-test-0001-0001",
+        })
+        .mount(&osv)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/vulns/GHSA-test-0001-0001"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "id": "GHSA-test-0001-0001",
+            "summary": "test vulnerability",
+            "database_specific": {"severity": "HIGH"},
+            "affected": [{
+                "package": {"name": "vulnerable", "ecosystem": "npm"},
+                "ranges": [{"type": "SEMVER", "events": [{"introduced": "0"}, {"fixed": "1.0.1"}]}],
+            }],
+        })))
+        .mount(&osv)
+        .await;
+    let server = MockServer::start().await;
+    let fixture = Fixture::new();
+    fs::write(
+        fixture.checkout.join("package.json"),
+        "{\n  \"name\": \"security\",\n  \"private\": true,\n  \"dependencies\": {\n    \"vulnerable\": \"1.0.0\"\n  }\n}\n",
+    )
+    .expect("package.json");
+    git(&fixture.checkout, &["add", "package.json"]);
+    git(&fixture.checkout, &["commit", "-m", "test: npm project"]);
+    git(&fixture.checkout, &["push", "origin", "main"]);
+    serve_ordinary_lane(&server).await;
+
+    fixture.run(
+        &server,
+        &Run {
+            npm_registry: Some(registry.uri()),
+            osv: Some(osv.uri()),
+            min_age: "7d".to_string(),
+            ..Run::default()
+        },
+    );
+
+    let manifest = fixture.file_on(BRANCH, "package.json").unwrap();
+    assert!(manifest.contains("\"vulnerable\": \"1.0.1\""), "{manifest}");
+    assert_eq!(numstat_from_main(&fixture, BRANCH), "1\t1\tpackage.json\n");
+    let requests = server.received_requests().await.unwrap();
+    let create = json_body(created_on(&requests, BRANCH));
+    assert_eq!(
+        create["title"], "fix(security): resolve advisory in vulnerable",
+        "{create}"
+    );
+    let report: serde_json::Value =
+        serde_json::from_str(&fixture.artifact("upd-security-report.json")).unwrap();
+    assert_eq!(report["fixes"][0]["status"], "pending_relock", "{report}");
 }

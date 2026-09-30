@@ -18,6 +18,10 @@ use std::cmp::Ordering;
 use serde::Serialize;
 use serde_json::Value;
 
+mod security;
+
+pub use security::{Security, SecurityCounts};
+
 /// Largest description, in bytes, sent to GitLab before falling back to the
 /// compact summary.
 pub const DESCRIPTION_BUDGET: usize = 32 * 1024;
@@ -81,6 +85,8 @@ pub struct Context<'a> {
     pub changed: bool,
     /// Repository paths the staged tree changes.
     pub changed_paths: &'a [String],
+    /// What the security step changed, when it ran.
+    pub security: Option<&'a Security>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -200,6 +206,9 @@ pub struct Presentation {
     /// Absent when the project has no major lane.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub major_lane: Option<MajorLane>,
+    /// Absent when security remediation did not run.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub security: Option<Security>,
 }
 
 impl Presentation {
@@ -209,7 +218,14 @@ impl Presentation {
         let annotations = annotation_rows(report)?;
         let normalized = normalized_rows(report)?;
         let mut policy_holds = policy_rows(report)?;
-        let blocked = blocked_rows(report)?;
+        let mut blocked = blocked_rows(report)?;
+        let security = context.security.cloned();
+        if let Some(security) = &security {
+            blocked.extend(security.attention.iter().cloned());
+            blocked.sort_by(|a, b| {
+                (&a.package, &a.path, &a.reason).cmp(&(&b.package, &b.path, &b.reason))
+            });
+        }
         let major_lane = match context.lane {
             Lane::Ordinary => None,
             Lane::BesideMajor {
@@ -303,6 +319,7 @@ impl Presentation {
             auto_merge_requested: context.auto_merge,
             title: String::new(),
             major_lane,
+            security,
         };
         presentation.title = presentation.derive_title();
         Ok(presentation)
@@ -340,6 +357,9 @@ impl Presentation {
                     rows.len()
                 ),
             };
+            return clean_str(&title, 72);
+        }
+        if let Some(title) = self.security_title() {
             return clean_str(&title, 72);
         }
         let title = if counts.updates == 1 && counts.normalized == 0 {
@@ -383,6 +403,48 @@ impl Presentation {
         clean_str(&title, 72)
     }
 
+    /// A `fix(security)` title for a merge request carrying security fixes,
+    /// naming the advisories it resolves when it resolves any.
+    fn security_title(&self) -> Option<String> {
+        let security = self
+            .security
+            .as_ref()
+            .filter(|found| !found.fixes.is_empty())?;
+        let advisories = security.counts.advisories;
+        // "update" names every package a fix moved; "resolve ... in" names
+        // only those left with no vulnerable occurrence, the ones whose
+        // advisories are counted.
+        let vulnerable = match security.fixed_packages().as_slice() {
+            [only] if is_title_package(only) => format!("vulnerable {only}"),
+            [_] => "a vulnerable dependency".to_string(),
+            many => format!("{} vulnerable dependencies", many.len()),
+        };
+        let within = match security.resolved_packages().as_slice() {
+            [only] if is_title_package(only) => (*only).to_string(),
+            [_] => "a dependency".to_string(),
+            many => format!("{} dependencies", many.len()),
+        };
+        let refreshes = self.counts.updates > 0 || self.counts.normalized > 0;
+        let title = match (advisories, refreshes) {
+            (0, false) => format!("fix(security): update {vulnerable}"),
+            (0, true) => format!("fix(security): update {vulnerable} and refresh dependencies"),
+            (1, false) => format!("fix(security): resolve advisory in {within}"),
+            (1, true) => "fix(security): resolve an advisory and refresh dependencies".to_string(),
+            (count, false) => format!("fix(security): resolve {count} advisories in {within}"),
+            (count, true) => {
+                format!("fix(security): resolve {count} advisories and refresh dependencies")
+            }
+        };
+        Some(title)
+    }
+
+    /// Security fixes this merge request carries.
+    fn security_fixes(&self) -> usize {
+        self.security
+            .as_ref()
+            .map_or(0, |security| security.counts.fixes)
+    }
+
     /// The merge-request description proposing `commit`: the full review
     /// when it fits the budget, otherwise a compact summary pointing at the
     /// pipeline artifact, and either way ending with the commit's record.
@@ -398,15 +460,26 @@ impl Presentation {
     }
 
     fn full_description(&self) -> String {
+        let security = self.security.as_ref();
+        let changes = [
+            security.map(Security::fixes_section).unwrap_or_default(),
+            self.changes(),
+        ]
+        .into_iter()
+        .filter(|section| !section.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n\n");
         format!(
-            "{BRAND}\n\n{}{}\n\n{}\n\n{}\n\n{}{}{}\n\n{}\n\n> Rebuilt from the latest default branch. The project pipeline remains the final merge boundary.\n\n---\nPrepared by [upd](https://github.com/rvben/upd).",
+            "{BRAND}\n\n{}{}\n\n{}\n\n{changes}\n\n{}{}{}{}\n\n{}\n\n> Rebuilt from the latest default branch. The project pipeline remains the final merge boundary.\n\n---\nPrepared by [upd](https://github.com/rvben/upd).",
             self.header(),
             self.never_merged_notice(),
             self.facts(),
-            self.changes(),
             self.confidence(),
             self.held(),
             self.blocked_section(),
+            security
+                .map(Security::unfixable_section)
+                .unwrap_or_default(),
             self.evidence(),
         )
     }
@@ -414,6 +487,13 @@ impl Presentation {
     fn result_summary(&self) -> String {
         let counts = &self.counts;
         let mut parts = Vec::new();
+        let security = self.security_fixes();
+        if security > 0 {
+            parts.push(format!(
+                "{security} security {}",
+                plural(security, "fix", "fixes")
+            ));
+        }
         if counts.updates > 0 {
             parts.push(format!(
                 "{} dependency {}",
@@ -448,6 +528,21 @@ impl Presentation {
     }
 
     fn version_boundary(&self) -> String {
+        const SECURITY: &str = "Security fixes move to the lowest release that resolves their advisories, whatever the freshness and bump policy.";
+        if self.security_fixes() == 0 {
+            return self.ordinary_boundary(false);
+        }
+        let counts = &self.counts;
+        if counts.updates == 0 && counts.normalized == 0 {
+            SECURITY.to_string()
+        } else {
+            format!("{SECURITY} {}", self.ordinary_boundary(true))
+        }
+    }
+
+    /// The version boundary of the updates and normalized specifiers;
+    /// `beside_fixes` when security fixes are described alongside them.
+    fn ordinary_boundary(&self, beside_fixes: bool) -> String {
         const NORMALIZED: &str = "Normalized specifiers are replaced as a whole; see the Normalized specifiers section for the versions written.";
         let counts = &self.counts;
         if counts.updates == 0 && counts.normalized > 0 {
@@ -464,6 +559,8 @@ impl Presentation {
         };
         if counts.normalized > 0 {
             format!("{majors} among ordinary updates. {NORMALIZED}")
+        } else if beside_fixes {
+            format!("{majors} among ordinary updates.")
         } else {
             format!("{majors}.")
         }
@@ -495,6 +592,21 @@ impl Presentation {
                 self.version_boundary(),
             );
         }
+        let security = self.security_fixes();
+        if counts.blocked == 0 && security > 0 {
+            return format!(
+                "> **{}, already prepared.** upd prepared {} across {} and {}. {}",
+                if security == 1 {
+                    "A security fix"
+                } else {
+                    "Security fixes"
+                },
+                self.result_summary(),
+                self.files_phrase(),
+                self.validation_phrase(),
+                self.version_boundary(),
+            );
+        }
         if counts.blocked > 0 {
             format!(
                 "> **A careful upgrade, with follow-up.** upd prepared {} across {} and {}. It stopped short of {} {} it could not change safely.",
@@ -518,6 +630,13 @@ impl Presentation {
     fn facts(&self) -> String {
         let counts = &self.counts;
         let mut facts = Vec::new();
+        let security = self.security_fixes();
+        if security > 0 {
+            facts.push(format!(
+                "{security} security {}",
+                plural(security, "fix", "fixes")
+            ));
+        }
         if counts.updates > 0 {
             facts.push(format!("{} moved forward", counts.updates));
         }
@@ -543,6 +662,13 @@ impl Presentation {
                 counts.blocked,
                 plural(counts.blocked, "needs", "need")
             ));
+        }
+        let unfixable = self
+            .security
+            .as_ref()
+            .map_or(0, |security| security.counts.unfixable);
+        if unfixable > 0 {
+            facts.push(format!("{unfixable} without a fix"));
         }
         facts
             .iter()
@@ -573,7 +699,12 @@ impl Presentation {
             )
         };
 
-        let mut out = if !review.is_empty() {
+        // Security fixes have their own section; only annotations can remain.
+        let fixes_only =
+            self.security_fixes() > 0 && self.counts.updates == 0 && self.counts.normalized == 0;
+        let mut out = if fixes_only {
+            String::new()
+        } else if !review.is_empty() {
             let mut section = String::from(
                 "### Worth a look\n\nYour attention is best spent on these non-patch updates.\n\n| Dependency | Before | After | Change | File |\n|---|---:|---:|---|---|\n",
             );
@@ -668,7 +799,10 @@ impl Presentation {
             }));
             out.push_str("\n\n</details>");
         }
-        out
+        match out.strip_prefix("\n\n") {
+            Some(rest) => rest.to_string(),
+            None => out,
+        }
     }
 
     fn held(&self) -> String {
@@ -757,8 +891,12 @@ impl Presentation {
         } else {
             "off"
         };
+        let security = match &self.security {
+            Some(security) if !security.is_empty() => security.evidence_lines(),
+            _ => String::new(),
+        };
         format!(
-            "<details>\n<summary><strong>Proof and provenance</strong></summary>\n\n- Applied updates: {}\n- Change mix: {} major, {} minor, {} patch, {} revision\n- Normalized specifiers: {}\n- Dependency annotations: {}\n- Held back by policy: {}\n- Blocked: {}\n- Not examined: {}\n- Warnings: {}\n- Auto-merge: {auto_merge}\n- Full update report and presentation model retained in the pipeline artifact\n\n</details>",
+            "<details>\n<summary><strong>Proof and provenance</strong></summary>\n\n{security}- Applied updates: {}\n- Change mix: {} major, {} minor, {} patch, {} revision\n- Normalized specifiers: {}\n- Dependency annotations: {}\n- Held back by policy: {}\n- Blocked: {}\n- Not examined: {}\n- Warnings: {}\n- Auto-merge: {auto_merge}\n- Full update {}report and presentation model retained in the pipeline artifact\n\n</details>",
             counts.updates,
             counts.updates_major,
             counts.updates_minor,
@@ -770,6 +908,11 @@ impl Presentation {
             counts.blocked,
             interpolate(&counts.not_examined),
             interpolate(&counts.warnings),
+            if security.is_empty() {
+                ""
+            } else {
+                "report, security "
+            },
         )
     }
 
@@ -810,8 +953,18 @@ impl Presentation {
         } else {
             "off"
         };
+        let security = match &self.security {
+            Some(security) if security.counts.fixes > 0 => {
+                let advisories = security.counts.advisories;
+                format!(
+                    "\n- **Security:** {advisories} {} resolved; security fixes follow the advisories, not the update policy.",
+                    plural(advisories, "advisory", "advisories"),
+                )
+            }
+            _ => String::new(),
+        };
         format!(
-            "### {heading}\n\n- **Validation:** {validation}; proposal integrity passed.\n- **Scope:** {}.\n- **Version boundary:** {}\n- **Policy:** Freshness {}; maximum bump {}; lockfile regeneration {lockfiles}.",
+            "### {heading}\n\n- **Validation:** {validation}; proposal integrity passed.\n- **Scope:** {}.\n- **Version boundary:** {}\n- **Policy:** Freshness {}; maximum bump {}; lockfile regeneration {lockfiles}.{security}",
             self.scope(),
             self.version_boundary(),
             code(&self.policy.min_age),
@@ -821,7 +974,8 @@ impl Presentation {
 
     fn fallback_description(&self) -> String {
         let counts = &self.counts;
-        let changes = counts.updates + counts.normalized;
+        let security = self.security_fixes();
+        let changes = security + counts.updates + counts.normalized;
         let files = self.files_phrase();
         let header = if counts.blocked > 0 {
             format!(
@@ -829,6 +983,17 @@ impl Presentation {
                 plural(changes, "change", "changes"),
                 counts.blocked,
                 plural(counts.blocked, "dependency needs", "dependencies need"),
+            )
+        } else if security > 0 {
+            format!(
+                "> **{}, prepared for review.** upd prepared {changes} dependency {} across {files}, including {security} security {}.",
+                if security == 1 {
+                    "A security fix"
+                } else {
+                    "Security fixes"
+                },
+                plural(changes, "change", "changes"),
+                plural(security, "fix", "fixes"),
             )
         } else if counts.updates_major > 0 {
             format!(
@@ -873,8 +1038,12 @@ impl Presentation {
             ),
             _ => String::new(),
         };
+        let security = match &self.security {
+            Some(security) if !security.is_empty() => security.evidence_lines(),
+            _ => String::new(),
+        };
         format!(
-            "{BRAND}\n\n{header}{}\n\n- Major-version jumps: {}\n- Normalized specifiers: {}\n- Saved for a deliberate upgrade: {}{major_lane}\n- Needs attention: {}\n- Validation: {validation}\n\nThe detailed presentation exceeded the configured body budget, so complete decisions and evidence are retained in the pipeline artifact.\n\n> Review the project pipeline before merging.",
+            "{BRAND}\n\n{header}{}\n\n{security}- Major-version jumps: {}\n- Normalized specifiers: {}\n- Saved for a deliberate upgrade: {}{major_lane}\n- Needs attention: {}\n- Validation: {validation}\n\nThe detailed presentation exceeded the configured body budget, so complete decisions and evidence are retained in the pipeline artifact.\n\n> Review the project pipeline before merging.",
             self.never_merged_notice(),
             counts.updates_major,
             counts.normalized,
@@ -1474,6 +1643,7 @@ mod tests {
             changed: true,
             changed_paths: &[],
             lane: Lane::Ordinary,
+            security: None,
         };
         let report = json!({"files": ["dependency.txt"], "summary": {}});
         assert!(Presentation::from_report(&report, &context).is_err());
@@ -1492,6 +1662,7 @@ mod tests {
             changed: false,
             changed_paths: &[],
             lane: Lane::Ordinary,
+            security: None,
         };
         let report = json!({"files": "none", "summary": {"warnings": 2}});
         let presentation = Presentation::from_report(&report, &context).unwrap();
@@ -1521,5 +1692,134 @@ mod tests {
         assert!(report_is_error_free(&json!({"summary": {}})).unwrap());
         assert!(!report_is_error_free(&json!({"summary": {"errors": 1}})).unwrap());
         assert!(!report_is_error_free(&json!({"summary": {"errors": "0"}})).unwrap());
+    }
+
+    fn security_title(fixes: Value, vulnerabilities: Value, refreshes: bool) -> String {
+        with_security(fixes, vulnerabilities, refreshes).title
+    }
+
+    fn with_security(fixes: Value, vulnerabilities: Value, refreshes: bool) -> Presentation {
+        let security = Security::from_report(
+            &json!({
+                "vulnerabilities": vulnerabilities,
+                "fixes": fixes,
+            }),
+            true,
+        )
+        .unwrap();
+        let files = if refreshes {
+            json!([{"path": "dependency.txt", "updates": [
+                {"package": "example", "current": "1.0.0", "latest": "1.1.0", "bump": "minor"}
+            ]}])
+        } else {
+            json!([])
+        };
+        let context = Context {
+            min_age: "7d",
+            max_bump: "minor",
+            lock: false,
+            auto_merge: false,
+            validation_configured: false,
+            changed: true,
+            changed_paths: &["package.json".to_string()],
+            lane: Lane::Ordinary,
+            security: Some(&security),
+        };
+        Presentation::from_report(&json!({"files": files, "summary": {}}), &context).unwrap()
+    }
+
+    #[test]
+    fn a_security_title_resolves_only_in_packages_left_with_no_vulnerable_occurrence() {
+        let title = security_title(
+            json!([
+                applied("lru"),
+                {"package": "lru", "from_version": "0.16.0", "path": "Cargo.lock", "status": "blocked"},
+                applied("time"),
+            ]),
+            json!([advisory("lru", "RUSTSEC-1"), advisory("time", "RUSTSEC-2")]),
+            false,
+        );
+        assert_eq!(title, "fix(security): resolve advisory in time");
+    }
+
+    #[test]
+    fn the_fallback_description_keeps_the_pending_relock_caveat() {
+        let presentation = with_security(
+            json!([{"package": "lodash", "from_version": "1.0.0", "to_version": "1.0.1",
+                    "path": "package.json", "status": "pending_relock"}]),
+            json!([advisory("lodash", "GHSA-1")]),
+            false,
+        );
+        let fallback = presentation.fallback_description();
+        assert!(
+            fallback.contains(
+                "- Security fixes: 1 (1 awaiting lockfile regeneration)\n- Advisories resolved: 1\n- Advisories without a fix: 0\n"
+            ),
+            "{fallback}"
+        );
+    }
+
+    fn applied(package: &str) -> Value {
+        json!({"package": package, "from_version": "1.0.0", "to_version": "1.0.1",
+               "path": "package.json", "status": "applied"})
+    }
+
+    fn advisory(package: &str, id: &str) -> Value {
+        json!({"package": package, "id": id, "severity": "High"})
+    }
+
+    #[test]
+    fn a_security_title_counts_resolved_advisories_and_names_a_lone_package() {
+        let lodash = json!([applied("lodash")]);
+        assert_eq!(
+            security_title(lodash.clone(), json!([advisory("lodash", "GHSA-1")]), false),
+            "fix(security): resolve advisory in lodash"
+        );
+        assert_eq!(
+            security_title(
+                lodash.clone(),
+                json!([advisory("lodash", "GHSA-1"), advisory("lodash", "GHSA-2")]),
+                false
+            ),
+            "fix(security): resolve 2 advisories in lodash"
+        );
+        assert_eq!(
+            security_title(
+                json!([applied("a"), applied("b")]),
+                json!([advisory("a", "GHSA-1"), advisory("b", "GHSA-2")]),
+                false
+            ),
+            "fix(security): resolve 2 advisories in 2 dependencies"
+        );
+        assert_eq!(
+            security_title(lodash, json!([advisory("lodash", "GHSA-1")]), true),
+            "fix(security): resolve an advisory and refresh dependencies"
+        );
+    }
+
+    #[test]
+    fn a_security_title_without_a_resolved_advisory_names_the_update_only() {
+        assert_eq!(
+            security_title(json!([applied("lodash")]), json!([]), false),
+            "fix(security): update vulnerable lodash"
+        );
+        assert_eq!(
+            security_title(json!([applied("lodash")]), json!([]), true),
+            "fix(security): update vulnerable lodash and refresh dependencies"
+        );
+        assert_eq!(
+            security_title(json!([applied("<b>x</b>")]), json!([]), false),
+            "fix(security): update a vulnerable dependency"
+        );
+    }
+
+    #[test]
+    fn a_security_step_without_fixes_leaves_the_ordinary_title() {
+        let title = security_title(
+            json!([{"package": "gone", "from_version": "1.0.0", "status": "unfixable"}]),
+            json!([advisory("gone", "GHSA-1")]),
+            true,
+        );
+        assert_eq!(title, "chore(deps): refresh example to 1.1.0");
     }
 }

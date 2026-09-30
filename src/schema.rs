@@ -323,7 +323,7 @@ fn build_schema() -> Value {
             },
             {
                 "name": "gitlab run",
-                "description": "Run one GitLab CI dependency update for the current project: update dependencies on the rolling automation branch, push it with a lease, and create, refresh or close its merge request. Configured by the GitLab CI job environment: requires UPD_GITLAB_TOKEN, CI_API_V4_URL, CI_DEFAULT_BRANCH, CI_PROJECT_DIR, CI_PROJECT_ID, CI_PROJECT_PATH and CI_SERVER_URL; reads UPD_BRANCH, UPD_PATHS, UPD_LANGS, UPD_PACKAGES, UPD_MIN_AGE, UPD_MAX_BUMP, UPD_LOCK, UPD_PREPARE_COMMAND, UPD_VALIDATION_COMMAND, UPD_COMMIT_MESSAGE, UPD_MR_TITLE, UPD_GIT_NAME, UPD_GIT_EMAIL, UPD_AUTO_MERGE, UPD_MAJOR_MR, UPD_MAJOR_BRANCH and UPD_MAJOR_COMMIT_MESSAGE. With UPD_MAJOR_MR=true (which needs UPD_MAX_BUMP set to minor or patch) a second lane then runs on UPD_MAJOR_BRANCH, proposing only the major-version upgrades the ceiling held (updater run with --only-bump major --strict-bump) in a merge request upd never merges: auto-merge does not apply to it and is cancelled when found armed. A lane that fails does not stop the other; the exit code is that of the first failure, ordinary lane first. The token is passed only to upd's own git and API calls, never to the prepare command, the validation command or the updater. With --dry-run the update and its checks still run, but nothing is pushed and nothing is written to GitLab; the outcome names what would have happened. Progress goes to stderr",
+                "description": "Run one GitLab CI dependency update for the current project: update dependencies on the rolling automation branch, push it with a lease, and create, refresh or close its merge request. Configured by the GitLab CI job environment: requires UPD_GITLAB_TOKEN, CI_API_V4_URL, CI_DEFAULT_BRANCH, CI_PROJECT_DIR, CI_PROJECT_ID, CI_PROJECT_PATH and CI_SERVER_URL; reads UPD_BRANCH, UPD_PATHS, UPD_LANGS, UPD_PACKAGES, UPD_MIN_AGE, UPD_MAX_BUMP, UPD_LOCK, UPD_PREPARE_COMMAND, UPD_VALIDATION_COMMAND, UPD_COMMIT_MESSAGE, UPD_MR_TITLE, UPD_GIT_NAME, UPD_GIT_EMAIL, UPD_AUTO_MERGE, UPD_SECURITY_REMEDIATION, UPD_MAJOR_MR, UPD_MAJOR_BRANCH and UPD_MAJOR_COMMIT_MESSAGE. Unless UPD_SECURITY_REMEDIATION=false, the update is preceded by upd audit --fix-audit, which moves every dependency with a published advisory to the lowest release that resolves it whatever UPD_MIN_AGE, UPD_MAX_BUMP and UPD_PACKAGES allow (with UPD_LOCK=false fixes change manifests only and are reported pending a relock); a security fix that fails stops the run before the update, and one a requirement blocks, or an advisory no release resolves, is listed in the merge request as needing attention. With UPD_MAJOR_MR=true (which needs UPD_MAX_BUMP set to minor or patch) a second lane then runs on UPD_MAJOR_BRANCH, proposing only the major-version upgrades the ceiling held (updater run with --only-bump major --strict-bump) in a merge request upd never merges: auto-merge does not apply to it and is cancelled when found armed. A lane that fails does not stop the other; the exit code is that of the first failure, ordinary lane first. The token is passed only to upd's own git and API calls, never to the prepare command, the validation command or the updater. With --dry-run the update and its checks still run, but nothing is pushed and nothing is written to GitLab; the outcome names what would have happened. Progress goes to stderr",
                 "effects": "non_idempotent",
                 "mutating": true,
                 "cardinality": "single",
@@ -343,6 +343,7 @@ fn build_schema() -> Value {
                     {"name": "push", "type": "boolean", "description": "would_publish only: whether a commit would be pushed; false when the branch already holds this update"},
                     {"name": "delete_branch", "type": "boolean", "description": "would_close only: whether the rolling branch would be deleted"},
                     {"name": "error", "type": "object", "description": "failed only: the lane's error, with kind, message and exit_code"},
+                    {"name": "security", "type": "object", "description": "Present when the security step ran (never on the major lane): fixes (dependencies moved to a release resolving their advisories, pending_relock included), pending_relock (fixes that changed a manifest and await lockfile regeneration), blocked (fixes a requirement excluded), skipped (fixes that need UPD_LOCK=true, including a manifest that already requires the fix while the lockfile is not regenerated), not_applied (fixes that exist but were not written, such as a package the configuration ignores or pins below the fix), unfixable (advisories no release resolves) and advisories (distinct advisories resolved)"},
                     {"name": "major", "type": "object", "description": "Present only with the major lane enabled: the major lane's result, with the fields above except command, for UPD_MAJOR_BRANCH"}
                 ]
             },
@@ -643,12 +644,14 @@ mod tests {
             "outcome",
             "merge_request",
             "error",
+            "security",
             "major",
         ] {
             assert!(fields.iter().any(|f| f == field), "{field}");
         }
         let description = command["description"].as_str().unwrap();
         for variable in [
+            "UPD_SECURITY_REMEDIATION",
             "UPD_MAJOR_MR",
             "UPD_MAJOR_BRANCH",
             "UPD_MAJOR_COMMIT_MESSAGE",

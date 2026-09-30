@@ -12,7 +12,7 @@ use serde_json::{Value, json};
 use super::Error;
 use super::api::{Client, MergeRequest};
 use super::git::{self, Git, Push};
-use super::present::{self, Presentation};
+use super::present::{self, Presentation, Security, SecurityCounts};
 
 /// Marks a merge request that automation has paused on, so the notice is
 /// added once.
@@ -49,6 +49,9 @@ pub struct Settings {
     pub max_bump: String,
     pub lock: bool,
     pub auto_merge: bool,
+    /// Whether the ordinary lane first fixes every dependency with a
+    /// published advisory, outside the update policy.
+    pub security_remediation: bool,
     pub prepare_command: String,
     pub validation_command: String,
     /// The updater to run; this executable unless `UPD_EXECUTABLE` names one.
@@ -134,6 +137,10 @@ impl Settings {
             max_bump: optional("UPD_MAX_BUMP", ""),
             lock: flag("UPD_LOCK")?,
             auto_merge: flag("UPD_AUTO_MERGE")?,
+            security_remediation: match lookup("UPD_SECURITY_REMEDIATION").as_deref() {
+                None | Some("") => true,
+                _ => flag("UPD_SECURITY_REMEDIATION")?,
+            },
             prepare_command: optional("UPD_PREPARE_COMMAND", ""),
             validation_command: optional("UPD_VALIDATION_COMMAND", ""),
             updater,
@@ -174,8 +181,9 @@ impl Settings {
     }
 
     /// The settings of the major lane, when it is enabled: its own branch
-    /// and commit message, no bump ceiling, no auto-merge, and a title upd
-    /// derives rather than the ordinary lane's configured one.
+    /// and commit message, no bump ceiling, no auto-merge, no security fixes
+    /// (the ordinary lane proposes those), and a title upd derives rather
+    /// than the ordinary lane's configured one.
     pub fn major_lane(&self) -> Option<Self> {
         if !self.major_mr || self.lane == Lane::Major {
             return None;
@@ -186,6 +194,7 @@ impl Settings {
             mr_title: String::new(),
             max_bump: String::new(),
             auto_merge: false,
+            security_remediation: false,
             lane: Lane::Major,
             ..self.clone()
         })
@@ -399,6 +408,24 @@ impl Outcome {
     }
 }
 
+/// What a lane did, and what its security step changed when it ran.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Proposal {
+    pub outcome: Outcome,
+    /// Absent when security remediation did not run.
+    pub security: Option<SecurityCounts>,
+}
+
+impl Proposal {
+    pub fn to_json(&self, branch: &str) -> Value {
+        let mut value = self.outcome.to_json(branch);
+        if let Some(security) = &self.security {
+            value["security"] = json!(security);
+        }
+        value
+    }
+}
+
 /// Where a run's progress goes: straight to stderr, or into a buffer the
 /// caller prints as one block, so concurrent runs do not interleave.
 #[derive(Debug, Default)]
@@ -471,7 +498,7 @@ pub struct Session<'a> {
 /// What each lane of a run did. A lane that failed does not stop the other.
 #[derive(Debug)]
 pub struct Lanes {
-    pub ordinary: Result<Outcome, Error>,
+    pub ordinary: Result<Proposal, Error>,
     /// Absent unless the major lane is enabled.
     pub major: Option<Result<Outcome, Error>>,
 }
@@ -489,7 +516,10 @@ impl Lanes {
     /// without a major lane reports it, and the major lane's under `major`.
     /// A lane that failed has the outcome `failed` and its `error`.
     pub fn to_json(&self, settings: &Settings) -> Value {
-        let mut value = lane_json(&self.ordinary, &settings.branch);
+        let mut value = match &self.ordinary {
+            Ok(proposal) => proposal.to_json(&settings.branch),
+            Err(error) => failed_json(error, &settings.branch),
+        };
         value["command"] = json!("gitlab run");
         if let Some(major) = &self.major {
             value["major"] = major_lane_json(major, &settings.major_branch);
@@ -499,7 +529,10 @@ impl Lanes {
 
     /// One line per lane.
     pub fn render_text(&self, settings: &Settings) -> String {
-        let mut lines = vec![lane_text(&self.ordinary, &settings.branch)];
+        let mut lines = vec![match &self.ordinary {
+            Ok(proposal) => proposal.outcome.render_text(&settings.branch),
+            Err(error) => failed_text(error, &settings.branch),
+        }];
         if let Some(major) = &self.major {
             lines.push(format!(
                 "Major lane: {}",
@@ -513,16 +546,20 @@ impl Lanes {
 fn lane_json(result: &Result<Outcome, Error>, branch: &str) -> Value {
     match result {
         Ok(outcome) => outcome.to_json(branch),
-        Err(error) => json!({
-            "branch": branch,
-            "outcome": "failed",
-            "error": {
-                "kind": error.kind(),
-                "message": error.message(),
-                "exit_code": error.exit_code(),
-            },
-        }),
+        Err(error) => failed_json(error, branch),
     }
+}
+
+fn failed_json(error: &Error, branch: &str) -> Value {
+    json!({
+        "branch": branch,
+        "outcome": "failed",
+        "error": {
+            "kind": error.kind(),
+            "message": error.message(),
+            "exit_code": error.exit_code(),
+        },
+    })
 }
 
 /// The major lane's result as it nests under its parent's `major` field,
@@ -538,8 +575,12 @@ pub(super) fn major_lane_json(result: &Result<Outcome, Error>, branch: &str) -> 
 pub(super) fn lane_text(result: &Result<Outcome, Error>, branch: &str) -> String {
     match result {
         Ok(outcome) => outcome.render_text(branch),
-        Err(error) => format!("Failed on {branch} ({}): {}", error.kind(), error.message()),
+        Err(error) => failed_text(error, branch),
     }
+}
+
+fn failed_text(error: &Error, branch: &str) -> String {
+    format!("Failed on {branch} ({}): {}", error.kind(), error.message())
 }
 
 /// Runs the ordinary lane and then, when enabled, the major lane. Only a
@@ -569,7 +610,8 @@ pub async fn propose_major(settings: Settings, log: &Log) -> Result<Outcome, Err
         "Major lane: proposing major-version upgrades on {}",
         settings.branch
     ));
-    Session::open(settings, log).await?.propose().await
+    let proposal = Session::open(settings, log).await?.propose().await?;
+    Ok(proposal.outcome)
 }
 
 /// Refuses a checkout holding edits or untracked files. Each lane resets the
@@ -649,7 +691,15 @@ impl<'a> Session<'a> {
 
     /// Rebuilds the automation branch from the default branch, runs the
     /// update and publishes, closes or pauses accordingly.
-    pub async fn propose(self) -> Result<Outcome, Error> {
+    pub async fn propose(self) -> Result<Proposal, Error> {
+        let mut security = None;
+        let outcome = self.propose_into(&mut security).await?;
+        Ok(Proposal { outcome, security })
+    }
+
+    /// [`Self::propose`], recording what the security step changed in
+    /// `counts` once it has run.
+    async fn propose_into(self, counts: &mut Option<SecurityCounts>) -> Result<Outcome, Error> {
         let Self {
             settings,
             git,
@@ -716,6 +766,25 @@ impl<'a> Session<'a> {
             ));
         }
 
+        let security = if settings.security_remediation {
+            let report = run_security_fixes(settings, log).await?;
+            let security = Security::from_report(&report, settings.lock)?;
+            log.line(security.summary_line(&report)?);
+            for warning in security.warnings() {
+                log.line(warning);
+            }
+            if !present::report_is_error_free(&report)? {
+                return Err(Error::Refused(
+                    "upd reported errors while applying security fixes; refusing to publish a partial result"
+                        .to_string(),
+                ));
+            }
+            *counts = Some(security.counts);
+            Some(security)
+        } else {
+            None
+        };
+
         let report = run_updater(settings, log).await?;
         log.line(present::summary_line(&report)?);
         if !present::report_is_error_free(&report)? {
@@ -748,6 +817,7 @@ impl<'a> Session<'a> {
                 validation_configured: !settings.validation_command.is_empty(),
                 changed,
                 changed_paths: &changed_paths,
+                security: security.as_ref(),
             },
         )?;
         write_artifact(
@@ -1114,11 +1184,89 @@ async fn run_updater(settings: &Settings, log: &Log) -> Result<Value, Error> {
         }
     }
     args.extend(settings.paths.iter().map(String::as_str));
+    invoke_updater(
+        settings,
+        log,
+        &args,
+        Invocation {
+            artifact: "upd-report.json",
+            accepted: &[0],
+            failed: "the updater failed",
+        },
+    )
+    .await
+}
 
+/// Moves every dependency with a published advisory to the lowest release
+/// that resolves it. The step answers to the advisories, not to the update
+/// policy, so the freshness window, bump ceiling and package filter are
+/// never passed on.
+async fn run_security_fixes(settings: &Settings, log: &Log) -> Result<Value, Error> {
+    let mut args: Vec<&str> = vec![
+        "audit",
+        "--fix-audit",
+        "--apply",
+        "--full-precision",
+        "--format",
+        "json",
+    ];
+    // Without lockfile regeneration a fix writes the manifest alone and
+    // reports it pending a relock, instead of editing the lockfile in place.
+    if !settings.lock {
+        args.push("--no-lock");
+    }
+    let config = settings
+        .config
+        .as_ref()
+        .map(|path| path.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    for (flag, value) in [
+        ("--config", config.as_str()),
+        ("--lang", &settings.langs),
+        ("--exclude-lang", &settings.exclude_langs),
+    ] {
+        if !value.is_empty() {
+            args.extend([flag, value]);
+        }
+    }
+    args.extend(settings.paths.iter().map(String::as_str));
+    // Exit 6 reports a fix a requirement blocked or an advisory no release
+    // resolves; the rest of the fixes applied and the report lists both.
+    invoke_updater(
+        settings,
+        log,
+        &args,
+        Invocation {
+            artifact: "upd-security-report.json",
+            accepted: &[0, 6],
+            failed: "the updater failed while applying security fixes",
+        },
+    )
+    .await
+}
+
+/// How one updater command is run and judged.
+struct Invocation<'a> {
+    /// The pipeline artifact that keeps the command's report.
+    artifact: &'a str,
+    /// Exit codes that still leave a report to act on.
+    accepted: &'a [i32],
+    /// The failure message, before the exit status.
+    failed: &'a str,
+}
+
+/// Runs the updater and reads the single JSON report it prints, keeping the
+/// report as a pipeline artifact whatever the outcome.
+async fn invoke_updater(
+    settings: &Settings,
+    log: &Log,
+    args: &[&str],
+    invocation: Invocation<'_>,
+) -> Result<Value, Error> {
     // `spawn` rather than `output`: `output` would capture stderr too, hiding
     // the updater's progress and diagnostics from a direct job log.
     let child = git::child(&settings.project_dir, &settings.updater)
-        .args(&args)
+        .args(args)
         .stdout(Stdio::piped())
         .stderr(if log.is_buffered() {
             Stdio::piped()
@@ -1139,11 +1287,15 @@ async fn run_updater(settings: &Settings, log: &Log) -> Result<Value, Error> {
     log.raw(&output.stderr);
     write_artifact(
         settings,
-        "upd-report.json",
+        invocation.artifact,
         &String::from_utf8_lossy(&output.stdout),
     )?;
-    if !output.status.success() {
-        let message = format!("the updater failed ({})", output.status);
+    let accepted = output
+        .status
+        .code()
+        .is_some_and(|code| invocation.accepted.contains(&code));
+    if !accepted {
+        let message = format!("{} ({})", invocation.failed, output.status);
         return Err(match output.status.code() {
             Some(3) => Error::Network(message),
             Some(4) => Error::Input(message),
@@ -1300,6 +1452,7 @@ mod tests {
             &[("UPD_GITLAB_TOKEN", "")][..],
             &[("UPD_LOCK", "yes")],
             &[("UPD_AUTO_MERGE", "1")],
+            &[("UPD_SECURITY_REMEDIATION", "yes")],
             &[("UPD_BRANCH", "main")],
             &[("CI_PROJECT_ID", "../../groups/1")],
         ] {
@@ -1329,6 +1482,33 @@ mod tests {
         assert_eq!(major.lane, Lane::Major);
         assert!(major.major_lane().is_none());
         assert_eq!(on.lane, Lane::Ordinary);
+    }
+
+    #[test]
+    fn security_remediation_is_on_unless_turned_off() {
+        assert!(settings(&[]).unwrap().security_remediation);
+        assert!(
+            settings(&[("UPD_SECURITY_REMEDIATION", "")])
+                .unwrap()
+                .security_remediation
+        );
+        assert!(
+            settings(&[("UPD_SECURITY_REMEDIATION", "true")])
+                .unwrap()
+                .security_remediation
+        );
+        assert!(
+            !settings(&[("UPD_SECURITY_REMEDIATION", "false")])
+                .unwrap()
+                .security_remediation
+        );
+    }
+
+    #[test]
+    fn only_the_ordinary_lane_applies_security_fixes() {
+        let on = settings(&[("UPD_MAJOR_MR", "true"), ("UPD_MAX_BUMP", "minor")]).unwrap();
+        assert!(on.security_remediation);
+        assert!(!on.major_lane().unwrap().security_remediation);
     }
 
     #[test]

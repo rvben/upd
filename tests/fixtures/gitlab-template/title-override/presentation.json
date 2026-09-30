@@ -30,6 +30,19 @@
   },
   "policy_holds": [],
   "schema": 1,
+  "security": {
+    "counts": {
+      "advisories": 0,
+      "blocked": 0,
+      "fixes": 0,
+      "not_applied": 0,
+      "pending_relock": 0,
+      "skipped": 0,
+      "unfixable": 0
+    },
+    "fixes": [],
+    "unfixable": []
+  },
   "state": "ready",
   "title": "chore(deps): refresh example to 1.1.0",
   "updates": [

@@ -41,6 +41,10 @@ spec:
       description: Regenerate lockfiles; requires ecosystem tools in the job image
       type: boolean
       default: false
+    security_remediation:
+      description: First move every dependency with a published advisory to the lowest release that resolves it, whatever min_age, max_bump and packages allow
+      type: boolean
+      default: true
     prepare_command:
       description: Command that installs or prepares repository-specific tooling
       default: ""
@@ -101,6 +105,7 @@ spec:
     UPD_GIT_NAME: "upd automation"
     UPD_GIT_EMAIL: "upd-automation@noreply.invalid"
     UPD_AUTO_MERGE: "$[[ inputs.auto_merge ]]"
+    UPD_SECURITY_REMEDIATION: "$[[ inputs.security_remediation ]]"
     UPD_MAJOR_MR: "$[[ inputs.major_mr ]]"
     UPD_MAJOR_BRANCH: "$[[ inputs.major_branch ]]"
     UPD_MAJOR_COMMIT_MESSAGE: "$[[ inputs.major_commit_message ]]"
