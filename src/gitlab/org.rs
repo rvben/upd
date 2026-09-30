@@ -7,7 +7,9 @@
 //! repository cannot supply commands, so no repository code runs. Each
 //! project is then handled exactly as `upd gitlab run` handles its own.
 
+use std::collections::BTreeSet;
 use std::env;
+use std::fmt;
 use std::path::PathBuf;
 use std::str::FromStr;
 
@@ -21,9 +23,12 @@ use super::api::Client;
 use super::git::{self, Git};
 use super::run::{self, Lane, Log, Outcome, Session, Settings};
 use crate::config::{CONFIG_FILE_NAMES, UpdConfig};
+use crate::lockfile::LockfileType;
 use crate::updater::Lang;
 
 const DEFAULT_CONCURRENCY: usize = 4;
+/// Where a project gets its lockfiles regenerated under its own token.
+const SINGLE_PROJECT_TEMPLATE: &str = "ci/gitlab-dependency-update.yml";
 const MAX_CONCURRENCY: usize = 16;
 
 /// Job configuration, read from the environment the organization template
@@ -64,6 +69,46 @@ pub struct OrgSettings {
     pub exclude: Vec<(String, GlobMatcher)>,
     pub updater: PathBuf,
     pub dry_run: bool,
+    /// Projects the lock pipeline gave to their own prepare, lock and publish
+    /// jobs; this run leaves them alone.
+    pub handed_off: BTreeSet<u64>,
+    /// The part of the group this run covers; the whole group when absent.
+    pub shard: Option<Shard>,
+}
+
+/// One of `count` disjoint parts of a group, selected by project ID, so
+/// several schedules can split a group too large for one pipeline.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Shard {
+    /// 1-based.
+    pub index: u64,
+    pub count: u64,
+}
+
+impl Shard {
+    fn parse(text: &str) -> Option<Self> {
+        let (index, count) = text.split_once('/')?;
+        let digits = |part: &str| {
+            (!part.is_empty() && part.bytes().all(|b| b.is_ascii_digit()))
+                .then(|| part.parse::<u64>().ok())
+                .flatten()
+        };
+        let (index, count) = (digits(index)?, digits(count)?);
+        (1..=count)
+            .contains(&index)
+            .then_some(Self { index, count })
+    }
+
+    /// Whether project `id` belongs to this shard.
+    pub fn contains(&self, id: u64) -> bool {
+        id % self.count == self.index - 1
+    }
+}
+
+impl fmt::Display for Shard {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "{}/{}", self.index, self.count)
+    }
 }
 
 impl OrgSettings {
@@ -165,6 +210,31 @@ impl OrgSettings {
         if major_mr {
             run::check_major_lane(&max_bump, "UPD_MAX_BUMP", &branch, &major_branch)?;
         }
+        let handed_off = optional("UPD_LOCK_HANDED_OFF", "")
+            .split(|c: char| c == ',' || c.is_whitespace())
+            .filter(|id| !id.is_empty())
+            .map(|id| {
+                id.parse::<u64>().map_err(|_| {
+                    Error::Input(format!(
+                        "UPD_LOCK_HANDED_OFF must list numeric project IDs, not '{id}'"
+                    ))
+                })
+            })
+            .collect::<Result<BTreeSet<_>, _>>()?;
+        if !handed_off.is_empty() && !lock {
+            return Err(Error::Input(
+                "UPD_LOCK_HANDED_OFF comes from the lock pipeline and needs UPD_LOCK=true"
+                    .to_string(),
+            ));
+        }
+        let shard = match value("UPD_SHARD") {
+            None => None,
+            Some(text) => Some(Shard::parse(&text).ok_or_else(|| {
+                Error::Input(format!(
+                    "UPD_SHARD must be k/n with 1 <= k <= n (for example 2/3), not '{text}'"
+                ))
+            })?),
+        };
 
         Ok(Self {
             token: required(
@@ -202,6 +272,8 @@ impl OrgSettings {
             exclude,
             updater,
             dry_run,
+            handed_off,
+            shard,
         })
     }
 
@@ -270,6 +342,9 @@ pub enum State {
     },
     /// The project was handled; `Outcome` says how.
     Processed(Outcome),
+    /// The project consented to lockfile regeneration after the lock
+    /// pipeline was planned; the next run hands it to lock jobs.
+    Deferred(String),
     Failed(Error),
 }
 
@@ -284,6 +359,9 @@ pub struct ProjectReport {
     /// Whether the ordinary lane applies security fixes; absent for a
     /// project that did not consent to updates.
     pub remediation: Option<Remediation>,
+    /// Whether its lockfiles are regenerated; absent for a project that did
+    /// not consent to updates or tracks no lockfile.
+    pub lockfiles: Option<Lockfiles>,
 }
 
 /// Whether a consented project's ordinary lane applies security fixes.
@@ -303,21 +381,43 @@ impl Remediation {
     }
 }
 
+/// Whether a consented project's lockfiles are regenerated, for a project
+/// whose default branch tracks one.
+#[derive(Debug)]
+pub enum Lockfiles {
+    /// Lock jobs regenerate them.
+    Regenerated,
+    /// Updates leave them as they are; the reason names the side that did
+    /// not allow regeneration and how to get it.
+    Kept(String),
+}
+
+impl Lockfiles {
+    fn to_json(&self) -> Value {
+        match self {
+            Self::Regenerated => json!({"regenerated": true}),
+            Self::Kept(reason) => json!({"regenerated": false, "reason": reason}),
+        }
+    }
+}
+
 impl State {
-    const NAMES: [&'static str; 5] = [
+    const NAMES: [&'static str; 6] = [
         "skipped",
         "not_opted_in",
         "config_invalid",
         "processed",
+        "deferred",
         "failed",
     ];
 
-    fn name(&self) -> &'static str {
+    pub(super) fn name(&self) -> &'static str {
         match self {
             Self::Skipped(_) => "skipped",
             Self::NotOptedIn(_) => "not_opted_in",
             Self::ConfigInvalid { .. } => "config_invalid",
             Self::Processed(_) => "processed",
+            Self::Deferred(_) => "deferred",
             Self::Failed(_) => "failed",
         }
     }
@@ -332,11 +432,14 @@ impl ProjectReport {
         if let Some(remediation) = &self.remediation {
             value["security_remediation"] = remediation.to_json();
         }
+        if let Some(lockfiles) = &self.lockfiles {
+            value["lockfiles"] = lockfiles.to_json();
+        }
         match &self.state {
             State::Skipped(reason) => {
                 value["reason"] = json!(reason);
             }
-            State::NotOptedIn(reason) => {
+            State::NotOptedIn(reason) | State::Deferred(reason) => {
                 value["reason"] = json!(reason);
             }
             State::ConfigInvalid { config, message } => {
@@ -372,6 +475,7 @@ impl ProjectReport {
                 format!("configuration invalid in {config}: {message}")
             }
             State::Processed(outcome) => outcome.render_text(branch),
+            State::Deferred(reason) => format!("deferred ({reason})"),
             State::Failed(error) => format!("failed ({}): {}", error.kind(), error.message()),
         };
         let major = match &self.major {
@@ -388,7 +492,13 @@ impl ProjectReport {
             }
             Some(Remediation::Enabled) | None => String::new(),
         };
-        format!("{}: {detail}{remediation}{major}", self.path)
+        let lockfiles = match &self.lockfiles {
+            Some(Lockfiles::Kept(reason)) => {
+                format!("\n{}: lockfiles not regenerated ({reason})", self.path)
+            }
+            Some(Lockfiles::Regenerated) | None => String::new(),
+        };
+        format!("{}: {detail}{remediation}{lockfiles}{major}", self.path)
     }
 
     /// Whether the project needs someone's attention for the run to count
@@ -408,6 +518,8 @@ pub struct Report {
     /// the lane.
     pub major_branch: Option<String>,
     pub dry_run: bool,
+    /// The part of the group the run covered; absent for the whole group.
+    pub shard: Option<Shard>,
     pub projects: Vec<ProjectReport>,
 }
 
@@ -461,6 +573,9 @@ impl Report {
         if let Some(major_branch) = &self.major_branch {
             value["major_branch"] = json!(major_branch);
         }
+        if let Some(shard) = &self.shard {
+            value["shard"] = json!(shard.to_string());
+        }
         value
     }
 
@@ -483,8 +598,16 @@ impl Report {
             Some(_) => format!(", {} major lane(s) failed", self.major_failures()),
             None => String::new(),
         };
+        let shard = match &self.shard {
+            Some(shard) => format!(" (shard {shard})"),
+            None => String::new(),
+        };
+        let deferred = match count("deferred") {
+            0 => String::new(),
+            deferred => format!(", {deferred} deferred to the next run's lock jobs"),
+        };
         format!(
-            "{}{} projects in {}: {} processed, {} not opted in, {} with invalid configuration, {} failed, {} skipped{major}.",
+            "{}{} projects in {}{shard}: {} processed{deferred}, {} not opted in, {} with invalid configuration, {} failed, {} skipped{major}.",
             if self.dry_run { "Dry run: " } else { "" },
             self.projects.len(),
             self.group,
@@ -503,11 +626,15 @@ pub async fn run(settings: &OrgSettings) -> Result<Report, Error> {
         run::check_branch_name(&env::temp_dir(), &settings.major_branch).await?;
     }
     let api = Client::new(&settings.api_url, &settings.token)?;
-    let listed = api.group_projects(&settings.group).await?;
+    let listed = in_shard(settings, api.group_projects(&settings.group).await?);
     eprintln!(
-        "Found {} projects in {}; checking which opted in",
+        "Found {} projects in {}{}; checking which opted in",
         listed.len(),
-        settings.group
+        settings.group,
+        match &settings.shard {
+            Some(shard) => format!(" (shard {shard})"),
+            None => String::new(),
+        }
     );
 
     let mut projects = futures::stream::iter(listed.into_iter().map(|raw| {
@@ -536,8 +663,20 @@ pub async fn run(settings: &OrgSettings) -> Result<Report, Error> {
         branch: settings.branch.clone(),
         major_branch: settings.major_mr.then(|| settings.major_branch.clone()),
         dry_run: settings.dry_run,
+        shard: settings.shard,
         projects,
     })
+}
+
+/// The listed projects in the settings' shard, all of them without one.
+pub(super) fn in_shard(settings: &OrgSettings, listed: Vec<Value>) -> Vec<Value> {
+    match &settings.shard {
+        None => listed,
+        Some(shard) => listed
+            .into_iter()
+            .filter(|raw| raw["id"].as_u64().is_some_and(|id| shard.contains(id)))
+            .collect(),
+    }
 }
 
 async fn handle(settings: &OrgSettings, api: &Client, raw: Value, log: &Log) -> ProjectReport {
@@ -546,20 +685,24 @@ async fn handle(settings: &OrgSettings, api: &Client, raw: Value, log: &Log) -> 
         .as_str()
         .unwrap_or_default()
         .to_string();
-    let report = |state, major, remediation| ProjectReport {
+    let report = |handled: Handled| ProjectReport {
         id,
         path: path.clone(),
-        state,
-        major,
-        remediation,
+        state: handled.state,
+        major: handled.major,
+        remediation: handled.remediation,
+        lockfiles: handled.lockfiles,
     };
     let project = match classify(settings, raw) {
         Ok(project) => project,
-        Err(state) => return report(state, None, None),
+        Err(state) => return report(Handled::stopped(state)),
     };
+    if settings.handed_off.contains(&project.id) {
+        return report(Handled::stopped(State::Skipped("handed_off")));
+    }
     match process(settings, api, &project, log).await {
-        Ok(handled) => report(handled.state, handled.major, handled.remediation),
-        Err(error) => report(State::Failed(error), None, None),
+        Ok(handled) => report(handled),
+        Err(error) => report(Handled::stopped(State::Failed(error))),
     }
 }
 
@@ -641,7 +784,7 @@ fn is_project_path(path: &str) -> bool {
 }
 
 /// The repository's answer to whether automation may update it.
-enum Consent {
+pub(super) enum Consent {
     No(String),
     Invalid {
         config: String,
@@ -702,6 +845,9 @@ struct Handled {
     major: Option<Result<Outcome, Error>>,
     /// Whether security fixes apply, when the project consented to updates.
     remediation: Option<Remediation>,
+    /// Whether lockfiles are regenerated, when the project consented to
+    /// updates and tracks a lockfile.
+    lockfiles: Option<Lockfiles>,
 }
 
 impl Handled {
@@ -710,6 +856,7 @@ impl Handled {
             state,
             major: None,
             remediation: None,
+            lockfiles: None,
         }
     }
 }
@@ -729,6 +876,9 @@ pub(super) struct Consented<'a> {
     /// Whether the project lets its lockfile regeneration run build
     /// backends.
     pub lock_build: bool,
+    /// Whether lockfiles are regenerated, when the default branch tracks
+    /// one.
+    pub lockfiles: Option<Lockfiles>,
     /// Keeps the checkout alive as long as the session.
     pub checkout: tempfile::TempDir,
 }
@@ -804,12 +954,28 @@ pub(super) async fn open_project<'a>(
             } else {
                 Remediation::Enabled
             };
+            let lockfiles = if tracks_lockfile(&session.git, &session.default_ref).await? {
+                Some(if !settings.lock {
+                    Lockfiles::Kept(format!(
+                        "the organization run does not regenerate lockfiles; turn its lock input on and set lock = true in {config}, or run {SINGLE_PROJECT_TEMPLATE} with lock: true in this project"
+                    ))
+                } else if !lock {
+                    Lockfiles::Kept(format!(
+                        "{config} does not set lock = true in [automation]; set it, or run {SINGLE_PROJECT_TEMPLATE} with lock: true in this project"
+                    ))
+                } else {
+                    Lockfiles::Regenerated
+                })
+            } else {
+                None
+            };
             session.settings.config = Some(PathBuf::from(config));
             Ok(Opened::Consented(Box::new(Consented {
                 session,
                 remediation,
                 lock: settings.lock && lock,
                 lock_build,
+                lockfiles,
                 checkout: work,
             })))
         }
@@ -826,9 +992,24 @@ async fn process(
         Opened::Stopped(state) => return Ok(Handled::stopped(state)),
         Opened::Consented(consented) => *consented,
     };
+    // Only lock jobs may regenerate a consenting project's lockfiles, and
+    // this run holds the token; the project waits for the next plan to hand
+    // it off rather than getting an update that leaves them stale.
+    if consented.lock && !settings.dry_run {
+        return Ok(Handled::stopped(State::Deferred(format!(
+            "{} consented to lockfile regeneration after this run was planned; the next run regenerates its lockfiles in lock jobs",
+            consented
+                .session
+                .settings
+                .config
+                .as_deref()
+                .map_or_else(String::new, |config| config.display().to_string())
+        ))));
+    }
     let Consented {
         session,
         remediation,
+        lockfiles,
         checkout: _checkout,
         ..
     } = consented;
@@ -847,10 +1028,23 @@ async fn process(
         state,
         major,
         remediation: Some(remediation),
+        lockfiles,
     })
 }
 
-async fn api_consent(api: &Client, project: &Project) -> Result<Consent, Error> {
+/// Whether the tree at `default_ref` tracks a file named as a lockfile of
+/// any format upd knows, at any depth.
+async fn tracks_lockfile(git: &Git, default_ref: &str) -> Result<bool, Error> {
+    let names = git
+        .read(["ls-tree", "-r", "-z", "--name-only", default_ref])
+        .await?;
+    Ok(names.split('\0').any(|path| {
+        let name = path.rsplit('/').next().unwrap_or(path);
+        LockfileType::from_filename(name).is_some()
+    }))
+}
+
+pub(super) async fn api_consent(api: &Client, project: &Project) -> Result<Consent, Error> {
     let quiet = Log::buffered();
     for name in CONFIG_FILE_NAMES {
         if let Some(content) = api

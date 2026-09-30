@@ -138,9 +138,10 @@ impl Stop {
             State::Skipped(reason) => Err(Error::Refused(format!(
                 "The project is not a candidate: {reason}"
             ))),
-            State::Processed(_) => Err(Error::Io(
-                "opening the project reported it processed".to_string(),
-            )),
+            State::Processed(_) | State::Deferred(_) => Err(Error::Io(format!(
+                "opening the project reported it {}",
+                state.name()
+            ))),
         }
     }
 }

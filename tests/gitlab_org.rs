@@ -133,7 +133,10 @@ impl Org {
         fs::write(work.join("dependency.txt"), "old\n").unwrap();
         for entry in entries {
             match entry {
-                Entry::File(file, content) => fs::write(work.join(file), content).unwrap(),
+                Entry::File(file, content) => {
+                    fs::create_dir_all(work.join(file).parent().unwrap()).unwrap();
+                    fs::write(work.join(file), content).unwrap()
+                }
                 Entry::Link(file, target) => {
                     std::os::unix::fs::symlink(target, work.join(file)).unwrap()
                 }
@@ -427,7 +430,7 @@ async fn only_projects_that_opted_in_are_updated() {
     assert_eq!(code, 2, "invalid configuration fails the run\n{stderr}");
     assert_eq!(
         report["counts"],
-        json!({"projects": 7, "skipped": 2, "not_opted_in": 2, "config_invalid": 1, "processed": 2, "failed": 0}),
+        json!({"projects": 7, "skipped": 2, "not_opted_in": 2, "config_invalid": 1, "processed": 2, "deferred": 0, "failed": 0}),
         "{report:#}\n{stderr}"
     );
     assert_eq!(
@@ -1884,4 +1887,201 @@ async fn prepare_refuses_a_project_outside_the_group() {
     );
     assert!(org.calls("elsewhere/app").is_empty());
     assert!(!org.job_dir(98, "ordinary").join("work.json").exists());
+}
+
+/// Adds project `id` at `path` with `config` as its `.updrc.toml` and a uv
+/// lockfile beside its manifest.
+fn locked_project(org: &mut Org, id: u64, path: &str, config: &'static str) {
+    org.project(
+        id,
+        path,
+        &[
+            Entry::File(".updrc.toml", config),
+            Entry::File("pyproject.toml", PYPROJECT),
+            Entry::File("sub/uv.lock", UV_LOCK),
+        ],
+    );
+}
+
+#[tokio::test]
+async fn a_project_whose_lockfiles_stay_stale_is_told_why_and_how_to_fix_it() {
+    let mut org = Org::new().await;
+    locked_project(&mut org, 71, "acme/python", OPTED_IN);
+    locked_project(&mut org, 72, "acme/consents", LOCK_OPTED_IN);
+    org.project(73, "acme/plain", &[Entry::File(".updrc.toml", OPTED_IN)]);
+    org.serve().await;
+
+    let (code, report, stderr) = org.run(&[], &[]);
+
+    assert_eq!(code, 0, "{report:#}\n{stderr}");
+    for path in ["acme/python", "acme/consents"] {
+        let project = project(&report, path);
+        assert_eq!(project["state"], "processed", "{report:#}");
+        assert_eq!(project["lockfiles"]["regenerated"], false, "{report:#}");
+        let reason = project["lockfiles"]["reason"].as_str().unwrap();
+        assert!(
+            reason.starts_with("the organization run does not regenerate lockfiles; turn its lock input on and set lock = true in .updrc.toml"),
+            "{reason}"
+        );
+        assert!(
+            reason.ends_with(
+                "or run ci/gitlab-dependency-update.yml with lock: true in this project"
+            ),
+            "{reason}"
+        );
+        assert!(
+            stderr.contains(&format!(
+                "{path}: lockfiles not regenerated (the organization run"
+            )),
+            "{stderr}"
+        );
+    }
+    let plain = project(&report, "acme/plain");
+    assert_eq!(plain["state"], "processed", "{report:#}");
+    assert!(plain.get("lockfiles").is_none(), "{report:#}");
+    assert!(!stderr.contains("acme/plain: lockfiles"), "{stderr}");
+}
+
+#[tokio::test]
+async fn a_lock_run_leaves_handed_off_and_newly_consenting_projects_to_lock_jobs() {
+    let mut org = Org::new().await;
+    locked_project(&mut org, 74, "acme/handed", LOCK_OPTED_IN);
+    locked_project(&mut org, 75, "acme/newly", LOCK_OPTED_IN);
+    locked_project(&mut org, 76, "acme/unlocked", OPTED_IN);
+    org.project(77, "acme/plain", &[Entry::File(".updrc.toml", OPTED_IN)]);
+    org.serve().await;
+    let vars = [("UPD_LOCK", "true"), ("UPD_LOCK_HANDED_OFF", "74")];
+
+    let (code, report, stderr) = org.run(&vars, &[]);
+
+    assert_eq!(
+        code, 0,
+        "a deferred project is not a failure\n{report:#}\n{stderr}"
+    );
+    let handed = project(&report, "acme/handed");
+    assert_eq!(handed["state"], "skipped", "{report:#}");
+    assert_eq!(handed["reason"], "handed_off", "{report:#}");
+    let newly = project(&report, "acme/newly");
+    assert_eq!(newly["state"], "deferred", "{report:#}");
+    assert!(
+        newly["reason"].as_str().unwrap().starts_with(
+            ".updrc.toml consented to lockfile regeneration after this run was planned"
+        ),
+        "{report:#}"
+    );
+    for (id, path) in [(74, "acme/handed"), (75, "acme/newly")] {
+        assert_eq!(org.updater_args(path), None, "{path} was updated");
+        assert_eq!(org.branch_file(id), None, "{path} got a branch");
+        assert!(org.merge_request_calls(id).await.is_empty(), "{path}");
+    }
+    let unlocked = project(&report, "acme/unlocked");
+    assert_eq!(unlocked["state"], "processed", "{report:#}");
+    assert_eq!(
+        unlocked["lockfiles"],
+        json!({"regenerated": false, "reason": ".updrc.toml does not set lock = true in [automation]; set it, or run ci/gitlab-dependency-update.yml with lock: true in this project"}),
+        "{report:#}"
+    );
+    assert_eq!(org.branch_file(76).as_deref(), Some("new\n"));
+    assert_eq!(project(&report, "acme/plain")["state"], "processed");
+    assert_eq!(report["counts"]["deferred"], 1, "{report:#}");
+    assert!(
+        stderr.contains("4 projects in acme: 2 processed, 1 deferred to the next run's lock jobs,"),
+        "{stderr}"
+    );
+
+    // A dry run hands nothing off, so it previews every consenting project.
+    let (code, report, stderr) = org.run(&[("UPD_LOCK", "true")], &["--dry-run"]);
+    assert_eq!(code, 0, "{report:#}\n{stderr}");
+    let newly = project(&report, "acme/newly");
+    assert_eq!(newly["state"], "processed", "{report:#}");
+    assert_eq!(
+        newly["lockfiles"],
+        json!({"regenerated": true}),
+        "{report:#}"
+    );
+}
+
+#[tokio::test]
+async fn handed_off_projects_need_lock_mode_and_numeric_ids() {
+    let mut org = Org::new().await;
+    org.project(78, "acme/plain", &[Entry::File(".updrc.toml", OPTED_IN)]);
+    org.serve().await;
+
+    for vars in [
+        &[("UPD_LOCK_HANDED_OFF", "78")][..],
+        &[
+            ("UPD_LOCK", "true"),
+            ("UPD_LOCK_HANDED_OFF", "78,acme/plain"),
+        ],
+    ] {
+        let output = org
+            .command(env!("CARGO_BIN_EXE_upd"), vars)
+            .args(["gitlab", "org", "run", "--output", "json"])
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(4), "{vars:?}");
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("UPD_LOCK_HANDED_OFF"),
+            "{vars:?}"
+        );
+    }
+    assert_eq!(org.updater_args("acme/plain"), None);
+}
+
+#[tokio::test]
+async fn shards_split_the_group_by_project_id() {
+    let mut org = Org::new().await;
+    for (id, path) in [
+        (60, "acme/a"),
+        (61, "acme/b"),
+        (62, "acme/c"),
+        (63, "acme/d"),
+        (64, "acme/e"),
+    ] {
+        org.project(id, path, &[Entry::File(".updrc.toml", OPTED_IN)]);
+    }
+    org.serve().await;
+
+    let mut seen = Vec::new();
+    for shard in ["1/3", "2/3", "3/3"] {
+        let (code, report, stderr) = org.run(&[("UPD_SHARD", shard)], &["--dry-run"]);
+        assert_eq!(code, 0, "{shard}: {report:#}\n{stderr}");
+        assert_eq!(report["shard"], shard, "{report:#}");
+        assert!(
+            stderr.contains(&format!("in acme (shard {shard}):")),
+            "{stderr}"
+        );
+        let ids: Vec<u64> = report["projects"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|project| project["id"].as_u64().unwrap())
+            .collect();
+        let index: u64 = shard[..1].parse().unwrap();
+        assert!(ids.iter().all(|id| id % 3 == index - 1), "{shard}: {ids:?}");
+        seen.extend(ids);
+    }
+    seen.sort_unstable();
+    assert_eq!(
+        seen,
+        [60, 61, 62, 63, 64],
+        "every project in exactly one shard"
+    );
+
+    let (_, whole, _) = org.run(&[], &["--dry-run"]);
+    assert!(whole.get("shard").is_none(), "{whole:#}");
+    assert_eq!(whole["counts"]["projects"], 5, "{whole:#}");
+
+    for shard in ["0/3", "4/3", "1/0", "3", "1/3/5", "a/3", "+1/3", " 1/3"] {
+        let output = org
+            .command(env!("CARGO_BIN_EXE_upd"), &[("UPD_SHARD", shard)])
+            .args(["gitlab", "org", "run", "--dry-run", "--output", "json"])
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(4), "{shard:?}");
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("UPD_SHARD must be k/n"),
+            "{shard:?}"
+        );
+    }
 }
