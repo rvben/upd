@@ -481,6 +481,17 @@ impl Log {
     }
 }
 
+/// What building a proposal left: an outcome reached without publishing,
+/// or a staged and presented change for [`Session::publish`].
+enum Build {
+    Done(Outcome),
+    Ready {
+        presentation: Box<Presentation>,
+        /// Whether the staged tree differs from the default branch.
+        changed: bool,
+    },
+}
+
 /// A checkout holding the fetched default branch and, when it exists, the
 /// automation branch, before anything is changed.
 pub struct Session<'a> {
@@ -693,27 +704,34 @@ impl<'a> Session<'a> {
     /// update and publishes, closes or pauses accordingly.
     pub async fn propose(self) -> Result<Proposal, Error> {
         let mut security = None;
-        let outcome = self.propose_into(&mut security).await?;
+        let outcome = match self.build(&mut security).await? {
+            Build::Done(outcome) => outcome,
+            Build::Ready {
+                presentation,
+                changed,
+            } => self.publish(presentation, changed).await?,
+        };
         Ok(Proposal { outcome, security })
     }
 
-    /// [`Self::propose`], recording what the security step changed in
-    /// `counts` once it has run.
-    async fn propose_into(self, counts: &mut Option<SecurityCounts>) -> Result<Outcome, Error> {
+    /// Claims the automation branch, rebuilds it from the default branch,
+    /// applies the security fixes and the update, and presents and validates
+    /// the staged result. Records what the security step changed in `counts`
+    /// once it has run.
+    async fn build(&self, counts: &mut Option<SecurityCounts>) -> Result<Build, Error> {
         let Self {
             settings,
             git,
             log,
             api,
-            url,
             default_ref,
             expected_remote_sha,
+            ..
         } = self;
-        let settings = &settings;
         let dir = &settings.project_dir;
 
         if !expected_remote_sha.is_empty() {
-            match claim(&git, &api, settings, &default_ref, &expected_remote_sha).await? {
+            match claim(git, api, settings, default_ref, expected_remote_sha).await? {
                 Claim::Written => {}
                 Claim::Recorded => log.line(format_args!(
                     "{} holds the commit its merge request records, written before the automation identity or commit message changed; replacing it",
@@ -721,9 +739,9 @@ impl<'a> Session<'a> {
                 )),
                 Claim::Foreign(open) => {
                     if settings.dry_run {
-                        return Ok(Outcome::WouldPause);
+                        return Ok(Build::Done(Outcome::WouldPause));
                     }
-                    return pause(&api, settings, log, &open).await;
+                    return pause(api, settings, log, &open).await.map(Build::Done);
                 }
             }
         }
@@ -735,7 +753,7 @@ impl<'a> Session<'a> {
                     "--quiet",
                     "--force-create",
                     &settings.branch,
-                    &default_ref,
+                    default_ref,
                 ])
                 .await?;
             }
@@ -749,7 +767,7 @@ impl<'a> Session<'a> {
                     "--discard-changes",
                     "--force-create",
                     &settings.branch,
-                    &default_ref,
+                    default_ref,
                 ])
                 .await?;
                 git.run(["clean", "--quiet", "--force", "-d"]).await?;
@@ -786,7 +804,7 @@ impl<'a> Session<'a> {
         };
         // The tree the fixes left, to tell whether the update changed it.
         let fixed_tree = match &security {
-            Some(security) if security.is_recheckable() => Some(staged_tree(&git).await?),
+            Some(security) if security.is_recheckable() => Some(staged_tree(git).await?),
             _ => None,
         };
 
@@ -802,7 +820,7 @@ impl<'a> Session<'a> {
         // dependency back to a release an advisory affects, so the final
         // tree is audited again.
         if let (Some(security), Some(fixed_tree)) = (security.as_mut(), fixed_tree)
-            && staged_tree(&git).await? != fixed_tree
+            && staged_tree(git).await? != fixed_tree
         {
             let recheck = run_security_recheck(settings, log).await?;
             if !present::report_is_error_free(&recheck)? {
@@ -820,7 +838,7 @@ impl<'a> Session<'a> {
 
         git.run(["add", "--all"]).await?;
         let changed = !git.test(["diff", "--cached", "--quiet"]).await?;
-        let changed_paths = staged_paths(&git).await?;
+        let changed_paths = staged_paths(git).await?;
         let min_age = policy_min_age(settings);
         let merge_requests = settings.major_merge_requests_url();
         let lane = match settings.lane {
@@ -852,7 +870,10 @@ impl<'a> Session<'a> {
         )?;
 
         if !changed {
-            return close_obsolete(&api, &git, settings, log, &url, &expected_remote_sha).await;
+            return Ok(Build::Ready {
+                presentation: Box::new(presentation),
+                changed,
+            });
         }
 
         if !settings.validation_command.is_empty() {
@@ -875,6 +896,33 @@ impl<'a> Session<'a> {
             "upd-presentation.json",
             &presentation.to_artifact(),
         )?;
+        Ok(Build::Ready {
+            presentation: Box::new(presentation),
+            changed,
+        })
+    }
+
+    /// Publishes a built proposal: commits and lease-pushes the staged
+    /// change and opens or updates its merge request, or, when nothing
+    /// changed, closes the merge request the change made obsolete.
+    async fn publish(
+        &self,
+        presentation: Box<Presentation>,
+        changed: bool,
+    ) -> Result<Outcome, Error> {
+        let Self {
+            settings,
+            git,
+            log,
+            api,
+            url,
+            default_ref,
+            expected_remote_sha,
+        } = self;
+        if !changed {
+            return close_obsolete(api, git, settings, log, url, expected_remote_sha).await;
+        }
+
         let title = if settings.mr_title.is_empty() {
             presentation.title.clone()
         } else {
@@ -883,7 +931,7 @@ impl<'a> Session<'a> {
         // Rewriting an identical commit would only change its timestamps, yet
         // it restarts the merge request's pipeline and approvals.
         let pushed = expected_remote_sha.is_empty()
-            || !already_proposed(&git, settings, &default_ref, &expected_remote_sha).await?;
+            || !already_proposed(git, settings, default_ref, expected_remote_sha).await?;
         if settings.dry_run {
             return Ok(Outcome::WouldPublish {
                 title,
@@ -909,13 +957,13 @@ impl<'a> Session<'a> {
         // Unpushed, the same lease is a no-op that still proves the branch is
         // the commit this run inspected before the merge request is touched.
         if let Push::Stale(detail) = git
-            .push_with_lease(&url, &settings.branch, &expected_remote_sha, &commit)
+            .push_with_lease(url, &settings.branch, expected_remote_sha, &commit)
             .await?
         {
             return Err(lease_conflict(&settings.branch, &detail));
         }
 
-        let existing = single_open_merge_request(&api, settings).await?;
+        let existing = single_open_merge_request(api, settings).await?;
         let description = presentation.description(&commit);
         write_artifact(settings, "upd-mr-description.md", &description)?;
 
