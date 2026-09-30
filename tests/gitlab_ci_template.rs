@@ -134,6 +134,11 @@ struct Run {
     audit_exit: Option<i32>,
     audit_file: String,
     audit_content: String,
+    /// What the fake updater prints when asked to audit the updated tree
+    /// (empty selects a report with no advisories) and the exit status it
+    /// ends with.
+    recheck_report: String,
+    recheck_exit: Option<i32>,
 }
 
 impl Default for Run {
@@ -171,6 +176,8 @@ impl Default for Run {
             audit_exit: None,
             audit_file: String::new(),
             audit_content: String::new(),
+            recheck_report: String::new(),
+            recheck_exit: None,
         }
     }
 }
@@ -241,6 +248,16 @@ if [ -n "${UPD_GITLAB_TOKEN+set}" ]; then
   exit 9
 fi
 printf '%s\n' "$*" >> "$FAKE_UPD_ARGV_LOG"
+if [ "${1:-}" = audit ] && [ "${2:-}" != --fix-audit ]; then
+  if [ -s "${FAKE_RECHECK_REPORT_FILE:-}" ]; then
+    cat "$FAKE_RECHECK_REPORT_FILE"
+  else
+    cat <<JSON
+{"command":"audit","errors":[],"status":"complete","summary":{"errors":0,"packages_checked":1,"vulnerabilities":0,"vulnerable_packages":0},"vulnerabilities":[]}
+JSON
+  fi
+  exit "${FAKE_RECHECK_EXIT:-0}"
+fi
 if [ "${1:-}" = audit ]; then
   if [ -n "${FAKE_AUDIT_FILE:-}" ]; then
     mkdir -p "$(dirname "$FAKE_AUDIT_FILE")"
@@ -365,6 +382,8 @@ fi
         fs::write(&major_report_file, major).expect("fixture major report");
         let audit_report_file = self._temp.path().join("fake-upd-audit-report.json");
         fs::write(&audit_report_file, &run.audit_report).expect("fixture audit report");
+        let recheck_report_file = self._temp.path().join("fake-upd-recheck-report.json");
+        fs::write(&recheck_report_file, &run.recheck_report).expect("fixture recheck report");
         command
             .current_dir(&self.checkout)
             .env("UPD_GITLAB_TOKEN", "test-token")
@@ -408,6 +427,7 @@ fi
             .env("UPD_SECURITY_REMEDIATION", &run.security_remediation)
             .env("FAKE_AUDIT_REPORT_FILE", audit_report_file)
             .env("FAKE_AUDIT_CONTENT", &run.audit_content)
+            .env("FAKE_RECHECK_REPORT_FILE", recheck_report_file)
             .env("FIXTURE_REMOTE", &self.remote);
         if let Some(code) = run.upd_exit {
             command.env("FAKE_UPD_EXIT", code.to_string());
@@ -417,6 +437,9 @@ fi
         }
         if let Some(code) = run.audit_exit {
             command.env("FAKE_AUDIT_EXIT", code.to_string());
+        }
+        if let Some(code) = run.recheck_exit {
+            command.env("FAKE_RECHECK_EXIT", code.to_string());
         }
         if !run.audit_file.is_empty() {
             command.env("FAKE_AUDIT_FILE", &run.audit_file);
@@ -4154,6 +4177,289 @@ async fn golden_security_fix_pulling_in_a_young_release() {
         },
     )
     .await;
+}
+
+/// A run whose security step fixes `lodash` in `package.json` with its
+/// lockfile regenerated, whose update then changes `dependency.txt`, and
+/// whose audit of the updated tree prints `recheck`.
+fn recheck_run(recheck: String) -> Run {
+    Run {
+        lock: "true".to_string(),
+        audit_file: "package.json".to_string(),
+        audit_content: "lodash 4.17.21".to_string(),
+        audit_report: audit_report(
+            json!([
+                advisory("lodash", "4.17.20", "GHSA-35jh-r3h4-6jhm", "High"),
+                advisory("lodash", "4.17.20", "GHSA-29mw-wpgm-hmr9", "Medium"),
+            ]),
+            json!([{
+                "package": "lodash", "ecosystem": "npm", "from_version": "4.17.20", "to_version": "4.17.21",
+                "method": "manifest", "path": "package.json", "status": "applied",
+            }]),
+            0,
+        ),
+        recheck_report: recheck,
+        ..Run::default()
+    }
+}
+
+/// The audit of the updated tree, which the security step's own flags
+/// scope and nothing else: it neither fixes nor applies.
+const RECHECK_INVOCATION: &str = "audit --format json .";
+
+#[tokio::test]
+async fn an_update_that_moves_a_fixed_dependency_back_to_a_vulnerable_release_is_flagged() {
+    let server = MockServer::start().await;
+    let fixture = Fixture::new();
+    serve_ordinary_lane(&server).await;
+    let recheck = audit_report(
+        json!([advisory(
+            "lodash",
+            "4.17.22",
+            "GHSA-test-7x2q-reintroduced",
+            "High"
+        )]),
+        json!([]),
+        0,
+    );
+    let run = Run {
+        // The audit exits 6 when it finds a vulnerability; that is the
+        // finding, not a failure.
+        recheck_exit: Some(6),
+        ..recheck_run(recheck.clone())
+    };
+
+    let output = fixture.execute_upd(&server, &run, &["--output", "json"]);
+
+    let outcome = outcome_of(&output);
+    assert_eq!(outcome["outcome"], "published", "{outcome}");
+    assert_eq!(outcome["security"]["fixes"], 1, "{outcome}");
+    assert_eq!(outcome["security"]["reintroduced"], 1, "{outcome}");
+    // The fix's advisories no longer count as resolved.
+    assert_eq!(outcome["security"]["advisories"], 0, "{outcome}");
+    let invocations = fixture.updater_invocations();
+    assert_eq!(invocations.len(), 3, "{invocations:?}");
+    assert_eq!(invocations[2], RECHECK_INVOCATION);
+    assert_eq!(
+        fixture.artifact("upd-security-recheck.json").trim(),
+        recheck
+    );
+    let reason = "the dependency update moved lodash to 4.17.22, which GHSA-test-7x2q-reintroduced still affects";
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains(&format!(
+            "warning: lodash (fixed in package.json): {reason}"
+        )),
+        "{}",
+        describe(&output)
+    );
+    let requests = server.received_requests().await.unwrap();
+    let create = json_body(created_on(&requests, BRANCH));
+    assert_eq!(
+        create["title"], "fix(security): update vulnerable lodash and refresh dependencies",
+        "{create}"
+    );
+    let description = create["description"].as_str().unwrap();
+    assert!(description.contains(reason), "{description}");
+    assert!(
+        description.contains("**1 vulnerable again**"),
+        "{description}"
+    );
+}
+
+#[tokio::test]
+async fn an_update_that_keeps_a_fixed_dependency_safe_leaves_its_advisories_resolved() {
+    let server = MockServer::start().await;
+    let fixture = Fixture::new();
+    serve_ordinary_lane(&server).await;
+
+    let output = fixture.execute_upd(&server, &recheck_run(String::new()), &["--output", "json"]);
+
+    let outcome = outcome_of(&output);
+    assert_eq!(outcome["outcome"], "published", "{outcome}");
+    assert_eq!(outcome["security"]["advisories"], 2, "{outcome}");
+    assert!(
+        outcome["security"].get("reintroduced").is_none(),
+        "{outcome}"
+    );
+    // The recheck ran and found the tree clean.
+    let invocations = fixture.updater_invocations();
+    assert_eq!(invocations.len(), 3, "{invocations:?}");
+    assert_eq!(invocations[2], RECHECK_INVOCATION);
+    let requests = server.received_requests().await.unwrap();
+    let create = json_body(created_on(&requests, BRANCH));
+    assert_eq!(
+        create["title"], "fix(security): resolve 2 advisories and refresh dependencies",
+        "{create}"
+    );
+}
+
+#[tokio::test]
+async fn an_update_that_changes_nothing_is_not_audited_again() {
+    let server = MockServer::start().await;
+    let fixture = Fixture::new();
+    serve_ordinary_lane(&server).await;
+    let vulnerable = audit_report(
+        json!([advisory(
+            "lodash",
+            "4.17.22",
+            "GHSA-test-7x2q-reintroduced",
+            "High"
+        )]),
+        json!([]),
+        0,
+    );
+
+    let output = fixture.execute_upd(
+        &server,
+        &Run {
+            change: false,
+            ..recheck_run(vulnerable)
+        },
+        &["--output", "json"],
+    );
+
+    let outcome = outcome_of(&output);
+    assert_eq!(outcome["security"]["advisories"], 2, "{outcome}");
+    let invocations = fixture.updater_invocations();
+    assert_eq!(invocations.len(), 2, "{invocations:?}");
+    assert!(!invocations.iter().any(|line| line == RECHECK_INVOCATION));
+}
+
+#[tokio::test]
+async fn a_fix_awaiting_a_relock_is_not_undone_by_its_stale_lockfile() {
+    let server = MockServer::start().await;
+    let fixture = Fixture::new();
+    serve_ordinary_lane(&server).await;
+    // Until a relock the lockfile still records the vulnerable version the
+    // security step found; the update did not put it there.
+    let stale = audit_report(
+        json!([advisory("lodash", "4.17.20", "GHSA-35jh-r3h4-6jhm", "High")]),
+        json!([]),
+        0,
+    );
+
+    let output = fixture.execute_upd(
+        &server,
+        &Run {
+            change: true,
+            recheck_report: stale,
+            recheck_exit: Some(6),
+            ..security_fix_run()
+        },
+        &["--output", "json"],
+    );
+
+    let outcome = outcome_of(&output);
+    assert_eq!(outcome["security"]["pending_relock"], 1, "{outcome}");
+    assert_eq!(outcome["security"]["advisories"], 1, "{outcome}");
+    assert!(
+        outcome["security"].get("reintroduced").is_none(),
+        "{outcome}"
+    );
+    let invocations = fixture.updater_invocations();
+    assert_eq!(invocations.len(), 3, "{invocations:?}");
+    assert_eq!(invocations[2], RECHECK_INVOCATION);
+}
+
+#[tokio::test]
+async fn an_audit_of_the_updated_tree_with_errors_is_refused() {
+    let server = MockServer::start().await;
+    let fixture = Fixture::new();
+
+    let output = fixture.execute(&server, &recheck_run(audit_report(json!([]), json!([]), 1)));
+
+    assert!(failed_with(&output, 2), "{}", describe(&output));
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("while auditing the updated tree"),
+        "{}",
+        describe(&output)
+    );
+    assert_eq!(fixture.updater_invocations().len(), 3);
+    assert_eq!(fixture.remote_tip(), None);
+}
+
+/// A fixed dependency the update moved back to a vulnerable release is
+/// listed for review, and the merge request is still published.
+#[tokio::test]
+async fn golden_security_fix_the_update_moved_back() {
+    assert_rendering_matches_golden(
+        "security-reintroduced",
+        recheck_run(
+            fs::read_to_string(
+                Path::new(GOLDEN_DIR)
+                    .join("security-reintroduced")
+                    .join("recheck.json"),
+            )
+            .expect("golden case recheck report"),
+        ),
+    )
+    .await;
+}
+
+/// What the security step's cooldown check could not verify.
+const FIX_AUDIT_WARNING: &str = "package-lock.json: companion 1.0.0 could not be checked against the 7d cooldown (the registry lookup failed)";
+/// What the audit of the updated tree could not check.
+const RECHECK_WARNING: &str =
+    "yarn.lock: the lockfile could not be parsed, so its dependencies were not audited";
+
+/// A security fix whose audit, and the audit after the update, each report
+/// something they could not check; the recheck repeats the fix audit's.
+fn warned_run() -> Run {
+    let mut recheck: serde_json::Value =
+        serde_json::from_str(&audit_report(json!([]), json!([]), 0)).unwrap();
+    recheck["warnings"] = json!([FIX_AUDIT_WARNING, RECHECK_WARNING]);
+    let run = recheck_run(recheck.to_string());
+    let mut report: serde_json::Value = serde_json::from_str(&run.audit_report).unwrap();
+    report["warnings"] = json!([FIX_AUDIT_WARNING]);
+    Run {
+        audit_report: report.to_string(),
+        ..run
+    }
+}
+
+#[tokio::test]
+async fn what_the_security_audits_could_not_check_is_logged_and_listed_for_review() {
+    let server = MockServer::start().await;
+    let fixture = Fixture::new();
+    serve_ordinary_lane(&server).await;
+
+    let output = fixture.execute_upd(&server, &warned_run(), &["--output", "json"]);
+
+    let outcome = outcome_of(&output);
+    assert_eq!(outcome["outcome"], "published", "{outcome}");
+    assert_eq!(outcome["security"]["audit_warnings"], 2, "{outcome}");
+    // A warning is a gap in the check, not a vulnerability.
+    assert_eq!(outcome["security"]["advisories"], 2, "{outcome}");
+    let log = String::from_utf8_lossy(&output.stderr);
+    for warning in [FIX_AUDIT_WARNING, RECHECK_WARNING] {
+        assert_eq!(
+            log.matches(&format!("warning: {warning}")).count(),
+            1,
+            "{}",
+            describe(&output)
+        );
+    }
+    let requests = server.received_requests().await.unwrap();
+    let description = json_body(created_on(&requests, BRANCH))["description"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let attention = &description[description
+        .find("### Needs attention")
+        .expect("a Needs attention section")..];
+    for warning in [FIX_AUDIT_WARNING, RECHECK_WARNING] {
+        assert_eq!(
+            attention.matches(&format!("- {warning}")).count(),
+            1,
+            "{description}"
+        );
+    }
+}
+
+/// What the security audits could not check is listed for review.
+#[tokio::test]
+async fn golden_security_audit_warnings() {
+    assert_rendering_matches_golden("security-audit-warnings", warned_run()).await;
 }
 
 #[tokio::test]

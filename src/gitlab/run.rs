@@ -766,7 +766,7 @@ impl<'a> Session<'a> {
             ));
         }
 
-        let security = if settings.security_remediation {
+        let mut security = if settings.security_remediation {
             let report = run_security_fixes(settings, log).await?;
             let security = Security::from_report(&report, settings.lock)?;
             log.line(security.summary_line(&report)?);
@@ -784,6 +784,11 @@ impl<'a> Session<'a> {
         } else {
             None
         };
+        // The tree the fixes left, to tell whether the update changed it.
+        let fixed_tree = match &security {
+            Some(security) if security.is_recheckable() => Some(staged_tree(&git).await?),
+            _ => None,
+        };
 
         let report = run_updater(settings, log).await?;
         log.line(present::summary_line(&report)?);
@@ -791,6 +796,26 @@ impl<'a> Session<'a> {
             return Err(Error::Refused(
                 "upd reported errors; refusing to publish a partial result".to_string(),
             ));
+        }
+
+        // An update that changed the tree the fixes left can move a fixed
+        // dependency back to a release an advisory affects, so the final
+        // tree is audited again.
+        if let (Some(security), Some(fixed_tree)) = (security.as_mut(), fixed_tree)
+            && staged_tree(&git).await? != fixed_tree
+        {
+            let recheck = run_security_recheck(settings, log).await?;
+            if !present::report_is_error_free(&recheck)? {
+                return Err(Error::Refused(
+                    "upd reported errors while auditing the updated tree; refusing to publish a partial result"
+                        .to_string(),
+                ));
+            }
+            security.apply_recheck(&recheck)?;
+            for warning in security.recheck_warnings() {
+                log.line(warning);
+            }
+            *counts = Some(security.counts);
         }
 
         git.run(["add", "--all"]).await?;
@@ -1247,6 +1272,45 @@ async fn run_security_fixes(settings: &Settings, log: &Log) -> Result<Value, Err
         },
     )
     .await
+}
+
+/// Audits the tree the update left, read-only, over the scope the security
+/// step covered.
+async fn run_security_recheck(settings: &Settings, log: &Log) -> Result<Value, Error> {
+    let mut args: Vec<&str> = vec!["audit", "--format", "json"];
+    let config = settings
+        .config
+        .as_ref()
+        .map(|path| path.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    for (flag, value) in [
+        ("--config", config.as_str()),
+        ("--lang", &settings.langs),
+        ("--exclude-lang", &settings.exclude_langs),
+    ] {
+        if !value.is_empty() {
+            args.extend([flag, value]);
+        }
+    }
+    args.extend(settings.paths.iter().map(String::as_str));
+    // Exit 6 is the finding this audit looks for, not a failure.
+    invoke_updater(
+        settings,
+        log,
+        &args,
+        Invocation {
+            artifact: "upd-security-recheck.json",
+            accepted: &[0, 6],
+            failed: "the updater failed while auditing the updated tree",
+        },
+    )
+    .await
+}
+
+/// Stages every change and names the tree the index then records.
+async fn staged_tree(git: &Git) -> Result<String, Error> {
+    git.run(["add", "--all"]).await?;
+    git.read(["write-tree"]).await
 }
 
 /// How one updater command is run and judged.

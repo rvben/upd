@@ -1,0 +1,9 @@
+{
+  "command": "audit",
+  "status": "complete",
+  "vulnerabilities": [
+    {"package": "lodash", "version": "4.17.22", "ecosystem": "npm", "id": "GHSA-test-7x2q-reintroduced", "summary": "Prototype pollution in lodash", "severity": "High", "fixed_version": "4.17.23", "url": "https://osv.dev/vulnerability/GHSA-test-7x2q-reintroduced", "aliases": [], "source": "GHSA"}
+  ],
+  "errors": [],
+  "summary": {"packages_checked": 12, "vulnerable_packages": 1, "vulnerabilities": 1, "errors": 0}
+}

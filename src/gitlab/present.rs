@@ -452,17 +452,61 @@ impl Presentation {
             .map_or(0, |security| security.counts.young)
     }
 
-    /// The header's pointer to the young releases a fix's relock locked,
-    /// starting with its separating space; empty when there are none.
-    fn young_note(&self) -> String {
-        let young = self.young_releases();
-        if young == 0 {
-            return String::new();
+    /// Fixed dependencies the update moved back to a vulnerable release.
+    fn reintroduced(&self) -> usize {
+        self.security
+            .as_ref()
+            .map_or(0, |security| security.counts.reintroduced)
+    }
+
+    /// Warnings the security audits reported about what they could not
+    /// check.
+    fn audit_warnings(&self) -> usize {
+        self.security
+            .as_ref()
+            .map_or(0, |security| security.counts.audit_warnings)
+    }
+
+    /// Advisories no release resolves, listed apart from Needs attention.
+    fn unfixable(&self) -> usize {
+        self.security
+            .as_ref()
+            .map_or(0, |security| security.counts.unfixable)
+    }
+
+    /// Security findings listed under Needs attention beside the blocked
+    /// decisions.
+    fn security_attention(&self) -> usize {
+        self.young_releases() + self.reintroduced() + self.audit_warnings()
+    }
+
+    /// The header's pointers to the security findings listed under Needs
+    /// attention, each starting with its separating space; empty when there
+    /// are none.
+    fn attention_note(&self) -> String {
+        let mut note = String::new();
+        let reintroduced = self.reintroduced();
+        if reintroduced > 0 {
+            note.push_str(&format!(
+                " The dependency update moved {reintroduced} fixed {} back to a vulnerable release, listed under Needs attention.",
+                plural(reintroduced, "dependency", "dependencies"),
+            ));
         }
-        format!(
-            " A fix's relock also locked {young} {} inside the freshness window, listed under Needs attention.",
-            plural(young, "release", "releases"),
-        )
+        let young = self.young_releases();
+        if young > 0 {
+            note.push_str(&format!(
+                " A fix's relock also locked {young} {} inside the freshness window, listed under Needs attention.",
+                plural(young, "release", "releases"),
+            ));
+        }
+        let warnings = self.audit_warnings();
+        if warnings > 0 {
+            note.push_str(&format!(
+                " The security audits reported {warnings} {} about what they could not check, listed under Needs attention.",
+                plural(warnings, "warning", "warnings"),
+            ));
+        }
+        note
     }
 
     /// The merge-request description proposing `commit`: the full review
@@ -625,7 +669,7 @@ impl Presentation {
                 self.files_phrase(),
                 self.validation_phrase(),
                 self.version_boundary(),
-                self.young_note(),
+                self.attention_note(),
             );
         }
         if counts.blocked > 0 {
@@ -636,15 +680,16 @@ impl Presentation {
                 self.validation_phrase(),
                 counts.blocked,
                 plural(counts.blocked, "dependency", "dependencies"),
-                self.young_note(),
+                self.attention_note(),
             )
         } else {
             format!(
-                "> **A tidy upgrade, already prepared.** upd prepared {} across {} and {}. {}",
+                "> **A tidy upgrade, already prepared.** upd prepared {} across {} and {}. {}{}",
                 self.result_summary(),
                 self.files_phrase(),
                 self.validation_phrase(),
                 self.version_boundary(),
+                self.attention_note(),
             )
         }
     }
@@ -685,14 +730,22 @@ impl Presentation {
                 plural(counts.blocked, "needs", "need")
             ));
         }
+        let reintroduced = self.reintroduced();
+        if reintroduced > 0 {
+            facts.push(format!("{reintroduced} vulnerable again"));
+        }
         let young = self.young_releases();
         if young > 0 {
             facts.push(format!("{young} inside the freshness window"));
         }
-        let unfixable = self
-            .security
-            .as_ref()
-            .map_or(0, |security| security.counts.unfixable);
+        let warnings = self.audit_warnings();
+        if warnings > 0 {
+            facts.push(format!(
+                "{warnings} security audit {}",
+                plural(warnings, "warning", "warnings")
+            ));
+        }
+        let unfixable = self.unfixable();
         if unfixable > 0 {
             facts.push(format!("{unfixable} without a fix"));
         }
@@ -887,7 +940,14 @@ impl Presentation {
         let young = self
             .security
             .as_ref()
-            .map(Security::young_section)
+            .map(|security| {
+                format!(
+                    "{}{}{}",
+                    security.reintroduced_section(),
+                    security.young_section(),
+                    security.audit_warnings_section()
+                )
+            })
             .unwrap_or_default();
         if blocked == 0 {
             return if young.is_empty() {
@@ -974,8 +1034,12 @@ impl Presentation {
     fn confidence(&self) -> String {
         let counts = &self.counts;
         let configured = self.validation.repository_command_configured;
+        // An advisory no release resolves leaves the tree vulnerable, however
+        // clean the rest of the change is.
+        let unfixable = self.unfixable();
         let heading = if counts.blocked == 0
-            && self.young_releases() == 0
+            && self.security_attention() == 0
+            && unfixable == 0
             && counts.updates_major == 0
             && configured
         {
@@ -1088,7 +1152,7 @@ impl Presentation {
             counts.updates_major,
             counts.normalized,
             counts.policy_holds,
-            counts.blocked + self.young_releases(),
+            counts.blocked + self.security_attention(),
         )
     }
 }
@@ -1861,5 +1925,51 @@ mod tests {
             true,
         );
         assert_eq!(title, "chore(deps): refresh example to 1.1.0");
+    }
+
+    /// The verification heading of a validated refresh whose security step
+    /// found `fixes` for the advisory in `gone`.
+    fn validated_heading(fixes: Value) -> String {
+        let security = Security::from_report(
+            &json!({"vulnerabilities": [advisory("gone", "GHSA-1")], "fixes": fixes}),
+            true,
+        )
+        .unwrap();
+        let context = Context {
+            min_age: "7d",
+            max_bump: "minor",
+            lock: false,
+            auto_merge: false,
+            validation_configured: true,
+            changed: true,
+            changed_paths: &["dependency.txt".to_string()],
+            lane: Lane::Ordinary,
+            security: Some(&security),
+        };
+        let files = json!([{"path": "dependency.txt", "updates": [
+            {"package": "example", "current": "1.0.0", "latest": "1.0.1", "bump": "patch"}
+        ]}]);
+        let presentation =
+            Presentation::from_report(&json!({"files": files, "summary": {}}), &context).unwrap();
+        presentation
+            .confidence()
+            .lines()
+            .next()
+            .unwrap()
+            .to_string()
+    }
+
+    #[test]
+    fn an_advisory_without_a_fix_is_not_a_comfortable_review() {
+        assert_eq!(
+            validated_heading(json!([
+                {"package": "gone", "from_version": "1.0.0", "status": "unfixable"}
+            ])),
+            "### What upd verified"
+        );
+        assert_eq!(
+            validated_heading(json!([applied("gone")])),
+            "### Why this is a comfortable review"
+        );
     }
 }

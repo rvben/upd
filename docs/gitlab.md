@@ -220,6 +220,25 @@ relocked lockfile back against `min_age`, and lists every release it finds
 inside the freshness window, other than the fixes themselves, under "Needs
 attention". upd leaves them locked, since holding one back could undo the fix.
 
+The update runs after the fixes and can move a fixed dependency again. When
+it changes the tree the fixes left, upd audits the result once more, over the
+same paths and languages. A fixed dependency that audit finds vulnerable again
+is listed under "Needs attention" with the release it moved to, the
+advisories that affect it and the files the security step fixed it in (that
+audit does not say which lockfile holds the release), and its advisories no
+longer count as resolved;
+the merge request is still published. For a fix that awaits lockfile
+regeneration, the vulnerable version the security step found is not flagged
+again, since a lockfile left as it was still records it. An
+audit of the updated tree that reports errors stops the run, as a security
+report with errors does.
+
+A security audit can also report something it could not check, such as a
+release a fix's relock locked whose age the registry could not tell. Each such
+warning, from the security step or from the audit of the updated tree, is
+printed to the job log and listed under "Needs attention", since what it names
+was not verified.
+
 With `lock: false`, a fix rewrites the manifest only and is marked as awaiting
 lockfile regeneration: until a lockfile is regenerated it still records the
 vulnerable version. A fix that can only be made in a lockfile (a Cargo
@@ -234,7 +253,8 @@ security fix that fails, or a security report with errors, stops it before the
 update, since publishing a partial result would hide the gap.
 
 The security report is kept beside the update report as
-`.upd-ci/upd-security-report.json`. Set `security_remediation: false` to leave
+`.upd-ci/upd-security-report.json`, and the audit after the update as
+`.upd-ci/upd-security-recheck.json`. Set `security_remediation: false` to leave
 advisories to another process.
 
 ## Auto-merge
@@ -368,7 +388,9 @@ place of the last three. When the security step ran, the JSON object also
 carries `security` with the number of `fixes`, `pending_relock`, `blocked`,
 `skipped`, `not_applied` and `unfixable` entries and of `advisories` resolved,
 plus `young`, the releases a fix's relock locked inside the freshness window,
-when there are any.
+`reintroduced`, the fixed dependencies the update moved back to a
+vulnerable release, and `audit_warnings`, the warnings the security audits
+reported about what they could not check, each when there are any.
 With the major lane enabled, its result follows on a second line of text, or
 under `major` in the JSON object with the same fields. A lane that failed
 reports the outcome `failed` with its `error` (`kind`, `message`, `exit_code`)

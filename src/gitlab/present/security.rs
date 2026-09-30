@@ -24,6 +24,9 @@ use super::{
 /// lockfile was regenerated.
 const FIXED: [&str; 2] = ["applied", "pending_relock"];
 
+/// The release a fix row shows when its report names none.
+const UNNAMED_FLOOR: &str = "resolved lockfile floor";
+
 fn is_zero(count: &usize) -> bool {
     *count == 0
 }
@@ -55,6 +58,24 @@ pub struct UnfixableRow {
     pub reason: String,
 }
 
+/// A fixed dependency the audit after the update found vulnerable again.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct ReintroducedRow {
+    pub package: String,
+    /// The OSV ecosystem, which tells the package apart from a same-named
+    /// one in another ecosystem.
+    #[serde(skip)]
+    pub ecosystem: String,
+    pub version: String,
+    pub advisories: Vec<String>,
+    pub severity: String,
+    pub reason: String,
+    /// The files the security step fixed the dependency in. The audit of
+    /// the updated tree names no file, so these are where to look, not
+    /// where the vulnerable release is locked.
+    pub fixed_in: Vec<String>,
+}
+
 /// A release a fix's relock locked besides the fix, published inside the
 /// cooldown. It stays locked, since holding it back could undo the fix.
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -83,6 +104,13 @@ pub struct SecurityCounts {
     /// there are none.
     #[serde(skip_serializing_if = "is_zero")]
     pub young: usize,
+    /// Fixed dependencies the update moved back to a release an advisory
+    /// affects; absent when there are none.
+    #[serde(skip_serializing_if = "is_zero")]
+    pub reintroduced: usize,
+    /// Warnings the security audits reported; absent when there are none.
+    #[serde(skip_serializing_if = "is_zero")]
+    pub audit_warnings: usize,
 }
 
 /// The security step's part of the review model.
@@ -93,15 +121,44 @@ pub struct Security {
     /// Absent when no fix's relock locked a release inside the cooldown.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub young: Vec<YoungRow>,
+    /// Absent unless the audit after the update found a fixed dependency
+    /// vulnerable again.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub reintroduced: Vec<ReintroducedRow>,
+    /// What the audit applying the fixes, and the audit after the update,
+    /// could not check, such as a release a fix's relock locked whose age
+    /// the registry would not give. Absent when both checked everything.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub audit_warnings: Vec<String>,
     pub counts: SecurityCounts,
     /// Fixes a requirement blocked, lockfile regeneration being off
     /// skipped, or upd could not write; the presentation lists them with
     /// everything else that needs attention.
     #[serde(skip)]
     pub attention: Vec<BlockedRow>,
+    /// Packages, by ecosystem, with at least one occurrence left
+    /// vulnerable.
+    #[serde(skip)]
+    open: BTreeSet<(String, String)>,
+    /// The vulnerable versions the security step found, by ecosystem and
+    /// package: what a lockfile awaiting regeneration still records.
+    #[serde(skip)]
+    audited: BTreeMap<(String, String), BTreeSet<String>>,
     /// Packages every fix for which applied, in order.
     #[serde(skip)]
     resolved: Vec<String>,
+    /// How many of `audit_warnings` the audit applying the fixes reported;
+    /// the rest came from the audit after the update.
+    #[serde(skip)]
+    fix_audit_warnings: usize,
+}
+
+/// The warnings an audit report lists, cleaned for display.
+fn report_warnings(report: &Value) -> Shaped<Vec<String>> {
+    Ok(each_or_empty(field(report, "warnings")?)?
+        .into_iter()
+        .map(|warning| clean_or(warning, UNKNOWN, 400))
+        .collect())
 }
 
 impl Security {
@@ -138,7 +195,7 @@ impl Security {
                 fixed if FIXED.contains(&fixed) || (lock && fixed == "already_satisfied") => {
                     let (ids, severity) = lookup(&ecosystem, &package);
                     fixes.push(SecurityFixRow {
-                        to: clean_or(field(fix, "to_version")?, "resolved lockfile floor", 160),
+                        to: clean_or(field(fix, "to_version")?, UNNAMED_FLOOR, 160),
                         package,
                         ecosystem,
                         from,
@@ -255,15 +312,8 @@ impl Security {
             )
         });
 
-        let resolved_rows = || {
-            fixes
-                .iter()
-                .filter(|row| !open.contains(&(row.ecosystem.clone(), row.package.clone())))
-        };
-        let advisories: BTreeSet<&String> =
-            resolved_rows().flat_map(|row| &row.advisories).collect();
-        let mut resolved: Vec<String> = resolved_rows().map(|row| row.package.clone()).collect();
-        resolved.dedup();
+        let mut audit_warnings = report_warnings(report)?;
+        unique_by(&mut audit_warnings, Clone::clone);
         let counts = SecurityCounts {
             fixes: fixes.len(),
             pending_relock: fixes
@@ -274,17 +324,167 @@ impl Security {
             skipped,
             not_applied,
             unfixable: unfixable.len(),
-            advisories: advisories.len(),
+            advisories: 0,
             young: young.len(),
+            reintroduced: 0,
+            audit_warnings: audit_warnings.len(),
         };
-        Ok(Self {
+        let mut security = Self {
             fixes,
             unfixable,
             young,
+            reintroduced: Vec::new(),
+            fix_audit_warnings: audit_warnings.len(),
+            audit_warnings,
             counts,
             attention,
-            resolved,
+            open,
+            audited: vulnerable_versions(report)?,
+            resolved: Vec::new(),
+        };
+        security.tally_resolved();
+        Ok(security)
+    }
+
+    /// Recomputes the resolved packages and their advisory count from the
+    /// fixes and the packages left open.
+    fn tally_resolved(&mut self) {
+        let resolved_rows = || {
+            self.fixes.iter().filter(|row| {
+                !self
+                    .open
+                    .contains(&(row.ecosystem.clone(), row.package.clone()))
+            })
+        };
+        let advisories: BTreeSet<&String> =
+            resolved_rows().flat_map(|row| &row.advisories).collect();
+        let advisories = advisories.len();
+        let mut resolved: Vec<String> = resolved_rows().map(|row| row.package.clone()).collect();
+        resolved.dedup();
+        self.counts.advisories = advisories;
+        self.resolved = resolved;
+    }
+
+    /// Resolved fixes, the ones an audit of the final tree can confirm.
+    fn confirmable(&self) -> impl Iterator<Item = &SecurityFixRow> {
+        self.fixes.iter().filter(|row| {
+            !self
+                .open
+                .contains(&(row.ecosystem.clone(), row.package.clone()))
         })
+    }
+
+    /// Whether any resolved fix is worth re-auditing once the update has
+    /// changed the tree.
+    pub fn is_recheckable(&self) -> bool {
+        self.confirmable().next().is_some()
+    }
+
+    /// Reads the report `upd audit --format json` printed for the final
+    /// tree. A resolved fix it still finds vulnerable was moved back by the
+    /// update: it is listed for attention, and its advisories no longer
+    /// count as resolved.
+    pub fn apply_recheck(&mut self, report: &Value) -> Shaped<()> {
+        // Vulnerable versions and their advisories, by ecosystem and package.
+        let mut found: BTreeMap<(String, String), BTreeMap<String, Advisories>> = BTreeMap::new();
+        for vulnerability in each_or_empty(field(report, "vulnerabilities")?)? {
+            let package = clean_or(field(vulnerability, "package")?, UNKNOWN_DEPENDENCY, 160);
+            let ecosystem = clean_or(field(vulnerability, "ecosystem")?, "", 32);
+            let version = clean_or(field(vulnerability, "version")?, UNKNOWN, 160);
+            let entry = found
+                .entry((ecosystem, package))
+                .or_default()
+                .entry(version)
+                .or_default();
+            entry
+                .ids
+                .insert(clean_or(field(vulnerability, "id")?, UNKNOWN, 80));
+            let severity = Severity::of(field(vulnerability, "severity")?);
+            if severity > entry.severity {
+                entry.severity = severity;
+            }
+        }
+        let mut reintroduced = Vec::new();
+        let mut reopened = BTreeSet::new();
+        for row in self.confirmable() {
+            let key = (row.ecosystem.clone(), row.package.clone());
+            let Some(versions) = found.get(&key) else {
+                continue;
+            };
+            // A fix awaiting lockfile regeneration leaves its lockfile at the
+            // vulnerable version the security step found, whatever the
+            // update did; only another vulnerable version is the update's.
+            let stale = self.fixes.iter().any(|fix| {
+                (fix.ecosystem.clone(), fix.package.clone()) == key
+                    && fix.status == "pending_relock"
+            });
+            for (version, advisories) in versions {
+                if stale
+                    && self
+                        .audited
+                        .get(&key)
+                        .is_some_and(|audited| audited.contains(version))
+                {
+                    continue;
+                }
+                let ids: Vec<String> = advisories.ids.iter().cloned().collect();
+                // The update moved it only when every fix names its release
+                // and none named this one.
+                let moved = self
+                    .fixes
+                    .iter()
+                    .filter(|fix| (fix.ecosystem.clone(), fix.package.clone()) == key)
+                    .all(|fix| fix.to != UNNAMED_FLOOR && &fix.to != version);
+                let reason = if !moved {
+                    format!(
+                        "after the dependency update, the audit finds {} {version} still affected by {}",
+                        row.package,
+                        ids.join(", ")
+                    )
+                } else {
+                    format!(
+                        "the dependency update moved {} to {version}, which {} still {}",
+                        row.package,
+                        ids.join(", "),
+                        plural(ids.len(), "affects", "affect")
+                    )
+                };
+                let fixed_in: BTreeSet<String> = self
+                    .fixes
+                    .iter()
+                    .filter(|fix| (fix.ecosystem.clone(), fix.package.clone()) == key)
+                    .map(|fix| fix.path.clone())
+                    .collect();
+                reopened.insert(key.clone());
+                reintroduced.push(ReintroducedRow {
+                    package: row.package.clone(),
+                    ecosystem: row.ecosystem.clone(),
+                    version: version.clone(),
+                    advisories: ids,
+                    severity: advisories.severity.label(),
+                    reason,
+                    fixed_in: fixed_in.into_iter().collect(),
+                });
+            }
+        }
+        unique_by(&mut reintroduced, |row| {
+            (
+                row.package.clone(),
+                row.ecosystem.clone(),
+                row.version.clone(),
+            )
+        });
+        self.open.extend(reopened);
+        self.reintroduced = reintroduced;
+        self.counts.reintroduced = self.reintroduced.len();
+        for warning in report_warnings(report)? {
+            if !self.audit_warnings.contains(&warning) {
+                self.audit_warnings.push(warning);
+            }
+        }
+        self.counts.audit_warnings = self.audit_warnings.len();
+        self.tally_resolved();
+        Ok(())
     }
 
     /// Whether the step found anything to report.
@@ -293,6 +493,7 @@ impl Security {
             && self.unfixable.is_empty()
             && self.attention.is_empty()
             && self.young.is_empty()
+            && self.reintroduced.is_empty()
     }
 
     /// Distinct packages the fixes moved, in order.
@@ -320,8 +521,21 @@ impl Security {
         } else {
             String::new()
         };
+        let reintroduced = if counts.reintroduced > 0 {
+            format!(
+                "- Vulnerable again after the dependency update: {}\n",
+                counts.reintroduced
+            )
+        } else {
+            String::new()
+        };
+        let audit_warnings = if counts.audit_warnings > 0 {
+            format!("- Security audit warnings: {}\n", counts.audit_warnings)
+        } else {
+            String::new()
+        };
         format!(
-            "- Security fixes: {} ({} awaiting lockfile regeneration)\n- Advisories resolved: {}\n- Advisories without a fix: {}\n{young}",
+            "- Security fixes: {} ({} awaiting lockfile regeneration)\n- Advisories resolved: {}\n- Advisories without a fix: {}\n{reintroduced}{young}{audit_warnings}",
             counts.fixes, counts.pending_relock, counts.advisories, counts.unfixable,
         )
     }
@@ -364,7 +578,88 @@ impl Security {
                 row.lockfile, row.package, row.version, row.published_at, row.cooldown
             )
         });
-        attention.chain(unfixable).chain(young).collect()
+        let audit = self.audit_warnings[..self.fix_audit_warnings]
+            .iter()
+            .map(|warning| format!("warning: {warning}"));
+        attention
+            .chain(unfixable)
+            .chain(young)
+            .chain(audit)
+            .collect()
+    }
+
+    /// A job-log warning for each fixed dependency the update moved back to
+    /// a vulnerable release, and for each new warning the audit after the
+    /// update reported.
+    pub fn recheck_warnings(&self) -> Vec<String> {
+        let reintroduced = self.reintroduced.iter().map(|row| {
+            format!(
+                "warning: {} (fixed in {}): {}",
+                row.package,
+                row.fixed_in.join(", "),
+                row.reason
+            )
+        });
+        let audit = self.audit_warnings[self.fix_audit_warnings..]
+            .iter()
+            .map(|warning| format!("warning: {warning}"));
+        reintroduced.chain(audit).collect()
+    }
+
+    /// The part of Needs attention for what the security audits could not
+    /// check, starting with its separating blank line; empty when they
+    /// checked everything.
+    pub fn audit_warnings_section(&self) -> String {
+        if self.audit_warnings.is_empty() {
+            return String::new();
+        }
+        let mut out = String::from(
+            "\n\n> The security audits could not check everything; what these warnings name was not verified. Review it before merging.\n\n",
+        );
+        out.push_str(&table(&self.audit_warnings, 12, |warning| {
+            format!("- {}", md(warning))
+        }));
+        if self.audit_warnings.len() > 12 {
+            out.push_str(&format!(
+                "\n\n_{} more security audit warnings are preserved in the pipeline artifact._",
+                self.audit_warnings.len() - 12
+            ));
+        }
+        out
+    }
+
+    /// The part of Needs attention for fixed dependencies the update moved
+    /// back to a vulnerable release, starting with its separating blank
+    /// line; empty when there are none.
+    pub fn reintroduced_section(&self) -> String {
+        if self.reintroduced.is_empty() {
+            return String::new();
+        }
+        let mut out = String::from(
+            "\n\n> The security step fixed these dependencies, but after the dependency update an audit finds them vulnerable again, so their advisories are not counted as resolved. Review them before merging; Fixed in names the files the security step changed, since the audit does not say which lockfile holds the release.\n\n| Dependency | Version | Advisories | Severity | Reason | Fixed in |\n|---|---:|---|---|---|---|\n",
+        );
+        out.push_str(&table(&self.reintroduced, 12, |row| {
+            format!(
+                "| {} | {} | {} | {} | {} | {} |",
+                code(&row.package),
+                code(&row.version),
+                advisory_cell(&row.advisories),
+                md(&row.severity),
+                md(&row.reason),
+                row.fixed_in
+                    .iter()
+                    .map(|path| code(path))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        }));
+        if self.reintroduced.len() > 12 {
+            out.push_str(&format!(
+                "\n\n_{} more dependencies vulnerable again are preserved in the pipeline artifact._",
+                self.reintroduced.len() - 12
+            ));
+        }
+        out
     }
 
     /// The part of Needs attention for releases the fixes' relocks locked
@@ -511,6 +806,21 @@ impl Severity {
 struct Advisories {
     ids: BTreeSet<String>,
     severity: Severity,
+}
+
+/// The vulnerable versions a report names, keyed by ecosystem and package.
+fn vulnerable_versions(report: &Value) -> Shaped<BTreeMap<(String, String), BTreeSet<String>>> {
+    let mut by_package: BTreeMap<(String, String), BTreeSet<String>> = BTreeMap::new();
+    for vulnerability in each_or_empty(field(report, "vulnerabilities")?)? {
+        by_package
+            .entry((
+                clean_or(field(vulnerability, "ecosystem")?, "", 32),
+                clean_or(field(vulnerability, "package")?, UNKNOWN_DEPENDENCY, 160),
+            ))
+            .or_default()
+            .insert(clean_or(field(vulnerability, "version")?, UNKNOWN, 160));
+    }
+    Ok(by_package)
 }
 
 /// Advisories keyed by ecosystem and package, the identity a fix entry
@@ -743,7 +1053,9 @@ mod tests {
         assert!(!security.is_empty());
         assert_eq!(
             security.warnings(),
-            ["warning: package-lock.json locks newdep 1.0.0, released 2026-09-29T08:00:00Z, inside the 7d cooldown; a security fix's relock locked it"]
+            [
+                "warning: package-lock.json locks newdep 1.0.0, released 2026-09-29T08:00:00Z, inside the 7d cooldown; a security fix's relock locked it"
+            ]
         );
     }
 
@@ -890,5 +1202,314 @@ mod tests {
     fn a_fixes_list_that_is_not_an_array_is_a_shape_error() {
         assert!(Security::from_report(&json!({"fixes": "none"}), true).is_err());
         assert!(Security::from_report(&json!({"fixes": [], "vulnerabilities": 3}), true).is_err());
+    }
+
+    fn recheck(vulnerabilities: Value) -> Value {
+        json!({"vulnerabilities": vulnerabilities, "summary": {"errors": 0}})
+    }
+
+    fn found(package: &str, version: &str, ecosystem: &str, id: &str) -> Value {
+        json!({"package": package, "version": version, "ecosystem": ecosystem, "id": id, "severity": "High"})
+    }
+
+    #[test]
+    fn a_fixed_dependency_the_update_moved_to_an_affected_release_is_reintroduced() {
+        let mut security = read(
+            json!([
+                vulnerability("lodash", "GHSA-1", "High"),
+                vulnerability("semver", "GHSA-2", "Low"),
+            ]),
+            json!([
+                fix("lodash", "4.17.21", "package.json", "applied"),
+                fix("semver", "7.5.2", "package.json", "applied"),
+            ]),
+        );
+        assert!(security.is_recheckable());
+        assert_eq!(security.counts.advisories, 2);
+
+        security
+            .apply_recheck(&recheck(json!([found(
+                "lodash", "4.17.22", "npm", "GHSA-9"
+            )])))
+            .unwrap();
+
+        assert_eq!(security.counts.reintroduced, 1);
+        assert_eq!(security.counts.advisories, 1);
+        assert_eq!(security.resolved_packages(), ["semver"]);
+        assert_eq!(
+            security.reintroduced,
+            [ReintroducedRow {
+                package: "lodash".to_string(),
+                version: "4.17.22".to_string(),
+                advisories: vec!["GHSA-9".to_string()],
+                severity: "High".to_string(),
+                reason: "the dependency update moved lodash to 4.17.22, which GHSA-9 still affects"
+                    .to_string(),
+                fixed_in: vec!["package.json".to_string()],
+                ecosystem: "npm".to_string(),
+            }]
+        );
+        assert!(
+            security
+                .reintroduced_section()
+                .contains("| <code>lodash</code> | <code>4.17.22</code> |")
+        );
+        assert!(
+            security
+                .evidence_lines()
+                .contains("- Vulnerable again after the dependency update: 1\n")
+        );
+    }
+
+    #[test]
+    fn a_fixed_release_the_recheck_still_finds_affected_is_not_said_to_have_moved() {
+        let mut security = read(
+            json!([vulnerability("lodash", "GHSA-1", "High")]),
+            json!([fix("lodash", "4.17.21", "package.json", "applied")]),
+        );
+
+        security
+            .apply_recheck(&recheck(json!([found(
+                "lodash", "4.17.21", "npm", "GHSA-9"
+            )])))
+            .unwrap();
+
+        assert_eq!(
+            security.reintroduced[0].reason,
+            "after the dependency update, the audit finds lodash 4.17.21 still affected by GHSA-9"
+        );
+        assert_eq!(security.counts.advisories, 0);
+    }
+
+    #[test]
+    fn a_recheck_matches_fixes_by_ecosystem_as_well_as_name() {
+        let mut security = read(
+            json!([vulnerability("lodash", "GHSA-1", "High")]),
+            json!([fix("lodash", "4.17.21", "package.json", "applied")]),
+        );
+
+        security
+            .apply_recheck(&recheck(json!([
+                found("lodash", "1.0.0", "PyPI", "PYSEC-1"),
+                found("other", "1.0.0", "npm", "GHSA-9"),
+            ])))
+            .unwrap();
+
+        assert!(security.reintroduced.is_empty());
+        assert_eq!(security.counts.reintroduced, 0);
+        assert_eq!(security.counts.advisories, 1);
+        assert_eq!(security.reintroduced_section(), "");
+    }
+
+    #[test]
+    fn only_resolved_fixes_are_rechecked() {
+        // A package another occurrence left vulnerable is not resolved, so
+        // there is nothing to confirm.
+        let open = read(
+            json!([vulnerability("lodash", "GHSA-1", "High")]),
+            json!([
+                fix("lodash", "4.17.21", "a/package.json", "applied"),
+                fix("lodash", "4.17.21", "b/package.json", "blocked"),
+            ]),
+        );
+        assert!(!open.is_recheckable());
+
+        for status in ["applied", "pending_relock"] {
+            let resolved = read_with_lock(
+                json!([vulnerability("lodash", "GHSA-1", "High")]),
+                json!([fix("lodash", "4.17.21", "package.json", status)]),
+                false,
+            );
+            assert!(resolved.is_recheckable(), "{status}");
+        }
+    }
+
+    /// Without a lockfile the audit reads the manifest, so a manifest-only
+    /// fix is still rechecked; a lockfile awaiting regeneration keeps the
+    /// version the security step found, which is not the update's doing.
+    #[test]
+    fn a_fix_awaiting_a_relock_is_reintroduced_only_at_a_version_the_security_step_did_not_find() {
+        let pending = || {
+            read_with_lock(
+                json!([vulnerability("lodash", "GHSA-1", "High")]),
+                json!([fix("lodash", "4.17.21", "package.json", "pending_relock")]),
+                false,
+            )
+        };
+
+        let mut stale = pending();
+        stale
+            .apply_recheck(&recheck(json!([found("lodash", "1.0.0", "npm", "GHSA-1")])))
+            .unwrap();
+        assert!(stale.reintroduced.is_empty());
+        assert_eq!(stale.counts.advisories, 1);
+
+        let mut moved = pending();
+        moved
+            .apply_recheck(&recheck(json!([found(
+                "lodash", "4.17.22", "npm", "GHSA-9"
+            )])))
+            .unwrap();
+        assert_eq!(moved.counts.reintroduced, 1);
+        assert_eq!(moved.reintroduced[0].version, "4.17.22");
+        assert_eq!(moved.counts.advisories, 0);
+    }
+
+    #[test]
+    fn same_named_dependencies_in_two_ecosystems_are_reintroduced_separately() {
+        let fixed = |ecosystem: &str, path: &str| json!({"package": "shared", "ecosystem": ecosystem, "from_version": "0.9.0", "to_version": "1.0.0", "path": path, "status": "applied"});
+        let mut security = Security::from_report(
+            &json!({
+                "vulnerabilities": [
+                    {"package": "shared", "version": "0.9.0", "ecosystem": "npm", "id": "GHSA-1"},
+                    {"package": "shared", "version": "0.9.0", "ecosystem": "PyPI", "id": "PYSEC-1"},
+                ],
+                "fixes": [fixed("npm", "package.json"), fixed("PyPI", "requirements.txt")],
+                "summary": {"errors": 0},
+            }),
+            true,
+        )
+        .unwrap();
+
+        security
+            .apply_recheck(&recheck(json!([
+                found("shared", "1.1.0", "npm", "GHSA-2"),
+                found("shared", "1.1.0", "PyPI", "PYSEC-2"),
+            ])))
+            .unwrap();
+
+        assert_eq!(security.counts.reintroduced, 2);
+        let paths: BTreeSet<&[String]> = security
+            .reintroduced
+            .iter()
+            .map(|row| row.fixed_in.as_slice())
+            .collect();
+        assert_eq!(
+            paths,
+            BTreeSet::from([
+                &["package.json".to_string()][..],
+                &["requirements.txt".to_string()][..]
+            ])
+        );
+    }
+
+    #[test]
+    fn a_dependency_fixed_in_several_files_names_each_it_was_fixed_in() {
+        let fixed = |path: &str| json!({"package": "lodash", "ecosystem": "npm", "from_version": "4.17.20", "to_version": "4.17.21", "path": path, "status": "applied"});
+        let mut security = Security::from_report(
+            &json!({
+                "vulnerabilities": [
+                    {"package": "lodash", "version": "4.17.20", "ecosystem": "npm", "id": "GHSA-1"},
+                ],
+                "fixes": [fixed("web/package.json"), fixed("api/package.json")],
+                "summary": {"errors": 0},
+            }),
+            true,
+        )
+        .unwrap();
+
+        security
+            .apply_recheck(&recheck(json!([found(
+                "lodash", "4.17.22", "npm", "GHSA-2"
+            )])))
+            .unwrap();
+
+        assert_eq!(security.counts.reintroduced, 1);
+        assert_eq!(
+            security.reintroduced[0].fixed_in,
+            ["api/package.json", "web/package.json"]
+        );
+        let section = security.reintroduced_section();
+        assert!(
+            section.contains("<code>api/package.json</code>, <code>web/package.json</code> |"),
+            "{section}"
+        );
+        assert_eq!(
+            security.recheck_warnings(),
+            [
+                "warning: lodash (fixed in api/package.json, web/package.json): the dependency update moved lodash to 4.17.22, which GHSA-2 still affects"
+            ]
+        );
+    }
+
+    const UNCHECKED: &str = "package-lock.json: companion 1.0.0 could not be checked against the 7d cooldown (the registry lookup failed)";
+
+    #[test]
+    fn a_warning_from_the_security_audit_needs_attention() {
+        let security = Security::from_report(
+            &json!({
+                "vulnerabilities": [vulnerability("lodash", "GHSA-1", "High")],
+                "fixes": [fix("lodash", "4.17.21", "package.json", "applied")],
+                "warnings": [UNCHECKED],
+                "summary": {"errors": 0},
+            }),
+            true,
+        )
+        .unwrap();
+
+        assert_eq!(security.audit_warnings, [UNCHECKED]);
+        assert_eq!(security.counts.audit_warnings, 1);
+        assert!(
+            security
+                .warnings()
+                .contains(&format!("warning: {UNCHECKED}")),
+            "{:?}",
+            security.warnings()
+        );
+        let section = security.audit_warnings_section();
+        assert!(
+            section.contains(&format!("- {}", md(UNCHECKED))),
+            "{section}"
+        );
+        assert!(
+            security
+                .evidence_lines()
+                .contains("- Security audit warnings: 1\n")
+        );
+    }
+
+    #[test]
+    fn a_security_audit_without_warnings_adds_nothing() {
+        let security = read(
+            json!([vulnerability("lodash", "GHSA-1", "High")]),
+            json!([fix("lodash", "4.17.21", "package.json", "applied")]),
+        );
+        assert!(security.audit_warnings.is_empty());
+        assert_eq!(security.audit_warnings_section(), "");
+        assert!(!security.evidence_lines().contains("audit warnings"));
+        let serialized = serde_json::to_value(&security).unwrap();
+        assert!(serialized.get("audit_warnings").is_none(), "{serialized}");
+        assert!(
+            serialized["counts"].get("audit_warnings").is_none(),
+            "{serialized}"
+        );
+    }
+
+    #[test]
+    fn a_warning_from_the_audit_after_the_update_is_added_once() {
+        let mut security = Security::from_report(
+            &json!({
+                "vulnerabilities": [vulnerability("lodash", "GHSA-1", "High")],
+                "fixes": [fix("lodash", "4.17.21", "package.json", "applied")],
+                "warnings": [UNCHECKED],
+                "summary": {"errors": 0},
+            }),
+            true,
+        )
+        .unwrap();
+        let later =
+            "go.mod: go 1.16 predates module graph pruning; indirect dependencies were not audited";
+
+        security
+            .apply_recheck(&json!({
+                "vulnerabilities": [],
+                "warnings": [UNCHECKED, later],
+                "summary": {"errors": 0},
+            }))
+            .unwrap();
+
+        assert_eq!(security.audit_warnings, [UNCHECKED, later]);
+        assert_eq!(security.counts.audit_warnings, 2);
+        assert_eq!(security.recheck_warnings(), [format!("warning: {later}")]);
     }
 }

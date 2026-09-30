@@ -1,0 +1,81 @@
+{
+  "annotations": [],
+  "auto_merge_requested": false,
+  "blocked": [],
+  "changed": true,
+  "changed_paths": [
+    "dependency.txt",
+    "package.json"
+  ],
+  "counts": {
+    "annotations": 0,
+    "blocked": 0,
+    "files_changed": 2,
+    "normalized": 0,
+    "not_examined": 0,
+    "policy_holds": 0,
+    "updates": 1,
+    "updates_major": 0,
+    "updates_minor": 1,
+    "updates_patch": 0,
+    "updates_quiet": 0,
+    "updates_review_worthy": 1,
+    "updates_revision": 0,
+    "warnings": 0
+  },
+  "normalized": [],
+  "policy": {
+    "lockfile_regeneration": true,
+    "max_bump": "minor",
+    "min_age": "7d"
+  },
+  "policy_holds": [],
+  "schema": 1,
+  "security": {
+    "audit_warnings": [
+      "package-lock.json: companion 1.0.0 could not be checked against the 7d cooldown (the registry lookup failed)",
+      "yarn.lock: the lockfile could not be parsed, so its dependencies were not audited"
+    ],
+    "counts": {
+      "advisories": 2,
+      "audit_warnings": 2,
+      "blocked": 0,
+      "fixes": 1,
+      "not_applied": 0,
+      "pending_relock": 0,
+      "skipped": 0,
+      "unfixable": 0
+    },
+    "fixes": [
+      {
+        "advisories": [
+          "GHSA-29mw-wpgm-hmr9",
+          "GHSA-35jh-r3h4-6jhm"
+        ],
+        "from": "4.17.20",
+        "package": "lodash",
+        "path": "package.json",
+        "severity": "High",
+        "status": "applied",
+        "to": "4.17.21"
+      }
+    ],
+    "unfixable": []
+  },
+  "state": "ready",
+  "title": "fix(security): resolve 2 advisories and refresh dependencies",
+  "updates": [
+    {
+      "bump": "minor",
+      "current": "1.0.0",
+      "latest": "1.1.0",
+      "package": "example",
+      "path": "dependency.txt",
+      "status": "applied"
+    }
+  ],
+  "validation": {
+    "proposal_integrity_passed": true,
+    "repository_command_configured": false
+  }
+}

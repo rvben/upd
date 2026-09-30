@@ -1,0 +1,91 @@
+{
+  "annotations": [],
+  "auto_merge_requested": false,
+  "blocked": [],
+  "changed": true,
+  "changed_paths": [
+    "dependency.txt",
+    "package.json"
+  ],
+  "counts": {
+    "annotations": 0,
+    "blocked": 0,
+    "files_changed": 2,
+    "normalized": 0,
+    "not_examined": 0,
+    "policy_holds": 0,
+    "updates": 1,
+    "updates_major": 0,
+    "updates_minor": 1,
+    "updates_patch": 0,
+    "updates_quiet": 0,
+    "updates_review_worthy": 1,
+    "updates_revision": 0,
+    "warnings": 0
+  },
+  "normalized": [],
+  "policy": {
+    "lockfile_regeneration": true,
+    "max_bump": "minor",
+    "min_age": "7d"
+  },
+  "policy_holds": [],
+  "schema": 1,
+  "security": {
+    "counts": {
+      "advisories": 0,
+      "blocked": 0,
+      "fixes": 1,
+      "not_applied": 0,
+      "pending_relock": 0,
+      "reintroduced": 1,
+      "skipped": 0,
+      "unfixable": 0
+    },
+    "fixes": [
+      {
+        "advisories": [
+          "GHSA-29mw-wpgm-hmr9",
+          "GHSA-35jh-r3h4-6jhm"
+        ],
+        "from": "4.17.20",
+        "package": "lodash",
+        "path": "package.json",
+        "severity": "High",
+        "status": "applied",
+        "to": "4.17.21"
+      }
+    ],
+    "reintroduced": [
+      {
+        "advisories": [
+          "GHSA-test-7x2q-reintroduced"
+        ],
+        "fixed_in": [
+          "package.json"
+        ],
+        "package": "lodash",
+        "reason": "the dependency update moved lodash to 4.17.22, which GHSA-test-7x2q-reintroduced still affects",
+        "severity": "High",
+        "version": "4.17.22"
+      }
+    ],
+    "unfixable": []
+  },
+  "state": "ready",
+  "title": "fix(security): update vulnerable lodash and refresh dependencies",
+  "updates": [
+    {
+      "bump": "minor",
+      "current": "1.0.0",
+      "latest": "1.1.0",
+      "package": "example",
+      "path": "dependency.txt",
+      "status": "applied"
+    }
+  ],
+  "validation": {
+    "proposal_integrity_passed": true,
+    "repository_command_configured": false
+  }
+}
