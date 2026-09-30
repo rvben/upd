@@ -79,6 +79,29 @@ pub enum LockfileType {
 }
 
 impl LockfileType {
+    /// Every lockfile format upd knows.
+    pub const ALL: [LockfileType; 13] = [
+        LockfileType::PoetryLock,
+        LockfileType::UvLock,
+        LockfileType::PackageLockJson,
+        LockfileType::NpmShrinkwrap,
+        LockfileType::YarnLock,
+        LockfileType::PnpmLock,
+        LockfileType::BunLock,
+        LockfileType::BunLockb,
+        LockfileType::CargoLock,
+        LockfileType::GoSum,
+        LockfileType::GemfileLock,
+        LockfileType::PackagesLockJson,
+        LockfileType::TerraformLock,
+    ];
+
+    /// The format whose lockfile is called `name`, a file name without
+    /// directories.
+    pub fn from_filename(name: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|kind| kind.filename() == name)
+    }
+
     /// Get the lockfile filename
     pub fn filename(&self) -> &'static str {
         match self {
@@ -242,6 +265,26 @@ pub fn containing_dir(path: &Path) -> &Path {
     match path.parent() {
         Some(dir) if !dir.as_os_str().is_empty() => dir,
         _ => Path::new("."),
+    }
+}
+
+/// The lockfiles a lock refresh after editing `manifest` rewrites. A uv
+/// workspace member's lockfile is its workspace root's, so for a member the
+/// root manifest is returned too, and nothing when the root has no uv.lock.
+pub fn refreshed_lockfiles(
+    manifest: &Path,
+) -> anyhow::Result<(Option<PathBuf>, Vec<LockfileType>)> {
+    match uv_workspace_root(manifest)? {
+        Some(root) => {
+            let owner = root.join("pyproject.toml");
+            if root.join("uv.lock").exists() {
+                let lockfiles = detect_lockfiles(&owner);
+                Ok((Some(owner), lockfiles))
+            } else {
+                Ok((None, Vec::new()))
+            }
+        }
+        None => Ok((None, detect_lockfiles(manifest))),
     }
 }
 
@@ -1366,6 +1409,34 @@ mod tests {
     use super::*;
     use std::fs;
     use tempfile::tempdir;
+
+    #[test]
+    fn every_format_is_listed_once_and_found_by_its_file_name() {
+        // The match has no wildcard: a new variant stops this test from
+        // compiling until it is counted here and added to ALL.
+        let listed = |kind: LockfileType| match kind {
+            LockfileType::PoetryLock
+            | LockfileType::UvLock
+            | LockfileType::PackageLockJson
+            | LockfileType::NpmShrinkwrap
+            | LockfileType::YarnLock
+            | LockfileType::PnpmLock
+            | LockfileType::BunLock
+            | LockfileType::BunLockb
+            | LockfileType::CargoLock
+            | LockfileType::GoSum
+            | LockfileType::GemfileLock
+            | LockfileType::PackagesLockJson
+            | LockfileType::TerraformLock => 13,
+        };
+        let distinct: std::collections::HashSet<_> = LockfileType::ALL.into_iter().collect();
+        assert_eq!(distinct.len(), listed(LockfileType::UvLock));
+        for kind in LockfileType::ALL {
+            assert_eq!(LockfileType::from_filename(kind.filename()), Some(kind));
+        }
+        assert_eq!(LockfileType::from_filename("pyproject.toml"), None);
+        assert_eq!(LockfileType::from_filename("sub/uv.lock"), None);
+    }
 
     /// Write a Cargo project whose lockfile holds two majors of `thiserror`
     /// and one `serde`, and answer the `-p` specs for updating both.

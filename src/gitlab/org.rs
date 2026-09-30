@@ -52,6 +52,12 @@ pub struct OrgSettings {
     /// Whether security fixes are allowed at all; each project must also
     /// consent.
     pub security_remediation: bool,
+    /// Whether lockfiles may be regenerated at all, in jobs that hold no
+    /// token; each project must also consent.
+    pub lock: bool,
+    /// The pipeline running the job, which lock mode seals each project's
+    /// work to; absent outside GitLab CI.
+    pub pipeline_id: Option<String>,
     pub major_branch: String,
     pub major_commit_message: String,
     pub concurrency: usize,
@@ -90,6 +96,7 @@ impl OrgSettings {
         };
         let auto_merge = flag("UPD_AUTO_MERGE")?;
         let major_mr = flag("UPD_MAJOR_MR")?;
+        let lock = flag("UPD_LOCK")?;
         // Unlike the other switches this one is on unless turned off: it
         // still enables nothing until a project consents too.
         let security_remediation = match value("UPD_SECURITY_REMEDIATION") {
@@ -184,6 +191,8 @@ impl OrgSettings {
             auto_merge,
             major_mr,
             security_remediation,
+            lock,
+            pipeline_id: value("CI_PIPELINE_ID"),
             major_branch,
             major_commit_message: optional(
                 "UPD_MAJOR_COMMIT_MESSAGE",
@@ -197,7 +206,7 @@ impl OrgSettings {
     }
 
     /// The single-project settings for `project`, before its consent is read.
-    fn for_project(&self, project: &Project, dir: PathBuf) -> Settings {
+    pub(super) fn for_project(&self, project: &Project, dir: PathBuf) -> Settings {
         Settings {
             token: self.token.clone(),
             api_url: self.api_url.clone(),
@@ -222,6 +231,7 @@ impl OrgSettings {
             min_age_floor: self.min_age_floor.clone(),
             max_bump: self.max_bump.clone(),
             lock: false,
+            no_build: false,
             auto_merge: false,
             security_remediation: false,
             prepare_command: String::new(),
@@ -240,10 +250,10 @@ impl OrgSettings {
 
 /// A group project as discovery lists it.
 #[derive(Debug, Clone)]
-struct Project {
-    id: u64,
-    path: String,
-    default_branch: String,
+pub(super) struct Project {
+    pub id: u64,
+    pub path: String,
+    pub default_branch: String,
 }
 
 /// What happened to one project.
@@ -285,7 +295,7 @@ pub enum Remediation {
 }
 
 impl Remediation {
-    fn to_json(&self) -> Value {
+    pub(super) fn to_json(&self) -> Value {
         match self {
             Self::Enabled => json!({"enabled": true}),
             Self::Disabled(reason) => json!({"enabled": false, "reason": reason}),
@@ -554,7 +564,7 @@ async fn handle(settings: &OrgSettings, api: &Client, raw: Value, log: &Log) -> 
 }
 
 /// A project to process, or why it is not a candidate.
-fn classify(settings: &OrgSettings, raw: Value) -> Result<Project, State> {
+pub(super) fn classify(settings: &OrgSettings, raw: Value) -> Result<Project, State> {
     let id = raw["id"].as_u64().unwrap_or_default();
     let Some(path) = raw["path_with_namespace"].as_str().map(str::to_string) else {
         return Err(State::Failed(Error::Refused(
@@ -642,6 +652,8 @@ enum Consent {
         auto_merge: bool,
         major_mr: bool,
         security_remediation: bool,
+        lock: bool,
+        lock_build: bool,
     },
 }
 
@@ -662,6 +674,8 @@ impl Consent {
                         auto_merge: parsed.auto_merge_enabled(),
                         major_mr: parsed.major_mr_enabled(),
                         security_remediation: parsed.security_remediation_enabled(),
+                        lock: parsed.lock_enabled(),
+                        lock_build: parsed.lock_build_enabled(),
                     }
                 } else {
                     Self::No(format!(
@@ -700,20 +714,28 @@ impl Handled {
     }
 }
 
-async fn process(
-    settings: &OrgSettings,
-    api: &Client,
-    project: &Project,
-    log: &Log,
-) -> Result<Handled, Error> {
-    // A cheap read through the API spares cloning projects that have not
-    // opted in. Anything else goes on to the clone, whose own copy of the
-    // file decides: the API follows no symbolic link and answers with the
-    // link's target path, so only the tree can say what is wrong with it.
-    if let Consent::No(reason) = api_consent(api, project).await? {
-        return Ok(Handled::stopped(State::NotOptedIn(reason)));
-    }
+/// A consented project's checkout, holding the fetched default branch with
+/// the consent applied to its settings, or why the project stops before one.
+pub(super) enum Opened<'a> {
+    Stopped(State),
+    Consented(Box<Consented<'a>>),
+}
 
+pub(super) struct Consented<'a> {
+    pub session: Session<'a>,
+    pub remediation: Remediation,
+    /// Whether both sides allow lockfile regeneration.
+    pub lock: bool,
+    /// Whether the project lets its lockfile regeneration run build
+    /// backends.
+    pub lock_build: bool,
+    /// Keeps the checkout alive as long as the session.
+    pub checkout: tempfile::TempDir,
+}
+
+/// A new, empty git repository for a checkout, in a directory removed when
+/// the returned guard drops.
+pub(super) async fn empty_checkout() -> Result<(tempfile::TempDir, PathBuf), Error> {
     let work = tempfile::Builder::new()
         .prefix("upd-org-")
         .tempdir()
@@ -733,18 +755,39 @@ async fn process(
             String::from_utf8_lossy(&init.stderr).trim()
         )));
     }
+    Ok((work, dir))
+}
 
+/// Reads the project's consent and, when it opted in, fetches it into a
+/// fresh checkout with the consent applied to the ordinary lane's settings.
+pub(super) async fn open_project<'a>(
+    settings: &OrgSettings,
+    api: &Client,
+    project: &Project,
+    log: &'a Log,
+) -> Result<Opened<'a>, Error> {
+    // A cheap read through the API spares cloning projects that have not
+    // opted in. Anything else goes on to the clone, whose own copy of the
+    // file decides: the API follows no symbolic link and answers with the
+    // link's target path, so only the tree can say what is wrong with it.
+    if let Consent::No(reason) = api_consent(api, project).await? {
+        return Ok(Opened::Stopped(State::NotOptedIn(reason)));
+    }
+
+    let (work, dir) = empty_checkout().await?;
     let mut session = Session::open(settings.for_project(project, dir), log).await?;
-    let remediation = match tree_consent(&session.git, &session.default_ref, log).await? {
-        Consent::No(reason) => return Ok(Handled::stopped(State::NotOptedIn(reason))),
+    match tree_consent(&session.git, &session.default_ref, log).await? {
+        Consent::No(reason) => Ok(Opened::Stopped(State::NotOptedIn(reason))),
         Consent::Invalid { config, message } => {
-            return Ok(Handled::stopped(State::ConfigInvalid { config, message }));
+            Ok(Opened::Stopped(State::ConfigInvalid { config, message }))
         }
         Consent::Yes {
             config,
             auto_merge,
             major_mr,
             security_remediation,
+            lock,
+            lock_build,
         } => {
             session.settings.auto_merge = settings.auto_merge && auto_merge;
             session.settings.major_mr = settings.major_mr && major_mr;
@@ -762,9 +805,33 @@ async fn process(
                 Remediation::Enabled
             };
             session.settings.config = Some(PathBuf::from(config));
-            remediation
+            Ok(Opened::Consented(Box::new(Consented {
+                session,
+                remediation,
+                lock: settings.lock && lock,
+                lock_build,
+                checkout: work,
+            })))
         }
+    }
+}
+
+async fn process(
+    settings: &OrgSettings,
+    api: &Client,
+    project: &Project,
+    log: &Log,
+) -> Result<Handled, Error> {
+    let consented = match open_project(settings, api, project, log).await? {
+        Opened::Stopped(state) => return Ok(Handled::stopped(state)),
+        Opened::Consented(consented) => *consented,
     };
+    let Consented {
+        session,
+        remediation,
+        checkout: _checkout,
+        ..
+    } = consented;
     // The major lane reads the same configuration and consent the ordinary
     // lane was given, from the same checkout.
     let major = session.settings.major_lane();
@@ -857,6 +924,11 @@ mod tests {
         let accepted = self::settings(&[("UPD_LANGS", "python, rust")]).unwrap();
         assert_eq!(accepted.langs, "python,rust");
         assert!(!settings.major_mr);
+        assert!(!settings.lock);
+        assert_eq!(settings.pipeline_id, None);
+        let lock = self::settings(&[("UPD_LOCK", "true"), ("CI_PIPELINE_ID", "981")]).unwrap();
+        assert!(lock.lock);
+        assert_eq!(lock.pipeline_id.as_deref(), Some("981"));
         assert_eq!(settings.major_branch, "automation/upd-dependencies-major");
         assert_eq!(
             settings.major_commit_message,
@@ -921,6 +993,7 @@ mod tests {
             &[("CI_PROJECT_ID", "acme/central")],
             &[("UPD_AUTO_MERGE", "yes")],
             &[("UPD_SECURITY_REMEDIATION", "yes")],
+            &[("UPD_LOCK", "on")],
             &[("UPD_CONCURRENCY", "0")],
             &[("UPD_CONCURRENCY", "17")],
             &[("UPD_CONCURRENCY", "four")],

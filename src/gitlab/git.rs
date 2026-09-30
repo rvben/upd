@@ -90,6 +90,27 @@ impl Git {
             .to_string())
     }
 
+    /// Runs a local git command and returns its stdout exactly as printed.
+    pub async fn bytes<I, S>(&self, args: I) -> Result<Vec<u8>, Error>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<OsStr>,
+    {
+        Ok(checked(self.local(args), "git").await?.stdout)
+    }
+
+    /// Runs a local git command on the index file `index` instead of the
+    /// repository's own, and returns its stdout exactly as printed.
+    pub async fn bytes_with_index<I, S>(&self, index: &Path, args: I) -> Result<Vec<u8>, Error>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<OsStr>,
+    {
+        let mut command = self.local(args);
+        command.env("GIT_INDEX_FILE", index);
+        Ok(checked(command, "git").await?.stdout)
+    }
+
     /// Runs a local git command whose exit status is a yes/no answer.
     pub async fn test<I, S>(&self, args: I) -> Result<bool, Error>
     where

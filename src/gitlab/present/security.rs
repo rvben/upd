@@ -147,6 +147,10 @@ pub struct Security {
     /// Packages every fix for which applied, in order.
     #[serde(skip)]
     resolved: Vec<String>,
+    /// The files of fixes that wait on a lockfile regeneration: written
+    /// pending a relock, or skipped because only a relock can apply them.
+    #[serde(skip)]
+    relock: BTreeSet<String>,
     /// How many of `audit_warnings` the audit applying the fixes reported;
     /// the rest came from the audit after the update.
     #[serde(skip)]
@@ -184,6 +188,7 @@ impl Security {
         let (mut blocked, mut skipped, mut not_applied) = (0, 0, 0);
         // Packages, by ecosystem, with at least one occurrence left vulnerable.
         let mut open = BTreeSet::new();
+        let mut relock = BTreeSet::new();
         for fix in each_or_empty(field(report, "fixes")?)? {
             let package = clean_or(field(fix, "package")?, UNKNOWN_DEPENDENCY, 160);
             let ecosystem = clean_or(field(fix, "ecosystem")?, "", 32);
@@ -191,6 +196,12 @@ impl Security {
             let status = clean_or(field(fix, "status")?, UNKNOWN, 32);
             let path = clean_or(field(fix, "path")?, UNKNOWN_FILE, 160);
             let error = field(fix, "error")?;
+            if matches!(
+                status.as_str(),
+                "pending_relock" | "skipped" | "already_satisfied"
+            ) {
+                relock.insert(path.clone());
+            }
             match status.as_str() {
                 fixed if FIXED.contains(&fixed) || (lock && fixed == "already_satisfied") => {
                     let (ids, severity) = lookup(&ecosystem, &package);
@@ -341,6 +352,7 @@ impl Security {
             open,
             audited: vulnerable_versions(report)?,
             resolved: Vec::new(),
+            relock,
         };
         security.tally_resolved();
         Ok(security)
@@ -372,6 +384,11 @@ impl Security {
                 .open
                 .contains(&(row.ecosystem.clone(), row.package.clone()))
         })
+    }
+
+    /// The files of fixes that only a lockfile regeneration completes.
+    pub fn relock_paths(&self) -> impl Iterator<Item = &str> {
+        self.relock.iter().map(String::as_str)
     }
 
     /// Whether any resolved fix is worth re-auditing once the update has

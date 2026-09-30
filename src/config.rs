@@ -37,6 +37,8 @@
 //! dependency_updates = true  # GitLab organization rolling merge request
 //! auto_merge = false         # consent to the organization's auto-merge
 //! major_mr = false           # consent to the organization's major-upgrade merge request
+//! lock = false               # consent to relocking in the organization's lock jobs
+//! lock_build = false         # let those lock jobs build Python sdists
 //!
 //! # Pin packages to specific versions or constraints - top-level table
 //! [pin]
@@ -120,6 +122,15 @@ pub struct AutomationConfig {
     /// separate merge request for major-version upgrades open.
     #[serde(default)]
     pub major_mr: Option<bool>,
+    /// Whether this repository consents to the organization run relocking
+    /// its lockfiles in a separate job that runs repository code without
+    /// the group token.
+    #[serde(default)]
+    pub lock: Option<bool>,
+    /// Whether those lock jobs may build Python source distributions, which
+    /// runs their build backends; off, uv resolves from wheels only.
+    #[serde(default)]
+    pub lock_build: Option<bool>,
 }
 
 /// Every key `[automation]` accepts.
@@ -128,6 +139,8 @@ const AUTOMATION_KEYS: &[&str] = &[
     "dependency_updates",
     "auto_merge",
     "major_mr",
+    "lock",
+    "lock_build",
 ];
 
 /// Raw cooldown config as written in the TOML file. Parsed into a
@@ -590,6 +603,10 @@ dependency_updates = false
 auto_merge = false
 # The organization run may keep a separate major-upgrade merge request open.
 major_mr = false
+# The organization run may relock lockfiles in a job without the group token.
+lock = false
+# Those lock jobs may build Python source distributions (runs build backends).
+lock_build = false
 "#
     }
 
@@ -693,6 +710,8 @@ major_mr = false
             || self.automation.dependency_updates.is_some()
             || self.automation.auto_merge.is_some()
             || self.automation.major_mr.is_some()
+            || self.automation.lock.is_some()
+            || self.automation.lock_build.is_some()
             || self.normalize.is_some()
             || self.update.pyproject.is_some()
             || self.ecosystems.enable.is_some()
@@ -753,6 +772,12 @@ major_mr = false
         if other.automation.major_mr.is_some() {
             self.automation.major_mr = other.automation.major_mr;
         }
+        if other.automation.lock.is_some() {
+            self.automation.lock = other.automation.lock;
+        }
+        if other.automation.lock_build.is_some() {
+            self.automation.lock_build = other.automation.lock_build;
+        }
         if let Some(other_normalize) = other.normalize
             && let Some(other_pyproject) = other_normalize.pyproject
         {
@@ -789,6 +814,17 @@ major_mr = false
     /// by an organization run.
     pub fn major_mr_enabled(&self) -> bool {
         self.automation.major_mr.unwrap_or(false)
+    }
+
+    /// Whether the repository consents to an organization run relocking it
+    /// in a job without the group token.
+    pub fn lock_enabled(&self) -> bool {
+        self.automation.lock.unwrap_or(false)
+    }
+
+    /// Whether those lock jobs may build Python source distributions.
+    pub fn lock_build_enabled(&self) -> bool {
+        self.automation.lock_build.unwrap_or(false)
     }
 }
 
@@ -992,6 +1028,11 @@ impl EffectiveConfig<'_> {
             self.config.auto_merge_enabled()
         ));
         out.push_str(&format!("  major_mr: {}\n", self.config.major_mr_enabled()));
+        out.push_str(&format!("  lock: {}\n", self.config.lock_enabled()));
+        out.push_str(&format!(
+            "  lock_build: {}\n",
+            self.config.lock_build_enabled()
+        ));
         out.push_str(&render_cooldown_for_show_config(self.cooldown));
 
         out
@@ -1043,6 +1084,8 @@ impl EffectiveConfig<'_> {
                 "dependency_updates": self.config.dependency_updates_enabled(),
                 "auto_merge": self.config.auto_merge_enabled(),
                 "major_mr": self.config.major_mr_enabled(),
+                "lock": self.config.lock_enabled(),
+                "lock_build": self.config.lock_build_enabled(),
             },
             "cooldown": {
                 "default_seconds": self.cooldown.default.num_seconds(),
@@ -1874,6 +1917,46 @@ security_remedation = false
         assert!(
             UpdConfig::parse_for_automation("[automation]\nmajor_mr = \"yes\"\n", "t").is_err()
         );
+    }
+
+    #[test]
+    fn test_lock_and_lock_build_are_explicit_automation_keys_merged_like_the_others() {
+        let (absent, _) = UpdConfig::parse_with_warnings("ignore = []", "test.toml").unwrap();
+        assert!(!absent.lock_enabled() && !absent.lock_build_enabled());
+
+        let content = "[automation]\ndependency_updates = true\nlock = true\n";
+        let (lock, warnings) = UpdConfig::parse_for_automation(content, "test.toml").unwrap();
+        assert!(warnings.is_empty(), "{warnings:?}");
+        assert!(lock.lock_enabled() && !lock.lock_build_enabled());
+        for key in ["lock", "lock_build"] {
+            let (only, _) =
+                UpdConfig::parse_with_warnings(&format!("[automation]\n{key} = true\n"), "t")
+                    .unwrap();
+            assert!(only.has_config(), "{key}");
+        }
+
+        let mut merged = lock.clone();
+        merged.merge(
+            UpdConfig::parse_with_warnings("[automation]\nlock_build = true\n", "t")
+                .unwrap()
+                .0,
+        );
+        assert!(merged.lock_enabled() && merged.lock_build_enabled());
+        merged.merge(
+            UpdConfig::parse_with_warnings("[automation]\nlock = false\n", "t")
+                .unwrap()
+                .0,
+        );
+        assert!(!merged.lock_enabled() && merged.lock_build_enabled());
+
+        let elsewhere = "lock = true\n[automation]\ndependency_updates = true\n";
+        let (config, warnings) = UpdConfig::parse_for_automation(elsewhere, "t").unwrap();
+        assert!(!config.lock_enabled());
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(UpdConfig::parse_for_automation("[automation]\nlock_build = 1\n", "t").is_err());
+
+        let shown = UpdConfig::schema_toml();
+        assert!(shown.contains("\nlock = false\n") && shown.contains("\nlock_build = false\n"));
     }
 
     #[test]

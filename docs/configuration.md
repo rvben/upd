@@ -69,6 +69,8 @@ django = "4.2.0"
 | `automation.dependency_updates` | `bool` | Allow a GitLab organization run to keep a rolling dependency merge request open in this repository (see [GitLab](gitlab.md#organization-mode)). Defaults to `false` |
 | `automation.auto_merge` | `bool` | Consent to that organization run asking GitLab to merge once the project's pipeline passes; the organization must enable it too. Defaults to `false` |
 | `automation.major_mr` | `bool` | Consent to that organization run keeping a separate merge request for major-version upgrades open (see [GitLab](gitlab.md#major-upgrades)); the organization must enable it too, and upd never merges it. Defaults to `false` |
+| `automation.lock` | `bool` | Consent to that organization run regenerating this repository's lockfiles in a separate job that holds no token (see [GitLab](gitlab.md#lockfiles-in-organization-mode)); the organization must enable it too. Supported for `uv.lock`, `package-lock.json`, `npm-shrinkwrap.json` and `Cargo.lock`. Defaults to `false` |
+| `automation.lock_build` | `bool` | Let that lock job build Python source distributions, which runs their build code; without it the job sets `UV_NO_BUILD=1`. Defaults to `false` |
 | `ecosystems` | `table` | Persistent enable/disable lists using `--lang` names |
 | `update.pyproject.exact-pins` | `bool` | Update concrete `==` pins automatically (default `true`) |
 | `normalize` | `table` | Opt-in `pyproject.toml` specifier normalization, configured per section |

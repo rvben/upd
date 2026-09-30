@@ -98,9 +98,14 @@ struct Org {
 
 impl Org {
     async fn new() -> Self {
+        Self::with_updater(FAKE_UPDATER).await
+    }
+
+    /// An organization whose updater is the bash `script`.
+    async fn with_updater(script: &str) -> Self {
         let temp = tempfile::tempdir().expect("tempdir");
         let updater = temp.path().join("fake-upd");
-        fs::write(&updater, FAKE_UPDATER).expect("fake updater");
+        fs::write(&updater, script).expect("fake updater");
         fs::set_permissions(&updater, fs::Permissions::from_mode(0o755)).unwrap();
         let log = temp.path().join("updater-log");
         fs::create_dir(&log).unwrap();
@@ -180,6 +185,18 @@ impl Org {
             .respond_with(MergeRequestHeads(Arc::new(self.remotes.clone())))
             .mount(&self.server)
             .await;
+        Mock::given(method("GET"))
+            .and(path("/api/v4/groups/acme"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"full_path": "acme"})))
+            .mount(&self.server)
+            .await;
+        for listed in &self.listing {
+            Mock::given(method("GET"))
+                .and(path(format!("/api/v4/projects/{}", listed["id"]).as_str()))
+                .respond_with(ResponseTemplate::new(200).set_body_json(listed))
+                .mount(&self.server)
+                .await;
+        }
         for id in self.remotes.keys() {
             let merge_requests = format!("/api/v4/projects/{id}/merge_requests");
             Mock::given(method("GET"))
@@ -1035,4 +1052,836 @@ async fn an_invalid_major_lane_is_refused_before_any_project_is_listed() {
             "{vars:?}"
         );
     }
+}
+
+// Lock mode: a project that consents to relocking has each lane split into
+// three jobs. `prepare` holds the token and edits manifests only, the lock
+// job holds no token and runs the relock, and `publish` holds the token
+// again and admits only what its checks allow.
+
+const PIPELINE: &str = "981";
+const LOCK_OPTED_IN: &str = "[automation]\ndependency_updates = true\nlock = true\n";
+
+const PYPROJECT: &str =
+    "[project]\nname = \"app\"\nversion = \"0.1.0\"\ndependencies = [\"example==1.0.0\"]\n";
+
+const UV_LOCK: &str = r#"version = 1
+requires-python = ">=3.12"
+
+[[package]]
+name = "example"
+version = "1.0.0"
+source = { registry = "https://pypi.example.test/simple" }
+sdist = { url = "https://files.example.test/example-1.0.0.tar.gz", hash = "sha256:00" }
+"#;
+
+const CARGO_LOCK: &str = r#"version = 4
+
+[[package]]
+name = "vulnerable"
+version = "1.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "00"
+"#;
+
+/// An updater that edits manifests always and lockfiles only when asked to
+/// relock, as `upd` does. `scenario.txt` in the repository picks what it
+/// changes; every invocation is logged with the `UV_NO_BUILD` it saw.
+const LOCK_UPDATER: &str = r##"#!/usr/bin/env bash
+set -euo pipefail
+if [ -n "${UPD_GITLAB_TOKEN+set}" ]; then
+  echo "fake upd received the GitLab token" >&2
+  exit 9
+fi
+name="$(cat project.txt)"
+scenario="$(cat scenario.txt)"
+printf '%s | UV_NO_BUILD=%s\n' "$*" "${UV_NO_BUILD:-}" >> "$FAKE_LOG/$name.calls"
+case " $* " in
+  *" --lock "*) locking=1 ;;
+  *" --fix-audit "*" --no-lock "*) locking=0 ;;
+  *" --fix-audit "*) locking=1 ;;
+  *) locking=0 ;;
+esac
+if [ "$1" = audit ]; then
+  if [ "$scenario" = cargo-transitive ] && [ "$2" = --fix-audit ]; then
+    status=skipped
+    if [ "$locking" = 1 ]; then
+      status=applied
+      cat > Cargo.lock <<'LOCK'
+version = 4
+
+[[package]]
+name = "vulnerable"
+version = "1.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "01"
+LOCK
+    fi
+    cat <<JSON
+{"command":"audit","errors":[],"status":"complete","summary":{"errors":0,"packages_checked":1,"vulnerabilities":1,"vulnerable_packages":1},"vulnerabilities":[{"package":"vulnerable","version":"1.0.0","ecosystem":"crates.io","id":"RUSTSEC-2026-0001","summary":"advisory for vulnerable","severity":"High","source":"RUSTSEC"}],"fixes":[{"package":"vulnerable","ecosystem":"crates.io","from_version":"1.0.0","to_version":"1.0.1","method":"lockfile","path":"Cargo.lock","status":"$status"}]}
+JSON
+  else
+    echo '{"command":"audit","errors":[],"fixes":[],"status":"complete","summary":{"errors":0,"packages_checked":1,"vulnerabilities":0,"vulnerable_packages":0},"vulnerabilities":[]}'
+  fi
+  exit 0
+fi
+version=1.1.0 bump=minor majors=0 minors=1
+case " $* " in
+  *" --only-bump major "*) version=2.0.0 bump=major majors=1 minors=0 ;;
+esac
+file=pyproject.toml
+case "$scenario" in
+  cargo-transitive)
+    echo '{"command":"update","mode":"applied","files":[],"summary":{"files_scanned":1,"files_with_changes":0,"updates_total":0,"updates_major":0,"updates_minor":0,"updates_patch":0,"pinned":0,"ignored":0,"errors":0,"warnings":0}}'
+    exit 0
+    ;;
+  go)
+    file=go.mod
+    printf 'module example.test/app\n\nrequire example.test/example v%s\n' "$version" > go.mod
+    ;;
+  *)
+    manifest="$version"
+    if [ "$scenario" = uv-drift ] && [ "$locking" = 1 ]; then
+      manifest=1.2.0
+    fi
+    printf '[project]\nname = "app"\nversion = "0.1.0"\ndependencies = ["example==%s"]\n' "$manifest" > pyproject.toml
+    if [ "$locking" = 1 ]; then
+      cat > uv.lock <<LOCK
+version = 1
+requires-python = ">=3.12"
+
+[[package]]
+name = "example"
+version = "$version"
+source = { registry = "https://pypi.example.test/simple" }
+sdist = { url = "https://files.example.test/example-$version.tar.gz", hash = "sha256:00" }
+LOCK
+      case "$scenario" in
+        uv-git)
+          cat >> uv.lock <<'LOCK'
+
+[[package]]
+name = "helper"
+version = "0.1.0"
+source = { git = "https://git.example.test/helper.git#0123456789abcdef" }
+LOCK
+          ;;
+        uv-extra)
+          printf 'changed by the lock job\n' > dependency.txt
+          ;;
+        uv-new-lock)
+          mkdir -p vendor
+          cp uv.lock vendor/uv.lock
+          ;;
+      esac
+    fi
+    ;;
+esac
+cat <<JSON
+{"command":"update","mode":"applied","files":[{"path":"$file","file_type":"test","lang":"test","updates":[{"package":"example","current":"1.0.0","latest":"$version","bump":"$bump"}],"pinned":[],"ignored":[],"errors":[],"warnings":[]}],"summary":{"files_scanned":1,"files_with_changes":1,"updates_total":1,"updates_major":$majors,"updates_minor":$minors,"updates_patch":0,"pinned":0,"ignored":0,"errors":0,"warnings":0}}
+JSON
+"##;
+
+/// The first `program` on the test's own `PATH`.
+fn on_path(program: &str) -> PathBuf {
+    std::env::split_paths(&std::env::var_os("PATH").expect("PATH is set"))
+        .map(|dir| dir.join(program))
+        .find(|candidate| candidate.is_file())
+        .unwrap_or_else(|| panic!("{program} is not on PATH"))
+}
+
+/// Runs `command` and returns its exit code, the JSON on stdout (`Null`
+/// when there is none) and stderr.
+fn finish(mut command: Command) -> (i32, Value, String) {
+    let output = command.output().expect("upd starts");
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    let report = if output.stdout.is_empty() {
+        Value::Null
+    } else {
+        serde_json::from_slice(&output.stdout).unwrap_or_else(|error| {
+            panic!(
+                "stdout is not JSON ({error})\nstdout:\n{}\nstderr:\n{stderr}",
+                String::from_utf8_lossy(&output.stdout)
+            )
+        })
+    };
+    (output.status.code().expect("exit code"), report, stderr)
+}
+
+/// A lock job's view of the machine: the programs a job image carries, and
+/// optionally the lock tools.
+struct Toolbox {
+    /// `git`, and the shell tools the fake updater uses.
+    base: PathBuf,
+    /// `uv` and `cargo`, printing a version and doing nothing else.
+    lock_tools: PathBuf,
+}
+
+impl Toolbox {
+    fn new(root: &Path) -> Self {
+        let base = root.join("tools");
+        fs::create_dir(&base).unwrap();
+        for program in ["git", "bash", "cat", "mkdir", "cp"] {
+            std::os::unix::fs::symlink(on_path(program), base.join(program)).unwrap();
+        }
+        let lock_tools = root.join("lock-tools");
+        fs::create_dir(&lock_tools).unwrap();
+        for (program, version) in [("uv", "uv 0.9.0 (fake)"), ("cargo", "cargo 1.90.0 (fake)")] {
+            let script = lock_tools.join(program);
+            fs::write(&script, format!("#!/bin/sh\necho '{version}'\n")).unwrap();
+            fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        Self { base, lock_tools }
+    }
+}
+
+impl Org {
+    /// An organization whose projects' updater relocks as `upd` does.
+    async fn locking() -> (Self, Toolbox) {
+        let org = Self::with_updater(LOCK_UPDATER).await;
+        let toolbox = Toolbox::new(org.temp.path());
+        (org, toolbox)
+    }
+
+    /// The directory the jobs of project `id`'s `lane` share, as the
+    /// pipeline's artifacts carry it from job to job.
+    fn job_dir(&self, id: u64, lane: &str) -> PathBuf {
+        self.temp.path().join("jobs").join(format!("{id}-{lane}"))
+    }
+
+    /// Runs `upd gitlab org <job>` (prepare or publish) for project `id`'s
+    /// `lane` in pipeline [`PIPELINE`] of a group that allows lock mode.
+    fn job(&self, job: &str, id: u64, lane: &str, vars: &[(&str, &str)]) -> (i32, Value, String) {
+        let mut command = self.command(
+            env!("CARGO_BIN_EXE_upd"),
+            &[("UPD_LOCK", "true"), ("CI_PIPELINE_ID", PIPELINE)],
+        );
+        for (name, value) in vars {
+            command.env(name, value);
+        }
+        command
+            .args(["gitlab", "org", job, "--project", &id.to_string()])
+            .args(["--lane", lane, "--dir"])
+            .arg(self.job_dir(id, lane))
+            .args(["--output", "json"]);
+        finish(command)
+    }
+
+    fn prepare(&self, id: u64, lane: &str) -> (i32, Value, String) {
+        self.job("prepare", id, lane, &[])
+    }
+
+    fn publish(&self, id: u64, lane: &str) -> (i32, Value, String) {
+        self.job("publish", id, lane, &[])
+    }
+
+    /// Runs the lock job as the template does: without the token, with only
+    /// `path` on `PATH`.
+    fn lock_worker(&self, id: u64, lane: &str, path: &[&Path]) -> (i32, Value, String) {
+        let mut command = self.command(env!("CARGO_BIN_EXE_upd"), &[]);
+        command
+            .env_remove("UPD_GITLAB_TOKEN")
+            .env("PATH", std::env::join_paths(path).unwrap())
+            .args(["gitlab", "org", "lock-worker", "--dir"])
+            .arg(self.job_dir(id, lane))
+            .args(["--output", "json"]);
+        finish(command)
+    }
+
+    /// Every updater invocation for the project at `path`, one per line.
+    fn calls(&self, path: &str) -> Vec<String> {
+        fs::read_to_string(self.log.join(format!("{}.calls", path.replace('/', "-"))))
+            .unwrap_or_default()
+            .lines()
+            .map(str::to_string)
+            .collect()
+    }
+
+    /// The body of the merge request created for project `id`, if one was.
+    async fn created_merge_request(&self, id: u64) -> Option<Value> {
+        let merge_requests = format!("/api/v4/projects/{id}/merge_requests");
+        self.server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .find(|request| {
+                request.method.as_str() == "POST" && request.url.path() == merge_requests
+            })
+            .map(|request| serde_json::from_slice(&request.body).unwrap())
+    }
+
+    /// The work tree `project` pushed project `path`'s `main` from.
+    fn work_tree(&self, path: &str) -> PathBuf {
+        self.temp.path().join("work").join(path.replace('/', "-"))
+    }
+}
+
+/// A Python project with a uv lockfile that consents with `config`, whose
+/// updater plays `scenario`.
+fn uv_project(org: &mut Org, id: u64, path: &str, config: &'static str, scenario: &'static str) {
+    org.project(
+        id,
+        path,
+        &[
+            Entry::File(".updrc.toml", config),
+            Entry::File("scenario.txt", scenario),
+            Entry::File("pyproject.toml", PYPROJECT),
+            Entry::File("uv.lock", UV_LOCK),
+        ],
+    );
+}
+
+/// Runs prepare and the lock job for project `id`'s `lane`, asserting both
+/// hand the lane on.
+fn prepare_and_lock(org: &Org, toolbox: &Toolbox, id: u64, lane: &str) {
+    let (code, report, stderr) = org.prepare(id, lane);
+    assert_eq!(code, 0, "{report:#}\n{stderr}");
+    assert_eq!(report["step"], "locking", "{report:#}");
+    let (code, report, stderr) = org.lock_worker(id, lane, &[&toolbox.lock_tools, &toolbox.base]);
+    assert_eq!(code, 0, "{report:#}\n{stderr}");
+    assert_eq!(report["step"], "locked", "{report:#}");
+}
+
+#[tokio::test]
+async fn a_lock_project_is_relocked_without_the_token_and_published_with_it() {
+    let (mut org, toolbox) = Org::locking().await;
+    uv_project(&mut org, 81, "acme/python", LOCK_OPTED_IN, "uv");
+    uv_project(
+        &mut org,
+        82,
+        "acme/builds",
+        "[automation]\ndependency_updates = true\nlock = true\nlock_build = true\n",
+        "uv",
+    );
+    org.serve().await;
+
+    let (code, report, stderr) = org.prepare(81, "ordinary");
+    assert_eq!(code, 0, "{report:#}\n{stderr}");
+    assert_eq!(report["command"], "gitlab org prepare", "{report:#}");
+    assert_eq!(report["path"], "acme/python", "{report:#}");
+    assert_eq!(report["branch"], BRANCH, "{report:#}");
+    assert_eq!(report["step"], "locking", "{report:#}");
+    assert_eq!(report["lockfiles"], json!(["uv.lock"]), "{report:#}");
+    assert_eq!(
+        org.file_on(81, BRANCH, "pyproject.toml"),
+        None,
+        "prepare pushed"
+    );
+    assert!(org.created_merge_request(81).await.is_none());
+    let calls = org.calls("acme/python");
+    assert_eq!(calls.len(), 1, "{calls:#?}");
+    assert!(
+        calls[0].starts_with("update --apply --format json --config .updrc.toml"),
+        "{calls:#?}"
+    );
+    assert!(!calls[0].contains("--lock"), "prepare relocked: {calls:#?}");
+
+    let (code, report, stderr) =
+        org.lock_worker(81, "ordinary", &[&toolbox.lock_tools, &toolbox.base]);
+    assert_eq!(code, 0, "{report:#}\n{stderr}");
+    assert_eq!(report["command"], "gitlab org lock-worker", "{report:#}");
+    assert_eq!(report["step"], "locked", "{report:#}");
+    assert_eq!(
+        report["tools"],
+        json!({"uv": "uv 0.9.0 (fake)"}),
+        "{report:#}"
+    );
+    let calls = org.calls("acme/python");
+    assert_eq!(calls.len(), 2, "{calls:#?}");
+    assert!(
+        calls[1].starts_with("update --apply --format json --lock --config .updrc.toml"),
+        "{calls:#?}"
+    );
+    assert!(calls[1].ends_with(" | UV_NO_BUILD=1"), "{calls:#?}");
+    assert_eq!(
+        org.file_on(81, BRANCH, "pyproject.toml"),
+        None,
+        "the lock job pushed"
+    );
+
+    let (code, report, stderr) = org.publish(81, "ordinary");
+    assert_eq!(code, 0, "{report:#}\n{stderr}");
+    assert_eq!(report["command"], "gitlab org publish", "{report:#}");
+    assert_eq!(report["step"], "finished", "{report:#}");
+    assert_eq!(report["result"]["outcome"], "published", "{report:#}");
+    assert_eq!(org.calls("acme/python").len(), 2, "publish ran the updater");
+    assert!(
+        org.file_on(81, BRANCH, "pyproject.toml")
+            .unwrap()
+            .contains("example==1.1.0")
+    );
+    let lock = org.file_on(81, BRANCH, "uv.lock").unwrap();
+    assert!(lock.contains("version = \"1.1.0\""), "{lock}");
+    let merge_request = org.created_merge_request(81).await.expect("merge request");
+    assert_eq!(merge_request["source_branch"], BRANCH, "{merge_request:#}");
+    let description = merge_request["description"].as_str().unwrap();
+    assert!(description.contains("example"), "{description}");
+    assert!(!description.contains("Built from"), "{description}");
+
+    // A project that lets its lock jobs build sdists gets no UV_NO_BUILD.
+    prepare_and_lock(&org, &toolbox, 82, "ordinary");
+    let calls = org.calls("acme/builds");
+    assert!(calls[1].contains("--lock"), "{calls:#?}");
+    assert!(calls[1].ends_with(" | UV_NO_BUILD="), "{calls:#?}");
+    let (code, report, stderr) = org.publish(82, "ordinary");
+    assert_eq!(code, 0, "{report:#}\n{stderr}");
+    assert_eq!(report["result"]["outcome"], "published", "{report:#}");
+}
+
+#[tokio::test]
+async fn a_lock_job_change_beyond_the_rules_is_not_published() {
+    let (mut org, toolbox) = Org::locking().await;
+    let cases = [
+        (
+            83,
+            "acme/git-source",
+            "uv-git",
+            "the regenerated uv.lock takes code from https://git.example.test/helper.git, which the original never does",
+        ),
+        (
+            84,
+            "acme/extra-file",
+            "uv-extra",
+            "dependency.txt: is neither a planned edit nor a lockfile",
+        ),
+        (
+            85,
+            "acme/drift",
+            "uv-drift",
+            "pyproject.toml: differs from the planned edit",
+        ),
+        (
+            86,
+            "acme/new-lock",
+            "uv-new-lock",
+            "vendor/uv.lock: creates a file",
+        ),
+    ];
+    for (id, path, scenario, _) in cases {
+        uv_project(&mut org, id, path, LOCK_OPTED_IN, scenario);
+    }
+    org.serve().await;
+
+    for (id, path, _, problem) in cases {
+        prepare_and_lock(&org, &toolbox, id, "ordinary");
+        let (code, report, stderr) = org.publish(id, "ordinary");
+        assert_eq!(code, 2, "{path}: {report:#}\n{stderr}");
+        assert!(
+            stderr.contains("The lock job changed what lock mode does not publish"),
+            "{path}: {stderr}"
+        );
+        assert!(stderr.contains(problem), "{path}: {stderr}");
+        assert_eq!(
+            org.file_on(id, BRANCH, "pyproject.toml"),
+            None,
+            "{path} was pushed"
+        );
+        assert!(org.created_merge_request(id).await.is_none(), "{path}");
+    }
+}
+
+#[tokio::test]
+async fn publish_refuses_work_it_did_not_seal_or_a_result_that_does_not_match() {
+    let (mut org, toolbox) = Org::locking().await;
+    uv_project(&mut org, 87, "acme/sealed", LOCK_OPTED_IN, "uv");
+    org.serve().await;
+    prepare_and_lock(&org, &toolbox, 87, "ordinary");
+    let dir = org.job_dir(87, "ordinary");
+
+    let (code, _, stderr) = org.job("publish", 87, "ordinary", &[("CI_PIPELINE_ID", "982")]);
+    assert_eq!(code, 2, "{stderr}");
+    assert!(
+        stderr.contains("does not carry this pipeline's seal"),
+        "{stderr}"
+    );
+
+    let (code, _, stderr) = org.job("publish", 87, "ordinary", &[("UPD_GITLAB_TOKEN", "other")]);
+    assert_eq!(code, 2, "{stderr}");
+    assert!(
+        stderr.contains("does not carry this pipeline's seal"),
+        "{stderr}"
+    );
+
+    // The work is sealed to its project and lane, not just its pipeline.
+    let (code, _, stderr) = org.job("publish", 87, "major", &[]);
+    assert_eq!(code, 2, "{stderr}");
+    assert!(stderr.contains("cannot read"), "{stderr}");
+    fs::create_dir_all(org.job_dir(87, "major")).unwrap();
+    for file in ["work.json", "work.seal"] {
+        fs::copy(dir.join(file), org.job_dir(87, "major").join(file)).unwrap();
+    }
+    let (code, _, stderr) = org.job("publish", 87, "major", &[]);
+    assert_eq!(code, 2, "{stderr}");
+    assert!(
+        stderr.contains("was prepared for pipeline 981, project 87, the ordinary lane"),
+        "{stderr}"
+    );
+
+    let tampered = |file: &str, from: &str, to: &str| {
+        let original = fs::read(dir.join(file)).unwrap();
+        let text = String::from_utf8(original.clone()).unwrap();
+        assert!(text.contains(from), "{file} lacks {from:?}:\n{text}");
+        fs::write(dir.join(file), text.replacen(from, to, 1)).unwrap();
+        let outcome = org.publish(87, "ordinary");
+        fs::write(dir.join(file), original).unwrap();
+        outcome
+    };
+    let (code, _, stderr) = tampered("work.json", "\"lock_build\": false", "\"lock_build\": true");
+    assert_eq!(code, 2, "{stderr}");
+    assert!(
+        stderr.contains("does not carry this pipeline's seal"),
+        "{stderr}"
+    );
+    let (code, _, stderr) = tampered("planned.patch", "example==1.1.0", "example==6.6.6");
+    assert_eq!(code, 2, "{stderr}");
+    assert!(
+        stderr.contains("planned.patch is not the patch prepare sealed"),
+        "{stderr}"
+    );
+    let (code, _, stderr) = tampered("result/result.patch", "1.1.0", "6.6.6");
+    assert_eq!(code, 2, "{stderr}");
+    assert!(
+        stderr.contains("result.patch is not the patch the lock job's result describes"),
+        "{stderr}"
+    );
+    assert_eq!(org.file_on(87, BRANCH, "pyproject.toml"), None);
+
+    let (code, report, stderr) = org.publish(87, "ordinary");
+    assert_eq!(code, 0, "{report:#}\n{stderr}");
+    assert_eq!(report["result"]["outcome"], "published", "{report:#}");
+}
+
+#[tokio::test]
+async fn publish_keeps_the_lease_and_the_base_prepare_saw() {
+    let (mut org, toolbox) = Org::locking().await;
+    uv_project(&mut org, 88, "acme/raced", LOCK_OPTED_IN, "uv");
+    uv_project(&mut org, 89, "acme/moved", LOCK_OPTED_IN, "uv");
+    uv_project(&mut org, 90, "acme/rewritten", LOCK_OPTED_IN, "uv");
+    org.serve().await;
+    for id in [88, 89, 90] {
+        prepare_and_lock(&org, &toolbox, id, "ordinary");
+    }
+
+    // Someone pushed the automation branch after prepare looked at it.
+    let raced = org.work_tree("acme/raced");
+    let remote = org.remotes[&88].to_str().unwrap().to_string();
+    git(
+        &raced,
+        &[
+            "push",
+            "--quiet",
+            &remote,
+            &format!("main:refs/heads/{BRANCH}"),
+        ],
+    );
+    let (code, _, stderr) = org.publish(88, "ordinary");
+    assert_eq!(code, 5, "{stderr}");
+    assert!(
+        stderr.contains("changed on the remote while this run was working"),
+        "{stderr}"
+    );
+    assert_eq!(
+        org.file_on(88, BRANCH, "pyproject.toml").as_deref(),
+        Some(PYPROJECT),
+        "the racing push was overwritten"
+    );
+
+    // The default branch moved on: the proposal stays on the commit it was
+    // built from, and says so.
+    let moved = org.work_tree("acme/moved");
+    fs::write(moved.join("later.txt"), "later\n").unwrap();
+    git(&moved, &["add", "later.txt"]);
+    git(&moved, &["commit", "--quiet", "-m", "test: later"]);
+    git(
+        &moved,
+        &[
+            "push",
+            "--quiet",
+            org.remotes[&89].to_str().unwrap(),
+            "main",
+        ],
+    );
+    let (code, report, stderr) = org.publish(89, "ordinary");
+    assert_eq!(code, 0, "{report:#}\n{stderr}");
+    assert_eq!(report["result"]["outcome"], "published", "{report:#}");
+    assert_eq!(org.file_on(89, BRANCH, "later.txt"), None);
+    let merge_request = org.created_merge_request(89).await.expect("merge request");
+    let description = merge_request["description"].as_str().unwrap();
+    assert!(description.contains("Built from"), "{description}");
+
+    // The default branch was rewritten without the commit prepare saw.
+    let rewritten = org.work_tree("acme/rewritten");
+    git(
+        &rewritten,
+        &["commit", "--quiet", "--amend", "-m", "test: rewritten"],
+    );
+    git(
+        &rewritten,
+        &[
+            "push",
+            "--quiet",
+            "--force",
+            org.remotes[&90].to_str().unwrap(),
+            "main",
+        ],
+    );
+    let (code, _, stderr) = org.publish(90, "ordinary");
+    assert_eq!(code, 5, "{stderr}");
+    assert!(stderr.contains("main no longer contains"), "{stderr}");
+    assert_eq!(org.file_on(90, BRANCH, "pyproject.toml"), None);
+}
+
+#[tokio::test]
+async fn the_lock_job_refuses_the_token_and_needs_its_tools() {
+    let (mut org, toolbox) = Org::locking().await;
+    uv_project(&mut org, 91, "acme/tools", LOCK_OPTED_IN, "uv");
+    org.serve().await;
+    let (code, report, stderr) = org.prepare(91, "ordinary");
+    assert_eq!(code, 0, "{report:#}\n{stderr}");
+    let result = org.job_dir(91, "ordinary").join("result");
+
+    let mut command = org.command(env!("CARGO_BIN_EXE_upd"), &[]);
+    command
+        .env(
+            "PATH",
+            std::env::join_paths([&toolbox.lock_tools, &toolbox.base]).unwrap(),
+        )
+        .args(["gitlab", "org", "lock-worker", "--dir"])
+        .arg(org.job_dir(91, "ordinary"));
+    let (code, _, stderr) = finish(command);
+    assert_eq!(code, 2, "{stderr}");
+    assert!(stderr.contains("must not hold the token"), "{stderr}");
+    assert!(!result.exists());
+
+    let (code, _, stderr) = org.lock_worker(91, "ordinary", &[&toolbox.base]);
+    assert_eq!(code, 2, "{stderr}");
+    assert!(
+        stderr.contains("lock tool missing: uv is not on PATH, and regenerating uv.lock needs it"),
+        "{stderr}"
+    );
+    assert!(!result.exists());
+    assert_eq!(
+        org.calls("acme/tools").len(),
+        1,
+        "the updater ran without its tools"
+    );
+
+    let (code, report, stderr) =
+        org.lock_worker(91, "ordinary", &[&toolbox.lock_tools, &toolbox.base]);
+    assert_eq!(code, 0, "{report:#}\n{stderr}");
+    assert!(result.join("result.patch").exists());
+    let (code, _, stderr) = org.lock_worker(91, "ordinary", &[&toolbox.lock_tools, &toolbox.base]);
+    assert_eq!(code, 2, "{stderr}");
+    assert!(stderr.contains("already exists"), "{stderr}");
+}
+
+#[tokio::test]
+async fn prepare_refuses_a_lockfile_lock_mode_cannot_check() {
+    let (mut org, _toolbox) = Org::locking().await;
+    org.project(
+        92,
+        "acme/go",
+        &[
+            Entry::File(".updrc.toml", LOCK_OPTED_IN),
+            Entry::File("scenario.txt", "go"),
+            Entry::File(
+                "go.mod",
+                "module example.test/app\n\nrequire example.test/example v1.0.0\n",
+            ),
+            Entry::File("go.sum", "example.test/example v1.0.0 h1:AAAA=\n"),
+        ],
+    );
+    org.serve().await;
+
+    let (code, _, stderr) = org.prepare(92, "ordinary");
+
+    assert_eq!(code, 2, "{stderr}");
+    assert!(
+        stderr.contains("lock mode does not support go.sum yet; nothing was published"),
+        "{stderr}"
+    );
+    assert!(!org.job_dir(92, "ordinary").join("work.json").exists());
+    assert_eq!(org.file_on(92, BRANCH, "go.mod"), None);
+    assert!(org.created_merge_request(92).await.is_none());
+}
+
+#[tokio::test]
+async fn a_security_fix_that_needs_a_relock_is_relocked_by_the_lock_job() {
+    let (mut org, toolbox) = Org::locking().await;
+    org.project(
+        93,
+        "acme/crate",
+        &[
+            Entry::File(
+                ".updrc.toml",
+                "[automation]\ndependency_updates = true\nsecurity_remediation = true\nlock = true\n",
+            ),
+            Entry::File("scenario.txt", "cargo-transitive"),
+            Entry::File("Cargo.lock", CARGO_LOCK),
+        ],
+    );
+    org.project(
+        99,
+        "acme/crate-unlocked",
+        &[
+            Entry::File(
+                ".updrc.toml",
+                "[automation]\ndependency_updates = true\nsecurity_remediation = true\n",
+            ),
+            Entry::File("scenario.txt", "cargo-transitive"),
+            Entry::File("Cargo.lock", CARGO_LOCK),
+        ],
+    );
+    org.serve().await;
+
+    let (code, report, stderr) = org.prepare(93, "ordinary");
+    assert_eq!(code, 0, "{report:#}\n{stderr}");
+    assert_eq!(report["lockfiles"], json!(["Cargo.lock"]), "{report:#}");
+    let calls = org.calls("acme/crate");
+    assert!(calls[0].starts_with("audit --fix-audit"), "{calls:#?}");
+    assert!(calls[0].contains(" --no-lock "), "{calls:#?}");
+
+    let (code, report, stderr) =
+        org.lock_worker(93, "ordinary", &[&toolbox.lock_tools, &toolbox.base]);
+    assert_eq!(code, 0, "{report:#}\n{stderr}");
+    assert_eq!(
+        report["tools"],
+        json!({"cargo": "cargo 1.90.0 (fake)"}),
+        "{report:#}"
+    );
+    let calls = org.calls("acme/crate");
+    let fix = calls
+        .iter()
+        .skip(2)
+        .find(|call| call.starts_with("audit --fix-audit"))
+        .unwrap_or_else(|| panic!("the lock job applied no fixes: {calls:#?}"));
+    assert!(!fix.contains("--no-lock"), "{calls:#?}");
+
+    let (code, report, stderr) = org.publish(93, "ordinary");
+    assert_eq!(code, 0, "{report:#}\n{stderr}");
+    assert_eq!(report["result"]["outcome"], "published", "{report:#}");
+    assert_eq!(report["result"]["security"]["fixes"], 1, "{report:#}");
+    assert_eq!(report["result"]["security"]["skipped"], 0, "{report:#}");
+    assert_eq!(report["result"]["security"]["advisories"], 1, "{report:#}");
+    let lock = org.file_on(93, BRANCH, "Cargo.lock").unwrap();
+    assert!(lock.contains("version = \"1.0.1\""), "{lock}");
+    let merge_request = org.created_merge_request(93).await.expect("merge request");
+    let title = merge_request["title"].as_str().unwrap();
+    assert!(title.starts_with("fix(security): "), "{title}");
+
+    // Without lock consent prepare finishes the lane, and the fix that
+    // needs a relock is reported skipped.
+    let (code, report, stderr) = org.prepare(99, "ordinary");
+    assert_eq!(code, 0, "{report:#}\n{stderr}");
+    assert_eq!(report["step"], "finished", "{report:#}");
+    assert_eq!(report["result"]["security"]["fixes"], 0, "{report:#}");
+    assert_eq!(report["result"]["security"]["skipped"], 1, "{report:#}");
+    let calls = org.calls("acme/crate-unlocked");
+    assert!(calls[0].contains(" --no-lock "), "{calls:#?}");
+}
+
+#[tokio::test]
+async fn the_major_lane_is_split_like_the_ordinary_lane() {
+    let (mut org, toolbox) = Org::locking().await;
+    uv_project(
+        &mut org,
+        94,
+        "acme/major",
+        "[automation]\ndependency_updates = true\nmajor_mr = true\nlock = true\n",
+        "uv",
+    );
+    uv_project(&mut org, 95, "acme/no-major", LOCK_OPTED_IN, "uv");
+    org.serve().await;
+    let major = [("UPD_MAJOR_MR", "true")];
+
+    let (code, report, stderr) = org.job("prepare", 94, "major", &major);
+    assert_eq!(code, 0, "{report:#}\n{stderr}");
+    assert_eq!(report["branch"], MAJOR_BRANCH, "{report:#}");
+    assert_eq!(report["step"], "locking", "{report:#}");
+    let (code, report, stderr) =
+        org.lock_worker(94, "major", &[&toolbox.lock_tools, &toolbox.base]);
+    assert_eq!(code, 0, "{report:#}\n{stderr}");
+    let calls = org.calls("acme/major");
+    assert!(
+        calls[1].contains("--lock --only-bump major --strict-bump"),
+        "{calls:#?}"
+    );
+    let (code, report, stderr) = org.job("publish", 94, "major", &major);
+    assert_eq!(code, 0, "{report:#}\n{stderr}");
+    assert_eq!(report["result"]["outcome"], "published", "{report:#}");
+    let lock = org.file_on(94, MAJOR_BRANCH, "uv.lock").unwrap();
+    assert!(lock.contains("version = \"2.0.0\""), "{lock}");
+    assert_eq!(org.file_on(94, BRANCH, "uv.lock"), None);
+
+    let (code, report, stderr) = org.job("prepare", 95, "major", &major);
+    assert_eq!(code, 0, "{report:#}\n{stderr}");
+    assert_eq!(report["step"], "lane_off", "{report:#}");
+    let (code, report, stderr) =
+        org.lock_worker(95, "major", &[&toolbox.lock_tools, &toolbox.base]);
+    assert_eq!(code, 0, "{report:#}\n{stderr}");
+    assert_eq!(report["step"], "nothing_to_do", "{report:#}");
+    let (code, report, stderr) = org.job("publish", 95, "major", &major);
+    assert_eq!(code, 0, "{report:#}\n{stderr}");
+    assert_eq!(report["step"], "nothing_to_do", "{report:#}");
+    assert!(org.calls("acme/no-major").is_empty());
+    assert_eq!(org.file_on(95, MAJOR_BRANCH, "uv.lock"), None);
+}
+
+#[tokio::test]
+async fn without_consent_on_both_sides_prepare_finishes_the_lane_itself() {
+    let (mut org, toolbox) = Org::locking().await;
+    uv_project(&mut org, 96, "acme/declined", OPTED_IN, "uv");
+    uv_project(&mut org, 97, "acme/group-off", LOCK_OPTED_IN, "uv");
+    org.serve().await;
+
+    for (id, path, vars) in [
+        (96, "acme/declined", &[][..]),
+        (97, "acme/group-off", &[("UPD_LOCK", "false")][..]),
+    ] {
+        let (code, report, stderr) = org.job("prepare", id, "ordinary", vars);
+        assert_eq!(code, 0, "{path}: {report:#}\n{stderr}");
+        assert_eq!(report["step"], "finished", "{path}: {report:#}");
+        assert_eq!(
+            report["result"]["outcome"], "published",
+            "{path}: {report:#}"
+        );
+        assert!(
+            org.file_on(id, BRANCH, "pyproject.toml")
+                .unwrap()
+                .contains("example==1.1.0")
+        );
+        assert_eq!(org.file_on(id, BRANCH, "uv.lock").as_deref(), Some(UV_LOCK));
+        let calls = org.calls(path);
+        assert!(
+            calls.iter().all(|call| !call.contains("--lock")),
+            "{calls:#?}"
+        );
+
+        let (code, report, stderr) =
+            org.lock_worker(id, "ordinary", &[&toolbox.lock_tools, &toolbox.base]);
+        assert_eq!(code, 0, "{path}: {report:#}\n{stderr}");
+        assert_eq!(report["step"], "nothing_to_do", "{path}: {report:#}");
+        let (code, report, stderr) = org.job("publish", id, "ordinary", vars);
+        assert_eq!(code, 0, "{path}: {report:#}\n{stderr}");
+        assert_eq!(report["step"], "nothing_to_do", "{path}: {report:#}");
+        assert_eq!(org.calls(path).len(), calls.len(), "{path}");
+    }
+}
+
+#[tokio::test]
+async fn prepare_refuses_a_project_outside_the_group() {
+    let (mut org, _toolbox) = Org::locking().await;
+    uv_project(&mut org, 98, "elsewhere/app", LOCK_OPTED_IN, "uv");
+    org.serve().await;
+
+    let (code, _, stderr) = org.prepare(98, "ordinary");
+
+    assert_eq!(code, 2, "{stderr}");
+    assert!(
+        stderr.contains("(elsewhere/app) is not in acme"),
+        "{stderr}"
+    );
+    assert!(org.calls("elsewhere/app").is_empty());
+    assert!(!org.job_dir(98, "ordinary").join("work.json").exists());
 }

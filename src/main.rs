@@ -999,17 +999,10 @@ fn plan_lock_groups(files: &[(PathBuf, FileType)]) -> Result<Vec<LockGroup>> {
         if *file_type == FileType::Annotated {
             continue;
         }
-        let workspace = upd::lockfile::uv_workspace_root(path)?;
-        let owner = workspace.as_ref().map(|root| root.join("pyproject.toml"));
-        let lockfiles = match &owner {
-            Some(owner) if owner.with_file_name("uv.lock").exists() => detect_lockfiles(owner),
-            Some(_) => Vec::new(),
-            None => detect_lockfiles(path),
-        };
+        let (owner, lockfiles) = upd::lockfile::refreshed_lockfiles(path)?;
         if lockfiles.is_empty() {
             continue;
         }
-        let owner = owner.filter(|owner| owner.with_file_name("uv.lock").exists());
         let dir = containing_dir(owner.as_deref().unwrap_or(path)).to_path_buf();
         let index = groups
             .iter()
@@ -1807,13 +1800,11 @@ async fn run() -> Result<()> {
             run_gitlab(&cli).await?;
         }
         Some(Command::Gitlab {
-            command:
-                upd::cli::GitlabCommand::Org {
-                    command: upd::cli::GitlabOrgCommand::Run,
-                },
-        }) => {
-            run_gitlab_org(&cli).await?;
-        }
+            command: upd::cli::GitlabCommand::Org { command },
+        }) => match command {
+            upd::cli::GitlabOrgCommand::Run => run_gitlab_org(&cli).await?,
+            step => run_gitlab_org_step(&cli, step).await?,
+        },
         Some(Command::Schema) => {
             // Already handled above before show_config check.
             unreachable!("Schema handled earlier");
@@ -1891,6 +1882,72 @@ async fn run_gitlab(cli: &Cli) -> Result<()> {
         }
         Err(error) => {
             print_error(&error);
+            std::process::exit(error.exit_code());
+        }
+    }
+}
+
+/// Runs one lock mode job of an organization run for one project lane.
+async fn run_gitlab_org_step(cli: &Cli, command: &upd::cli::GitlabOrgCommand) -> Result<()> {
+    use upd::cli::{GitlabLane, GitlabOrgCommand};
+    use upd::gitlab::{Error, org, run, split};
+
+    init_tls(cli)?;
+    let lane = |lane: GitlabLane| match lane {
+        GitlabLane::Ordinary => run::Lane::Ordinary,
+        GitlabLane::Major => run::Lane::Major,
+    };
+    let log = run::Log::direct();
+    let result = async {
+        if cli.dry_run {
+            return Err(Error::Input(
+                "the lock mode jobs do not take --dry-run; gitlab org run --dry-run previews an organization run".to_string(),
+            ));
+        }
+        match command {
+            GitlabOrgCommand::Run => unreachable!("gitlab org run is dispatched separately"),
+            GitlabOrgCommand::Prepare(args) => {
+                let settings = org::OrgSettings::from_env(false)?;
+                split::prepare(&settings, args.project, lane(args.lane), &args.dir, &log).await
+            }
+            GitlabOrgCommand::LockWorker { dir } => {
+                let updater = match std::env::var_os("UPD_EXECUTABLE").filter(|path| !path.is_empty()) {
+                    Some(path) => std::path::PathBuf::from(path),
+                    None => std::env::current_exe().map_err(|error| {
+                        Error::Io(format!("cannot locate the upd executable: {error}"))
+                    })?,
+                };
+                split::lock_worker(dir, updater, &log).await
+            }
+            GitlabOrgCommand::Publish(args) => {
+                let settings = org::OrgSettings::from_env(false)?;
+                split::publish(&settings, args.project, lane(args.lane), &args.dir, &log).await
+            }
+        }
+    }
+    .await;
+    match result {
+        Ok(report) => {
+            if effective_json_mode(cli) {
+                eprintln!("{}", report.render_text());
+                println!("{}", serde_json::to_string_pretty(&report.to_json())?);
+            } else {
+                println!("{}", report.render_text());
+            }
+            if report.is_failure() {
+                std::process::exit(2);
+            }
+            Ok(())
+        }
+        Err(error) => {
+            eprintln!(
+                "{}",
+                serde_json::json!({"error": {
+                    "kind": error.kind(),
+                    "message": error.message(),
+                    "exit_code": error.exit_code(),
+                }})
+            );
             std::process::exit(error.exit_code());
         }
     }

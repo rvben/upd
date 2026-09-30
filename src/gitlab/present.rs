@@ -70,6 +70,16 @@ pub enum Lane<'a> {
     Major,
 }
 
+/// The default-branch commit a proposal is built on, as it stands when the
+/// proposal is published.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Base<'a> {
+    /// The default branch's current head.
+    Latest,
+    /// This earlier commit; the default branch has moved since.
+    Behind(&'a str),
+}
+
 /// Job facts the presentation needs beyond the report itself.
 #[derive(Debug, Clone)]
 pub struct Context<'a> {
@@ -87,6 +97,7 @@ pub struct Context<'a> {
     pub changed_paths: &'a [String],
     /// What the security step changed, when it ran.
     pub security: Option<&'a Security>,
+    pub base: Base<'a>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -209,6 +220,10 @@ pub struct Presentation {
     /// Absent when security remediation did not run.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub security: Option<Security>,
+    /// The default-branch commit the proposal is built on; absent when that
+    /// is the branch's current head.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub built_from: Option<String>,
 }
 
 impl Presentation {
@@ -320,6 +335,10 @@ impl Presentation {
             title: String::new(),
             major_lane,
             security,
+            built_from: match context.base {
+                Base::Latest => None,
+                Base::Behind(commit) => Some(clean_str(commit, 64)),
+            },
         };
         presentation.title = presentation.derive_title();
         Ok(presentation)
@@ -534,7 +553,7 @@ impl Presentation {
         .collect::<Vec<_>>()
         .join("\n\n");
         format!(
-            "{BRAND}\n\n{}{}\n\n{}\n\n{changes}\n\n{}{}{}{}\n\n{}\n\n> Rebuilt from the latest default branch. The project pipeline remains the final merge boundary.\n\n---\nPrepared by [upd](https://github.com/rvben/upd).",
+            "{BRAND}\n\n{}{}\n\n{}\n\n{changes}\n\n{}{}{}{}\n\n{}\n\n> {} The project pipeline remains the final merge boundary.\n\n---\nPrepared by [upd](https://github.com/rvben/upd).",
             self.header(),
             self.never_merged_notice(),
             self.facts(),
@@ -545,7 +564,19 @@ impl Presentation {
                 .map(Security::unfixable_section)
                 .unwrap_or_default(),
             self.evidence(),
+            self.base_note(),
         )
+    }
+
+    /// Which default-branch commit the proposal is built on.
+    fn base_note(&self) -> String {
+        match &self.built_from {
+            None => "Rebuilt from the latest default branch.".to_string(),
+            Some(commit) => format!(
+                "Built from {}; the default branch has moved since, and the next scheduled run rebuilds this merge request on it.",
+                code(&commit.chars().take(8).collect::<String>())
+            ),
+        }
     }
 
     fn result_summary(&self) -> String {
@@ -1748,6 +1779,7 @@ mod tests {
             changed_paths: &[],
             lane: Lane::Ordinary,
             security: None,
+            base: Base::Latest,
         };
         let report = json!({"files": ["dependency.txt"], "summary": {}});
         assert!(Presentation::from_report(&report, &context).is_err());
@@ -1767,6 +1799,7 @@ mod tests {
             changed_paths: &[],
             lane: Lane::Ordinary,
             security: None,
+            base: Base::Latest,
         };
         let report = json!({"files": "none", "summary": {"warnings": 2}});
         let presentation = Presentation::from_report(&report, &context).unwrap();
@@ -1828,6 +1861,7 @@ mod tests {
             changed_paths: &["package.json".to_string()],
             lane: Lane::Ordinary,
             security: Some(&security),
+            base: Base::Latest,
         };
         Presentation::from_report(&json!({"files": files, "summary": {}}), &context).unwrap()
     }
@@ -1945,6 +1979,7 @@ mod tests {
             changed_paths: &["dependency.txt".to_string()],
             lane: Lane::Ordinary,
             security: Some(&security),
+            base: Base::Latest,
         };
         let files = json!([{"path": "dependency.txt", "updates": [
             {"package": "example", "current": "1.0.0", "latest": "1.0.1", "bump": "patch"}

@@ -319,6 +319,36 @@ impl Client {
         )))
     }
 
+    /// The full path of `group`, a numeric id or a full path.
+    pub async fn group_path(&self, group: &str) -> Result<String, Error> {
+        let url = self.url(&format!(
+            "{}/groups/{}",
+            self.api_url,
+            encode_segment(group)
+        ))?;
+        let answer = self.send(Method::GET, url, None).await?;
+        match answer["full_path"].as_str() {
+            Some(path) if !path.is_empty() => Ok(path.to_string()),
+            _ => Err(Error::Refused(format!(
+                "GitLab described the group {group} without a full_path: {}",
+                excerpt(&answer.to_string())
+            ))),
+        }
+    }
+
+    /// The project `project_id`, described as a group listing describes it.
+    pub async fn project(&self, project_id: u64) -> Result<Value, Error> {
+        let url = self.url(&format!("{}/projects/{project_id}", self.api_url))?;
+        let answer = self.send(Method::GET, url, None).await?;
+        if answer["id"].as_u64() != Some(project_id) {
+            return Err(Error::Refused(format!(
+                "GitLab answered for project {project_id} with another project: {}",
+                excerpt(&answer.to_string())
+            )));
+        }
+        Ok(answer)
+    }
+
     /// The content of `path` at `reference` in `project_id`, or `None` when
     /// the file does not exist there.
     pub async fn raw_file(
@@ -1125,6 +1155,45 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(error.kind(), "api_error", "{error}");
+    }
+
+    #[tokio::test]
+    async fn a_project_or_group_lookup_refuses_an_answer_about_something_else() {
+        let server = MockServer::start().await;
+        for (route, body) in [
+            (
+                "/api/v4/projects/42",
+                json!({"id": 42, "path_with_namespace": "acme/a"}),
+            ),
+            (
+                "/api/v4/projects/43",
+                json!({"id": 7, "path_with_namespace": "acme/b"}),
+            ),
+            (
+                "/api/v4/groups/acme%2Fplatform",
+                json!({"id": 5, "full_path": "acme/platform"}),
+            ),
+            ("/api/v4/groups/6", json!({"id": 6})),
+        ] {
+            Mock::given(method("GET"))
+                .and(path(route))
+                .respond_with(ResponseTemplate::new(200).set_body_json(body))
+                .mount(&server)
+                .await;
+        }
+        let client = client(&server).await;
+        assert_eq!(
+            client.project(42).await.unwrap()["path_with_namespace"],
+            "acme/a"
+        );
+        let error = client.project(43).await.unwrap_err();
+        assert_eq!(error.kind(), "refused", "{error}");
+        assert_eq!(
+            client.group_path("acme/platform").await.unwrap(),
+            "acme/platform"
+        );
+        let error = client.group_path("6").await.unwrap_err();
+        assert_eq!(error.kind(), "refused", "{error}");
     }
 
     #[test]

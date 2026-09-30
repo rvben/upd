@@ -450,6 +450,56 @@ pub enum GitlabOrgCommand {
     /// With --dry-run, reports what each project would get without pushing
     /// or writing to GitLab.
     Run,
+
+    /// Lock mode, first job: open one project lane and hand its lockfiles on.
+    ///
+    /// Holds the token. Applies the security fixes and the update to
+    /// manifests only, then either finishes the lane or writes the lock
+    /// job's work into --dir, sealed with the token. Configured as
+    /// `gitlab org run` is, plus CI_PIPELINE_ID.
+    Prepare(GitlabOrgLaneArgs),
+
+    /// Lock mode, second job: regenerate the lockfiles without the token.
+    ///
+    /// Runs the security fixes and the update with lockfile regeneration on
+    /// the commit prepare bundled into --dir, and writes the change and the
+    /// reports into --dir/result. Refuses to run with UPD_GITLAB_TOKEN set.
+    LockWorker {
+        /// The directory prepare wrote its work into.
+        #[arg(long, value_name = "DIR")]
+        dir: PathBuf,
+    },
+
+    /// Lock mode, third job: verify the lock job's result and publish it.
+    ///
+    /// Holds the token. Verifies the seal on prepare's work, admits only the
+    /// planned manifest edits and in-place edits of existing lockfiles that
+    /// add no new place to fetch code from, and publishes with the lease
+    /// prepare observed.
+    Publish(GitlabOrgLaneArgs),
+}
+
+/// The project lane a lock mode job handles.
+#[derive(clap::Args, Clone, Debug)]
+pub struct GitlabOrgLaneArgs {
+    /// The project's numeric id.
+    #[arg(long, value_name = "ID")]
+    pub project: u64,
+    /// Which of the project's merge requests the job builds.
+    #[arg(long, value_enum, default_value_t = GitlabLane::Ordinary)]
+    pub lane: GitlabLane,
+    /// The directory the jobs exchange their work through.
+    #[arg(long, value_name = "DIR")]
+    pub dir: PathBuf,
+}
+
+/// The two merge requests a project can have.
+#[derive(ValueEnum, Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GitlabLane {
+    /// Every update the bump ceiling allows.
+    Ordinary,
+    /// Major-version upgrades only.
+    Major,
 }
 
 impl Cli {

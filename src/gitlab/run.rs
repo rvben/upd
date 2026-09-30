@@ -6,13 +6,13 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Mutex;
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use super::Error;
 use super::api::{Client, MergeRequest};
 use super::git::{self, Git, Push};
-use super::present::{self, Presentation, Security, SecurityCounts};
+use super::present::{self, Base, Presentation, Security, SecurityCounts};
 
 /// Marks a merge request that automation has paused on, so the notice is
 /// added once.
@@ -48,6 +48,9 @@ pub struct Settings {
     pub min_age_floor: String,
     pub max_bump: String,
     pub lock: bool,
+    /// Whether regenerating a lockfile must not build a package from
+    /// source; sets `UV_NO_BUILD` for every updater command.
+    pub no_build: bool,
     pub auto_merge: bool,
     /// Whether the ordinary lane first fixes every dependency with a
     /// published advisory, outside the update policy.
@@ -71,7 +74,8 @@ pub struct Settings {
 }
 
 /// The two merge requests a project can have.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Lane {
     /// Every update the bump ceiling allows; the only lane unless
     /// `major_mr` is set.
@@ -136,6 +140,7 @@ impl Settings {
             min_age_floor: String::new(),
             max_bump: optional("UPD_MAX_BUMP", ""),
             lock: flag("UPD_LOCK")?,
+            no_build: false,
             auto_merge: flag("UPD_AUTO_MERGE")?,
             security_remediation: match lookup("UPD_SECURITY_REMEDIATION").as_deref() {
                 None | Some("") => true,
@@ -483,7 +488,7 @@ impl Log {
 
 /// What building a proposal left: an outcome reached without publishing,
 /// or a staged and presented change for [`Session::publish`].
-enum Build {
+pub(super) enum Build {
     Done(Outcome),
     Ready {
         presentation: Box<Presentation>,
@@ -711,14 +716,23 @@ impl<'a> Session<'a> {
                 changed,
             } => self.publish(presentation, changed).await?,
         };
-        Ok(Proposal { outcome, security })
+        Ok(Proposal {
+            outcome,
+            security: security.map(|security| security.counts),
+        })
+    }
+
+    /// The remote automation branch tip this session inspected, empty when
+    /// the branch is absent.
+    pub(super) fn expected_remote_sha(&self) -> &str {
+        &self.expected_remote_sha
     }
 
     /// Claims the automation branch, rebuilds it from the default branch,
     /// applies the security fixes and the update, and presents and validates
-    /// the staged result. Records what the security step changed in `counts`
-    /// once it has run.
-    async fn build(&self, counts: &mut Option<SecurityCounts>) -> Result<Build, Error> {
+    /// the staged result. Records what the security step changed in
+    /// `security` once the result is presented.
+    pub(super) async fn build(&self, security: &mut Option<Security>) -> Result<Build, Error> {
         let Self {
             settings,
             git,
@@ -784,90 +798,16 @@ impl<'a> Session<'a> {
             ));
         }
 
-        let mut security = if settings.security_remediation {
-            let report = run_security_fixes(settings, log).await?;
-            let security = Security::from_report(&report, settings.lock)?;
-            log.line(security.summary_line(&report)?);
-            for warning in security.warnings() {
-                log.line(warning);
-            }
-            if !present::report_is_error_free(&report)? {
-                return Err(Error::Refused(
-                    "upd reported errors while applying security fixes; refusing to publish a partial result"
-                        .to_string(),
-                ));
-            }
-            *counts = Some(security.counts);
-            Some(security)
-        } else {
-            None
-        };
-        // The tree the fixes left, to tell whether the update changed it.
-        let fixed_tree = match &security {
-            Some(security) if security.is_recheckable() => Some(staged_tree(git).await?),
-            _ => None,
-        };
-
-        let report = run_updater(settings, log).await?;
-        log.line(present::summary_line(&report)?);
-        if !present::report_is_error_free(&report)? {
-            return Err(Error::Refused(
-                "upd reported errors; refusing to publish a partial result".to_string(),
-            ));
-        }
-
-        // An update that changed the tree the fixes left can move a fixed
-        // dependency back to a release an advisory affects, so the final
-        // tree is audited again.
-        if let (Some(security), Some(fixed_tree)) = (security.as_mut(), fixed_tree)
-            && staged_tree(git).await? != fixed_tree
-        {
-            let recheck = run_security_recheck(settings, log).await?;
-            if !present::report_is_error_free(&recheck)? {
-                return Err(Error::Refused(
-                    "upd reported errors while auditing the updated tree; refusing to publish a partial result"
-                        .to_string(),
-                ));
-            }
-            security.apply_recheck(&recheck)?;
-            for warning in security.recheck_warnings() {
-                log.line(warning);
-            }
-            *counts = Some(security.counts);
-        }
-
-        git.run(["add", "--all"]).await?;
-        let changed = !git.test(["diff", "--cached", "--quiet"]).await?;
-        let changed_paths = staged_paths(git).await?;
-        let min_age = policy_min_age(settings);
-        let merge_requests = settings.major_merge_requests_url();
-        let lane = match settings.lane {
-            Lane::Ordinary if settings.major_mr => present::Lane::BesideMajor {
-                branch: &settings.major_branch,
-                merge_requests: &merge_requests,
-            },
-            Lane::Ordinary => present::Lane::Ordinary,
-            Lane::Major => present::Lane::Major,
-        };
-        let mut presentation = Presentation::from_report(
-            &report,
-            &present::Context {
-                lane,
-                min_age: &min_age,
-                max_bump: &settings.max_bump,
-                lock: settings.lock,
-                auto_merge: settings.auto_merge,
-                validation_configured: !settings.validation_command.is_empty(),
-                changed,
-                changed_paths: &changed_paths,
-                security: security.as_ref(),
-            },
-        )?;
-        write_artifact(
+        let applied = apply_changes(settings, git, log).await?;
+        let (mut presentation, changed) = stage_and_present(
             settings,
-            "upd-presentation.json",
-            &presentation.to_artifact(),
-        )?;
+            git,
+            &applied.reports.update,
+            applied.security.as_ref(),
+            Base::Latest,
+        )
+        .await?;
+        *security = applied.security;
 
         if !changed {
             return Ok(Build::Ready {
@@ -905,7 +845,7 @@ impl<'a> Session<'a> {
     /// Publishes a built proposal: commits and lease-pushes the staged
     /// change and opens or updates its merge request, or, when nothing
     /// changed, closes the merge request the change made obsolete.
-    async fn publish(
+    pub(super) async fn publish(
         &self,
         presentation: Box<Presentation>,
         changed: bool,
@@ -916,8 +856,8 @@ impl<'a> Session<'a> {
             log,
             api,
             url,
-            default_ref,
             expected_remote_sha,
+            ..
         } = self;
         if !changed {
             return close_obsolete(api, git, settings, log, url, expected_remote_sha).await;
@@ -931,7 +871,7 @@ impl<'a> Session<'a> {
         // Rewriting an identical commit would only change its timestamps, yet
         // it restarts the merge request's pipeline and approvals.
         let pushed = expected_remote_sha.is_empty()
-            || !already_proposed(git, settings, default_ref, expected_remote_sha).await?;
+            || !already_proposed(git, settings, expected_remote_sha).await?;
         if settings.dry_run {
             return Ok(Outcome::WouldPublish {
                 title,
@@ -1040,9 +980,202 @@ fn policy_min_age(settings: &Settings) -> String {
     }
 }
 
+/// The reports the security fixes, the update and the audit of the updated
+/// tree printed, as [`apply_changes`] ran them.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub(super) struct Reports {
+    /// Absent when security remediation is off.
+    pub security: Option<Value>,
+    pub update: Value,
+    /// Absent unless the update changed the tree the fixes left.
+    pub recheck: Option<Value>,
+}
+
+/// What [`apply_changes`] left in the checkout, read back from its reports.
+pub(super) struct Applied {
+    pub reports: Reports,
+    /// What the security step changed, when it ran.
+    pub security: Option<Security>,
+}
+
+/// Applies the security fixes and the update to the checkout, then audits
+/// the result again when the update changed what the fixes left. Each
+/// report passes its gate before the next step runs.
+pub(super) async fn apply_changes(
+    settings: &Settings,
+    git: &Git,
+    log: &Log,
+) -> Result<Applied, Error> {
+    let (security_report, mut security) = if settings.security_remediation {
+        let report = run_security_fixes(settings, log).await?;
+        let security = check_fixes(&report, settings.lock, log)?;
+        (Some(report), Some(security))
+    } else {
+        (None, None)
+    };
+    // The tree the fixes left, to tell whether the update changed it.
+    let fixed_tree = match &security {
+        Some(security) if security.is_recheckable() => Some(staged_tree(git).await?),
+        _ => None,
+    };
+
+    let update = run_updater(settings, log).await?;
+    check_update(&update, log)?;
+
+    // An update that changed the tree the fixes left can move a fixed
+    // dependency back to a release an advisory affects, so the final tree is
+    // audited again.
+    let mut recheck = None;
+    if let (Some(security), Some(fixed_tree)) = (security.as_mut(), fixed_tree)
+        && staged_tree(git).await? != fixed_tree
+    {
+        let report = run_security_recheck(settings, log).await?;
+        check_recheck(security, &report, log)?;
+        recheck = Some(report);
+    }
+    Ok(Applied {
+        reports: Reports {
+            security: security_report,
+            update,
+            recheck,
+        },
+        security,
+    })
+}
+
+/// Reads back reports another job's [`apply_changes`] printed, through the
+/// same gates, so they stop a publish exactly as they would have stopped
+/// the run that printed them.
+pub(super) fn assess(
+    settings: &Settings,
+    reports: &Reports,
+    log: &Log,
+) -> Result<Option<Security>, Error> {
+    if reports.security.is_some() != settings.security_remediation {
+        return Err(Error::Refused(format!(
+            "The lock job's result {} a security report, but security remediation is {} for this project",
+            if reports.security.is_some() {
+                "carries"
+            } else {
+                "lacks"
+            },
+            if settings.security_remediation {
+                "on"
+            } else {
+                "off"
+            },
+        )));
+    }
+    let mut security = match &reports.security {
+        Some(report) => Some(check_fixes(report, settings.lock, log)?),
+        None => None,
+    };
+    check_update(&reports.update, log)?;
+    match (security.as_mut(), &reports.recheck) {
+        (Some(security), Some(report)) => check_recheck(security, report, log)?,
+        (None, Some(_)) => {
+            return Err(Error::Refused(
+                "The lock job's result audits the updated tree without having applied security fixes"
+                    .to_string(),
+            ));
+        }
+        (_, None) => {}
+    }
+    Ok(security)
+}
+
+/// Reads the security step's report and refuses one that reports errors.
+fn check_fixes(report: &Value, lock: bool, log: &Log) -> Result<Security, Error> {
+    let security = Security::from_report(report, lock)?;
+    log.line(security.summary_line(report)?);
+    for warning in security.warnings() {
+        log.line(warning);
+    }
+    if !present::report_is_error_free(report)? {
+        return Err(Error::Refused(
+            "upd reported errors while applying security fixes; refusing to publish a partial result"
+                .to_string(),
+        ));
+    }
+    Ok(security)
+}
+
+/// Refuses an update report that reports errors.
+fn check_update(report: &Value, log: &Log) -> Result<(), Error> {
+    log.line(present::summary_line(report)?);
+    if !present::report_is_error_free(report)? {
+        return Err(Error::Refused(
+            "upd reported errors; refusing to publish a partial result".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+/// Reads the audit of the updated tree into `security`, refusing one that
+/// reports errors.
+fn check_recheck(security: &mut Security, report: &Value, log: &Log) -> Result<(), Error> {
+    if !present::report_is_error_free(report)? {
+        return Err(Error::Refused(
+            "upd reported errors while auditing the updated tree; refusing to publish a partial result"
+                .to_string(),
+        ));
+    }
+    security.apply_recheck(report)?;
+    for warning in security.recheck_warnings() {
+        log.line(warning);
+    }
+    Ok(())
+}
+
+/// Stages everything in the checkout and presents it against `HEAD`, the
+/// commit the proposal is built on. Returns the presentation and whether
+/// the staged tree differs from that commit.
+pub(super) async fn stage_and_present(
+    settings: &Settings,
+    git: &Git,
+    report: &Value,
+    security: Option<&Security>,
+    base: Base<'_>,
+) -> Result<(Presentation, bool), Error> {
+    git.run(["add", "--all"]).await?;
+    let changed = !git.test(["diff", "--cached", "--quiet"]).await?;
+    let changed_paths = staged_paths(git).await?;
+    let min_age = policy_min_age(settings);
+    let merge_requests = settings.major_merge_requests_url();
+    let lane = match settings.lane {
+        Lane::Ordinary if settings.major_mr => present::Lane::BesideMajor {
+            branch: &settings.major_branch,
+            merge_requests: &merge_requests,
+        },
+        Lane::Ordinary => present::Lane::Ordinary,
+        Lane::Major => present::Lane::Major,
+    };
+    let presentation = Presentation::from_report(
+        report,
+        &present::Context {
+            lane,
+            min_age: &min_age,
+            max_bump: &settings.max_bump,
+            lock: settings.lock,
+            auto_merge: settings.auto_merge,
+            validation_configured: !settings.validation_command.is_empty(),
+            changed,
+            changed_paths: &changed_paths,
+            security,
+            base,
+        },
+    )?;
+    write_artifact(
+        settings,
+        "upd-presentation.json",
+        &presentation.to_artifact(),
+    )?;
+    Ok((presentation, changed))
+}
+
 /// Creates the artifact directory and keeps it out of the repository's view,
 /// so artifacts never reach a commit or trip a cleanliness check.
-async fn prepare_artifact_dir(git: &Git, dir: &Path) -> Result<(), Error> {
+pub(super) async fn prepare_artifact_dir(git: &Git, dir: &Path) -> Result<(), Error> {
     fs::create_dir_all(dir.join(ARTIFACT_DIR))
         .map_err(|error| Error::Io(format!("cannot create {ARTIFACT_DIR}/: {error}")))?;
     let exclude = dir.join(
@@ -1154,16 +1287,10 @@ async fn is_written_as_configured(
 
 /// Whether `tip`, a branch `claim` accepted, already is the commit
 /// this run would write from the staged result: the same tree, directly on
-/// the current default branch, with the configured identity and message.
-async fn already_proposed(
-    git: &Git,
-    settings: &Settings,
-    default_ref: &str,
-    tip: &str,
-) -> Result<bool, Error> {
-    let base = git
-        .read(["rev-parse", &format!("{default_ref}^{{commit}}")])
-        .await?;
+/// `HEAD`, the commit the proposal is built on, with the configured identity
+/// and message.
+async fn already_proposed(git: &Git, settings: &Settings, tip: &str) -> Result<bool, Error> {
+    let base = git.read(["rev-parse", "HEAD^{commit}"]).await?;
     let parent = git.read(["rev-parse", &format!("{tip}^")]).await?;
     if parent != base {
         return Ok(false);
@@ -1381,7 +1508,11 @@ async fn invoke_updater(
 ) -> Result<Value, Error> {
     // `spawn` rather than `output`: `output` would capture stderr too, hiding
     // the updater's progress and diagnostics from a direct job log.
-    let child = git::child(&settings.project_dir, &settings.updater)
+    let mut command = git::child(&settings.project_dir, &settings.updater);
+    if settings.no_build {
+        command.env("UV_NO_BUILD", "1");
+    }
+    let child = command
         .args(args)
         .stdout(Stdio::piped())
         .stderr(if log.is_buffered() {
@@ -1513,13 +1644,13 @@ async fn single_open_merge_request(
     }
 }
 
-fn lease_conflict(branch: &str, detail: &str) -> Error {
+pub(super) fn lease_conflict(branch: &str, detail: &str) -> Error {
     Error::Conflict(format!(
         "{branch} changed on the remote while this run was working; nothing was overwritten ({detail})"
     ))
 }
 
-fn write_artifact(settings: &Settings, name: &str, content: &str) -> Result<(), Error> {
+pub(super) fn write_artifact(settings: &Settings, name: &str, content: &str) -> Result<(), Error> {
     let path = settings.artifact(name);
     fs::write(&path, content)
         .map_err(|error| Error::Io(format!("cannot write {}: {error}", path.display())))
