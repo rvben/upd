@@ -275,9 +275,11 @@ impl NpmRegistry {
         .build()
         .expect("Failed to create HTTP client. This usually indicates a TLS/SSL configuration issue on your system.");
 
+        // Package paths are joined as `{registry_url}/{package}`, so a
+        // conventional trailing slash would put an empty segment before them.
         Self {
             client,
-            registry_url,
+            registry_url: registry_url.trim_end_matches('/').to_string(),
         }
     }
 
@@ -935,6 +937,39 @@ mod tests {
         assert!(
             rc.published_at.is_some(),
             "5.0.0-rc.1 timestamp should parse"
+        );
+    }
+
+    /// `.npmrc` registry URLs conventionally end in `/`; the package path is
+    /// joined onto the registry root either way, never after an empty segment.
+    #[tokio::test]
+    async fn a_registry_url_ending_in_a_slash_reads_the_package_at_its_root() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/scoped/lodash"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                r#"{
+              "name": "lodash",
+              "dist-tags": {"latest": "4.17.21"},
+              "versions": {"4.17.21": {"version": "4.17.21"}}
+            }"#,
+            ))
+            .mount(&mock_server)
+            .await;
+
+        let registry = NpmRegistry::with_registry_url(format!("{}/scoped/", mock_server.uri()));
+        assert_eq!(
+            registry.registry_url(),
+            format!("{}/scoped", mock_server.uri())
+        );
+        let versions = registry.list_versions("lodash").await.unwrap();
+        assert_eq!(versions.len(), 1, "{versions:?}");
+        assert_eq!(
+            registry.get_latest_version("lodash").await.unwrap(),
+            "4.17.21"
         );
     }
 
