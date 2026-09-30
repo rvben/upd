@@ -611,8 +611,8 @@ async fn fix_audit_reports_pseudo_version_as_unbumpable_not_lock_only() {
     );
 
     assert_eq!(
-        code, 0,
-        "no edit means total_fixed stays 0, matching the lock-only dry-run contract; stderr: {stderr}"
+        code, 6,
+        "a vulnerability no fix was written for is left unresolved; stderr: {stderr}"
     );
     assert!(
         stderr.contains("Cannot auto-fix"),
@@ -706,7 +706,10 @@ async fn fix_audit_holds_a_fix_only_where_the_governing_configuration_says_so() 
     fs::write(held.join(".updrc.toml"), "ignore = [\"requests\"]\n").unwrap();
 
     let (report, code) = apply_fix_audit(tmp.path(), &server);
-    assert_eq!(code, 0, "{report}");
+    assert_eq!(
+        code, 6,
+        "the held file is left vulnerable even though the other was fixed: {report}"
+    );
     assert_eq!(
         fs::read_to_string(tmp.path().join("requirements.txt")).unwrap(),
         "requests==2.28.0\n",
@@ -778,7 +781,7 @@ async fn fix_audit_leaves_a_configured_ignore_untouched_and_says_why() {
         fix["error"], "ignored by configuration; the fix needs 2.28.0 or later",
         "{fix}"
     );
-    assert_eq!(code, 0);
+    assert_eq!(code, 6, "an ignored vulnerability is left unresolved");
 }
 
 #[tokio::test]
@@ -794,5 +797,5 @@ async fn fix_audit_does_not_write_past_a_pin_below_the_fix_and_says_why() {
         fix["error"], "pinned to 1.0.0 by configuration; the fix needs 2.28.0 or later",
         "{fix}"
     );
-    assert_eq!(code, 0);
+    assert_eq!(code, 6, "a held vulnerability is left unresolved");
 }

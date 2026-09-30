@@ -5040,24 +5040,36 @@ async fn run_audit(cli: &Cli) -> Result<()> {
             // Exit-code contract for --fix-audit:
             // - errors during fix (any Failed/RolledBack outcome) → 2
             // - dry-run with pending fixes and !no_fail → 1
-            // - a manifest requirement blocked a fix (and no genuine error
-            //   or pending dry-run outranks it) and !no_fail → 6, the same
+            // - a vulnerability is left unresolved (and no genuine error or
+            //   pending dry-run outranks it) and !no_fail → 6, the same
             //   "vulnerabilities found, not fully resolved" code plain
-            //   audit uses; other fixes in the run still applied, so this
-            //   is not an error
-            // - applied successfully (or no_fail) → 0
+            //   audit uses: a manifest requirement blocked its fix, its fix
+            //   was skipped (`--no-lock` leaves a lock-only Cargo fix
+            //   unwritten), its manifest already required the fix but
+            //   `--no-lock` left the lockfile at the vulnerable release, or
+            //   it was reported unfixable (no release
+            //   resolves it, the configuration holds it, or the writer
+            //   refuses the file). Other fixes in the run still applied, so
+            //   this is not an error
+            // - every vulnerability resolved (or no_fail) → 0
             let fix_errors: Vec<String> = outcomes
                 .iter()
                 .filter(|o| matches!(o.status, FixStatus::Failed | FixStatus::RolledBack))
                 .filter_map(|o| o.error.clone())
                 .collect();
             let has_planned = outcomes.iter().any(|o| o.status == FixStatus::Planned);
-            let has_blocked = outcomes.iter().any(|o| o.status == FixStatus::Blocked);
+            let has_unresolved = !routing.unfixable.is_empty()
+                || outcomes.iter().any(|o| {
+                    matches!(
+                        o.status,
+                        FixStatus::Blocked | FixStatus::Skipped | FixStatus::Unfixable
+                    ) || (cli.no_lock && o.status == FixStatus::AlreadySatisfied)
+                });
             let fix_exit_code = if !fix_errors.is_empty() {
                 2
             } else if effective_dry_run && has_planned && !no_fail {
                 1
-            } else if has_blocked && !no_fail {
+            } else if has_unresolved && !no_fail {
                 6
             } else {
                 0

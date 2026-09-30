@@ -12,7 +12,8 @@ upd audit ./services   # Audit specific directory
 
 # Auto-fix: bump each vulnerable package to the minimum safe version
 # (max of fixed_version across all its vulnerabilities). Packages with
-# no fixed_version are reported but left untouched.
+# no fixed_version are reported but left untouched, and the run exits 6
+# while any vulnerability is left unresolved.
 upd audit --fix-audit --apply
 
 # Auto-fix and refresh the affected lockfiles (e.g. go.sum, Cargo.lock)

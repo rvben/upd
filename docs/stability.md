@@ -291,7 +291,7 @@ that project asked for.
 | `2` | An error was reported. A file could not be read/written, a required path does not exist, a lockfile refresh failed (its directory is put back as the run found it), a dependency could not be checked (its constraint could not be read, or its registry lookup did not answer), or `--interactive` was given with no terminal on stdin. Takes precedence over every other code. An interactive session reports these the same way a plain run does, after applying whatever it approved |
 | `3` | Network error. A registry was unreachable or timed out |
 | `4` | Invalid CLI arguments or an unparseable dependency file / configuration |
-| `6` | Vulnerabilities found (`upd audit`). Pass `--no-fail` to force exit 0. |
+| `6` | Vulnerabilities found (`upd audit`). Under `--fix-audit`, a vulnerability left unresolved: its fix was blocked, skipped, or reported unfixable, or `--no-lock` left the lockfile at the vulnerable release when the manifest already required the fix, even when other fixes in the run applied. Pass `--no-fail` to force exit 0. |
 
 > The authoritative exit-code contract is emitted by `upd schema` (`outcomes` and
 > `errors`). A bare `upd` / `upd audit` already signals these codes; `--check` does

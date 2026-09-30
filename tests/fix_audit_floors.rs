@@ -394,7 +394,10 @@ async fn no_lock_reports_pending_relock_and_skipped() {
         ],
     );
 
-    assert_eq!(code, 0, "stdout: {stdout}\nstderr: {stderr}");
+    assert_eq!(
+        code, 6,
+        "the skipped Cargo fix leaves its vulnerability in Cargo.lock\nstdout: {stdout}\nstderr: {stderr}"
+    );
     assert!(
         !uv_marker.exists(),
         "uv must never be invoked under --no-lock"
@@ -488,8 +491,9 @@ async fn no_lock_dry_run_reports_cargo_precise_skipped() {
 
     // A target skipped under --no-lock is not a pending fix (only `planned`
     // outcomes count as pending in the exit-code matrix), so this dry run
-    // exits 0 rather than promising work that `--apply` would not perform.
-    assert_eq!(code, 0, "stdout: {stdout}\nstderr: {stderr}");
+    // never exits 1 promising work that `--apply` would not perform. The
+    // vulnerability stays in Cargo.lock, so it exits 6 like a plain audit.
+    assert_eq!(code, 6, "stdout: {stdout}\nstderr: {stderr}");
 }
 
 /// (d) Dry-run lists pending floors, never writes, and exits 1 (or 0 with
@@ -633,11 +637,10 @@ async fn npm_both_direct_and_transitive_writes_dollar_name() {
 }
 
 /// (f) poetry.lock has no floor mechanism upd can write to: a lock-only
-/// vulnerable package there is reported unfixable, never blocking the
-/// overall exit code (no other fixable/unfixable-without-a-fix target
-/// exists).
+/// vulnerable package there is reported unfixable and left unresolved, so
+/// the run exits 6, and 0 under `--no-fail`.
 #[tokio::test]
-async fn poetry_lock_only_is_unfixable_with_exit_0() {
+async fn poetry_lock_only_is_unfixable_and_exits_6() {
     let server = wiremock::MockServer::start().await;
     mount_osv_single(&server, "GHSA-floors-f", "poetrydep", "PyPI", "1.0.1").await;
 
@@ -655,8 +658,25 @@ async fn poetry_lock_only_is_unfixable_with_exit_0() {
         &[("OSV_API_URL", &server.uri())],
     );
 
-    assert_eq!(code, 0, "stdout: {stdout}\nstderr: {stderr}");
+    assert_eq!(
+        code, 6,
+        "an unfixable vulnerability is left unresolved\nstdout: {stdout}\nstderr: {stderr}"
+    );
     assert!(stderr.contains("Cannot auto-fix"), "{stderr}");
+
+    let (_, no_fail_stderr, no_fail_code) = run_with_env(
+        &[
+            "audit",
+            "--fix-audit",
+            "--no-fail",
+            "--no-cache",
+            "--format",
+            "json",
+        ],
+        tmp.path(),
+        &[("OSV_API_URL", &server.uri())],
+    );
+    assert_eq!(no_fail_code, 0, "--no-fail reports it without failing: {no_fail_stderr}");
 
     let json: serde_json::Value = serde_json::from_str(&stdout).unwrap();
     let fixes = json["fixes"].as_array().unwrap();
@@ -859,8 +879,8 @@ async fn cargo_fix_to_an_unpublished_version_is_unfixable_and_spares_its_sibling
     );
 
     assert_eq!(
-        code, 0,
-        "an unpublished fix is unfixable like a missing one, never a failed relock\nstdout: {stdout}\nstderr: {stderr}"
+        code, 6,
+        "an unpublished fix is unfixable like a missing one: left unresolved, never a failed relock\nstdout: {stdout}\nstderr: {stderr}"
     );
     let log_content = fs::read_to_string(&log).unwrap();
     assert!(
@@ -1686,6 +1706,78 @@ async fn manifest_already_satisfied_still_relocks_stale_lock() {
     assert_eq!(entry["method"], "manifest");
 }
 
+/// Runs `--fix-audit --apply --no-lock` (plus `extra`) over a pyproject that
+/// already requires `lockonly>=0.49.1` and a uv.lock still at the vulnerable
+/// 0.40.0, returning the `lockonly` fix entry and the exit code. Neither
+/// file may change.
+async fn no_lock_over_stale_lock(extra: &[&str]) -> (serde_json::Value, i32) {
+    let server = wiremock::MockServer::start().await;
+    mount_osv_single(&server, "GHSA-floors-nolock", "lockonly", "PyPI", "0.49.1").await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let pyproject_path = tmp.path().join("pyproject.toml");
+    fs::write(
+        &pyproject_path,
+        "[project]\nname = \"t\"\nversion = \"1.0.0\"\ndependencies = [\"lockonly>=0.49.1\"]\n",
+    )
+    .unwrap();
+    fs::write(tmp.path().join("uv.lock"), uv_lock_at("lockonly", "0.40.0")).unwrap();
+    let pyproject_before = fs::read(&pyproject_path).unwrap();
+    let uv_lock_before = fs::read(tmp.path().join("uv.lock")).unwrap();
+
+    let mut args = vec![
+        "audit",
+        "--fix-audit",
+        "--apply",
+        "--no-lock",
+        "--no-cache",
+        "--format",
+        "json",
+    ];
+    args.extend_from_slice(extra);
+    let (stdout, stderr, code) = run_with_env(&args, tmp.path(), &[("OSV_API_URL", &server.uri())]);
+
+    assert_eq!(
+        fs::read(&pyproject_path).unwrap(),
+        pyproject_before,
+        "the manifest requirement already covers the fix; nothing is written\nstderr: {stderr}"
+    );
+    assert_eq!(
+        fs::read(tmp.path().join("uv.lock")).unwrap(),
+        uv_lock_before,
+        "--no-lock never touches the lockfile"
+    );
+    let json: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    let entry = json["fixes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|f| f["package"] == "lockonly")
+        .cloned()
+        .unwrap_or_else(|| panic!("no lockonly fix entry\nstdout: {stdout}"));
+    (entry, code)
+}
+
+/// A manifest that already requires the fix writes nothing, and `--no-lock`
+/// leaves the lockfile at the vulnerable release, so the vulnerability is
+/// left unresolved and the run exits 6.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_satisfied_manifest_over_a_stale_lock_under_no_lock_is_unresolved() {
+    let (entry, code) = no_lock_over_stale_lock(&[]).await;
+    assert_eq!(entry["status"], "already_satisfied", "{entry}");
+    assert_eq!(code, 6, "lockonly is still locked at the vulnerable 0.40.0");
+}
+
+/// `--no-fail` still turns the unresolved vulnerability into exit 0.
+#[cfg(unix)]
+#[tokio::test]
+async fn no_fail_accepts_a_satisfied_manifest_over_a_stale_lock() {
+    let (entry, code) = no_lock_over_stale_lock(&["--no-fail"]).await;
+    assert_eq!(entry["status"], "already_satisfied", "{entry}");
+    assert_eq!(code, 0);
+}
+
 /// Adjudicated spec point: in a `CargoPrecise` group with more than one
 /// target, a relock-equivalent group failure demotes targets that had
 /// already succeeded (`Wrote`/`AlreadySatisfied`) to `rolled_back` carrying
@@ -1964,7 +2056,10 @@ async fn text_mode_reports_apply_time_unfixable() {
         ],
     );
 
-    assert_eq!(code, 0, "stdout: {stdout}\nstderr: {stderr}");
+    assert_eq!(
+        code, 6,
+        "a fix the writer refuses leaves its vulnerability unresolved\nstdout: {stdout}\nstderr: {stderr}"
+    );
     assert!(stderr.contains("Cannot auto-fix"), "{stderr}");
     assert!(stderr.contains("lockonly"), "{stderr}");
     assert!(stderr.contains("not a simple form"), "{stderr}");
