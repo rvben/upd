@@ -11,6 +11,7 @@ mod git;
 pub mod org;
 pub mod present;
 pub mod run;
+pub mod sources;
 
 use std::fmt;
 
