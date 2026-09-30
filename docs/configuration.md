@@ -45,8 +45,8 @@ exclude = ["**/archive/**"]
 update_action_shas = false
 
 # Allow the scheduled GitHub security-remediation workflow to maintain its
-# rolling pull request. This is false when omitted. Manual dry runs remain
-# available either way.
+# rolling pull request, and a GitLab organization run to apply security fixes.
+# This is false when omitted. Manual dry runs remain available either way.
 [automation]
 security_remediation = true
 
@@ -65,7 +65,7 @@ django = "4.2.0"
 | `exclude` | `string[]` | Path globs removed from discovery; takes precedence over `include` |
 | `pin` | `table` | Map of package names to pinned versions |
 | `update_action_shas` | `bool` | Whether SHA-pinned GitHub Actions are checked and updated. Defaults to `true`; `--update-action-shas` and `--no-update-action-shas` override it |
-| `automation.security_remediation` | `bool` | Allow scheduled security remediation to publish or clean up its rolling pull request. Defaults to `false` |
+| `automation.security_remediation` | `bool` | Allow scheduled security remediation to publish or clean up its rolling pull request, and a GitLab organization run to apply [security fixes](gitlab.md#security-fixes-in-organization-mode) here; the organization must allow them too. Defaults to `false` |
 | `automation.dependency_updates` | `bool` | Allow a GitLab organization run to keep a rolling dependency merge request open in this repository (see [GitLab](gitlab.md#organization-mode)). Defaults to `false` |
 | `automation.auto_merge` | `bool` | Consent to that organization run asking GitLab to merge once the project's pipeline passes; the organization must enable it too. Defaults to `false` |
 | `automation.major_mr` | `bool` | Consent to that organization run keeping a separate merge request for major-version upgrades open (see [GitLab](gitlab.md#major-upgrades)); the organization must enable it too, and upd never merges it. Defaults to `false` |

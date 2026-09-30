@@ -32,6 +32,13 @@ if [ -n "${UPD_GITLAB_TOKEN+set}" ]; then
   exit 9
 fi
 name="$(cat project.txt)"
+if [ "${1:-}" = audit ]; then
+  printf '%s\n' "$*" >> "$FAKE_LOG/$name.audit.args"
+  cat <<JSON
+{"command":"audit","errors":[],"fixes":[],"status":"complete","summary":{"errors":0,"packages_checked":1,"vulnerabilities":0,"vulnerable_packages":0},"vulnerabilities":[]}
+JSON
+  exit 0
+fi
 case " $* " in
   *" --only-bump major "*)
     printf '%s\n' "$*" > "$FAKE_LOG/$name.major.args"
@@ -248,6 +255,16 @@ impl Org {
     /// The updater's arguments for the project at `path`, if it ran.
     fn updater_args(&self, path: &str) -> Option<String> {
         fs::read_to_string(self.log.join(format!("{}.args", path.replace('/', "-")))).ok()
+    }
+
+    /// Every audit invocation for the project at `path`, one per line, if
+    /// any ran.
+    fn audit_args(&self, path: &str) -> Option<String> {
+        fs::read_to_string(
+            self.log
+                .join(format!("{}.audit.args", path.replace('/', "-"))),
+        )
+        .ok()
     }
 
     /// The major lane's updater arguments for the project at `path`, if it
@@ -477,6 +494,92 @@ async fn auto_merge_needs_both_the_group_and_the_project_to_allow_it() {
             .any(|call| call.starts_with("PUT")),
         "the group did not allow auto-merge"
     );
+}
+
+const REMEDIATION_OPTED_IN: &str =
+    "[automation]\ndependency_updates = true\nsecurity_remediation = true\n";
+
+#[tokio::test]
+async fn security_fixes_need_both_the_group_and_the_project_to_allow_them() {
+    let mut org = Org::new().await;
+    org.project(
+        31,
+        "acme/both",
+        &[Entry::File(".updrc.toml", REMEDIATION_OPTED_IN)],
+    );
+    org.project(32, "acme/absent", &[Entry::File(".updrc.toml", OPTED_IN)]);
+    org.project(
+        33,
+        "acme/declined",
+        &[Entry::File(
+            ".updrc.toml",
+            "[automation]\ndependency_updates = true\nsecurity_remediation = false\n",
+        )],
+    );
+    org.serve().await;
+
+    // The group allows remediation unless it turns it off.
+    let (code, report, stderr) = org.run(&[], &[]);
+
+    assert_eq!(code, 0, "{report:#}\n{stderr}");
+    let both = project(&report, "acme/both");
+    assert_eq!(both["state"], "processed", "{report:#}");
+    assert_eq!(
+        both["security_remediation"],
+        json!({"enabled": true}),
+        "{report:#}"
+    );
+    assert_eq!(
+        org.audit_args("acme/both").as_deref(),
+        Some(
+            "audit --fix-audit --apply --full-precision --format json --no-lock --config .updrc.toml --min-age-floor 7d --exclude-lang nix .\n"
+        ),
+        "without lock consent the fixes leave lockfiles alone"
+    );
+    assert_eq!(org.branch_file(31).as_deref(), Some("new\n"));
+    for path in ["acme/absent", "acme/declined"] {
+        let declined = project(&report, path);
+        assert_eq!(declined["state"], "processed", "{report:#}");
+        assert_eq!(
+            declined["security_remediation"],
+            json!({
+                "enabled": false,
+                "reason": ".updrc.toml does not set security_remediation = true in [automation]",
+            }),
+            "{report:#}"
+        );
+        assert!(declined.get("security").is_none(), "{report:#}");
+        assert_eq!(org.audit_args(path), None, "{path} was audited");
+        assert!(org.updater_args(path).is_some(), "{path} was not updated");
+    }
+    assert!(
+        stderr.contains(
+            "acme/absent: security fixes off (.updrc.toml does not set security_remediation = true in [automation])"
+        ),
+        "{stderr}"
+    );
+
+    let mut org = Org::new().await;
+    org.project(
+        34,
+        "acme/project-only",
+        &[Entry::File(".updrc.toml", REMEDIATION_OPTED_IN)],
+    );
+    org.serve().await;
+    let (code, report, stderr) = org.run(&[("UPD_SECURITY_REMEDIATION", "false")], &[]);
+    assert_eq!(code, 0, "{report:#}\n{stderr}");
+    let project_only = project(&report, "acme/project-only");
+    assert_eq!(project_only["state"], "processed", "{report:#}");
+    assert_eq!(
+        project_only["security_remediation"],
+        json!({
+            "enabled": false,
+            "reason": "the organization run turned security remediation off",
+        }),
+        "{report:#}"
+    );
+    assert_eq!(org.audit_args("acme/project-only"), None);
+    assert_eq!(org.branch_file(34).as_deref(), Some("new\n"));
 }
 
 #[tokio::test]

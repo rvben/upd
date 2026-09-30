@@ -49,6 +49,9 @@ pub struct OrgSettings {
     /// Whether a major-upgrade merge request is allowed at all; each project
     /// must also consent.
     pub major_mr: bool,
+    /// Whether security fixes are allowed at all; each project must also
+    /// consent.
+    pub security_remediation: bool,
     pub major_branch: String,
     pub major_commit_message: String,
     pub concurrency: usize,
@@ -87,6 +90,12 @@ impl OrgSettings {
         };
         let auto_merge = flag("UPD_AUTO_MERGE")?;
         let major_mr = flag("UPD_MAJOR_MR")?;
+        // Unlike the other switches this one is on unless turned off: it
+        // still enables nothing until a project consents too.
+        let security_remediation = match value("UPD_SECURITY_REMEDIATION") {
+            None => true,
+            Some(_) => flag("UPD_SECURITY_REMEDIATION")?,
+        };
         let concurrency = match value("UPD_CONCURRENCY") {
             None => DEFAULT_CONCURRENCY,
             Some(text) => text
@@ -174,6 +183,7 @@ impl OrgSettings {
             max_bump,
             auto_merge,
             major_mr,
+            security_remediation,
             major_branch,
             major_commit_message: optional(
                 "UPD_MAJOR_COMMIT_MESSAGE",
@@ -261,6 +271,26 @@ pub struct ProjectReport {
     /// The major lane's result; absent unless both the organization and the
     /// project enabled it.
     pub major: Option<Result<Outcome, Error>>,
+    /// Whether the ordinary lane applies security fixes; absent for a
+    /// project that did not consent to updates.
+    pub remediation: Option<Remediation>,
+}
+
+/// Whether a consented project's ordinary lane applies security fixes.
+#[derive(Debug)]
+pub enum Remediation {
+    Enabled,
+    /// The reason names the side that did not allow it.
+    Disabled(String),
+}
+
+impl Remediation {
+    fn to_json(&self) -> Value {
+        match self {
+            Self::Enabled => json!({"enabled": true}),
+            Self::Disabled(reason) => json!({"enabled": false, "reason": reason}),
+        }
+    }
 }
 
 impl State {
@@ -288,6 +318,9 @@ impl ProjectReport {
         let mut value = json!({"id": self.id, "path": self.path, "state": self.state.name()});
         if let Some(major) = &self.major {
             value["major"] = run::major_lane_json(major, major_branch);
+        }
+        if let Some(remediation) = &self.remediation {
+            value["security_remediation"] = remediation.to_json();
         }
         match &self.state {
             State::Skipped(reason) => {
@@ -339,7 +372,13 @@ impl ProjectReport {
             ),
             None => String::new(),
         };
-        format!("{}: {detail}{major}", self.path)
+        let remediation = match &self.remediation {
+            Some(Remediation::Disabled(reason)) => {
+                format!("\n{}: security fixes off ({reason})", self.path)
+            }
+            Some(Remediation::Enabled) | None => String::new(),
+        };
+        format!("{}: {detail}{remediation}{major}", self.path)
     }
 
     /// Whether the project needs someone's attention for the run to count
@@ -497,19 +536,20 @@ async fn handle(settings: &OrgSettings, api: &Client, raw: Value, log: &Log) -> 
         .as_str()
         .unwrap_or_default()
         .to_string();
-    let report = |state, major| ProjectReport {
+    let report = |state, major, remediation| ProjectReport {
         id,
         path: path.clone(),
         state,
         major,
+        remediation,
     };
     let project = match classify(settings, raw) {
         Ok(project) => project,
-        Err(state) => return report(state, None),
+        Err(state) => return report(state, None, None),
     };
     match process(settings, api, &project, log).await {
-        Ok((state, major)) => report(state, major),
-        Err(error) => report(State::Failed(error), None),
+        Ok(handled) => report(handled.state, handled.major, handled.remediation),
+        Err(error) => report(State::Failed(error), None, None),
     }
 }
 
@@ -601,6 +641,7 @@ enum Consent {
         config: String,
         auto_merge: bool,
         major_mr: bool,
+        security_remediation: bool,
     },
 }
 
@@ -620,6 +661,7 @@ impl Consent {
                         config: config.to_string(),
                         auto_merge: parsed.auto_merge_enabled(),
                         major_mr: parsed.major_mr_enabled(),
+                        security_remediation: parsed.security_remediation_enabled(),
                     }
                 } else {
                     Self::No(format!(
@@ -638,20 +680,38 @@ impl Consent {
     }
 }
 
-/// The project's state, and the major lane's result when the project
-/// consented to one. The major lane runs even when the ordinary lane failed.
+/// What processing a project left to report.
+struct Handled {
+    state: State,
+    /// The major lane's result, when the project consented to one. The
+    /// major lane runs even when the ordinary lane failed.
+    major: Option<Result<Outcome, Error>>,
+    /// Whether security fixes apply, when the project consented to updates.
+    remediation: Option<Remediation>,
+}
+
+impl Handled {
+    fn stopped(state: State) -> Self {
+        Self {
+            state,
+            major: None,
+            remediation: None,
+        }
+    }
+}
+
 async fn process(
     settings: &OrgSettings,
     api: &Client,
     project: &Project,
     log: &Log,
-) -> Result<(State, Option<Result<Outcome, Error>>), Error> {
+) -> Result<Handled, Error> {
     // A cheap read through the API spares cloning projects that have not
     // opted in. Anything else goes on to the clone, whose own copy of the
     // file decides: the API follows no symbolic link and answers with the
     // link's target path, so only the tree can say what is wrong with it.
     if let Consent::No(reason) = api_consent(api, project).await? {
-        return Ok((State::NotOptedIn(reason), None));
+        return Ok(Handled::stopped(State::NotOptedIn(reason)));
     }
 
     let work = tempfile::Builder::new()
@@ -675,21 +735,36 @@ async fn process(
     }
 
     let mut session = Session::open(settings.for_project(project, dir), log).await?;
-    match tree_consent(&session.git, &session.default_ref, log).await? {
-        Consent::No(reason) => return Ok((State::NotOptedIn(reason), None)),
+    let remediation = match tree_consent(&session.git, &session.default_ref, log).await? {
+        Consent::No(reason) => return Ok(Handled::stopped(State::NotOptedIn(reason))),
         Consent::Invalid { config, message } => {
-            return Ok((State::ConfigInvalid { config, message }, None));
+            return Ok(Handled::stopped(State::ConfigInvalid { config, message }));
         }
         Consent::Yes {
             config,
             auto_merge,
             major_mr,
+            security_remediation,
         } => {
-            session.settings.config = Some(PathBuf::from(config));
             session.settings.auto_merge = settings.auto_merge && auto_merge;
             session.settings.major_mr = settings.major_mr && major_mr;
+            session.settings.security_remediation =
+                settings.security_remediation && security_remediation;
+            let remediation = if !settings.security_remediation {
+                Remediation::Disabled(
+                    "the organization run turned security remediation off".to_string(),
+                )
+            } else if !security_remediation {
+                Remediation::Disabled(format!(
+                    "{config} does not set security_remediation = true in [automation]"
+                ))
+            } else {
+                Remediation::Enabled
+            };
+            session.settings.config = Some(PathBuf::from(config));
+            remediation
         }
-    }
+    };
     // The major lane reads the same configuration and consent the ordinary
     // lane was given, from the same checkout.
     let major = session.settings.major_lane();
@@ -701,7 +776,11 @@ async fn process(
         Some(major) => Some(run::propose_major(major, log).await),
         None => None,
     };
-    Ok((state, major))
+    Ok(Handled {
+        state,
+        major,
+        remediation: Some(remediation),
+    })
 }
 
 async fn api_consent(api: &Client, project: &Project) -> Result<Consent, Error> {
@@ -773,6 +852,7 @@ mod tests {
         assert_eq!(settings.concurrency, DEFAULT_CONCURRENCY);
         assert_eq!(settings.central_project, None);
         assert!(!settings.auto_merge);
+        assert!(settings.security_remediation);
         assert!(settings.exclude.is_empty() && settings.min_age_floor.is_empty());
         let accepted = self::settings(&[("UPD_LANGS", "python, rust")]).unwrap();
         assert_eq!(accepted.langs, "python,rust");
@@ -840,6 +920,7 @@ mod tests {
             &[("CI_SERVER_URL", "")],
             &[("CI_PROJECT_ID", "acme/central")],
             &[("UPD_AUTO_MERGE", "yes")],
+            &[("UPD_SECURITY_REMEDIATION", "yes")],
             &[("UPD_CONCURRENCY", "0")],
             &[("UPD_CONCURRENCY", "17")],
             &[("UPD_CONCURRENCY", "four")],
@@ -983,6 +1064,14 @@ mod tests {
             read("[automation]\ndependency_updates = true\n"),
             Consent::Yes {
                 auto_merge: false,
+                security_remediation: false,
+                ..
+            }
+        ));
+        assert!(matches!(
+            read("[automation]\ndependency_updates = true\nsecurity_remediation = true\n"),
+            Consent::Yes {
+                security_remediation: true,
                 ..
             }
         ));

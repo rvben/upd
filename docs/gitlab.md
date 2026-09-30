@@ -419,8 +419,9 @@ default branch says so:
 # .updrc.toml
 [automation]
 dependency_updates = true
-auto_merge = true   # optional; the central job must allow it too
-major_mr = true     # optional; the central job must enable it too
+auto_merge = true            # optional; the central job must allow it too
+major_mr = true              # optional; the central job must enable it too
+security_remediation = true  # optional; the central job allows it unless turned off
 ```
 
 The file is found the way `upd` finds configuration (`.updrc.toml`, then
@@ -479,6 +480,7 @@ release: `upd_version` must name a release that provides `upd gitlab org run`.
 | `branch`, `commit_message` | as above | Rolling branch and generated commit message in every project |
 | `auto_merge` | `false` | Allow auto-merge in projects that also set `auto_merge = true` |
 | `major_mr` | `false` | Keep a [major-upgrade merge request](#major-upgrades) in projects that also set `major_mr = true`; needs `max_bump` set to `minor` or `patch` |
+| `security_remediation` | `true` | Apply [security fixes](#security-fixes) in projects that also set `security_remediation = true`; `false` turns them off everywhere |
 | `major_branch`, `major_commit_message` | as above | Rolling branch and generated commit message of the major merge request in every project |
 | `concurrency` | `4` | Projects processed at the same time (1 to 16) |
 | `dry_run` | `false` | Report what each project would get without pushing or writing to GitLab |
@@ -487,8 +489,22 @@ release: `upd_version` must name a release that provides `upd gitlab org run`.
 longer cooldown keeps it. Organization mode never runs `nix flake update`, which
 would evaluate repository content in a job holding a group-wide token, so Nix
 is always left out and `langs` cannot select it. Lockfile regeneration,
-preparation and validation commands are single-project features and are not
-offered here: one job image cannot carry every project's toolchain.
+preparation and validation commands are not offered here for the same reason:
+each runs a program the repository controls (a build backend, an install
+script, the command itself), and none of them belongs in a job holding a
+group-wide token.
+
+### Security fixes in organization mode
+
+A project gets [security fixes](#security-fixes) only when both sides allow
+them: the central `security_remediation` input, on unless set to `false`, and
+`security_remediation = true` in the project's `[automation]` table. The
+central default therefore changes nothing for a project that has not opted
+in. Without lockfile regeneration, each fix rewrites the manifest and is
+listed as awaiting it, exactly as with `lock: false` in a single project.
+Each opted-in project's report entry, `security_remediation`, says whether its fixes were
+enabled and, when not, which side turned them off; the job log prints that
+reason under the project's line.
 
 ### Results
 
