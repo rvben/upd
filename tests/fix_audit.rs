@@ -748,6 +748,10 @@ async fn fix_audit_writes_the_fix_when_configuration_allows_it() {
     let (written, fix, code) = fix_requests_under_config("").await;
     assert_eq!(written, "requests==2.28.0\n");
     assert_eq!(fix["status"], "applied", "{fix}");
+    assert_eq!(
+        fix["ecosystem"], "PyPI",
+        "a fix names its package's ecosystem as vulnerabilities[] does: {fix}"
+    );
     assert_eq!(code, 0);
 
     // A pin at or above the fix already satisfies it, so the fix is written.
@@ -765,6 +769,7 @@ async fn fix_audit_leaves_a_configured_ignore_untouched_and_says_why() {
         "an ignored package is never written"
     );
     assert_eq!(fix["status"], "unfixable", "{fix}");
+    assert_eq!(fix["ecosystem"], "PyPI", "{fix}");
     assert_eq!(
         fix["to_version"], "2.28.0",
         "the known fix stays visible: {fix}"

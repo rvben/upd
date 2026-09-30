@@ -561,6 +561,8 @@ pub struct AuditSummary {
 #[derive(Debug, Serialize)]
 pub struct FixEntry {
     pub package: String,
+    /// OSV ecosystem of `package`, as its `vulnerabilities[]` entries name it.
+    pub ecosystem: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub dependency_key: Option<String>,
     pub from_version: String,
@@ -603,6 +605,7 @@ pub fn build_fix_entries(
         .iter()
         .map(|outcome| FixEntry {
             package: outcome.target.package.clone(),
+            ecosystem: outcome.target.ecosystem.as_str(),
             dependency_key: outcome.target.dependency_key.clone(),
             from_version: outcome.target.from_version.clone(),
             to_version: Some(outcome.target.to_version.clone()),
@@ -614,6 +617,7 @@ pub fn build_fix_entries(
         .collect();
     entries.extend(unfixable.iter().map(|u| FixEntry {
         package: u.package.clone(),
+        ecosystem: u.ecosystem.as_str(),
         dependency_key: u.dependency_key.clone(),
         from_version: u.from_version.clone(),
         to_version: u.to_version.clone(),

@@ -932,6 +932,7 @@ mod tests {
     fn uv_constraint_target(package_json: PathBuf, lockfile: PathBuf) -> FixTarget {
         FixTarget {
             package: "lockonly".to_string(),
+            ecosystem: crate::audit::Ecosystem::PyPI,
             dependency_key: None,
             from_version: "0.40.0".to_string(),
             to_version: "0.49.1".to_string(),
@@ -948,6 +949,7 @@ mod tests {
     fn cargo_floor_target(package: &str, to_version: &str) -> FixTarget {
         FixTarget {
             package: package.to_string(),
+            ecosystem: crate::audit::Ecosystem::CratesIo,
             dependency_key: None,
             from_version: "1.0.0".to_string(),
             to_version: to_version.to_string(),
@@ -1091,6 +1093,7 @@ mod tests {
 
         let target = FixTarget {
             package: "dupcrate".to_string(),
+            ecosystem: crate::audit::Ecosystem::CratesIo,
             dependency_key: None,
             from_version: "1.2.3".to_string(),
             to_version: "2.0.1".to_string(),
@@ -1136,6 +1139,7 @@ mod tests {
 
         let target = FixTarget {
             package: "dupcrate".to_string(),
+            ecosystem: crate::audit::Ecosystem::CratesIo,
             dependency_key: None,
             from_version: "1.2.3".to_string(),
             to_version: "2.0.1".to_string(),
@@ -1183,6 +1187,7 @@ mod tests {
 
         let target = FixTarget {
             package: "examplepkg".to_string(),
+            ecosystem: crate::audit::Ecosystem::Npm,
             dependency_key: None,
             from_version: "2.5.0".to_string(),
             to_version: "2.5.0".to_string(),
@@ -1220,6 +1225,7 @@ mod tests {
 
         let target = FixTarget {
             package: "examplepkg".to_string(),
+            ecosystem: crate::audit::Ecosystem::Npm,
             dependency_key: None,
             from_version: "1.2.0".to_string(),
             to_version: "1.5.0".to_string(),
@@ -1255,6 +1261,7 @@ mod tests {
 
         let override_target = FixTarget {
             package: "examplepkg".to_string(),
+            ecosystem: crate::audit::Ecosystem::Npm,
             dependency_key: None,
             from_version: "1.2.0".to_string(),
             to_version: "1.5.0".to_string(),
@@ -1268,6 +1275,7 @@ mod tests {
         };
         let manifest_target = FixTarget {
             package: "examplepkg".to_string(),
+            ecosystem: crate::audit::Ecosystem::Npm,
             dependency_key: None,
             from_version: "1.0.0".to_string(),
             to_version: "1.5.0".to_string(),
@@ -1326,6 +1334,7 @@ mod tests {
     ) -> FixTarget {
         FixTarget {
             package: package.to_string(),
+            ecosystem: crate::audit::Ecosystem::CratesIo,
             dependency_key: None,
             from_version: from_version.to_string(),
             to_version: to_version.to_string(),
@@ -1396,6 +1405,7 @@ mod tests {
 
         let target = FixTarget {
             package: "examplepkg".to_string(),
+            ecosystem: crate::audit::Ecosystem::Npm,
             dependency_key: None,
             from_version: "1.0.0".to_string(),
             to_version: "1.5.0".to_string(),
@@ -1443,6 +1453,7 @@ mod tests {
 
         let manifest_target = FixTarget {
             package: "examplepkg".to_string(),
+            ecosystem: crate::audit::Ecosystem::Npm,
             dependency_key: None,
             from_version: "1.0.0".to_string(),
             to_version: "1.5.0".to_string(),
@@ -1456,6 +1467,7 @@ mod tests {
         };
         let override_target = FixTarget {
             package: "examplepkg".to_string(),
+            ecosystem: crate::audit::Ecosystem::Npm,
             dependency_key: None,
             from_version: "1.2.0".to_string(),
             to_version: "1.5.0".to_string(),
@@ -1518,6 +1530,7 @@ mod tests {
 
         let target = FixTarget {
             package: "dupcrate".to_string(),
+            ecosystem: crate::audit::Ecosystem::CratesIo,
             dependency_key: None,
             from_version: "1.2.3".to_string(),
             to_version: "2.0.1".to_string(),

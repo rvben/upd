@@ -70,6 +70,8 @@ pub enum NpmOverrideForm {
 #[derive(Debug, Clone)]
 pub struct FixTarget {
     pub package: String,
+    /// The ecosystem of the audited package this target fixes.
+    pub ecosystem: Ecosystem,
     pub dependency_key: Option<String>,
     pub from_version: String,
     pub to_version: String,
@@ -89,6 +91,8 @@ pub struct FixTarget {
 #[derive(Debug, Clone)]
 pub struct UnfixableTarget {
     pub package: String,
+    /// The ecosystem of the audited package left unfixed.
+    pub ecosystem: Ecosystem,
     pub dependency_key: Option<String>,
     pub from_version: String,
     pub to_version: Option<String>,
@@ -247,7 +251,7 @@ fn route_manifest_covered(
     for owner in owners {
         if owner.npm_alias {
             sink.unfixable.push(UnfixableTarget {
-                package: pkg.name.clone(),
+                package: pkg.name.clone(), ecosystem: pkg.ecosystem,
                 dependency_key: Some(owner.dependency_key.clone()),
                 from_version: pkg.version.clone(),
                 to_version: Some(to_version.to_string()),
@@ -286,6 +290,7 @@ fn route_manifest_covered(
             if !occ.is_bumpable {
                 sink.unfixable.push(UnfixableTarget {
                     package: pkg.name.clone(),
+                    ecosystem: pkg.ecosystem,
                     dependency_key: dep_key.clone(),
                     from_version: occ.version.clone(),
                     to_version: Some(to_version.to_string()),
@@ -298,6 +303,7 @@ fn route_manifest_covered(
             }
             sink.manifest_edits.push(FixTarget {
                 package: pkg.name.clone(),
+                ecosystem: pkg.ecosystem,
                 dependency_key: dep_key.clone(),
                 from_version: occ.version.clone(),
                 to_version: to_version.to_string(),
@@ -345,6 +351,7 @@ fn route_manifest_covered_owner(
     let Some(from_version) = spec else {
         sink.unfixable.push(UnfixableTarget {
             package: pkg.name.clone(),
+            ecosystem: pkg.ecosystem,
             dependency_key: dep_key,
             from_version: pkg.version.clone(),
             to_version: Some(to_version.to_string()),
@@ -368,6 +375,7 @@ fn route_manifest_covered_owner(
 
     sink.manifest_edits.push(FixTarget {
         package: pkg.name.clone(),
+        ecosystem: pkg.ecosystem,
         dependency_key: dep_key,
         from_version,
         to_version: to_version.to_string(),
@@ -397,6 +405,7 @@ fn route_no_provenance(
         if !occ.is_bumpable {
             sink.unfixable.push(UnfixableTarget {
                 package: pkg.name.clone(),
+                ecosystem: pkg.ecosystem,
                 dependency_key: dep_key,
                 from_version: occ.version.clone(),
                 to_version: Some(to_version.to_string()),
@@ -409,6 +418,7 @@ fn route_no_provenance(
         }
         sink.manifest_edits.push(FixTarget {
             package: pkg.name.clone(),
+            ecosystem: pkg.ecosystem,
             dependency_key: dep_key,
             from_version: occ.version.clone(),
             to_version: to_version.to_string(),
@@ -443,6 +453,7 @@ fn route_lock_only(
             let host = dir.join("pyproject.toml");
             sink.floor_targets.push(FixTarget {
                 package: pkg.name.clone(),
+                ecosystem: pkg.ecosystem,
                 dependency_key: None,
                 from_version: pkg.version.clone(),
                 to_version: to_version.to_string(),
@@ -457,7 +468,7 @@ fn route_lock_only(
         }
         LockKind::Poetry | LockKind::Gradle => {
             sink.unfixable.push(UnfixableTarget {
-                package: pkg.name.clone(),
+                package: pkg.name.clone(), ecosystem: pkg.ecosystem,
                 dependency_key: None,
                 from_version: pkg.version.clone(),
                 to_version: Some(to_version.to_string()),
@@ -474,6 +485,7 @@ fn route_lock_only(
         LockKind::Cargo => {
             sink.cargo_targets.push(FixTarget {
                 package: pkg.name.clone(),
+                ecosystem: pkg.ecosystem,
                 dependency_key: None,
                 from_version: pkg.version.clone(),
                 to_version: to_version.to_string(),
@@ -517,7 +529,7 @@ fn route_npm_lock_only(
             .is_none_or(|range| crate::npm_range::admits(range, to_version) != Some(true))
     {
         sink.unfixable.push(UnfixableTarget {
-            package: pkg.name.clone(), dependency_key: None,
+            package: pkg.name.clone(), ecosystem: pkg.ecosystem, dependency_key: None,
             from_version: pkg.version.clone(), to_version: Some(to_version.to_string()),
             method: Some("npm-override"), path: Some(host),
             reason: format!("fixing {}@{} requires {to_version}, outside its compatibility range; update its parent dependency instead of forcing an incompatible override", pkg.name, pkg.version),
@@ -549,7 +561,7 @@ fn route_npm_lock_only(
             })
     {
         sink.unfixable.push(UnfixableTarget {
-            package: pkg.name.clone(), dependency_key: None,
+            package: pkg.name.clone(), ecosystem: pkg.ecosystem, dependency_key: None,
             from_version: pkg.version.clone(), to_version: Some(to_version.to_string()),
             method: Some("npm-override"), path: Some(host),
             reason: format!("{} has direct and transitive copies on incompatible branches; update its parent dependencies instead of applying a global $-reference override", pkg.name),
@@ -562,6 +574,7 @@ fn route_npm_lock_only(
         None => {
             sink.floor_targets.push(FixTarget {
                 package: pkg.name.clone(),
+                ecosystem: pkg.ecosystem,
                 dependency_key: None,
                 from_version: pkg.version.clone(),
                 to_version: to_version.to_string(),
@@ -580,7 +593,7 @@ fn route_npm_lock_only(
         }
         Some(d) if d.spec.starts_with("npm:") => {
             sink.unfixable.push(UnfixableTarget {
-                package: pkg.name.clone(),
+                package: pkg.name.clone(), ecosystem: pkg.ecosystem,
                 dependency_key: Some(d.key.clone()),
                 from_version: pkg.version.clone(),
                 to_version: Some(to_version.to_string()),
@@ -601,6 +614,7 @@ fn route_npm_lock_only(
                 Some(o) => {
                     sink.floor_targets.push(FixTarget {
                         package: pkg.name.clone(),
+                        ecosystem: pkg.ecosystem,
                         dependency_key: None,
                         from_version: pkg.version.clone(),
                         to_version: to_version.to_string(),
@@ -615,6 +629,7 @@ fn route_npm_lock_only(
                     let dep_key = dependency_key_if_different(&d.key, &pkg.name);
                     sink.npm_companions.push(FixTarget {
                         package: pkg.name.clone(),
+                        ecosystem: pkg.ecosystem,
                         dependency_key: dep_key,
                         from_version: o.version.clone(),
                         to_version: to_version.to_string(),
@@ -629,7 +644,7 @@ fn route_npm_lock_only(
                 }
                 None => {
                     sink.unfixable.push(UnfixableTarget {
-                        package: pkg.name.clone(),
+                        package: pkg.name.clone(), ecosystem: pkg.ecosystem,
                         dependency_key: Some(d.key.clone()),
                         from_version: pkg.version.clone(),
                         to_version: Some(to_version.to_string()),
@@ -803,6 +818,7 @@ fn fix_bound(vulnerabilities: &[crate::audit::Vulnerability]) -> FixBound<'_> {
 fn no_fix(pkg: &Package, reason: String) -> UnfixableTarget {
     UnfixableTarget {
         package: pkg.name.clone(),
+        ecosystem: pkg.ecosystem,
         dependency_key: None,
         from_version: pkg.version.clone(),
         to_version: None,
@@ -1172,6 +1188,7 @@ pub fn hold_configured_targets(
         match config_for(&target.path)?.and_then(|config| configured_hold(&target, &config)) {
             Some(reason) => unfixable.push(UnfixableTarget {
                 package: target.package,
+                ecosystem: target.ecosystem,
                 dependency_key: target.dependency_key,
                 from_version: target.from_version,
                 to_version: Some(target.to_version),
@@ -3655,6 +3672,7 @@ mod tests {
     ) -> FixTarget {
         FixTarget {
             package: package.to_string(),
+            ecosystem: Ecosystem::PyPI,
             dependency_key: key.map(str::to_string),
             from_version: "1.0.0".to_string(),
             to_version: "2.28.0".to_string(),
