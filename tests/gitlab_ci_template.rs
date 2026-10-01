@@ -2318,7 +2318,7 @@ async fn publish(fixture: &Fixture, run: &Run) -> Published {
         .expect(1)
         .mount(&server)
         .await;
-    serve_merge_request_heads(&server, &fixture).await;
+    serve_merge_request_heads(&server, fixture).await;
     Mock::given(method("PUT"))
         .and(path("/api/v4/projects/1/merge_requests/7/merge"))
         .respond_with(ResponseTemplate::new(200).set_body_json(mr_response(7, true)))

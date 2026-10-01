@@ -63,6 +63,18 @@ fn git(cwd: &Path, args: &[&str]) -> Output {
     run(isolated::command("git").current_dir(cwd).args(args))
 }
 
+/// One invocation of the publish pipeline: the change it carries and the
+/// repository settings it runs under.
+struct PublishRun<'a> {
+    changed: bool,
+    content: &'a str,
+    auto_merge: bool,
+    report_json: &'a str,
+    validation_configured: bool,
+    has_publishing_token: bool,
+    security_report_json: Option<&'a str>,
+}
+
 struct Fixture {
     _temp: TempDir,
     checkout: PathBuf,
@@ -204,15 +216,15 @@ esac
         validation_configured: bool,
         has_publishing_token: bool,
     ) {
-        self.run_publish_full(
+        self.run_publish_full(PublishRun {
             changed,
             content,
             auto_merge,
             report_json,
             validation_configured,
             has_publishing_token,
-            None,
-        );
+            security_report_json: None,
+        });
     }
 
     /// Exercises the same publish pipeline with a non-empty security-fix
@@ -228,27 +240,27 @@ esac
         report_json: &str,
         security_report_json: &str,
     ) {
-        self.run_publish_full(
+        self.run_publish_full(PublishRun {
             changed,
             content,
             auto_merge,
             report_json,
-            true,
-            true,
-            Some(security_report_json),
-        );
+            validation_configured: true,
+            has_publishing_token: true,
+            security_report_json: Some(security_report_json),
+        });
     }
 
-    fn run_publish_full(
-        &self,
-        changed: bool,
-        content: &str,
-        auto_merge: bool,
-        report_json: &str,
-        validation_configured: bool,
-        has_publishing_token: bool,
-        security_report_json: Option<&str>,
-    ) {
+    fn run_publish_full(&self, run: PublishRun<'_>) {
+        let PublishRun {
+            changed,
+            content,
+            auto_merge,
+            report_json,
+            validation_configured,
+            has_publishing_token,
+            security_report_json,
+        } = run;
         git(
             &self.checkout,
             &[
