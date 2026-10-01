@@ -2,6 +2,7 @@
 //! manifests changed by the update command.
 
 use anyhow::{Context, Result, bail};
+use chrono::Utc;
 use ignore::WalkBuilder;
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet};
@@ -9,7 +10,9 @@ use std::path::{Path, PathBuf};
 
 use upd::cli::{BumpLevel, Cli, OutputFormat};
 use upd::config::UpdConfig;
-use upd::lockfile::{Snapshot, tool_command};
+use upd::lockfile::{Snapshot, refresh_uv_lock_gated, tool_command};
+use upd::lockgate::ReleaseAgeGate;
+use upd::lockgate::check::LockCooldownCheck;
 use upd::lockscan::{LockScan, LockedPackage, cargo, npm, uv};
 use upd::updater::{BumpKind, Lang, classify_bump, classify_bump_for};
 
@@ -235,7 +238,31 @@ fn ensure_uv_workspace_root(path: &Path, dir: &Path) -> Result<()> {
     Ok(())
 }
 
-fn refresh_one(path: &Path, cli: &Cli) -> Result<Entry> {
+/// Why a refresh under a cooldown cannot stand once read back: a release it
+/// locked was published inside the cooldown, or one's publish date could not
+/// be checked.
+fn read_back_failure(check: &LockCooldownCheck) -> Option<String> {
+    let mut reasons: Vec<String> = check
+        .findings
+        .iter()
+        .map(|finding| {
+            format!(
+                "{} {} was published {} (cooldown {})",
+                finding.package,
+                finding.version,
+                finding.published_at.format("%Y-%m-%d"),
+                finding.cooldown
+            )
+        })
+        .collect();
+    reasons.extend(check.warnings.iter().cloned());
+    reasons.extend(check.errors.iter().map(|(_, error)| error.clone()));
+    (!reasons.is_empty()).then(|| reasons.join("; "))
+}
+
+/// `progress` shows each package-manager command as it runs, on stdout, so
+/// it is off for JSON output.
+async fn refresh_one(path: &Path, cli: &Cli, progress: bool) -> Result<Entry> {
     let kind = Kind::for_path(path).context("unsupported lockfile")?;
     let dir = path.parent().context("lockfile has no parent directory")?;
     let manifest = dir.join(kind.manifest());
@@ -273,7 +300,8 @@ fn refresh_one(path: &Path, cli: &Cli) -> Result<Entry> {
     let (ecosystem, lang) = kind.ecosystem();
     let cooldown =
         config.to_cooldown_policy(cli.min_age.as_deref(), cli.min_age_floor.as_deref())?;
-    if cooldown.is_enabled_for(ecosystem, Some(lang)) {
+    let gate = ReleaseAgeGate::new(cooldown.effective_for(ecosystem, Some(lang)), Utc::now());
+    if gate.is_some() && kind != Kind::Uv {
         bail!(
             "{}: lock maintenance under a cooldown is not yet supported for {}; no files changed",
             path.display(),
@@ -324,20 +352,28 @@ fn refresh_one(path: &Path, cli: &Cli) -> Result<Entry> {
             args.push(package.into());
         }
     }
-    let output = tool_command(tool)
-        .args(&args)
-        .current_dir(dir)
-        .output()
-        .with_context(|| format!("could not start {tool} for {}", path.display()));
-    let result = (|| -> Result<Entry> {
-        let output = output?;
-        if !output.status.success() {
-            bail!(
-                "{} failed: {}",
-                tool,
-                String::from_utf8_lossy(&output.stderr).trim()
-            );
-        }
+    let result = async {
+        // Only uv reaches here with a gate; the others were refused above.
+        let report = match gate {
+            Some(gate) => {
+                Some(refresh_uv_lock_gated(dir, args, gate, progress).map_err(anyhow::Error::msg)?)
+            }
+            None => {
+                let output = tool_command(tool)
+                    .args(&args)
+                    .current_dir(dir)
+                    .output()
+                    .with_context(|| format!("could not start {tool} for {}", path.display()))?;
+                if !output.status.success() {
+                    bail!(
+                        "{} failed: {}",
+                        tool,
+                        String::from_utf8_lossy(&output.stderr).trim()
+                    );
+                }
+                None
+            }
+        };
         if std::fs::read(&manifest)? != manifest_before {
             bail!("{} changed the manifest during lockfile maintenance", tool);
         }
@@ -382,6 +418,13 @@ fn refresh_one(path: &Path, cli: &Cli) -> Result<Entry> {
                 }
             }
         }
+        if let Some(report) = report {
+            crate::init_tls(cli)?;
+            let check = crate::read_back_lockfiles(cli, vec![report]).await;
+            if let Some(reason) = read_back_failure(&check) {
+                bail!("the refresh did not keep to the cooldown: {reason}");
+            }
+        }
         Ok(Entry {
             lockfile: path.display().to_string(),
             status: if std::fs::read(path)? == lock_before {
@@ -392,7 +435,8 @@ fn refresh_one(path: &Path, cli: &Cli) -> Result<Entry> {
             changes,
             error: None,
         })
-    })();
+    }
+    .await;
     if let Err(error) = &result {
         let failures = snapshot.restore();
         if !failures.is_empty() {
@@ -410,7 +454,7 @@ fn refresh_one(path: &Path, cli: &Cli) -> Result<Entry> {
     result
 }
 
-pub fn run(cli: &Cli, paths: &[PathBuf], json: bool) -> Result<()> {
+pub async fn run(cli: &Cli, paths: &[PathBuf], json: bool) -> Result<()> {
     if cli.no_cache
         || cli.full_precision
         || cli.update_action_shas
@@ -454,7 +498,7 @@ pub fn run(cli: &Cli, paths: &[PathBuf], json: bool) -> Result<()> {
         .skip(cli.offset)
         .take(cli.limit.unwrap_or(usize::MAX))
     {
-        match refresh_one(&path, cli) {
+        match refresh_one(&path, cli, cli.verbose && !json && !cli.quiet).await {
             Ok(entry) => entries.push(entry),
             Err(error) => {
                 failures += 1;

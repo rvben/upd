@@ -207,6 +207,42 @@ fn cooldown_refuses_refresh_before_invoking_the_tool() {
 }
 
 #[test]
+fn cooldown_refuses_a_cargo_refresh_before_invoking_cargo() {
+    let temp = tempfile::tempdir().unwrap();
+    fs::write(
+        temp.path().join("Cargo.toml"),
+        "[package]\nname = 'demo'\nversion = '0.1.0'\n",
+    )
+    .unwrap();
+    let before = "version = 4\n";
+    fs::write(temp.path().join("Cargo.lock"), before).unwrap();
+    fs::write(
+        temp.path().join(".updrc.toml"),
+        "[cooldown]\ndefault = '7d'\n",
+    )
+    .unwrap();
+    fake_tool(temp.path(), "cargo", "echo ran > cargo.ran");
+    let output = run(temp.path(), &["lock-refresh", ".", "--apply", "-o", "json"]);
+    assert!(!output.status.success());
+    assert!(
+        !temp.path().join("cargo.ran").exists(),
+        "cargo must not run"
+    );
+    assert_eq!(
+        fs::read_to_string(temp.path().join("Cargo.lock")).unwrap(),
+        before
+    );
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(
+        report[0]["error"]
+            .as_str()
+            .unwrap()
+            .contains("cooldown is not yet supported for crates.io"),
+        "{report}"
+    );
+}
+
+#[test]
 fn invalid_output_fields_fail_before_running_a_package_manager() {
     let temp = tempfile::tempdir().unwrap();
     fs::write(temp.path().join("package.json"), "{\"name\":\"demo\"}\n").unwrap();

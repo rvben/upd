@@ -78,8 +78,10 @@ to name, described below the table.
 For uv, no check-only (`--check`, `--check-exists`, `--dry-run`), script
 (`--script`), upgrade (`--upgrade`, `--upgrade-package`, `--upgrade-group`), or
 resolver override flags (`--resolution`, `--prerelease`, `--fork-strategy`,
-`--exclude-newer`, `--no-sources`) are added. The job is to refresh the project's
-lockfile using its configured policies. `upd` passes no `uv sync` options,
+`--no-sources`) are added. The job is to refresh the project's lockfile using
+its configured policies. The one exception is a cooldown: its first pass adds
+`--exclude-newer` and `--exclude-newer-package`, then a plain `uv lock`
+confirms the result (see [Lockfiles](configuration.md#lockfiles)). `upd` passes no `uv sync` options,
 because it never invokes that command. Run `uv sync` yourself to synchronize
 the environment after reviewing updates.
 

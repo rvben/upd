@@ -941,65 +941,140 @@ impl GatedRefresh<'_> {
         }
     }
 
-    /// uv is gated in two passes. The first resolves under `--exclude-newer`,
-    /// exempting each locked package that already has a release inside the
-    /// cooldown so it is not moved back. The cutoff it records in `uv.lock` is
-    /// then removed, since `uv lock --locked` rejects a lockfile whose cutoff
-    /// the project does not configure, and a plain `uv lock` confirms the
-    /// result. Some uv releases resolve again once the cutoff is gone, so a
-    /// plain pass that moves anything is reported as not keeping to the gate.
+    /// uv is gated in two passes, see [`uv_two_pass`]. A gated pass that
+    /// cannot stand is undone and the lockfile refreshed without the gate.
     fn uv(self) -> Relock {
-        let query = |cmd: &str, args: &[&str]| run_query(self.dir, cmd, args);
-        let plan = uv::plan(
+        match uv_two_pass(
             self.dir,
+            &self.lock_path,
             self.before.as_deref(),
             self.gate,
-            &query,
-            &|key| std::env::var_os(key),
-        );
-        let extra_args = match plan {
-            Ok(extra_args) => extra_args,
-            Err(reason) => return self.finish_plain(GateStatus::Unenforced { reason }),
-        };
-        if let Err(failure) = self.run(&self.gated(extra_args, Vec::new())) {
-            return self.fall_back(refused(&failure));
-        }
-        let gated = match std::fs::read(&self.lock_path) {
-            Ok(bytes) => bytes,
-            Err(e) => {
-                return self.fall_back(format!(
-                    "uv.lock could not be read back after the gated refresh ({e})"
-                ));
+            &self.plain.args,
+            &self.plain,
+            self.verbose,
+        ) {
+            Ok(status) => self.succeeded(status),
+            Err(UvGateFailure::Unenforced(reason)) => {
+                self.finish_plain(GateStatus::Unenforced { reason })
             }
-        };
-        if let Some(reason) = self
-            .before
-            .as_deref()
-            .and_then(|before| uv::downgrade(before, &gated))
-        {
-            return self.fall_back(reason);
+            Err(UvGateFailure::Refused(reason)) => self.fall_back(reason),
+            Err(UvGateFailure::Failed(message)) => self.failed(message),
         }
-        let unpinned = match uv::strip_cutoff(&gated) {
-            Ok(bytes) => bytes,
-            Err(reason) => return self.fall_back(reason),
-        };
-        if let Err(e) = std::fs::write(&self.lock_path, &unpinned) {
-            return self.fall_back(format!(
-                "the cutoff could not be removed from uv.lock ({e})"
-            ));
-        }
-        if let Err(failure) = self.run(&self.plain) {
-            return self.failed(failure.message);
-        }
-        let status = match std::fs::read(&self.lock_path) {
-            Ok(after) => uv::drift(&unpinned, &after).map_or(GateStatus::Enforced, |reason| {
-                GateStatus::Bypassed { reason }
-            }),
-            Err(e) => GateStatus::Unenforced {
-                reason: format!("uv.lock could not be read back after the refresh ({e})"),
-            },
-        };
-        self.succeeded(status)
+    }
+}
+
+/// Why a gated uv refresh did not complete.
+enum UvGateFailure {
+    /// The gate cannot be handed to this uv or project; nothing ran.
+    Unenforced(String),
+    /// The gated pass failed or locked something that cannot stand; the
+    /// lockfile holds whatever that pass left.
+    Refused(String),
+    /// The confirming plain pass failed.
+    Failed(String),
+}
+
+/// uv is gated in two passes. The first runs `upgrade` (the refresh's own
+/// arguments) under `--exclude-newer`, exempting each locked package that
+/// already has a release inside the cooldown so it is not moved back. The
+/// cutoff it records in `uv.lock` is then removed, since `uv lock --locked`
+/// rejects a lockfile whose cutoff the project does not configure, and
+/// `confirm`, a plain `uv lock`, checks the result. Some uv releases resolve
+/// again once the cutoff is gone, so a confirming pass that moves anything is
+/// reported as not keeping to the gate.
+fn uv_two_pass(
+    dir: &Path,
+    lock_path: &Path,
+    before: Option<&[u8]>,
+    gate: ReleaseAgeGate,
+    upgrade: &[String],
+    confirm: &Invocation,
+    verbose: bool,
+) -> Result<GateStatus, UvGateFailure> {
+    let query = |cmd: &str, args: &[&str]| run_query(dir, cmd, args);
+    let extra_args = uv::plan(dir, before, gate, &query, &|key| std::env::var_os(key))
+        .map_err(UvGateFailure::Unenforced)?;
+    let gated = Invocation {
+        cmd: confirm.cmd,
+        args: upgrade.iter().cloned().chain(extra_args).collect(),
+        env: Vec::new(),
+    };
+    gated
+        .run(LockfileType::UvLock, dir, verbose)
+        .map_err(|failure| UvGateFailure::Refused(refused(&failure)))?;
+    let gated = std::fs::read(lock_path).map_err(|e| {
+        UvGateFailure::Refused(format!(
+            "uv.lock could not be read back after the gated refresh ({e})"
+        ))
+    })?;
+    if let Some(reason) = before.and_then(|before| uv::downgrade(before, &gated)) {
+        return Err(UvGateFailure::Refused(reason));
+    }
+    let unpinned = uv::strip_cutoff(&gated).map_err(UvGateFailure::Refused)?;
+    std::fs::write(lock_path, &unpinned).map_err(|e| {
+        UvGateFailure::Refused(format!(
+            "the cutoff could not be removed from uv.lock ({e})"
+        ))
+    })?;
+    confirm
+        .run(LockfileType::UvLock, dir, verbose)
+        .map_err(|failure| UvGateFailure::Failed(failure.message))?;
+    Ok(match std::fs::read(lock_path) {
+        Ok(after) => uv::drift(&unpinned, &after).map_or(GateStatus::Enforced, |reason| {
+            GateStatus::Bypassed { reason }
+        }),
+        Err(e) => GateStatus::Unenforced {
+            reason: format!("uv.lock could not be read back after the refresh ({e})"),
+        },
+    })
+}
+
+/// Refresh the `uv.lock` in `dir` with `upgrade` (`lock --upgrade`, or
+/// `lock` with `--upgrade-package` arguments) under `gate`, for lockfile
+/// maintenance. Unlike a refresh after a manifest edit, nothing falls back
+/// to an ungated run: every way the gate could not be kept is an error, and
+/// the caller restores the lockfile. The report returned is for reading back
+/// what the refresh introduced.
+pub fn refresh_uv_lock_gated(
+    dir: &Path,
+    upgrade: Vec<String>,
+    gate: ReleaseAgeGate,
+    verbose: bool,
+) -> Result<GateReport, String> {
+    let lock_path = dir.join(LockfileType::UvLock.filename());
+    let before = std::fs::read(&lock_path).ok();
+    let confirm = Invocation {
+        cmd: "uv",
+        args: vec!["lock".to_string()],
+        env: Vec::new(),
+    };
+    let cooldown = gate.humanized();
+    match uv_two_pass(
+        dir,
+        &lock_path,
+        before.as_deref(),
+        gate,
+        &upgrade,
+        &confirm,
+        verbose,
+    ) {
+        Ok(GateStatus::Enforced) => Ok(GateReport {
+            lockfile: lock_path,
+            lockfile_type: LockfileType::UvLock,
+            gate,
+            status: GateStatus::Enforced,
+            before,
+            keep: Vec::new(),
+        }),
+        Ok(GateStatus::Unenforced { reason } | GateStatus::Bypassed { reason })
+        | Err(UvGateFailure::Refused(reason)) => Err(format!(
+            "the refresh could not keep to the {cooldown} cooldown ({reason})"
+        )),
+        Ok(GateStatus::Exempt) => unreachable!("a two-pass refresh never runs exempt"),
+        Err(UvGateFailure::Unenforced(reason)) => Err(format!(
+            "the {cooldown} cooldown cannot be applied ({reason})"
+        )),
+        Err(UvGateFailure::Failed(message)) => Err(message),
     }
 }
 

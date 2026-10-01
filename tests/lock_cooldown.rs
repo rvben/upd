@@ -535,6 +535,7 @@ fn uv_entry(index: &str, name: &str, version: &str, uploaded: DateTime<Utc>) -> 
 const UV_RECORDING: &str = r#"#!/bin/sh
 case "$1" in
   --version) echo 'uv 0.9.0'; exit 0 ;;
+  workspace) pwd; exit 0 ;;
 esac
 if [ "$1" = lock ] && [ "$2" = --help ]; then
   echo '      --exclude-newer-package <EXCLUDE_NEWER_PACKAGE>'
@@ -860,6 +861,298 @@ async fn a_uv_that_resolves_again_without_the_cutoff_is_named_and_checked() {
         "the undone gate must be named with what moved: {report}"
     );
     young_requests_reported(&report);
+}
+
+// ------------------------------------------------------- uv lock-refresh
+
+/// `upd lock-refresh` of a uv project under a 7-day cooldown, whose gated
+/// pass locks `gated`. The lockfile holds requests 2.31.0 (uploaded two days
+/// ago, so exempt) and idna 3.10. `config` is the project's `.updrc.toml`.
+struct LockRefresh {
+    run: UvRun,
+    lock_before: String,
+}
+
+async fn uv_lock_refresh(gated: &str, config: &str, extra: &[(&str, &str)]) -> LockRefresh {
+    uv_lock_refresh_with(gated, config, extra, &[]).await
+}
+
+/// [`uv_lock_refresh`] with `flags` added to the command line.
+async fn uv_lock_refresh_with(
+    gated: &str,
+    config: &str,
+    extra: &[(&str, &str)],
+    flags: &[&str],
+) -> LockRefresh {
+    let server = wiremock::MockServer::start().await;
+    mount_pypi(
+        &server,
+        "requests",
+        &[
+            ("2.31.0", days_ago(2)),
+            ("2.31.5", days_ago(3)),
+            ("2.32.0", days_ago(30)),
+            ("2.33.0", days_ago(1)),
+        ],
+    )
+    .await;
+    mount_pypi(&server, "idna", &[("3.10", days_ago(300))]).await;
+    let fx = Fixture::new();
+    write_fake_tool(&fx.bin, "uv", UV_RECORDING);
+    fx.write("pyproject.toml", PYPROJECT);
+    fx.write(".updrc.toml", config);
+    let index = format!("{}/simple", server.uri());
+    let locked_upload = days_ago(2).trunc_subsecs(0) + Duration::milliseconds(250);
+    let idna = uv_entry(&index, "idna", "3.10", days_ago(300));
+    let lock_before = format!(
+        "version = 1\n{}{idna}",
+        uv_entry(&index, "requests", "2.31.0", locked_upload),
+    );
+    fx.write("uv.lock", &lock_before);
+    let gated = gated
+        .replace("{index}", &index)
+        .replace("{idna}", &idna)
+        .replace(
+            "{requests 2.31.0}",
+            &uv_entry(&index, "requests", "2.31.0", locked_upload),
+        );
+    let after = fx.stash("uv.lock.after", &gated);
+    let lock_fresh = format!(
+        "version = 1\n{}{idna}",
+        uv_entry(&index, "requests", "2.33.0", days_ago(1)),
+    );
+    let fresh = fx.stash("uv.lock.fresh", &lock_fresh);
+
+    let mut env = vec![
+        ("FAKE_LOCK", after.display().to_string()),
+        ("FAKE_FRESH_LOCK", fresh.display().to_string()),
+        ("UV_INDEX_URL", server.uri()),
+    ];
+    env.extend(extra.iter().map(|(k, v)| (*k, v.to_string())));
+    let env: Vec<(&str, &str)> = env.iter().map(|(k, v)| (*k, v.as_str())).collect();
+    let mut args = vec!["lock-refresh", ".", "--apply", "-o", "json"];
+    args.extend_from_slice(flags);
+    let (stdout, stderr, code) = fx.run(&args, &env);
+    LockRefresh {
+        run: UvRun {
+            fx,
+            stdout,
+            stderr,
+            code,
+            locked_upload,
+        },
+        lock_before,
+    }
+}
+
+const COOLDOWN: &str = "[cooldown]\ndefault = '7d'\n";
+
+fn requests_locked(index: &str, version: &str, uploaded: DateTime<Utc>) -> String {
+    format!(
+        "version = 1\n{}{{idna}}",
+        uv_entry(index, "requests", version, uploaded)
+    )
+}
+
+impl LockRefresh {
+    fn uv_lock(&self) -> String {
+        fs::read_to_string(self.run.fx.project.join("uv.lock")).unwrap()
+    }
+
+    fn report(&self) -> serde_json::Value {
+        json(&self.run.stdout, &self.run.stderr)
+    }
+
+    /// The refresh failed, naming `reason`, and left uv.lock as it was.
+    fn assert_refused(&self, reason: &str) {
+        assert_eq!(
+            self.uv_lock(),
+            self.lock_before,
+            "a refused refresh must restore uv.lock byte for byte\nstderr: {}",
+            self.run.stderr
+        );
+        assert_ne!(
+            self.run.code, 0,
+            "stdout: {}\nstderr: {}",
+            self.run.stdout, self.run.stderr
+        );
+        let report = self.report();
+        assert_eq!(report[0]["status"], "failed", "{report}");
+        let error = report[0]["error"].as_str().unwrap_or_default();
+        assert!(error.contains(reason), "expected {reason:?} in: {report}");
+    }
+}
+
+#[tokio::test]
+async fn a_uv_lock_refresh_under_a_cooldown_is_gated_and_keeps_no_cutoff() {
+    let refresh = uv_lock_refresh(
+        &requests_locked("{index}", "2.32.0", days_ago(30)),
+        COOLDOWN,
+        &[],
+    )
+    .await;
+    let run = &refresh.run;
+
+    assert_eq!(
+        run.code, 0,
+        "stdout: {}\nstderr: {}",
+        run.stdout, run.stderr
+    );
+    let locks = run.fx.logged();
+    assert_eq!(locks.len(), 2, "a gated pass, then a plain one: {locks:?}");
+    let gated = &locks[0];
+    assert!(
+        gated.starts_with("lock --upgrade --exclude-newer"),
+        "the upgrade itself is gated: {gated}"
+    );
+    assert_near_cutoff(
+        flag_value(gated, "--exclude-newer").unwrap(),
+        Duration::days(7),
+        gated,
+    );
+    let rounded_up = (run.locked_upload.trunc_subsecs(0) + Duration::seconds(1))
+        .format("%Y-%m-%dT%H:%M:%SZ")
+        .to_string();
+    assert_eq!(
+        flag_value(gated, "--exclude-newer-package"),
+        Some(format!("requests={rounded_up}").as_str()),
+        "the young locked release is exempt so it is not moved back: {gated}"
+    );
+    assert_eq!(locks[1], "lock", "the confirming pass is plain: {locks:?}");
+
+    let lock = refresh.uv_lock();
+    assert!(lock.contains("version = \"2.32.0\""), "{lock}");
+    assert!(
+        !lock.contains("exclude-newer"),
+        "uv.lock must not keep the gate's cutoff: {lock}"
+    );
+    let report = refresh.report();
+    assert_eq!(report[0]["status"], "refreshed", "{report}");
+    assert_eq!(report[0]["changes"][0]["package"], "requests", "{report}");
+    assert_eq!(report[0]["changes"][0]["to"][0], "2.32.0", "{report}");
+}
+
+/// Verbose progress must not reach stdout, where it would break the JSON.
+#[tokio::test]
+async fn a_verbose_uv_lock_refresh_prints_only_json() {
+    let refresh = uv_lock_refresh_with(
+        &requests_locked("{index}", "2.32.0", days_ago(30)),
+        COOLDOWN,
+        &[],
+        &["--verbose"],
+    )
+    .await;
+    let run = &refresh.run;
+    assert_eq!(
+        run.code, 0,
+        "stdout: {}\nstderr: {}",
+        run.stdout, run.stderr
+    );
+    assert_eq!(refresh.report()[0]["status"], "refreshed");
+}
+
+/// With an ignored package, only the others are upgraded, and that narrower
+/// refresh is gated too.
+#[tokio::test]
+async fn a_uv_lock_refresh_around_an_ignored_package_is_gated() {
+    let refresh = uv_lock_refresh(
+        "version = 1\n{requests 2.31.0}{idna}",
+        &format!("ignore = ['requests']\n{COOLDOWN}"),
+        &[],
+    )
+    .await;
+    let run = &refresh.run;
+
+    assert_eq!(
+        run.code, 0,
+        "stdout: {}\nstderr: {}",
+        run.stdout, run.stderr
+    );
+    let locks = run.fx.logged();
+    assert_eq!(locks.len(), 2, "{locks:?}");
+    assert!(
+        locks[0].starts_with("lock --upgrade-package idna --exclude-newer"),
+        "{locks:?}"
+    );
+    assert_eq!(locks[1], "lock", "{locks:?}");
+}
+
+/// The exemption that keeps a young locked release in place admits every
+/// release of that package up to it, so the gated pass can lock another
+/// young one. Read back, it fails the refresh, which puts uv.lock back.
+#[tokio::test]
+async fn a_uv_lock_refresh_that_locks_a_young_release_is_rolled_back() {
+    let refresh = uv_lock_refresh(
+        &requests_locked("{index}", "2.31.5", days_ago(3)),
+        COOLDOWN,
+        &[],
+    )
+    .await;
+    refresh.assert_refused("requests 2.31.5");
+    assert!(
+        refresh.report()[0]["error"]
+            .as_str()
+            .unwrap()
+            .contains("cooldown"),
+        "{}",
+        refresh.report()
+    );
+}
+
+/// An entry locked from an index upd does not read cannot be dated, so the
+/// refresh cannot show it kept to the cooldown and is rolled back.
+#[tokio::test]
+async fn a_uv_lock_refresh_with_an_undatable_entry_is_rolled_back() {
+    let refresh = uv_lock_refresh(
+        &requests_locked("https://other.example/simple", "2.32.0", days_ago(30)),
+        COOLDOWN,
+        &[],
+    )
+    .await;
+    refresh.assert_refused("requests");
+    let error = refresh.report()[0]["error"].as_str().unwrap().to_string();
+    assert!(error.contains("not checked"), "{error}");
+}
+
+/// A gate uv cannot satisfy is not dropped: lock maintenance has no ungated
+/// fallback, so the refresh fails and nothing else runs.
+#[tokio::test]
+async fn a_uv_lock_refresh_the_gate_cannot_satisfy_is_rolled_back() {
+    let refresh = uv_lock_refresh(
+        &requests_locked("{index}", "2.32.0", days_ago(30)),
+        COOLDOWN,
+        &[("FAKE_REFUSE_GATE", "1")],
+    )
+    .await;
+    refresh.assert_refused("No solution found");
+    let locks = refresh.run.fx.logged();
+    assert_eq!(locks.len(), 1, "no ungated pass follows: {locks:?}");
+}
+
+/// A uv that resolves again once the cutoff is removed undoes the gate.
+#[tokio::test]
+async fn a_uv_lock_refresh_whose_plain_pass_moves_anything_is_rolled_back() {
+    let refresh = uv_lock_refresh(
+        &requests_locked("{index}", "2.32.0", days_ago(30)),
+        COOLDOWN,
+        &[("FAKE_RERESOLVE", "1")],
+    )
+    .await;
+    refresh.assert_refused("requests 2.32.0 to 2.33.0");
+}
+
+/// A project with its own exclude-newer would have it overridden by the
+/// gate, so the refresh is refused before uv locks anything.
+#[tokio::test]
+async fn a_uv_lock_refresh_of_a_project_with_its_own_cutoff_is_refused() {
+    let refresh = uv_lock_refresh(
+        &requests_locked("{index}", "2.32.0", days_ago(30)),
+        COOLDOWN,
+        &[("UV_EXCLUDE_NEWER", "2025-01-01T00:00:00Z")],
+    )
+    .await;
+    refresh.assert_refused("UV_EXCLUDE_NEWER");
+    assert!(refresh.run.fx.logged().is_empty(), "uv must not lock");
 }
 
 // ---------------------------------------------------------------- poetry

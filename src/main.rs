@@ -1148,6 +1148,12 @@ async fn check_fix_refreshes(
             ..LockCooldownCheck::default()
         };
     }
+    read_back_lockfiles(cli, gates).await
+}
+
+/// Read back the lockfiles refreshed under a cooldown against the registries
+/// their entries were locked from.
+async fn read_back_lockfiles(cli: &Cli, gates: Vec<GateReport>) -> LockCooldownCheck {
     let cache = Cache::new_shared();
     let cache_enabled = !cli.no_cache;
     let pypi_registry = pypi_registry(false);
@@ -1789,7 +1795,7 @@ async fn run() -> Result<()> {
         }
         Some(Command::LockRefresh { .. }) => {
             let paths = resolve_scan_paths(&cli).map_err(anyhow::Error::msg)?;
-            lock_maintenance::run(&cli, &paths, effective_json_mode(&cli))?;
+            lock_maintenance::run(&cli, &paths, effective_json_mode(&cli)).await?;
         }
         Some(Command::Audit { .. }) => {
             run_audit(&cli).await?;

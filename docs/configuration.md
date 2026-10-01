@@ -295,7 +295,9 @@ back, and any transitive release published an hour ago. So the refresh carries
 the cooldown too, in whatever form the tool understands.
 
 This covers the refreshes `upd update` runs, interactive ones and the relock
-that writes a version floor included. `upd audit --fix-audit` is different: it
+that writes a version floor included. `upd lock-refresh` gates `uv.lock` the
+same way but fails, restoring the lockfile, wherever this section only warns;
+see [Lockfile maintenance](lock-maintenance.md#under-a-cooldown). `upd audit --fix-audit` is different: it
 moves a vulnerable package to the release that fixes it, however young that
 release is, so its refreshes are not gated and nothing in them is held, since
 holding a release back could undo the fix. They are still read back as below,

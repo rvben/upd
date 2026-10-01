@@ -36,11 +36,47 @@ that command, or a broken project), the refresh is refused as well.
 `UV_PROJECT` and `UV_WORKING_DIR` are removed from every uv invocation, so the
 project refreshed is always the one containing the selected lockfile.
 
+## Under a cooldown
+
+With an active `[cooldown]`, `--min-age` or `--min-age-floor`, a `uv.lock` is
+refreshed the way `upd update --lock` gates uv (see
+[Lockfiles](configuration.md#lockfiles)): `uv lock --upgrade`, or the
+`--upgrade-package` form, runs with `--exclude-newer` at the cooldown's cutoff
+and every locked package younger than it exempted at its own upload time, so
+nothing is moved back. The cutoff uv records in `uv.lock` is removed and a
+plain `uv lock` confirms the result.
+
+Maintenance never drops the cooldown to finish a refresh. The lockfile is put
+back and the refresh fails, naming the reason, when:
+
+- uv predates `--exclude-newer-package`, or the project or user configuration
+  (or `UV_EXCLUDE_NEWER`) sets its own `exclude-newer`, which the gate would
+  override;
+- the gated resolution fails, for example because an index lists no upload
+  times, or would move a locked package back;
+- the confirming plain `uv lock` moves anything;
+- reading the result back finds an entry the refresh introduced that was
+  published inside the cooldown (an exemption admits every release of its
+  package up to the exempted time, so `--upgrade` can reach a young one), or
+  one whose publish date upd cannot establish.
+
+Publish dates are read as for `upd update --lock`: from the indexes upd reads,
+through their JSON API. An entry from an index that only serves the simple API,
+from `find-links`, or from any index upd does not read cannot be dated, so a
+refresh that introduces one fails.
+
+The cooldown selects versions by when they were released. A file uploaded
+later to a release that is already outside the cooldown, such as a new wheel,
+can still be locked, as with upd's release-age rule for manifests.
+
+npm and Cargo lockfiles are refused under a cooldown before the package
+manager runs.
+
+## Options
+
 The no-write mode lists candidates; it does not predict the package-manager
 resolution. Use `--apply` in a clean Git checkout to review the resulting diff.
-An active `[cooldown]`, `--min-age` or `--min-age-floor` is currently refused before invoking a
-package manager. Cooldown-aware maintenance needs its own release-age checks
-for the full resolved graph. `--only-bump` and `--package` are not yet supported
+`--only-bump` and `--package` are not yet supported
 for maintenance (nor, with them, `--strict-bump`); `--lang` and `--max-bump`
 are supported.
 `--check`, `--interactive`, and `--no-ignore` are also unsupported by this
