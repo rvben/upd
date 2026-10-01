@@ -67,3 +67,6 @@ jobs:
 
       - name: Build
         run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Compile tests
+        run: make check-targets TARGET=${{ matrix.target }}

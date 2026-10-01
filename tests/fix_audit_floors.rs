@@ -999,6 +999,7 @@ async fn cargo_fix_passes_over_releases_the_advisory_still_covers() {
 /// One crate whose advisory names an unpublished edge, locked from
 /// `source`. Returns the project dir, the fake-cargo log and the bin dir
 /// holding the fake cargo.
+#[cfg(unix)]
 fn stalecrate_project(source: &str) -> (tempfile::TempDir, std::path::PathBuf, std::path::PathBuf) {
     let tmp = tempfile::tempdir().unwrap();
     fs::write(

@@ -7,7 +7,9 @@
 //! see. `cargo` itself is faked here (matching `tests/lock_cooldown.rs` and
 //! `tests/fix_audit_floors.rs`) since this file is checking the wiring, not
 //! cargo's own dependency resolution, and a real registry bump would need
-//! network access.
+//! network access. The fake is a shell script, so this file runs on Unix
+//! only.
+#![cfg(unix)]
 
 use std::fs;
 use std::process::Command;
@@ -34,7 +36,6 @@ fn run_with_env(
     )
 }
 
-#[cfg(unix)]
 fn write_fake_tool(bin_dir: &std::path::Path, name: &str, script: &str) {
     use std::os::unix::fs::PermissionsExt;
     let path = bin_dir.join(name);
@@ -42,7 +43,6 @@ fn write_fake_tool(bin_dir: &std::path::Path, name: &str, script: &str) {
     fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
 }
 
-#[cfg(unix)]
 fn path_with(bin_dir: &std::path::Path) -> String {
     format!(
         "{}:{}",

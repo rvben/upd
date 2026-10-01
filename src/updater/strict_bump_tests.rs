@@ -596,6 +596,7 @@ async fn case(file_type: FileType, with_major: bool) -> Case {
                 format!("#!/bin/sh\ncp '{}' flake.lock\n", replacement_path.display()),
             )
             .unwrap();
+            #[cfg(unix)]
             {
                 use std::os::unix::fs::PermissionsExt;
                 std::fs::set_permissions(&script_path, std::fs::Permissions::from_mode(0o755))

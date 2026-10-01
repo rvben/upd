@@ -1,8 +1,12 @@
-.PHONY: build release test test-verbose lint fmt fmt-check release-pins-check check ci clean run run-release install release-patch release-minor release-major
+.PHONY: build check-targets release test test-verbose lint fmt fmt-check release-pins-check check ci clean run run-release install release-patch release-minor release-major
 
 # Build debug binary
 build:
 	cargo build
+
+# Compile every target, tests included, for TARGET (default: the host)
+check-targets:
+	cargo check --all-targets $(if $(TARGET),--target $(TARGET))
 
 # Build release binary
 release:

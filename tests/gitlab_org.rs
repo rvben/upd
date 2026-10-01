@@ -1,6 +1,8 @@
 //! End-to-end tests for `upd gitlab org run` and its CI template: a mocked
 //! GitLab API in front of real bare repositories, one per project, and a fake
-//! updater that records how it was invoked.
+//! updater that records how it was invoked. The fakes and the template are
+//! shell scripts, so these tests run on Unix only.
+#![cfg(unix)]
 
 mod isolated;
 
