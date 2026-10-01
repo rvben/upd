@@ -103,7 +103,8 @@ fn uv_refresh_rolls_back_when_an_ignored_package_moves() {
     fake_tool(
         temp.path(),
         "uv",
-        r#"test "$1" = lock
+        r#"if [ "$1" = workspace ]; then pwd; exit 0; fi
+test "$1" = lock
 printf '%s\n' "$@" > uv-args.txt
 cat > uv.lock <<'LOCK'
 version = 1
@@ -321,4 +322,152 @@ fn uv_refresh_ignores_inherited_project_redirection() {
             "{variable}: the selected lockfile was not refreshed"
         );
     }
+}
+
+/// A uv workspace at `root` with one member at `root/member`, both offline.
+/// The root lockfile is real and then made stale, so any `uv lock` that
+/// reaches the workspace rewrites it.
+fn stale_uv_workspace(root: &Path) {
+    let manifest = |version: &str| {
+        format!(
+            "[project]\nname = \"root\"\nversion = \"{version}\"\nrequires-python = \">=3.8\"\ndependencies = []\n\n\
+             [tool.uv.workspace]\nmembers = [\"member\"]\n\n\
+             [tool.uv]\nno-index = true\npython-downloads = \"never\"\ncache-dir = \"{cache}\"\n",
+            cache = root.join("uv-cache").display(),
+        )
+    };
+    fs::create_dir_all(root.join("member")).unwrap();
+    fs::write(
+        root.join("member/pyproject.toml"),
+        "[project]\nname = \"member\"\nversion = \"0.1.0\"\nrequires-python = \">=3.8\"\ndependencies = []\n",
+    )
+    .unwrap();
+    fs::write(root.join("pyproject.toml"), manifest("0.1.0")).unwrap();
+    let output = uv_lock_in(root, &[]);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    fs::write(root.join("pyproject.toml"), manifest("0.2.0")).unwrap();
+}
+
+/// Runs `lock-refresh member --apply` from the workspace root and returns
+/// the single report entry.
+fn refresh_member(root: &Path) -> (Output, serde_json::Value) {
+    let output = Command::new(env!("CARGO_BIN_EXE_upd"))
+        .args(["lock-refresh", "member", "--apply", "-o", "json"])
+        .current_dir(root)
+        .output()
+        .unwrap();
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout)
+        .unwrap_or_else(|e| panic!("{e}: {}", String::from_utf8_lossy(&output.stderr)));
+    assert_eq!(report.as_array().unwrap().len(), 1, "{report}");
+    (output, report[0].clone())
+}
+
+fn assert_refused_as_member(output: &Output, entry: &serde_json::Value, root: &Path) {
+    assert!(!output.status.success(), "{entry}");
+    assert_eq!(entry["status"], "failed", "{entry}");
+    let error = entry["error"].as_str().unwrap();
+    let root = root.canonicalize().unwrap();
+    assert!(
+        error.contains("is not the workspace root") && error.contains(&*root.to_string_lossy()),
+        "{error}"
+    );
+}
+
+#[test]
+fn uv_refresh_refuses_a_stray_member_lockfile() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    stale_uv_workspace(root);
+    fs::copy(root.join("uv.lock"), root.join("member/uv.lock")).unwrap();
+    let root_before = fs::read_to_string(root.join("uv.lock")).unwrap();
+    let member_before = fs::read_to_string(root.join("member/uv.lock")).unwrap();
+
+    let (output, entry) = refresh_member(root);
+
+    assert_eq!(
+        fs::read_to_string(root.join("uv.lock")).unwrap(),
+        root_before,
+        "the refresh rewrote the workspace root's lockfile"
+    );
+    assert_refused_as_member(&output, &entry, root);
+    assert_eq!(
+        fs::read_to_string(root.join("member/uv.lock")).unwrap(),
+        member_before
+    );
+}
+
+#[test]
+fn uv_refresh_refuses_a_member_lockfile_behind_a_git_boundary() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    stale_uv_workspace(root);
+    fs::create_dir_all(root.join("member/.git")).unwrap();
+    fs::copy(root.join("uv.lock"), root.join("member/uv.lock")).unwrap();
+    let root_before = fs::read_to_string(root.join("uv.lock")).unwrap();
+
+    let (output, entry) = refresh_member(root);
+
+    assert_eq!(
+        fs::read_to_string(root.join("uv.lock")).unwrap(),
+        root_before,
+        "the refresh rewrote the workspace root's lockfile"
+    );
+    assert_refused_as_member(&output, &entry, root);
+}
+
+#[test]
+fn uv_refresh_of_a_member_lockfile_creates_no_root_lockfile() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    stale_uv_workspace(root);
+    fs::rename(root.join("uv.lock"), root.join("member/uv.lock")).unwrap();
+
+    let (output, entry) = refresh_member(root);
+
+    assert!(
+        !root.join("uv.lock").exists(),
+        "the refresh created a lockfile at the workspace root"
+    );
+    assert_refused_as_member(&output, &entry, root);
+}
+
+#[test]
+fn uv_refresh_fails_closed_when_uv_cannot_name_the_workspace_root() {
+    let temp = tempfile::tempdir().unwrap();
+    fs::write(
+        temp.path().join("pyproject.toml"),
+        "[project]\nname = 'demo'\nversion = '0.1.0'\n",
+    )
+    .unwrap();
+    let before = "version = 1\n";
+    fs::write(temp.path().join("uv.lock"), before).unwrap();
+    // A uv release without the `workspace dir` subcommand.
+    fake_tool(
+        temp.path(),
+        "uv",
+        r#"if [ "$1" = workspace ]; then
+  echo "error: unrecognized subcommand 'workspace'" >&2
+  exit 2
+fi
+touch uv-lock-ran
+echo 'version = 2' > uv.lock"#,
+    );
+    let output = run(temp.path(), &["lock-refresh", ".", "--apply", "-o", "json"]);
+    assert!(!output.status.success());
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report[0]["status"], "failed");
+    let error = report[0]["error"].as_str().unwrap();
+    assert!(
+        error.contains("`uv workspace dir` failed") && error.contains("unrecognized subcommand"),
+        "{error}"
+    );
+    assert!(!temp.path().join("uv-lock-ran").exists());
+    assert_eq!(
+        fs::read_to_string(temp.path().join("uv.lock")).unwrap(),
+        before
+    );
 }

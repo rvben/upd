@@ -201,6 +201,40 @@ fn exceeds_limit(level: Option<&str>, limit: BumpLevel) -> bool {
     )
 }
 
+/// Refuses a uv.lock that uv itself would not write. uv locks a whole
+/// workspace at its root, so `uv lock` run beside a member's stray lockfile
+/// rewrites (or creates) the root's lockfile instead, which this refresh
+/// never snapshotted or checked. uv decides the root, crossing a member's
+/// `.git` and whether or not the root has a lockfile yet, so it is asked
+/// directly, with the same directory and environment the lock runs with.
+fn ensure_uv_workspace_root(path: &Path, dir: &Path) -> Result<()> {
+    let output = tool_command("uv")
+        .args(["workspace", "dir"])
+        .current_dir(dir)
+        .output()
+        .with_context(|| format!("could not start uv for {}", path.display()))?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    if !output.status.success() || stdout.trim().is_empty() {
+        bail!(
+            "{}: `uv workspace dir` failed, so the workspace that owns this lockfile is unknown; no files changed: {}",
+            path.display(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    let reported = PathBuf::from(stdout.trim());
+    let root = reported
+        .canonicalize()
+        .with_context(|| format!("uv reported workspace root {}", reported.display()))?;
+    if dir.canonicalize()? != root {
+        bail!(
+            "{} is not the workspace root's lockfile: uv locks this workspace at {}; no files changed",
+            path.display(),
+            root.display()
+        );
+    }
+    Ok(())
+}
+
 fn refresh_one(path: &Path, cli: &Cli) -> Result<Entry> {
     let kind = Kind::for_path(path).context("unsupported lockfile")?;
     let dir = path.parent().context("lockfile has no parent directory")?;
@@ -257,6 +291,10 @@ fn refresh_one(path: &Path, cli: &Cli) -> Result<Entry> {
             changes: vec![],
             error: None,
         });
+    }
+
+    if kind == Kind::Uv {
+        ensure_uv_workspace_root(path, dir)?;
     }
 
     let manifest_before = std::fs::read(&manifest)?;

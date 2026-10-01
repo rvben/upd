@@ -27,6 +27,15 @@ if the package manager or lockfile parser fails. It also checks that the
 adjacent manifest was not edited. Failures in one lockfile do not stop other
 lockfiles from being attempted, and the command exits nonzero if any failed.
 
+uv locks a whole workspace at its root, so a `uv.lock` inside a workspace
+member is not one uv would write: `uv lock` run there rewrites, or creates,
+the root's lockfile instead. Before refreshing a `uv.lock`, `upd` asks
+`uv workspace dir` for the workspace root and refuses the lockfile, changing
+nothing, unless it sits at that root. If uv cannot answer (a release without
+that command, or a broken project), the refresh is refused as well.
+`UV_PROJECT` and `UV_WORKING_DIR` are removed from every uv invocation, so the
+project refreshed is always the one containing the selected lockfile.
+
 The no-write mode lists candidates; it does not predict the package-manager
 resolution. Use `--apply` in a clean Git checkout to review the resulting diff.
 An active `[cooldown]`, `--min-age` or `--min-age-floor` is currently refused before invoking a
