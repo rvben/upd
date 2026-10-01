@@ -7,6 +7,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.15.0](https://github.com/rvben/upd/compare/v0.14.4...v0.15.0) - 2026-10-01
+
+### Added
+
+- **gitlab**: regenerate organization lockfiles in a child pipeline ([159165c](https://github.com/rvben/upd/commit/159165c5c1741b162ab61790e9a8189ed61bed98))
+- **gitlab**: leave lock projects to lock jobs and explain stale lockfiles ([4492c5c](https://github.com/rvben/upd/commit/4492c5c8f6b8d0df99508a059415d14fe387a491))
+- **gitlab**: relock organization projects in a job without the token ([84aa98d](https://github.com/rvben/upd/commit/84aa98d10aa9fc3a4c7a5c0852c3ed50e3d751a6))
+- **gitlab**: check that a regenerated lockfile adds no place to fetch from ([849377e](https://github.com/rvben/upd/commit/849377eba1814480207f6d8558498e42de4a1e64))
+- **gitlab**: apply security fixes in organization mode on both sides' consent ([951925c](https://github.com/rvben/upd/commit/951925cdbf660bea387579b29345be411c28879c))
+- **gitlab**: re-audit the updated tree after security fixes ([44d806d](https://github.com/rvben/upd/commit/44d806dd03bc727e1d197a0eec3cd3fce1d86d38))
+- **gitlab**: list young releases a security fix relock locked ([bd8bcd3](https://github.com/rvben/upd/commit/bd8bcd3208df78c0eb3049480725dc6e5872e9ef))
+- **audit**: report young releases a fix relock locks besides the fix ([15366b3](https://github.com/rvben/upd/commit/15366b3b9b12d042b03d02ecbb57ec3fe5ce6f3e))
+- **gitlab**: apply security fixes before the dependency update ([50f49bb](https://github.com/rvben/upd/commit/50f49bbd5e28e35ab1883d9e3f2c4b6ce772c4aa))
+- **audit**: name each fix entry's ecosystem in the JSON report ([cba9a0e](https://github.com/rvben/upd/commit/cba9a0e38afe078473543299cad571264550b21f))
+- **gitlab**: propose major-version upgrades on a separate merge request ([4d58a33](https://github.com/rvben/upd/commit/4d58a33746ce3a8608987cab8b588f5f7bfeccbb))
+- add --strict-bump to write only updates at the --only-bump levels ([35ea2cc](https://github.com/rvben/upd/commit/35ea2cc1faa2ded021dd10c4d5549b48b0639b77))
+
+### Fixed
+
+- **audit**: exit 6 when --fix-audit leaves a vulnerability unresolved ([49f3365](https://github.com/rvben/upd/commit/49f3365ca2758279acd7ed8d780d676f47001338))
+- **audit**: honor configured ignore and pin when applying security fixes ([5541ac9](https://github.com/rvben/upd/commit/5541ac9767d40865f13dd0179c6ae348dabfdd9a))
+- **audit**: confirm a fix is a published release before writing it ([7132b35](https://github.com/rvben/upd/commit/7132b3571ca0395736012b1ad32e095d23505ef6))
+- **npm**: read packages at the registry root when its URL ends in a slash ([a0d2081](https://github.com/rvben/upd/commit/a0d20810bbf09df49b12cda485b00fc3ff0492cb))
+- **gitlab**: refuse an automation branch nested under the default branch's name ([54877f7](https://github.com/rvben/upd/commit/54877f711f627d3f844860e2c179d314d12e39a4))
+- **pyproject**: compare a resolved release with its anchor as a PEP 440 version ([78980fa](https://github.com/rvben/upd/commit/78980fa109864c518dba6c92abe5df97ddea2cc8))
+- **gitlab**: wait for GitLab to process a push before opening or arming a merge request ([08e5343](https://github.com/rvben/upd/commit/08e5343a3bb88ec604a2c8701938bf38ba46d314))
+- **gitlab**: keep an inherited GIT_DIR from redirecting git into the caller's repository ([42ae7c1](https://github.com/rvben/upd/commit/42ae7c1ddb8c4e87fdddd0a8ea73024759224aaa))
+
 ## [0.14.4](https://github.com/rvben/upd/compare/v0.14.3...v0.14.4) - 2026-09-29
 
 ### Fixed
