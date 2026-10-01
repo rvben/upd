@@ -6,11 +6,10 @@ use ignore::WalkBuilder;
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 use upd::cli::{BumpLevel, Cli, OutputFormat};
 use upd::config::UpdConfig;
-use upd::lockfile::Snapshot;
+use upd::lockfile::{Snapshot, tool_command};
 use upd::lockscan::{LockScan, LockedPackage, cargo, npm, uv};
 use upd::updater::{BumpKind, Lang, classify_bump, classify_bump_for};
 
@@ -287,7 +286,7 @@ fn refresh_one(path: &Path, cli: &Cli) -> Result<Entry> {
             args.push(package.into());
         }
     }
-    let output = Command::new(tool)
+    let output = tool_command(tool)
         .args(&args)
         .current_dir(dir)
         .output()

@@ -230,3 +230,95 @@ fn invalid_output_fields_fail_before_running_a_package_manager() {
     assert!(!output.status.success());
     assert!(!temp.path().join("was-run").exists());
 }
+
+/// Writes an offline uv project (no dependencies, no index, isolated cache)
+/// at `version`, so a real `uv lock` runs without the network.
+fn write_offline_uv_project(dir: &Path, name: &str, version: &str) {
+    fs::create_dir_all(dir).unwrap();
+    fs::write(
+        dir.join("pyproject.toml"),
+        format!(
+            "[project]\nname = \"{name}\"\nversion = \"{version}\"\nrequires-python = \">=3.8\"\ndependencies = []\n\n\
+             [tool.uv]\nno-index = true\npython-downloads = \"never\"\ncache-dir = \"{cache}\"\n",
+            cache = dir.join("uv-cache").display(),
+        ),
+    )
+    .unwrap();
+}
+
+fn uv_lock_in(dir: &Path, envs: &[(&str, &Path)]) -> Output {
+    let mut command = Command::new("uv");
+    command.arg("lock").current_dir(dir);
+    command
+        .env_remove("UV_PROJECT")
+        .env_remove("UV_WORKING_DIR");
+    for (key, value) in envs {
+        command.env(key, value);
+    }
+    command
+        .output()
+        .unwrap_or_else(|e| panic!("uv not found on PATH: {e}"))
+}
+
+/// Two locked projects whose manifests have both moved past their lockfiles,
+/// so a `uv lock` in either one rewrites that project's uv.lock.
+fn stale_uv_projects(root: &Path) -> (std::path::PathBuf, std::path::PathBuf) {
+    let selected = root.join("selected");
+    let other = root.join("other");
+    for (dir, name) in [(&selected, "selected"), (&other, "other")] {
+        write_offline_uv_project(dir, name, "0.1.0");
+        let output = uv_lock_in(dir, &[]);
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        write_offline_uv_project(dir, name, "0.2.0");
+    }
+    (selected, other)
+}
+
+fn lock_records_version(dir: &Path, version: &str) -> bool {
+    fs::read_to_string(dir.join("uv.lock"))
+        .unwrap()
+        .contains(&format!("version = \"{version}\""))
+}
+
+#[test]
+fn uv_refresh_ignores_inherited_project_redirection() {
+    for variable in ["UV_PROJECT", "UV_WORKING_DIR"] {
+        let temp = tempfile::tempdir().unwrap();
+        let (selected, other) = stale_uv_projects(temp.path());
+
+        // Negative control: the variable really redirects a plain uv lock.
+        let control = tempfile::tempdir().unwrap();
+        let (control_selected, control_other) = stale_uv_projects(control.path());
+        let output = uv_lock_in(&control_selected, &[(variable, &control_other)]);
+        assert!(output.status.success());
+        assert!(lock_records_version(&control_other, "0.2.0"));
+        assert!(lock_records_version(&control_selected, "0.1.0"));
+
+        let other_before = fs::read_to_string(other.join("uv.lock")).unwrap();
+        let output = Command::new(env!("CARGO_BIN_EXE_upd"))
+            .args(["lock-refresh", ".", "--apply", "-o", "json"])
+            .current_dir(&selected)
+            .env(variable, &other)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{variable}: {}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            fs::read_to_string(other.join("uv.lock")).unwrap(),
+            other_before,
+            "{variable} redirected the refresh into another project's lockfile"
+        );
+        assert!(
+            lock_records_version(&selected, "0.2.0"),
+            "{variable}: the selected lockfile was not refreshed"
+        );
+    }
+}

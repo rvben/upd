@@ -504,10 +504,30 @@ pub fn probe_tool(tool: &str) -> ToolProbe {
     probe_in(tool, None)
 }
 
+/// Environment variables that make uv operate on a project other than the
+/// one in its working directory: `UV_PROJECT` picks the project to discover
+/// and `UV_WORKING_DIR` changes directory before anything runs. upd chooses
+/// the lockfile and runs uv in its directory, so an inherited value would
+/// have uv rewrite a lockfile upd never selected, snapshotted or checked.
+const UV_REDIRECTION: [&str; 2] = ["UV_PROJECT", "UV_WORKING_DIR"];
+
+/// The command every lockfile tool spawn starts from. For uv it removes the
+/// inherited project redirection, so uv works on the project in the
+/// directory upd runs it in.
+pub fn tool_command(tool: &str) -> Command {
+    let mut command = Command::new(tool);
+    if tool == "uv" {
+        for variable in UV_REDIRECTION {
+            command.env_remove(variable);
+        }
+    }
+    command
+}
+
 /// [`probe_tool`] run in `dir`, where a version manager may select a
 /// different release of the tool than the one outside the project.
 fn probe_in(tool: &str, dir: Option<&Path>) -> ToolProbe {
-    let mut command = Command::new(tool);
+    let mut command = tool_command(tool);
     command.arg("--version");
     if let Some(dir) = dir {
         command.current_dir(dir);
@@ -693,7 +713,7 @@ impl Invocation {
             );
         }
 
-        let output = Command::new(self.cmd)
+        let output = tool_command(self.cmd)
             .args(&self.args)
             .envs(self.env.iter().map(|(key, value)| (key, value)))
             .current_dir(dir)
@@ -1320,7 +1340,7 @@ pub(crate) fn cargo_update_precise(
         );
     }
 
-    let output = match Command::new("cargo")
+    let output = match tool_command("cargo")
         .args(&args)
         .current_dir(lock_dir)
         .output()
@@ -1409,6 +1429,71 @@ mod tests {
     use super::*;
     use std::fs;
     use tempfile::tempdir;
+
+    #[test]
+    fn uv_commands_drop_inherited_project_redirection() {
+        let removed = |tool: &str| -> Vec<String> {
+            tool_command(tool)
+                .get_envs()
+                .filter(|(_, value)| value.is_none())
+                .map(|(key, _)| key.to_string_lossy().into_owned())
+                .collect()
+        };
+        assert_eq!(removed("uv"), ["UV_PROJECT", "UV_WORKING_DIR"]);
+        assert!(removed("npm").is_empty());
+        assert!(removed("cargo").is_empty());
+    }
+
+    /// Every lockfile tool spawn goes through [`tool_command`], so none can
+    /// inherit a uv project redirection. A process spawn anywhere else in
+    /// the crate must be one this list knows runs no lockfile tool.
+    #[test]
+    fn lockfile_tools_are_spawned_only_through_tool_command() {
+        fn sources(dir: &Path, out: &mut Vec<std::path::PathBuf>) {
+            for entry in fs::read_dir(dir).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    sources(&path, out);
+                } else if path.extension().is_some_and(|ext| ext == "rs") {
+                    out.push(path);
+                }
+            }
+        }
+        let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut files = Vec::new();
+        sources(&src, &mut files);
+        let needle = ["Command", "::new("].concat();
+        let mut spawning: Vec<(String, usize)> = files
+            .iter()
+            .filter_map(|path| {
+                let count = fs::read_to_string(path).unwrap().matches(&needle).count();
+                let relative = path.strip_prefix(&src).unwrap().to_string_lossy();
+                (count > 0).then(|| (relative.replace('\\', "/"), count))
+            })
+            .collect();
+        spawning.sort();
+        let expected: Vec<(String, usize)> = [
+            // cli shim re-executing upd itself
+            ("bin/upd-cli.rs", 2),
+            // git and the job's shell commands
+            ("gitlab/git.rs", 1),
+            ("gitlab/plan.rs", 3),
+            // tool_command itself, the one lockfile tool spawn
+            ("lockfile.rs", 1),
+            // cargo metadata and cargo update for nested Cargo lockfiles
+            ("nested_lock.rs", 3),
+            // docker credential helpers
+            ("registry/docker_credentials.rs", 2),
+            // gh auth token
+            ("registry/github_releases.rs", 1),
+            // nix flake lock
+            ("updater/flake_lock.rs", 1),
+        ]
+        .into_iter()
+        .map(|(path, count)| (path.to_string(), count))
+        .collect();
+        assert_eq!(spawning, expected);
+    }
 
     #[test]
     fn every_format_is_listed_once_and_found_by_its_file_name() {

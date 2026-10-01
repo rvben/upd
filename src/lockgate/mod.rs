@@ -18,12 +18,11 @@ pub(crate) mod uv;
 
 use std::ffi::OsString;
 use std::path::{Component, Path, PathBuf};
-use std::process::Command;
 
 use chrono::{DateTime, Duration, Utc};
 
 use crate::cooldown::humanize_cooldown;
-use crate::lockfile::LockfileType;
+use crate::lockfile::{LockfileType, tool_command};
 
 /// The oldest a release may be published and still be locked: now minus the
 /// cooldown in force for the lockfile's manifests.
@@ -188,7 +187,7 @@ pub(crate) type EnvLookup<'a> = &'a dyn Fn(&str) -> Option<OsString>;
 pub(crate) type LockEntry = (String, String);
 
 pub(crate) fn run_query(dir: &Path, cmd: &str, args: &[&str]) -> Result<String, String> {
-    let output = Command::new(cmd)
+    let output = tool_command(cmd)
         .args(args)
         .current_dir(dir)
         .output()
