@@ -190,7 +190,26 @@ fn ci_and_release_jobs_install_only_the_tools_they_use() {
             "{name} must not install unrelated tools as a single concurrent batch"
         );
     }
-    assert_eq!(CI_WORKFLOW.matches("run: mise install rust").count(), 2);
+    assert_eq!(CI_WORKFLOW.matches("run: mise install rust").count(), 1);
+    // The release reruns the test suite, so it needs the same tools as CI;
+    // both take them from one make target.
+    for (name, workflow) in [("CI", CI_WORKFLOW), ("release", RELEASE_WORKFLOW)] {
+        assert_eq!(
+            workflow.matches("run: make test-tools").count(),
+            1,
+            "{name} must install the test suite's tools with make test-tools"
+        );
+    }
+    let makefile = include_str!("../Makefile");
+    let recipe = makefile
+        .split_once("\ntest-tools:\n")
+        .and_then(|(_, rest)| rest.lines().next())
+        .expect("the Makefile should have a test-tools target");
+    assert_eq!(
+        recipe.split_whitespace().collect::<Vec<_>>(),
+        ["mise", "install", "rust", "uv"],
+        "test-tools must install uv, which the relock tests run"
+    );
     assert!(RELEASE_WORKFLOW.contains("mise install cargo-binstall"));
     assert!(!RELEASE_WORKFLOW.contains("mise install cargo:cargo-binstall"));
     assert!(RELEASE_WORKFLOW.contains("run: mise install github:PyO3/maturin"));

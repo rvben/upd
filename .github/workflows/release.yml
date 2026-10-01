@@ -112,8 +112,8 @@ jobs:
           experimental: true
           install: false
 
-      - name: Install Rust
-        run: mise install rust
+      - name: Install test tools
+        run: make test-tools
 
       - name: Install Rust components
         run: rustup component add rustfmt clippy

@@ -1,4 +1,4 @@
-.PHONY: build check-targets release test test-verbose lint fmt fmt-check release-pins-check check ci clean run run-release install release-patch release-minor release-major
+.PHONY: build check-targets test-tools release test test-verbose lint fmt fmt-check release-pins-check check ci clean run run-release install release-patch release-minor release-major
 
 # Build debug binary
 build:
@@ -7,6 +7,11 @@ build:
 # Compile every target, tests included, for TARGET (default: the host)
 check-targets:
 	cargo check --all-targets $(if $(TARGET),--target $(TARGET))
+
+# Install the toolchain the test suite needs; some integration tests run uv.
+# CI and the release workflow both run this, so they test with the same tools.
+test-tools:
+	mise install rust uv
 
 # Build release binary
 release:
