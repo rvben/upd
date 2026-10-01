@@ -18,6 +18,7 @@ jobs:
       lock: true
       min-age: 7d
       max-bump: minor
+      prepare-command: make test-tools
       validation-command: make check
       fail-on-blocked: false
       branch: deps/upd

@@ -8,10 +8,18 @@ build:
 check-targets:
 	cargo check --all-targets $(if $(TARGET),--target $(TARGET))
 
-# Install the toolchain the test suite needs; some integration tests run uv.
-# CI and the release workflow both run this, so they test with the same tools.
+# Install the tools the test suite needs beyond Rust; some integration tests
+# run uv. Every workflow that runs the suite runs this target, so none can
+# test with fewer tools than CI. Jobs without mise rely on the runner's Rust
+# and install the uv version pinned in .mise.toml with pipx.
+UV_VERSION := $(shell sed -n 's/^uv = "\(.*\)"$$/\1/p' .mise.toml)
+
 test-tools:
-	mise install rust uv
+	if command -v mise >/dev/null 2>&1; then \
+		mise install rust uv; \
+	else \
+		pipx install --force "uv==$(UV_VERSION)"; \
+	fi
 
 # Build release binary
 release:

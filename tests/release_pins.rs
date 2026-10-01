@@ -179,6 +179,76 @@ fn release_pin_publication_keeps_its_recovery_and_integrity_guards() {
 }
 
 #[test]
+fn every_workflow_that_runs_the_test_suite_installs_its_tools() {
+    let workflows = repo_root().join(".github/workflows");
+    let mut suite_runners = Vec::new();
+    for entry in std::fs::read_dir(&workflows).expect("the workflows directory is readable") {
+        let path = entry.unwrap().path();
+        let text = std::fs::read_to_string(&path).unwrap();
+        let name = path.file_name().unwrap().to_string_lossy().into_owned();
+        // A command is either a whole line of a run block or the value of a
+        // `run:` or `*-command:` key.
+        let invokes = |command: &str| {
+            text.lines()
+                .filter(|line| {
+                    let line = line.trim();
+                    line == command || line.ends_with(&format!(": {command}"))
+                })
+                .count()
+        };
+        if invokes("make check") + invokes("make ci") > 0 {
+            assert_eq!(
+                invokes("make test-tools"),
+                1,
+                "{name} runs the test suite, so it must install the suite's tools once with make test-tools"
+            );
+            suite_runners.push(name);
+        }
+    }
+    suite_runners.sort();
+    assert_eq!(
+        suite_runners,
+        [
+            "ci.yml",
+            "dependencies.yml",
+            "release.yml",
+            "remediate-dependencies.yml",
+            "sync-release-pins.yml",
+        ],
+        "the scan should find every workflow known to run the suite"
+    );
+
+    let makefile = include_str!("../Makefile");
+    let recipe = makefile
+        .split_once("\ntest-tools:\n")
+        .map(|(_, rest)| rest.split("\n\n").next().unwrap_or_default())
+        .expect("the Makefile should have a test-tools target");
+    assert!(
+        recipe.contains("mise install rust uv"),
+        "test-tools must install uv through mise where mise exists: {recipe}"
+    );
+    assert!(
+        recipe.contains("pipx install --force \"uv==$(UV_VERSION)\""),
+        "test-tools must install the pinned uv where mise is absent: {recipe}"
+    );
+    let pinned = MISE_CONFIG
+        .lines()
+        .find_map(|line| line.strip_prefix("uv = \""))
+        .and_then(|rest| rest.strip_suffix('"'))
+        .expect(".mise.toml pins uv");
+    let output = Command::new("make")
+        .args(["--no-print-directory", "-n", "test-tools"])
+        .current_dir(repo_root())
+        .output()
+        .expect("make runs");
+    let dry_run = String::from_utf8(output.stdout).unwrap();
+    assert!(
+        dry_run.contains(&format!("pipx install --force \"uv=={pinned}\"")),
+        "UV_VERSION must resolve to the uv version .mise.toml pins: {dry_run}"
+    );
+}
+
+#[test]
 fn ci_and_release_jobs_install_only_the_tools_they_use() {
     for (name, workflow) in [("CI", CI_WORKFLOW), ("release", RELEASE_WORKFLOW)] {
         assert!(
@@ -191,25 +261,6 @@ fn ci_and_release_jobs_install_only_the_tools_they_use() {
         );
     }
     assert_eq!(CI_WORKFLOW.matches("run: mise install rust").count(), 1);
-    // The release reruns the test suite, so it needs the same tools as CI;
-    // both take them from one make target.
-    for (name, workflow) in [("CI", CI_WORKFLOW), ("release", RELEASE_WORKFLOW)] {
-        assert_eq!(
-            workflow.matches("run: make test-tools").count(),
-            1,
-            "{name} must install the test suite's tools with make test-tools"
-        );
-    }
-    let makefile = include_str!("../Makefile");
-    let recipe = makefile
-        .split_once("\ntest-tools:\n")
-        .and_then(|(_, rest)| rest.lines().next())
-        .expect("the Makefile should have a test-tools target");
-    assert_eq!(
-        recipe.split_whitespace().collect::<Vec<_>>(),
-        ["mise", "install", "rust", "uv"],
-        "test-tools must install uv, which the relock tests run"
-    );
     assert!(RELEASE_WORKFLOW.contains("mise install cargo-binstall"));
     assert!(!RELEASE_WORKFLOW.contains("mise install cargo:cargo-binstall"));
     assert!(RELEASE_WORKFLOW.contains("run: mise install github:PyO3/maturin"));

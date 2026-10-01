@@ -24,6 +24,7 @@ jobs:
             (github.event_name == 'workflow_dispatch' && inputs.publish) }}
       langs: rust
       allowed-paths: Cargo.toml Cargo.lock
+      prepare-command: make test-tools
       validation-command: make check
       branch: security/upd
       commit-message: "fix(deps): remediate vulnerable Rust dependencies with upd"

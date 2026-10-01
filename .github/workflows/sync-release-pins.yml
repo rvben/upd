@@ -139,7 +139,8 @@ jobs:
       - name: Install validation tools
         if: steps.synchronize.outputs.changed == 'true'
         run: |
-          mise install rust actionlint
+          make test-tools
+          mise install actionlint
           rustup component add rustfmt clippy
 
       - name: Validate generated change
