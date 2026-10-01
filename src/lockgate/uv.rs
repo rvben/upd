@@ -129,8 +129,20 @@ fn configured_setting(dir: &Path, env: EnvLookup<'_>) -> Result<Option<String>, 
     Ok(None)
 }
 
+/// Whether a uv configuration table sets a release-age cutoff: at the top
+/// level, or on one of its indexes (`[[index]]` in uv.toml, `[[tool.uv.index]]`
+/// in pyproject.toml), which uv honours for that index's packages.
 fn sets_exclude_newer(table: &toml::Table) -> bool {
     SETTINGS.iter().any(|key| table.contains_key(*key))
+        || table
+            .get("index")
+            .and_then(|indexes| indexes.as_array())
+            .is_some_and(|indexes| {
+                indexes
+                    .iter()
+                    .filter_map(toml::Value::as_table)
+                    .any(|index| index.contains_key("exclude-newer"))
+            })
 }
 
 /// A TOML file, `None` when there is none at `path`.
@@ -502,6 +514,53 @@ mod tests {
         .unwrap();
         let reason = plan(&project, None, gate(), &help, &no_env).unwrap_err();
         assert!(reason.contains("uv.toml"), "{reason}");
+    }
+
+    #[test]
+    fn an_index_cutoff_is_the_projects_own_setting() {
+        let root = tempfile::tempdir().unwrap();
+        let project = root.path();
+
+        // An index without a cutoff leaves the gate in place.
+        std::fs::write(
+            project.join("pyproject.toml"),
+            "[[tool.uv.index]]\nname = \"a\"\nurl = \"https://a.example/simple\"\n",
+        )
+        .unwrap();
+        assert!(plan(project, None, gate(), &help, &no_env).is_ok());
+
+        for pyproject in [
+            "[[tool.uv.index]]\nname = \"a\"\nurl = \"https://a.example/simple\"\n\n\
+             [[tool.uv.index]]\nname = \"b\"\nurl = \"https://b.example/simple\"\nexclude-newer = \"2026-01-01T00:00:00Z\"\n",
+            "[tool.uv]\nindex = [{ name = \"a\", url = \"https://a.example/simple\", exclude-newer = false }]\n",
+        ] {
+            std::fs::write(project.join("pyproject.toml"), pyproject).unwrap();
+            let reason = plan(project, None, gate(), &help, &no_env).unwrap_err();
+            assert!(reason.contains("pyproject.toml"), "{pyproject}: {reason}");
+        }
+
+        std::fs::write(
+            project.join("uv.toml"),
+            "[[index]]\nname = \"a\"\nurl = \"https://a.example/simple\"\nexclude-newer = false\n",
+        )
+        .unwrap();
+        let reason = plan(project, None, gate(), &help, &no_env).unwrap_err();
+        assert!(reason.contains("uv.toml"), "{reason}");
+
+        // The same in the user configuration.
+        let user = tempfile::tempdir().unwrap();
+        let xdg = user.path().join("xdg");
+        let elsewhere = user.path().join("p");
+        std::fs::create_dir_all(xdg.join("uv")).unwrap();
+        std::fs::create_dir_all(&elsewhere).unwrap();
+        std::fs::write(
+            xdg.join("uv/uv.toml"),
+            "[[index]]\nname = \"a\"\nurl = \"https://a.example/simple\"\nexclude-newer = \"2026-01-01T00:00:00Z\"\n",
+        )
+        .unwrap();
+        let env = |key: &str| (key == "XDG_CONFIG_HOME").then(|| xdg.clone().into_os_string());
+        let reason = plan(&elsewhere, None, gate(), &help, &env).unwrap_err();
+        assert!(reason.contains("xdg/uv/uv.toml"), "{reason}");
     }
 
     #[test]

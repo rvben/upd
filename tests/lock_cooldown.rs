@@ -579,15 +579,15 @@ struct UvRun {
 }
 
 async fn uv_refresh(extra: &[(&str, &str)]) -> UvRun {
-    uv_refresh_locking(("2.32.0", days_ago(30)), false, extra).await
+    uv_refresh_locking(("2.32.0", days_ago(30)), None, extra).await
 }
 
 /// A `--lock` refresh whose gated pass locks `gated`, the `requests` release
 /// and its upload time. The mock index is configured through the environment,
-/// or with `declared` only in `[[tool.uv.index]]`.
+/// or with `declared` only in `[[tool.uv.index]]`, holding its extra lines.
 async fn uv_refresh_locking(
     gated: (&str, DateTime<Utc>),
-    declared: bool,
+    declared: Option<&str>,
     extra: &[(&str, &str)],
 ) -> UvRun {
     let server = wiremock::MockServer::start().await;
@@ -606,10 +606,10 @@ async fn uv_refresh_locking(
     let fx = Fixture::new();
     write_fake_tool(&fx.bin, "uv", UV_RECORDING);
     let index = format!("{}/simple", server.uri());
-    if declared {
+    if let Some(lines) = declared {
         fx.write(
             "pyproject.toml",
-            &format!("{PYPROJECT}\n[[tool.uv.index]]\nname = \"mock\"\nurl = \"{index}\"\n"),
+            &format!("{PYPROJECT}\n[[tool.uv.index]]\nname = \"mock\"\nurl = \"{index}\"\n{lines}"),
         );
     } else {
         fx.write("pyproject.toml", PYPROJECT);
@@ -641,7 +641,7 @@ async fn uv_refresh_locking(
         ("FAKE_LOCK", after.display().to_string()),
         ("FAKE_FRESH_LOCK", fresh.display().to_string()),
     ];
-    if !declared {
+    if declared.is_none() {
         env.push(("UV_INDEX_URL", server.uri()));
     }
     env.extend(extra.iter().map(|(k, v)| (*k, v.to_string())));
@@ -719,7 +719,7 @@ async fn a_uv_refresh_under_a_cooldown_resolves_gated_then_removes_the_cutoff() 
 /// cooldown; what it introduced is read back.
 #[tokio::test]
 async fn a_uv_refresh_whose_exemption_admits_a_young_release_reports_it() {
-    let run = uv_refresh_locking(("2.31.5", days_ago(3)), false, &[]).await;
+    let run = uv_refresh_locking(("2.31.5", days_ago(3)), None, &[]).await;
     exempted_requests_reported(&run);
 }
 
@@ -727,8 +727,33 @@ async fn a_uv_refresh_whose_exemption_admits_a_young_release_reports_it() {
 /// index, as its dependencies are looked up there.
 #[tokio::test]
 async fn a_uv_entry_from_a_declared_index_is_checked_against_it() {
-    let run = uv_refresh_locking(("2.31.5", days_ago(3)), true, &[]).await;
+    let run = uv_refresh_locking(("2.31.5", days_ago(3)), Some(""), &[]).await;
     exempted_requests_reported(&run);
+}
+
+/// An index's own exclude-newer is the project's release-age setting, which
+/// a global `--exclude-newer` would override, so the refresh runs plain, as
+/// for a top-level setting, and what it locked is read back.
+#[tokio::test]
+async fn a_uv_index_with_its_own_cutoff_is_not_overridden() {
+    let run = uv_refresh_locking(
+        ("2.31.5", days_ago(3)),
+        Some("exclude-newer = false\n"),
+        &[("FAKE_RERESOLVE", "1")],
+    )
+    .await;
+
+    assert_eq!(
+        run.code, 0,
+        "stdout: {}\nstderr: {}",
+        run.stdout, run.stderr
+    );
+    assert_eq!(
+        run.fx.logged(),
+        ["lock"],
+        "the index's own cutoff must not be overridden"
+    );
+    young_requests_reported(&json(&run.stdout, &run.stderr));
 }
 
 /// The gated pass ran with an exemption, no warning was raised, and the

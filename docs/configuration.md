@@ -323,6 +323,11 @@ the cutoff in `uv.lock`, where it would make `uv lock --locked` fail without the
 same flags, so upd removes it and runs a plain `uv lock` to confirm the result.
 An exemption admits every release of its package up to the exempted time,
 including a young one, which is why a gated refresh is still checked as below.
+A project whose uv configuration sets its own `exclude-newer` or
+`exclude-newer-package`, or an index's own `exclude-newer`
+(`[[tool.uv.index]]`, `[[index]]` in `uv.toml`, `false` included), keeps that
+setting: a global `--exclude-newer` would override it, so the refresh runs
+without one and what it locked is checked as below.
 
 For Cargo, each crates.io entry the refresh introduced inside the cooldown is
 held at the newest compatible release outside it, never below what the
