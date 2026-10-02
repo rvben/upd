@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.15.1](https://github.com/rvben/upd/compare/v0.15.0...v0.15.1) - 2026-10-02
+
+### Added
+
+- **lock-refresh**: refresh uv.lock under a cooldown ([e31aaa4](https://github.com/rvben/upd/commit/e31aaa4db0b2e979025b4abd6e90b8b88e5cdc95))
+
+### Fixed
+
+- **lockfile**: keep a uv index's own exclude-newer under a cooldown ([48676f1](https://github.com/rvben/upd/commit/48676f1c6106283016dd78014b9a9fb6b4774e58))
+- **lock-refresh**: refuse a uv.lock outside its workspace root ([9dd4215](https://github.com/rvben/upd/commit/9dd42151beb6b546573c92ca97ad0bc72afaf16e))
+- **lockfile**: ignore inherited UV_PROJECT and UV_WORKING_DIR when running uv ([0f704f3](https://github.com/rvben/upd/commit/0f704f302d6bfe7f5b94ff13168af59f2e060139))
+
 ## [0.15.0](https://github.com/rvben/upd/compare/v0.14.4...v0.15.0) - 2026-10-01
 
 ### Added
