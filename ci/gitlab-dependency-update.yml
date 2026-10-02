@@ -12,7 +12,7 @@ spec:
       default: "debian:bookworm-slim@sha256:abd67ffcfa541b485a3dff59865ab629aa048a6c613e639d36e7456b0b229241"
     upd_version:
       description: Exact released upd version
-      default: "v0.15.0"
+      default: "v0.15.1"
       regex: '^v[0-9]+\.[0-9]+\.[0-9]+([+-][0-9A-Za-z.-]+)?$'
     upd_sha256:
       description: Archive digest; required when overriding upd_version or upd_target
@@ -163,16 +163,16 @@ spec:
         fi
 
         expected_sha="${UPD_SHA256}"
-        if [ -z "$expected_sha" ] && [ "$version" = "v0.15.0" ]; then
+        if [ -z "$expected_sha" ] && [ "$version" = "v0.15.1" ]; then
           case "$target" in
             x86_64-unknown-linux-gnu)
-              expected_sha="4824da03a43a1238fd17b35580a1e53dbd851996ae025980231d834295ac7f86"
+              expected_sha="d3de7abc9343494bd3645e2272e5286f75df7671690460af1cf9d1df9e5cd6ab"
               ;;
             x86_64-unknown-linux-musl)
-              expected_sha="76bf403e3d762dab6b5060f5416363813a5b353637a7ae71bae97ab288683c6c"
+              expected_sha="63fe74d8a7e200107d6bc9dbcef2a8d798d690d1aab90aaf35d13ed7233636d4"
               ;;
             aarch64-unknown-linux-gnu)
-              expected_sha="f63f55a55377d0326410410df460457a93eaebccd2fdf8c5ac66fd329cb806c6"
+              expected_sha="c92fa6f9110d3dfca52fe72e4fd3f9902a7f38f111f513a07dab18273117ce09"
               ;;
           esac
         fi
