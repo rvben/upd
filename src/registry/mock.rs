@@ -32,6 +32,7 @@ pub struct MockRegistry {
     repo_files: HashMap<(String, String, String), Vec<u8>>,
     /// Map of package + tag + asset name to the release asset's bytes
     release_assets: HashMap<(String, String, String), Vec<u8>>,
+    release_digests: HashMap<(String, String, String), String>,
     /// Registry name
     name: &'static str,
 }
@@ -52,8 +53,21 @@ impl MockRegistry {
             without_tag_concept: HashSet::new(),
             repo_files: HashMap::new(),
             release_assets: HashMap::new(),
+            release_digests: HashMap::new(),
             name,
         }
+    }
+
+    pub fn with_release_digest(
+        mut self,
+        package: &str,
+        tag: &str,
+        asset: &str,
+        digest: &str,
+    ) -> Self {
+        self.release_digests
+            .insert((package.into(), tag.into(), asset.into()), digest.into());
+        self
     }
 
     /// Add a package with its latest stable version.
@@ -342,6 +356,27 @@ impl Registry for MockRegistry {
             .get(&(package.to_string(), reference.to_string(), path.to_string()))
             .cloned()
             .ok_or_else(|| anyhow!("no repo file fixture for {package}@{reference}:{path}"))
+    }
+
+    async fn release_asset_metadata(
+        &self,
+        package: &str,
+        tag: &str,
+        asset: &str,
+    ) -> Result<super::ReleaseAssetMetadata> {
+        let key = (package.into(), tag.into(), asset.into());
+        let digest = self.release_digests.get(&key).cloned();
+        if digest.is_none() && !self.release_assets.contains_key(&key) {
+            anyhow::bail!("no release asset fixture for {package}@{tag}:{asset}");
+        }
+        Ok(super::ReleaseAssetMetadata { sha256: digest })
+    }
+
+    async fn release_asset_digest(&self, package: &str, tag: &str, asset: &str) -> Result<String> {
+        self.release_digests
+            .get(&(package.into(), tag.into(), asset.into()))
+            .cloned()
+            .ok_or_else(|| anyhow!("no release digest fixture for {package}@{tag}:{asset}"))
     }
 
     async fn release_asset(&self, package: &str, tag: &str, asset_name: &str) -> Result<Vec<u8>> {

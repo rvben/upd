@@ -1,6 +1,8 @@
-//! The updater for files `upd` has no parser for, driven by trailing comment
+//! The updater for files `upd` has no parser for, driven by comment
 //! annotations. This module owns the registry dispatch and the warning mode;
 //! the grammar and the text surgery live in `crate::annotation`.
+
+pub(crate) mod checksum;
 
 use super::{
     CooldownOutcome, FileType, OwnsLines, ParsedDependency, PendingVersion, UpdateOptions,
@@ -9,8 +11,7 @@ use super::{
 use crate::align::compare_versions;
 use crate::annotation::{
     AnnotationSource, ParseOutcome, UNSUPPORTED_SOURCE_PREFIX, distinct_values,
-    is_prerelease_token, is_version_token, parse_line, reapply_v_prefix, rewrite_spans,
-    version_spans,
+    is_prerelease_token, is_version_token, reapply_v_prefix, rewrite_spans, version_spans,
 };
 use crate::cache::CachedRegistry;
 use crate::registry::{
@@ -155,6 +156,7 @@ struct AnnotatedLine {
     version: String,
     /// Every candidate span, ascending. A repeated value has several.
     spans: Vec<Range<usize>>,
+    id: Option<String>,
 }
 
 /// The result of reading a file: the usable lines, and one refusal message per
@@ -162,6 +164,8 @@ struct AnnotatedLine {
 struct AnnotatedScan {
     lines: Vec<AnnotatedLine>,
     refusals: Vec<String>,
+    checksums: Vec<(usize, crate::annotation::ChecksumAnnotation)>,
+    checksum_refused: bool,
 }
 
 /// Apply `--lang` per line. An empty selection means everything;
@@ -200,13 +204,23 @@ fn choose_write_value(current: &str, resolved: &str, full_precision: bool) -> St
 /// `owner` is present only when this file also has an updater of its own, and
 /// reports the lines that updater rewrites. See [`OwnsLines`].
 fn scan_annotated(content: &str, owner: Option<&dyn OwnsLines>) -> AnnotatedScan {
+    scan_annotated_with_diagnostics(content, owner, true)
+}
+
+fn scan_annotated_with_diagnostics(
+    content: &str,
+    owner: Option<&dyn OwnsLines>,
+    deduplicate_sources: bool,
+) -> AnnotatedScan {
     let mut lines: Vec<AnnotatedLine> = Vec::new();
     let mut refusals: Vec<String> = Vec::new();
+    let mut checksums = Vec::new();
+    let mut checksum_refused = false;
     let mut unsupported_sources: HashSet<String> = HashSet::new();
 
     let outcomes = match owner {
         Some(owner) => owner.annotations(content),
-        None => content.lines().map(parse_line).collect(),
+        None => crate::annotation::parse_annotations(content),
     };
     for (line_idx, (raw, outcome)) in content.lines().zip(outcomes).enumerate() {
         // Checked before the outcome is read, so a marker on an owned line is
@@ -216,6 +230,8 @@ fn scan_annotated(content: &str, owner: Option<&dyn OwnsLines>) -> AnnotatedScan
         // to remove.
         if !matches!(outcome, ParseOutcome::None) && owner.is_some_and(|owner| owner.owns_line(raw))
         {
+            checksum_refused |= matches!(outcome, ParseOutcome::Checksum(_))
+                || crate::annotation::has_checksum_marker(raw);
             refusals.push(format!(
                 "line {}: annotation ignored, this line's version is already resolved by the file's own updater",
                 line_idx + 1
@@ -226,14 +242,21 @@ fn scan_annotated(content: &str, owner: Option<&dyn OwnsLines>) -> AnnotatedScan
         let annotation = match outcome {
             ParseOutcome::None => continue,
             ParseOutcome::Malformed(reason) => {
+                checksum_refused |=
+                    reason.contains("checksum") || crate::annotation::has_checksum_marker(raw);
                 if let Some(source) = reason
                     .strip_prefix(UNSUPPORTED_SOURCE_PREFIX)
                     .and_then(|rest| rest.split_once('\'').map(|(source, _)| source))
                     && !unsupported_sources.insert(source.to_string())
+                    && deduplicate_sources
                 {
                     continue;
                 }
                 refusals.push(format!("line {}: {}", line_idx + 1, reason));
+                continue;
+            }
+            ParseOutcome::Checksum(annotation) => {
+                checksums.push((line_idx, annotation));
                 continue;
             }
             ParseOutcome::Found(annotation) => annotation,
@@ -266,6 +289,7 @@ fn scan_annotated(content: &str, owner: Option<&dyn OwnsLines>) -> AnnotatedScan
             version: distinct[0].to_string(),
             package: annotation.package,
             spans,
+            id: annotation.id,
         });
     }
 
@@ -301,7 +325,68 @@ fn scan_annotated(content: &str, owner: Option<&dyn OwnsLines>) -> AnnotatedScan
     let conflicted: HashSet<&str> = conflicts.iter().map(|(name, _)| name.as_str()).collect();
     lines.retain(|line| !conflicted.contains(line.package.as_str()));
 
-    AnnotatedScan { lines, refusals }
+    AnnotatedScan {
+        lines,
+        refusals,
+        checksums,
+        checksum_refused,
+    }
+}
+
+/// Offline validation uses the updater's parser and checksum binding rules.
+/// It establishes structural validity, not whether a release or digest exists.
+pub fn validate_annotations(
+    content: &str,
+    file_type: FileType,
+) -> crate::annotation_tools::Validation {
+    let docker = super::DockerUpdater::new();
+    let actions = super::GithubActionsUpdater::new();
+    let owner: Option<&dyn OwnsLines> = match file_type {
+        FileType::Dockerfile => Some(&docker),
+        FileType::GithubActions => Some(&actions),
+        _ => None,
+    };
+    let scan = scan_annotated_with_diagnostics(content, owner, false);
+    let groups = checksum::Groups::scan(content, &scan, file_type == FileType::Dockerfile);
+    let mut diagnostics: Vec<_> = scan
+        .refusals
+        .iter()
+        .chain(groups.warnings.iter())
+        .map(|message| crate::annotation_tools::Diagnostic::from_parser(message))
+        .collect();
+    let mut ids: std::collections::BTreeMap<&str, Vec<usize>> = std::collections::BTreeMap::new();
+    for line in &scan.lines {
+        if let Some(id) = &line.id {
+            ids.entry(id).or_default().push(line.line_idx + 1);
+        }
+    }
+    for (id, lines) in ids {
+        if lines.len() > 1 {
+            diagnostics.push(crate::annotation_tools::Diagnostic {
+                lines,
+                message: format!("duplicate annotation id {id}; give each version a unique id"),
+            });
+        }
+    }
+    let versions = scan.lines.len();
+    let checksums = scan.checksums.len();
+    if file_type != FileType::Annotated
+        && !file_type.scans_annotations()
+        && (versions > 0 || checksums > 0)
+    {
+        diagnostics.push(crate::annotation_tools::Diagnostic {
+            lines: scan.lines.iter().map(|line| line.line_idx + 1)
+                .chain(scan.checksums.iter().map(|(idx, _)| idx + 1)).collect(),
+            message: format!("{} uses its native dependency parser and does not support annotations; move these pins to an annotated file", file_type.as_str()),
+        });
+    }
+    diagnostics.sort_by(|a, b| a.lines.cmp(&b.lines).then(a.message.cmp(&b.message)));
+    diagnostics.dedup();
+    crate::annotation_tools::Validation {
+        versions,
+        checksums,
+        diagnostics,
+    }
 }
 
 /// Updates dependencies whose ecosystem is declared per line rather than by the
@@ -390,6 +475,81 @@ impl Updater for AnnotatedUpdater {
 }
 
 impl AnnotatedUpdater {
+    /// Resolve every checksum before recording or changing the version.
+    #[allow(clippy::too_many_arguments)]
+    async fn resolve_checksums(
+        &self,
+        groups: &checksum::Groups,
+        content: &str,
+        line: &AnnotatedLine,
+        target: &str,
+        resolved: &str,
+        pinned: bool,
+        result: &mut UpdateResult,
+        new_lines: &mut [String],
+    ) -> bool {
+        if !groups.linked(line.line_idx) {
+            return true;
+        }
+        let resolved_edits = async {
+            let registry = self.registries.for_source(line.source)?;
+            anyhow::ensure!(
+                target.trim_start_matches('v') == resolved.trim_start_matches('v'),
+                "checksum-linked version must name the complete release; use --full-precision"
+            );
+            let tag = if pinned {
+                let names = registry.list_ref_names(&line.package).await?;
+                let matches: Vec<_> = names
+                    .into_iter()
+                    .filter(|name| name.trim_start_matches('v') == target.trim_start_matches('v'))
+                    .collect();
+                anyhow::ensure!(
+                    matches.len() == 1,
+                    "pinned version {target} must match exactly one release tag, found {}",
+                    matches.len()
+                );
+                matches[0].clone()
+            } else {
+                resolved.to_string()
+            };
+            groups.resolve(content, line, target, &tag, registry).await
+        }
+        .await;
+        match resolved_edits {
+            Ok(edits) => {
+                if target == line.version {
+                    if let Some(edit) = edits.iter().find(|edit| edit.original != edit.replacement)
+                    {
+                        result.skipped.push(super::SkippedUpdate {
+                            package: line.package.clone(), current: line.version.clone(),
+                            status: super::SkipStatus::Blocked, reason: "checksum-mismatch",
+                            message: format!("line {}: recorded checksum differs from {}@{} asset {}; unchanged versions never replace checksums automatically", edit.line, line.package, edit.tag, edit.asset),
+                            line_number: Some(line.line_idx + 1),
+                        });
+                        return false;
+                    }
+                    return true;
+                }
+                for edit in &edits {
+                    new_lines[edit.line - 1] = edit.replacement.clone();
+                }
+                result.checksum_updates.extend(edits);
+                true
+            }
+            Err(error) => {
+                result.skipped.push(super::SkippedUpdate {
+                    package: line.package.clone(),
+                    current: line.version.clone(),
+                    status: super::SkipStatus::Blocked,
+                    reason: "checksum-unavailable",
+                    message: format!("line {}: {error:#}", line.line_idx + 1),
+                    line_number: Some(line.line_idx + 1),
+                });
+                false
+            }
+        }
+    }
+
     /// The body shared by both entry points.
     ///
     /// `owner` is `None` when this updater is the file's only one, and `Some`
@@ -408,6 +568,12 @@ impl AnnotatedUpdater {
         // `--package other` must not hide a malformed annotation.
         result.warnings.extend(scan.refusals.iter().cloned());
 
+        let groups = checksum::Groups::scan(
+            &content,
+            &scan,
+            FileType::detect(path) == Some(FileType::Dockerfile),
+        );
+        result.warnings.extend(groups.warnings.iter().cloned());
         let lines: Vec<&str> = content.lines().collect();
         let mut fetch: Vec<&AnnotatedLine> = Vec::new();
         let mut version_map: HashMap<usize, PendingVersion> = HashMap::new();
@@ -420,6 +586,7 @@ impl AnnotatedUpdater {
             result
                 .entry_ecosystem
                 .insert(line.package.clone(), line.source);
+            result.annotation_sources.insert(line_num, line.source);
 
             // A commit-pinned Go version names a commit, not a release. Refuse
             // it before the gates, as GoModUpdater does.
@@ -450,7 +617,20 @@ impl AnnotatedUpdater {
                 continue;
             }
 
-            // A pin short-circuits the registry entirely.
+            if let Some(message) = groups.errors.get(&line.line_idx) {
+                result.skipped.push(super::SkippedUpdate {
+                    package: line.package.clone(),
+                    current: line.version.clone(),
+                    status: super::SkipStatus::Blocked,
+                    reason: "checksum-invalid",
+                    message: message.clone(),
+                    line_number: Some(line_num),
+                });
+                continue;
+            }
+
+            // A pin bypasses version discovery. Linked checksums still need
+            // metadata from the release the configured pin selects.
             if let Some(pinned) = options.get_pinned_version(&line.package) {
                 version_map.insert(line.line_idx, PendingVersion::Pinned(pinned.to_string()));
                 continue;
@@ -500,7 +680,21 @@ impl AnnotatedUpdater {
                 PendingVersion::Pinned(pinned) => {
                     let target = choose_write_value(&line.version, &pinned, options.full_precision);
                     if target == line.version {
-                        result.unchanged += 1;
+                        if self
+                            .resolve_checksums(
+                                &groups,
+                                &content,
+                                line,
+                                &target,
+                                &pinned,
+                                true,
+                                &mut result,
+                                &mut new_lines,
+                            )
+                            .await
+                        {
+                            result.unchanged += 1;
+                        }
                         continue;
                     }
                     if result.hold_strict_pin(
@@ -511,6 +705,21 @@ impl AnnotatedUpdater {
                         Some(line_num),
                     ) {
                         result.capped.last_mut().unwrap().lang = Some(lang);
+                        continue;
+                    }
+                    if !self
+                        .resolve_checksums(
+                            &groups,
+                            &content,
+                            line,
+                            &target,
+                            &pinned,
+                            true,
+                            &mut result,
+                            &mut new_lines,
+                        )
+                        .await
+                    {
                         continue;
                     }
                     result.pinned.push((
@@ -593,7 +802,21 @@ impl AnnotatedUpdater {
                     let target =
                         choose_write_value(&line.version, &resolved, options.full_precision);
                     if target == line.version {
-                        result.unchanged += 1;
+                        if self
+                            .resolve_checksums(
+                                &groups,
+                                &content,
+                                line,
+                                &target,
+                                &resolved,
+                                false,
+                                &mut result,
+                                &mut new_lines,
+                            )
+                            .await
+                        {
+                            result.unchanged += 1;
+                        }
                         continue;
                     }
 
@@ -615,6 +838,21 @@ impl AnnotatedUpdater {
                         continue;
                     }
 
+                    if !self
+                        .resolve_checksums(
+                            &groups,
+                            &content,
+                            line,
+                            &target,
+                            &resolved,
+                            false,
+                            &mut result,
+                            &mut new_lines,
+                        )
+                        .await
+                    {
+                        continue;
+                    }
                     result.update_context.insert(
                         result.updated.len(),
                         super::UpdateContext {
@@ -662,7 +900,14 @@ impl AnnotatedUpdater {
             // A write failure must not discard what this run already learned.
             // Append the error, keep the warnings, and return Ok so the file's
             // diagnostics still reach the report.
-            if let Err(e) = write_file_atomic(path, &new_content) {
+            let write = (|| -> Result<()> {
+                anyhow::ensure!(
+                    read_file_safe(path)? == content,
+                    "annotated file changed while resolving updates; rerun upd"
+                );
+                write_file_atomic(path, &new_content)
+            })();
+            if let Err(e) = write {
                 result.errors.push(e.to_string());
                 return Ok(UpdateResult {
                     errors: result.errors,

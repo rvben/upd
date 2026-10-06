@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Linked GitHub release SHA-256 updates in annotation-capable text files, including Dockerfiles, shell scripts, Makefiles, and GitHub Actions workflows. Resolve all linked assets before updating a version; support published asset digests and explicit checksum manifests, with release provenance in JSON reports.
+- Offline `annotations validate` command with file-and-line diagnostics for annotation syntax, ambiguous links, invalid hashes/templates, and Docker stage visibility.
+- `annotations init` command to generate linked version/checksum snippets in shell, Docker, TOML, YAML, or JavaScript syntax. Supply a SHA-256 offline or explicitly resolve the exact release asset's published digest/manifest online; override filename inference with an asset template that must match the URL exactly. JSON records the checksum source.
+
+### Changed
+
+- Checksum reports distinguish changed hashes from companions verified unchanged for the new release, while retaining both in atomic update plans.
+
 ## [0.15.1](https://github.com/rvben/upd/compare/v0.15.0...v0.15.1) - 2026-10-02
 
 ### Added

@@ -6,12 +6,58 @@ use chrono::{DateTime, Utc};
 use reqwest::Client;
 use reqwest::header::{ACCEPT, AUTHORIZATION, HeaderMap, HeaderValue};
 use serde::Deserialize;
-use std::sync::OnceLock;
+use sha2::{Digest, Sha256};
+use std::collections::HashMap;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
+use tokio::sync::{Mutex, OnceCell};
+
+type ReleaseAssets = Arc<Vec<ReleaseAsset>>;
+type ReleaseCache = HashMap<(String, String), Arc<OnceCell<ReleaseAssets>>>;
+type AssetCache = HashMap<(String, String, String), Arc<OnceCell<Arc<Vec<u8>>>>>;
 
 pub struct GitHubReleasesRegistry {
     client: Client,
     api_url: String,
+    release_assets: Mutex<ReleaseCache>,
+    asset_bytes: Mutex<AssetCache>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct ReleaseAsset {
+    name: String,
+    #[serde(default)]
+    url: String,
+    digest: Option<String>,
+    state: Option<String>,
+}
+
+impl ReleaseAsset {
+    fn metadata(&self) -> Result<super::ReleaseAssetMetadata> {
+        anyhow::ensure!(
+            self.state
+                .as_deref()
+                .is_none_or(|state| state == "uploaded"),
+            "release asset {} is not fully uploaded",
+            self.name
+        );
+        let sha256 = self
+            .digest
+            .as_deref()
+            .map(|digest| -> Result<String> {
+                let digest = digest
+                    .strip_prefix("sha256:")
+                    .ok_or_else(|| anyhow!("unsupported digest algorithm for {}", self.name))?;
+                anyhow::ensure!(
+                    digest.len() == 64 && digest.bytes().all(|b| b.is_ascii_hexdigit()),
+                    "invalid SHA-256 digest for {}",
+                    self.name
+                );
+                Ok(digest.to_ascii_lowercase())
+            })
+            .transpose()?;
+        Ok(super::ReleaseAssetMetadata { sha256 })
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -86,6 +132,101 @@ struct ReleaseListEntry {
 }
 
 impl GitHubReleasesRegistry {
+    /// Share one exact-release metadata snapshot across all linked architectures.
+    /// This cache lasts only for this registry instance, never on disk.
+    async fn release_assets_at_tag(&self, package: &str, tag: &str) -> Result<ReleaseAssets> {
+        let key = (package.to_string(), tag.to_string());
+        let cell = self
+            .release_assets
+            .lock()
+            .await
+            .entry(key)
+            .or_default()
+            .clone();
+        let assets = cell
+            .get_or_try_init(|| async {
+                let (owner, repo) = Self::extract_owner_repo(package)?;
+                let mut url = url::Url::parse(&self.api_url)?;
+                url.path_segments_mut()
+                    .map_err(|_| anyhow!("Invalid GitHub API URL"))?
+                    .pop_if_empty()
+                    .extend(["repos", owner, repo, "releases", "tags", tag]);
+                let response = get_with_retry(&self.client, url.as_str()).await?;
+                anyhow::ensure!(
+                    response.status().is_success(),
+                    "Cannot read release {package}@{tag}: HTTP {}",
+                    response.status()
+                );
+                #[derive(Deserialize)]
+                struct Release {
+                    assets: Vec<ReleaseAsset>,
+                }
+                let release: Release = response.json().await?;
+                Ok::<_, anyhow::Error>(Arc::new(release.assets))
+            })
+            .await?;
+        Ok(Arc::clone(assets))
+    }
+
+    async fn release_asset_at_tag(
+        &self,
+        package: &str,
+        tag: &str,
+        asset_name: &str,
+    ) -> Result<ReleaseAsset> {
+        let assets = self.release_assets_at_tag(package, tag).await?;
+        let matches: Vec<_> = assets.iter().filter(|a| a.name == asset_name).collect();
+        anyhow::ensure!(
+            matches.len() == 1,
+            "release {package}@{tag}: expected exactly one asset named {asset_name}, found {}",
+            matches.len()
+        );
+        Ok(matches[0].clone())
+    }
+
+    async fn download_release_asset(
+        &self,
+        package: &str,
+        tag: &str,
+        asset_name: &str,
+    ) -> Result<Vec<u8>> {
+        let asset = self.release_asset_at_tag(package, tag, asset_name).await?;
+        let metadata = asset.metadata()?;
+        anyhow::ensure!(
+            !asset.url.is_empty(),
+            "release asset {asset_name} has no download URL"
+        );
+
+        let mut headers = HeaderMap::new();
+        headers.insert(ACCEPT, HeaderValue::from_static("application/octet-stream"));
+        let mut asset_response =
+            super::get_with_retry_and_headers(&self.client, &asset.url, Some(&headers)).await?;
+        if !asset_response.status().is_success() {
+            return Err(anyhow!(
+                "Cannot download asset {asset_name} for {package}@{tag}: HTTP {}",
+                asset_response.status()
+            ));
+        }
+        let mut bytes = Vec::new();
+        while let Some(chunk) = asset_response.chunk().await? {
+            if bytes.len() + chunk.len() > 2 * 1024 * 1024 {
+                return Err(anyhow!("Release asset {asset_name} response exceeds 2 MiB"));
+            }
+            bytes.extend_from_slice(&chunk);
+        }
+        if let Some(expected) = metadata.sha256 {
+            let actual: String = Sha256::digest(&bytes)
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect();
+            anyhow::ensure!(
+                actual == expected,
+                "SHA-256 mismatch for downloaded release asset {asset_name} from {package}@{tag}"
+            );
+        }
+        Ok(bytes)
+    }
+
     pub fn new() -> Self {
         let token = Self::detect_token();
         Self::with_api_url_and_token("https://api.github.com".to_string(), token)
@@ -120,7 +261,12 @@ impl GitHubReleasesRegistry {
         .build()
         .expect("Failed to create HTTP client for GitHub API.");
 
-        Self { client, api_url }
+        Self {
+            client,
+            api_url,
+            release_assets: Default::default(),
+            asset_bytes: Default::default(),
+        }
     }
 
     /// Check `GITHUB_TOKEN`, then `GH_TOKEN`, then fall back to the token an
@@ -560,54 +706,44 @@ impl Registry for GitHubReleasesRegistry {
         Ok(base64::engine::general_purpose::STANDARD.decode(encoded)?)
     }
 
-    async fn release_asset(&self, package: &str, tag: &str, asset_name: &str) -> Result<Vec<u8>> {
-        let (owner, repo) = Self::extract_owner_repo(package)?;
-        let mut url = url::Url::parse(&self.api_url)?;
-        url.path_segments_mut()
-            .map_err(|_| anyhow!("Invalid GitHub API URL"))?
-            .pop_if_empty()
-            .extend(["repos", owner, repo, "releases", "tags", tag]);
-        let response = get_with_retry(&self.client, url.as_str()).await?;
-        if !response.status().is_success() {
-            return Err(anyhow!(
-                "Cannot read release {package}@{tag}: HTTP {}",
-                response.status()
-            ));
-        }
-        #[derive(Deserialize)]
-        struct ReleaseWithAssets {
-            assets: Vec<ReleaseAsset>,
-        }
-        #[derive(Deserialize)]
-        struct ReleaseAsset {
-            name: String,
-            url: String,
-        }
-        let release: ReleaseWithAssets = response.json().await?;
-        let asset = release
-            .assets
-            .iter()
-            .find(|a| a.name == asset_name)
-            .ok_or_else(|| anyhow!("release {package}@{tag} has no asset named {asset_name}"))?;
+    async fn release_asset_metadata(
+        &self,
+        package: &str,
+        tag: &str,
+        asset_name: &str,
+    ) -> Result<super::ReleaseAssetMetadata> {
+        self.release_asset_at_tag(package, tag, asset_name)
+            .await?
+            .metadata()
+    }
 
-        let mut headers = HeaderMap::new();
-        headers.insert(ACCEPT, HeaderValue::from_static("application/octet-stream"));
-        let mut asset_response =
-            super::get_with_retry_and_headers(&self.client, &asset.url, Some(&headers)).await?;
-        if !asset_response.status().is_success() {
-            return Err(anyhow!(
-                "Cannot download asset {asset_name} for {package}@{tag}: HTTP {}",
-                asset_response.status()
-            ));
-        }
-        let mut bytes = Vec::new();
-        while let Some(chunk) = asset_response.chunk().await? {
-            if bytes.len() + chunk.len() > 2 * 1024 * 1024 {
-                return Err(anyhow!("Release asset {asset_name} response exceeds 2 MiB"));
-            }
-            bytes.extend_from_slice(&chunk);
-        }
-        Ok(bytes)
+    async fn release_asset_digest(
+        &self,
+        package: &str,
+        tag: &str,
+        asset_name: &str,
+    ) -> Result<String> {
+        self.release_asset_metadata(package, tag, asset_name).await?.sha256
+            .ok_or_else(|| anyhow!("release {package}@{tag}: SHA-256 digest unavailable for {asset_name}; specify checksums=<release asset>"))
+    }
+
+    async fn release_asset(&self, package: &str, tag: &str, asset_name: &str) -> Result<Vec<u8>> {
+        let key = (package.to_string(), tag.to_string(), asset_name.to_string());
+        let cell = self
+            .asset_bytes
+            .lock()
+            .await
+            .entry(key)
+            .or_default()
+            .clone();
+        let bytes = cell
+            .get_or_try_init(|| async {
+                self.download_release_asset(package, tag, asset_name)
+                    .await
+                    .map(Arc::new)
+            })
+            .await?;
+        Ok(bytes.as_ref().clone())
     }
 
     async fn python_releases(
@@ -1949,6 +2085,240 @@ mod tests {
             .repo_file_at_ref("rvben/upd", "v0.14.2", "release-pins.json")
             .await;
         assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn release_asset_digest_uses_exact_asset_and_shares_release_metadata() {
+        let server = MockServer::start().await;
+        let digest = "a".repeat(64);
+        Mock::given(method("GET"))
+            .and(path("/repos/jdx/mise/releases/tags/v2026.9.1"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "assets": [
+                    {"name": "mise-linux-x64.tar.gz", "digest": format!("sha256:{digest}")},
+                    {"name": "mise-linux-arm64.tar.gz", "digest": format!("sha256:{}", "b".repeat(64))}
+                ]
+            }))).expect(1).mount(&server).await;
+        let registry = registry(&server);
+        assert_eq!(
+            registry
+                .release_asset_digest("jdx/mise", "v2026.9.1", "mise-linux-x64.tar.gz")
+                .await
+                .unwrap(),
+            digest
+        );
+        assert_eq!(
+            registry
+                .release_asset_digest("jdx/mise", "v2026.9.1", "mise-linux-arm64.tar.gz")
+                .await
+                .unwrap(),
+            "b".repeat(64)
+        );
+        assert!(
+            registry
+                .release_asset_digest("jdx/mise", "v2026.9.1", "missing.tar.gz")
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn concurrent_release_metadata_and_manifest_downloads_share_one_snapshot() {
+        let server = MockServer::start().await;
+        let bytes = b"published checksums\n";
+        let digest = "87d978ba1360408b53459bf7c4ca157fdf5639a4ef89b429ce93a82921290ae3";
+        Mock::given(method("GET"))
+            .and(path("/repos/acme/tool/releases/tags/v1.2.3"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"assets":[
+                {"name":"sums.txt", "state":"uploaded", "digest":format!("sha256:{digest}"), "url":format!("{}/sums", server.uri())}
+            ]})).set_delay(Duration::from_millis(30)))
+            .expect(1).mount(&server).await;
+        Mock::given(method("GET"))
+            .and(path("/sums"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_bytes(bytes.to_vec())
+                    .set_delay(Duration::from_millis(30)),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        let registry = registry(&server);
+        let results = futures::future::join_all((0..16).map(|_| async {
+            let metadata = registry
+                .release_asset_metadata("acme/tool", "v1.2.3", "sums.txt")
+                .await
+                .unwrap();
+            let downloaded = registry
+                .release_asset("acme/tool", "v1.2.3", "sums.txt")
+                .await
+                .unwrap();
+            (metadata.sha256.unwrap(), downloaded)
+        }))
+        .await;
+        for (reported, downloaded) in results {
+            assert_eq!(reported, digest);
+            assert_eq!(downloaded, bytes);
+        }
+    }
+
+    #[tokio::test]
+    async fn release_asset_refuses_bad_metadata_before_download_and_mismatched_bytes_afterward() {
+        for (state, digest, downloads, message) in [
+            (
+                "starter",
+                format!("sha256:{}", "a".repeat(64)),
+                0,
+                "not fully uploaded",
+            ),
+            ("uploaded", "sha256:invalid".into(), 0, "invalid SHA-256"),
+            (
+                "uploaded",
+                format!("sha512:{}", "a".repeat(64)),
+                0,
+                "unsupported digest algorithm",
+            ),
+            (
+                "uploaded",
+                format!("sha256:{}", "a".repeat(64)),
+                1,
+                "SHA-256 mismatch",
+            ),
+        ] {
+            let server = MockServer::start().await;
+            Mock::given(method("GET")).and(path("/repos/acme/tool/releases/tags/v1.2.3"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"assets":[
+                    {"name":"sums.txt", "state":state, "digest":digest, "url":format!("{}/sums", server.uri())}
+                ]}))).expect(1).mount(&server).await;
+            Mock::given(method("GET"))
+                .and(path("/sums"))
+                .respond_with(ResponseTemplate::new(200).set_body_string("different bytes"))
+                .expect(downloads)
+                .mount(&server)
+                .await;
+            let error = registry(&server)
+                .release_asset("acme/tool", "v1.2.3", "sums.txt")
+                .await
+                .unwrap_err();
+            assert!(error.to_string().contains(message), "{error}");
+        }
+    }
+
+    #[tokio::test]
+    async fn failed_asset_downloads_are_not_cached_and_can_be_retried() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/repos/acme/tool/releases/tags/v1.2.3"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({"assets":[
+                    {"name":"sums.txt", "state":"uploaded", "url":format!("{}/sums", server.uri())}
+                ]})),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        let registry = registry(&server);
+        let failure = Mock::given(method("GET"))
+            .and(path("/sums"))
+            .respond_with(ResponseTemplate::new(404))
+            .expect(1)
+            .mount_as_scoped(&server)
+            .await;
+        assert!(
+            registry
+                .release_asset("acme/tool", "v1.2.3", "sums.txt")
+                .await
+                .is_err()
+        );
+        drop(failure);
+        Mock::given(method("GET"))
+            .and(path("/sums"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("valid manifest"))
+            .expect(1)
+            .mount(&server)
+            .await;
+        assert_eq!(
+            registry
+                .release_asset("acme/tool", "v1.2.3", "sums.txt")
+                .await
+                .unwrap(),
+            b"valid manifest"
+        );
+        assert_eq!(
+            registry
+                .release_asset("acme/tool", "v1.2.3", "sums.txt")
+                .await
+                .unwrap(),
+            b"valid manifest"
+        );
+    }
+
+    #[tokio::test]
+    async fn release_asset_metadata_verifies_presence_and_upload_state_without_requiring_a_digest()
+    {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/repos/acme/tool/releases/tags/v1.2.3"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({"assets":[
+                    {"name":"legacy.tar.gz", "state":"uploaded", "digest":null},
+                    {"name":"uploading.tar.gz", "state":"starter", "digest":null}
+                ]})),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        let registry = registry(&server);
+        assert!(
+            registry
+                .release_asset_metadata("acme/tool", "v1.2.3", "legacy.tar.gz")
+                .await
+                .unwrap()
+                .sha256
+                .is_none()
+        );
+        assert!(
+            registry
+                .release_asset_metadata("acme/tool", "v1.2.3", "missing.tar.gz")
+                .await
+                .is_err()
+        );
+        assert!(
+            registry
+                .release_asset_metadata("acme/tool", "v1.2.3", "uploading.tar.gz")
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn release_asset_digest_refuses_absent_malformed_and_ambiguous_digests() {
+        for assets in [
+            serde_json::json!([{"name":"asset", "digest":null}]),
+            serde_json::json!([{"name":"asset"}]),
+            serde_json::json!([{"name":"asset", "digest":"sha256:broken"}]),
+            serde_json::json!([{"name":"asset", "digest":format!("sha512:{}", "a".repeat(64))}]),
+            serde_json::json!([
+                {"name":"asset", "digest":format!("sha256:{}", "a".repeat(64))},
+                {"name":"asset", "digest":format!("sha256:{}", "b".repeat(64))}
+            ]),
+        ] {
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path("/repos/acme/tool/releases/tags/v1.2.3"))
+                .respond_with(
+                    ResponseTemplate::new(200).set_body_json(serde_json::json!({"assets":assets})),
+                )
+                .expect(1)
+                .mount(&server)
+                .await;
+            assert!(
+                registry(&server)
+                    .release_asset_digest("acme/tool", "v1.2.3", "asset")
+                    .await
+                    .is_err()
+            );
+        }
     }
 
     #[tokio::test]

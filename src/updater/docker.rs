@@ -303,20 +303,80 @@ impl DockerUpdater {
     }
 }
 
+/// Shared physical-line analysis for annotation placement and variable scope.
+/// Variables are recorded from complete ARG/ENV instructions, excluding comments
+/// and heredoc contents, with continuations and quoted values handled together.
+pub(crate) struct DockerfileAnalysis {
+    pub annotations: Vec<ParseOutcome>,
+    pub variables: Vec<DockerVariable>,
+    pub stages: Vec<usize>,
+    pub parents: Vec<Option<usize>>,
+}
+
+pub(crate) struct DockerVariable {
+    pub line: usize,
+    pub stage: usize,
+    pub name: String,
+    pub import: bool,
+}
+
+/// Split instruction words while keeping quoted values together. No expansion
+/// or evaluation takes place; only literal variable names are recorded.
+fn instruction_words(raw: &str, escape: char) -> Vec<String> {
+    let mut words = Vec::new();
+    let mut word = String::new();
+    let mut quote = None;
+    let mut escaped = false;
+    for ch in raw.chars() {
+        if escaped {
+            word.push(ch);
+            escaped = false;
+        } else if ch == escape && quote != Some('\'') {
+            escaped = true;
+        } else if Some(ch) == quote {
+            quote = None;
+        } else if quote.is_none() && matches!(ch, '\'' | '"') {
+            quote = Some(ch);
+        } else if quote.is_none() && ch.is_whitespace() {
+            if !word.is_empty() {
+                words.push(std::mem::take(&mut word));
+            }
+        } else {
+            word.push(ch);
+        }
+    }
+    if !word.is_empty() {
+        words.push(word);
+    }
+    words
+}
+
+fn dockerfile_annotations(content: &str) -> Vec<ParseOutcome> {
+    analyze_dockerfile(content).annotations
+}
+
 /// Read Dockerfile annotations without treating instruction arguments as comments.
 /// Keep physical line numbers so normal and interactive writes share one parser.
-fn dockerfile_annotations(content: &str) -> Vec<ParseOutcome> {
+pub(crate) fn analyze_dockerfile(content: &str) -> DockerfileAnalysis {
     static HEREDOC: LazyLock<Regex> = LazyLock::new(|| {
         Regex::new(r#"<<(-?)[\t ]*(?:'([^']+)'|"([^"]+)"|([^\s<>|;&'"\\]+))"#).unwrap()
     });
     let lines: Vec<_> = content.lines().collect();
     let mut outcomes = vec![ParseOutcome::None; lines.len()];
+    let mut instructions = vec![false; lines.len()];
+    let mut variables = Vec::new();
+    let mut logical: Option<(usize, usize, String)> = None;
+    let mut stages = vec![0; lines.len()];
+    let mut parents = vec![None];
+    let mut aliases = std::collections::HashMap::<String, usize>::new();
+    let mut stage = 0;
     let mut pending: Option<(usize, ParseOutcome)> = None;
     let mut continued = false;
     let mut escape = '\\';
     let mut heredocs: VecDeque<(String, bool)> = VecDeque::new();
     for (idx, raw) in lines.iter().enumerate() {
         let trimmed = raw.trim();
+        stages[idx] = stage;
         if !continued && let Some((delimiter, strip_tabs)) = heredocs.front() {
             let candidate = if *strip_tabs {
                 raw.trim_start_matches('\t')
@@ -355,11 +415,87 @@ fn dockerfile_annotations(content: &str) -> Vec<ParseOutcome> {
             continue;
         }
         let was_continued = continued;
+        instructions[idx] = !was_continued && !trimmed.is_empty();
+        let words: Vec<_> = trimmed.split_whitespace().collect();
+        if instructions[idx]
+            && words
+                .first()
+                .is_some_and(|word| word.eq_ignore_ascii_case("FROM"))
+        {
+            stage += 1;
+            stages[idx] = stage;
+            parents.push(None);
+        }
         // Empty lines do not end an instruction continued from a prior line.
         if !trimmed.is_empty() {
             continued = trimmed.ends_with(escape);
         }
-        for captures in HEREDOC.captures_iter(raw) {
+        let relevant = words.first().is_some_and(|word| {
+            word.eq_ignore_ascii_case("ARG")
+                || word.eq_ignore_ascii_case("ENV")
+                || word.eq_ignore_ascii_case("FROM")
+        });
+        let fragment = if continued {
+            raw.trim_end().strip_suffix(escape).unwrap_or(raw)
+        } else {
+            raw
+        };
+        if instructions[idx] && relevant {
+            logical = Some((idx, stage, fragment.to_string()));
+        } else if was_continued && let Some((_, _, text)) = &mut logical {
+            text.push_str(fragment);
+        }
+        if !continued && let Some((line, scope, text)) = logical.take() {
+            let tokens = instruction_words(&text, escape);
+            let instruction = tokens.first().map(String::as_str).unwrap_or("");
+            if instruction.eq_ignore_ascii_case("FROM") {
+                let base = tokens.iter().skip(1).find(|word| !word.starts_with("--"));
+                parents[scope] = base.and_then(|base| {
+                    aliases
+                        .get(&base.to_ascii_lowercase())
+                        .copied()
+                        .or_else(|| {
+                            base.parse::<usize>()
+                                .ok()
+                                .and_then(|n| n.checked_add(1))
+                                .filter(|parent| *parent < scope)
+                        })
+                });
+                if let Some(alias) = tokens
+                    .windows(2)
+                    .find(|pair| pair[0].eq_ignore_ascii_case("AS"))
+                {
+                    aliases.insert(alias[1].to_ascii_lowercase(), scope);
+                }
+            } else {
+                let is_arg = instruction.eq_ignore_ascii_case("ARG");
+                let assignments = &tokens[1..];
+                let old_env = !is_arg
+                    && assignments
+                        .first()
+                        .is_some_and(|token| !token.contains('='));
+                for (position, token) in assignments.iter().enumerate() {
+                    if (is_arg || old_env) && position != 0 {
+                        break;
+                    }
+                    let name = token.split('=').next().unwrap_or("");
+                    if crate::annotation::valid_variable(name) {
+                        variables.push(DockerVariable {
+                            line,
+                            stage: scope,
+                            name: name.to_string(),
+                            import: is_arg && assignments.len() == 1 && !token.contains('='),
+                        });
+                    }
+                }
+            }
+        }
+        for captures in HEREDOC.captures_iter(raw).filter(|_| {
+            was_continued
+                || words.first().is_some_and(|word| {
+                    word.eq_ignore_ascii_case("RUN") || word.eq_ignore_ascii_case("COPY")
+                })
+        }) {
             let delimiter = captures
                 .get(2)
                 .or_else(|| captures.get(3))
@@ -368,11 +504,23 @@ fn dockerfile_annotations(content: &str) -> Vec<ParseOutcome> {
             heredocs.push_back((delimiter.as_str().to_string(), &captures[1] == "-"));
         }
         if let Some((comment_idx, outcome)) = pending.take() {
-            if !was_continued && !continued && literal_version_assignment(trimmed) {
+            if !was_continued
+                && !continued
+                && (match &outcome {
+                    ParseOutcome::Checksum(_) => {
+                        crate::updater::annotated::checksum::assignment(raw).is_some()
+                    }
+                    _ => literal_version_assignment(trimmed),
+                })
+            {
                 outcomes[idx] = match outcome {
                     ParseOutcome::Found(mut annotation) => {
                         annotation.comment_start = raw.len();
                         ParseOutcome::Found(annotation)
+                    }
+                    ParseOutcome::Checksum(mut annotation) => {
+                        annotation.comment_start = raw.len();
+                        ParseOutcome::Checksum(annotation)
                     }
                     other => other,
                 };
@@ -393,7 +541,19 @@ fn dockerfile_annotations(content: &str) -> Vec<ParseOutcome> {
             "Dockerfile annotation must immediately precede a single-line ARG or ENV version assignment".into(),
         );
     }
-    outcomes
+    for (raw, outcome) in lines.iter().zip(&mut outcomes) {
+        if crate::annotation::has_checksum_marker(raw)
+            && let ParseOutcome::Malformed(reason) = outcome
+        {
+            *reason = format!("checksum annotation: {reason}");
+        }
+    }
+    DockerfileAnalysis {
+        annotations: outcomes,
+        variables,
+        stages,
+        parents,
+    }
 }
 
 fn literal_version_assignment(line: &str) -> bool {

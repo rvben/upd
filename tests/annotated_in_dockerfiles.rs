@@ -217,3 +217,41 @@ fn dockerfile_heredoc_delimiters_keep_body_annotations_untouched() {
         );
     }
 }
+
+#[test]
+fn malformed_linked_checksum_blocks_release_pin_and_reports_reason() {
+    for annotation in [
+        "# upd: checksum MISE_VERSION asset=mise-{unknown}.tar.gz",
+        "# upd:  checksum MISE_VERSION asset=mise.tar.gz unknown=value",
+    ] {
+        let content = format!(
+            "FROM alpine:3.22\n# upd: github-releases jdx/mise\nARG MISE_VERSION=2025.12.9\n{annotation}\nARG MISE_CHECKSUM={}\n",
+            "a".repeat(64)
+        );
+        let dir = fixture("Dockerfile", &content);
+        std::fs::write(
+            dir.path().join(".updrc.toml"),
+            "[pin]\n\"jdx/mise\" = \"2026.9.1\"\n",
+        )
+        .unwrap();
+        let output = run(
+            &dir,
+            "Dockerfile",
+            &["--apply", "--lang", "github-releases"],
+        );
+        let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("Dockerfile")).unwrap(),
+            content
+        );
+        let file = &report["files"][0];
+        assert_eq!(
+            file["skipped"][0]["reason"], "checksum-invalid",
+            "{report:#}"
+        );
+        assert_eq!(file["skipped"][0]["package"], "jdx/mise");
+        assert!(file["updates"].as_array().unwrap().is_empty());
+        assert!(file["pinned"].as_array().unwrap().is_empty());
+        assert!(!file["warnings"].as_array().unwrap().is_empty());
+    }
+}

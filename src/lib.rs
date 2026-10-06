@@ -1,5 +1,6 @@
 pub mod align;
 pub mod annotation;
+pub mod annotation_tools;
 pub mod audit;
 pub mod cache;
 pub mod cli;

@@ -341,6 +341,11 @@ pub struct Cli {
 
 #[derive(Subcommand, Clone)]
 pub enum Command {
+    /// Validate annotations or generate linked version/checksum snippets
+    Annotations {
+        #[command(subcommand)]
+        command: AnnotationsCommand,
+    },
     /// Update dependencies (default when no command specified)
     Update {
         /// Paths to update
@@ -420,6 +425,42 @@ pub enum Command {
 
     /// Describe offline-safe CLI capabilities
     Capabilities,
+}
+
+#[derive(Subcommand, Clone)]
+pub enum AnnotationsCommand {
+    /// Check annotation syntax and checksum links offline (exit 2 on errors)
+    Validate {
+        /// Files or directories to check; defaults to the nearest git root
+        paths: Vec<PathBuf>,
+    },
+    /// Print linked annotations from a GitHub release asset URL; never writes files
+    Init {
+        /// HTTPS github.com/<owner>/<repo>/releases/download/<tag>/<asset> URL
+        asset_url: String,
+        /// The asset's published SHA-256 (64 hexadecimal digits)
+        #[arg(
+            long,
+            required_unless_present = "resolve_checksum",
+            conflicts_with = "resolve_checksum"
+        )]
+        checksum: Option<String>,
+        /// Resolve the published SHA-256 online for this exact release asset
+        #[arg(long, conflicts_with = "checksum")]
+        resolve_checksum: bool,
+        /// Override the inferred asset filename template; must expand to the URL's asset
+        #[arg(long)]
+        asset_template: Option<String>,
+        /// Variable prefix; defaults to the repository name in uppercase
+        #[arg(long)]
+        name: Option<String>,
+        /// Syntax for the generated snippet
+        #[arg(long, value_enum, default_value = "shell")]
+        syntax: crate::annotation_tools::SnippetSyntax,
+        /// Published checksum manifest filename or template, when needed
+        #[arg(long)]
+        checksums: Option<String>,
+    },
 }
 
 #[derive(Subcommand, Clone)]
@@ -565,6 +606,9 @@ impl Cli {
     /// themselves; this method only surfaces what the user typed.
     pub fn get_paths(&self) -> Vec<PathBuf> {
         match &self.command {
+            Some(Command::Annotations {
+                command: AnnotationsCommand::Validate { paths },
+            }) if !paths.is_empty() => paths.clone(),
             Some(Command::Update { paths }) if !paths.is_empty() => paths.clone(),
             Some(Command::LockRefresh { paths }) if !paths.is_empty() => paths.clone(),
             Some(Command::Align { paths }) if !paths.is_empty() => paths.clone(),

@@ -106,9 +106,44 @@ impl AnnotationSource {
 pub struct Annotation {
     pub source: AnnotationSource,
     pub package: String,
-    /// Byte offset of the first comment introducer on the line. Only bytes
+    /// Optional file-local identity for links on lines without a simple key.
+    pub id: Option<String>,
+    /// Byte offset of the first unquoted comment introducer on the line. Only bytes
     /// before this are searched for a version token.
     pub comment_start: usize,
+}
+
+/// A SHA-256 value linked to an annotated version's key or explicit identity.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChecksumAnnotation {
+    pub variable: String,
+    pub asset: String,
+    pub checksums: Option<String>,
+    pub comment_start: usize,
+}
+
+/// Recognize checksum intent even when a malformed directive cannot be parsed.
+pub fn has_checksum_marker(raw: &str) -> bool {
+    static MARKER: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r"(?i)(?:#|//)\s*upd:\s*checksum\b").unwrap());
+    MARKER.is_match(raw)
+}
+
+pub fn valid_variable(name: &str) -> bool {
+    !name.is_empty()
+        && !name.as_bytes()[0].is_ascii_digit()
+        && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
+}
+
+/// Templates are literal release asset names with only these two substitutions.
+pub fn expand_asset_template(template: &str, version: &str, tag: &str) -> anyhow::Result<String> {
+    let expanded = template.replace("{version}", version).replace("{tag}", tag);
+    if expanded.is_empty() || expanded.contains(['{', '}', '/', '\\']) {
+        anyhow::bail!(
+            "invalid asset template: {template}; use only {{version}} and {{tag}} in an asset filename"
+        );
+    }
+    Ok(expanded)
 }
 
 /// What a line yielded.
@@ -117,6 +152,7 @@ pub enum ParseOutcome {
     /// No marker present. Not a diagnostic: most lines look like this.
     None,
     Found(Annotation),
+    Checksum(ChecksumAnnotation),
     /// Reason, surfaced as a warning. The line is left untouched.
     Malformed(String),
 }
@@ -150,8 +186,71 @@ pub fn parse_line(line: &str) -> ParseOutcome {
 }
 
 fn first_comment_introducer(bytes: &[u8]) -> Option<usize> {
-    (0..bytes.len())
-        .find(|&i| bytes[i] == b'#' || (bytes[i] == b'/' && bytes.get(i + 1) == Some(&b'/')))
+    let mut quote = None;
+    let mut escaped = false;
+    for (i, &byte) in bytes.iter().enumerate() {
+        if escaped {
+            escaped = false;
+        } else if byte == b'\\' {
+            escaped = true;
+        } else if Some(byte) == quote {
+            quote = None;
+        } else if quote.is_none() {
+            if matches!(byte, b'\'' | b'"' | b'`') {
+                quote = Some(byte);
+            } else if byte == b'#' || (byte == b'/' && bytes.get(i + 1) == Some(&b'/')) {
+                return Some(i);
+            }
+        }
+    }
+    None
+}
+
+/// Inline directives or a standalone directive immediately before its value.
+/// Physical line indices and exact code boundaries are shared by both writers.
+pub fn parse_annotations(content: &str) -> Vec<ParseOutcome> {
+    let lines: Vec<_> = content.lines().collect();
+    let mut outcomes: Vec<_> = lines.iter().map(|line| parse_line(line)).collect();
+    for idx in 0..lines.len() {
+        if !is_comment_line(lines[idx])
+            || !matches!(
+                outcomes[idx],
+                ParseOutcome::Found(_) | ParseOutcome::Checksum(_)
+            )
+        {
+            continue;
+        }
+        let next = idx + 1;
+        if next < lines.len()
+            && !lines[next].trim().is_empty()
+            && !is_comment_line(lines[next])
+            && matches!(outcomes[next], ParseOutcome::None)
+        {
+            let mut outcome = std::mem::replace(&mut outcomes[idx], ParseOutcome::None);
+            let end = first_comment_introducer(lines[next].as_bytes()).unwrap_or(lines[next].len());
+            match &mut outcome {
+                ParseOutcome::Found(annotation) => annotation.comment_start = end,
+                ParseOutcome::Checksum(annotation) => annotation.comment_start = end,
+                _ => unreachable!(),
+            }
+            outcomes[next] = outcome;
+        } else {
+            let kind = if matches!(outcomes[idx], ParseOutcome::Checksum(_)) {
+                "checksum "
+            } else {
+                ""
+            };
+            outcomes[idx] = ParseOutcome::Malformed(format!(
+                "{kind}annotation must immediately precede an unannotated value line"
+            ));
+        }
+    }
+    outcomes
+}
+
+fn is_comment_line(raw: &str) -> bool {
+    let trimmed = raw.trim_start();
+    trimmed.starts_with('#') || trimmed.starts_with("//")
 }
 
 /// Byte offsets just past every marker at or after `comment_start`. Comparison
@@ -193,12 +292,69 @@ fn follows_comment_introducer(bytes: &[u8], i: usize) -> bool {
 
 fn parse_upd_body(body: &str, comment_start: usize) -> ParseOutcome {
     let tokens: Vec<&str> = body.split_whitespace().collect();
+    if tokens
+        .first()
+        .is_some_and(|token| token.eq_ignore_ascii_case("checksum"))
+    {
+        return parse_checksum_body(&tokens, comment_start);
+    }
     match tokens.as_slice() {
         [source, package] => resolve(source, package, comment_start),
+        [source, package, option] if option.starts_with("id=") => {
+            let id = &option[3..];
+            if !valid_variable(id) {
+                return ParseOutcome::Malformed(format!("invalid annotation id '{id}'"));
+            }
+            match resolve(source, package, comment_start) {
+                ParseOutcome::Found(mut annotation) => {
+                    annotation.id = Some(id.to_string());
+                    ParseOutcome::Found(annotation)
+                }
+                outcome => outcome,
+            }
+        }
         _ => ParseOutcome::Malformed(format!(
-            "malformed annotation: expected `upd: <source> <package>`, found {} token(s)",
+            "malformed annotation: expected `upd: <source> <package> [id=<name>]`, found {} token(s)",
             tokens.len()
         )),
+    }
+}
+
+fn parse_checksum_body(tokens: &[&str], comment_start: usize) -> ParseOutcome {
+    let parsed = (|| -> anyhow::Result<ChecksumAnnotation> {
+        let variable = *tokens
+            .get(1)
+            .ok_or_else(|| anyhow::anyhow!("missing version variable"))?;
+        anyhow::ensure!(
+            valid_variable(variable),
+            "invalid version variable {variable}"
+        );
+        let mut asset = None;
+        let mut checksums = None;
+        for token in &tokens[2..] {
+            match token.split_once('=') {
+                Some(("asset", value)) if asset.is_none() => asset = Some(value.to_string()),
+                Some(("checksums", value)) if checksums.is_none() => {
+                    checksums = Some(value.to_string())
+                }
+                _ => anyhow::bail!("unknown or duplicate checksum option {token}"),
+            }
+        }
+        let asset = asset.ok_or_else(|| anyhow::anyhow!("missing asset=<filename>"))?;
+        expand_asset_template(&asset, "1.2.3", "v1.2.3")?;
+        if let Some(template) = &checksums {
+            expand_asset_template(template, "1.2.3", "v1.2.3")?;
+        }
+        Ok(ChecksumAnnotation {
+            variable: variable.to_string(),
+            asset,
+            checksums,
+            comment_start,
+        })
+    })();
+    match parsed {
+        Ok(annotation) => ParseOutcome::Checksum(annotation),
+        Err(error) => ParseOutcome::Malformed(format!("malformed checksum annotation: {error}")),
     }
 }
 
@@ -243,6 +399,7 @@ fn resolve(source: &str, package: &str, comment_start: usize) -> ParseOutcome {
         return ParseOutcome::Found(Annotation {
             source,
             package: package.to_string(),
+            id: None,
             comment_start,
         });
     }
@@ -369,6 +526,107 @@ pub fn is_prerelease_token(token: &str, lang: Lang) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn explicit_ids_are_optional_strict_and_preserve_case() {
+        let annotation = found("value = '1.2.3' # upd: github-releases acme/tool id=Tool");
+        assert_eq!(annotation.id.as_deref(), Some("Tool"));
+        assert_eq!(
+            found("v = '1.2.3' # upd: github-releases acme/tool").id,
+            None
+        );
+        for option in ["id=", "id=1bad", "id=a/b", "id=tool id=other", "other=x"] {
+            assert!(
+                matches!(
+                    parse_line(&format!(
+                        "v='1.2.3' # upd: github-releases acme/tool {option}"
+                    )),
+                    ParseOutcome::Malformed(_)
+                ),
+                "{option}"
+            );
+        }
+    }
+
+    #[test]
+    fn standalone_directives_share_value_line_indices_and_comment_boundaries() {
+        let content = "# upd: github-releases acme/tool id=tool\r\nversion = '1.2.3' # keep this\r\n// upd: checksum tool asset=tool-{tag}.zip\r\nsha = 'abcdef' // retain";
+        let parsed = parse_annotations(content);
+        assert!(matches!(parsed[0], ParseOutcome::None));
+        let ParseOutcome::Found(version) = &parsed[1] else {
+            panic!("{parsed:?}")
+        };
+        assert_eq!(version.id.as_deref(), Some("tool"));
+        assert_eq!(version.comment_start, "version = '1.2.3' ".len());
+        assert!(matches!(parsed[2], ParseOutcome::None));
+        let ParseOutcome::Checksum(checksum) = &parsed[3] else {
+            panic!("{parsed:?}")
+        };
+        assert_eq!(checksum.comment_start, "sha = 'abcdef' ".len());
+    }
+
+    #[test]
+    fn standalone_directives_do_not_jump_over_blanks_comments_or_other_annotations() {
+        for next in [
+            "",
+            "# explanation",
+            "// explanation",
+            "x='1.2.3' # upd: github-releases acme/tool",
+        ] {
+            let parsed = parse_annotations(&format!(
+                "# upd: checksum tool asset=tool.zip\n{next}\nx='1.2.3'\n"
+            ));
+            assert!(
+                matches!(&parsed[0], ParseOutcome::Malformed(reason) if reason.contains("checksum")),
+                "{next}: {parsed:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn quoted_urls_and_marker_text_do_not_start_comments() {
+        let line = r#"fetch("https://example.com/tool-1.2.3.zip#download"); // upd: github-releases acme/tool id=tool"#;
+        assert_eq!(found(line).comment_start, line.find("// upd").unwrap());
+        for line in [
+            r##"message = "# upd: checksum tool asset=x""##,
+            r#"message = '// upd: github-releases acme/tool'"#,
+            r#"const message = `# upd: github-releases acme/tool`;"#,
+        ] {
+            assert_eq!(parse_line(line), ParseOutcome::None, "{line}");
+        }
+    }
+
+    #[test]
+    fn checksum_directives_validate_relationships_options_and_templates() {
+        let ParseOutcome::Checksum(annotation) = parse_line(
+            "# upd: checksum MISE_VERSION asset=mise-{tag}-linux-x64.tar.gz checksums=SHASUMS256.txt",
+        ) else {
+            panic!("expected checksum");
+        };
+        assert_eq!(annotation.variable, "MISE_VERSION");
+        assert_eq!(annotation.checksums.as_deref(), Some("SHASUMS256.txt"));
+        for directive in [
+            "# upd: checksum",
+            "# upd: checksum 1BAD asset=x",
+            "# upd: checksum VERSION",
+            "# upd: checksum VERSION asset=",
+            "# upd: checksum VERSION asset=x asset=y",
+            "# upd: checksum VERSION asset=x unknown=y",
+            "# upd: checksum VERSION asset=x checksums=y checksums=z",
+            "# upd: checksum VERSION asset=x-{unknown}",
+            "# upd: checksum VERSION asset=../x",
+            "# upd: checksum VERSION asset=x checksums=https://example.com/sums",
+        ] {
+            assert!(
+                matches!(parse_line(directive), ParseOutcome::Malformed(_)),
+                "{directive}"
+            );
+        }
+        assert_eq!(
+            expand_asset_template("tool-{tag}-{version}.zip", "1.2.3", "v1.2.3").unwrap(),
+            "tool-v1.2.3-1.2.3.zip"
+        );
+    }
 
     /// `ALL` is what every question about annotations in general is answered
     /// from, so a source missing from it is a silent under-answer rather than a

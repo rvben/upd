@@ -31,6 +31,12 @@ pub use pypi::{MultiPyPiRegistry, PyPiCredentials, PyPiRegistry};
 pub use rubygems::RubyGemsRegistry;
 pub use terraform::TerraformRegistry;
 
+/// Metadata for one existing, uniquely named release asset.
+#[derive(Debug, Clone)]
+pub struct ReleaseAssetMetadata {
+    pub sha256: Option<String>,
+}
+
 // The constraint grammars, shared with the updaters that have to decide whether
 // a release a manifest already admits is worth rewriting the manifest for.
 pub(crate) use nuget::matches_nuget_range;
@@ -414,6 +420,27 @@ pub trait Registry: Send + Sync {
         _asset_name: &str,
     ) -> Result<Vec<u8>> {
         anyhow::bail!("registry does not provide release asset downloads")
+    }
+
+    /// Verify an exact asset exists and return its optional SHA-256 metadata.
+    /// A release manifest entry alone is insufficient proof the archive exists.
+    async fn release_asset_metadata(
+        &self,
+        _package: &str,
+        _tag: &str,
+        _asset: &str,
+    ) -> Result<ReleaseAssetMetadata> {
+        anyhow::bail!("registry does not provide release asset metadata")
+    }
+
+    /// SHA-256 reported by the registry for an exact release asset.
+    async fn release_asset_digest(
+        &self,
+        _package: &str,
+        _tag: &str,
+        _asset: &str,
+    ) -> Result<String> {
+        anyhow::bail!("registry does not provide release asset digests")
     }
 
     /// SHA-256 of an official Gradle distribution; never inferred from a version.

@@ -279,6 +279,201 @@ not cross between suffixes, precision levels, or `v`-prefixed and unprefixed
 tags. Updating `tag@sha256:digest` safely also requires resolving and verifying
 the replacement manifest digest, so digest pins are blocked in this release.
 
+## Linked release checksums
+
+Versions annotated with `github-releases` can have linked SHA-256 values in
+every file scanned by the annotation updater: Makefiles, shell scripts, YAML,
+GitHub Actions workflows, Dockerfiles, and other explicitly selected text files.
+The link names the version's assignment key or explicit ID and the exact
+release asset. It does not guess relationships from a checksum's name or proximity.
+
+```sh
+MISE_VERSION=2025.12.9 # upd: github-releases jdx/mise
+MISE_CHECKSUM=afe7e9f2ea8e1704e9cc41e4b020798b8c60e5924ab4a313ccbf201a062f54d0 # upd: checksum MISE_VERSION asset=mise-v{version}-linux-x64.tar.gz
+```
+
+Outside Dockerfiles, inline comments (`#` or `//`) and standalone comments
+immediately before the value line both work. A blank line, another comment,
+or another annotation between the directive and its value is refused. The
+checksum line must contain exactly one complete, 64-digit hexadecimal SHA-256
+token before its comment. Quotes, punctuation, `sha256:` prefixes, indentation,
+line endings, and a missing final newline are preserved. Hashes in comments,
+multiple hash tokens, and substrings of longer values are never selected.
+
+Simple assignment keys such as `MISE_VERSION=...`, `MISE_VERSION ?= ...`,
+`MISE_VERSION = ...`, `MISE_VERSION: ...`, and `const MISE_VERSION = ...` can be
+referenced directly. This is text matching rather than language evaluation:
+an inferred key must be unique in the file. For repeated YAML/TOML keys or a
+version on another kind of line, give the version annotation a unique,
+case-sensitive `id=<name>` and reference that ID:
+
+```toml
+[mise]
+version = "2025.12.9" # upd: github-releases jdx/mise id=mise
+sha256 = "afe7e9f2ea8e1704e9cc41e4b020798b8c60e5924ab4a313ccbf201a062f54d0" # upd: checksum mise asset=mise-{tag}-linux-x64.tar.gz
+```
+
+IDs take precedence over inferred keys. An ID starts with an ASCII letter or
+underscore and contains only ASCII letters, digits, and underscores. Generic
+links are file-local and independent of declaration order; duplicate IDs and
+ambiguous keys block their groups. Existing annotation discovery rules still
+apply: pass a custom text file explicitly or add an `include` glob for directory
+walks. Recognized manifests retain their own parser; adding a checksum does not
+opt them into annotation support. GitHub workflow annotations on native `uses:`
+references remain refused; tool versions under `env:` or `with:` can be linked.
+
+Dockerfiles keep their instruction and stage-scope rules. Use separate comments
+immediately above literal, single-line `ARG` or `ENV` assignments:
+
+```dockerfile
+# upd: github-releases jdx/mise
+ARG MISE_VERSION=2025.12.9
+
+# upd: checksum MISE_VERSION asset=mise-v{version}-linux-x64.tar.gz
+ARG MISE_CHECKSUM=afe7e9f2ea8e1704e9cc41e4b020798b8c60e5924ab4a313ccbf201a062f54d0
+
+RUN curl -fsSL "https://github.com/jdx/mise/releases/download/v${MISE_VERSION}/mise-v${MISE_VERSION}-linux-x64.tar.gz" -o mise.tar.gz \
+    && echo "${MISE_CHECKSUM}  mise.tar.gz" | sha256sum -c -
+```
+
+Run `upd <file>` to preview, or `upd <file> --apply` to write. Interactive
+approval selects the version together with all its linked checksum edits; a
+file changed since preview must be rescanned before those edits can be applied.
+Batch apply also checks the file again after release lookups and refuses to
+overwrite changes made while those requests were in flight.
+
+In a Dockerfile, a checksum reference must name an annotated
+`github-releases` version visible before the checksum assignment in its Docker
+stage. Names may be reused in independent stages. Global `ARG` defaults require
+consumption with `ARG NAME` inside a stage; child stages inherit variables from
+the stage named by `FROM`, following [Docker's scope rules](https://docs.docker.com/reference/dockerfile/#scope).
+Multiple declarations of a linked variable within one stage are ambiguous and
+blocked. Quoted values, multiline instructions, and heredoc contents are handled
+as instruction arguments rather than separate variable declarations.
+An explicit ID in a Dockerfile also follows the linked variable's stage scope.
+Other registries and checksum algorithms are not supported yet.
+
+- `{version}` expands to the value written in the version assignment, preserving
+  its leading `v` if present. `{tag}` expands to the actual release tag.
+  For an unprefixed `2025.12.9` assignment and tag `v2025.12.9`, use
+  `mise-v{version}-linux-x64.tar.gz` or `mise-{tag}-linux-x64.tar.gz`.
+- Templates are release asset filenames. Unknown placeholders, paths, URLs,
+  unknown options, and duplicate options are refused. No commands or shell
+  expressions are evaluated.
+- By default, the checksum comes from the exact asset's GitHub `sha256:` digest.
+  If the release does not expose that digest, the group is blocked with a hint
+  to specify a checksum manifest. The updater does not download the binary to
+  invent a replacement checksum.
+- Add `checksums=SHASUMS256.txt` to the annotation to select a release manifest
+  explicitly. GNU (`hash  filename`, including binary `*filename`) and BSD
+  (`SHA256 (filename) = hash`) formats are supported. Leading `./` is accepted;
+  the full asset filename must match exactly once. A bare hash is accepted only
+  when the selected sidecar is named `<asset>.sha256`. Missing entries, duplicate
+  entries, malformed hashes, and failed downloads block the whole group. The
+  referenced archive must also exist as a unique, uploaded release asset. If
+  GitHub provides its SHA-256 digest, the manifest must agree with it.
+  The checksum manifest itself must be uploaded, and its downloaded bytes must
+  match its own GitHub SHA-256 digest when available. Concurrent files share
+  one in-memory metadata and manifest snapshot for the run. Failed downloads
+  are not cached, so a later lookup can retry.
+- Multiple checksum annotations may reference the same version key or ID, for
+  example one per architecture. Every checksum is resolved before any member of
+  that group changes. Unrelated dependency groups can still update.
+- Version pins, ignore rules, package selection, cooldown, prerelease tracks,
+  and bump ceilings apply to the version and its checksums together.
+  `--lang annotated` and `--lang github-releases` select these groups;
+  `--lang docker` selects image references. A checksum-linked version must name
+  the complete release; use `--full-precision` when starting from a shortened pin.
+- An unchanged version with a different recorded checksum is reported as blocked;
+  its hash is never silently repaired. Checksum manifests and GitHub digests
+  provide integrity metadata; fetching them does not verify a publisher signature.
+
+JSON reports include `checksum_updates` with the version line, checksum line,
+asset, release tag, checksum source, and old/new SHA-256. Each entry's `change`
+is `changed` or `verified_unchanged`: the latter is a companion whose hash
+matches the new release. It stays in the report and the atomic approval plan,
+and text output labels it as verified unchanged. `change` describes the hash
+comparison; the existing optional `status` records a failed or rolled-back
+write. Blocked groups appear
+in `skipped` with `checksum-invalid`, `checksum-unavailable`, or
+`checksum-mismatch` reasons. A malformed directive whose intended relationship
+cannot be established, including an unknown version variable, conservatively
+blocks GitHub release version updates in that file until the annotation is fixed.
+
+## Annotation tools
+
+Validate syntax, version tokens, assignment/ID links, SHA-256 token shape, asset
+templates, and Docker stage visibility before running an update:
+
+```sh
+upd annotations validate Dockerfile versions.sh pins.toml
+upd annotations validate . --output json
+```
+
+Validation shares the update parser and checksum-link resolver. It uses normal
+file discovery, gitignore, and config `include`/`exclude` rules; an explicit file
+bypasses discovery exclusions. With no paths, it checks the nearest Git root.
+Update selection policies such as ignored packages and cooldowns do not hide
+structural errors. Recognized manifests that use only their native parser are
+reported as unsupported if they contain annotations. GitHub Actions `uses:`
+collisions and Docker's inline directives are refused as they are during updates.
+
+Exit status is 0 for valid input and 2 for validation or I/O errors. Text mode
+prints file-and-line diagnostics on stderr; JSON includes `valid`, `files` with
+`diagnostics` (`lines`, `message`), and a `summary` of files, versions, checksums,
+and errors. This checks local structure only: it does not establish that a
+release asset exists or that a recorded checksum matches published metadata.
+
+Generate a snippet from an exact GitHub release asset URL and its published SHA:
+
+```sh
+upd annotations init \
+  https://github.com/jdx/mise/releases/download/v2025.12.9/mise-v2025.12.9-linux-x64.tar.gz \
+  --checksum afe7e9f2ea8e1704e9cc41e4b020798b8c60e5924ab4a313ccbf201a062f54d0 \
+  --syntax docker --output text
+```
+
+The default syntax is `shell`; `docker`, `toml`, `yaml`, and `javascript` are
+also supported. The variable prefix defaults to the repository name in
+uppercase; override it with `--name MISE`. Add `--checksums SHASUMS256.txt` when
+the publisher provides a manifest. The generator replaces tag/version tokens
+in the asset name with `{tag}`/`{version}` and preserves a fixed asset name.
+Inspect that template before using it with a publisher whose naming varies
+between releases. Override inference with `--asset-template 'mise-{tag}-linux-x64.tar.gz'`.
+An override can be a fixed filename or use `{version}` and `{tag}`, but must
+expand exactly to the URL's asset name. Paths, URLs, unknown placeholders,
+whitespace, and mismatching filenames are refused before network access.
+Every generated snippet passes the same structural validator.
+
+For online generation, replace `--checksum <sha>` with `--resolve-checksum`:
+
+```sh
+upd annotations init \
+  https://github.com/jdx/mise/releases/download/v2025.12.9/mise-v2025.12.9-linux-x64.tar.gz \
+  --resolve-checksum --asset-template 'mise-{tag}-linux-x64.tar.gz' \
+  --syntax docker --output text
+```
+
+Exactly one checksum mode is required. Online mode queries only the tag and
+asset named in the URL, uses GitHub's published SHA-256, and never downloads
+the binary or looks up the latest release. When a release has no GitHub digest,
+explicitly select its published manifest with `--checksums <filename-or-template>`.
+The manifest must be a different release asset from the binary being pinned.
+No manifest name is guessed, and an explicitly selected manifest must agree
+with any published archive digest. Archive presence, upload state, unique
+manifest entries, and the manifest's own digest (when published) are verified
+using the same resolver as updates. A failed resolution prints no snippet;
+it never falls back to an unverified hash. Online mode uses the existing GitHub
+authentication and TLS settings.
+
+Both commands never write files, even with `--apply`. Init does not load
+configuration. `--checksum` stays offline and does not verify the supplied hash;
+validation remains offline. JSON generation output includes `checksum_source`:
+`supplied`, `github-asset-digest`, or the selected manifest's expanded filename.
+Piped output defaults to JSON; select `--output text` for a pasteable snippet.
+Snippets belong in annotation-capable files; generating TOML does not enable
+annotations inside native manifests such as `Cargo.toml`.
+
 ## Terraform / OpenTofu
 
 - `.tf` files (HCL format)
@@ -440,14 +635,14 @@ it, backend prefix included: `ignore = ["cargo:cargo-zigbuild"]`.
 ## Annotated files
 
 A version pinned in a file `upd` does not otherwise understand can declare its
-own source with a trailing comment:
+own source with an inline comment or a comment immediately before its value:
 
 ```makefile
 BAO_VERSION ?= 2.6.1  # upd: pypi openbao-cli
 NODE_VERSION := 22.11.0  # upd: npm node
 ```
 
-- Syntax: `upd: <source> <package>` in a trailing `#` or `//` comment
+- Syntax: `upd: <source> <package> [id=<name>]` in a `#` or `//` comment
 - Sources: `pypi`, `npm`, `crates`, `go`, `rubygems`, `nuget`, `github-releases`
 - Otherwise-unrecognized files scanned by name: `Makefile`, `makefile`,
   `GNUmakefile`, `*.mk`, `justfile`, `Justfile`, `*.sh`, `*.bash`, `*.yml`,
@@ -460,11 +655,14 @@ NODE_VERSION := 22.11.0  # upd: npm node
   Terraform), and `exclude` takes precedence when both match
 - Dockerfiles and GitHub Actions workflows keep their own updaters and are
   scanned for annotations as well. Dockerfiles require preceding comments as
-  described above; workflow `with:` inputs use trailing comments. See
+  described above; workflow `with:` inputs accept inline or preceding comments. See
   [GitHub Actions](github-actions.md#annotated-versions-in-a-workflow)
 - The version on the line is found and rewritten in place, keeping a leading
   `v` and the line's own precision (`v2.60` becomes `v2.65`, not `v2.65.4`)
 - One package name may not appear under two different sources in the same file
+- Annotated GitHub releases can link SHA-256 values with
+  `upd: checksum <key-or-id> asset=<filename>`; see
+  [linked release checksums](#linked-release-checksums)
 - `ignore` and `pin` in `.updrc.toml` reach annotated packages by name. Package
   matching is PEP 503-normalized, so `"Oven-SH/bun"` and `"oven-sh/bun"` are
   one key, as are `"foo-bar"` and `"foo_bar"`

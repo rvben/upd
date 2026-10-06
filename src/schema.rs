@@ -197,6 +197,44 @@ fn build_schema() -> Value {
         ],
         "commands": [
             {
+                "name": "annotations validate",
+                "description": "Validate annotation syntax and checksum relationships offline. Uses update discovery rules and include/exclude configuration; checks structural validity, not published release metadata. Exit 2 on validation or I/O errors",
+                "effects": "read_only", "mutating": false, "cardinality": "single",
+                "args": [{"name": "paths", "type": "path[]", "required": false}],
+                "output_fields": [
+                    {"name": "command", "type": "string"},
+                    {"name": "valid", "type": "boolean"},
+                    {"name": "files", "type": "array", "items": {"type": "object"}, "description": "File paths, version/checksum annotation counts and diagnostics with one-based lines and messages"},
+                    {"name": "summary", "type": "object", "description": "files, versions, checksums and errors totals"}
+                ],
+                "example": {"args": ["annotations", "validate", "Dockerfile"]}
+            },
+            {
+                "name": "annotations init",
+                "description": "Print a linked version/checksum snippet from an exact GitHub release asset URL. Provide exactly one of --checksum (offline, supplied SHA-256) or --resolve-checksum (online, published digest or explicit --checksums manifest). Never writes files. Use --output text for a directly pasteable snippet",
+                "effects": "read_only", "mutating": false, "cardinality": "single",
+                "args": [
+                    {"name": "asset_url", "type": "string", "required": true},
+                    {"name": "checksum", "type": "string", "required": false, "description": "Published SHA-256 supplied offline; required unless resolve-checksum is set, mutually exclusive with it"},
+                    {"name": "resolve-checksum", "type": "boolean", "default": false, "description": "Opt in to online checksum resolution for the exact URL tag and asset; mutually exclusive with checksum"},
+                    {"name": "asset-template", "type": "string", "required": false, "description": "Override filename inference; only {version} and {tag}, and must expand exactly to the URL asset"},
+                    {"name": "name", "type": "string", "required": false},
+                    {"name": "syntax", "type": "string", "enum": ["shell", "docker", "toml", "yaml", "javascript"], "default": "shell"},
+                    {"name": "checksums", "type": "string", "required": false}
+                ],
+                "output_fields": [
+                    {"name": "command", "type": "string"},
+                    {"name": "package", "type": "string"},
+                    {"name": "version", "type": "string"},
+                    {"name": "tag", "type": "string"},
+                    {"name": "asset", "type": "string"},
+                    {"name": "asset_template", "type": "string"},
+                    {"name": "checksum", "type": "string"},
+                    {"name": "checksum_source", "type": "string", "description": "supplied, github-asset-digest, or the explicitly selected manifest filename"},
+                    {"name": "snippet", "type": "string"}
+                ]
+            },
+            {
                 "name": "lock-refresh",
                 "description": "Refresh uv, npm, and Cargo lockfiles within existing manifest constraints. Without --apply, list candidates without running package managers",
                 "effects": "non_idempotent",

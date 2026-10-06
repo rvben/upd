@@ -91,6 +91,8 @@ pub struct UpdateFileReport {
     pub pinned: Vec<PinnedEntry>,
     pub ignored: Vec<IgnoredEntry>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub checksum_updates: Vec<ChecksumEntry>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub held_back: Vec<HeldBackEntry>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub skipped_by_cooldown: Vec<SkippedByCooldownEntry>,
@@ -104,6 +106,23 @@ pub struct UpdateFileReport {
     pub normalized: Vec<NormalizedEntry>,
     pub errors: Vec<ErrorEntry>,
     pub warnings: Vec<String>,
+}
+
+/// A checksum edit belonging to one version update, with its release provenance.
+#[derive(Debug, Serialize)]
+pub struct ChecksumEntry {
+    /// Distinguishes an edit from an unchanged companion verified for the new release.
+    pub change: &'static str,
+    pub package: String,
+    pub version_line: usize,
+    pub line: usize,
+    pub asset: String,
+    pub tag: String,
+    pub source: String,
+    pub current: String,
+    pub latest: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub status: Option<&'static str>,
 }
 
 /// What a failed lockfile refresh under `--lock` made of the writes in the
@@ -145,6 +164,9 @@ impl UpdateFileReport {
         }
         for pinned in &mut self.pinned {
             pinned.status = Some(status.as_str());
+        }
+        for checksum in &mut self.checksum_updates {
+            checksum.status = Some(status.as_str());
         }
         for normalized in &mut self.normalized {
             normalized.status = Some(status.as_str());
@@ -677,6 +699,18 @@ pub fn build_update_file_report(
     classify: impl Fn(&str, &str) -> &'static str,
 ) -> UpdateFileReport {
     let source_of = |package: &str| result.entry_ecosystem.get(package).copied();
+    let source_at = |package: &str, line: Option<usize>| {
+        line.and_then(|line| result.annotation_sources.get(&line).copied())
+            .or_else(|| {
+                if !result.annotation_sources.is_empty()
+                    && matches!(file_type, FileType::Dockerfile | FileType::GithubActions)
+                {
+                    None
+                } else {
+                    source_of(package)
+                }
+            })
+    };
 
     let updates = result
         .updated
@@ -712,7 +746,7 @@ pub fn build_update_file_report(
                             .find(|s| s.lang() == c.lang)
                     })
                     .filter(|_| file_type == FileType::PreCommitConfig)
-                    .or_else(|| source_of(name))
+                    .or_else(|| source_at(name, *line))
                     .map(AnnotationSource::token),
                 reference_kind: sha.map(|_| "sha"),
                 current_commit: sha.map(|change| change.current_commit.clone()),
@@ -736,7 +770,7 @@ pub fn build_update_file_report(
                 .filter(|edit| edit.pinned)
                 .nth(index)
                 .and_then(|edit| edit.source)
-                .or_else(|| source_of(name))
+                .or_else(|| source_at(name, *line))
                 .map(AnnotationSource::token),
             status: None,
         })
@@ -749,7 +783,7 @@ pub fn build_update_file_report(
             package: name.clone(),
             current: current.clone(),
             line: *line,
-            source: source_of(name).map(AnnotationSource::token),
+            source: source_at(name, *line).map(AnnotationSource::token),
         })
         .collect();
 
@@ -897,6 +931,29 @@ pub fn build_update_file_report(
         normalized,
         errors,
         warnings: result.warnings.clone(),
+        checksum_updates: result
+            .checksum_updates
+            .iter()
+            .map(|edit| ChecksumEntry {
+                change: if edit
+                    .current_checksum
+                    .eq_ignore_ascii_case(&edit.latest_checksum)
+                {
+                    "verified_unchanged"
+                } else {
+                    "changed"
+                },
+                package: edit.package.clone(),
+                version_line: edit.version_line,
+                line: edit.line,
+                asset: edit.asset.clone(),
+                tag: edit.tag.clone(),
+                source: edit.source.clone(),
+                current: edit.current_checksum.clone(),
+                latest: edit.latest_checksum.clone(),
+                status: None,
+            })
+            .collect(),
     }
 }
 

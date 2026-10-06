@@ -329,7 +329,8 @@ to hold one, and the pin reports an error rather than a rewrite.
 
 ## Annotated Version Pins
 
-Files without a dependency-manifest format can carry a trailing annotation:
+Files without a dependency-manifest format can carry an inline annotation or
+one immediately above its value:
 
 ```yaml
 shinyhub_version: "0.11.16"  # upd: pypi shinyhub
@@ -363,6 +364,50 @@ annotations, and `--lang docker` selects image tags only. Place the comment
 immediately above a single-line `ARG` or `ENV` assignment. Docker treats inline
 `#` text as instruction arguments, so inline annotations are refused.
 Renovate comments such as `# renovate: datasource=pypi depName=uv` work too.
+
+Downloaded GitHub release binaries can keep their version and SHA-256 together
+in any file scanned for annotations:
+
+```sh
+MISE_VERSION=2025.12.9 # upd: github-releases jdx/mise
+MISE_CHECKSUM=afe7e9f2ea8e1704e9cc41e4b020798b8c60e5924ab4a313ccbf201a062f54d0 # upd: checksum MISE_VERSION asset=mise-v{version}-linux-x64.tar.gz
+```
+
+This works in Makefiles, shell scripts, YAML, GitHub workflows, and other
+explicitly selected text files. Add `id=<name>` to the version annotation when
+the version has no simple assignment key or the file repeats that key. The
+checksum references that ID. Comments may also immediately precede the value
+line; Dockerfiles require that form:
+
+```dockerfile
+# upd: github-releases jdx/mise
+ARG MISE_VERSION=2025.12.9
+
+# upd: checksum MISE_VERSION asset=mise-v{version}-linux-x64.tar.gz
+ARG MISE_CHECKSUM=afe7e9f2ea8e1704e9cc41e4b020798b8c60e5924ab4a313ccbf201a062f54d0
+```
+
+`upd` resolves the exact release asset's GitHub SHA-256 digest before updating
+both assignments. Add `checksums=SHASUMS256.txt` to explicitly use a release
+checksum manifest instead. If any linked checksum cannot be resolved, the
+entire version/checksum group stays unchanged. See
+[linked release checksums](docs/ecosystems.md#linked-release-checksums) for
+multiple architectures, templates, and diagnostics.
+
+Check annotation syntax and checksum links without accessing any registry:
+
+```sh
+upd annotations validate Dockerfile versions.sh
+```
+
+`upd annotations init <release-asset-url> --checksum <published-sha256>` prints
+a linked snippet. Choose `--syntax docker`, `shell`, `toml`, `yaml`, or
+`javascript`; use `--output text` for plain text when piping it. Replace
+`--checksum` with `--resolve-checksum` to fetch the published digest online,
+optionally selecting a manifest with `--checksums`. Use `--asset-template` to
+override filename inference; it must expand exactly to the URL asset. Neither
+command writes files. See
+[annotation tools](docs/ecosystems.md#annotation-tools) for examples.
 
 A GitHub Actions workflow keeps its Actions updater and is
 scanned for annotations as well, so a tool version passed to an action through a

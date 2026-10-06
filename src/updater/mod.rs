@@ -14,6 +14,10 @@ mod pyproject;
 mod requirements;
 mod terraform;
 
+pub use annotated::checksum::{
+    ChecksumUpdate, ReleaseChecksum, resolve_release_checksum, validate_checksum_plan,
+};
+pub use annotated::validate_annotations;
 pub use annotated::{AnnotatedUpdater, ParseWarnings, RegistrySet, selection_reaches_annotations};
 pub use cargo_toml::CargoTomlUpdater;
 pub use csproj::CsprojUpdater;
@@ -955,6 +959,8 @@ pub struct ParsedDependency {
 pub struct UpdateResult {
     /// Exact scalar edits retained for applying selected hook updates interactively.
     pub pre_commit_edits: Vec<PreCommitEdit>,
+    /// Linked release asset SHA-256 edits, resolved during the preview.
+    pub checksum_updates: Vec<ChecksumUpdate>,
     /// Per-occurrence sources for mixed-ecosystem cooldown reporting.
     pub held_back_sources: BTreeMap<usize, AnnotationSource>,
     pub cooldown_skip_sources: BTreeMap<usize, AnnotationSource>,
@@ -986,6 +992,9 @@ pub struct UpdateResult {
     /// Source of an entry that does not inherit its ecosystem from the file,
     /// keyed by package name. Populated only by `AnnotatedUpdater`.
     pub entry_ecosystem: HashMap<String, AnnotationSource>,
+    /// Per-file physical line sources distinguish annotated assignments from
+    /// native image/action references with the same package name.
+    pub annotation_sources: BTreeMap<usize, AnnotationSource>,
     /// Extra immutable-ref details for GitHub Actions updates. The matching
     /// entry also appears in `updated`, using semantic versions for bump
     /// classification and human-readable reporting.
@@ -1168,6 +1177,8 @@ impl UpdateResult {
                 .map(|(i, s)| (i + skip_offset, s)),
         );
         self.pre_commit_edits.extend(other.pre_commit_edits);
+        self.checksum_updates.extend(other.checksum_updates);
+        self.annotation_sources.extend(other.annotation_sources);
         let offset = self.updated.len();
         self.update_context.extend(
             other
@@ -1729,7 +1740,7 @@ pub trait OwnsLines: Send + Sync {
     /// An annotation outcome for each physical line, attributed to the line
     /// whose version would be rewritten. Formats may require preceding comments.
     fn annotations(&self, content: &str) -> Vec<crate::annotation::ParseOutcome> {
-        content.lines().map(crate::annotation::parse_line).collect()
+        crate::annotation::parse_annotations(content)
     }
 
     /// Whether this line carries a version this updater resolves itself.

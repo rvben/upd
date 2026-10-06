@@ -727,6 +727,7 @@ fn empty_floor_report(path: &Path) -> upd::output::UpdateFileReport {
         updates: Vec::new(),
         pinned: Vec::new(),
         ignored: Vec::new(),
+        checksum_updates: Vec::new(),
         held_back: Vec::new(),
         skipped_by_cooldown: Vec::new(),
         skipped: Vec::new(),
@@ -1692,6 +1693,14 @@ async fn run() -> Result<()> {
         colored::control::set_override(false);
     }
 
+    // Annotation inputs are validated before any optional registry construction.
+    if let Some(Command::Annotations { command }) = &cli.command {
+        let code = run_annotations(&cli, command).await?;
+        if code != 0 {
+            std::process::exit(code);
+        }
+        return Ok(());
+    }
     // Schema subcommand: works offline with no config or auth required.
     if matches!(cli.command, Some(Command::Schema)) {
         upd::schema::print_schema();
@@ -1703,7 +1712,7 @@ async fn run() -> Result<()> {
             "version": env!("CARGO_PKG_VERSION"),
             "clispec": "0.3",
             "output": ["text", "json", "sarif"],
-            "features": ["schema", "dry-run", "dependency updates", "lockfile maintenance", "security audit", "verified action SHA updates"]
+            "features": ["schema", "dry-run", "dependency updates", "lockfile maintenance", "security audit", "verified action SHA updates", "linked release checksums", "offline annotation validation", "annotation scaffolding"]
         });
         if effective_json_mode(&cli) {
             println!("{}", serde_json::to_string_pretty(&capabilities)?);
@@ -1816,6 +1825,7 @@ async fn run() -> Result<()> {
             // Already handled above before show_config check.
             unreachable!("Schema handled earlier");
         }
+        Some(Command::Annotations { .. }) => unreachable!("handled before registry setup"),
         Some(Command::Capabilities) => {
             unreachable!("Capabilities handled earlier");
         }
@@ -2069,6 +2079,100 @@ fn effective_json_mode(cli: &Cli) -> bool {
     }
 }
 
+async fn run_annotations(cli: &Cli, command: &upd::cli::AnnotationsCommand) -> Result<i32> {
+    run_annotations_with_github(cli, command, GitHubReleasesRegistry::new).await
+}
+
+async fn run_annotations_with_github(
+    cli: &Cli,
+    command: &upd::cli::AnnotationsCommand,
+    github_registry: impl FnOnce() -> GitHubReleasesRegistry,
+) -> Result<i32> {
+    use upd::annotation_tools::{ScaffoldRequest, ValidationReport};
+    use upd::cli::AnnotationsCommand;
+    let json = effective_json_mode(cli);
+    if cli.format == Some(upd::cli::OutputFormat::Sarif) {
+        anyhow::bail!("annotations supports text or JSON output; SARIF is supported by audit");
+    }
+    match command {
+        AnnotationsCommand::Init {
+            asset_url,
+            checksum,
+            resolve_checksum,
+            asset_template,
+            name,
+            syntax,
+            checksums,
+        } => {
+            let request = ScaffoldRequest::new(
+                asset_url,
+                name.as_deref(),
+                *syntax,
+                checksums.as_deref(),
+                asset_template.as_deref(),
+            )?;
+            let result = match (checksum.as_deref(), resolve_checksum) {
+                (Some(checksum), false) => request.with_checksum(checksum)?,
+                (None, true) => {
+                    init_tls(cli)?;
+                    request
+                        .resolve(&github_registry())
+                        .await
+                        .map_err(|error| anyhow::anyhow!("{error:#}"))?
+                }
+                _ => anyhow::bail!("provide exactly one of --checksum or --resolve-checksum"),
+            };
+            if json {
+                println!("{}", serde_json::to_string_pretty(&result)?);
+            } else {
+                print!("{}", result.snippet);
+            }
+            Ok(0)
+        }
+        AnnotationsCommand::Validate { .. } => {
+            let paths = resolve_scan_paths(cli).map_err(anyhow::Error::msg)?;
+            let config = resolve_root_config(cli, &paths)?;
+            let report = ValidationReport::scan(
+                &paths,
+                DiscoverOptions {
+                    no_ignore: cli.no_ignore,
+                    verbose: cli.verbose,
+                    include: &config.config.include,
+                    exclude: &config.config.exclude,
+                },
+            );
+            if json {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else {
+                for file in &report.files {
+                    for diagnostic in &file.validation.diagnostics {
+                        let lines = diagnostic
+                            .lines
+                            .iter()
+                            .map(ToString::to_string)
+                            .collect::<Vec<_>>()
+                            .join(",");
+                        let location = if lines.is_empty() {
+                            String::new()
+                        } else {
+                            format!(":{lines}")
+                        };
+                        eprintln!("{}{location}: {}", file.path, diagnostic.message);
+                    }
+                }
+                if !cli.quiet {
+                    let summary = &report.summary;
+                    println!(
+                        "Checked {} files: {} version annotations, {} checksum annotations, {} errors (offline).",
+                        summary.files, summary.versions, summary.checksums, summary.errors
+                    );
+                }
+            }
+            Ok(if report.valid { 0 } else { 2 })
+        }
+    }
+}
+
 fn with_ecosystem_config(cli: &Cli, config: &UpdConfig) -> Result<(Cli, bool)> {
     let selection = config
         .selected_ecosystems(&cli.langs, &cli.exclude_langs)
@@ -2118,6 +2222,19 @@ fn with_ecosystem_config(cli: &Cli, config: &UpdConfig) -> Result<(Cli, bool)> {
 }
 
 async fn run_update(cli: &Cli) -> Result<()> {
+    let exit_code = run_update_with_github(cli, GitHubReleasesRegistry::new).await?;
+    if exit_code != 0 {
+        std::process::exit(exit_code);
+    }
+    Ok(())
+}
+
+/// Keep registry construction injectable so tests exercise the complete CLI
+/// update path against HTTP fixtures without adding a production URL override.
+async fn run_update_with_github(
+    cli: &Cli,
+    github_registry: impl FnOnce() -> GitHubReleasesRegistry,
+) -> Result<i32> {
     let json_mode = effective_json_mode(cli);
     let package_filter = PackageFilter::new(cli.packages.clone()).map_err(anyhow::Error::msg)?;
 
@@ -2195,7 +2312,7 @@ async fn run_update(cli: &Cli) -> Result<()> {
                 &BoundedOutputParams::from_cli(cli),
             )?;
         }
-        return Ok(());
+        return Ok(0);
     }
 
     // Init TLS only after we know we're going to network. The empty-files
@@ -2282,7 +2399,7 @@ async fn run_update(cli: &Cli) -> Result<()> {
     let nuget = CachedRegistry::new(nuget_registry, Arc::clone(&cache), cache_enabled);
 
     // Create GitHub releases registry with optional token
-    let github_releases_registry = GitHubReleasesRegistry::new();
+    let github_releases_registry = github_registry();
     if cli.verbose && GitHubReleasesRegistry::detect_token().is_some() {
         eprintln!("{}", "Using authenticated GitHub access".cyan());
     }
@@ -2370,7 +2487,8 @@ async fn run_update(cli: &Cli) -> Result<()> {
             &file_cooldowns,
             Arc::clone(&cooldown_notes),
         )
-        .await;
+        .await
+        .map(|()| 0);
     }
 
     // Non-interactive mode: process files in parallel
@@ -3343,6 +3461,7 @@ async fn run_update(cli: &Cli) -> Result<()> {
             file_result.normalized.clear();
             file_result.annotations.clear();
             file_result.action_sha_updates.clear();
+            file_result.checksum_updates.clear();
         }
         total_result.merge(file_result);
     }
@@ -3412,11 +3531,7 @@ async fn run_update(cli: &Cli) -> Result<()> {
     let has_errors = !total_result.errors.is_empty();
     let has_pending = has_checkable_manifest_changes(&total_result, filter) || floor_has_planned;
     let exit_code = upd::decide_exit_code(dry_run, has_pending, has_errors);
-    if exit_code != 0 {
-        std::process::exit(exit_code);
-    }
-
-    Ok(())
+    Ok(exit_code)
 }
 
 /// Parameters controlling bounded JSON output (--limit, --offset, --fields).
@@ -4154,11 +4269,9 @@ async fn run_interactive_update(
                 old_version: change.old_version.as_str(),
                 new_version: change.new_version.as_str(),
                 line_num: change.line_num,
-                expected_source: scanned_file
-                    .result
-                    .entry_ecosystem
-                    .get(&change.package)
-                    .copied(),
+                expected_source: change
+                    .line_num
+                    .and_then(|line| scanned_file.result.annotation_sources.get(&line).copied()),
                 // A workflow scan records the resolved commit transition beside
                 // the version one.
                 sha_pin: sha_pin_for(
@@ -4205,11 +4318,12 @@ async fn run_interactive_update(
                     applied: vec![true; updates.len()],
                 })
         } else {
-            apply_version_updates(
+            apply_version_updates_with_checksums(
                 &content,
                 &updates,
                 scanned_file.file_type,
                 cli.full_precision,
+                &scanned_file.result.checksum_updates,
             )
         }
         .map_err(|e| {
@@ -5885,6 +5999,48 @@ fn apply_version_updates(
     file_type: FileType,
     full_precision: bool,
 ) -> Result<AppliedVersionUpdates> {
+    apply_version_updates_with_checksums(content, updates, file_type, full_precision, &[])
+}
+
+fn apply_version_updates_with_checksums(
+    content: &str,
+    updates: &[VersionEdit<'_>],
+    file_type: FileType,
+    full_precision: bool,
+    checksums: &[upd::updater::ChecksumUpdate],
+) -> Result<AppliedVersionUpdates> {
+    let selected_checksums: Vec<_> = checksums
+        .iter()
+        .filter(|checksum| {
+            updates.iter().any(|update| {
+                update.package == checksum.package
+                    && update.old_version == checksum.current
+                    && update.new_version == checksum.target
+                    && update.line_num == Some(checksum.version_line)
+            })
+        })
+        .collect();
+    for checksum in &selected_checksums {
+        if checksum.preview.as_ref() != content {
+            anyhow::bail!("Checksum-linked file changed since preview; rerun upd");
+        }
+    }
+    {
+        let selected: Vec<_> = updates
+            .iter()
+            .filter(|update| update.expected_source.is_some())
+            .map(|update| {
+                (
+                    update.package,
+                    update.old_version,
+                    update.new_version,
+                    update.line_num,
+                )
+            })
+            .collect();
+        upd::updater::validate_checksum_plan(content, file_type, &selected, checksums)?;
+    }
+
     if matches!(
         file_type,
         FileType::GradleCatalog | FileType::GradleScript | FileType::GradleWrapper
@@ -5901,6 +6057,16 @@ fn apply_version_updates(
     }
     let mut document = TextDocument::from_content(content);
     let mut applied = vec![false; updates.len()];
+    let generic_annotations = if file_type == FileType::Annotated
+        || (file_type != FileType::Dockerfile
+            && updates
+                .iter()
+                .any(|update| update.expected_source.is_some()))
+    {
+        annotation::parse_annotations(content)
+    } else {
+        Vec::new()
+    };
 
     for (idx, update) in updates.iter().enumerate() {
         let target_version = written_version(
@@ -5944,6 +6110,15 @@ fn apply_version_updates(
             continue;
         }
 
+        if update.expected_source.is_some() && file_type != FileType::Dockerfile {
+            applied[idx] = apply_annotated_version(
+                &mut document,
+                update,
+                &target_version,
+                &generic_annotations,
+            );
+            continue;
+        }
         applied[idx] = match file_type {
             // Rewritten by Nix, never as text; see `FlakeLockUpdater::refresh_inputs`.
             FileType::FlakeLock => false,
@@ -6003,8 +6178,23 @@ fn apply_version_updates(
                     false
                 }
             }
-            FileType::Annotated => apply_annotated_version(&mut document, update, &target_version),
+            FileType::Annotated => apply_annotated_version(
+                &mut document,
+                update,
+                &target_version,
+                &generic_annotations,
+            ),
         };
+    }
+
+    for checksum in selected_checksums {
+        let Some(line) = document.lines.get_mut(checksum.line - 1) else {
+            anyhow::bail!("Checksum assignment disappeared since preview; rerun upd");
+        };
+        if *line != checksum.original {
+            anyhow::bail!("Checksum assignment changed since preview; rerun upd");
+        }
+        *line = checksum.replacement.clone();
     }
 
     let unapplied: Vec<String> = updates
@@ -6596,10 +6786,9 @@ fn apply_annotated_version(
     document: &mut TextDocument,
     update: &VersionEdit<'_>,
     target_version: &str,
+    annotations: &[annotation::ParseOutcome],
 ) -> bool {
-    let outcome = line_index(update.line_num)
-        .and_then(|idx| document.lines.get(idx))
-        .map(|line| annotation::parse_line(line));
+    let outcome = line_index(update.line_num).and_then(|idx| annotations.get(idx).cloned());
     apply_annotated_version_with_outcome(document, update, target_version, outcome)
 }
 
@@ -7156,6 +7345,32 @@ fn print_file_result(
             };
             println!("{} {}", file_location.blue().underline(), line.dimmed());
         }
+    }
+
+    for checksum in &result.checksum_updates {
+        if checksum
+            .current_checksum
+            .eq_ignore_ascii_case(&checksum.latest_checksum)
+        {
+            println!(
+                "{} {} SHA-256 {} verified unchanged ({}, {})",
+                format!("{}:{}:", path, checksum.line).blue().underline(),
+                checksum.package.bold(),
+                &checksum.latest_checksum[..12],
+                checksum.asset,
+                checksum.source
+            );
+            continue;
+        }
+        println!(
+            "{} {} SHA-256 {} → {} ({}, {})",
+            format!("{}:{}:", path, checksum.line).blue().underline(),
+            checksum.package.bold(),
+            &checksum.current_checksum[..12],
+            &checksum.latest_checksum[..12],
+            checksum.asset,
+            checksum.source
+        );
     }
 
     // Show ignored packages (only in verbose mode)
@@ -10361,6 +10576,787 @@ mod output_tests {
             path_a,
             "ALPHA ?= v2.0.0  # upd: pypi alpha\r\nUNCHANGED := yes\nBETA ?= 2.0  # upd: pypi beta",
             "both must preserve exact line endings, final-newline state, v prefix, and precision"
+        );
+    }
+}
+
+#[cfg(test)]
+mod annotation_scaffolding_tests {
+    use super::*;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    const URL: &str = "https://github.com/acme/tool/releases/download/v1.2.3/tool-v1.2.3.tar.gz";
+
+    #[tokio::test]
+    async fn online_failures_preserve_the_http_and_integrity_causes_for_cli_errors() {
+        for manifest in [false, true] {
+            let server = MockServer::start().await;
+            Mock::given(method("GET")).and(path("/repos/acme/tool/releases/tags/v1.2.3"))
+                .respond_with(if manifest {
+                    ResponseTemplate::new(200).set_body_json(serde_json::json!({ "assets": [
+                        {"name": "tool-v1.2.3.tar.gz", "digest": format!("sha256:{}", "b".repeat(64))},
+                        {"name": "sums.txt", "digest": format!("sha256:{}", "a".repeat(64)), "url": format!("{}/sums", server.uri())}
+                    ] }))
+                } else { ResponseTemplate::new(401) }).expect(1).mount(&server).await;
+            Mock::given(method("GET"))
+                .and(path("/sums"))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .set_body_string(format!("{}  tool-v1.2.3.tar.gz\n", "b".repeat(64))),
+                )
+                .expect(if manifest { 1 } else { 0 })
+                .mount(&server)
+                .await;
+            let mut args = vec!["upd", "annotations", "init", URL, "--resolve-checksum"];
+            if manifest {
+                args.extend(["--checksums", "sums.txt"]);
+            }
+            let cli = Cli::try_parse_from(args).unwrap();
+            let Some(Command::Annotations { command }) = &cli.command else {
+                unreachable!()
+            };
+            let error = run_annotations_with_github(&cli, command, || {
+                GitHubReleasesRegistry::with_api_url_and_token(server.uri(), None)
+            })
+            .await
+            .unwrap_err();
+            let report = classify_error(&error);
+            let message = report["error"]["message"].as_str().unwrap();
+            assert!(
+                message.contains(if manifest {
+                    "SHA-256 mismatch"
+                } else {
+                    "HTTP 401"
+                }),
+                "{report}"
+            );
+            if !manifest {
+                assert_eq!(report["error"]["kind"], "network_error");
+                assert_eq!(report["error"]["exit_code"], 3);
+            }
+            server.verify().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn invalid_local_inputs_and_offline_generation_never_construct_a_registry() {
+        let sha = "b".repeat(64);
+        let cases = [
+            (vec!["--checksum", sha.as_str()], true),
+            (vec!["--checksum", "bad"], false),
+            (
+                vec![
+                    "--resolve-checksum",
+                    "--asset-template",
+                    "wrong-{tag}.tar.gz",
+                ],
+                false,
+            ),
+            (
+                vec![
+                    "--resolve-checksum",
+                    "--asset-template",
+                    "x-{unknown}.tar.gz",
+                ],
+                false,
+            ),
+            (
+                vec!["--resolve-checksum", "--checksums", "../sums.txt"],
+                false,
+            ),
+            (
+                vec!["--resolve-checksum", "--checksums", "tool-{tag}.tar.gz"],
+                false,
+            ),
+            (vec!["--resolve-checksum", "--name", "bad-name"], false),
+        ];
+        for (flags, valid) in cases {
+            let mut args = vec![
+                "upd",
+                "annotations",
+                "init",
+                URL,
+                "--output",
+                "json",
+                "--config",
+                "/nonexistent/upd.toml",
+            ];
+            args.extend(flags);
+            let cli = Cli::try_parse_from(args).unwrap();
+            let Some(Command::Annotations { command }) = &cli.command else {
+                unreachable!()
+            };
+            let result = run_annotations_with_github(&cli, command, || {
+                panic!("constructed a registry before valid online input")
+            })
+            .await;
+            assert_eq!(result.is_ok(), valid);
+        }
+    }
+
+    #[tokio::test]
+    async fn online_generation_runs_through_cli_with_exact_metadata_and_no_file_writes() {
+        for manifest in [false, true] {
+            let server = MockServer::start().await;
+            let sha = "b".repeat(64);
+            Mock::given(method("GET")).and(path("/repos/acme/tool/releases/tags/v1.2.3"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "assets": [
+                        {"name": "tool-v1.2.3.tar.gz", "state": "uploaded", "digest": format!("sha256:{sha}"), "url": format!("{}/binary", server.uri())},
+                        {"name": "sums.txt", "state": "uploaded", "url": format!("{}/sums", server.uri())}
+                    ]
+                }))).expect(1).mount(&server).await;
+            Mock::given(method("GET"))
+                .and(path("/sums"))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .set_body_string(format!("{sha}  tool-v1.2.3.tar.gz\n")),
+                )
+                .expect(if manifest { 1 } else { 0 })
+                .mount(&server)
+                .await;
+            Mock::given(method("GET"))
+                .and(path("/binary"))
+                .respond_with(ResponseTemplate::new(500))
+                .expect(0)
+                .mount(&server)
+                .await;
+            let dir = tempfile::tempdir().unwrap();
+            let output_file = dir.path().join("Dockerfile");
+            std::fs::write(&output_file, "FROM scratch\n").unwrap();
+            let mut args = vec![
+                "upd",
+                "annotations",
+                "init",
+                URL,
+                "--resolve-checksum",
+                "--syntax",
+                "docker",
+                "--asset-template",
+                "tool-{tag}.tar.gz",
+                "--apply",
+                "--output",
+                "json",
+                "--config",
+                "/nonexistent/upd.toml",
+            ];
+            if manifest {
+                args.extend(["--checksums", "sums.txt"]);
+            }
+            let cli = Cli::try_parse_from(args).unwrap();
+            let Some(Command::Annotations { command }) = &cli.command else {
+                unreachable!()
+            };
+            assert_eq!(
+                run_annotations_with_github(&cli, command, || {
+                    GitHubReleasesRegistry::with_api_url_and_token(server.uri(), None)
+                })
+                .await
+                .unwrap(),
+                0
+            );
+            assert_eq!(
+                std::fs::read_to_string(output_file).unwrap(),
+                "FROM scratch\n"
+            );
+            let requests = server.received_requests().await.unwrap();
+            assert_eq!(requests.len(), if manifest { 2 } else { 1 });
+            server.verify().await;
+        }
+    }
+}
+
+#[cfg(test)]
+mod checksum_selection_tests {
+    use super::*;
+
+    fn checksum_updater_at(api_url: &str) -> AnnotatedUpdater {
+        let cache = Arc::new(Mutex::new(Cache::default()));
+        macro_rules! cached {
+            ($registry:expr) => {
+                Arc::new(CachedRegistry::new($registry, Arc::clone(&cache), false))
+            };
+        }
+        AnnotatedUpdater::new(RegistrySet::resolving(
+            &cached!(MultiPyPiRegistry::from_primary_and_extras(
+                PyPiRegistry::new(),
+                Vec::new()
+            )),
+            &cached!(NpmRegistry::new()),
+            &cached!(CratesIoRegistry::new()),
+            &cached!(GoProxyRegistry::new()),
+            &cached!(RubyGemsRegistry::new()),
+            &cached!(NuGetRegistry::new()),
+            &cached!(GitHubReleasesRegistry::with_api_url_and_token(
+                api_url.to_string(),
+                None
+            )),
+        ))
+    }
+
+    #[tokio::test]
+    async fn checksum_updates_work_through_cli_preview_apply_idempotency_and_interactive_approval()
+    {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        for (name, manifest_mode) in [
+            "Dockerfile",
+            "versions.sh",
+            "Makefile",
+            "pins.toml",
+            "pins.yaml",
+            "versions.js",
+            ".github/workflows/check.yml",
+        ]
+        .into_iter()
+        .flat_map(|name| [false, true].map(|mode| (name, mode)))
+        {
+            let server = MockServer::start().await;
+            let digest_x64 = "b".repeat(64);
+            let digest_arm = "d".repeat(64);
+            let manifest = "SHASUMS256.txt";
+            let mut assets = vec![
+                serde_json::json!({"name":"tool-v1.3.0-x64.tar.gz", "state":"uploaded", "url":format!("{}/archive/x64", server.uri()),
+                    "digest": if manifest_mode { None } else { Some(format!("sha256:{digest_x64}")) }}),
+                serde_json::json!({"name":"tool-v1.3.0-arm64.tar.gz", "state":"uploaded", "url":format!("{}/archive/arm", server.uri()),
+                    "digest": if manifest_mode { None } else { Some(format!("sha256:{digest_arm}")) }}),
+            ];
+            if manifest_mode {
+                assets.push(serde_json::json!({"name":manifest, "state":"uploaded", "url":format!("{}/checksums", server.uri())}));
+                Mock::given(method("GET")).and(path("/checksums"))
+                    .respond_with(ResponseTemplate::new(200).set_body_string(format!("{digest_x64}  ./tool-v1.3.0-x64.tar.gz\nSHA256 (tool-v1.3.0-arm64.tar.gz) = {digest_arm}\n")))
+                    .expect(4).mount(&server).await;
+            }
+            Mock::given(method("GET"))
+                .and(path("/repos/acme/tool/releases/latest"))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .set_body_json(serde_json::json!({"tag_name":"v1.3.0"})),
+                )
+                .expect(4)
+                .mount(&server)
+                .await;
+            Mock::given(method("GET"))
+                .and(path("/repos/acme/tool/releases/tags/v1.3.0"))
+                .respond_with(
+                    ResponseTemplate::new(200).set_body_json(serde_json::json!({"assets":assets})),
+                )
+                .expect(4)
+                .mount(&server)
+                .await;
+            for archive in ["/archive/x64", "/archive/arm"] {
+                Mock::given(method("GET"))
+                    .and(path(archive))
+                    .respond_with(ResponseTemplate::new(500))
+                    .expect(0)
+                    .mount(&server)
+                    .await;
+            }
+            let dir = tempfile::tempdir().unwrap();
+            let file = dir.path().join(name);
+            std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+            let file_type = FileType::detect(&file).unwrap_or(FileType::Annotated);
+            let config = dir.path().join(".updrc.toml");
+            std::fs::write(&config, "").unwrap();
+            let option = if manifest_mode {
+                " checksums=SHASUMS256.txt"
+            } else {
+                ""
+            };
+            let original = if file_type == FileType::Dockerfile {
+                format!(
+                    "FROM alpine:3.22\r\n # upd: github-releases acme/tool\r\n  ARG TOOL_VERSION=1.2.3\r\n# upd: checksum TOOL_VERSION asset=tool-{{tag}}-x64.tar.gz{option}\r\n ENV SUM_X64=\"{}\"\r\n# upd: checksum TOOL_VERSION asset=tool-{{tag}}-arm64.tar.gz{option}\r\n ARG SUM_ARM='{}'",
+                    "a".repeat(64),
+                    "c".repeat(64)
+                )
+            } else {
+                let (version, x64, arm, comment) = match name {
+                    "versions.sh" => (
+                        "export TOOL_VERSION=1.2.3",
+                        "SUM_X64=\"{hash}\"",
+                        "SUM_ARM='{hash}'",
+                        "#",
+                    ),
+                    "Makefile" => (
+                        "TOOL_VERSION ?= 1.2.3",
+                        "SUM_X64 := \"{hash}\"",
+                        "SUM_ARM := '{hash}'",
+                        "#",
+                    ),
+                    "versions.js" => (
+                        "const TOOL_VERSION = '1.2.3';",
+                        "verify('{hash}');",
+                        "verify('{hash}');",
+                        "//",
+                    ),
+                    "pins.yaml" | ".github/workflows/check.yml" => (
+                        "  TOOL_VERSION: '1.2.3'",
+                        "  SUM_X64: \"{hash}\"",
+                        "  SUM_ARM: '{hash}'",
+                        "#",
+                    ),
+                    _ => (
+                        "TOOL_VERSION = '1.2.3'",
+                        "SUM_X64 = \"{hash}\"",
+                        "SUM_ARM = '{hash}'",
+                        "#",
+                    ),
+                };
+                format!(
+                    "{version} {comment} upd: github-releases acme/tool id=tool\r\n{comment} upd: checksum tool asset=tool-{{tag}}-x64.tar.gz{option}\r\n{} {comment} keep x64\r\n{} {comment} upd: checksum tool asset=tool-{{tag}}-arm64.tar.gz{option}",
+                    x64.replace("{hash}", &"a".repeat(64)),
+                    arm.replace("{hash}", &"c".repeat(64))
+                )
+            };
+            let expected = original
+                .replace("1.2.3", "1.3.0")
+                .replace(&"a".repeat(64), &digest_x64)
+                .replace(&"c".repeat(64), &digest_arm);
+            std::fs::write(&file, &original).unwrap();
+            let preview_cli = Cli::try_parse_from([
+                "upd",
+                file.to_str().unwrap(),
+                "--config",
+                config.to_str().unwrap(),
+                "--no-cache",
+                "--no-lock",
+                "--min-age",
+                "0",
+                "--lang",
+                "github-releases",
+                "--output",
+                "json",
+            ])
+            .unwrap();
+            assert_eq!(
+                run_update_with_github(&preview_cli, || {
+                    GitHubReleasesRegistry::with_api_url_and_token(server.uri(), None)
+                })
+                .await
+                .unwrap(),
+                1
+            );
+            assert_eq!(std::fs::read_to_string(&file).unwrap(), original);
+
+            let updater = checksum_updater_at(&server.uri());
+            let scan = if file_type == FileType::Dockerfile {
+                updater
+                    .update_alongside(
+                        &file,
+                        UpdateOptions::new(true, false),
+                        &DockerUpdater::new(),
+                    )
+                    .await
+                    .unwrap()
+            } else if file_type == FileType::GithubActions {
+                updater
+                    .update_alongside(
+                        &file,
+                        UpdateOptions::new(true, false),
+                        &GithubActionsUpdater::new(),
+                    )
+                    .await
+                    .unwrap()
+            } else {
+                updater
+                    .update(&file, &NpmRegistry::new(), UpdateOptions::new(true, false))
+                    .await
+                    .unwrap()
+            };
+            assert!(
+                scan.errors.is_empty() && scan.skipped.is_empty(),
+                "{scan:?}"
+            );
+            assert_eq!(scan.updated.len(), 1);
+            assert_eq!(scan.checksum_updates.len(), 2);
+            let json = serde_json::to_value(upd::output::build_update_file_report(
+                &file,
+                file_type,
+                &scan,
+                None,
+                |_, _| "minor",
+            ))
+            .unwrap();
+            assert_eq!(json["checksum_updates"][0]["tag"], "v1.3.0");
+            assert_eq!(
+                json["checksum_updates"][0]["source"],
+                if manifest_mode {
+                    manifest
+                } else {
+                    "github-asset-digest"
+                }
+            );
+            let edits: Vec<_> = scan
+                .updated
+                .iter()
+                .map(|(package, current, target, line)| VersionEdit {
+                    package,
+                    old_version: current,
+                    new_version: target,
+                    line_num: *line,
+                    expected_source: line.and_then(|n| scan.annotation_sources.get(&n).copied()),
+                    sha_pin: None,
+                })
+                .collect();
+            let interactive = apply_version_updates_with_checksums(
+                &original,
+                &edits,
+                file_type,
+                false,
+                &scan.checksum_updates,
+            )
+            .unwrap();
+            assert_eq!(interactive.applied_count(), 1);
+            assert_eq!(interactive.content, expected);
+            let apply_cli = Cli {
+                apply: true,
+                ..preview_cli
+            };
+            assert_eq!(
+                run_update_with_github(&apply_cli, || {
+                    GitHubReleasesRegistry::with_api_url_and_token(server.uri(), None)
+                })
+                .await
+                .unwrap(),
+                0
+            );
+            assert_eq!(std::fs::read_to_string(&file).unwrap(), expected);
+            assert_eq!(
+                run_update_with_github(&apply_cli, || {
+                    GitHubReleasesRegistry::with_api_url_and_token(server.uri(), None)
+                })
+                .await
+                .unwrap(),
+                0
+            );
+            assert_eq!(std::fs::read_to_string(&file).unwrap(), expected);
+        }
+    }
+
+    #[test]
+    fn newly_added_links_cannot_bypass_interactive_checks_with_indentation_or_malformed_options() {
+        for directive in [
+            "# upd: checksum VERSION asset=tool-{tag}.tar.gz",
+            "# upd: checksum VERSION asset=tool-{unknown}.tar.gz",
+            "# upd: checksum VERSION asset=tool-{tag}.tar.gz unknown=value",
+            "# upd: checksum VERSOIN asset=tool-{tag}.tar.gz",
+        ] {
+            let content = format!(
+                "FROM alpine:3.22\n # upd: github-releases acme/tool\n  ARG VERSION=1.2.3\n{directive}\n  ARG CHECKSUM={}\n",
+                "a".repeat(64)
+            );
+            let update = VersionEdit {
+                package: "acme/tool",
+                old_version: "1.2.3",
+                new_version: "1.3.0",
+                line_num: Some(3),
+                expected_source: Some(AnnotationSource::GitHubReleases),
+                sha_pin: None,
+            };
+            assert!(
+                apply_version_updates_with_checksums(
+                    &content,
+                    &[update],
+                    FileType::Dockerfile,
+                    false,
+                    &[]
+                )
+                .is_err(),
+                "{directive}"
+            );
+        }
+    }
+
+    #[test]
+    fn generic_interactive_links_reject_new_invalid_and_stale_relationships() {
+        for file_type in [FileType::Annotated, FileType::GithubActions] {
+            for directive in [
+                "# upd: checksum tool asset=tool-{tag}.tar.gz",
+                "# upd: checksum tool asset=tool-{unknown}.tar.gz",
+                "# upd: checksum typo asset=tool-{tag}.tar.gz",
+                "# upd: checksum tool asset=x # upd: github-releases acme/tool",
+            ] {
+                let content = format!(
+                    "version = '1.2.3' # upd: github-releases acme/tool id=tool\nsha = '{}' {directive}",
+                    "a".repeat(64)
+                );
+                let update = VersionEdit {
+                    package: "acme/tool",
+                    old_version: "1.2.3",
+                    new_version: "1.3.0",
+                    line_num: Some(1),
+                    expected_source: Some(AnnotationSource::GitHubReleases),
+                    sha_pin: None,
+                };
+                assert!(
+                    apply_version_updates_with_checksums(
+                        &content,
+                        &[update],
+                        file_type,
+                        false,
+                        &[]
+                    )
+                    .is_err(),
+                    "{file_type:?}: {directive}"
+                );
+            }
+        }
+        let old_digest = "a".repeat(64);
+        let new_digest = "b".repeat(64);
+        let content = format!(
+            "# upd: github-releases acme/tool id=tool\nversion = '1.2.3'\nsha = '{old_digest}' # upd: checksum tool asset=tool-{{tag}}.tar.gz"
+        );
+        let update = VersionEdit {
+            package: "acme/tool",
+            old_version: "1.2.3",
+            new_version: "1.3.0",
+            line_num: Some(2),
+            expected_source: Some(AnnotationSource::GitHubReleases),
+            sha_pin: None,
+        };
+        let planned = upd::updater::ChecksumUpdate {
+            package: "acme/tool".into(),
+            current: "1.2.3".into(),
+            target: "1.3.0".into(),
+            version_line: 2,
+            line: 3,
+            original: format!(
+                "sha = '{old_digest}' # upd: checksum tool asset=tool-{{tag}}.tar.gz"
+            ),
+            replacement: format!(
+                "sha = '{new_digest}' # upd: checksum tool asset=tool-{{tag}}.tar.gz"
+            ),
+            asset: "tool-v1.3.0.tar.gz".into(),
+            tag: "v1.3.0".into(),
+            source: "github-asset-digest".into(),
+            current_checksum: old_digest.clone(),
+            latest_checksum: new_digest.clone(),
+            preview: content.clone().into(),
+        };
+        let approved = apply_version_updates_with_checksums(
+            &content,
+            &[update],
+            FileType::Annotated,
+            false,
+            std::slice::from_ref(&planned),
+        )
+        .unwrap();
+        assert_eq!(
+            approved.content,
+            content
+                .replace("1.2.3", "1.3.0")
+                .replace(&old_digest, &new_digest)
+        );
+        let unselected = apply_version_updates_with_checksums(
+            &content,
+            &[],
+            FileType::Annotated,
+            false,
+            std::slice::from_ref(&planned),
+        )
+        .unwrap();
+        assert_eq!(unselected.content, content);
+        for changed in [
+            content.replace("id=tool", "id=other"),
+            content.replace("asset=tool-", "asset=other-"),
+            content.replace(&old_digest, &"c".repeat(64)),
+            format!("{content}\n# new content"),
+            content.replace(
+                "# upd: checksum tool asset=tool-{tag}.tar.gz",
+                "# removed link",
+            ),
+        ] {
+            assert!(
+                apply_version_updates_with_checksums(
+                    &changed,
+                    &[update],
+                    FileType::Annotated,
+                    false,
+                    std::slice::from_ref(&planned)
+                )
+                .is_err(),
+                "{changed}"
+            );
+        }
+    }
+
+    #[test]
+    fn workflow_native_actions_and_checksum_linked_annotations_share_interactive_writer() {
+        let old_digest = "a".repeat(64);
+        let new_digest = "b".repeat(64);
+        let content = format!(
+            "name: example\nenv:\n  TOOL_VERSION: '1.2.3' # upd: github-releases acme/tool\n  TOOL_CHECKSUM: '{old_digest}' # upd: checksum TOOL_VERSION asset=tool-{{tag}}.tar.gz\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - uses: actions/checkout@v4.1.0\n"
+        );
+        let updates = [
+            VersionEdit {
+                package: "acme/tool",
+                old_version: "1.2.3",
+                new_version: "1.3.0",
+                line_num: Some(3),
+                expected_source: Some(AnnotationSource::GitHubReleases),
+                sha_pin: None,
+            },
+            VersionEdit {
+                package: "actions/checkout",
+                old_version: "v4.1.0",
+                new_version: "v4.2.0",
+                line_num: Some(9),
+                expected_source: None,
+                sha_pin: None,
+            },
+        ];
+        let planned = upd::updater::ChecksumUpdate {
+            package: "acme/tool".into(),
+            current: "1.2.3".into(),
+            target: "1.3.0".into(),
+            version_line: 3,
+            line: 4,
+            original: format!(
+                "  TOOL_CHECKSUM: '{old_digest}' # upd: checksum TOOL_VERSION asset=tool-{{tag}}.tar.gz"
+            ),
+            replacement: format!(
+                "  TOOL_CHECKSUM: '{new_digest}' # upd: checksum TOOL_VERSION asset=tool-{{tag}}.tar.gz"
+            ),
+            asset: "tool-v1.3.0.tar.gz".into(),
+            tag: "v1.3.0".into(),
+            source: "github-asset-digest".into(),
+            current_checksum: old_digest.clone(),
+            latest_checksum: new_digest.clone(),
+            preview: content.clone().into(),
+        };
+        let applied = apply_version_updates_with_checksums(
+            &content,
+            &updates,
+            FileType::GithubActions,
+            false,
+            &[planned],
+        )
+        .unwrap();
+        assert_eq!(applied.applied_count(), 2);
+        assert_eq!(
+            applied.content,
+            content
+                .replace("1.2.3", "1.3.0")
+                .replace("v4.1.0", "v4.2.0")
+                .replace(&old_digest, &new_digest)
+        );
+    }
+
+    #[test]
+    fn an_image_and_checksum_linked_version_with_the_same_package_can_be_selected_together() {
+        let old_digest = "a".repeat(64);
+        let new_digest = "b".repeat(64);
+        let content = format!(
+            "FROM acme/tool:1.2.3\n# upd: github-releases acme/tool\nARG VERSION=1.2.3\n# upd: checksum VERSION asset=tool-{{tag}}.tar.gz\nARG SUM={old_digest}\n"
+        );
+        let updates: Vec<_> = [1, 3]
+            .into_iter()
+            .map(|line| VersionEdit {
+                package: "acme/tool",
+                old_version: "1.2.3",
+                new_version: "1.3.0",
+                line_num: Some(line),
+                expected_source: (line == 3).then_some(AnnotationSource::GitHubReleases),
+                sha_pin: None,
+            })
+            .collect();
+        let planned = upd::updater::ChecksumUpdate {
+            package: "acme/tool".into(),
+            current: "1.2.3".into(),
+            target: "1.3.0".into(),
+            version_line: 3,
+            line: 5,
+            original: format!("ARG SUM={old_digest}"),
+            replacement: format!("ARG SUM={new_digest}"),
+            asset: "tool-v1.3.0.tar.gz".into(),
+            tag: "v1.3.0".into(),
+            source: "github-asset-digest".into(),
+            preview: content.clone().into(),
+            current_checksum: old_digest.clone(),
+            latest_checksum: new_digest.clone(),
+        };
+        let result = apply_version_updates_with_checksums(
+            &content,
+            &updates,
+            FileType::Dockerfile,
+            false,
+            &[planned],
+        )
+        .unwrap();
+        assert_eq!(result.applied_count(), 2);
+        assert_eq!(
+            result.content,
+            content
+                .replace("1.2.3", "1.3.0")
+                .replace(&old_digest, &new_digest)
+        );
+    }
+
+    #[test]
+    fn interactive_checksum_groups_apply_only_selected_edits_and_reject_stale_preview() {
+        let old_digest = "a".repeat(64);
+        let new_digest = "b".repeat(64);
+        let content = format!(
+            "# upd: github-releases acme/tool\r\nARG VERSION=1.2.3\r\n# upd: checksum VERSION asset=tool-{{tag}}.tar.gz\r\nARG CHECKSUM=\"{old_digest}\""
+        );
+        let update = VersionEdit {
+            package: "acme/tool",
+            old_version: "1.2.3",
+            new_version: "1.3.0",
+            line_num: Some(2),
+            expected_source: Some(AnnotationSource::GitHubReleases),
+            sha_pin: None,
+        };
+        let planned = upd::updater::ChecksumUpdate {
+            package: "acme/tool".into(),
+            current: "1.2.3".into(),
+            target: "1.3.0".into(),
+            version_line: 2,
+            line: 4,
+            original: format!("ARG CHECKSUM=\"{old_digest}\""),
+            replacement: format!("ARG CHECKSUM=\"{new_digest}\""),
+            asset: "tool-v1.3.0.tar.gz".into(),
+            tag: "v1.3.0".into(),
+            source: "github-asset-digest".into(),
+            preview: content.clone().into(),
+            current_checksum: old_digest.clone(),
+            latest_checksum: new_digest.clone(),
+        };
+        assert!(apply_version_updates(&content, &[update], FileType::Dockerfile, false).is_err());
+        let result = apply_version_updates_with_checksums(
+            &content,
+            &[update],
+            FileType::Dockerfile,
+            false,
+            std::slice::from_ref(&planned),
+        )
+        .unwrap();
+        assert_eq!(
+            result.content,
+            content
+                .replace("VERSION=1.2.3", "VERSION=1.3.0")
+                .replace(&old_digest, &new_digest)
+        );
+        assert_eq!(result.applied_count(), 1);
+        let unselected = apply_version_updates_with_checksums(
+            &content,
+            &[],
+            FileType::Dockerfile,
+            false,
+            std::slice::from_ref(&planned),
+        )
+        .unwrap();
+        assert_eq!(unselected.content, content);
+        assert!(
+            apply_version_updates_with_checksums(
+                &content.replace("asset=tool-", "asset=other-"),
+                &[update],
+                FileType::Dockerfile,
+                false,
+                &[planned]
+            )
+            .is_err()
         );
     }
 }

@@ -446,6 +446,12 @@ other line is free.
 Annotated entries are updates like any other. They obey `ignore`, `pin`,
 cooldown, and `max-bump`, and they keep the line's own precision.
 
+An annotation may be inline or immediately above its value line. GitHub release
+versions can also have [linked SHA-256 values](ecosystems.md#linked-release-checksums)
+under `env:` or `with:`. The version and all its checksums update together; use
+an explicit `id=<name>` on the version annotation when multiple inputs share
+the same key.
+
 ### Selecting them with `--lang`
 
 The two passes are selected separately, because they update different things:

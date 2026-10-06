@@ -490,6 +490,19 @@ impl<R: Registry> Registry for CachedRegistry<R> {
     /// self-pin updater downloads a release's own checksum sidecar to verify
     /// a pin bump, and that answer must come from the real registry rather
     /// than the trait default.
+    async fn release_asset_metadata(
+        &self,
+        package: &str,
+        tag: &str,
+        asset: &str,
+    ) -> Result<crate::registry::ReleaseAssetMetadata> {
+        self.inner.release_asset_metadata(package, tag, asset).await
+    }
+
+    async fn release_asset_digest(&self, package: &str, tag: &str, asset: &str) -> Result<String> {
+        self.inner.release_asset_digest(package, tag, asset).await
+    }
+
     async fn release_asset(&self, package: &str, tag: &str, asset_name: &str) -> Result<Vec<u8>> {
         self.inner.release_asset(package, tag, asset_name).await
     }
@@ -1241,6 +1254,49 @@ mod forwarding_tests {
         assert_eq!(
             bytes, b"{\"version\":\"v0.14.2\"}",
             "CachedRegistry must forward repo_file_at_ref to the inner registry"
+        );
+    }
+
+    #[tokio::test]
+    async fn cached_registry_forwards_release_asset_metadata_without_inventing_a_digest() {
+        let inner = MockRegistry::new("github-releases").with_release_asset(
+            "acme/tool",
+            "v1.2.3",
+            "tool.tar.gz",
+            b"",
+        );
+        let registry = CachedRegistry::new(inner, Arc::new(Mutex::new(Cache::default())), true);
+        assert!(
+            registry
+                .release_asset_metadata("acme/tool", "v1.2.3", "tool.tar.gz")
+                .await
+                .unwrap()
+                .sha256
+                .is_none()
+        );
+        assert!(
+            registry
+                .release_asset_metadata("acme/tool", "v1.2.3", "missing.tar.gz")
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn cached_registry_forwards_release_asset_digest() {
+        let inner = MockRegistry::new("github-releases").with_release_digest(
+            "acme/tool",
+            "v1.2.3",
+            "tool.tar.gz",
+            &"a".repeat(64),
+        );
+        let registry = CachedRegistry::new(inner, Arc::new(Mutex::new(Cache::default())), true);
+        assert_eq!(
+            registry
+                .release_asset_digest("acme/tool", "v1.2.3", "tool.tar.gz")
+                .await
+                .unwrap(),
+            "a".repeat(64)
         );
     }
 
