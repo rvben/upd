@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.16.0](https://github.com/rvben/upd/compare/v0.15.1...v0.16.0) - 2026-10-06
+
 ### Added
 
 - Linked GitHub release SHA-256 updates in annotation-capable text files, including Dockerfiles, shell scripts, Makefiles, and GitHub Actions workflows. Resolve all linked assets before updating a version; support published asset digests and explicit checksum manifests, with release provenance in JSON reports.
