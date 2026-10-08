@@ -169,6 +169,31 @@ impl std::fmt::Display for RefNotFound {
 
 impl std::error::Error for RefNotFound {}
 
+/// A registry request failed before it could establish release metadata.
+/// Kept distinct from a successful response whose assets or checksums fail a
+/// safety check, so an outage is reported as a failed run rather than a block.
+#[derive(Debug)]
+pub(crate) struct RegistryRequestError(anyhow::Error);
+
+impl RegistryRequestError {
+    pub(crate) fn new(error: anyhow::Error) -> Self {
+        Self(error)
+    }
+}
+
+impl std::fmt::Display for RegistryRequestError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(&self.0, f)
+    }
+}
+
+impl std::error::Error for RegistryRequestError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        let error: &(dyn std::error::Error + Send + Sync + 'static) = self.0.as_ref();
+        error.source()
+    }
+}
+
 /// Whether a failed ref lookup means the ref does not exist.
 pub fn is_ref_not_found(error: &anyhow::Error) -> bool {
     error.downcast_ref::<RefNotFound>().is_some()

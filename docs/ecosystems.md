@@ -277,7 +277,9 @@ Docker image tags are mutable registry labels, not package releases. `upd`
 therefore follows the exact numeric channel already chosen in the file and does
 not cross between suffixes, precision levels, or `v`-prefixed and unprefixed
 tags. Updating `tag@sha256:digest` safely also requires resolving and verifying
-the replacement manifest digest, so digest pins are blocked in this release.
+the replacement manifest digest. Digest-pin updates are unsupported in this
+release: they are reported as `not-examined`, are left unchanged without registry
+verification, and do not fail `--check --fail-on-blocked`.
 
 ## Linked release checksums
 
@@ -369,7 +371,10 @@ Other registries and checksum algorithms are not supported yet.
   (`SHA256 (filename) = hash`) formats are supported. Leading `./` is accepted;
   the full asset filename must match exactly once. A bare hash is accepted only
   when the selected sidecar is named `<asset>.sha256`. Missing entries, duplicate
-  entries, malformed hashes, and failed downloads block the whole group. The
+  entries and malformed hashes block the whole group. Missing assets (including
+  HTTP 404) are safety refusals; other unsuccessful HTTP responses, transport
+  failures and response-body read failures are request errors (exit 2). Either
+  outcome leaves the whole group unchanged. The
   referenced archive must also exist as a unique, uploaded release asset. If
   GitHub provides its SHA-256 digest, the manifest must agree with it.
   The checksum manifest itself must be uploaded, and its downloaded bytes must
@@ -540,15 +545,18 @@ pull-request workflow are covered in [GitHub Actions](github-actions.md).
 A `rev` is a git reference, not a version, so only one upd can read as a version
 tag is rewritten. `v4.5.0`, `24.3.0`, four-segment tags such as `v0.11.0.1`,
 prereleases, and single-number tags all qualify. Anything else is left exactly as
-it is and reported as blocked, with the reason naming which kind it was:
+it is, with the status and reason naming which kind it was:
 
-| Reason | Revisions |
-| --- | --- |
-| `sha-pinned-rev` | a full 40-character commit SHA |
-| `unrecognized-rev` | an abbreviated SHA, a branch (`main`), a moving pointer (`1.x`), a prefixed tag (`black-24.3.0`) |
+| Status | Reason | Revisions |
+| --- | --- | --- |
+| `not-examined` | `sha-pinned-rev` | a full 40-character commit SHA, including `pre-commit autoupdate --freeze` pins |
+| `blocked` | `unrecognized-rev` | an abbreviated SHA, a branch (`main`), a moving pointer (`1.x`), a prefixed tag (`black-24.3.0`) |
 
-Neither is examined, so neither costs a registry lookup, and neither makes
-`--check` fail. A configured `[pin]` does not override this: the pinned version
+Neither costs a revision lookup. Frozen commit-pin updates are unsupported and
+do not fail `--check --fail-on-blocked`; an unrecognized revision fails this
+strict check because no safe version-tag rewrite is available. Plain `--check`
+does not fail for either revision alone. A configured `[pin]` does not override
+this: the pinned version
 is written in the shape of the revision it replaces, which for an unreadable
 revision is the truncation this guard exists to prevent. An abbreviated commit
 SHA made only

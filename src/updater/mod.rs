@@ -1102,9 +1102,10 @@ pub struct SkippedUpdate {
 ///
 /// Both statuses leave the line untouched, but they answer different questions.
 /// `Blocked` means the dependency was examined and a safety condition refused
-/// the change. `NotExamined` means it was never looked at, because the feature
-/// that reads that kind of pin is off. Reporting the second as the first would
-/// describe a configuration choice as a safety problem, and reporting either as
+/// the change. `NotExamined` means verification was not performed, because
+/// that kind of pin is unsupported or its update feature is off. Reporting the
+/// second as the first would describe missing support or a configuration choice
+/// as a safety problem, and reporting either as
 /// up to date would claim a check that never happened.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SkipStatus {

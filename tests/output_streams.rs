@@ -41,6 +41,30 @@ fn run_with_env(args: &[&str], cwd: &Path, env: &[(&str, &str)]) -> (String, Str
     )
 }
 
+#[test]
+fn invalid_blocked_check_modes_return_the_structured_cli_error() {
+    let temp = tempfile::tempdir().unwrap();
+    for args in [
+        vec!["--fail-on-blocked"],
+        vec!["audit", "--check", "--fail-on-blocked"],
+        vec!["--check", "align", "--fail-on-blocked"],
+        vec!["--check", "--fail-on-blocked", "update", "--interactive"],
+    ] {
+        let (stdout, stderr, code) = run(&args, temp.path());
+        assert_eq!(code, 4, "{args:?}: {stderr}");
+        assert!(stdout.is_empty(), "{args:?}: {stdout}");
+        let envelope: serde_json::Value = serde_json::from_str(&stderr).unwrap();
+        assert_eq!(envelope["error"]["kind"], "parse_error");
+        assert_eq!(envelope["error"]["exit_code"], 4);
+        assert!(
+            envelope["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("--fail-on-blocked")
+        );
+    }
+}
+
 /// Error messages from a file parse failure go to stderr, not stdout.
 ///
 /// A corrupted package.json produces a parse error. The error text must appear

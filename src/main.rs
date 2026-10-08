@@ -1668,7 +1668,7 @@ async fn main() {
 }
 
 async fn run() -> Result<()> {
-    let cli = Cli::try_parse().unwrap_or_else(|e| {
+    let cli = Cli::try_parse().and_then(Cli::validate).unwrap_or_else(|e| {
         // Clap uses Err for help/version display too; those are not real errors.
         // Only emit the structured envelope for genuine parse failures.
         // Help and version display are not errors; let clap handle them with its
@@ -3529,7 +3529,13 @@ async fn run_update_with_github(
     }
 
     let has_errors = !total_result.errors.is_empty();
-    let has_pending = has_checkable_manifest_changes(&total_result, filter) || floor_has_planned;
+    let has_pending = has_checkable_manifest_changes(&total_result, filter)
+        || floor_has_planned
+        || (cli.fail_on_blocked
+            && total_result
+                .skipped
+                .iter()
+                .any(|entry| entry.status == SkipStatus::Blocked));
     let exit_code = upd::decide_exit_code(dry_run, has_pending, has_errors);
     Ok(exit_code)
 }
@@ -10235,6 +10241,117 @@ mod output_tests {
         );
     }
 
+    #[tokio::test]
+    async fn fail_on_blocked_check_rejects_unsafe_pins_without_writing() {
+        let temp = tempfile::tempdir().unwrap();
+        let file = temp.path().join(".pre-commit-config.yaml");
+        let config = temp.path().join("upd.toml");
+        std::fs::write(&config, "").unwrap();
+        let input = "repos:\n  - repo: https://github.com/acme/tool\n    rev: main\n    hooks:\n      - id: tool\n";
+        std::fs::write(&file, input).unwrap();
+        for (flag, expected) in [(false, 0), (true, 1)] {
+            let mut args = vec![
+                "upd",
+                "--check",
+                "--no-cache",
+                "--config",
+                config.to_str().unwrap(),
+                file.to_str().unwrap(),
+            ];
+            if flag {
+                args.push("--fail-on-blocked");
+            }
+            let cli = Cli::try_parse_from(args).unwrap();
+            assert_eq!(
+                run_update_with_github(&cli, GitHubReleasesRegistry::new)
+                    .await
+                    .unwrap(),
+                expected
+            );
+            assert_eq!(std::fs::read_to_string(&file).unwrap(), input);
+        }
+    }
+
+    #[tokio::test]
+    async fn fail_on_blocked_does_not_reject_unsupported_docker_digest_pins() {
+        let temp = tempfile::tempdir().unwrap();
+        let file = temp.path().join("Dockerfile");
+        let config = temp.path().join("upd.toml");
+        let input = format!("FROM alpine:3.20@sha256:{}\n", "a".repeat(64));
+        std::fs::write(&config, "").unwrap();
+        std::fs::write(&file, &input).unwrap();
+        let cli = Cli::try_parse_from([
+            "upd",
+            "--check",
+            "--fail-on-blocked",
+            "--no-cache",
+            "--config",
+            config.to_str().unwrap(),
+            file.to_str().unwrap(),
+        ])
+        .unwrap();
+        assert_eq!(
+            run_update_with_github(&cli, GitHubReleasesRegistry::new)
+                .await
+                .unwrap(),
+            0
+        );
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), input);
+    }
+
+    #[tokio::test]
+    async fn fail_on_blocked_preserves_frozen_pre_commit_pins_without_a_lookup() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(503))
+            .expect(0)
+            .mount(&server)
+            .await;
+        let sha = "2c9f875913ee60ca25ce70243dc24d5b6415598c";
+        for (name, input) in [
+            (
+                ".pre-commit-config.yaml",
+                format!(
+                    "repos:\n  - repo: https://github.com/acme/tool\n    rev: {sha}\n    hooks:\n      - id: tool\n"
+                ),
+            ),
+            (
+                "prek.toml",
+                format!(
+                    "[[repos]]\nrepo = 'https://github.com/acme/tool'\nrev = '{sha}'\nhooks = [{{id = 'tool'}}]\n"
+                ),
+            ),
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let file = temp.path().join(name);
+            let config = temp.path().join("upd.toml");
+            std::fs::write(&config, "").unwrap();
+            std::fs::write(&file, &input).unwrap();
+            let cli = Cli::try_parse_from([
+                "upd",
+                "--check",
+                "--fail-on-blocked",
+                "--no-cache",
+                "--config",
+                config.to_str().unwrap(),
+                file.to_str().unwrap(),
+            ])
+            .and_then(Cli::validate)
+            .unwrap();
+            let code = run_update_with_github(&cli, || {
+                GitHubReleasesRegistry::with_api_url_and_token(server.uri(), None)
+            })
+            .await
+            .unwrap();
+            assert_eq!(code, 0, "{name}");
+            assert_eq!(std::fs::read_to_string(&file).unwrap(), input, "{name}");
+        }
+        assert!(server.received_requests().await.unwrap().is_empty());
+    }
+
     fn options_for(cli_flag: Option<bool>, config_key: Option<bool>) -> UpdateOptions {
         let package_filter = PackageFilter::default();
         build_update_options(
@@ -10770,6 +10887,238 @@ mod annotation_scaffolding_tests {
 #[cfg(test)]
 mod checksum_selection_tests {
     use super::*;
+
+    #[tokio::test]
+    async fn self_pin_checksum_requests_fail_the_check_without_rewriting_the_triple() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let old_sha = "1".repeat(40);
+        let new_sha = "2".repeat(40);
+        for (case, expected) in [
+            ("metadata-503", 2),
+            ("metadata-403", 2),
+            ("sidecar-503", 2),
+            ("sidecar-401", 2),
+            ("sidecar-transport", 2),
+            ("missing-release", 1),
+            ("missing-asset", 1),
+            ("sidecar-404", 1),
+            ("malformed-sidecar", 1),
+        ] {
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path("/repos/rvben/upd/releases/latest"))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .set_body_json(serde_json::json!({"tag_name":"v0.15.0"})),
+                )
+                .mount(&server)
+                .await;
+            for (tag, sha) in [("v0.14.2", &old_sha), ("v0.15.0", &new_sha)] {
+                Mock::given(method("GET"))
+                    .and(path(format!("/repos/rvben/upd/commits/{tag}")))
+                    .respond_with(
+                        ResponseTemplate::new(200).set_body_json(serde_json::json!({"sha":sha})),
+                    )
+                    .mount(&server)
+                    .await;
+            }
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let closed_address = listener.local_addr().unwrap();
+            drop(listener);
+            let url = if case == "sidecar-transport" {
+                format!("http://{closed_address}/sidecar")
+            } else {
+                format!("{}/sidecar", server.uri())
+            };
+            let metadata = match case {
+                "metadata-503" => ResponseTemplate::new(503),
+                "metadata-403" => ResponseTemplate::new(403),
+                "missing-release" => ResponseTemplate::new(404),
+                "missing-asset" => {
+                    ResponseTemplate::new(200).set_body_json(serde_json::json!({"assets":[]}))
+                }
+                _ => ResponseTemplate::new(200).set_body_json(serde_json::json!({"assets":[{
+                    "name":"upd-v0.15.0-x86_64-unknown-linux-gnu.tar.gz.sha256", "url":url
+                }]})),
+            };
+            Mock::given(method("GET"))
+                .and(path("/repos/rvben/upd/releases/tags/v0.15.0"))
+                .respond_with(metadata)
+                .mount(&server)
+                .await;
+            Mock::given(method("GET"))
+                .and(path("/sidecar"))
+                .respond_with(match case {
+                    "sidecar-503" => ResponseTemplate::new(503),
+                    "sidecar-401" => ResponseTemplate::new(401),
+                    "sidecar-404" => ResponseTemplate::new(404),
+                    _ => ResponseTemplate::new(200).set_body_string("invalid checksum"),
+                })
+                .mount(&server)
+                .await;
+
+            let temp = tempfile::tempdir().unwrap();
+            let file = temp.path().join(".github/workflows/check.yml");
+            std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+            let config = temp.path().join("upd.toml");
+            std::fs::write(&config, "").unwrap();
+            let input = format!(
+                "jobs:\n  update:\n    uses: rvben/upd/.github/workflows/dependency-health.yml@{old_sha} # v0.14.2\n    with:\n      upd-version: v0.14.2\n      upd-target: x86_64-unknown-linux-gnu\n      upd-sha256: {}\n",
+                "a".repeat(64)
+            );
+            std::fs::write(&file, &input).unwrap();
+            let cli = Cli::try_parse_from([
+                "upd",
+                "--check",
+                "--fail-on-blocked",
+                "--update-action-shas",
+                "--no-cache",
+                "--config",
+                config.to_str().unwrap(),
+                file.to_str().unwrap(),
+            ])
+            .and_then(Cli::validate)
+            .unwrap();
+            let code = run_update_with_github(&cli, || {
+                GitHubReleasesRegistry::with_api_url_and_token(server.uri(), None)
+            })
+            .await
+            .unwrap();
+            assert_eq!(code, expected, "{case}");
+            assert_eq!(std::fs::read_to_string(&file).unwrap(), input, "{case}");
+        }
+    }
+
+    #[tokio::test]
+    async fn blocked_checksums_and_registry_failures_have_distinct_cli_exit_codes() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        for (case, expected) in [
+            ("healthy", 0),
+            ("missing-tag", 1),
+            ("ambiguous-tag", 1),
+            ("missing-asset", 1),
+            ("ambiguous-asset", 1),
+            ("missing-digest", 1),
+            ("malformed-digest", 1),
+            ("mismatch", 1),
+            ("missing-release", 1),
+            ("manifest-conflict", 1),
+            ("manifest-missing-entry", 1),
+            ("tag-outage", 2),
+            ("metadata-outage", 2),
+            ("manifest-outage", 2),
+            ("invalid-response", 2),
+        ] {
+            let server = MockServer::start().await;
+            let tags = match case {
+                "tag-outage" => ResponseTemplate::new(503),
+                "missing-tag" => ResponseTemplate::new(200).set_body_json(serde_json::json!([])),
+                "ambiguous-tag" => ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!([{"name":"v1.2.3"}, {"name":"1.2.3"}])),
+                _ => {
+                    ResponseTemplate::new(200).set_body_json(serde_json::json!([{"name":"v1.2.3"}]))
+                }
+            };
+            Mock::given(method("GET"))
+                .and(path("/repos/acme/tool/tags"))
+                .respond_with(tags)
+                .mount(&server)
+                .await;
+            let digest = match case {
+                "missing-digest" | "manifest-outage" => None,
+                "malformed-digest" => Some("sha256:invalid".to_string()),
+                "mismatch" => Some(format!("sha256:{}", "b".repeat(64))),
+                _ => Some(format!("sha256:{}", "a".repeat(64))),
+            };
+            let asset = serde_json::json!({
+                "name":"tool-v1.2.3.tar.gz", "state":"uploaded", "digest":digest
+            });
+            let assets = match case {
+                "missing-asset" => vec![],
+                "ambiguous-asset" => vec![asset.clone(), asset],
+                case if case.starts_with("manifest-") => vec![
+                    asset,
+                    serde_json::json!({"name":"SUMS.txt", "state":"uploaded", "url":format!("{}/checksum-manifest", server.uri())}),
+                ],
+                _ => vec![asset],
+            };
+            let metadata = match case {
+                "metadata-outage" => ResponseTemplate::new(503),
+                "missing-release" => ResponseTemplate::new(404),
+                "invalid-response" => ResponseTemplate::new(200).set_body_string("not JSON"),
+                _ => ResponseTemplate::new(200).set_body_json(serde_json::json!({"assets":assets})),
+            };
+            Mock::given(method("GET"))
+                .and(path("/repos/acme/tool/releases/tags/v1.2.3"))
+                .respond_with(metadata)
+                .mount(&server)
+                .await;
+            Mock::given(method("GET"))
+                .and(path("/checksum-manifest"))
+                .respond_with(match case {
+                    "manifest-conflict" => ResponseTemplate::new(200)
+                        .set_body_string(format!("{}  tool-v1.2.3.tar.gz\n", "b".repeat(64))),
+                    "manifest-missing-entry" => ResponseTemplate::new(200)
+                        .set_body_string(format!("{}  other.tar.gz\n", "a".repeat(64))),
+                    _ => ResponseTemplate::new(503),
+                })
+                .mount(&server)
+                .await;
+
+            let temp = tempfile::tempdir().unwrap();
+            let file = temp.path().join("versions.sh");
+            let blocked = temp.path().join(".pre-commit-config.yaml");
+            let config = temp.path().join("upd.toml");
+            std::fs::write(&config, "[pin]\n\"acme/tool\" = \"1.2.3\"\n").unwrap();
+            let manifest = if case.starts_with("manifest-") {
+                " checksums=SUMS.txt"
+            } else {
+                ""
+            };
+            let input = format!(
+                "TOOL_VERSION='1.2.3' # upd: github-releases acme/tool\nSUM='{}' # upd: checksum TOOL_VERSION asset=tool-{{tag}}.tar.gz{manifest}\n",
+                "a".repeat(64)
+            );
+            let blocked_input = "repos:\n  - repo: https://github.com/acme/blocked\n    rev: main\n    hooks:\n      - id: blocked\n";
+            std::fs::write(&file, &input).unwrap();
+            std::fs::write(&blocked, blocked_input).unwrap();
+            for mixed in [false, true] {
+                let mut args = vec![
+                    "upd",
+                    "--check",
+                    "--fail-on-blocked",
+                    "--no-cache",
+                    "--config",
+                    config.to_str().unwrap(),
+                    file.to_str().unwrap(),
+                ];
+                if mixed {
+                    args.push(blocked.to_str().unwrap());
+                }
+                let cli = Cli::try_parse_from(args).unwrap();
+                let code = run_update_with_github(&cli, || {
+                    GitHubReleasesRegistry::with_api_url_and_token(server.uri(), None)
+                })
+                .await
+                .unwrap();
+                assert_eq!(
+                    code,
+                    if mixed { expected.max(1) } else { expected },
+                    "{case}, mixed={mixed}"
+                );
+                assert_eq!(std::fs::read_to_string(&file).unwrap(), input, "{case}");
+                assert_eq!(
+                    std::fs::read_to_string(&blocked).unwrap(),
+                    blocked_input,
+                    "{case}"
+                );
+            }
+        }
+    }
 
     fn checksum_updater_at(api_url: &str) -> AnnotatedUpdater {
         let cache = Arc::new(Mutex::new(Cache::default()));

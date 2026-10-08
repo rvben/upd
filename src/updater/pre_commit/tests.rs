@@ -527,7 +527,7 @@ async fn a_guarded_rev_is_reported_without_a_lookup_while_its_neighbour_updates(
     assert_eq!(result.skipped[0].current, sha);
     assert_eq!(
         result.skipped[0].status,
-        crate::updater::SkipStatus::Blocked
+        crate::updater::SkipStatus::NotExamined
     );
     assert_eq!(result.skipped[0].reason, "sha-pinned-rev");
     assert_eq!(result.skipped[0].line_number, Some(6));

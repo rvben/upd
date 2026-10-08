@@ -3,7 +3,7 @@ use super::{
     downgrade_warning, read_file_safe, write_file_atomic,
 };
 use crate::align::compare_versions;
-use crate::registry::{Registry, is_ref_not_found};
+use crate::registry::{Registry, RegistryRequestError, is_ref_not_found};
 use crate::updater::Lang;
 use anyhow::Result;
 use futures::future::join_all;
@@ -143,14 +143,18 @@ enum SelfPinFetchFailure {
     /// The release's `<asset>.sha256` sidecar could not be read, or did not
     /// contain a recognizable digest.
     ChecksumUnavailable(String),
+    /// The registry could not answer; this is a failed run, not a safety refusal.
+    Failed(String),
 }
 
 impl SelfPinFetchFailure {
     /// Stable token for machine-readable output.
+    /// `Failed` has no emitted token: request failures go to errors instead.
     fn reason(&self) -> &'static str {
         match self {
             Self::TargetUnknown(_) => "self-pin-target-unknown",
             Self::ChecksumUnavailable(_) => "self-pin-checksum-unavailable",
+            Self::Failed(_) => "self-pin-checksum-unavailable",
         }
     }
 
@@ -161,6 +165,9 @@ impl SelfPinFetchFailure {
             ),
             Self::ChecksumUnavailable(error) => format!(
                 "could not read the release checksum sidecar for {owner_repo}@{target_version}: {error}"
+            ),
+            Self::Failed(error) => format!(
+                "failed to fetch the release checksum sidecar for {owner_repo}@{target_version}: {error}"
             ),
         }
     }
@@ -206,7 +213,13 @@ async fn fetch_self_pin_checksum(
     let sidecar_bytes = registry
         .release_asset("rvben/upd", target_version, &format!("{asset_name}.sha256"))
         .await
-        .map_err(|error| SelfPinFetchFailure::ChecksumUnavailable(error.to_string()))?;
+        .map_err(|error| {
+            if error.downcast_ref::<RegistryRequestError>().is_some() {
+                SelfPinFetchFailure::Failed(format!("{error:#}"))
+            } else {
+                SelfPinFetchFailure::ChecksumUnavailable(format!("{error:#}"))
+            }
+        })?;
     let sidecar_text = String::from_utf8_lossy(&sidecar_bytes);
     let sidecar_sha256 = sidecar_text
         .split_whitespace()
@@ -1442,15 +1455,20 @@ impl Updater for GithubActionsUpdater {
                                     self_pin_rewrites.push((*sha_idx, sha_line));
                                 }
                                 Err(failure) => {
-                                    result.skipped.push(super::SkippedUpdate {
-                                        package: action.owner_repo.clone(),
-                                        current: current_version.clone(),
-                                        status: SkipStatus::Blocked,
-                                        reason: failure.reason(),
-                                        message: failure
-                                            .message(&action.owner_repo, &target_version),
-                                        line_number: Some(line_num),
-                                    });
+                                    let message =
+                                        failure.message(&action.owner_repo, &target_version);
+                                    if matches!(failure, SelfPinFetchFailure::Failed(_)) {
+                                        result.errors.push(message);
+                                    } else {
+                                        result.skipped.push(super::SkippedUpdate {
+                                            package: action.owner_repo.clone(),
+                                            current: current_version.clone(),
+                                            status: SkipStatus::Blocked,
+                                            reason: failure.reason(),
+                                            message,
+                                            line_number: Some(line_num),
+                                        });
+                                    }
                                     result.keep_annotation(&options, annotation);
                                     new_lines.push(kept_line);
                                     continue;

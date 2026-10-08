@@ -16,7 +16,7 @@ use crate::annotation::{
 use crate::cache::CachedRegistry;
 use crate::registry::{
     CratesIoRegistry, GitHubReleasesRegistry, GoProxyRegistry, MultiPyPiRegistry, NpmRegistry,
-    NuGetRegistry, Registry, RubyGemsRegistry,
+    NuGetRegistry, Registry, RegistryRequestError, RubyGemsRegistry,
 };
 use crate::updater::{GoModUpdater, Lang};
 use crate::version::match_version_precision;
@@ -498,7 +498,10 @@ impl AnnotatedUpdater {
                 "checksum-linked version must name the complete release; use --full-precision"
             );
             let tag = if pinned {
-                let names = registry.list_ref_names(&line.package).await?;
+                let names = registry
+                    .list_ref_names(&line.package)
+                    .await
+                    .map_err(RegistryRequestError::new)?;
                 let matches: Vec<_> = names
                     .into_iter()
                     .filter(|name| name.trim_start_matches('v') == target.trim_start_matches('v'))
@@ -537,6 +540,14 @@ impl AnnotatedUpdater {
                 true
             }
             Err(error) => {
+                if error.downcast_ref::<RegistryRequestError>().is_some() {
+                    result.errors.push(format!(
+                        "{}: failed to resolve checksum at line {}: {error:#}",
+                        line.package,
+                        line.line_idx + 1
+                    ));
+                    return false;
+                }
                 result.skipped.push(super::SkippedUpdate {
                     package: line.package.clone(),
                     current: line.version.clone(),

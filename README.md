@@ -196,12 +196,23 @@ upd --lang prek
 # Exit 1 if anything is outdated (for CI and pre-commit)
 upd --check
 
+# Also reject unsafe or unverifiable dependencies blocked by safety checks
+upd --check --fail-on-blocked
+
 # Regenerate lockfiles after writing; a failed refresh rolls its directory back
 upd --apply --lock
 
 # Print the effective configuration and exit
 upd --show-config
 ```
+
+`--fail-on-blocked` is supported only by `upd update` or the default `upd`
+invocation. `--check --fail-on-blocked` exits 1 for safety refusals and 2 for
+failed registry requests. Unsupported Docker digest-pin and pre-commit frozen
+commit-pin updates remain `not-examined` and do not fail this check; their pins
+are left unchanged without revision verification. The reusable workflow's
+`fail-on-blocked` input additionally covers unfixable or skipped version floors
+and blocked security relocks; see [GitHub Actions](docs/github-actions.md).
 
 `upd --help` lists every flag; [Stability](https://github.com/rvben/upd/blob/main/docs/stability.md)
 documents the ones that are contractual, and `upd schema` emits the whole

@@ -1,6 +1,6 @@
 use crate::package_filter::parse_package_pattern;
 use crate::updater::Lang;
-use clap::{Parser, Subcommand, ValueEnum};
+use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
 use std::path::PathBuf;
 
 pub const REVERT_TIP: &str = "Tip: changes are applied in-place - use git to revert.";
@@ -202,6 +202,11 @@ pub struct Cli {
     /// Intended for CI pipelines that should fail when dependencies are outdated.
     #[arg(long, global = true)]
     pub check: bool,
+
+    /// With --check, also exit 1 when an unsafe or unverifiable dependency is blocked.
+    /// Normal cooldown holds, bump limits, and unexamined pins do not count.
+    #[arg(long, global = true)]
+    pub fail_on_blocked: bool,
 
     /// Regenerate lockfiles after updating or fixing.
     ///
@@ -566,6 +571,37 @@ pub enum GitlabLane {
 }
 
 impl Cli {
+    /// Validate relationships after global flags have propagated across command levels.
+    pub fn validate(self) -> Result<Self, clap::Error> {
+        if self.fail_on_blocked {
+            if !matches!(self.command.as_ref(), None | Some(Command::Update { .. })) {
+                return Err(Self::command().error(
+                    clap::error::ErrorKind::ArgumentConflict,
+                    "--fail-on-blocked is supported only by update",
+                ));
+            }
+            if self.show_config {
+                return Err(Self::command().error(
+                    clap::error::ErrorKind::ArgumentConflict,
+                    "--fail-on-blocked cannot be combined with --show-config",
+                ));
+            }
+            if !self.check {
+                return Err(Self::command().error(
+                    clap::error::ErrorKind::MissingRequiredArgument,
+                    "--fail-on-blocked requires --check",
+                ));
+            }
+            if self.interactive {
+                return Err(Self::command().error(
+                    clap::error::ErrorKind::ArgumentConflict,
+                    "--fail-on-blocked cannot be combined with --interactive",
+                ));
+            }
+        }
+        Ok(self)
+    }
+
     /// Returns true when a run should be dry-run.
     ///
     /// Dry-run is implied by --check, --dry-run, or the absence of --apply/--yes
@@ -1027,6 +1063,99 @@ mod tests {
     fn test_cli_parses_check() {
         let cli = Cli::try_parse_from(["upd", "--check"]).unwrap();
         assert!(cli.check);
+    }
+
+    #[test]
+    fn fail_on_blocked_requires_check() {
+        for args in [
+            vec!["upd", "--fail-on-blocked"],
+            vec!["upd", "update", "--fail-on-blocked"],
+        ] {
+            let error = Cli::try_parse_from(args)
+                .and_then(Cli::validate)
+                .err()
+                .unwrap();
+            assert_eq!(
+                error.kind(),
+                clap::error::ErrorKind::MissingRequiredArgument
+            );
+        }
+        let cli = Cli::try_parse_from(["upd", "--check", "--fail-on-blocked"])
+            .and_then(Cli::validate)
+            .unwrap();
+        assert!(cli.fail_on_blocked);
+    }
+
+    #[test]
+    fn fail_on_blocked_accepts_check_across_command_levels() {
+        for args in [
+            ["upd", "--check", "update", "--fail-on-blocked"],
+            ["upd", "--fail-on-blocked", "update", "--check"],
+            ["upd", "update", "--check", "--fail-on-blocked"],
+        ] {
+            let cli = Cli::try_parse_from(args).and_then(Cli::validate).unwrap();
+            assert!(cli.check && cli.fail_on_blocked);
+        }
+    }
+
+    #[test]
+    fn fail_on_blocked_rejects_commands_that_do_not_honor_it() {
+        for command in [
+            "audit",
+            "align",
+            "lock-refresh",
+            "schema",
+            "capabilities",
+            "clean-cache",
+            "self-update",
+        ] {
+            for args in [
+                vec!["upd", "--check", "--fail-on-blocked", command],
+                vec!["upd", command, "--check", "--fail-on-blocked"],
+            ] {
+                let error = Cli::try_parse_from(args)
+                    .and_then(Cli::validate)
+                    .err()
+                    .unwrap();
+                assert_eq!(
+                    error.kind(),
+                    clap::error::ErrorKind::ArgumentConflict,
+                    "{command}"
+                );
+            }
+        }
+        let error = Cli::try_parse_from(["upd", "--check", "--fail-on-blocked", "--show-config"])
+            .and_then(Cli::validate)
+            .err()
+            .unwrap();
+        assert_eq!(error.kind(), clap::error::ErrorKind::ArgumentConflict);
+    }
+
+    #[test]
+    fn fail_on_blocked_rejects_interactive_mode() {
+        for args in [
+            vec!["upd", "--check", "--fail-on-blocked", "--interactive"],
+            vec![
+                "upd",
+                "--check",
+                "--fail-on-blocked",
+                "update",
+                "--interactive",
+            ],
+            vec![
+                "upd",
+                "--check",
+                "--interactive",
+                "update",
+                "--fail-on-blocked",
+            ],
+        ] {
+            let error = Cli::try_parse_from(args)
+                .and_then(Cli::validate)
+                .err()
+                .expect("interactive mode cannot honor the blocked check exit code");
+            assert_eq!(error.kind(), clap::error::ErrorKind::ArgumentConflict);
+        }
     }
 
     #[test]

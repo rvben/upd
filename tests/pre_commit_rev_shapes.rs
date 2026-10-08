@@ -103,6 +103,48 @@ fn only_skipped(report: &Value) -> &Value {
     &entries[0]
 }
 
+#[test]
+fn strict_check_distinguishes_frozen_pins_from_unsafe_revision_shapes() {
+    for (name, make) in [
+        (".pre-commit-config.yaml", yaml as fn(&str) -> String),
+        ("prek.toml", toml as fn(&str) -> String),
+    ] {
+        for (rev, status, reason, code) in [
+            (DESTROYED_SHA, "not-examined", "sha-pinned-rev", 0),
+            ("main", "blocked", "unrecognized-rev", 1),
+            ("2c9f875", "blocked", "unrecognized-rev", 1),
+        ] {
+            let input = make(rev);
+            let dir = fixture(name, &input);
+            let output = run(
+                &dir,
+                name,
+                &[
+                    "--check",
+                    "--fail-on-blocked",
+                    "--no-cache",
+                    "--output",
+                    "json",
+                ],
+            );
+            assert_eq!(
+                output.status.code(),
+                Some(code),
+                "{name}: {rev}: {output:?}"
+            );
+            let report = json_of(&output);
+            let entry = only_skipped(&report);
+            assert_eq!(entry["status"], status, "{report:#}");
+            assert_eq!(entry["reason"], reason, "{report:#}");
+            assert_eq!(report["summary"]["errors"], 0, "{report:#}");
+            assert_eq!(
+                std::fs::read_to_string(dir.path().join(name)).unwrap(),
+                input
+            );
+        }
+    }
+}
+
 /// Apply a run over one config and return the file as it stands afterwards,
 /// together with the JSON report.
 fn apply(dir: &TempDir, name: &str, extra: &[&str]) -> (String, Value) {
@@ -123,7 +165,7 @@ fn a_commit_pinned_rev_survives_apply_and_is_reported() {
     assert_eq!(written, original, "the commit pin was rewritten");
 
     let entry = only_skipped(&report);
-    assert_eq!(entry["status"], "blocked", "report: {report:#}");
+    assert_eq!(entry["status"], "not-examined", "report: {report:#}");
     assert_eq!(entry["reason"], "sha-pinned-rev", "report: {report:#}");
     assert_eq!(entry["package"], REPO, "report: {report:#}");
     assert_eq!(entry["current"], DESTROYED_SHA, "report: {report:#}");
@@ -144,7 +186,7 @@ fn a_commit_pinned_rev_that_survived_by_luck_is_still_reported() {
 
     assert_eq!(written, original, "the commit pin was rewritten");
     let entry = only_skipped(&report);
-    assert_eq!(entry["status"], "blocked", "report: {report:#}");
+    assert_eq!(entry["status"], "not-examined", "report: {report:#}");
     assert_eq!(entry["reason"], "sha-pinned-rev", "report: {report:#}");
 }
 
@@ -214,7 +256,7 @@ fn prek_toml_guards_the_same_rev_shapes() {
 
     assert_eq!(written, original, "the commit pin was rewritten");
     let entry = only_skipped(&report);
-    assert_eq!(entry["status"], "blocked", "report: {report:#}");
+    assert_eq!(entry["status"], "not-examined", "report: {report:#}");
     assert_eq!(entry["reason"], "sha-pinned-rev", "report: {report:#}");
 }
 
@@ -235,15 +277,15 @@ fn a_readable_rev_is_still_rewritten() {
     );
 }
 
-/// A config whose only rev was never checked must not close on the green tick,
-/// and the line naming it has to say what upd refused to do.
+/// A config whose only rev was never checked must not close on the green tick;
+/// verbose output names the pin that was left unexamined.
 #[test]
 fn the_text_summary_does_not_claim_up_to_date_for_an_unchecked_rev() {
     let dir = fixture(".pre-commit-config.yaml", &yaml(DESTROYED_SHA));
     let stdout = stdout_of(&run(
         &dir,
         ".pre-commit-config.yaml",
-        &["--dry-run", "--no-cache", "--output", "text"],
+        &["--dry-run", "--no-cache", "--output", "text", "--verbose"],
     ));
 
     assert!(
@@ -251,8 +293,8 @@ fn the_text_summary_does_not_claim_up_to_date_for_an_unchecked_rev() {
         "the only rev was never looked at:\n{stdout}"
     );
     assert!(
-        stdout.contains("Blocked") && stdout.contains("sha-pinned-rev"),
-        "the line must name the refusal and its reason:\n{stdout}"
+        stdout.contains("Not checked") && stdout.contains("sha-pinned-rev"),
+        "verbose output must name the unsupported pin and its reason:\n{stdout}"
     );
     assert!(
         stdout.contains(DESTROYED_SHA),

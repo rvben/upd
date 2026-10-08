@@ -289,15 +289,26 @@ that project asked for.
 | Code | Meaning |
 |------|---------|
 | `0` | Success. No action required, or updates applied cleanly |
-| `1` | Pending updates or misalignments found (dry-run / `--check`). Not an error. |
+| `1` | Pending updates or misalignments found (dry-run / `--check`), or `upd --check --fail-on-blocked` found a dependency refused by a safety check. Not an error. Unsupported or unexamined pins, ordinary cooldown holds and bump limits do not count as safety refusals. |
 | `2` | An error was reported. A file could not be read/written, a required path does not exist, a lockfile refresh failed (its directory is put back as the run found it), a dependency could not be checked (its constraint could not be read, or its registry lookup did not answer), or `--interactive` was given with no terminal on stdin. Takes precedence over every other code. An interactive session reports these the same way a plain run does, after applying whatever it approved |
 | `3` | Network error. A registry was unreachable or timed out |
 | `4` | Invalid CLI arguments or an unparseable dependency file / configuration |
 | `6` | Vulnerabilities found (`upd audit`). Under `--fix-audit`, a vulnerability left unresolved: its fix was blocked, skipped, or reported unfixable, or `--no-lock` left the lockfile at the vulnerable release when the manifest already required the fix, even when other fixes in the run applied. Pass `--no-fail` to force exit 0. |
 
 > The authoritative exit-code contract is emitted by `upd schema` (`outcomes` and
-> `errors`). A bare `upd` / `upd audit` already signals these codes; `--check` does
-> not change `update`/`audit` exit codes (it gates `align`, which otherwise exits 0).
+> `errors`). A bare `upd` / `upd audit` already signals these codes. `--check` makes
+> `update` read-only and gates `align`, which otherwise exits 0. With `update`,
+> `--check --fail-on-blocked` additionally exits 1 for safety refusals; failed
+> registry requests still exit 2 and take precedence. `--fail-on-blocked` is
+> rejected on other subcommands and with `--interactive` or `--show-config`.
+
+A release or checksum-asset lookup answered with HTTP 404 is treated as missing
+metadata and a safety refusal. GitHub can also use 404 to conceal a private
+repository, so check credentials when an expected release is missing. Other
+unsuccessful HTTP statuses, transport or body-read failures, and release-metadata
+JSON that cannot be decoded are request errors. Successfully received checksum
+contents that fail validation remain safety refusals. A failed
+tag-list request is always an error, including 404, because no list was obtained.
 
 ## Stable output
 

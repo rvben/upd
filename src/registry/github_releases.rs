@@ -1,4 +1,7 @@
-use super::{RefNotFound, Registry, TagsAtCommit, VersionMeta, get_with_retry, http_error_message};
+use super::{
+    RefNotFound, Registry, RegistryRequestError, TagsAtCommit, VersionMeta, get_with_retry,
+    http_error_message,
+};
 use crate::version::TagVersion;
 use anyhow::{Result, anyhow};
 use async_trait::async_trait;
@@ -151,17 +154,28 @@ impl GitHubReleasesRegistry {
                     .map_err(|_| anyhow!("Invalid GitHub API URL"))?
                     .pop_if_empty()
                     .extend(["repos", owner, repo, "releases", "tags", tag]);
-                let response = get_with_retry(&self.client, url.as_str()).await?;
-                anyhow::ensure!(
-                    response.status().is_success(),
-                    "Cannot read release {package}@{tag}: HTTP {}",
-                    response.status()
-                );
+                let response = get_with_retry(&self.client, url.as_str())
+                    .await
+                    .map_err(RegistryRequestError::new)?;
+                if !response.status().is_success() {
+                    let error = anyhow!(
+                        "Cannot read release {package}@{tag}: HTTP {}",
+                        response.status()
+                    );
+                    return Err(if response.status() == reqwest::StatusCode::NOT_FOUND {
+                        error
+                    } else {
+                        RegistryRequestError::new(error).into()
+                    });
+                }
                 #[derive(Deserialize)]
                 struct Release {
                     assets: Vec<ReleaseAsset>,
                 }
-                let release: Release = response.json().await?;
+                let release: Release = response
+                    .json()
+                    .await
+                    .map_err(|error| RegistryRequestError::new(error.into()))?;
                 Ok::<_, anyhow::Error>(Arc::new(release.assets))
             })
             .await?;
@@ -200,15 +214,28 @@ impl GitHubReleasesRegistry {
         let mut headers = HeaderMap::new();
         headers.insert(ACCEPT, HeaderValue::from_static("application/octet-stream"));
         let mut asset_response =
-            super::get_with_retry_and_headers(&self.client, &asset.url, Some(&headers)).await?;
+            super::get_with_retry_and_headers(&self.client, &asset.url, Some(&headers))
+                .await
+                .map_err(RegistryRequestError::new)?;
         if !asset_response.status().is_success() {
-            return Err(anyhow!(
+            let error = anyhow!(
                 "Cannot download asset {asset_name} for {package}@{tag}: HTTP {}",
                 asset_response.status()
-            ));
+            );
+            return Err(
+                if asset_response.status() == reqwest::StatusCode::NOT_FOUND {
+                    error
+                } else {
+                    RegistryRequestError::new(error).into()
+                },
+            );
         }
         let mut bytes = Vec::new();
-        while let Some(chunk) = asset_response.chunk().await? {
+        while let Some(chunk) = asset_response
+            .chunk()
+            .await
+            .map_err(|error| RegistryRequestError::new(error.into()))?
+        {
             if bytes.len() + chunk.len() > 2 * 1024 * 1024 {
                 return Err(anyhow!("Release asset {asset_name} response exceeds 2 MiB"));
             }

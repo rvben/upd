@@ -654,9 +654,9 @@ impl Updater for DockerUpdater {
                 result.skipped.push(SkippedUpdate {
                     package: dependency.image.clone(),
                     current: dependency.tag.clone(),
-                    status: SkipStatus::Blocked,
+                    status: SkipStatus::NotExamined,
                     reason: "digest-pin",
-                    message: "tag-and-digest references require verified digest resolution"
+                    message: "digest-pinned image updates are not supported; no registry verification was performed"
                         .to_string(),
                     line_number,
                 });

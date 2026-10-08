@@ -286,7 +286,7 @@ only Contents and Pull requests write for the target repository.
 | `prepare-command` | empty | Prepare project tooling without changing repository files |
 | `validation-command` | empty | Check updates before publishing |
 | `validate-actions` | `true` | Run `actionlint` when workflow files change |
-| `fail-on-blocked` | `false` | Fail when a safety condition blocks an update |
+| `fail-on-blocked` | `false` | Fail for blocked safety checks, unfixable or skipped version floors, or blocked security relocks |
 | `branch` | `automation/upd-github-actions` | Automation-owned rolling branch |
 | `commit-message` | `ci(deps): update dependencies with upd` | Generated commit message |
 | `pull-request-title` | derived from update evidence | Optional pull-request title override |
@@ -375,6 +375,11 @@ configured target, or trailing text where the annotation would go is reported as
 `blocked` with a machine-readable reason. With `update-action-shas: false`, these
 pins are instead reported as `not-examined`. Set `fail-on-blocked: true` when
 every immutable pin is expected to be maintainable automatically.
+
+The reusable workflow input `fail-on-blocked` covers more outcomes than the
+CLI flag `--check --fail-on-blocked`: it also fails for version floors reported
+as `unfixable` or `skipped`, and security fixes whose relock is `blocked`. The
+CLI flag counts only update entries in `skipped[]` with status `blocked`.
 
 Interactive runs report annotations but do not write them; run without
 `--interactive` to apply them.

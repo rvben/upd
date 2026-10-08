@@ -48,6 +48,13 @@ enum UnreadableRev {
 }
 
 impl UnreadableRev {
+    fn status(self) -> SkipStatus {
+        match self {
+            Self::CommitPin => SkipStatus::NotExamined,
+            Self::NotAVersion => SkipStatus::Blocked,
+        }
+    }
+
     /// Stable token for machine-readable output. The two are separate because
     /// they are differently actionable: a commit pin is a choice someone made,
     /// while anything else is usually a revision the maintainer would want to
@@ -353,7 +360,7 @@ impl PreCommitUpdater {
             result.skipped.push(SkippedUpdate {
                 package: repo.into(),
                 current: current.clone(),
-                status: SkipStatus::Blocked,
+                status: unreadable.status(),
                 reason: unreadable.reason(),
                 message: unreadable.message(current),
                 line_number: line,
