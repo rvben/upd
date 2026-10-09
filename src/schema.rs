@@ -212,7 +212,7 @@ fn build_schema() -> Value {
                     {"name": "files", "type": "array", "items": {"type": "object"}, "description": "File paths, version/checksum annotation counts and diagnostics with one-based lines and messages"},
                     {"name": "summary", "type": "object", "description": "files, versions, checksums and errors totals"}
                 ],
-                "example": {"args": ["annotations", "validate", "Dockerfile"]}
+                "example": {"args": ["annotations", "validate", "benchmarks/install-tools.sh"]}
             },
             {
                 "name": "annotations init",
