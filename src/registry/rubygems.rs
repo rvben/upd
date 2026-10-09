@@ -150,6 +150,15 @@ impl Registry for RubyGemsRegistry {
         ))
     }
 
+    // Publication timestamps come from the registry's own upload metadata.
+    async fn list_versions_for_cooldown(
+        &self,
+        package: &str,
+        _strict: bool,
+    ) -> Result<Vec<VersionMeta>> {
+        self.list_versions(package).await
+    }
+
     async fn list_versions(&self, package: &str) -> Result<Vec<VersionMeta>> {
         let url = format!("{}/api/v1/versions/{}.json", self.api_url, package);
         let response = get_with_retry(&self.client, &url).await?;

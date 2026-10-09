@@ -5,7 +5,7 @@ use super::{
     unrewritable_warning, write_file_atomic,
 };
 use crate::align::compare_versions;
-use crate::registry::{DeclaredIndex, IndexChain, Registry, VersionQuery};
+use crate::registry::{DeclaredIndex, IndexChain, Registry};
 use crate::updater::Lang;
 use crate::version::{is_prerelease_pep440, match_version_precision};
 use anyhow::Result;
@@ -193,27 +193,7 @@ impl RequirementsUpdater {
     /// Check if constraint is a simple single-version constraint that doesn't need
     /// constraint-aware lookup (i.e., no upper bounds that could be violated)
     fn is_simple_constraint(constraint: &str) -> bool {
-        // If there are multiple constraints (comma-separated), need constraint-aware lookup
-        if constraint.contains(',') {
-            return false;
-        }
-
-        // If the constraint has an upper-bound operator, need constraint-aware lookup
-        // Examples: "<4.2", "<=2.0", "~=1.4" (compatible release - allows only patch updates)
-        if constraint.starts_with('<')
-            || constraint.starts_with("<=")
-            || constraint.starts_with("~=")
-        {
-            return false;
-        }
-
-        // Also check for != which could affect version selection
-        if constraint.starts_with("!=") {
-            return false;
-        }
-
-        // Simple constraints like "==1.0.0", ">=1.0.0", ">1.0.0" are fine
-        true
+        super::is_simple_python_constraint(constraint)
     }
 
     /// Where this line's floor version sits, and whether it is one an update may
@@ -394,28 +374,15 @@ impl Updater for RequirementsUpdater {
                     // already admits. Asking for the newest release *matching*
                     // it would answer that with itself.
                     effective_registry.get_latest_version(&parsed.package).await
-                } else if is_prerelease_pep440(&parsed.first_version) {
-                    python_version_with_revalidation(
-                        effective_registry,
-                        &parsed.package,
-                        &parsed.first_version,
-                        VersionQuery::IncludingPrereleases,
-                    )
-                    .await
-                } else if Self::is_simple_constraint(&parsed.full_constraint) {
-                    python_version_with_revalidation(
-                        effective_registry,
-                        &parsed.package,
-                        &parsed.first_version,
-                        VersionQuery::Stable,
-                    )
-                    .await
                 } else {
                     python_version_with_revalidation(
                         effective_registry,
                         &parsed.package,
                         &parsed.first_version,
-                        VersionQuery::Matching(&parsed.full_constraint),
+                        super::python_resolution_query(
+                            Some(&parsed.full_constraint),
+                            is_prerelease_pep440(&parsed.first_version),
+                        ),
                     )
                     .await
                 }
@@ -527,13 +494,19 @@ impl Updater for RequirementsUpdater {
                             let scoped = effective_registry
                                 .for_dependency(line)
                                 .expect("marker validated before lookup");
-                            let (outcome, note) = crate::updater::apply_cooldown(
+                            let (outcome, note) = crate::updater::apply_cooldown_for_query(
                                 &scoped,
                                 &parsed.package,
                                 &parsed.first_version,
                                 &latest_version,
                                 constraints_for_cooldown,
-                                current_is_prerelease,
+                                super::CooldownSelection {
+                                    current_is_prerelease,
+                                    query: super::python_resolution_query(
+                                        Some(&parsed.full_constraint),
+                                        current_is_prerelease,
+                                    ),
+                                },
                                 &options,
                             )
                             .await;
@@ -547,6 +520,11 @@ impl Updater for RequirementsUpdater {
                                     skipped_version,
                                     skipped_published_at,
                                 } => (chosen, Some((skipped_version, skipped_published_at))),
+                                crate::updater::CooldownOutcome::LookupFailed { error } => {
+                                    result.errors.push(error);
+                                    new_lines.push(line.to_string());
+                                    continue;
+                                }
                                 crate::updater::CooldownOutcome::Skipped {
                                     skipped_version,
                                     skipped_published_at,

@@ -1,6 +1,7 @@
 use super::*;
 use crate::annotation::AnnotationSource;
 use crate::config::UpdConfig;
+use crate::cooldown::CooldownPolicy;
 use crate::registry::{GitHubReleasesRegistry, MockRegistry};
 use std::sync::Arc;
 use wiremock::{
@@ -251,6 +252,7 @@ async fn cooldown_uses_the_dependency_ecosystem_and_python_patch_classification(
         CooldownPolicy {
             default: Duration::zero(),
             per_ecosystem: HashMap::from([("pypi".into(), Duration::days(7))]),
+            strict: false,
             force_override: None,
         },
         now,
@@ -301,6 +303,7 @@ async fn revision_cooldown_and_precision_also_apply_to_toml() {
         CooldownPolicy {
             default: Duration::days(7),
             per_ecosystem: HashMap::new(),
+            strict: false,
             force_override: None,
         },
         now,
@@ -398,6 +401,7 @@ async fn same_named_cooldown_entries_report_their_own_registry_and_policy() {
                 ("pypi".into(), Duration::days(7)),
                 ("crates.io".into(), Duration::days(10)),
             ]),
+            strict: false,
             force_override: None,
         };
         let options = UpdateOptions::new(true, false).with_cooldown_policy(policy.clone(), now);
@@ -721,6 +725,7 @@ async fn update_with_cooldown_keys(
             .iter()
             .map(|(key, days)| ((*key).to_string(), Duration::days(*days)))
             .collect(),
+        strict: false,
         force_override: None,
     };
     let options = UpdateOptions::new(false, false)
@@ -763,4 +768,44 @@ async fn an_ignored_or_filtered_repository_with_an_unreadable_rev_is_not_reporte
     .await;
     assert!(result.skipped.is_empty(), "{result:?}");
     assert_eq!(written, original);
+}
+
+#[tokio::test]
+async fn strict_cooldown_holds_tag_only_revisions_but_an_explicit_pin_still_applies() {
+    use chrono::{Duration, Utc};
+    let registry = MockRegistry::new("github-releases").with_version("owner/repo", "v1.2.0");
+    for pinned in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join(".pre-commit-config.yaml");
+        let original = "repos:\n  - repo: https://github.com/owner/repo\n    rev: v1.0.0\n    hooks: [{id: sample}]\n";
+        std::fs::write(&file, original).unwrap();
+        let mut options = UpdateOptions::new(false, false).with_cooldown_policy(
+            CooldownPolicy {
+                strict: true,
+                default: Duration::days(7),
+                ..Default::default()
+            },
+            Utc::now(),
+        );
+        if pinned {
+            options = options.with_config(Arc::new(UpdConfig {
+                pin: HashMap::from([("owner/repo".into(), "v1.2.0".into())]),
+                ..Default::default()
+            }));
+        }
+        let result = updater().update(&file, &registry, options).await.unwrap();
+        assert!(result.errors.is_empty(), "{result:?}");
+        if pinned {
+            assert_eq!(result.pinned.len(), 1, "{result:?}");
+            assert!(
+                std::fs::read_to_string(file)
+                    .unwrap()
+                    .contains("rev: v1.2.0")
+            );
+        } else {
+            assert_eq!(std::fs::read_to_string(file).unwrap(), original);
+            assert_eq!(result.skipped_by_cooldown.len(), 1, "{result:?}");
+            assert!(result.skipped_by_cooldown[0].3.is_none());
+        }
+    }
 }

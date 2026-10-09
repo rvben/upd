@@ -408,6 +408,10 @@ impl PreCommitUpdater {
                     held_back = Some((skipped_version, skipped_published_at));
                     chosen
                 }
+                CooldownOutcome::LookupFailed { error } => {
+                    result.errors.push(error);
+                    return (result, None);
+                }
                 CooldownOutcome::Skipped {
                     skipped_version,
                     skipped_published_at,

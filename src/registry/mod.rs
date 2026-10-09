@@ -521,6 +521,33 @@ pub trait Registry: Send + Sync {
     /// the cooldown layer reads as "publish dates unavailable here".
     async fn list_versions(&self, package: &str) -> Result<Vec<VersionMeta>>;
 
+    /// Metadata for cooldown. Strict mode fails closed by default. Providers
+    /// must opt in only for publication dates they record, never git author,
+    /// committer or tagger dates. Decorators must forward this method.
+    async fn list_versions_for_cooldown(
+        &self,
+        package: &str,
+        strict: bool,
+    ) -> Result<Vec<VersionMeta>> {
+        if strict {
+            no_version_metadata()
+        } else {
+            self.list_versions(package).await
+        }
+    }
+
+    /// Publication metadata for the same query used to resolve the candidate.
+    /// Multi-index registries must keep strict dates on the answering index.
+    async fn list_versions_for_cooldown_query(
+        &self,
+        package: &str,
+        strict: bool,
+        _query: VersionQuery<'_>,
+        _resolved: Option<&str>,
+    ) -> Result<Vec<VersionMeta>> {
+        self.list_versions_for_cooldown(package, strict).await
+    }
+
     /// List the ref names a consumer can actually pin to, for registries where
     /// refs are distinct from released versions.
     ///

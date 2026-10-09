@@ -1224,6 +1224,12 @@ impl Updater for GithubActionsUpdater {
                             skipped_version,
                             skipped_published_at,
                         } => (chosen, Some((skipped_version, skipped_published_at))),
+                        crate::updater::CooldownOutcome::LookupFailed { error } => {
+                            result.errors.push(error);
+                            result.keep_annotation(&options, annotation);
+                            new_lines.push(kept_line);
+                            continue;
+                        }
                         crate::updater::CooldownOutcome::Skipped {
                             skipped_version,
                             skipped_published_at,
@@ -1578,6 +1584,11 @@ impl Updater for GithubActionsUpdater {
                                     skipped_version,
                                     skipped_published_at,
                                 } => (chosen, Some((skipped_version, skipped_published_at))),
+                                crate::updater::CooldownOutcome::LookupFailed { error } => {
+                                    result.errors.push(error);
+                                    new_lines.push(line.to_string());
+                                    continue;
+                                }
                                 crate::updater::CooldownOutcome::Skipped {
                                     skipped_version,
                                     skipped_published_at,
@@ -4349,6 +4360,50 @@ mod sha_pin_annotation_tests {
             "errors: {:?}",
             result.errors
         );
+    }
+
+    /// A strict publication-date outage holds the commit but keeps the release
+    /// annotation recovered independently from its tags.
+    #[tokio::test]
+    async fn strict_date_failure_keeps_a_recovered_sha_annotation() {
+        use crate::cooldown::CooldownPolicy;
+        use chrono::Duration;
+
+        for dry_run in [false, true] {
+            let mut file = NamedTempFile::new().unwrap();
+            let original = format!("steps:\n  - uses: acme/action@{BARE_SHA}\n");
+            write!(file, "{original}").unwrap();
+            let registry = MockRegistry::new("github-releases")
+                .with_version("acme/action", "v2.0.0")
+                .with_resolved_ref("acme/action", "v1.0.0", BARE_SHA)
+                .with_unavailable_versions("acme/action");
+            let options = UpdateOptions::new(dry_run, false)
+                .with_action_sha_updates(true)
+                .with_cooldown_policy(
+                    CooldownPolicy {
+                        strict: true,
+                        default: Duration::days(7),
+                        ..Default::default()
+                    },
+                    chrono::Utc::now(),
+                );
+            let result = GithubActionsUpdater::new()
+                .update(file.path(), &registry, options)
+                .await
+                .unwrap();
+            assert_eq!(result.errors.len(), 1, "{:?}", result.errors);
+            assert!(result.errors[0].contains("publication date lookup failed"));
+            assert!(result.updated.is_empty());
+            assert_eq!(result.annotations.len(), 1);
+            assert_eq!(result.annotations[0].version, "v1.0.0");
+            assert_eq!(result.annotations[0].commit, BARE_SHA);
+            let expected = if dry_run {
+                original
+            } else {
+                format!("steps:\n  - uses: acme/action@{BARE_SHA} # v1.0.0\n")
+            };
+            assert_eq!(fs::read_to_string(file.path()).unwrap(), expected);
+        }
     }
 
     /// The ceiling holds the update back, but the release the pin is at was

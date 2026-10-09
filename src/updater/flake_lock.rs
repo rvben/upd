@@ -568,6 +568,23 @@ impl Updater for FlakeLockUpdater {
             // how often an input moves: it moves once its locked commit is
             // older than the window, and then to the newest commit.
             if cooldown > Duration::zero() {
+                if options
+                    .cooldown_policy
+                    .as_ref()
+                    .is_some_and(|policy| policy.strict)
+                {
+                    result.skipped_by_cooldown.push((
+                        input.name.clone(),
+                        short(locked),
+                        short(&head),
+                        None,
+                    ));
+                    options.note_cooldown_unavailable(&super::strict_cooldown_note(
+                        "nix",
+                        "git revisions have no trustworthy publication date",
+                    ));
+                    continue;
+                }
                 let Some(locked_at) = input.last_modified else {
                     result.skipped.push(SkippedUpdate {
                         package: input.name.clone(),

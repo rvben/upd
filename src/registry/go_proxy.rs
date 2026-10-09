@@ -390,6 +390,19 @@ impl Registry for GoProxyRegistry {
         })
     }
 
+    async fn list_versions_for_cooldown(
+        &self,
+        package: &str,
+        strict: bool,
+    ) -> Result<Vec<VersionMeta>> {
+        // Go's .info Time is the VCS commit time, not a proxy-recorded upload time.
+        if strict {
+            Ok(Vec::new())
+        } else {
+            self.list_versions(package).await
+        }
+    }
+
     async fn list_versions(&self, package: &str) -> Result<Vec<VersionMeta>> {
         let encoded = Self::escape_module_path(package);
         let list_url = format!("{}/{}/@v/list", self.proxy_url, encoded);
@@ -759,6 +772,18 @@ mod tests {
             nosumdb_patterns: vec![],
         };
         assert!(with_noproxy.has_private_patterns());
+    }
+
+    #[tokio::test]
+    async fn strict_metadata_does_not_trust_go_commit_dates() {
+        let registry = GoProxyRegistry::new();
+        assert!(
+            registry
+                .list_versions_for_cooldown("example.invalid/module", true)
+                .await
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[tokio::test]

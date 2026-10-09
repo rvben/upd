@@ -818,14 +818,54 @@ impl Registry for MultiPyPiRegistry {
         Err(last_error.unwrap_or_else(|| anyhow!("No versions found for package '{}'", package)))
     }
 
-    /// Query indexes in order and return the first non-empty result, so that
-    /// cooldown decisions are based on the same source used for resolution.
-    ///
-    /// An index that fails is not an index that answered "no publish dates".
-    /// The cooldown layer distinguishes the two and tells the user which
-    /// happened, so a failure on every index is reported rather than flattened
-    /// into an empty answer. It still never becomes a hard failure: that call
-    /// degrades to the regular update path.
+    async fn list_versions_for_cooldown(
+        &self,
+        package: &str,
+        strict: bool,
+    ) -> Result<Vec<VersionMeta>> {
+        self.list_versions_for_cooldown_query(package, strict, VersionQuery::Stable, None)
+            .await
+    }
+
+    async fn list_versions_for_cooldown_query(
+        &self,
+        package: &str,
+        strict: bool,
+        query: VersionQuery<'_>,
+        resolved: Option<&str>,
+    ) -> Result<Vec<VersionMeta>> {
+        if !strict {
+            return self.list_versions(package).await;
+        }
+        let mut last_error = None;
+        for registry in &self.registries {
+            match query.run(registry.as_ref(), package).await {
+                Ok(version) => {
+                    if let Some(target) = resolved.filter(|target| {
+                        crate::version::compare::compare_versions(&version, target)
+                            != std::cmp::Ordering::Equal
+                    }) {
+                        let offered = registry.python_releases(package).await?;
+                        if !offered.iter().any(|release| {
+                            crate::version::compare::compare_versions(&release.version, target)
+                                == std::cmp::Ordering::Equal
+                        }) {
+                            return Err(anyhow!(
+                                "The answering index does not offer selected candidate '{target}'"
+                            ));
+                        }
+                    }
+                    return registry.list_versions_for_cooldown(package, true).await;
+                }
+                Err(error) => last_error = Some(error),
+            }
+        }
+        Err(last_error.unwrap_or_else(|| anyhow!("No index resolved '{package}'")))
+    }
+
+    /// Normal mode retains first non-empty metadata lookup across indexes.
+    /// Strict mode instead binds metadata to the index answering the query,
+    /// including that index's empty answer or lookup failure.
     async fn list_versions(&self, package: &str) -> Result<Vec<VersionMeta>> {
         let mut last_error = None;
         for registry in &self.registries {
@@ -965,6 +1005,15 @@ impl Registry for PyPiRegistry {
             package,
             constraints
         ))
+    }
+
+    // Publication timestamps come from the registry's own upload metadata.
+    async fn list_versions_for_cooldown(
+        &self,
+        package: &str,
+        _strict: bool,
+    ) -> Result<Vec<VersionMeta>> {
+        self.list_versions(package).await
     }
 
     async fn list_versions(&self, package: &str) -> Result<Vec<VersionMeta>> {

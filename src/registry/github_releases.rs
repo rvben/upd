@@ -931,13 +931,25 @@ impl Registry for GitHubReleasesRegistry {
     }
 
     async fn list_versions(&self, package: &str) -> Result<Vec<VersionMeta>> {
+        self.list_versions_for_cooldown(package, false).await
+    }
+
+    async fn list_versions_for_cooldown(
+        &self,
+        package: &str,
+        strict: bool,
+    ) -> Result<Vec<VersionMeta>> {
         let (owner, repo) = Self::extract_owner_repo(package)?;
         let url = format!("{}/repos/{}/{}/releases", self.api_url, owner, repo);
 
         let response = get_with_retry(&self.client, &url).await?;
         let status = response.status();
         if status == reqwest::StatusCode::NOT_FOUND {
-            return self.tag_versions(owner, repo).await;
+            return if strict {
+                Ok(Vec::new())
+            } else {
+                self.tag_versions(owner, repo).await
+            };
         }
         if !status.is_success() {
             let hint = match status.as_u16() {
@@ -983,7 +995,11 @@ impl Registry for GitHubReleasesRegistry {
         // about releases, not about whether the repository can say when its
         // versions appeared, and reading it as the latter turns cooldown off
         // for every hook the run touches.
-        self.tag_versions(owner, repo).await
+        if strict {
+            Ok(Vec::new())
+        } else {
+            self.tag_versions(owner, repo).await
+        }
     }
 }
 
@@ -1699,6 +1715,25 @@ mod tests {
             .unwrap();
 
         assert_eq!(version, "v0.12.0.0-rc.1");
+    }
+
+    #[tokio::test]
+    async fn strict_metadata_never_requests_tag_dates() {
+        for status in [200, 404] {
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path("/repos/acme/hook/releases"))
+                .respond_with(ResponseTemplate::new(status).set_body_string("[]"))
+                .expect(1)
+                .mount(&server)
+                .await;
+            let versions = registry(&server)
+                .list_versions_for_cooldown("acme/hook", true)
+                .await
+                .unwrap();
+            assert!(versions.is_empty());
+            assert_eq!(server.received_requests().await.unwrap().len(), 1);
+        }
     }
 
     #[tokio::test]

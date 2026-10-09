@@ -355,14 +355,70 @@ impl Registry for IndexChain<'_> {
     ///
     /// A link that fails is not a link that answered "no publish dates". The
     /// cooldown layer distinguishes the two and tells the user which happened,
-    /// so a failure anywhere in the chain is reported rather than flattened. It
-    /// still never becomes a hard failure: that call degrades to the regular
-    /// update path, which is the caller's decision to make and not this
-    /// layer's to pre-empt by discarding the reason.
+    /// so the chain preserves the failure rather than flattening it. The caller
+    /// can fall through in ordinary
+    /// cooldown mode or hold and report a per-package error in strict mode.
     async fn list_versions(&self, package: &str) -> Result<Vec<VersionMeta>> {
+        self.list_versions_for_cooldown(package, false).await
+    }
+
+    async fn list_versions_for_cooldown_query(
+        &self,
+        package: &str,
+        strict: bool,
+        query: VersionQuery<'_>,
+        resolved: Option<&str>,
+    ) -> Result<Vec<VersionMeta>> {
+        if !strict {
+            return self.list_versions(package).await;
+        }
         let mut last_error = None;
         for link in self.links_for(package) {
-            match link.registry().list_versions(package).await {
+            let registry = link.registry();
+            match query.run(registry, package).await {
+                Ok(version) => {
+                    if let Some(target) = resolved.filter(|target| {
+                        matches!(&link, Link::Index(_))
+                            && crate::version::compare::compare_versions(&version, target)
+                                != std::cmp::Ordering::Equal
+                    }) {
+                        let offered = registry.python_releases(package).await?;
+                        if !offered.iter().any(|release| {
+                            crate::version::compare::compare_versions(&release.version, target)
+                                == std::cmp::Ordering::Equal
+                        }) {
+                            return Err(anyhow!(
+                                "The answering index does not offer selected candidate '{target}'"
+                            ));
+                        }
+                    }
+                    return registry
+                        .list_versions_for_cooldown_query(package, true, query, resolved)
+                        .await;
+                }
+                Err(error) => last_error = Some(error),
+            }
+        }
+        Err(last_error.unwrap_or_else(|| anyhow!("No index resolved '{package}'")))
+    }
+
+    async fn list_versions_for_cooldown(
+        &self,
+        package: &str,
+        strict: bool,
+    ) -> Result<Vec<VersionMeta>> {
+        if strict {
+            return self
+                .list_versions_for_cooldown_query(package, true, VersionQuery::Stable, None)
+                .await;
+        }
+        let mut last_error = None;
+        for link in self.links_for(package) {
+            match link
+                .registry()
+                .list_versions_for_cooldown(package, strict)
+                .await
+            {
                 Ok(versions) if !versions.is_empty() => return Ok(versions),
                 Ok(_) => {}
                 Err(error) => last_error = Some(error),

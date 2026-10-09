@@ -533,7 +533,7 @@ impl CargoTomlUpdater {
                                 key,
                                 current_version,
                                 skipped_version,
-                                Some(skipped_published_at),
+                                skipped_published_at,
                             ));
                             continue;
                         }
@@ -542,6 +542,10 @@ impl CargoTomlUpdater {
                             skipped_version,
                             skipped_published_at,
                         } => (chosen, Some((skipped_version, skipped_published_at))),
+                        crate::updater::CooldownOutcome::LookupFailed { error } => {
+                            result.errors.push(error);
+                            continue;
+                        }
                         crate::updater::CooldownOutcome::Skipped {
                             skipped_version,
                             skipped_published_at,
@@ -1579,6 +1583,7 @@ built = "0.25.13+spec-1.1.0"
         let policy = crate::cooldown::CooldownPolicy {
             default: Duration::days(7),
             per_ecosystem: HashMap::new(),
+            strict: false,
             force_override: None,
         };
 

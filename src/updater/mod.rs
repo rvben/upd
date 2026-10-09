@@ -79,6 +79,30 @@ pub(crate) fn downgrade_warning(pkg: &str, latest: &str, current: &str) -> Strin
     format!("skipping {pkg}: latest \"{latest}\" is not greater than current \"{current}\"")
 }
 
+pub(crate) fn is_simple_python_constraint(constraint: &str) -> bool {
+    !constraint.contains(',')
+        && !constraint.starts_with('<')
+        && !constraint.starts_with("~=")
+        && !constraint.starts_with("!=")
+}
+
+/// Keep provenance lookup identical to Python's version resolution, including
+/// exact pins being raised and prerelease tracks taking precedence over ranges.
+pub(crate) fn python_resolution_query(
+    constraints: Option<&str>,
+    prerelease: bool,
+) -> crate::registry::VersionQuery<'_> {
+    if prerelease {
+        crate::registry::VersionQuery::IncludingPrereleases
+    } else if let Some(constraints) =
+        constraints.filter(|value| !is_simple_python_constraint(value))
+    {
+        crate::registry::VersionQuery::Matching(constraints)
+    } else {
+        crate::registry::VersionQuery::Stable
+    }
+}
+
 /// Run a Python latest-version query and distrust an answer below the version
 /// already present in the manifest.
 ///
@@ -954,7 +978,11 @@ pub struct ParsedDependency {
     pub is_bumpable: bool,
 }
 
-/// Result of updating a single file
+/// A cooldown hold: package, current release, chosen release, skipped release,
+/// and its publication timestamp (unknown in a strict hold of an undated release).
+pub type HeldBackUpdate = (String, String, String, String, Option<DateTime<Utc>>);
+
+/// Result of updating a single file.
 #[derive(Debug, Default, Clone)]
 pub struct UpdateResult {
     /// Exact scalar edits retained for applying selected hook updates interactively.
@@ -983,7 +1011,7 @@ pub struct UpdateResult {
     /// Packages where cooldown forced us to a safer-older version than the
     /// absolute latest. Tuple: (name, old_version, chosen_version,
     /// skipped_latest_version, skipped_latest_published_at).
-    pub held_back: Vec<(String, String, String, String, DateTime<Utc>)>,
+    pub held_back: Vec<HeldBackUpdate>,
     /// Packages where every newer version sits inside the cooldown window and
     /// we kept the current version. Tuple: (name, current_version,
     /// skipped_latest_version, skipped_latest_published_at). The publish date
@@ -1072,7 +1100,7 @@ pub struct NormalizedSpec {
     /// Whether the chosen version came from `[pin]`.
     pub pinned: bool,
     /// Newer release rejected by cooldown: (version, publication time).
-    pub held_back_from: Option<(String, DateTime<Utc>)>,
+    pub held_back_from: Option<(String, Option<DateTime<Utc>>)>,
     pub line_number: Option<usize>,
 }
 
@@ -1809,7 +1837,10 @@ where
 
 /// Outcome of applying the cooldown layer to a resolved `(current -> latest)`
 /// transition. See `apply_cooldown`.
+#[derive(Debug)]
 pub enum CooldownOutcome {
+    /// A strict publication-date lookup failed; each caller must report the error.
+    LookupFailed { error: String },
     /// No cooldown policy active, or the latest is already old enough.
     /// The caller proceeds with this version.
     Unchanged(String),
@@ -1818,7 +1849,7 @@ pub enum CooldownOutcome {
     HeldBack {
         chosen: String,
         skipped_version: String,
-        skipped_published_at: DateTime<Utc>,
+        skipped_published_at: Option<DateTime<Utc>>,
     },
     /// Every candidate was too new. The caller keeps the current version and
     /// records the skip.
@@ -1843,6 +1874,12 @@ pub struct CooldownNote {
     pub message: String,
 }
 
+/// The actual resolution query, kept separate from candidate eligibility bounds.
+pub(crate) struct CooldownSelection<'a> {
+    pub current_is_prerelease: bool,
+    pub query: VersionQuery<'a>,
+}
+
 /// Apply the active cooldown policy to a resolved `(current -> latest)` pair.
 /// Returns the outcome plus an optional diagnostic note the caller should
 /// stash on `UpdateOptions::note_cooldown_unavailable` for later reporting.
@@ -1855,13 +1892,44 @@ pub async fn apply_cooldown(
     current_is_prerelease: bool,
     options: &UpdateOptions,
 ) -> (CooldownOutcome, Option<CooldownNote>) {
+    apply_cooldown_for_query(
+        registry,
+        package,
+        current,
+        latest,
+        constraints,
+        CooldownSelection {
+            current_is_prerelease,
+            query: if registry.name() == "pypi" {
+                python_resolution_query(constraints, current_is_prerelease)
+            } else if current_is_prerelease {
+                VersionQuery::IncludingPrereleases
+            } else {
+                VersionQuery::Stable
+            },
+        },
+        options,
+    )
+    .await
+}
+
+/// Apply cooldown while preserving the exact query used to resolve a candidate.
+pub(crate) async fn apply_cooldown_for_query(
+    registry: &dyn Registry,
+    package: &str,
+    current: &str,
+    latest: &str,
+    constraints: Option<&str>,
+    selection: CooldownSelection<'_>,
+    options: &UpdateOptions,
+) -> (CooldownOutcome, Option<CooldownNote>) {
     apply_cooldown_inner(
         registry,
         package,
         Some(current),
         latest,
         constraints,
-        current_is_prerelease,
+        selection,
         options,
     )
     .await
@@ -1873,19 +1941,17 @@ pub(crate) async fn apply_cooldown_without_floor(
     registry: &dyn Registry,
     package: &str,
     latest: &str,
-    current_is_prerelease: bool,
+    selection: CooldownSelection<'_>,
     options: &UpdateOptions,
 ) -> (CooldownOutcome, Option<CooldownNote>) {
-    apply_cooldown_inner(
-        registry,
-        package,
-        None,
-        latest,
-        None,
-        current_is_prerelease,
-        options,
-    )
-    .await
+    apply_cooldown_inner(registry, package, None, latest, None, selection, options).await
+}
+
+fn strict_cooldown_note(ecosystem: &str, cause: &str) -> CooldownNote {
+    CooldownNote {
+        key: format!("{ecosystem}:strict-unavailable"),
+        message: format!("strict cooldown held updates for {ecosystem}: {cause}"),
+    }
 }
 
 async fn apply_cooldown_inner(
@@ -1894,9 +1960,13 @@ async fn apply_cooldown_inner(
     current: Option<&str>,
     latest: &str,
     constraints: Option<&str>,
-    current_is_prerelease: bool,
+    selection: CooldownSelection<'_>,
     options: &UpdateOptions,
 ) -> (CooldownOutcome, Option<CooldownNote>) {
+    let CooldownSelection {
+        current_is_prerelease,
+        query,
+    } = selection;
     let ecosystem = registry.name();
     let Some(policy) = options.cooldown_policy.as_ref() else {
         return (CooldownOutcome::Unchanged(latest.to_string()), None);
@@ -1923,15 +1993,39 @@ async fn apply_cooldown_inner(
     // that it holds no publish dates, which no retry changes. An error is the
     // question going unanswered, which a retry may well change, so it is
     // reported as the failure it is rather than as a registry limitation.
-    let versions = match registry.list_versions(package).await {
+    let versions = match registry
+        .list_versions_for_cooldown_query(package, policy.strict, query, Some(latest))
+        .await
+    {
         Ok(v) if !v.is_empty() => v,
         Ok(_) => {
             return (
-                CooldownOutcome::Unchanged(latest.to_string()),
-                Some(no_publish_dates_note(ecosystem)),
+                if policy.strict {
+                    CooldownOutcome::Skipped {
+                        skipped_version: latest.to_string(),
+                        skipped_published_at: None,
+                    }
+                } else {
+                    CooldownOutcome::Unchanged(latest.to_string())
+                },
+                Some(if policy.strict {
+                    strict_cooldown_note(ecosystem, "no trustworthy publication dates available")
+                } else {
+                    no_publish_dates_note(ecosystem)
+                }),
             );
         }
         Err(error) => {
+            if policy.strict {
+                return (
+                    CooldownOutcome::LookupFailed {
+                        error: format!(
+                            "{package}: strict cooldown publication date lookup failed ({error})"
+                        ),
+                    },
+                    None,
+                );
+            }
             return (
                 CooldownOutcome::Unchanged(latest.to_string()),
                 Some(CooldownNote {
@@ -1948,8 +2042,19 @@ async fn apply_cooldown_inner(
     };
 
     use crate::cooldown::{CooldownDecision, select, select_without_floor};
-    let decision = match current {
-        Some(current) => select(
+    let decision = if policy.strict {
+        let mut versions = versions;
+        // The resolved latest may be a tag without a release, even in a repository
+        // that publishes other releases. Keep it as an undated diagnostic anchor.
+        if !versions.iter().any(|v| v.version == latest) {
+            versions.push(crate::registry::VersionMeta {
+                version: latest.to_string(),
+                published_at: None,
+                yanked: false,
+                prerelease: current_is_prerelease,
+            });
+        }
+        crate::cooldown::select_strict(
             &versions,
             current,
             latest,
@@ -1957,8 +2062,20 @@ async fn apply_cooldown_inner(
             current_is_prerelease,
             cooldown,
             now,
-        ),
-        None => select_without_floor(&versions, latest, current_is_prerelease, cooldown, now),
+        )
+    } else {
+        match current {
+            Some(current) => select(
+                &versions,
+                current,
+                latest,
+                constraints,
+                current_is_prerelease,
+                cooldown,
+                now,
+            ),
+            None => select_without_floor(&versions, latest, current_is_prerelease, cooldown, now),
+        }
     };
     match decision {
         CooldownDecision::Use {
@@ -1974,7 +2091,14 @@ async fn apply_cooldown_inner(
                 skipped_version: info.version,
                 skipped_published_at: info.published_at,
             },
-            None,
+            if policy.strict && info.published_at.is_none() {
+                Some(strict_cooldown_note(
+                    ecosystem,
+                    "candidate publication date unavailable",
+                ))
+            } else {
+                None
+            },
         ),
         CooldownDecision::Skip { latest_too_new } => (
             CooldownOutcome::Skipped {
@@ -1985,11 +2109,29 @@ async fn apply_cooldown_inner(
                 // with the cooldown that skipped it and never looks wrong.
                 skipped_published_at: latest_too_new.published_at,
             },
-            None,
+            if policy.strict && latest_too_new.published_at.is_none() {
+                Some(strict_cooldown_note(
+                    ecosystem,
+                    "candidate publication date unavailable",
+                ))
+            } else {
+                None
+            },
         ),
         CooldownDecision::Unsupported => (
-            CooldownOutcome::Unchanged(latest.to_string()),
-            Some(no_publish_dates_note(ecosystem)),
+            if policy.strict {
+                CooldownOutcome::Skipped {
+                    skipped_version: latest.to_string(),
+                    skipped_published_at: None,
+                }
+            } else {
+                CooldownOutcome::Unchanged(latest.to_string())
+            },
+            Some(if policy.strict {
+                strict_cooldown_note(ecosystem, "no trustworthy publication dates available")
+            } else {
+                no_publish_dates_note(ecosystem)
+            }),
         ),
     }
 }
@@ -4301,6 +4443,7 @@ mod cooldown_integration_tests {
         let policy = CooldownPolicy {
             default: Duration::days(7),
             per_ecosystem: HashMap::new(),
+            strict: false,
             force_override: None,
         };
 
@@ -4340,6 +4483,7 @@ mod cooldown_integration_tests {
         let policy = CooldownPolicy {
             default: Duration::days(7),
             per_ecosystem: HashMap::new(),
+            strict: false,
             force_override: None,
         };
 
@@ -4378,6 +4522,7 @@ mod cooldown_integration_tests {
         let policy = CooldownPolicy {
             default: Duration::days(7),
             per_ecosystem: HashMap::new(),
+            strict: false,
             force_override: None,
         };
 
@@ -4433,6 +4578,7 @@ mod cooldown_integration_tests {
         let policy = CooldownPolicy {
             default: Duration::days(7),
             per_ecosystem: HashMap::new(),
+            strict: false,
             force_override: None,
         };
 
@@ -4493,6 +4639,7 @@ mod cooldown_integration_tests {
         let policy = CooldownPolicy {
             default: Duration::days(7),
             per_ecosystem: HashMap::new(),
+            strict: false,
             force_override: None,
         };
 
@@ -4549,6 +4696,7 @@ mod cooldown_integration_tests {
         let policy = CooldownPolicy {
             default: Duration::days(7),
             per_ecosystem: HashMap::new(),
+            strict: false,
             force_override: None,
         };
 
@@ -4599,6 +4747,7 @@ mod cooldown_integration_tests {
         let policy = CooldownPolicy {
             default: Duration::days(7),
             per_ecosystem: HashMap::new(),
+            strict: false,
             force_override: None,
         };
 
@@ -4631,6 +4780,7 @@ mod cooldown_integration_tests {
         let policy = CooldownPolicy {
             default: Duration::days(7),
             per_ecosystem: HashMap::new(),
+            strict: false,
             force_override: None,
         };
         let options = UpdateOptions::new(true, false).with_cooldown_policy(policy, now);
@@ -4666,6 +4816,7 @@ mod cooldown_integration_tests {
         let policy = CooldownPolicy {
             default: Duration::days(7),
             per_ecosystem: HashMap::new(),
+            strict: false,
             force_override: None,
         };
         let options = UpdateOptions::new(true, false).with_cooldown_policy(policy, now);
@@ -4790,5 +4941,171 @@ mod python_bump_tests {
         rust.merge(python);
         assert_eq!(rust.update_bump(0), BumpKind::Major);
         assert_eq!(rust.update_bump(1), BumpKind::Patch);
+    }
+}
+
+#[cfg(test)]
+mod strict_cooldown_tests {
+    use super::*;
+    use crate::cooldown::CooldownPolicy;
+    use crate::registry::{MockRegistry, VersionMeta};
+    use chrono::Duration;
+
+    fn options(strict: bool) -> UpdateOptions {
+        UpdateOptions::new(true, false).with_cooldown_policy(
+            CooldownPolicy {
+                strict,
+                default: Duration::days(7),
+                ..Default::default()
+            },
+            Utc::now(),
+        )
+    }
+
+    #[tokio::test]
+    async fn unavailable_metadata_fails_closed_only_in_strict_mode() {
+        for registry in [
+            MockRegistry::new("pypi"),
+            MockRegistry::new("pypi").with_unavailable_versions("pkg"),
+        ] {
+            let (normal, _) = apply_cooldown(
+                &registry,
+                "pkg",
+                "1.0.0",
+                "2.0.0",
+                None,
+                false,
+                &options(false),
+            )
+            .await;
+            assert!(matches!(normal, CooldownOutcome::Unchanged(ref v) if v == "2.0.0"));
+            let (strict, note) = apply_cooldown(
+                &registry,
+                "pkg",
+                "1.0.0",
+                "2.0.0",
+                None,
+                false,
+                &options(true),
+            )
+            .await;
+            match strict {
+                CooldownOutcome::Skipped {
+                    skipped_published_at: None,
+                    ..
+                } => assert!(
+                    note.unwrap()
+                        .message
+                        .contains("strict cooldown held updates")
+                ),
+                CooldownOutcome::LookupFailed { error } => {
+                    assert!(error.contains("pkg: strict cooldown publication date lookup failed"));
+                    assert!(note.is_none());
+                }
+                other => panic!("unexpected strict outcome: {other:?}"),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn undated_latest_can_hold_back_to_a_dated_release() {
+        // Latest is absent from metadata: a tag can exist without a Release.
+        let registry = MockRegistry::new("github-releases").with_version_meta(
+            "pkg",
+            "1.5.0",
+            Some(Utc::now() - Duration::days(30)),
+            false,
+            false,
+        );
+        let (outcome, note) = apply_cooldown(
+            &registry,
+            "pkg",
+            "1.0.0",
+            "2.0.0",
+            None,
+            false,
+            &options(true),
+        )
+        .await;
+        assert!(
+            matches!(outcome, CooldownOutcome::HeldBack { ref chosen, ref skipped_version, skipped_published_at: None } if chosen == "1.5.0" && skipped_version == "2.0.0")
+        );
+        assert!(
+            note.unwrap()
+                .message
+                .contains("publication date unavailable")
+        );
+    }
+
+    #[tokio::test]
+    async fn strict_metadata_never_promotes_above_the_resolved_latest() {
+        let now = Utc::now();
+        let registry = MockRegistry::new("npm")
+            .with_version_meta("pkg", "3.0.0", None, false, false)
+            .with_version_meta("pkg", "2.0.0", Some(now - Duration::days(30)), false, false)
+            .with_version_meta("pkg", "1.5.0", Some(now - Duration::days(30)), false, false);
+        let (outcome, _) = apply_cooldown(
+            &registry,
+            "pkg",
+            "1.0.0",
+            "1.5.0",
+            None,
+            false,
+            &options(true),
+        )
+        .await;
+        assert!(matches!(outcome, CooldownOutcome::Unchanged(ref v) if v == "1.5.0"));
+    }
+
+    #[tokio::test]
+    async fn disabling_duration_bypasses_strict_metadata_lookup() {
+        let registry = MockRegistry::new("github-releases").with_unavailable_versions("pkg");
+        let mut options = options(true);
+        Arc::make_mut(options.cooldown_policy.as_mut().unwrap()).force_override =
+            Some(Duration::zero());
+        let (outcome, note) =
+            apply_cooldown(&registry, "pkg", "1.0.0", "2.0.0", None, false, &options).await;
+        assert!(matches!(outcome, CooldownOutcome::Unchanged(ref v) if v == "2.0.0"));
+        assert!(note.is_none());
+    }
+
+    #[test]
+    fn strict_selection_preserves_tracks_constraints_yanking_and_floor() {
+        let now = Utc::now();
+        let meta = |version: &str, dated: bool, yanked, prerelease| VersionMeta {
+            version: version.into(),
+            published_at: dated.then_some(now - Duration::days(30)),
+            yanked,
+            prerelease,
+        };
+        let versions = vec![
+            meta("3.0.0", false, false, false),
+            meta("2.9.0", true, true, false),
+            meta("2.8.0-beta.1", true, false, true),
+            meta("2.7.0", true, false, false),
+            meta("1.0.0", true, false, false),
+        ];
+        let select = |floor, constraints, prerelease| {
+            crate::cooldown::select_strict(
+                &versions,
+                floor,
+                "3.0.0",
+                constraints,
+                prerelease,
+                Duration::days(7),
+                now,
+            )
+        };
+        assert!(
+            matches!(select(Some("2.0.0"), Some("<3"), false), crate::cooldown::CooldownDecision::Use { ref version, .. } if version == "2.7.0")
+        );
+        assert!(matches!(
+            select(Some("2.7.0"), None, false),
+            crate::cooldown::CooldownDecision::Skip { .. }
+        ));
+        assert!(matches!(
+            select(None, Some("~=3.0"), false),
+            crate::cooldown::CooldownDecision::Skip { .. }
+        ));
     }
 }

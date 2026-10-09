@@ -434,27 +434,27 @@ impl PackageJsonUpdater {
                                             // held_back_info carries skipped info if cooldown
                                             // chose an older version; it is pushed to
                                             // result.held_back only after the update is confirmed.
-                                            let (effective_version, held_back_info) =
-                                                if let Some(anchor) =
-                                                    lower_bound_anchor(version_str)
-                                                {
-                                                    let anchor_is_pre =
-                                                        is_prerelease_semver(&anchor);
-                                                    let (outcome, note) =
-                                                        crate::updater::apply_cooldown(
-                                                            registry,
-                                                            package,
-                                                            &anchor,
-                                                            &matched,
-                                                            cooldown_constraint,
-                                                            anchor_is_pre,
-                                                            &options,
-                                                        )
-                                                        .await;
-                                                    if let Some(msg) = note {
-                                                        options.note_cooldown_unavailable(&msg);
-                                                    }
-                                                    match outcome {
+                                            let (effective_version, held_back_info) = if let Some(
+                                                anchor,
+                                            ) =
+                                                lower_bound_anchor(version_str)
+                                            {
+                                                let anchor_is_pre = is_prerelease_semver(&anchor);
+                                                let (outcome, note) =
+                                                    crate::updater::apply_cooldown(
+                                                        registry,
+                                                        package,
+                                                        &anchor,
+                                                        &matched,
+                                                        cooldown_constraint,
+                                                        anchor_is_pre,
+                                                        &options,
+                                                    )
+                                                    .await;
+                                                if let Some(msg) = note {
+                                                    options.note_cooldown_unavailable(&msg);
+                                                }
+                                                match outcome {
                                                     crate::updater::CooldownOutcome::Unchanged(
                                                         v,
                                                     ) => (Some(v), None),
@@ -469,6 +469,10 @@ impl PackageJsonUpdater {
                                                             skipped_published_at,
                                                         )),
                                                     ),
+                                                    crate::updater::CooldownOutcome::LookupFailed { error } => {
+                                                        result.errors.push(error);
+                                                        (None, None)
+                                                    }
                                                     crate::updater::CooldownOutcome::Skipped {
                                                         skipped_version,
                                                         skipped_published_at,
@@ -482,11 +486,11 @@ impl PackageJsonUpdater {
                                                         (None, None)
                                                     }
                                                 }
-                                                } else {
-                                                    // No lower bound anchor - no cooldown possible,
-                                                    // proceed with the matched version directly.
-                                                    (Some(matched), None)
-                                                };
+                                            } else {
+                                                // No lower bound anchor - no cooldown possible,
+                                                // proceed with the matched version directly.
+                                                (Some(matched), None)
+                                            };
 
                                             if let Some(effective) = effective_version {
                                                 // A shape range is looked up
@@ -760,6 +764,10 @@ impl PackageJsonUpdater {
                             skipped_version,
                             skipped_published_at,
                         } => (chosen, Some((skipped_version, skipped_published_at))),
+                        crate::updater::CooldownOutcome::LookupFailed { error } => {
+                            result.errors.push(error);
+                            continue;
+                        }
                         crate::updater::CooldownOutcome::Skipped {
                             skipped_version,
                             skipped_published_at,
@@ -2210,6 +2218,7 @@ mod tests {
         let policy = CooldownPolicy {
             default: Duration::days(7),
             per_ecosystem: std::collections::HashMap::new(),
+            strict: false,
             force_override: None,
         };
 
@@ -2282,6 +2291,7 @@ mod tests {
         let policy = CooldownPolicy {
             default: Duration::days(7),
             per_ecosystem: std::collections::HashMap::new(),
+            strict: false,
             force_override: None,
         };
 
@@ -2359,6 +2369,7 @@ mod tests {
         let policy = CooldownPolicy {
             default: Duration::days(7),
             per_ecosystem: std::collections::HashMap::new(),
+            strict: false,
             force_override: None,
         };
 

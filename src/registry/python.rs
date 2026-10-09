@@ -292,13 +292,35 @@ impl Registry for PythonRegistry<'_> {
         self.select(package, query).await
     }
     async fn list_versions(&self, package: &str) -> Result<Vec<VersionMeta>> {
+        self.list_versions_for_cooldown(package, false).await
+    }
+
+    async fn list_versions_for_cooldown(
+        &self,
+        package: &str,
+        strict: bool,
+    ) -> Result<Vec<VersionMeta>> {
+        self.list_versions_for_cooldown_query(package, strict, VersionQuery::Stable, None)
+            .await
+    }
+
+    async fn list_versions_for_cooldown_query(
+        &self,
+        package: &str,
+        strict: bool,
+        query: VersionQuery<'_>,
+        resolved: Option<&str>,
+    ) -> Result<Vec<VersionMeta>> {
         if !self.filtering() {
-            return self.inner.list_versions(package).await;
+            return self
+                .inner
+                .list_versions_for_cooldown_query(package, strict, query, resolved)
+                .await;
         }
         let releases = self.python_releases(package).await?;
         Ok(self
             .inner
-            .list_versions(package)
+            .list_versions_for_cooldown_query(package, strict, query, resolved)
             .await?
             .into_iter()
             .filter(|meta| {

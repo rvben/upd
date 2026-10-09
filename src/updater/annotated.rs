@@ -796,6 +796,10 @@ impl AnnotatedUpdater {
                             skipped_version,
                             skipped_published_at,
                         } => (chosen, Some((skipped_version, skipped_published_at))),
+                        CooldownOutcome::LookupFailed { error } => {
+                            result.errors.push(error);
+                            continue;
+                        }
                         CooldownOutcome::Skipped {
                             skipped_version,
                             skipped_published_at,

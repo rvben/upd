@@ -234,6 +234,42 @@ NuGet, Gradle Maven metadata, Terraform Registry, and generic OCI tag listings d
 per-version publish dates we can consume today; cooldown is reported as
 unavailable for those files.
 
+### Strict publication dates
+
+Opt in to stateless, fail-closed selection with:
+
+```toml
+[cooldown]
+default = "7d"
+strict = true
+```
+
+Strict mode accepts only provider-recorded publication timestamps, such as
+GitHub Release `published_at`. It holds candidates with missing dates and holds
+updates when metadata lookup fails, reporting each returned lookup error
+(exit 2). A missing metadata endpoint (HTTP 404) is treated as unavailable dates
+and holds the update. With multiple Python indexes, strict metadata stays on the
+index that answers the version query; missing or failed metadata never falls
+through to another index. An older dated release can still be selected;
+output marks an undated skipped version as having an unknown publication date.
+No local first-seen history is stored, so the policy does not depend on whether a
+machine has seen a version before.
+
+GitHub tagger and commit dates are author-controlled and do not establish when a
+tag was pushed. Strict mode never uses them. Tag-only repositories (including
+many pre-commit mirrors), Go proxy commit timestamps, and Nix revision ages cannot
+pass a positive strict cooldown. NuGet, Gradle, Terraform and generic OCI tag
+listings are also held because they expose no usable publication dates. Explicit `[pin]` choices and `--min-age 0` retain
+their existing override behavior. A zero effective window disables cooldown;
+`strict` does not introduce a duration or change duration precedence. Setting it
+without any positive window therefore has no effect. A child `[cooldown]` table
+replaces its parent's entire table, including `strict`.
+
+The default remains non-strict, including its tag-date fallback and its behavior
+when publication metadata is unavailable. This mode governs upd's version and
+revision selection. Lockfile refreshes retain their documented release-age
+checks and reporting; a package manager's transitive selections are independent.
+
 ### Keying a cooldown on a language
 
 `[cooldown.ecosystem]` takes a language name as well as a registry name, spelled

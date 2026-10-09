@@ -1411,6 +1411,9 @@ pub async fn resolve_floor_version(
         options.note_cooldown_unavailable(&msg);
     }
     let candidate = match outcome {
+        crate::updater::CooldownOutcome::LookupFailed { error } => {
+            return Err(anyhow::anyhow!(error));
+        }
         crate::updater::CooldownOutcome::Unchanged(v) => v,
         crate::updater::CooldownOutcome::HeldBack { chosen, .. } => chosen,
         crate::updater::CooldownOutcome::Skipped { .. } => return Ok(FloorResolution::NotNeeded),
@@ -2583,6 +2586,30 @@ mod tests {
         use crate::registry::mock::MockRegistry;
         use crate::updater::{BumpFilter, UpdateOptions};
         use std::sync::Arc;
+
+        #[tokio::test]
+        async fn strict_lookup_failure_is_an_error_for_a_lock_only_floor() {
+            let registry = MockRegistry::new("pypi")
+                .with_version("lockonly", "1.1.0")
+                .with_unavailable_versions("lockonly");
+            let options = UpdateOptions::new(false, false).with_cooldown_policy(
+                crate::cooldown::CooldownPolicy {
+                    strict: true,
+                    default: chrono::Duration::days(7),
+                    ..Default::default()
+                },
+                chrono::Utc::now(),
+            );
+            let error =
+                resolve_floor_version(&registry, "lockonly", "1.0.0", Lang::Python, &options)
+                    .await
+                    .unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("lockonly: strict cooldown publication date lookup failed")
+            );
+        }
 
         #[tokio::test]
         async fn registry_latest_above_locked_is_floored() {

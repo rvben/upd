@@ -632,6 +632,15 @@ impl Registry for DockerRegistry {
         self.get_latest_version(package).await
     }
 
+    // Publication timestamps come from the registry's own upload metadata.
+    async fn list_versions_for_cooldown(
+        &self,
+        package: &str,
+        _strict: bool,
+    ) -> Result<Vec<VersionMeta>> {
+        self.list_versions(package).await
+    }
+
     async fn list_versions(&self, package: &str) -> Result<Vec<VersionMeta>> {
         self.channel_versions(package).await
     }

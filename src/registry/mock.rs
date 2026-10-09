@@ -281,6 +281,15 @@ impl Registry for MockRegistry {
         self.get_latest_version(package).await
     }
 
+    // Tests explicitly supply publication metadata for this synthetic provider.
+    async fn list_versions_for_cooldown(
+        &self,
+        package: &str,
+        _strict: bool,
+    ) -> Result<Vec<VersionMeta>> {
+        self.list_versions(package).await
+    }
+
     async fn list_versions(&self, package: &str) -> Result<Vec<VersionMeta>> {
         if self.unavailable_versions.contains(package) {
             return Err(anyhow!("Version listing failed: {package}"));

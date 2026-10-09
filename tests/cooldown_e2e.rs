@@ -208,3 +208,64 @@ python = "7d"
         index_url,
     }
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn strict_cooldown_holds_unknown_dates_but_respects_explicit_overrides() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET")).and(path("/pypi/requests/json"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "info": { "version": "2.31.0" },
+            "releases": { "2.31.0": [{ "yanked": false }], "2.30.0": [{ "yanked": false, "upload_time_iso_8601": "2020-01-01T00:00:00Z" }] }
+        }))).mount(&server).await;
+    Mock::given(method("GET"))
+        .and(path("/simple/requests/"))
+        .respond_with(ResponseTemplate::new(404))
+        .mount(&server)
+        .await;
+    for scenario in ["strict", "zero", "pin"] {
+        let dir = TempDir::new().unwrap();
+        let file = dir.path().join("requirements.txt");
+        std::fs::write(&file, "requests==2.28.0\n").unwrap();
+        let config = format!(
+            "[cooldown]\ndefault = '7d'\nstrict = true\n{}",
+            if scenario == "pin" {
+                "[pin]\nrequests = '2.31.0'\n"
+            } else {
+                ""
+            }
+        );
+        std::fs::write(dir.path().join(".updrc.toml"), config).unwrap();
+        let mut command = Command::new(upd_bin());
+        command.args(["--apply", "--output", "json"]);
+        if scenario == "zero" {
+            command.args(["--min-age", "0"]);
+        }
+        let output = command
+            .arg(&file)
+            .current_dir(dir.path())
+            .env("UV_INDEX_URL", server.uri())
+            .env("UPD_CACHE_DIR", dir.path().join("cache"))
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        let contents = std::fs::read_to_string(file).unwrap();
+        if scenario == "strict" {
+            assert!(contents.contains("2.30.0"), "{contents}");
+            assert_eq!(
+                json["files"][0]["held_back"][0]["skipped_latest"], "2.31.0",
+                "{json}"
+            );
+            assert!(
+                json["files"][0]["held_back"][0]["skipped_published_at"].is_null(),
+                "{json}"
+            );
+        } else {
+            assert!(contents.contains("2.31.0"), "{contents}");
+        }
+    }
+}

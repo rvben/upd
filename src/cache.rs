@@ -437,6 +437,26 @@ impl<R: Registry> Registry for CachedRegistry<R> {
         Ok(version)
     }
 
+    async fn list_versions_for_cooldown(
+        &self,
+        package: &str,
+        strict: bool,
+    ) -> Result<Vec<VersionMeta>> {
+        self.inner.list_versions_for_cooldown(package, strict).await
+    }
+
+    async fn list_versions_for_cooldown_query(
+        &self,
+        package: &str,
+        strict: bool,
+        query: VersionQuery<'_>,
+        resolved: Option<&str>,
+    ) -> Result<Vec<VersionMeta>> {
+        self.inner
+            .list_versions_for_cooldown_query(package, strict, query, resolved)
+            .await
+    }
+
     async fn list_versions(&self, package: &str) -> Result<Vec<VersionMeta>> {
         self.inner.list_versions(package).await
     }
@@ -1097,8 +1117,33 @@ mod forwarding_tests {
         );
     }
 
-    /// The two tests above inject a `MockRegistry`, which cannot see a wiring
-    /// bug: it answers whether or not a request was ever made. This one wraps
+    /// Strict mode must reach the inner registry without falling back to tags.
+    #[tokio::test]
+    async fn cached_registry_forwards_strict_mode_without_tag_fallback() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/repos/acme/hook/releases"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("[]"))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let cached = CachedRegistry::new(
+            GitHubReleasesRegistry::with_api_url(server.uri()),
+            Cache::new_shared(),
+            true,
+        );
+        assert!(
+            cached
+                .list_versions_for_cooldown("acme/hook", true)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
+    }
+
+    /// Mock-only tests cannot see a wiring
+    /// bug: the mock answers whether or not a request was ever made. This test wraps
     /// the production registry over a mock HTTP server, so passing requires the
     /// call to travel through the decorator and out onto the wire. `expect(1)`,
     /// verified when the server drops, is what makes a silent no-op fail: a

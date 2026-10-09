@@ -488,3 +488,55 @@ async fn compatibility_holds_appear_in_json_even_when_nothing_can_update() {
     );
     assert_eq!(std::fs::read_to_string(file).unwrap(), content);
 }
+
+/// Strict dates stay on the bound index even when interpreter compatibility
+/// selects an older release than that index's unfiltered latest version.
+#[tokio::test]
+async fn strict_cooldown_preserves_filtered_python_selection_and_prerelease_ranges() {
+    for extras in [false, true] {
+        let private = index(json!([
+            {"filename":"demo-1.5.tar.gz", "requires-python":">=3.8"},
+            {"filename":"demo-1.6rc1.tar.gz", "requires-python":">=3.8"},
+            {"filename":"demo-2.0.tar.gz", "requires-python":">=3.11"},
+            {"filename":"demo-2.1rc1.tar.gz", "requires-python":">=3.11"}
+        ]))
+        .await;
+        Mock::given(path("/pypi/demo/json"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "releases": {
+                    "1.5": [{"yanked": false, "upload_time_iso_8601": "2020-01-01T00:00:00Z"}],
+                    "1.6rc1": [{"yanked": false, "upload_time_iso_8601": "2020-01-01T00:00:00Z"}],
+                    "2.0": [{"yanked": false, "upload_time_iso_8601": "2020-01-01T00:00:00Z"}],
+                    "2.1rc1": [{"yanked": false, "upload_time_iso_8601": "2020-01-01T00:00:00Z"}]
+                }
+            })))
+            .mount(&private)
+            .await;
+        let public = MockServer::start().await;
+        let registry = CachedRegistry::new(
+            MultiPyPiRegistry::from_primary_and_extras(
+                PyPiRegistry::with_index_url(private.uri()),
+                if extras { vec![public.uri()] } else { vec![] },
+            ),
+            Arc::new(Mutex::new(Cache::default())),
+            true,
+        );
+        for (dependency, expected) in [
+            ("demo==1.0", "demo==1.5"),
+            ("demo>=1.0rc1,<3", "demo>=1.6rc1,<3"),
+        ] {
+            let options = UpdateOptions::new(false, true).with_cooldown_policy(
+                upd::cooldown::CooldownPolicy {
+                    strict: true,
+                    default: chrono::Duration::days(7),
+                    ..Default::default()
+                },
+                chrono::Utc::now(),
+            );
+            let (result, text) = project(&registry, ">=3.10", dependency, options).await;
+            assert!(result.errors.is_empty(), "{result:?}");
+            assert!(text.contains(expected), "{text}");
+        }
+        assert!(public.received_requests().await.unwrap().is_empty());
+    }
+}

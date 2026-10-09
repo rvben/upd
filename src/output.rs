@@ -318,10 +318,10 @@ pub struct HeldBackEntry {
     pub current: String,
     /// The version that was actually written (old enough to pass the cooldown).
     pub chosen: String,
-    /// The absolute latest that was skipped because it is too new.
+    /// The absolute latest held for being too new or lacking a trusted date.
     pub skipped_latest: String,
-    /// RFC 3339 timestamp of when `skipped_latest` was published.
-    pub skipped_published_at: String,
+    /// RFC 3339 timestamp of when `skipped_latest` was published, or null when unknown.
+    pub skipped_published_at: Option<String>,
     /// Cooldown duration that caused the hold-back, in seconds.
     pub cooldown_seconds: i64,
     /// Annotation source token for an entry whose ecosystem is per-line rather
@@ -336,7 +336,7 @@ pub struct HeldBackEntry {
 pub struct SkippedByCooldownEntry {
     pub package: String,
     pub current: String,
-    /// The latest version that was skipped because it is too new.
+    /// The latest held for being too new or lacking a trustworthy publication date.
     pub skipped_latest: String,
     /// RFC 3339 timestamp of when `skipped_latest` was published, or null when
     /// the registry does not report one. Serialized even when absent so a
@@ -802,7 +802,7 @@ pub fn build_update_file_report(
                 current: old.clone(),
                 chosen: chosen.clone(),
                 skipped_latest: skipped.clone(),
-                skipped_published_at: pub_at.to_rfc3339(),
+                skipped_published_at: pub_at.map(|t| t.to_rfc3339()),
                 cooldown_seconds: entry_cooldown(cooldown_policy, source, file_type).num_seconds(),
                 source: source.map(AnnotationSource::token),
             }
@@ -903,7 +903,10 @@ pub fn build_update_file_report(
                 .held_back_from
                 .as_ref()
                 .map(|(version, _)| version.clone()),
-            skipped_published_at: entry.held_back_from.as_ref().map(|(_, at)| at.to_rfc3339()),
+            skipped_published_at: entry
+                .held_back_from
+                .as_ref()
+                .and_then(|(_, at)| at.map(|t| t.to_rfc3339())),
             line: entry.line_number,
             status: None,
         })
@@ -1339,6 +1342,7 @@ mod tests {
                 .iter()
                 .map(|(k, v)| ((*k).to_string(), Duration::seconds(*v)))
                 .collect(),
+            strict: false,
             force_override: None,
         }
     }
@@ -1612,7 +1616,7 @@ mod tests {
                 "1.0.0".into(),
                 "1.0.1".into(),
                 "1.0.2".into(),
-                published,
+                Some(published),
             )],
             skipped_by_cooldown: vec![(
                 "tokio".into(),
@@ -1747,7 +1751,7 @@ mod tests {
             "1.0.0".to_string(),
             "1.0.1".to_string(),
             "1.0.2".to_string(),
-            Utc::now(),
+            Some(Utc::now()),
         ));
         result
             .entry_ecosystem

@@ -624,26 +624,7 @@ impl PyProjectUpdater {
 
     /// Check if constraint is simple (no upper bounds that could be violated)
     fn is_simple_constraint(constraint: &str) -> bool {
-        // If there are multiple constraints (comma-separated), need constraint-aware lookup
-        if constraint.contains(',') {
-            return false;
-        }
-
-        // If the constraint has an upper-bound operator, need constraint-aware lookup
-        if constraint.starts_with('<')
-            || constraint.starts_with("<=")
-            || constraint.starts_with("~=")
-        {
-            return false;
-        }
-
-        // Also check for != which could affect version selection
-        if constraint.starts_with("!=") {
-            return false;
-        }
-
-        // Simple constraints like "==1.0.0", ">=1.0.0", ">1.0.0" are fine
-        true
+        super::is_simple_python_constraint(constraint)
     }
 
     fn update_dependency(&self, dep: &str, new_version: &str) -> String {
@@ -1115,28 +1096,15 @@ impl PyProjectUpdater {
                     // already admits. Asking for the newest release *matching*
                     // it would answer that with itself.
                     registry.get_latest_version(&parsed.package).await
-                } else if !is_stable_pep440(&parsed.version) {
-                    python_version_with_revalidation(
-                        registry,
-                        &parsed.package,
-                        &parsed.version,
-                        VersionQuery::IncludingPrereleases,
-                    )
-                    .await
-                } else if Self::is_simple_constraint(&parsed.full_constraint) {
-                    python_version_with_revalidation(
-                        registry,
-                        &parsed.package,
-                        &parsed.version,
-                        VersionQuery::Stable,
-                    )
-                    .await
                 } else {
                     python_version_with_revalidation(
                         registry,
                         &parsed.package,
                         &parsed.version,
-                        VersionQuery::Matching(&parsed.full_constraint),
+                        super::python_resolution_query(
+                            Some(&parsed.full_constraint),
+                            !is_stable_pep440(&parsed.version),
+                        ),
                     )
                     .await
                 }
@@ -1199,13 +1167,19 @@ impl PyProjectUpdater {
                     } else {
                         Some(full_constraint.as_str())
                     };
-                    let (outcome, note) = crate::updater::apply_cooldown(
+                    let (outcome, note) = crate::updater::apply_cooldown_for_query(
                         registry,
                         &package,
                         &current_version,
                         &latest_version,
                         constraints_for_cooldown,
-                        current_is_prerelease,
+                        super::CooldownSelection {
+                            current_is_prerelease,
+                            query: super::python_resolution_query(
+                                Some(&full_constraint),
+                                !is_stable_pep440(&current_version),
+                            ),
+                        },
                         options,
                     )
                     .await;
@@ -1219,6 +1193,10 @@ impl PyProjectUpdater {
                             skipped_version,
                             skipped_published_at,
                         } => (chosen, Some((skipped_version, skipped_published_at))),
+                        crate::updater::CooldownOutcome::LookupFailed { error } => {
+                            result.errors.push(error);
+                            continue;
+                        }
                         crate::updater::CooldownOutcome::Skipped {
                             skipped_version,
                             skipped_published_at,
@@ -1534,13 +1512,20 @@ impl PyProjectUpdater {
 
             let (outcome, note) = match target.anchor.as_deref() {
                 Some(anchor) => {
-                    crate::updater::apply_cooldown(
+                    crate::updater::apply_cooldown_for_query(
                         registry,
                         &target.package,
                         anchor,
                         &latest,
                         None,
-                        is_prerelease_pep440(&latest),
+                        super::CooldownSelection {
+                            current_is_prerelease: is_prerelease_pep440(&latest),
+                            query: if !is_stable_pep440(anchor) {
+                                VersionQuery::IncludingPrereleases
+                            } else {
+                                VersionQuery::Stable
+                            },
+                        },
                         options,
                     )
                     .await
@@ -1550,7 +1535,10 @@ impl PyProjectUpdater {
                         registry,
                         &target.package,
                         &latest,
-                        is_prerelease_pep440(&latest),
+                        super::CooldownSelection {
+                            current_is_prerelease: is_prerelease_pep440(&latest),
+                            query: VersionQuery::Stable,
+                        },
                         options,
                     )
                     .await
@@ -1566,6 +1554,10 @@ impl PyProjectUpdater {
                     skipped_version,
                     skipped_published_at,
                 } => (chosen, Some((skipped_version, skipped_published_at))),
+                crate::updater::CooldownOutcome::LookupFailed { error } => {
+                    result.errors.push(error);
+                    continue;
+                }
                 crate::updater::CooldownOutcome::Skipped {
                     skipped_version,
                     skipped_published_at,
@@ -1805,18 +1797,15 @@ impl PyProjectUpdater {
         let version_futures: Vec<_> = deps_to_check
             .iter()
             .map(|(key, _, version, _)| async {
-                if is_stable_pep440(version) {
-                    python_version_with_revalidation(registry, key, version, VersionQuery::Stable)
-                        .await
+                let query = if is_stable_pep440(version) {
+                    VersionQuery::Stable
                 } else {
-                    python_version_with_revalidation(
-                        registry,
-                        key,
-                        version,
-                        VersionQuery::IncludingPrereleases,
-                    )
-                    .await
-                }
+                    VersionQuery::IncludingPrereleases
+                };
+                (
+                    query,
+                    python_version_with_revalidation(registry, key, version, query).await,
+                )
             })
             .collect();
 
@@ -1826,6 +1815,7 @@ impl PyProjectUpdater {
         for ((key, prefix, version, line_num), version_result) in
             deps_to_check.into_iter().zip(version_results)
         {
+            let (query, version_result) = version_result;
             match version_result {
                 Ok(latest_version) => {
                     // When the current version is a pre-release, we fetched the latest
@@ -1843,13 +1833,16 @@ impl PyProjectUpdater {
                     } else {
                         Some(full_constraint.as_str())
                     };
-                    let (outcome, note) = crate::updater::apply_cooldown(
+                    let (outcome, note) = crate::updater::apply_cooldown_for_query(
                         registry,
                         &key,
                         &version,
                         &latest_version,
                         constraints_for_cooldown,
-                        current_is_prerelease,
+                        super::CooldownSelection {
+                            current_is_prerelease,
+                            query,
+                        },
                         options,
                     )
                     .await;
@@ -1863,6 +1856,10 @@ impl PyProjectUpdater {
                             skipped_version,
                             skipped_published_at,
                         } => (chosen, Some((skipped_version, skipped_published_at))),
+                        crate::updater::CooldownOutcome::LookupFailed { error } => {
+                            result.errors.push(error);
+                            continue;
+                        }
                         crate::updater::CooldownOutcome::Skipped {
                             skipped_version,
                             skipped_published_at,
@@ -4713,6 +4710,7 @@ dev = ["ruff"]
         let policy = crate::cooldown::CooldownPolicy {
             default: chrono::Duration::days(7),
             per_ecosystem: HashMap::new(),
+            strict: false,
             force_override: None,
         };
         let options = UpdateOptions::new(false, false)

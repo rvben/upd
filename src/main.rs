@@ -163,14 +163,17 @@ fn format_held_back_line(
     old: &str,
     new: &str,
     skipped_latest: &str,
-    skipped_published_at: DateTime<Utc>,
+    skipped_published_at: Option<DateTime<Utc>>,
     cooldown: Duration,
     now: DateTime<Utc>,
 ) -> String {
-    let age = now - skipped_published_at;
+    let released = skipped_published_at.map_or_else(
+        || "release date unknown".to_string(),
+        |at| format!("released {}", humanize_age(now - at)),
+    );
     format!(
-        "Held back {name} {old} → {new} ({skipped_latest} released {}, cooldown {})",
-        humanize_age(age),
+        "Held back {name} {old} → {new} ({skipped_latest} {}, cooldown {})",
+        released,
         humanize_cooldown(cooldown),
     )
 }
@@ -7339,7 +7342,14 @@ fn print_file_result(
                 file_type,
             );
             let line = if file_type == FileType::FlakeLock {
-                format_flake_cooldown_line(package, current, skipped_latest, cooldown)
+                if cooldown_policy.is_some_and(|policy| policy.strict) {
+                    format!(
+                        "Skipped {package} (new revision {skipped_latest} has no trustworthy publication date, strict cooldown {})",
+                        upd::cooldown::humanize_cooldown(cooldown)
+                    )
+                } else {
+                    format_flake_cooldown_line(package, current, skipped_latest, cooldown)
+                }
             } else {
                 format_skipped_by_cooldown_line(
                     package,
@@ -8579,7 +8589,7 @@ mod tests {
                         "1.0".into(),
                         "1.5".into(),
                         "2.0".into(),
-                        chrono::Utc::now(),
+                        Some(chrono::Utc::now()),
                     )],
                     ..clean.clone()
                 },
@@ -10057,7 +10067,7 @@ mod output_tests {
             "4.17.20",
             "4.17.21",
             "4.17.22",
-            pub_at,
+            Some(pub_at),
             Duration::days(7),
             fixed_now(),
         );
@@ -10189,7 +10199,7 @@ mod output_tests {
                 "1.0.0".to_string(),
                 "1.0.1".to_string(),
                 "1.0.2".to_string(),
-                Utc::now(),
+                Some(Utc::now()),
             )],
             ..Default::default()
         };

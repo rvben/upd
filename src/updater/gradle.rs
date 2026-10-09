@@ -620,6 +620,10 @@ impl Updater for GradleUpdater {
                             target = chosen;
                             held = Some((skipped_version, skipped_published_at));
                         }
+                        CooldownOutcome::LookupFailed { error } => {
+                            result.errors.push(error);
+                            continue;
+                        }
                         CooldownOutcome::Skipped {
                             skipped_version,
                             skipped_published_at,

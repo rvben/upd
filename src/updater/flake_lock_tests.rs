@@ -151,6 +151,7 @@ fn cooldown(days: i64, now: DateTime<Utc>) -> UpdateOptions {
     let policy = CooldownPolicy {
         default: Duration::days(days),
         per_ecosystem: HashMap::new(),
+        strict: false,
         force_override: None,
     };
     UpdateOptions::new(true, false).with_cooldown_policy(policy, now)
@@ -421,6 +422,27 @@ async fn cooldown_holds_an_input_whose_locked_commit_is_younger_than_the_window(
     assert_eq!(
         result.skipped_by_cooldown,
         vec![("nixpkgs".into(), OLD[..12].into(), NEW[..12].into(), None)]
+    );
+}
+
+#[tokio::test]
+async fn strict_cooldown_never_uses_an_old_locked_commit_as_publication_evidence() {
+    let server = MockServer::start().await;
+    github_head(&server, "/repos/NixOS/nixpkgs/commits/nixos-unstable", NEW).await;
+    let original = nixpkgs_lock(OLD);
+    let flake = Flake::new(&original);
+    let now = DateTime::from_timestamp(LOCKED_AT, 0).unwrap() + Duration::days(30);
+    let mut options = cooldown(7, now);
+    Arc::make_mut(options.cooldown_policy.as_mut().unwrap()).strict = true;
+    let result = updater(&server)
+        .update(&flake.lock_path(), &registry(), options)
+        .await
+        .unwrap();
+    assert!(result.updated.is_empty());
+    assert_eq!(result.skipped_by_cooldown.len(), 1);
+    assert_eq!(
+        std::fs::read_to_string(flake.lock_path()).unwrap(),
+        original
     );
 }
 

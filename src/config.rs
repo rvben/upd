@@ -147,6 +147,9 @@ const AUTOMATION_KEYS: &[&str] = &[
 /// `crate::cooldown::CooldownPolicy` at runtime via `UpdConfig::to_cooldown_policy`.
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct CooldownConfig {
+    /// Require provider-recorded publication dates; missing or failed lookups hold updates.
+    #[serde(default)]
+    pub strict: bool,
     /// Default cooldown applied to all ecosystems (e.g. "7d").
     #[serde(default)]
     pub default: Option<String>,
@@ -470,6 +473,14 @@ impl UpdConfig {
             }
         }
 
+        if let Some(cooldown) = raw.get("cooldown").and_then(toml::Value::as_table) {
+            for key in cooldown.keys() {
+                if !["default", "strict", "ecosystem"].contains(&key.as_str()) {
+                    warnings.push(format!("unknown key `{key}` in [cooldown] in config file {source_label}; valid keys are: default, strict, ecosystem"));
+                }
+            }
+        }
+
         // Warn on unknown ecosystem keys inside [cooldown.ecosystem]. Derived
         // from the languages themselves so a new one is spellable the day it
         // exists, in both the registry name and the narrower language name.
@@ -561,6 +572,7 @@ exclude = [
 # Accepts durations like "0" (disabled), "72h", "7d", "2w".
 [cooldown]
 # default = "7d"         # applied to every ecosystem unless overridden below
+# strict = true          # hold candidates without provider-recorded publication dates
 
 # Per-ecosystem overrides. A key names a registry (pypi, npm, crates.io,
 # go-proxy, rubygems, nuget, gradle, github-releases, terraform, docker) or a
@@ -661,6 +673,7 @@ lock_build = false
         };
 
         Ok(CooldownPolicy {
+            strict: self.cooldown.as_ref().is_some_and(|c| c.strict),
             default,
             per_ecosystem,
             force_override,
@@ -901,6 +914,7 @@ pub fn render_cooldown_for_show_config(policy: &crate::cooldown::CooldownPolicy)
     }
 
     let mut out = String::from("cooldown:\n");
+    out.push_str(&format!("  strict: {}\n", policy.strict));
     if let Some(d) = policy.force_override {
         out.push_str(&format!("  (--min-age override active: {})\n", fmt_dur(d)));
     }
@@ -1088,6 +1102,7 @@ impl EffectiveConfig<'_> {
                 "lock_build": self.config.lock_build_enabled(),
             },
             "cooldown": {
+                "strict": self.cooldown.strict,
                 "default_seconds": self.cooldown.default.num_seconds(),
                 "min_age_override_seconds": self.cooldown
                     .force_override
@@ -2107,6 +2122,7 @@ dependency-groups = "exact"
         let policy = crate::cooldown::CooldownPolicy {
             default: chrono::Duration::zero(),
             per_ecosystem: HashMap::new(),
+            strict: false,
             force_override: None,
         };
         let config = UpdConfig {
@@ -2508,6 +2524,7 @@ default = "nope"
         let policy = crate::cooldown::CooldownPolicy {
             default: chrono::Duration::days(7),
             per_ecosystem: per,
+            strict: false,
             force_override: None,
         };
         let rendered = render_cooldown_for_show_config(&policy);
@@ -2520,6 +2537,7 @@ default = "nope"
         let policy = crate::cooldown::CooldownPolicy {
             default: chrono::Duration::days(7),
             per_ecosystem: std::collections::HashMap::new(),
+            strict: false,
             force_override: Some(chrono::Duration::zero()),
         };
         let rendered = render_cooldown_for_show_config(&policy);
@@ -2618,5 +2636,43 @@ mod policy_tests {
         assert!(parent.update_exact_pins());
         assert_eq!(parent.selected_ecosystems(&[], &[]).unwrap(), Some(vec![]));
         assert_eq!(parent.ecosystems.disable.unwrap(), ["rust"]);
+    }
+}
+
+#[cfg(test)]
+mod strict_cooldown_config_tests {
+    use super::*;
+
+    #[test]
+    fn a_misspelled_strict_option_is_reported() {
+        let (_, warnings) =
+            UpdConfig::parse_with_warnings("[cooldown]\nstict = true\n", "fixture.toml").unwrap();
+        assert!(
+            warnings
+                .iter()
+                .any(|warning| warning.contains("unknown key `stict` in [cooldown]"))
+        );
+    }
+
+    #[test]
+    fn strict_is_opt_in_and_zero_override_still_wins() {
+        assert!(
+            !UpdConfig::default()
+                .to_cooldown_policy(None, None)
+                .unwrap()
+                .strict
+        );
+        let config: UpdConfig = toml::from_str(
+            "[cooldown]\ndefault = '7d'\nstrict = true\n[cooldown.ecosystem]\npre-commit = '30d'\n",
+        )
+        .unwrap();
+        let policy = config.to_cooldown_policy(Some("0"), Some("14d")).unwrap();
+        assert!(policy.strict);
+        assert_eq!(
+            policy.effective_for("github-releases", Some("pre-commit")),
+            chrono::Duration::zero()
+        );
+        assert!(render_cooldown_for_show_config(&policy).contains("strict: true"));
+        assert!(toml::from_str::<UpdConfig>("[cooldown]\nstrict = 'yes'\n").is_err());
     }
 }

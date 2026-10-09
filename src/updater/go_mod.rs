@@ -336,6 +336,11 @@ impl Updater for GoModUpdater {
                                     skipped_version,
                                     skipped_published_at,
                                 } => (chosen, Some((skipped_version, skipped_published_at))),
+                                crate::updater::CooldownOutcome::LookupFailed { error } => {
+                                    result.errors.push(error);
+                                    new_lines.push(line.to_string());
+                                    continue;
+                                }
                                 crate::updater::CooldownOutcome::Skipped {
                                     skipped_version,
                                     skipped_published_at,

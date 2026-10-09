@@ -75,6 +75,8 @@ pub fn humanize_cooldown(d: Duration) -> String {
 /// the registry key, then `default`, then zero (disabled).
 #[derive(Debug, Clone, Default)]
 pub struct CooldownPolicy {
+    /// Reject candidates without a provider-recorded publication timestamp.
+    pub strict: bool,
     /// Applied to every ecosystem unless overridden.
     pub default: Duration,
     /// Overrides keyed by registry name (see `src/cache.rs` for the canonical
@@ -139,7 +141,7 @@ pub enum CooldownDecision {
 #[derive(Debug, Clone)]
 pub struct HeldBackInfo {
     pub version: String,
-    pub published_at: DateTime<Utc>,
+    pub published_at: Option<DateTime<Utc>>,
 }
 
 /// Select a version under the cooldown policy.
@@ -174,6 +176,7 @@ pub fn select(
         current_is_prerelease,
         cooldown,
         now,
+        false,
     )
 }
 
@@ -195,9 +198,34 @@ pub fn select_without_floor(
         current_is_prerelease,
         cooldown,
         now,
+        false,
     )
 }
 
+/// Fail closed for undated candidates while retaining ordinary constraint and track filtering.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn select_strict(
+    versions: &[VersionMeta],
+    current: Option<&str>,
+    latest: &str,
+    constraints: Option<&str>,
+    current_is_prerelease: bool,
+    cooldown: Duration,
+    now: DateTime<Utc>,
+) -> CooldownDecision {
+    select_with_floor(
+        versions,
+        current,
+        latest,
+        constraints,
+        current_is_prerelease,
+        cooldown,
+        now,
+        true,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
 fn select_with_floor(
     versions: &[VersionMeta],
     current: Option<&str>,
@@ -206,6 +234,7 @@ fn select_with_floor(
     current_is_prerelease: bool,
     cooldown: Duration,
     now: DateTime<Utc>,
+    strict: bool,
 ) -> CooldownDecision {
     // Empty input => unsupported (nothing to decide on).
     if versions.is_empty() {
@@ -266,6 +295,12 @@ fn select_with_floor(
             .collect()
     };
 
+    // The resolved latest already reflects registry policy (e.g. npm dist-tags)
+    // and interpreter compatibility. Strict metadata must not promote above it.
+    if strict {
+        candidates.retain(|v| compare_versions(&v.version, latest) != std::cmp::Ordering::Greater);
+    }
+
     // Sort descending by version (best-effort semver; fall back to numeric-aware
     // segment compare for non-semver ecosystems).
     candidates.sort_by(|a, b| compare_versions(&b.version, &a.version));
@@ -282,7 +317,7 @@ fn select_with_floor(
 
     // If any candidate has no publish date, we can't apply cooldown. Bail
     // out cleanly.
-    if candidates.iter().any(|v| v.published_at.is_none()) {
+    if !strict && candidates.iter().any(|v| v.published_at.is_none()) {
         return CooldownDecision::Unsupported;
     }
 
@@ -296,8 +331,8 @@ fn select_with_floor(
     }
 
     let top = candidates[0];
-    let top_ts = top.published_at.expect("checked above");
-    if top_ts + cooldown <= now {
+    let top_ts = top.published_at;
+    if top_ts.is_some_and(|ts| ts + cooldown <= now) {
         return CooldownDecision::Use {
             version: top.version.clone(),
             held_back_from: None,
@@ -307,8 +342,10 @@ fn select_with_floor(
     // Top is too new. Walk down for the newest version that satisfies the
     // window.
     for candidate in candidates.iter().skip(1) {
-        let ts = candidate.published_at.expect("checked above");
-        if ts + cooldown <= now {
+        if candidate
+            .published_at
+            .is_some_and(|ts| ts + cooldown <= now)
+        {
             return CooldownDecision::Use {
                 version: candidate.version.clone(),
                 held_back_from: Some(HeldBackInfo {
@@ -503,6 +540,7 @@ mod tests {
         let policy = CooldownPolicy {
             default: Duration::days(7),
             per_ecosystem: std::collections::HashMap::new(),
+            strict: false,
             force_override: None,
         };
         assert_eq!(policy.effective_for("pypi", None), Duration::days(7));
@@ -517,6 +555,7 @@ mod tests {
         let policy = CooldownPolicy {
             default: Duration::days(7),
             per_ecosystem: per,
+            strict: false,
             force_override: None,
         };
         assert_eq!(policy.effective_for("npm", None), Duration::days(14));
@@ -534,6 +573,7 @@ mod tests {
         let policy = CooldownPolicy {
             default: Duration::days(7),
             per_ecosystem: per,
+            strict: false,
             force_override: Some(Duration::days(3)),
         };
         assert_eq!(
@@ -555,6 +595,7 @@ mod tests {
         let policy = CooldownPolicy {
             default: Duration::days(7),
             per_ecosystem: per,
+            strict: false,
             force_override: Some(Duration::zero()),
         };
         assert_eq!(policy.effective_for("npm", None), Duration::zero());
@@ -575,6 +616,7 @@ mod tests {
             ]
             .into_iter()
             .collect(),
+            strict: false,
             force_override: None,
         };
 
@@ -601,6 +643,7 @@ mod tests {
             default: Duration::days(1),
             per_ecosystem: std::iter::once(("pre-commit".to_string(), Duration::days(30)))
                 .collect(),
+            strict: false,
             force_override: None,
         };
 
@@ -622,6 +665,7 @@ mod tests {
             default: Duration::days(1),
             per_ecosystem: std::iter::once(("pre-commit".to_string(), Duration::days(30)))
                 .collect(),
+            strict: false,
             force_override: Some(Duration::days(3)),
         };
 
@@ -636,6 +680,7 @@ mod tests {
         let policy = CooldownPolicy {
             default: Duration::zero(),
             per_ecosystem: std::iter::once(("npm".to_string(), Duration::days(7))).collect(),
+            strict: false,
             force_override: None,
         };
         assert!(policy.is_enabled_for("npm", None));
