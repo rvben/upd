@@ -1337,11 +1337,7 @@ fn workflow_installs_nix_only_for_a_repository_with_flake_inputs_to_update() {
     assert!(WORKFLOW.contains(
         "if: (inputs.langs == '' || contains(inputs.langs, 'nix')) && hashFiles('**/flake.lock') != ''"
     ));
-    assert!(
-        WORKFLOW.contains(
-            "cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24 # v31.11.1"
-        )
-    );
+    assert!(WORKFLOW.contains("uses: cachix/install-nix-action@"));
 }
 
 #[test]
@@ -1799,11 +1795,11 @@ fn workflow_defaults_are_reproducible_and_safe() {
     assert!(WORKFLOW.contains(".assets[$target].sha256"));
     assert!(WORKFLOW.contains("manifest_asset\" != \"$expected_asset"));
     assert!(WORKFLOW.contains("--retry 3 --retry-all-errors"));
-    assert!(WORKFLOW.contains("actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1"));
-    assert!(WORKFLOW.contains("actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a"));
-    assert!(
-        WORKFLOW.contains("actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c")
-    );
+    // release_pins.rs checks that every external action uses a full commit SHA.
+    // Check the required actions here without freezing their dependency versions.
+    assert!(WORKFLOW.contains("uses: actions/checkout@"));
+    assert!(WORKFLOW.contains("uses: actions/upload-artifact@"));
+    assert!(WORKFLOW.contains("uses: actions/download-artifact@"));
     assert!(WORKFLOW.contains("--force-with-lease="));
     assert!(WORKFLOW.contains("persist-credentials: false"));
     assert!(WORKFLOW.contains("GIT_ASKPASS=\"$askpass\""));
@@ -1841,12 +1837,11 @@ fn workflow_defaults_are_reproducible_and_safe() {
 
 #[test]
 fn repository_dependency_jobs_share_the_hardened_workflow() {
-    // The pinned commit must be the tag commit of a published upd release at
-    // or above the token broker's minimum release, or the workflow is rejected
-    // at the token exchange.
-    assert!(DEPENDENCIES_WORKFLOW.contains(
-        "uses: rvben/upd/.github/workflows/dependency-health.yml@b015afc2c81f52fbffd862469203c076e32e6edf"
-    ));
+    // The broker enforces release trust at token exchange. release_pins.rs
+    // checks full commit pins; this contract permits dependency updates.
+    assert!(
+        DEPENDENCIES_WORKFLOW.contains("uses: rvben/upd/.github/workflows/dependency-health.yml@")
+    );
     assert!(DEPENDENCIES_WORKFLOW.contains("langs: rust,actions"));
     assert!(DEPENDENCIES_WORKFLOW.contains("lock: true"));
     assert!(DEPENDENCIES_WORKFLOW.contains("branch: deps/upd"));
