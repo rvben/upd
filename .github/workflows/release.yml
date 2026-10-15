@@ -181,11 +181,11 @@ jobs:
           TARGET: ${{ matrix.target }}
         run: |
           if [[ "$TARGET" == *-musl ]]; then
-            mise exec -- maturin build --release --target "$TARGET" --compatibility musllinux_1_2 --zig
+            mise exec github:PyO3/maturin -- maturin build --release --target "$TARGET" --compatibility musllinux_1_2 --zig
           elif [[ "$TARGET" == *-gnu ]]; then
-            mise exec -- maturin build --release --target "$TARGET" --compatibility manylinux2014 --zig
+            mise exec github:PyO3/maturin -- maturin build --release --target "$TARGET" --compatibility manylinux2014 --zig
           else
-            mise exec -- maturin build --release --target "$TARGET"
+            mise exec github:PyO3/maturin -- maturin build --release --target "$TARGET"
           fi
         shell: bash
 
@@ -194,7 +194,7 @@ jobs:
           TARGET: ${{ matrix.target }}
         run: |
           if [[ "$TARGET" == *-linux-* ]]; then
-            mise exec -- cargo zigbuild --release --target "$TARGET"
+            mise exec cargo:cargo-zigbuild -- cargo zigbuild --release --target "$TARGET"
           else
             cargo build --release --target "$TARGET"
           fi
@@ -266,7 +266,7 @@ jobs:
       - name: Install attested maturin binary
         run: mise install github:PyO3/maturin
       - name: Build source distribution
-        run: mise exec -- maturin sdist
+        run: mise exec github:PyO3/maturin -- maturin sdist
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           path: target/wheels/*.tar.gz

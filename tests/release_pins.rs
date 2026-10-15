@@ -262,6 +262,12 @@ fn ci_and_release_jobs_install_only_the_tools_they_use() {
             "{name} must not install unrelated tools as a single concurrent batch"
         );
     }
+    assert!(
+        !RELEASE_WORKFLOW.contains("mise exec --"),
+        "release commands must name their tools so mise does not install unrelated tools",
+    );
+    assert!(RELEASE_WORKFLOW.contains("mise exec github:PyO3/maturin -- maturin sdist"));
+    assert!(RELEASE_WORKFLOW.contains("mise exec cargo:cargo-zigbuild -- cargo zigbuild"));
     assert_eq!(CI_WORKFLOW.matches("run: mise install rust").count(), 1);
     assert!(RELEASE_WORKFLOW.contains("mise install cargo-binstall"));
     assert!(!RELEASE_WORKFLOW.contains("mise install cargo:cargo-binstall"));
