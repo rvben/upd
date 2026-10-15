@@ -1172,7 +1172,12 @@ fn template_inputs_are_declared_exactly_where_they_are_used() {
 
 #[test]
 fn template_defaults_are_pinned_and_protect_the_report() {
-    assert!(TEMPLATE.contains("debian:bookworm-slim@sha256:"));
+    let pins: serde_json::Value =
+        serde_json::from_str(include_str!("../release-pins.json")).unwrap();
+    let image = pins["image"]
+        .as_str()
+        .unwrap_or("debian:bookworm-slim@sha256:");
+    assert!(TEMPLATE.contains(image));
     assert!(TEMPLATE.contains("UPD_VERSION: \"$[[ inputs.upd_version ]]\""));
     assert!(TEMPLATE.contains("args=(gitlab org run --output json)"));
     assert!(TEMPLATE.contains("    access: developer\n"));
