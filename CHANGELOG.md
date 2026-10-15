@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.17.0](https://github.com/rvben/upd/compare/v0.16.0...v0.17.0) - 2026-10-15
+
 ### Added
 
 - Conservative Renovate migration and GitLab organization onboarding, with persistent declined invitations and manual review for unsupported settings.
@@ -14,10 +16,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - A project-owned lockfile CI template using a project-scoped token, alongside the existing isolated lock runners.
 - Named uv index credentials and GitLab CI registry credential fallback scoped to the instance registry.
 - Release automation for multi-platform CI images and verified image digest pins in GitLab templates after publication.
+- **cooldown**: enforce stateless strict publication dates ([3ae6291](https://github.com/rvben/upd/commit/3ae629155655a4b242d5fe0b2cd5acf963b620fa))
+- **cli**: fail check mode on blocked dependencies ([902f694](https://github.com/rvben/upd/commit/902f694086c5277e5ad9e05b527023d6b4ef4866))
 
 ### Fixed
 
 - Stop private Python index authentication and request failures from silently falling through to a public index.
+- **schema**: use a runnable annotation validation example ([9583b49](https://github.com/rvben/upd/commit/9583b49a78319e2b50523db78518d83fe7acfc4a))
 
 ## [0.16.0](https://github.com/rvben/upd/compare/v0.15.1...v0.16.0) - 2026-10-06
 
