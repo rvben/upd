@@ -270,6 +270,13 @@ when publication metadata is unavailable. This mode governs upd's version and
 revision selection. Lockfile refreshes retain their documented release-age
 checks and reporting; a package manager's transitive selections are independent.
 
+GitHub tag and release lists are paginated, with a limit of 20 pages of 100
+entries per repository. A failed page, unsafe pagination link, or longer list
+fails the lookup instead of returning incomplete data. Complete tag lists
+are shared within a run. For tag-only repositories, non-strict cooldown dates
+at most the five newest stable and five newest prerelease tags; it holds the
+update if none of those candidates is old enough.
+
 ### Keying a cooldown on a language
 
 `[cooldown.ecosystem]` takes a language name as well as a registry name, spelled

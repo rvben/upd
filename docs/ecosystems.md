@@ -60,6 +60,13 @@ Reports identify the complete section (including group name) and show the
 full old and new constraint. JSON updates add `section`, `previous_spec`, and
 `new_spec` without changing the existing version fields.
 
+PEP 440 prefix matches such as `demo==1.*` and `demo==1.2.*` keep their chosen
+series. upd checks whether the latest release fits that series and reports a
+newer release outside it without rewriting the wildcard. This also applies in
+requirements files and hook dependencies. To declare a concrete version floor
+that upd can advance, use a lower bound or compatible-release constraint, such
+as `demo>=1.2.0` or `demo~=1.2.0`.
+
 ### uv upload cutoffs
 
 Python `update` candidate selection, including lock-only `--package` updates,
@@ -542,25 +549,41 @@ pull-request workflow are covered in [GitHub Actions](github-actions.md).
 - Updates `rev` fields for GitHub-hosted hook repositories; special repositories
   (`local`, `meta`, `builtin`) and non-GitHub repository revisions stay unchanged
 
-A `rev` is a git reference, not a version, so only one upd can read as a version
-tag is rewritten. `v4.5.0`, `24.3.0`, four-segment tags such as `v0.11.0.1`,
-prereleases, and single-number tags all qualify. Anything else is left exactly as
-it is, with the status and reason naming which kind it was:
+A `rev` is a git reference, not a version. upd updates readable version tags
+and existing frozen commit pins. `v4.5.0`, `24.3.0`, four-segment tags such as
+`v0.11.0.1`, prereleases, and single-number tags all qualify.
+
+Pins created by `pre-commit autoupdate --freeze` carry an immediately trailing
+`# frozen: <tag>` comment. upd verifies that the exact tag names the pinned
+40-character commit or annotated tag object before selecting an update, then
+resolves the selected tag and changes the SHA and comment together. Updates
+preserve commit pins and annotated-object pins in their existing form.
+This works in YAML and `prek.toml`,
+preserves quoting and trailing comments, and keeps the published tag's full
+spelling. It respects cooldown, bump limits, ignores, package selection, and
+explicit configuration pins. It does not create new commit pins or infer a
+release for a bare SHA. `upd align` leaves all SHA revisions read-only because
+alignment runs without verifying remote references.
+
+Other revisions are left exactly as they are, with the status and reason
+naming which kind they were:
 
 | Status | Reason | Revisions |
 | --- | --- | --- |
-| `not-examined` | `sha-pinned-rev` | a full 40-character commit SHA, including `pre-commit autoupdate --freeze` pins |
+| `not-examined` | `sha-pinned-rev` | a full 40-character commit SHA without an immediately trailing `frozen:` comment |
 | `blocked` | `unrecognized-rev` | an abbreviated SHA, a branch (`main`), a moving pointer (`1.x`), a prefixed tag (`black-24.3.0`) |
+| `blocked` | `invalid-frozen-tag` | a `frozen:` comment without a readable version tag |
+| `blocked` | `frozen-tag-not-found` | the current or selected frozen tag is missing, or its repository is inaccessible |
+| `blocked` | `frozen-tag-mismatch` | the current frozen tag identifies a different Git object and commit |
+| `blocked` | `unusable-frozen-tag` | the tag does not reach a commit, or is nested too deeply to verify |
 
-Neither costs a revision lookup. Frozen commit-pin updates are unsupported and
-do not fail `--check --fail-on-blocked`; an unrecognized revision fails this
-strict check because no safe version-tag rewrite is available. Plain `--check`
-does not fail for either revision alone. A configured `[pin]` does not override
-this: the pinned version
-is written in the shape of the revision it replaces, which for an unreadable
-revision is the truncation this guard exists to prevent. An abbreviated commit
-SHA made only
-of decimal digits is indistinguishable from a numeric tag such as the CalVer
+Bare commit pins and unrecognized revisions are not looked up for revision updates. Blocked
+revisions fail `--check --fail-on-blocked`; plain `--check` does not fail for a
+blocked revision alone. Failed verification requests are errors rather than
+evidence that a pin is current. A configured `[pin]` cannot override a failed
+verification or turn an unreadable revision into a version tag. For a verified
+frozen pin it must name the exact target tag. An abbreviated commit SHA made
+only of decimal digits is indistinguishable from a numeric tag such as the CalVer
 `20250101`, and is read as the tag.
 
 Hook `additional_dependencies` are updated according to the hook's language,

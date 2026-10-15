@@ -724,6 +724,13 @@ pub fn build_update_file_report(
                     && change.new_version == *new
                     && change.line_number == *line
             });
+            let frozen = result.pre_commit_edits.iter().find(|edit| {
+                edit.frozen_tag.is_some()
+                    && edit.package == *name
+                    && edit.current == *old
+                    && edit.new == *new
+                    && edit.line == *line
+            });
             UpdateEntry {
                 section: context.and_then(|c| c.section.clone()),
                 previous_spec: context.and_then(|c| c.previous_spec.clone()),
@@ -748,9 +755,18 @@ pub fn build_update_file_report(
                     .filter(|_| file_type == FileType::PreCommitConfig)
                     .or_else(|| source_at(name, *line))
                     .map(AnnotationSource::token),
-                reference_kind: sha.map(|_| "sha"),
-                current_commit: sha.map(|change| change.current_commit.clone()),
-                latest_commit: sha.map(|change| change.new_commit.clone()),
+                reference_kind: (sha.is_some() || frozen.is_some()).then_some("sha"),
+                current_commit: sha.map(|change| change.current_commit.clone()).or_else(|| {
+                    frozen.and_then(|edit| {
+                        edit.frozen_tag
+                            .as_ref()
+                            .map(|tag| tag.current_commit.clone())
+                    })
+                }),
+                latest_commit: sha.map(|change| change.new_commit.clone()).or_else(|| {
+                    frozen
+                        .and_then(|edit| edit.frozen_tag.as_ref().map(|tag| tag.new_commit.clone()))
+                }),
             }
         })
         .collect();

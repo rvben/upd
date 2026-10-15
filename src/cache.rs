@@ -477,6 +477,15 @@ impl<R: Registry> Registry for CachedRegistry<R> {
         self.inner.resolve_ref_to_commit(package, reference).await
     }
 
+    // Pin verification must use live tag identities, including annotated objects.
+    async fn resolve_git_tag(
+        &self,
+        package: &str,
+        tag: &str,
+    ) -> Result<crate::registry::ResolvedGitTag> {
+        self.inner.resolve_git_tag(package, tag).await
+    }
+
     /// Forwarded without caching, for the same reason as `resolve_ref_to_commit`:
     /// the answer decides which release a SHA pin is annotated with, and a tag
     /// can be moved onto or off a commit between runs.
@@ -1077,6 +1086,38 @@ mod forwarding_tests {
     use crate::registry::MockRegistry;
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    #[tokio::test]
+    async fn cached_registry_forwards_annotated_tag_identity_without_caching_it() {
+        let server = MockServer::start().await;
+        let object = "1111111111111111111111111111111111111111";
+        let commit = "2222222222222222222222222222222222222222";
+        Mock::given(path("/repos/acme/hook/git/ref/tags/v1.2.3"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"object": {"sha": object, "type": "tag"}})),
+            )
+            .expect(2)
+            .mount(&server)
+            .await;
+        Mock::given(path(format!("/repos/acme/hook/git/tags/{object}")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(
+                serde_json::json!({"sha": object, "object": {"sha": commit, "type": "commit"}}),
+            ))
+            .expect(2)
+            .mount(&server)
+            .await;
+        let cached = CachedRegistry::new(
+            GitHubReleasesRegistry::with_api_url_and_token(server.uri(), None),
+            Cache::new_shared(),
+            true,
+        );
+        for _ in 0..2 {
+            let tag = cached.resolve_git_tag("acme/hook", "v1.2.3").await.unwrap();
+            assert_eq!(tag.object, object);
+            assert_eq!(tag.commit, commit);
+        }
+    }
 
     /// CachedRegistry decorates another registry, so every Registry method has
     /// to be forwarded explicitly. A method left to the trait default answers

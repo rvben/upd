@@ -6026,11 +6026,7 @@ fn apply_selected_pre_commit_edits(
             );
         }
     }
-    edits.sort_by_key(|edit| std::cmp::Reverse(edit.span.start));
-    let mut rewritten = content.to_string();
-    for edit in edits {
-        rewritten.replace_range(edit.span.clone(), &edit.replacement);
-    }
+    let rewritten = upd::updater::PreCommitEdit::apply_all(content, edits)?;
     Ok(AppliedVersionUpdates {
         content: rewritten,
         applied: vec![true; updates.len()],
@@ -10345,7 +10341,7 @@ mod output_tests {
     }
 
     #[tokio::test]
-    async fn fail_on_blocked_preserves_frozen_pre_commit_pins_without_a_lookup() {
+    async fn fail_on_blocked_preserves_bare_pre_commit_pins_without_a_lookup() {
         use wiremock::matchers::method;
         use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -10395,6 +10391,79 @@ mod output_tests {
             assert_eq!(std::fs::read_to_string(&file).unwrap(), input, "{name}");
         }
         assert!(server.received_requests().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn frozen_pre_commit_checks_distinguish_updates_verification_blocks_and_request_errors() {
+        use wiremock::matchers::path;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let sha = "1234567890abcdef1234567890abcdef12345678";
+        let next = "abcdefabcdefabcdefabcdefabcdefabcdefabcd";
+        for name in [".pre-commit-config.yaml", "prek.toml"] {
+            for (status, resolved, latest, expected) in [
+                (200, sha, "v1.2.3", 0),
+                (200, sha, "v2.0.0", 1),
+                (200, next, "v2.0.0", 1),
+                (404, sha, "v2.0.0", 1),
+                (403, sha, "v2.0.0", 2),
+            ] {
+                let server = MockServer::start().await;
+                Mock::given(path("/repos/acme/tool/git/ref/tags/v1.2.3"))
+                    .respond_with(ResponseTemplate::new(status).set_body_json(
+                        serde_json::json!({"object": {"sha": resolved, "type": "commit"}}),
+                    ))
+                    .mount(&server)
+                    .await;
+                Mock::given(path("/repos/acme/tool/releases/latest"))
+                    .respond_with(
+                        ResponseTemplate::new(200)
+                            .set_body_json(serde_json::json!({"tag_name": latest})),
+                    )
+                    .mount(&server)
+                    .await;
+                Mock::given(path("/repos/acme/tool/git/ref/tags/v2.0.0"))
+                    .respond_with(ResponseTemplate::new(200).set_body_json(
+                        serde_json::json!({"object": {"sha": next, "type": "commit"}}),
+                    ))
+                    .mount(&server)
+                    .await;
+                let temp = tempfile::tempdir().unwrap();
+                let file = temp.path().join(name);
+                let config = temp.path().join("upd.toml");
+                let input = if name.ends_with(".toml") {
+                    format!(
+                        "[[repos]]\nrepo = 'https://github.com/acme/tool'\nrev = '{sha}' # frozen: v1.2.3\nhooks = []\n"
+                    )
+                } else {
+                    format!(
+                        "repos:\n- repo: https://github.com/acme/tool\n  rev: {sha} # frozen: v1.2.3\n  hooks: []\n"
+                    )
+                };
+                std::fs::write(&file, &input).unwrap();
+                std::fs::write(&config, "").unwrap();
+                let cli = Cli::try_parse_from([
+                    "upd",
+                    "--check",
+                    "--fail-on-blocked",
+                    "--no-cache",
+                    "--config",
+                    config.to_str().unwrap(),
+                    file.to_str().unwrap(),
+                ])
+                .and_then(Cli::validate)
+                .unwrap();
+                let code = run_update_with_github(&cli, || {
+                    GitHubReleasesRegistry::with_api_url_and_token(server.uri(), None)
+                })
+                .await
+                .unwrap();
+                assert_eq!(
+                    code, expected,
+                    "{name}: HTTP {status}, current {resolved}, latest {latest}"
+                );
+                assert_eq!(std::fs::read_to_string(&file).unwrap(), input);
+            }
+        }
     }
 
     fn options_for(cli_flag: Option<bool>, config_key: Option<bool>) -> UpdateOptions {
@@ -11761,6 +11830,94 @@ mod pre_commit_selection_tests {
     use upd::updater::PreCommitEdit;
 
     #[test]
+    fn frozen_pin_selection_keeps_comment_atomic_and_requires_revision_for_inherited_hooks() {
+        use upd::updater::PreCommitTagEdit;
+        let old_sha = "1234567890abcdef1234567890abcdef12345678";
+        let new_sha = "abcdefabcdefabcdefabcdefabcdefabcdefabcd";
+        let content = format!(
+            "[[repos]]\nrepo = 'https://github.com/owner/repo'\nrev = '{old_sha}' # frozen: v1.2.3\nhooks = [{{id = 'demo', additional_dependencies = ['demo==1.0.0']}}]\n"
+        );
+        let start = content.find(old_sha).unwrap();
+        let span = start..start + old_sha.len();
+        let comment_end = content[span.end..].find('\n').unwrap() + span.end;
+        let dependency = content.find("demo==1.0.0").unwrap();
+        let planned = vec![
+            PreCommitEdit {
+                package: "owner/repo".into(),
+                current: "v1.2.3".into(),
+                new: "v2.0.0".into(),
+                line: Some(3),
+                span: span.clone(),
+                original: old_sha.into(),
+                replacement: new_sha.into(),
+                frozen_tag: Some(PreCommitTagEdit {
+                    span: span.end..comment_end,
+                    original: content[span.end..comment_end].into(),
+                    replacement: "' # frozen: v2.0.0".into(),
+                    current_commit: old_sha.into(),
+                    new_commit: new_sha.into(),
+                }),
+                source: None,
+                pinned: false,
+                required_revision: None,
+            },
+            PreCommitEdit {
+                package: "demo".into(),
+                current: "1.0.0".into(),
+                new: "2.0.0".into(),
+                line: Some(4),
+                span: dependency..dependency + "demo==1.0.0".len(),
+                original: "demo==1.0.0".into(),
+                replacement: "demo==2.0.0".into(),
+                frozen_tag: None,
+                source: Some(AnnotationSource::PyPi),
+                pinned: false,
+                required_revision: Some((span, new_sha.into())),
+            },
+        ];
+        let updates = [
+            VersionEdit {
+                package: "owner/repo",
+                old_version: "v1.2.3",
+                new_version: "v2.0.0",
+                line_num: Some(3),
+                expected_source: None,
+                sha_pin: None,
+            },
+            VersionEdit {
+                package: "demo",
+                old_version: "1.0.0",
+                new_version: "2.0.0",
+                line_num: Some(4),
+                expected_source: Some(AnnotationSource::PyPi),
+                sha_pin: None,
+            },
+        ];
+        assert!(apply_selected_pre_commit_edits(&content, &updates[1..], &planned).is_err());
+        let revision_only =
+            apply_selected_pre_commit_edits(&content, &updates[..1], &planned).unwrap();
+        assert_eq!(
+            revision_only.content,
+            content
+                .replace(old_sha, new_sha)
+                .replace("v1.2.3", "v2.0.0")
+        );
+        let both = apply_selected_pre_commit_edits(&content, &updates, &planned).unwrap();
+        assert_eq!(
+            both.content,
+            revision_only.content.replace("demo==1.0.0", "demo==2.0.0")
+        );
+        assert!(
+            apply_selected_pre_commit_edits(
+                &content.replace("frozen:", "reason:"),
+                &updates,
+                &planned
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
     fn selecting_one_inline_dependency_only_changes_that_scalar() {
         let content = "repos = [{repo = 'local', hooks = [{id = 'demo', language = 'python', additional_dependencies = ['demo==1.0.0', 'other==1.0.0']}]}]";
         let start = content.find("demo==1.0.0").unwrap();
@@ -11772,6 +11929,7 @@ mod pre_commit_selection_tests {
             span: start..start + "demo==1.0.0".len(),
             original: "demo==1.0.0".into(),
             replacement: "demo==2.0.0".into(),
+            frozen_tag: None,
             source: Some(AnnotationSource::PyPi),
             pinned: false,
             required_revision: None,

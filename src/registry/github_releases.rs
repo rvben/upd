@@ -18,12 +18,15 @@ use tokio::sync::{Mutex, OnceCell};
 type ReleaseAssets = Arc<Vec<ReleaseAsset>>;
 type ReleaseCache = HashMap<(String, String), Arc<OnceCell<ReleaseAssets>>>;
 type AssetCache = HashMap<(String, String, String), Arc<OnceCell<Arc<Vec<u8>>>>>;
+type RepoTags = Arc<Vec<TagResponse>>;
+type TagCache = HashMap<(String, String), Arc<OnceCell<RepoTags>>>;
 
 pub struct GitHubReleasesRegistry {
     client: Client,
     api_url: String,
     release_assets: Mutex<ReleaseCache>,
     asset_bytes: Mutex<AssetCache>,
+    tags: Mutex<TagCache>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -100,6 +103,12 @@ struct RefObject {
     sha: String,
     #[serde(rename = "type")]
     kind: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct AnnotatedTagResponse {
+    sha: String,
+    object: RefObject,
 }
 
 #[derive(Debug, Deserialize)]
@@ -293,6 +302,7 @@ impl GitHubReleasesRegistry {
             api_url,
             release_assets: Default::default(),
             asset_bytes: Default::default(),
+            tags: Default::default(),
         }
     }
 
@@ -326,31 +336,86 @@ impl GitHubReleasesRegistry {
         Ok((owner, repo))
     }
 
-    /// Fetch all tags for a repo and return them as raw strings.
-    async fn fetch_tags(&self, owner: &str, repo: &str) -> Result<Vec<String>> {
-        let url = format!(
-            "{}/repos/{}/{}/tags?per_page=100",
-            self.api_url, owner, repo
-        );
+    /// Every item of a paginated list, following `rel="next"` links for at most
+    /// [`MAX_PAGES`] pages.
+    ///
+    /// `Ok(None)` means the first page answered 404, which some callers read as
+    /// an answer. Anything short of the whole list is an error instead: a later
+    /// page that fails, 404 included, a `next` link that cannot be followed,
+    /// or a list longer than the cap. Answering from the pages read so far
+    /// would be indistinguishable from having read them all, and the newest
+    /// version is not guaranteed to be on the first page.
+    async fn get_all_pages<T: serde::de::DeserializeOwned>(
+        &self,
+        first_url: String,
+        subject: &str,
+        kind: &'static str,
+    ) -> Result<Option<Vec<T>>> {
+        let mut url = first_url;
+        let mut items = Vec::new();
 
-        let response = get_with_retry(&self.client, &url).await?;
-
-        if !response.status().is_success() {
+        for page in 0..MAX_PAGES {
+            let response = get_with_retry(&self.client, &url).await?;
             let status = response.status();
-            let hint = match status.as_u16() {
-                403 | 429 => Some("Set GITHUB_TOKEN to increase the API rate limit."),
-                _ => None,
-            };
-            return Err(anyhow!(http_error_message(
-                status,
-                "Repository",
-                &format!("{}/{}", owner, repo),
-                hint,
-            )));
+            if page == 0 && status == reqwest::StatusCode::NOT_FOUND {
+                return Ok(None);
+            }
+            if !status.is_success() {
+                return Err(repository_error(status, subject));
+            }
+
+            let next = next_page_url(response.headers(), &self.api_url)?;
+            let page_items: Vec<T> = response
+                .json()
+                .await
+                .map_err(|e| anyhow!("Failed to parse GitHub {kind} for '{subject}': {e}"))?;
+            items.extend(page_items);
+
+            match next {
+                Some(next_url) => url = next_url,
+                None => return Ok(Some(items)),
+            }
         }
 
-        let tags: Vec<TagResponse> = response.json().await?;
-        Ok(tags.into_iter().map(|t| t.name).collect())
+        Err(ListTooLong {
+            subject: subject.to_string(),
+            kind,
+        }
+        .into())
+    }
+
+    /// The repository's complete tag list, read once per registry instance.
+    ///
+    /// Latest-version, ref-name, cooldown and commit lookups all read the same
+    /// list, and each walk can cost many pages. A failure is not remembered, so
+    /// a later lookup asks again rather than inheriting it.
+    async fn all_tags(&self, owner: &str, repo: &str) -> Result<RepoTags> {
+        let key = (owner.to_string(), repo.to_string());
+        let cell = self.tags.lock().await.entry(key).or_default().clone();
+        let tags = cell
+            .get_or_try_init(|| async {
+                let subject = format!("{owner}/{repo}");
+                let url = format!(
+                    "{}/repos/{}/{}/tags?per_page={}",
+                    self.api_url, owner, repo, PAGE_SIZE
+                );
+                self.get_all_pages::<TagResponse>(url, &subject, "tags")
+                    .await?
+                    .map(Arc::new)
+                    .ok_or_else(|| repository_error(reqwest::StatusCode::NOT_FOUND, &subject))
+            })
+            .await?;
+        Ok(Arc::clone(tags))
+    }
+
+    /// Fetch all tags for a repo and return them as raw strings.
+    async fn fetch_tags(&self, owner: &str, repo: &str) -> Result<Vec<String>> {
+        Ok(self
+            .all_tags(owner, repo)
+            .await?
+            .iter()
+            .map(|t| t.name.clone())
+            .collect())
     }
 
     /// Collect every tag naming `commit`, walking the paginated tag list.
@@ -370,61 +435,40 @@ impl GitHubReleasesRegistry {
         repo: &str,
         commit: &str,
     ) -> Result<TagsAtCommit> {
-        let target = commit.to_ascii_lowercase();
-        let mut url = format!(
-            "{}/repos/{}/{}/tags?per_page={}",
-            self.api_url, owner, repo, TAG_PAGE_SIZE
-        );
+        // The caller writes a version comment from this answer, so a repository
+        // too heavily tagged to read whole gets an honest failure instead of a
+        // pin annotated from a partial view, with advice fit for the pin.
+        let tags = self.all_tags(owner, repo).await.map_err(|error| {
+            if error.is::<ListTooLong>() {
+                anyhow!(
+                    "Repository '{owner}/{repo}' publishes more than {} tags; \
+                     upd stopped before identifying commit {commit}. \
+                     Annotate this pin by hand with the release it names.",
+                    MAX_PAGES * PAGE_SIZE,
+                )
+            } else {
+                error
+            }
+        })?;
+
         let mut names = Vec::new();
         let mut publishes_releases = false;
-
-        for _ in 0..MAX_TAG_PAGES {
-            let response = get_with_retry(&self.client, &url).await?;
-
-            if !response.status().is_success() {
-                let status = response.status();
-                let hint = match status.as_u16() {
-                    403 | 429 => Some("Set GITHUB_TOKEN to increase the API rate limit."),
-                    _ => None,
-                };
-                return Err(anyhow!(http_error_message(
-                    status,
-                    "Repository",
-                    &format!("{}/{}", owner, repo),
-                    hint,
-                )));
-            }
-
-            let next = next_page_url(response.headers(), &self.api_url);
-            let tags: Vec<TagResponse> = response.json().await?;
-
-            for tag in tags {
-                publishes_releases |= super::is_release_tag(&tag.name);
-                if tag
-                    .commit
-                    .is_some_and(|c| c.sha.eq_ignore_ascii_case(&target))
-                {
-                    names.push(tag.name);
-                }
-            }
-
-            match next {
-                Some(next_url) => url = next_url,
-                None if !publishes_releases => return Ok(TagsAtCommit::NoReleases),
-                None => return Ok(TagsAtCommit::Known(names)),
+        for tag in tags.iter() {
+            publishes_releases |= super::is_release_tag(&tag.name);
+            if tag
+                .commit
+                .as_ref()
+                .is_some_and(|c| c.sha.eq_ignore_ascii_case(commit))
+            {
+                names.push(tag.name.clone());
             }
         }
 
-        // Answering with the tags found so far would be indistinguishable from
-        // having read the whole list, and the caller writes a version comment
-        // from this answer. A repository this heavily tagged gets an honest
-        // failure instead of a pin annotated from a partial view.
-        Err(anyhow!(
-            "Repository '{owner}/{repo}' publishes more than {} tags; \
-             upd stopped before identifying commit {commit}. \
-             Annotate this pin by hand with the release it names.",
-            MAX_TAG_PAGES * TAG_PAGE_SIZE,
-        ))
+        Ok(if publishes_releases {
+            TagsAtCommit::Known(names)
+        } else {
+            TagsAtCommit::NoReleases
+        })
     }
 
     /// Publish dates read from the tag list, for a repository that publishes no
@@ -512,6 +556,48 @@ impl GitHubReleasesRegistry {
             .and_then(timestamp))
     }
 
+    async fn peel_git_target(
+        &self,
+        owner: &str,
+        repo: &str,
+        mut target: RefObject,
+        subject: &str,
+    ) -> Result<String> {
+        // Git permits tags of tags. Peel immutable objects, never a second
+        // mutable ref lookup that could disagree with the identity just read.
+        for _ in 0..16 {
+            anyhow::ensure!(
+                target.sha.len() == 40 && target.sha.bytes().all(|b| b.is_ascii_hexdigit()),
+                "GitHub returned an invalid tag target for '{subject}'"
+            );
+            match target.kind.as_str() {
+                "commit" => {
+                    return Ok(target.sha.to_ascii_lowercase());
+                }
+                "tag" => {
+                    let annotated: AnnotatedTagResponse = self
+                        .get_json(&["repos", owner, repo, "git", "tags", &target.sha], subject)
+                        .await?;
+                    anyhow::ensure!(
+                        annotated.sha.eq_ignore_ascii_case(&target.sha),
+                        "GitHub returned a different tag object for '{subject}'"
+                    );
+                    target = annotated.object;
+                }
+                _ => {
+                    return Err(super::UnusableGitTag(format!(
+                        "Git tag '{subject}' does not identify a commit"
+                    ))
+                    .into());
+                }
+            }
+        }
+        Err(super::UnusableGitTag(format!(
+            "Git tag '{subject}' is nested too deeply to verify"
+        ))
+        .into())
+    }
+
     /// GET one JSON document, reporting a failure against `subject`.
     async fn get_json<T: serde::de::DeserializeOwned>(
         &self,
@@ -531,9 +617,11 @@ impl GitHubReleasesRegistry {
                 403 | 429 => Some("Set GITHUB_TOKEN to increase the API rate limit."),
                 _ => None,
             };
-            return Err(anyhow!(http_error_message(
-                status, "Git ref", subject, hint
-            )));
+            let message = http_error_message(status, "Git ref", subject, hint);
+            return Err(match status.as_u16() {
+                404 | 422 => RefNotFound::new(message).into(),
+                _ => anyhow!(message),
+            });
         }
         Ok(response.json().await?)
     }
@@ -578,12 +666,43 @@ fn parse_gh_token_output(status_success: bool, stdout: &[u8]) -> Option<String> 
     }
 }
 
-/// Tags requested per page. GitHub's maximum, so the common repository is one
-/// request.
-const TAG_PAGE_SIZE: usize = 100;
+/// Items requested per page of a tag or release list. GitHub's maximum, so the
+/// common repository is one request.
+const PAGE_SIZE: usize = 100;
 
-/// Pages walked before a commit lookup gives up and reports failure.
-const MAX_TAG_PAGES: usize = 20;
+/// Pages walked before a list read gives up and reports failure.
+const MAX_PAGES: usize = 20;
+
+/// A list longer than [`MAX_PAGES`] pages, which is reported rather than
+/// answered from the part read.
+#[derive(Debug)]
+struct ListTooLong {
+    subject: String,
+    kind: &'static str,
+}
+
+impl std::fmt::Display for ListTooLong {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "Repository '{}' publishes more than {} {}; upd will not answer from a partial list.",
+            self.subject,
+            MAX_PAGES * PAGE_SIZE,
+            self.kind,
+        )
+    }
+}
+
+impl std::error::Error for ListTooLong {}
+
+/// A failed repository request, with the token hint when it was throttled.
+fn repository_error(status: reqwest::StatusCode, subject: &str) -> anyhow::Error {
+    let hint = match status.as_u16() {
+        403 | 429 => Some("Set GITHUB_TOKEN to increase the API rate limit."),
+        _ => None,
+    };
+    anyhow!(http_error_message(status, "Repository", subject, hint))
+}
 
 /// Tags dated per release track when a repository publishes no releases.
 ///
@@ -600,35 +719,69 @@ fn timestamp(raw: &str) -> Option<DateTime<Utc>> {
         .map(|dt| dt.with_timezone(&Utc))
 }
 
-/// The `rel="next"` URL from a `Link` header, if the response has one.
+/// The `rel="next"` URL from a `Link` header, or `None` on the last page.
 ///
 /// The URL is only followed when it addresses the same origin the request went
 /// to, so a redirecting proxy in front of the API cannot walk the client, and
-/// its `Authorization` header, onto a host the user never configured.
-fn next_page_url(headers: &reqwest::header::HeaderMap, api_url: &str) -> Option<String> {
-    let link = headers.get(reqwest::header::LINK)?.to_str().ok()?;
-
-    let candidate = link.split(',').find_map(|entry| {
-        let (target, params) = entry.split_once(';')?;
-        if !params
-            .split(';')
-            .any(|p| matches!(p.trim(), "rel=\"next\"" | "rel=next"))
-        {
-            return None;
+/// its `Authorization` header, onto a host the user never configured. A next
+/// link that is unreadable or leaves that origin is an error, not the end of
+/// the list: stopping there would answer from the pages read so far.
+fn next_page_url(headers: &reqwest::header::HeaderMap, api_url: &str) -> Result<Option<String>> {
+    let mut candidate = None;
+    for link in headers.get_all(reqwest::header::LINK) {
+        let link = link
+            .to_str()
+            .map_err(|_| anyhow!("GitHub returned an unreadable pagination Link header"))?;
+        for entry in link.split(',') {
+            let (target, params) = entry
+                .split_once(';')
+                .ok_or_else(|| anyhow!("GitHub returned a malformed pagination Link header"))?;
+            let target = target
+                .trim()
+                .strip_prefix('<')
+                .and_then(|t| t.strip_suffix('>'))
+                .ok_or_else(|| anyhow!("GitHub returned a malformed pagination link"))?;
+            let mut is_next = false;
+            for param in params.split(';') {
+                let (name, value) = param.trim().split_once('=').ok_or_else(|| {
+                    anyhow!("GitHub returned a malformed pagination link parameter")
+                })?;
+                let value = value.trim();
+                let value = if let Some(quoted) = value.strip_prefix('"') {
+                    quoted.strip_suffix('"').ok_or_else(|| {
+                        anyhow!("GitHub returned an unterminated pagination link parameter")
+                    })?
+                } else {
+                    value
+                };
+                is_next |=
+                    name.trim() == "rel" && value.split_ascii_whitespace().any(|rel| rel == "next");
+            }
+            if is_next {
+                anyhow::ensure!(
+                    candidate.is_none(),
+                    "GitHub returned multiple next-page links"
+                );
+                candidate = Some(target.to_string());
+            }
         }
-        let target = target.trim();
-        target
-            .strip_prefix('<')
-            .and_then(|t| t.strip_suffix('>'))
-            .map(str::to_string)
-    })?;
+    }
+    let Some(candidate) = candidate else {
+        return Ok(None);
+    };
 
-    let base = reqwest::Url::parse(api_url).ok()?;
-    let next = reqwest::Url::parse(&candidate).ok()?;
-    (next.scheme() == base.scheme()
-        && next.host_str() == base.host_str()
-        && next.port_or_known_default() == base.port_or_known_default())
-    .then_some(candidate)
+    let base = reqwest::Url::parse(api_url)?;
+    let next = reqwest::Url::parse(&candidate)
+        .map_err(|e| anyhow!("GitHub returned a malformed next-page link: {e}"))?;
+    anyhow::ensure!(
+        next.scheme() == base.scheme()
+            && next.host_str() == base.host_str()
+            && next.port_or_known_default() == base.port_or_known_default()
+            && next.username().is_empty()
+            && next.password().is_none(),
+        "GitHub returned a next-page link to another origin; refusing to follow it"
+    );
+    Ok(Some(candidate))
 }
 
 impl Default for GitHubReleasesRegistry {
@@ -639,6 +792,18 @@ impl Default for GitHubReleasesRegistry {
 
 #[async_trait]
 impl Registry for GitHubReleasesRegistry {
+    async fn resolve_git_tag(&self, package: &str, tag: &str) -> Result<super::ResolvedGitTag> {
+        let (owner, repo) = Self::extract_owner_repo(package)?;
+        let subject = format!("{owner}/{repo}@{tag}");
+        let reference: RefResponse = self
+            .get_json(&["repos", owner, repo, "git", "ref", "tags", tag], &subject)
+            .await?;
+        let target = reference.object;
+        let object = target.sha.to_ascii_lowercase();
+        let commit = self.peel_git_target(owner, repo, target, &subject).await?;
+        Ok(super::ResolvedGitTag { object, commit })
+    }
+
     async fn pre_commit_manifest(&self, package: &str, reference: &str) -> Result<String> {
         use base64::Engine;
         let (owner, repo) = Self::extract_owner_repo(package)?;
@@ -649,6 +814,27 @@ impl Registry for GitHubReleasesRegistry {
             .extend(["repos", owner, repo, "contents", ".pre-commit-hooks.yaml"]);
         url.query_pairs_mut().append_pair("ref", reference);
         let mut response = get_with_retry(&self.client, url.as_str()).await?;
+        if response.status() == reqwest::StatusCode::NOT_FOUND
+            && reference.len() == 40
+            && reference.bytes().all(|b| b.is_ascii_hexdigit())
+        {
+            // Contents may not accept an annotated tag object's SHA. This is
+            // also needed when only a hook dependency is selected: its rev
+            // stays untouched, but its language must still be read at that pin.
+            let commit = self
+                .peel_git_target(
+                    owner,
+                    repo,
+                    RefObject {
+                        sha: reference.into(),
+                        kind: "tag".into(),
+                    },
+                    &format!("{package}@{reference}"),
+                )
+                .await?;
+            url.query_pairs_mut().clear().append_pair("ref", &commit);
+            response = get_with_retry(&self.client, url.as_str()).await?;
+        }
         if !response.status().is_success() {
             return Err(anyhow!(
                 "Cannot read hook manifest for {package}@{reference}: HTTP {}",
@@ -940,34 +1126,24 @@ impl Registry for GitHubReleasesRegistry {
         strict: bool,
     ) -> Result<Vec<VersionMeta>> {
         let (owner, repo) = Self::extract_owner_repo(package)?;
-        let url = format!("{}/repos/{}/{}/releases", self.api_url, owner, repo);
+        let url = format!(
+            "{}/repos/{}/{}/releases?per_page={}",
+            self.api_url, owner, repo, PAGE_SIZE
+        );
 
-        let response = get_with_retry(&self.client, &url).await?;
-        let status = response.status();
-        if status == reqwest::StatusCode::NOT_FOUND {
+        // Only a first page answering 404 says the repository has no release
+        // list; a later page failing says nothing about the releases already
+        // read, and the walk reports it as an error.
+        let Some(items) = self
+            .get_all_pages::<ReleaseListEntry>(url, &format!("{owner}/{repo}"), "releases")
+            .await?
+        else {
             return if strict {
                 Ok(Vec::new())
             } else {
                 self.tag_versions(owner, repo).await
             };
-        }
-        if !status.is_success() {
-            let hint = match status.as_u16() {
-                403 | 429 => Some("Set GITHUB_TOKEN to increase the API rate limit."),
-                _ => None,
-            };
-            return Err(anyhow!(http_error_message(
-                status,
-                "Repository",
-                &format!("{owner}/{repo}"),
-                hint,
-            )));
-        }
-
-        let items: Vec<ReleaseListEntry> = response
-            .json()
-            .await
-            .map_err(|e| anyhow!("Failed to parse GitHub releases for '{package}': {e}"))?;
+        };
 
         // A release tag that is not a version names no release of the package:
         // github/codeql-action publishes CodeQL bundles as releases beside its
@@ -1013,6 +1189,98 @@ mod tests {
 
     fn registry(server: &MockServer) -> GitHubReleasesRegistry {
         GitHubReleasesRegistry::with_api_url(server.uri())
+    }
+
+    #[tokio::test]
+    async fn exact_tag_resolution_retains_object_identity_and_peels_nested_tags() {
+        let server = MockServer::start().await;
+        let first = "1111111111111111111111111111111111111111";
+        let second = "2222222222222222222222222222222222222222";
+        let commit = "3333333333333333333333333333333333333333";
+        Mock::given(path("/repos/acme/hook/git/ref/tags/v1.2.3"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"object": {"sha": first, "type": "tag"}})),
+            )
+            .mount(&server)
+            .await;
+        for (object, target, kind) in [(first, second, "tag"), (second, commit, "commit")] {
+            Mock::given(path(format!("/repos/acme/hook/git/tags/{object}")))
+                .respond_with(ResponseTemplate::new(200).set_body_json(
+                    serde_json::json!({"sha": object, "object": {"sha": target, "type": kind}}),
+                ))
+                .mount(&server)
+                .await;
+        }
+        let tag = registry(&server)
+            .resolve_git_tag("acme/hook", "v1.2.3")
+            .await
+            .unwrap();
+        assert_eq!(tag.object, first);
+        assert_eq!(tag.commit, commit);
+    }
+
+    #[tokio::test]
+    async fn exact_tag_resolution_rejects_noncommit_targets_and_malformed_objects() {
+        for (object, kind, response_sha) in [
+            (
+                "1111111111111111111111111111111111111111",
+                "blob",
+                "1111111111111111111111111111111111111111",
+            ),
+            ("short", "commit", "short"),
+            (
+                "1111111111111111111111111111111111111111",
+                "tag",
+                "2222222222222222222222222222222222222222",
+            ),
+        ] {
+            let server = MockServer::start().await;
+            Mock::given(path("/repos/acme/hook/git/ref/tags/v1.2.3"))
+                .respond_with(
+                    ResponseTemplate::new(200).set_body_json(
+                        serde_json::json!({"object": {"sha": object, "type": kind}}),
+                    ),
+                )
+                .mount(&server)
+                .await;
+            Mock::given(path(format!("/repos/acme/hook/git/tags/{object}")))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"sha": response_sha, "object": {"sha": response_sha, "type": "commit"}})))
+                .mount(&server).await;
+            assert!(
+                registry(&server)
+                    .resolve_git_tag("acme/hook", "v1.2.3")
+                    .await
+                    .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn pagination_relations_accept_spacing_tokens_and_multiple_headers() {
+        let base = "https://api.example.com";
+        let mut headers = HeaderMap::new();
+        headers.append(
+            "link",
+            HeaderValue::from_static("<https://api.example.com/tags?page=1>; rel=prev"),
+        );
+        headers.append(
+            "link",
+            HeaderValue::from_static("<https://api.example.com/tags?page=3>; rel = \"next last\""),
+        );
+        assert_eq!(
+            next_page_url(&headers, base).unwrap().as_deref(),
+            Some("https://api.example.com/tags?page=3")
+        );
+        for malformed in [
+            "garbage",
+            "<https://api.example.com/tags>; rel=\"next",
+            "<https://api.example.com/tags>; rel=next; broken",
+        ] {
+            let mut headers = HeaderMap::new();
+            headers.insert("link", HeaderValue::from_str(malformed).unwrap());
+            assert!(next_page_url(&headers, base).is_err(), "{malformed}");
+        }
     }
 
     #[test]
@@ -1286,36 +1554,43 @@ mod tests {
     }
 
     /// A `Link` header pointing somewhere else must not walk the client, and its
-    /// `Authorization` header, onto a host the user never configured. The walk
-    /// stops instead, which for this fixture means the off-origin page's tag is
-    /// never seen.
+    /// `Authorization` header, onto a host the user never configured. Nor may
+    /// the walk stop there and answer, since the unread page can hold the tag
+    /// that matters; a next link that cannot be read at all is the same case.
     #[tokio::test]
-    async fn pagination_does_not_follow_a_link_to_another_origin() {
+    async fn pagination_fails_on_a_next_link_it_cannot_follow() {
         let sha = "1234567890abcdef1234567890abcdef12345678";
-        let server = MockServer::start().await;
+        for link in [
+            r#"<https://attacker.example/repos/acme/action/tags?page=2>; rel="next""#,
+            r#"https://attacker.example/repos/acme/action/tags?page=2; rel="next""#,
+            r#"<not a url>; rel="next""#,
+        ] {
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path("/repos/acme/action/tags"))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .insert_header("link", link)
+                        .set_body_string(
+                            r#"[{"name": "v1.0.0", "commit": {"sha": "abcdefabcdefabcdefabcdefabcdefabcdefabcd"}}]"#,
+                        ),
+                )
+                .expect(2)
+                .mount(&server)
+                .await;
 
-        Mock::given(method("GET"))
-            .and(path("/repos/acme/action/tags"))
-            .respond_with(
-                ResponseTemplate::new(200)
-                    .insert_header(
-                        "link",
-                        r#"<https://attacker.example/repos/acme/action/tags?page=2>; rel="next""#,
-                    )
-                    .set_body_string(
-                        r#"[{"name": "v1.0.0", "commit": {"sha": "abcdefabcdefabcdefabcdefabcdefabcdefabcd"}}]"#,
-                    ),
-            )
-            .mount(&server)
-            .await;
-
-        assert_eq!(
-            registry(&server)
-                .tags_at_commit("acme/action", sha)
-                .await
-                .unwrap(),
-            TagsAtCommit::Known(Vec::new())
-        );
+            let registry = registry(&server);
+            assert!(
+                registry.tags_at_commit("acme/action", sha).await.is_err(),
+                "{link}"
+            );
+            // The failed walk is not remembered, so this asks again: the mock
+            // expects both requests.
+            assert!(
+                registry.list_ref_names("acme/action").await.is_err(),
+                "{link}"
+            );
+        }
     }
 
     /// Answering with the tags read so far would be indistinguishable from
@@ -1339,7 +1614,8 @@ mod tests {
             .mount(&server)
             .await;
 
-        let error = registry(&server)
+        let registry = registry(&server);
+        let error = registry
             .tags_at_commit("acme/action", "1234567890abcdef1234567890abcdef12345678")
             .await
             .expect_err("a tag list that never ends must not answer 'no tags'");
@@ -1348,6 +1624,14 @@ mod tests {
             error.to_string().contains("more than"),
             "the error must say the list was too long to read: {error}"
         );
+
+        // The latest-version lookup reads the same list and must not pick a
+        // newest tag from the part it read.
+        let error = registry
+            .get_latest_version_including_prereleases("acme/action")
+            .await
+            .expect_err("a tag list that never ends must not answer from part of it");
+        assert!(error.to_string().contains("more than"), "{error}");
     }
 
     /// A rate limit is not evidence that a commit belongs to no release.
@@ -1366,6 +1650,173 @@ mod tests {
                 .await
                 .is_err()
         );
+    }
+
+    /// The first page of `acme/hook`'s `list` (`tags` or `releases`), answering
+    /// `body` and linking to page 2.
+    async fn first_page(server: &MockServer, list: &str, body: &str, requests: u64) {
+        let next = format!(
+            "{}/repos/acme/hook/{list}?per_page=100&page=2",
+            server.uri()
+        );
+        Mock::given(method("GET"))
+            .and(path(format!("/repos/acme/hook/{list}")))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("link", format!(r#"<{next}>; rel="next""#).as_str())
+                    .set_body_string(body),
+            )
+            .expect(requests)
+            .mount(server)
+            .await;
+    }
+
+    /// Page 2 of `acme/hook`'s `list`, outranking the first page's mock.
+    fn second_page(list: &str, response: ResponseTemplate) -> Mock {
+        Mock::given(method("GET"))
+            .and(path(format!("/repos/acme/hook/{list}")))
+            .and(query_param("page", "2"))
+            .respond_with(response)
+            .with_priority(1)
+    }
+
+    /// GitHub does not promise the newest tag is on the first page, so every
+    /// lookup over the tag list reads all of it. The list is read once however
+    /// many lookups ask: each page mock expects a single request.
+    #[tokio::test]
+    async fn the_newest_tags_on_a_later_page_are_found() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/repos/acme/hook/releases/latest"))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&server)
+            .await;
+        second_page(
+            "tags",
+            ResponseTemplate::new(200).set_body_string(
+                r#"[{"name": "v2.0.0"}, {"name": "v3.0.0-rc.1"}, {"name": "v1"}]"#,
+            ),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+        first_page(&server, "tags", r#"[{"name": "v1.0.0"}]"#, 1).await;
+
+        let registry = registry(&server);
+        assert_eq!(
+            registry.get_latest_version("acme/hook").await.unwrap(),
+            "v2.0.0"
+        );
+        assert_eq!(
+            registry
+                .get_latest_version_including_prereleases("acme/hook")
+                .await
+                .unwrap(),
+            "v3.0.0-rc.1"
+        );
+        assert_eq!(
+            registry.list_ref_names("acme/hook").await.unwrap(),
+            ["v1.0.0", "v2.0.0", "v3.0.0-rc.1", "v1"]
+        );
+    }
+
+    /// A later page that fails leaves the list unread, not shorter: answering
+    /// from the first page would offer a stale latest version. The failure is
+    /// not remembered, so the next lookup reads the list afresh.
+    #[tokio::test]
+    async fn a_failed_later_tag_page_fails_the_lookup_until_it_succeeds() {
+        let server = MockServer::start().await;
+        let failure = second_page("tags", ResponseTemplate::new(403))
+            .expect(1)
+            .mount_as_scoped(&server)
+            .await;
+        first_page(&server, "tags", r#"[{"name": "v1.0.0"}]"#, 2).await;
+        let registry = registry(&server);
+
+        assert!(
+            registry
+                .get_latest_version_including_prereleases("acme/hook")
+                .await
+                .is_err()
+        );
+
+        drop(failure);
+        second_page(
+            "tags",
+            ResponseTemplate::new(200).set_body_string(r#"[{"name": "v2.0.0"}]"#),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+        assert_eq!(
+            registry
+                .get_latest_version_including_prereleases("acme/hook")
+                .await
+                .unwrap(),
+            "v2.0.0"
+        );
+    }
+
+    /// Cooldown holds an update back to an older release when the newest is
+    /// too new, and that older release can sit past the first page.
+    #[tokio::test]
+    async fn an_older_release_on_a_later_page_is_listed() {
+        let server = MockServer::start().await;
+        second_page(
+            "releases",
+            ResponseTemplate::new(200).set_body_string(
+                r#"[{"tag_name":"v1.0.0","published_at":"2026-01-01T00:00:00Z","prerelease":false,"draft":false}]"#,
+            ),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+        first_page(
+            &server,
+            "releases",
+            r#"[{"tag_name":"v2.0.0","published_at":"2026-10-14T00:00:00Z","prerelease":false,"draft":false}]"#,
+            1,
+        )
+        .await;
+
+        let versions = registry(&server)
+            .list_versions_for_cooldown("acme/hook", true)
+            .await
+            .unwrap();
+
+        let names: Vec<&str> = versions.iter().map(|v| v.version.as_str()).collect();
+        assert_eq!(names, ["v2.0.0", "v1.0.0"]);
+        assert_eq!(
+            versions[1].published_at,
+            Some(Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap()),
+        );
+    }
+
+    /// Only a release list missing outright sends cooldown to the tags. A later
+    /// page answering 404 says nothing about the releases already read, so it
+    /// is an error rather than licence to date tags instead.
+    #[tokio::test]
+    async fn a_later_release_page_answering_404_is_an_error() {
+        let server = MockServer::start().await;
+        second_page("releases", ResponseTemplate::new(404))
+            .expect(1)
+            .mount(&server)
+            .await;
+        first_page(
+            &server,
+            "releases",
+            r#"[{"tag_name":"v2.0.0","published_at":"2026-10-14T00:00:00Z","prerelease":false,"draft":false}]"#,
+            1,
+        )
+        .await;
+        Mock::given(method("GET"))
+            .and(path("/repos/acme/hook/tags"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("[]"))
+            .expect(0)
+            .mount(&server)
+            .await;
+
+        assert!(registry(&server).list_versions("acme/hook").await.is_err());
     }
 
     #[tokio::test]

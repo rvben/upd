@@ -1,6 +1,6 @@
 //! Mock registry for testing updaters without network calls.
 
-use super::{RefNotFound, Registry, TagsAtCommit, VersionMeta};
+use super::{RefNotFound, Registry, ResolvedGitTag, TagsAtCommit, VersionMeta};
 use anyhow::{Result, anyhow};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
@@ -22,6 +22,7 @@ pub struct MockRegistry {
     unavailable_versions: HashSet<String>,
     /// Map of package name + ref to its immutable commit SHA
     resolved_refs: HashMap<(String, String), String>,
+    tag_objects: HashMap<(String, String), String>,
     /// Refs whose lookup fails without answering whether they exist
     unavailable_refs: HashSet<(String, String)>,
     /// Commits whose tag lookup fails without answering which tags name them
@@ -48,6 +49,7 @@ impl MockRegistry {
             unavailable_ref_names: HashSet::new(),
             unavailable_versions: HashSet::new(),
             resolved_refs: HashMap::new(),
+            tag_objects: HashMap::new(),
             unavailable_refs: HashSet::new(),
             unavailable_commit_tags: HashSet::new(),
             without_tag_concept: HashSet::new(),
@@ -111,6 +113,12 @@ impl MockRegistry {
             (package.to_string(), reference.to_string()),
             commit_sha.to_string(),
         );
+        self
+    }
+
+    pub fn with_tag_object(mut self, package: &str, tag: &str, object: &str) -> Self {
+        self.tag_objects
+            .insert((package.into(), tag.into()), object.into());
         self
     }
 
@@ -213,6 +221,24 @@ impl MockRegistry {
 
 #[async_trait]
 impl Registry for MockRegistry {
+    async fn pre_commit_manifest(&self, package: &str, reference: &str) -> Result<String> {
+        String::from_utf8(
+            self.repo_file_at_ref(package, reference, ".pre-commit-hooks.yaml")
+                .await?,
+        )
+        .map_err(Into::into)
+    }
+
+    async fn resolve_git_tag(&self, package: &str, tag: &str) -> Result<ResolvedGitTag> {
+        let commit = self.resolve_ref_to_commit(package, tag).await?;
+        let object = self
+            .tag_objects
+            .get(&(package.into(), tag.into()))
+            .cloned()
+            .unwrap_or_else(|| commit.clone());
+        Ok(ResolvedGitTag { object, commit })
+    }
+
     async fn python_releases(&self, package: &str) -> Result<Vec<super::PythonRelease>> {
         // Ordinary mock versions represent files with no interpreter restriction.
         let mut versions = HashSet::new();

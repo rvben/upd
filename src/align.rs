@@ -813,6 +813,45 @@ mod tests {
         }
     }
 
+    #[test]
+    fn pre_commit_sha_pins_and_unreadable_refs_are_visible_but_never_aligned() {
+        let dir = tempfile::tempdir().unwrap();
+        let yaml = dir.path().join(".pre-commit-config.yaml");
+        let toml = dir.path().join("prek.toml");
+        let sha = "1234567890abcdef1234567890abcdef12345678";
+        for rev in [sha, "main"] {
+            std::fs::write(
+                &yaml,
+                format!(
+                    "repos:\n- repo: https://github.com/owner/repo\n  rev: {rev} # frozen: v1.0.0\n"
+                ),
+            )
+            .unwrap();
+            std::fs::write(
+                &toml,
+                "[[repos]]\nrepo = 'https://github.com/owner/repo'\nrev = 'v2.0.0'\n",
+            )
+            .unwrap();
+            let files = vec![
+                (yaml.clone(), FileType::PreCommitConfig),
+                (toml.clone(), FileType::PreCommitConfig),
+            ];
+            let packages = scan_packages(&files, &[], ParseWarnings::Suppress).unwrap();
+            let occurrences = &packages[&("owner/repo".into(), Lang::PreCommit)];
+            assert_eq!(occurrences.len(), 2);
+            assert!(
+                !occurrences
+                    .iter()
+                    .find(|o| o.version == rev)
+                    .unwrap()
+                    .is_bumpable
+            );
+            let result = find_alignments(packages, false);
+            assert_eq!(result.misaligned_count, 0);
+            assert_eq!(result.packages[0].highest_version, "v2.0.0");
+        }
+    }
+
     /// scan_packages must include pseudo-version Go dependencies so that the audit path
     /// can see them. The occurrence must carry `is_bumpable: false`.
     #[test]

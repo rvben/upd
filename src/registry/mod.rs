@@ -383,6 +383,26 @@ pub fn is_release_tag(tag: &str) -> bool {
     semver::Version::parse(tag.strip_prefix('v').unwrap_or(tag)).is_ok()
 }
 
+/// A tag's direct Git object and the commit reached by peeling annotated tags.
+/// Native pre-commit freeze pins can contain either immutable identifier.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedGitTag {
+    pub object: String,
+    pub commit: String,
+}
+
+/// A real tag whose target cannot be used as a commit pin.
+#[derive(Debug)]
+pub struct UnusableGitTag(pub String);
+
+impl std::fmt::Display for UnusableGitTag {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for UnusableGitTag {}
+
 /// The answer from a registry with no tag concept.
 ///
 /// Distinct from `Known(vec![])`, which says the repository was asked and no tag
@@ -412,6 +432,12 @@ pub fn tags_at_commit_unsupported() -> Result<TagsAtCommit> {
 /// a new one that does not silently loses prerelease and constraint handling.
 #[async_trait]
 pub trait Registry: Send + Sync {
+    /// Resolve an exact tag, retaining its annotated object identity as well as
+    /// its commit. A commit-only lookup cannot verify native frozen tag objects.
+    async fn resolve_git_tag(&self, _package: &str, _tag: &str) -> Result<ResolvedGitTag> {
+        anyhow::bail!("registry does not provide Git tag identities")
+    }
+
     /// Read hook definitions at a repository revision without executing hooks.
     async fn pre_commit_manifest(&self, _package: &str, _reference: &str) -> Result<String> {
         anyhow::bail!("registry does not provide pre-commit hook manifests")

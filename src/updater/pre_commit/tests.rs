@@ -36,18 +36,462 @@ fn updater() -> PreCommitUpdater {
 }
 
 async fn run(name: &str, content: &str, options: UpdateOptions) -> (UpdateResult, String) {
+    run_with_registry(
+        name,
+        content,
+        options,
+        &MockRegistry::new("github-releases").with_version("owner/repo", "v2.0.0"),
+    )
+    .await
+}
+
+async fn run_with_registry(
+    name: &str,
+    content: &str,
+    options: UpdateOptions,
+    registry: &dyn Registry,
+) -> (UpdateResult, String) {
     let dir = tempfile::tempdir().unwrap();
     let file = dir.path().join(name);
     std::fs::write(&file, content).unwrap();
-    let result = updater()
-        .update(
-            &file,
-            &MockRegistry::new("github-releases").with_version("owner/repo", "v2.0.0"),
-            options,
-        )
-        .await
-        .unwrap();
+    let result = updater().update(&file, registry, options).await.unwrap();
     (result, std::fs::read_to_string(file).unwrap())
+}
+
+const OLD_SHA: &str = "1234567890abcdef1234567890abcdef12345678";
+const NEW_SHA: &str = "abcdefabcdefabcdefabcdefabcdefabcdefabcd";
+const OLD_COMMIT: &str = "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee";
+const NEW_OBJECT: &str = "dddddddddddddddddddddddddddddddddddddddd";
+
+fn frozen_fixture(name: &str, tag: &str) -> String {
+    if name.ends_with(".toml") {
+        format!(
+            "# café\r\n[[repos]]\r\nrepo = 'https://github.com/owner/repo'\r\nrev = \"{OLD_SHA}\"  # frozen: {tag} # keep\r\nhooks = []\r\n"
+        )
+    } else {
+        format!(
+            "# café\r\nrepos:\r\n- repo: https://github.com/owner/repo\r\n  rev: '{OLD_SHA}'  # frozen: {tag} # keep\r\n  hooks: []\r\n"
+        )
+    }
+}
+
+#[tokio::test]
+async fn frozen_pins_verify_and_update_sha_and_exact_tag_together_in_both_formats() {
+    // No precision truncation: two- and four-component release tags are refs,
+    // not a formatting template for the selected release.
+    for (current, latest) in [("v1.2", "2.3.4"), ("v0.11.0.1", "v0.12.0.2")] {
+        let registry = MockRegistry::new("github-releases")
+            .with_version("owner/repo", latest)
+            .with_resolved_ref("owner/repo", current, OLD_SHA)
+            .with_resolved_ref("owner/repo", latest, NEW_SHA);
+        for name in [".pre-commit-config.yaml", "prek.toml"] {
+            let original = frozen_fixture(name, current);
+            for dry_run in [true, false] {
+                let (result, written) = run_with_registry(
+                    name,
+                    &original,
+                    UpdateOptions::new(dry_run, false),
+                    &registry,
+                )
+                .await;
+                assert!(result.errors.is_empty(), "{result:?}");
+                assert!(result.skipped.is_empty(), "{result:?}");
+                assert_eq!(result.updated.len(), 1, "{result:?}");
+                assert_eq!(result.updated[0].1, current);
+                assert_eq!(result.updated[0].2, latest);
+                let report = crate::output::build_update_file_report(
+                    Path::new(name),
+                    FileType::PreCommitConfig,
+                    &result,
+                    None,
+                    |_, _| "major",
+                );
+                let json = serde_json::to_value(report).unwrap();
+                assert_eq!(json["updates"][0]["reference_kind"], "sha");
+                assert_eq!(json["updates"][0]["current_commit"], OLD_SHA);
+                assert_eq!(json["updates"][0]["latest_commit"], NEW_SHA);
+                let expected = original.replace(OLD_SHA, NEW_SHA).replace(current, latest);
+                assert_eq!(&written, if dry_run { &original } else { &expected });
+                assert_eq!(
+                    PreCommitEdit::apply_all(&original, &result.pre_commit_edits).unwrap(),
+                    expected
+                );
+                for drift in [
+                    original.replace("frozen:", "reason:"),
+                    original.replace(current, "v9.9.9"),
+                    original.replace(OLD_SHA, NEW_SHA),
+                    original.replace("owner/repo", "owner/evil"),
+                ] {
+                    assert!(PreCommitEdit::apply_all(&drift, &result.pre_commit_edits).is_err());
+                }
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn frozen_pin_verification_failures_never_become_updates_or_up_to_date() {
+    for name in [".pre-commit-config.yaml", "prek.toml"] {
+        let original = frozen_fixture(name, "v1.2.3");
+        for (registry, reason) in [
+            (
+                MockRegistry::new("github-releases").with_resolved_ref(
+                    "owner/repo",
+                    "v1.2.3",
+                    NEW_SHA,
+                ),
+                Some("frozen-tag-mismatch"),
+            ),
+            (
+                MockRegistry::new("github-releases"),
+                Some("frozen-tag-not-found"),
+            ),
+            (
+                MockRegistry::new("github-releases").with_unavailable_ref("owner/repo", "v1.2.3"),
+                None,
+            ),
+            (
+                MockRegistry::new("github-releases")
+                    .with_version("owner/repo", "v2.0.0")
+                    .with_resolved_ref("owner/repo", "v1.2.3", OLD_SHA)
+                    .with_unavailable_ref("owner/repo", "v2.0.0"),
+                None,
+            ),
+        ] {
+            let (result, written) =
+                run_with_registry(name, &original, UpdateOptions::new(false, false), &registry)
+                    .await;
+            assert_eq!(written, original);
+            assert!(
+                result.updated.is_empty() && result.pinned.is_empty(),
+                "{result:?}"
+            );
+            assert!(result.pre_commit_edits.is_empty(), "{result:?}");
+            assert_eq!(result.unchanged, 0, "{result:?}");
+            if let Some(reason) = reason {
+                assert!(result.errors.is_empty(), "{result:?}");
+                assert_eq!(result.skipped[0].status, SkipStatus::Blocked);
+                assert_eq!(result.skipped[0].reason, reason);
+            } else {
+                assert_eq!(result.errors.len(), 1, "{result:?}");
+                assert!(result.skipped.is_empty(), "{result:?}");
+            }
+        }
+        for tag in ["", "main"] {
+            let original = frozen_fixture(name, tag);
+            let (result, written) = run_with_registry(
+                name,
+                &original,
+                UpdateOptions::new(false, false),
+                &MockRegistry::new("github-releases"),
+            )
+            .await;
+            assert_eq!(written, original);
+            assert_eq!(result.skipped[0].reason, "invalid-frozen-tag");
+        }
+    }
+}
+
+#[tokio::test]
+async fn frozen_pins_reuse_selection_policy_but_verify_even_when_already_current() {
+    use chrono::{Duration, TimeZone, Utc};
+    let now = Utc.with_ymd_and_hms(2026, 7, 1, 0, 0, 0).unwrap();
+    let original = frozen_fixture("prek.toml", "v1.2.3");
+    let registry = MockRegistry::new("github-releases")
+        .with_version("owner/repo", "v3.0.0")
+        .with_resolved_ref("owner/repo", "v1.2.3", OLD_SHA)
+        .with_resolved_ref("owner/repo", "v2.0.0", NEW_SHA)
+        .with_version_meta("owner/repo", "v3.0.0", Some(now), false, false)
+        .with_version_meta(
+            "owner/repo",
+            "v2.0.0",
+            Some(now - Duration::days(30)),
+            false,
+            false,
+        );
+    let cooldown = UpdateOptions::new(false, false).with_cooldown_policy(
+        CooldownPolicy {
+            default: Duration::days(7),
+            per_ecosystem: HashMap::new(),
+            strict: false,
+            force_override: None,
+        },
+        now,
+    );
+    let (result, written) =
+        run_with_registry("prek.toml", &original, cooldown.clone(), &registry).await;
+    assert_eq!(result.updated[0].2, "v2.0.0");
+    assert_eq!(result.held_back.len(), 1);
+    assert_eq!(
+        written,
+        original
+            .replace(OLD_SHA, NEW_SHA)
+            .replace("v1.2.3", "v2.0.0")
+    );
+
+    let mut capped = cooldown;
+    capped.bump_filter.major = false;
+    let (result, written) = run_with_registry("prek.toml", &original, capped, &registry).await;
+    assert_eq!(written, original);
+    assert_eq!(result.capped.len(), 1);
+    let pinned = UpdateOptions::new(false, false).with_config(Arc::new(UpdConfig {
+        pin: HashMap::from([("owner/repo".into(), "v2.0.0".into())]),
+        ..Default::default()
+    }));
+    let (result, written) =
+        run_with_registry("prek.toml", &original, pinned.clone(), &registry).await;
+    assert_eq!(result.pinned.len(), 1);
+    assert!(written.contains(NEW_SHA));
+    let (result, written) = run_with_registry(
+        "prek.toml",
+        &original,
+        pinned.with_strict_bump(true),
+        &registry,
+    )
+    .await;
+    assert_eq!(written, original);
+    assert_eq!(result.capped.len(), 1);
+
+    let same = MockRegistry::new("github-releases")
+        .with_version("owner/repo", "v1.2.3")
+        .with_resolved_ref("owner/repo", "v1.2.3", OLD_SHA);
+    let (result, written) = run_with_registry(
+        "prek.toml",
+        &original,
+        UpdateOptions::new(false, false),
+        &same,
+    )
+    .await;
+    assert_eq!(result.unchanged, 1);
+    assert_eq!(written, original);
+}
+
+#[tokio::test]
+async fn frozen_pin_filters_skip_verification_and_inherited_hooks_use_the_new_sha() {
+    let original = frozen_fixture("prek.toml", "v1.2.3");
+    for options in [
+        UpdateOptions::new(false, false).with_packages(vec!["other".into()]),
+        UpdateOptions::new(false, false).with_config(Arc::new(UpdConfig {
+            ignore: vec!["owner/repo".into()],
+            ..Default::default()
+        })),
+    ] {
+        let (result, written) = run_with_registry(
+            "prek.toml",
+            &original,
+            options,
+            &MockRegistry::new("github-releases").with_unavailable_ref("owner/repo", "v1.2.3"),
+        )
+        .await;
+        assert!(result.errors.is_empty() && result.skipped.is_empty());
+        assert_eq!(written, original);
+    }
+    let original = original.replace(
+        "hooks = []",
+        "hooks = [{ id = 'demo', additional_dependencies = ['demo==1.0.0'] }]",
+    );
+    let registry = MockRegistry::new("github-releases")
+        .with_version("owner/repo", "v2.0.0")
+        .with_resolved_ref("owner/repo", "v1.2.3", OLD_SHA)
+        .with_resolved_ref("owner/repo", "v2.0.0", NEW_SHA)
+        .with_repo_file(
+            "owner/repo",
+            NEW_SHA,
+            ".pre-commit-hooks.yaml",
+            b"- id: demo\n  language: python\n",
+        );
+    let (result, _) = run_with_registry(
+        "prek.toml",
+        &original,
+        UpdateOptions::new(true, false),
+        &registry,
+    )
+    .await;
+    assert_eq!(result.updated.len(), 2, "{result:?}");
+    let revision = &result.pre_commit_edits[0];
+    assert_eq!(
+        result.pre_commit_edits[1].required_revision,
+        Some((revision.span.clone(), NEW_SHA.into()))
+    );
+}
+
+#[tokio::test]
+async fn native_annotated_tag_pins_are_verified_and_hook_manifests_use_the_peeled_commit() {
+    for name in [".pre-commit-config.yaml", "prek.toml"] {
+        let original = frozen_fixture(name, "v1.2.3");
+        let registry = MockRegistry::new("github-releases")
+            .with_version("owner/repo", "v2.0.0")
+            .with_resolved_ref("owner/repo", "v1.2.3", OLD_COMMIT)
+            .with_tag_object("owner/repo", "v1.2.3", OLD_SHA)
+            .with_resolved_ref("owner/repo", "v2.0.0", NEW_SHA)
+            .with_tag_object("owner/repo", "v2.0.0", NEW_OBJECT);
+        let (result, written) =
+            run_with_registry(name, &original, UpdateOptions::new(false, false), &registry).await;
+        assert!(
+            result.errors.is_empty() && result.skipped.is_empty(),
+            "{result:?}"
+        );
+        assert_eq!(
+            written,
+            original
+                .replace(OLD_SHA, NEW_OBJECT)
+                .replace("v1.2.3", "v2.0.0")
+        );
+        let report = crate::output::build_update_file_report(
+            Path::new(name),
+            FileType::PreCommitConfig,
+            &result,
+            None,
+            |_, _| "major",
+        );
+        let json = serde_json::to_value(report).unwrap();
+        assert_eq!(json["updates"][0]["current_commit"], OLD_COMMIT);
+        assert_eq!(json["updates"][0]["latest_commit"], NEW_SHA);
+        let commit_pin = original.replace(OLD_SHA, OLD_COMMIT);
+        let (_, written) = run_with_registry(
+            name,
+            &commit_pin,
+            UpdateOptions::new(false, false),
+            &registry,
+        )
+        .await;
+        assert_eq!(
+            written,
+            commit_pin
+                .replace(OLD_COMMIT, NEW_SHA)
+                .replace("v1.2.3", "v2.0.0")
+        );
+    }
+    // An already-current annotated pin stays byte-for-byte; dependency updates
+    // read its commit, without requiring a nonexistent revision update.
+    let original = frozen_fixture("prek.toml", "v1.2.3").replace(
+        "hooks = []",
+        "hooks = [{ id = 'demo', additional_dependencies = ['demo==1.0.0'] }]",
+    );
+    let registry = MockRegistry::new("github-releases")
+        .with_version("owner/repo", "v1.2.3")
+        .with_resolved_ref("owner/repo", "v1.2.3", OLD_COMMIT)
+        .with_tag_object("owner/repo", "v1.2.3", OLD_SHA)
+        .with_repo_file(
+            "owner/repo",
+            OLD_COMMIT,
+            ".pre-commit-hooks.yaml",
+            b"- id: demo\n  language: python\n",
+        );
+    let (result, written) = run_with_registry(
+        "prek.toml",
+        &original,
+        UpdateOptions::new(false, false),
+        &registry,
+    )
+    .await;
+    assert_eq!(result.updated.len(), 1, "{result:?}");
+    assert_eq!(result.unchanged, 1);
+    assert!(result.pre_commit_edits[0].required_revision.is_none());
+    assert_eq!(written, original.replace("demo==1.0.0", "demo==2.0.0"));
+
+    let registry = registry
+        .with_version("owner/repo", "v2.0.0")
+        .with_resolved_ref("owner/repo", "v2.0.0", NEW_SHA)
+        .with_tag_object("owner/repo", "v2.0.0", NEW_OBJECT)
+        .with_repo_file(
+            "owner/repo",
+            NEW_SHA,
+            ".pre-commit-hooks.yaml",
+            b"- id: demo\n  language: python\n",
+        );
+    let (result, _) = run_with_registry(
+        "prek.toml",
+        &original,
+        UpdateOptions::new(true, false),
+        &registry,
+    )
+    .await;
+    assert_eq!(result.updated.len(), 2, "{result:?}");
+    assert_eq!(result.pre_commit_edits[0].replacement, NEW_OBJECT);
+    assert_eq!(
+        result.pre_commit_edits[1].required_revision,
+        Some((result.pre_commit_edits[0].span.clone(), NEW_OBJECT.into()))
+    );
+}
+
+#[tokio::test]
+async fn inherited_hooks_keep_the_verified_current_commit_when_the_target_fails() {
+    let original = frozen_fixture("prek.toml", "v1.2.3").replace(
+        "hooks = []",
+        "hooks = [{id = 'demo', additional_dependencies = ['demo==1.0.0']}]",
+    );
+    for unavailable in [false, true] {
+        let mut registry = MockRegistry::new("github-releases")
+            .with_version("owner/repo", "v2.0.0")
+            .with_resolved_ref("owner/repo", "v1.2.3", OLD_COMMIT)
+            .with_tag_object("owner/repo", "v1.2.3", OLD_SHA)
+            .with_repo_file(
+                "owner/repo",
+                OLD_COMMIT,
+                ".pre-commit-hooks.yaml",
+                b"- id: demo\n  language: python\n",
+            );
+        if unavailable {
+            registry = registry.with_unavailable_ref("owner/repo", "v2.0.0");
+        }
+        let (result, written) = run_with_registry(
+            "prek.toml",
+            &original,
+            UpdateOptions::new(false, false),
+            &registry,
+        )
+        .await;
+        assert_eq!(result.updated.len(), 1, "{result:?}");
+        assert_eq!(result.updated[0].0, "demo");
+        assert!(result.pre_commit_edits[0].required_revision.is_none());
+        assert_eq!(written, original.replace("demo==1.0.0", "demo==2.0.0"));
+        assert_eq!(result.errors.len(), usize::from(unavailable));
+        assert_eq!(result.skipped.len(), usize::from(!unavailable));
+    }
+}
+
+#[tokio::test]
+async fn dependency_only_updates_can_read_an_annotated_pin_without_updating_the_revision() {
+    use base64::Engine;
+    let server = MockServer::start().await;
+    Mock::given(path("/repos/owner/repo/contents/.pre-commit-hooks.yaml"))
+        .and(query_param("ref", OLD_SHA))
+        .respond_with(ResponseTemplate::new(404))
+        .expect(2)
+        .mount(&server)
+        .await;
+    Mock::given(path(format!("/repos/owner/repo/git/tags/{OLD_SHA}")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(
+            serde_json::json!({"sha": OLD_SHA, "object": {"sha": OLD_COMMIT, "type": "commit"}}),
+        ))
+        .expect(2)
+        .mount(&server)
+        .await;
+    Mock::given(path("/repos/owner/repo/contents/.pre-commit-hooks.yaml"))
+        .and(query_param("ref", OLD_COMMIT))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"content": base64::engine::general_purpose::STANDARD.encode("- id: demo\n  language: python\n"), "encoding": "base64"})))
+        .expect(2).mount(&server).await;
+    let registry = GitHubReleasesRegistry::with_api_url_and_token(server.uri(), None);
+    let original = frozen_fixture("prek.toml", "v1.2.3").replace(
+        "hooks = []",
+        "hooks = [{id = 'demo', additional_dependencies = ['demo==1.0.0']}]",
+    );
+    for options in [
+        UpdateOptions::new(false, false).with_packages(vec!["demo".into()]),
+        UpdateOptions::new(false, false).with_config(Arc::new(UpdConfig {
+            ignore: vec!["owner/repo".into()],
+            ..Default::default()
+        })),
+    ] {
+        let (result, written) = run_with_registry("prek.toml", &original, options, &registry).await;
+        assert!(
+            result.errors.is_empty() && result.warnings.is_empty(),
+            "{result:?}"
+        );
+        assert_eq!(result.updated.len(), 1);
+        assert_eq!(written, original.replace("demo==1.0.0", "demo==2.0.0"));
+    }
 }
 
 #[tokio::test]

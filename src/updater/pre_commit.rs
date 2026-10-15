@@ -9,7 +9,7 @@ use super::{
     apply_cooldown, downgrade_warning, read_file_safe, write_file_atomic,
 };
 use crate::align::compare_versions;
-use crate::registry::Registry;
+use crate::registry::{Registry, is_ref_not_found};
 use crate::updater::{Lang, SkipStatus, SkippedUpdate};
 use crate::version::TagVersion;
 use anyhow::Result;
@@ -31,16 +31,139 @@ pub struct PreCommitEdit {
     pub span: Range<usize>,
     pub original: String,
     pub replacement: String,
+    /// The native `frozen:` tag comment moves atomically with its SHA.
+    pub frozen_tag: Option<PreCommitTagEdit>,
     pub source: Option<crate::annotation::AnnotationSource>,
     pub pinned: bool,
     /// An inherited language was read at this planned repository revision.
     pub required_revision: Option<(Range<usize>, String)>,
 }
 
+#[derive(Debug, Clone)]
+pub struct PreCommitTagEdit {
+    pub span: Range<usize>,
+    pub original: String,
+    pub replacement: String,
+    pub current_commit: String,
+    pub new_commit: String,
+}
+
+struct FrozenTag {
+    value: String,
+    span: Range<usize>,
+    original: String,
+    value_span: Range<usize>,
+}
+
+struct RevisionUpdate {
+    result: UpdateResult,
+    target: Option<String>,
+    /// The peeled commit is also needed when an annotated pin stays unchanged.
+    manifest: Option<String>,
+}
+
+impl From<(UpdateResult, Option<String>)> for RevisionUpdate {
+    fn from((result, target): (UpdateResult, Option<String>)) -> Self {
+        Self {
+            result,
+            target,
+            manifest: None,
+        }
+    }
+}
+
+struct HookRevision<'a> {
+    manifest: Option<&'a str>,
+    planned: Option<&'a str>,
+}
+
+impl PreCommitEdit {
+    /// Validate the complete preview before changing either half of a frozen pin.
+    pub fn apply_all<'a>(
+        content: &str,
+        edits: impl IntoIterator<Item = &'a Self>,
+    ) -> Result<String> {
+        let (root, is_toml) = match config::toml(content) {
+            Ok(root) => (root, true),
+            Err(_) => (config::yaml(content)?, false),
+        };
+        let mut replacements = Vec::new();
+        for edit in edits {
+            if edit.source.is_none() {
+                anyhow::ensure!(
+                    root.get("repos")
+                        .map(Node::sequence)
+                        .unwrap_or_default()
+                        .iter()
+                        .any(|repo| {
+                            repo.get("rev")
+                                .and_then(Node::scalar)
+                                .is_some_and(|rev| rev.span.as_ref() == Some(&edit.span))
+                                && repo
+                                    .text("repo")
+                                    .and_then(PreCommitUpdater::extract_github_owner_repo)
+                                    .as_deref()
+                                    == Some(edit.package.as_str())
+                        }),
+                    "Hook repository changed since preview; rerun upd"
+                );
+            }
+            replacements.push((
+                &edit.span,
+                edit.original.as_str(),
+                edit.replacement.as_str(),
+            ));
+            if let Some(tag) = &edit.frozen_tag {
+                replacements.push((&tag.span, tag.original.as_str(), tag.replacement.as_str()));
+            }
+        }
+        replacements.sort_by_key(|(span, _, _)| span.start);
+        let mut end = 0;
+        for (span, original, _) in &replacements {
+            anyhow::ensure!(
+                span.start >= end && content.get((*span).clone()) == Some(*original),
+                "Hook configuration changed since preview; rerun upd"
+            );
+            end = span.end;
+        }
+        let mut rewritten = content.to_string();
+        for (span, _, replacement) in replacements.into_iter().rev() {
+            rewritten.replace_range(span.clone(), replacement);
+        }
+        if is_toml {
+            config::toml(&rewritten)?;
+        } else {
+            config::yaml(&rewritten)?;
+        }
+        Ok(rewritten)
+    }
+}
+
+/// Only an immediately trailing comment belongs unambiguously to this scalar.
+/// In particular, a comment after another flow-mapping field cannot label rev.
+fn frozen_tag(rev: &Scalar, content: &str) -> Option<FrozenTag> {
+    let span = rev.span.as_ref()?;
+    let mut start = span.end;
+    if matches!(content.as_bytes().get(start), Some(b'\'' | b'"')) {
+        start += 1;
+    }
+    let suffix = content.get(start..)?.split(['\r', '\n']).next()?;
+    let comment = suffix.trim_start_matches([' ', '\t']).strip_prefix('#')?;
+    let value = comment.trim_start().strip_prefix("frozen:")?.trim_start();
+    let tag = value.split_whitespace().next().unwrap_or("");
+    let tag_start = start + suffix.len() - value.len();
+    Some(FrozenTag {
+        value: tag.into(),
+        span: span.end..start + suffix.len(),
+        original: content[span.end..start + suffix.len()].into(),
+        value_span: tag_start - span.end..tag_start - span.end + tag.len(),
+    })
+}
+
 /// Why upd will not compute a new value for a repository revision.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum UnreadableRev {
-    /// A full 40-character commit SHA, which is a deliberate pin to a commit.
+    /// A full 40-character Git SHA, pinning a commit or annotated tag object.
     CommitPin,
     /// Anything else upd cannot read as a version: an abbreviated SHA, a branch
     /// name, a moving pointer like `1.x`, a prefixed tag like `black-24.3.0`.
@@ -68,7 +191,7 @@ impl UnreadableRev {
 
     fn message(self, rev: &str) -> String {
         match self {
-            Self::CommitPin => format!("rev {rev} is a commit pin, and upd updates version tags"),
+            Self::CommitPin => format!("rev {rev} is a commit pin without a frozen tag comment"),
             Self::NotAVersion => format!("rev {rev} is not a version tag upd can read"),
         }
     }
@@ -112,6 +235,7 @@ fn record_edit(result: &mut UpdateResult, scalar: &Scalar, replacement: &str) {
             span: scalar.span.clone().unwrap(),
             original: scalar.value.clone(),
             replacement: replacement.into(),
+            frozen_tag: None,
             source: result.entry_ecosystem.get(package).copied(),
             pinned,
             required_revision: None,
@@ -133,7 +257,7 @@ impl PreCommitUpdater {
     async fn update_hooks(
         &self,
         repo: &Node,
-        revision: Option<&str>,
+        revision: HookRevision<'_>,
         content: &str,
         registry: &dyn Registry,
         options: &UpdateOptions,
@@ -155,7 +279,7 @@ impl PreCommitUpdater {
         let key = repo
             .text("repo")
             .and_then(Self::extract_github_owner_repo)
-            .zip(revision.map(str::to_string));
+            .zip(revision.manifest.map(str::to_string));
         if needs_manifest
             && let Some(key) = &key
             && !manifests.contains_key(key)
@@ -227,7 +351,7 @@ impl PreCommitUpdater {
                         record_edit(&mut update, dep, &new);
                         if hook.get("language").is_none()
                             && let Some(rev) = repo.get("rev").and_then(Node::scalar)
-                            && let Some(revision) = revision.filter(|v| *v != rev.value)
+                            && let Some(revision) = revision.planned.filter(|v| *v != rev.value)
                             && let Some(span) = &rev.span
                         {
                             for edit in &mut update.pre_commit_edits {
@@ -285,7 +409,7 @@ impl PreCommitUpdater {
                     version: rev.value.clone(),
                     line_number: rev.line(content),
                     has_upper_bound: false,
-                    is_bumpable: true,
+                    is_bumpable: unreadable_rev(&rev.value).is_none(),
                 })
             })
             .collect()
@@ -320,7 +444,10 @@ impl PreCommitUpdater {
             let Some(rev) = repo.get("rev").and_then(Node::scalar) else {
                 continue;
             };
-            if rev.value != old || line.is_some_and(|line| rev.line(content) != Some(line)) {
+            if unreadable_rev(&rev.value).is_some()
+                || rev.value != old
+                || line.is_some_and(|line| rev.line(content) != Some(line))
+            {
                 continue;
             }
             let mut rewritten = content.to_string();
@@ -337,26 +464,34 @@ impl PreCommitUpdater {
         registry: &dyn Registry,
         options: &UpdateOptions,
         versions: &mut HashMap<String, Result<String, String>>,
-    ) -> (UpdateResult, Option<String>) {
+    ) -> RevisionUpdate {
         let mut result = UpdateResult::default();
         let current = &rev.value;
         let line = rev.line(content);
         if rev.span.is_none() {
-            return (result, None);
+            return (result, None).into();
         }
         if options.is_package_filtered_out(repo) {
             result.unchanged += 1;
-            return (result, None);
+            return (result, None).into();
         }
         if options.should_ignore(repo) {
             result.ignored.push((repo.into(), current.clone(), line));
-            return (result, None);
+            return (result, None).into();
         }
         // Before the pin is read and before any lookup: a configured pin is
         // written straight over the revision without the comparison that used
         // to catch some of these, and a revision upd will not move must not
         // cost a request either.
         if let Some(unreadable) = unreadable_rev(current) {
+            if unreadable == UnreadableRev::CommitPin
+                && let Some(tag) = frozen_tag(rev, content)
+            {
+                return Self::update_frozen_revision(
+                    repo, rev, tag, content, registry, options, versions,
+                )
+                .await;
+            }
             result.skipped.push(SkippedUpdate {
                 package: repo.into(),
                 current: current.clone(),
@@ -365,8 +500,23 @@ impl PreCommitUpdater {
                 message: unreadable.message(current),
                 line_number: line,
             });
-            return (result, None);
+            return (result, None).into();
         }
+        Self::select_revision(repo, current, line, registry, options, versions, true)
+            .await
+            .into()
+    }
+
+    async fn select_revision(
+        repo: &str,
+        current: &str,
+        line: Option<usize>,
+        registry: &dyn Registry,
+        options: &UpdateOptions,
+        versions: &mut HashMap<String, Result<String, String>>,
+        preserve_precision: bool,
+    ) -> (UpdateResult, Option<String>) {
+        let mut result = UpdateResult::default();
         let pin = options.get_pinned_version(repo);
         let latest = if let Some(pin) = pin {
             Ok(pin.to_string())
@@ -418,7 +568,7 @@ impl PreCommitUpdater {
                 } => {
                     result.skipped_by_cooldown.push((
                         repo.into(),
-                        current.clone(),
+                        current.to_string(),
                         skipped_version,
                         skipped_published_at,
                     ));
@@ -426,8 +576,12 @@ impl PreCommitUpdater {
                 }
             }
         };
-        let new = Self::compute_updated_version(current, &latest, options.full_precision);
-        if new == *current {
+        let new = if preserve_precision {
+            Self::compute_updated_version(current, &latest, options.full_precision)
+        } else {
+            latest
+        };
+        if new == current {
             result.unchanged += 1;
             return (result, None);
         }
@@ -445,7 +599,7 @@ impl PreCommitUpdater {
         if pin.is_some() && result.hold_strict_pin(options, repo, current, &new, line) {
             return (result, None);
         }
-        let entry = (repo.into(), current.clone(), new.clone(), line);
+        let entry = (repo.into(), current.to_string(), new.clone(), line);
         if pin.is_some() {
             result.pinned.push(entry);
         } else {
@@ -453,10 +607,141 @@ impl PreCommitUpdater {
             if let Some((skipped, at)) = held_back {
                 result
                     .held_back
-                    .push((repo.into(), current.clone(), new.clone(), skipped, at));
+                    .push((repo.into(), current.to_string(), new.clone(), skipped, at));
             }
         }
         (result, Some(new))
+    }
+
+    async fn update_frozen_revision(
+        repo: &str,
+        rev: &Scalar,
+        tag: FrozenTag,
+        content: &str,
+        registry: &dyn Registry,
+        options: &UpdateOptions,
+        versions: &mut HashMap<String, Result<String, String>>,
+    ) -> RevisionUpdate {
+        let line = rev.line(content);
+        let blocked = |reason, message| -> RevisionUpdate {
+            let mut result = UpdateResult::default();
+            result.skipped.push(SkippedUpdate {
+                package: repo.into(),
+                current: rev.value.clone(),
+                status: SkipStatus::Blocked,
+                reason,
+                message,
+                line_number: line,
+            });
+            (result, None).into()
+        };
+        if TagVersion::parse(&tag.value).is_none() {
+            return blocked(
+                "invalid-frozen-tag",
+                "frozen comment must name a version tag".into(),
+            );
+        }
+        let current_tag = match registry.resolve_git_tag(repo, &tag.value).await {
+            Ok(tag) => tag,
+            Err(error) if error.is::<crate::registry::UnusableGitTag>() => {
+                return blocked("unusable-frozen-tag", error.to_string());
+            }
+            Err(error) if is_ref_not_found(&error) => {
+                return blocked(
+                    "frozen-tag-not-found",
+                    format!(
+                        "Cannot read frozen tag {}: it may be missing or its repository may be private or inaccessible ({error})",
+                        tag.value
+                    ),
+                );
+            }
+            Err(error) => {
+                let mut result = UpdateResult::default();
+                result.errors.push(format!(
+                    "{repo}@{}: failed to verify frozen pin: {error}",
+                    tag.value
+                ));
+                return (result, None).into();
+            }
+        };
+        if !current_tag.object.eq_ignore_ascii_case(&rev.value)
+            && !current_tag.commit.eq_ignore_ascii_case(&rev.value)
+        {
+            return blocked(
+                "frozen-tag-mismatch",
+                format!(
+                    "frozen tag {} identifies object {} and commit {}, not the pinned revision",
+                    tag.value, current_tag.object, current_tag.commit
+                ),
+            );
+        }
+        // Frozen comments name actual refs, so never shorten or restyle a
+        // selected tag. The SHA and comment must describe that exact release.
+        let keep_current_commit = |mut outcome: RevisionUpdate| {
+            outcome.manifest = Some(current_tag.commit.clone());
+            outcome
+        };
+        let (mut result, new) =
+            Self::select_revision(repo, &tag.value, line, registry, options, versions, false).await;
+        let Some(new) = new else {
+            return RevisionUpdate {
+                result,
+                target: None,
+                manifest: Some(current_tag.commit),
+            };
+        };
+        if TagVersion::parse(&new).is_none() {
+            return keep_current_commit(blocked(
+                "invalid-frozen-tag",
+                format!("target {new} is not a version tag"),
+            ));
+        }
+        let target = match registry.resolve_git_tag(repo, &new).await {
+            Ok(tag) => tag,
+            Err(error) if error.is::<crate::registry::UnusableGitTag>() => {
+                return keep_current_commit(blocked("unusable-frozen-tag", error.to_string()));
+            }
+            Err(error) if is_ref_not_found(&error) => {
+                return keep_current_commit(blocked(
+                    "frozen-tag-not-found",
+                    format!(
+                        "Cannot read target tag {new}: it may be missing or its repository may be private or inaccessible ({error})"
+                    ),
+                ));
+            }
+            Err(error) => {
+                let mut result = UpdateResult::default();
+                result.errors.push(format!(
+                    "{repo}@{new}: failed to resolve new frozen pin: {error}"
+                ));
+                return keep_current_commit((result, None).into());
+            }
+        };
+        let revision = if current_tag.object != current_tag.commit
+            && current_tag.object.eq_ignore_ascii_case(&rev.value)
+        {
+            target.object
+        } else {
+            target.commit.clone()
+        };
+        let mut replacement = tag.original.clone();
+        replacement.replace_range(tag.value_span, &new);
+        let frozen = PreCommitTagEdit {
+            span: tag.span,
+            original: tag.original,
+            replacement,
+            current_commit: current_tag.commit,
+            new_commit: target.commit.clone(),
+        };
+        record_edit(&mut result, rev, &revision);
+        for edit in &mut result.pre_commit_edits {
+            edit.frozen_tag = Some(frozen.clone());
+        }
+        RevisionUpdate {
+            result,
+            target: Some(revision),
+            manifest: Some(target.commit),
+        }
     }
 }
 
@@ -505,24 +790,37 @@ impl Updater for PreCommitUpdater {
         let mut manifests = HashMap::new();
         for repo in root.get("repos").map(Node::sequence).unwrap_or_default() {
             let mut revision = repo.text("rev").map(str::to_string);
+            let mut planned_revision = None;
             if let Some(name) = repo.text("repo").and_then(Self::extract_github_owner_repo)
                 && let Some(rev) = repo.get("rev").and_then(Node::scalar)
             {
-                let (mut update, new) =
-                    Self::update_revision(&name, rev, &content, registry, &options, &mut versions)
-                        .await;
-                if let Some(new) = &new {
+                let RevisionUpdate {
+                    result: mut update,
+                    target: new,
+                    manifest,
+                } = Self::update_revision(&name, rev, &content, registry, &options, &mut versions)
+                    .await;
+                if let Some(new) = &new
+                    && update.pre_commit_edits.is_empty()
+                {
                     record_edit(&mut update, rev, new);
                 }
                 result.merge(update);
                 if let Some(new) = new {
                     revision = Some(new.clone());
+                    planned_revision = Some(new);
+                }
+                if let Some(manifest) = manifest {
+                    revision = Some(manifest);
                 }
             }
             result.merge(
                 self.update_hooks(
                     repo,
-                    revision.as_deref(),
+                    HookRevision {
+                        manifest: revision.as_deref(),
+                        planned: planned_revision.as_deref(),
+                    },
                     &content,
                     registry,
                     &options,
@@ -532,12 +830,7 @@ impl Updater for PreCommitUpdater {
             );
         }
         if !options.dry_run && !result.pre_commit_edits.is_empty() {
-            let mut edits: Vec<_> = result.pre_commit_edits.iter().collect();
-            edits.sort_by_key(|edit| std::cmp::Reverse(edit.span.start));
-            let mut updated = content;
-            for edit in edits {
-                updated.replace_range(edit.span.clone(), &edit.replacement);
-            }
+            let updated = PreCommitEdit::apply_all(&content, &result.pre_commit_edits)?;
             Self::parse(&updated, path)?;
             write_file_atomic(path, &updated)?;
         }

@@ -19,12 +19,18 @@ impl Scalar {
             let raw = content.get(span.clone())?;
             if raw == value {
                 Some(span)
-            } else if raw.len() >= 2
-                && matches!(raw.as_bytes()[0], b'\'' | b'"')
-                && raw.as_bytes().first() == raw.as_bytes().last()
-                && raw.get(1..raw.len() - 1) == Some(value)
+            } else if matches!(raw.as_bytes().first(), Some(b'\'' | b'"'))
+                && !value.contains(['\r', '\n'])
+                && raw.get(1..1 + value.len()) == Some(value)
+                && raw.as_bytes().get(1 + value.len()) == raw.as_bytes().first()
+                && raw.get(2 + value.len()..).is_some_and(|suffix| {
+                    // Saphyr's quoted-scalar span can include the trailing
+                    // comment. Only the literal token belongs to this value.
+                    let suffix = suffix.trim_start_matches([' ', '\t']);
+                    suffix.is_empty() || suffix.starts_with('#')
+                })
             {
-                Some(span.start + 1..span.end - 1)
+                Some(span.start + 1..span.start + 1 + value.len())
             } else {
                 None
             }
@@ -204,5 +210,27 @@ fn toml_node(item: &Item, content: &str) -> Node {
         )
     } else {
         Node::Unsupported
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn quoted_yaml_values_keep_exact_literal_spans_with_trailing_comments() {
+        for ending in ["\n", "\r\n"] {
+            for quote in ["", "'", "\""] {
+                let content = format!("# café{ending}rev: {quote}v1.2.3{quote}  # keep{ending}");
+                let root = yaml(&content).unwrap();
+                let rev = root.get("rev").unwrap().scalar().unwrap();
+                assert_eq!(&content[rev.span.clone().unwrap()], "v1.2.3");
+            }
+        }
+        for value in [r#""v1.\u0032.3""#, "'v1.2.3\n  suffix'", "&shared 'v1.2.3'"] {
+            let content = format!("rev: {value} # keep\n");
+            let root = yaml(&content).unwrap();
+            assert!(root.get("rev").unwrap().scalar().unwrap().span.is_none());
+        }
     }
 }

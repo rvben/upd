@@ -208,9 +208,10 @@ upd --show-config
 
 `--fail-on-blocked` is supported only by `upd update` or the default `upd`
 invocation. `--check --fail-on-blocked` exits 1 for safety refusals and 2 for
-failed registry requests. Unsupported Docker digest-pin and pre-commit frozen
-commit-pin updates remain `not-examined` and do not fail this check; their pins
-are left unchanged without revision verification. The reusable workflow's
+failed registry requests. Unsupported Docker digest pins and bare pre-commit
+commit pins remain `not-examined` and do not fail this check. Pre-commit pins
+with a `# frozen: <tag>` comment are verified and updated together with that
+comment; a mismatch fails the strict check. The reusable workflow's
 `fail-on-blocked` input additionally covers unfixable or skipped version floors
 and blocked security relocks; see [GitHub Actions](docs/github-actions.md).
 
