@@ -44,6 +44,12 @@ class ReleasePinSynchronizerTest(unittest.TestCase):
                 f"{digest}  {name}\n", encoding="utf-8"
             )
 
+        # Later releases must retain an image once the checked-in pins have one.
+        (self.artifacts / f"upd-{version}-image.json").write_text(
+            json.dumps({"image": f"ghcr.io/rvben/upd:{version}@sha256:" + "a" * 64}),
+            encoding="utf-8",
+        )
+
     def test_verified_artifacts_update_every_consumer_idempotently(self) -> None:
         old = PINS.load_manifest(self.root / "release-pins.json")
         major, minor, patch = PINS.version_key(old["version"])
