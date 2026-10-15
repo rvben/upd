@@ -4611,3 +4611,131 @@ async fn the_real_updater_applies_a_security_fix_the_cooldown_would_hold_back() 
         serde_json::from_str(&fixture.artifact("upd-security-report.json")).unwrap();
     assert_eq!(report["fixes"][0]["status"], "pending_relock", "{report}");
 }
+
+async fn serve_project_lock_mr(server: &MockServer) {
+    let mut existing = mr_list_response(7, false);
+    existing[0]["description"] = json!("Existing dependency proposal");
+    Mock::given(method("GET"))
+        .and(path("/api/v4/projects/1/merge_requests"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(existing))
+        .mount(server)
+        .await;
+    Mock::given(method("PUT"))
+        .and(path("/api/v4/projects/1/merge_requests/7"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(mr_response(7, false)))
+        .mount(server)
+        .await;
+}
+
+fn project_lock_script() -> String {
+    include_str!("../ci/gitlab-project-lock.yml")
+        .split_once("  script:\n    - |\n")
+        .unwrap()
+        .1
+        .lines()
+        .map(|line| line.strip_prefix("      ").unwrap_or(line))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+#[tokio::test]
+async fn project_owned_lock_job_pushes_only_lockfiles_and_the_next_run_still_owns_the_branch() {
+    let fixture = Fixture::new();
+    fs::write(fixture.checkout.join("uv.lock"), "old lock\n").unwrap();
+    git(&fixture.checkout, &["add", "uv.lock"]);
+    git(&fixture.checkout, &["commit", "-m", "test: add lockfile"]);
+    git(&fixture.checkout, &["push", "origin", "main"]);
+    let server = MockServer::start().await;
+    serve_project_lock_mr(&server).await;
+    fixture.run_template(&server, true, "first", false);
+    let tip = fixture.remote_tip().unwrap();
+    let output = isolated::command("bash")
+        .current_dir(&fixture.checkout)
+        .args(["-c", &project_lock_script()])
+        .env("CI_COMMIT_SHA", &tip)
+        .env("UPD_LOCK_BRANCH", BRANCH)
+        .env("UPD_LOCK_COMMAND", "printf 'fresh lock\\n' > uv.lock")
+        .env("UPD_PROJECT_TOKEN", "project-only-token")
+        .env(
+            "CI_SERVER_URL",
+            format!("file://{}", fixture.remote.parent().unwrap().display()),
+        )
+        .env("CI_PROJECT_PATH", "remote")
+        .env_remove("UPD_GITLAB_TOKEN")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        fixture.file_on(BRANCH, "uv.lock").as_deref(),
+        Some("fresh lock\n")
+    );
+    assert_eq!(fixture.branch_commit_count(), 2);
+    let locked_tip = fixture.remote_tip();
+    fixture.run_template(&server, true, "first", false);
+    assert_eq!(fixture.remote_tip(), locked_tip);
+    // A real CI invocation starts from a fresh checkout. The unchanged run
+    // leaves its proposal staged locally; clean only this fixture before run 3.
+    git(
+        &fixture.checkout,
+        &[
+            "checkout",
+            "--detach",
+            "--force",
+            locked_tip.as_deref().unwrap(),
+        ],
+    );
+    assert_eq!(
+        fixture.file_on(BRANCH, "uv.lock").as_deref(),
+        Some("fresh lock\n")
+    );
+    fixture.run_template(&server, true, "second", false);
+    assert_eq!(fixture.branch_file().as_deref(), Some("second\n"));
+    assert_eq!(fixture.branch_commit_count(), 1);
+}
+
+#[tokio::test]
+async fn a_fake_project_lock_commit_that_changes_a_manifest_still_pauses() {
+    let fixture = Fixture::new();
+    let server = MockServer::start().await;
+    serve_project_lock_mr(&server).await;
+    fixture.run_template(&server, true, "first", false);
+    fs::write(fixture.checkout.join("dependency.txt"), "human work").unwrap();
+    git(&fixture.checkout, &["add", "dependency.txt"]);
+    git(
+        &fixture.checkout,
+        &["commit", "-m", "chore(deps): refresh lockfiles for upd"],
+    );
+    git(&fixture.checkout, &["push", "origin", BRANCH]);
+    fixture.run_template(&server, true, "second", false);
+    assert_eq!(fixture.branch_file().as_deref(), Some("human work"));
+}
+
+#[test]
+fn project_lock_job_rejects_the_group_token_and_unexpected_changes() {
+    let script = project_lock_script();
+    let output = isolated::command("bash")
+        .args(["-c", &script])
+        .env("UPD_GITLAB_TOKEN", "group-secret")
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("must not receive"));
+    assert!(!String::from_utf8_lossy(&output.stderr).contains("group-secret"));
+    let fixture = Fixture::new();
+    let sha = String::from_utf8(git(&fixture.checkout, &["rev-parse", "HEAD"]).stdout).unwrap();
+    let output = isolated::command("bash")
+        .current_dir(&fixture.checkout)
+        .args(["-c", &script])
+        .env("CI_COMMIT_SHA", sha.trim())
+        .env_remove("UPD_GITLAB_TOKEN")
+        .env("UPD_PROJECT_TOKEN", "project-token")
+        .env("UPD_LOCK_COMMAND", "printf 'bad\\n' > dependency.txt")
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("non-lockfile"));
+}

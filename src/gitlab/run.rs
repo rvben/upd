@@ -274,6 +274,11 @@ pub(super) fn branches_collide(a: &str, b: &str) -> bool {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case", tag = "outcome")]
 pub enum Outcome {
+    /// An onboarding invitation, or the reason no invitation was opened.
+    Onboarding {
+        merge_request: Option<String>,
+        reason: String,
+    },
     /// Nothing to propose, and nothing obsolete to clean up.
     Clean,
     /// Nothing to propose; the obsolete merge request and/or branch was removed.
@@ -328,6 +333,16 @@ impl Outcome {
     /// One-line account of the run, for the job log.
     pub fn render_text(&self, branch: &str) -> String {
         match self {
+            Self::Onboarding {
+                merge_request,
+                reason,
+            } => format!(
+                "Onboarding: {reason}{}",
+                merge_request
+                    .as_ref()
+                    .map(|url| format!(" ({url})"))
+                    .unwrap_or_default()
+            ),
             Self::Clean => "No dependency updates within policy.".to_string(),
             Self::Closed {
                 merge_request,
@@ -1234,6 +1249,9 @@ async fn claim(
     default_ref: &str,
     tip: &str,
 ) -> Result<Claim, Error> {
+    if project_lock_commit(git, settings, default_ref, tip).await? {
+        return Ok(Claim::Written);
+    }
     let single = is_single_commit_on(git, default_ref, tip).await?;
     if single && is_written_as_configured(git, settings, tip).await? {
         return Ok(Claim::Written);
@@ -1249,6 +1267,61 @@ async fn claim(
     } else {
         Claim::Foreign(open)
     })
+}
+
+/// Accept exactly one project-CI follow-up to our generated manifest commit.
+/// It may only modify existing regular lockfiles, never manifests or CI code.
+async fn project_lock_commit(
+    git: &Git,
+    settings: &Settings,
+    default_ref: &str,
+    tip: &str,
+) -> Result<bool, Error> {
+    let message = git.read(["show", "-s", "--format=%B", tip]).await?;
+    if message != "chore(deps): refresh lockfiles for upd" {
+        return Ok(false);
+    }
+    let parents = git.read(["rev-list", "--parents", "-n", "1", tip]).await?;
+    let parents: Vec<_> = parents.split_whitespace().skip(1).collect();
+    let [parent] = parents.as_slice() else {
+        return Ok(false);
+    };
+    if !is_single_commit_on(git, default_ref, parent).await?
+        || !is_written_as_configured(git, settings, parent).await?
+    {
+        return Ok(false);
+    }
+    let changes = git
+        .read([
+            "diff-tree",
+            "--no-commit-id",
+            "--raw",
+            "-r",
+            "--no-renames",
+            "-z",
+            parent,
+            tip,
+        ])
+        .await?;
+    let mut fields = changes.split('\0').filter(|s| !s.is_empty());
+    let mut count = 0;
+    while let Some(meta) = fields.next() {
+        let Some(path) = fields.next() else {
+            return Ok(false);
+        };
+        let parts: Vec<_> = meta.split_whitespace().collect();
+        if parts.len() != 5
+            || parts[0] != ":100644"
+            || parts[1] != "100644"
+            || parts[4] != "M"
+            || crate::lockfile::LockfileType::from_filename(path.rsplit('/').next().unwrap_or(path))
+                .is_none()
+        {
+            return Ok(false);
+        }
+        count += 1;
+    }
+    Ok(count > 0)
 }
 
 /// Whether `tip` is a single commit on top of the default branch's history.
@@ -1290,6 +1363,14 @@ async fn is_written_as_configured(
 /// `HEAD`, the commit the proposal is built on, with the configured identity
 /// and message.
 async fn already_proposed(git: &Git, settings: &Settings, tip: &str) -> Result<bool, Error> {
+    // The same manifest proposal can keep the project CI lock commit too;
+    // otherwise every schedule would undo and regenerate identical locks.
+    let generated_tip = if project_lock_commit(git, settings, "HEAD", tip).await? {
+        git.read(["rev-parse", &format!("{tip}^")]).await?
+    } else {
+        tip.to_owned()
+    };
+    let tip = generated_tip.as_str();
     let base = git.read(["rev-parse", "HEAD^{commit}"]).await?;
     let parent = git.read(["rev-parse", &format!("{tip}^")]).await?;
     if parent != base {

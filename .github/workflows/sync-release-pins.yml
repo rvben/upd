@@ -106,6 +106,11 @@ jobs:
             gh attestation verify "$archive" --repo "$GITHUB_REPOSITORY"
           done
 
+          image_metadata="artifacts/release-assets/upd-${VERSION}-image.json"
+          if [[ -f "$image_metadata" ]]; then
+            gh attestation verify "$image_metadata" --repo "$GITHUB_REPOSITORY"
+          fi
+
           smoke_dir="$RUNNER_TEMP/upd-release-smoke"
           mkdir -p "$smoke_dir"
           smoke_archive="artifacts/release-assets/upd-${VERSION}-x86_64-unknown-linux-gnu.tar.gz"

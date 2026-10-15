@@ -149,6 +149,9 @@ spec:
 
       if [ -n "$UPD_EXECUTABLE" ]; then
         upd_bin="$UPD_EXECUTABLE"
+      elif command -v upd >/dev/null 2>&1 && [ "$(upd --version)" = "upd ${version#v}" ]; then
+        # The release image and its embedded binary are pinned by image digest.
+        upd_bin="$(command -v upd)"
       else
         target="${UPD_TARGET}"
         if [ -z "$target" ]; then

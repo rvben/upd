@@ -74,6 +74,15 @@ async fn never_asked(mock: &MockServer, package: &str) {
 /// and everything else isolated from the host (no pip.conf, no inherited
 /// registry or credential configuration, a fixture-local cache).
 fn run(dir: &TempDir, default_index: &str, args: &[&str]) -> std::process::Output {
+    run_with_vars(dir, default_index, args, &[])
+}
+
+fn run_with_vars(
+    dir: &TempDir,
+    default_index: &str,
+    args: &[&str],
+    vars: &[(&str, &str)],
+) -> std::process::Output {
     let home = dir.path().join("home");
     let xdg_config = dir.path().join("xdg-config");
     std::fs::create_dir_all(&home).expect("fixture HOME created");
@@ -81,6 +90,7 @@ fn run(dir: &TempDir, default_index: &str, args: &[&str]) -> std::process::Outpu
 
     Command::new(env!("CARGO_BIN_EXE_upd"))
         .env_clear()
+        .envs(vars.iter().copied())
         .arg("pyproject.toml")
         .args(args)
         .env("HOME", home)
@@ -383,4 +393,89 @@ url = "{}/simple/"
         stdout.contains("Scanned 1 file(s), all dependencies up to date"),
         "stdout:\n{stdout}"
     );
+}
+
+#[tokio::test]
+async fn uv_named_credentials_are_scoped_to_the_declared_index() {
+    use wiremock::matchers::header;
+    let private = MockServer::start().await;
+    let public = MockServer::start().await;
+    serve(&private, "internal", &["1.0.0", "1.1.0"]).await;
+    Mock::given(method("GET"))
+        .and(path("/pypi/internal/json"))
+        .and(header("Authorization", "Basic dXNlcjpzZWNyZXQ="))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_string(pypi_releases(&["1.0.0", "1.2.0"])),
+        )
+        .with_priority(1)
+        .expect(1)
+        .mount(&private)
+        .await;
+    serve(&public, "public", &["1.0.0", "1.1.0"]).await;
+    missing(&private, "public").await;
+    let dir = TempDir::new().unwrap();
+    write_pyproject(
+        &dir,
+        &format!(
+            r#"[project]
+name = "example"
+version = "0.1.0"
+dependencies = ["internal==1.0.0", "public==1.0.0"]
+[[tool.uv.index]]
+name = "internal-proxy"
+url = "{}/simple"
+[tool.uv.sources]
+internal = {{ index = "internal-proxy" }}
+"#,
+            private.uri()
+        ),
+    );
+    let output = run_with_vars(
+        &dir,
+        &public.uri(),
+        &["--no-cache", "--format", "json"],
+        &[
+            ("UV_INDEX_INTERNAL_PROXY_USERNAME", "user"),
+            ("UV_INDEX_INTERNAL_PROXY_PASSWORD", "secret"),
+        ],
+    );
+    let report = json_of(&output);
+    assert_eq!(report["summary"]["errors"], 0, "{report}");
+    assert!(report.to_string().contains("1.2.0"));
+    for request in public.received_requests().await.unwrap() {
+        assert!(!request.headers.contains_key("authorization"));
+    }
+    assert!(!String::from_utf8_lossy(&output.stdout).contains("secret"));
+}
+
+#[tokio::test]
+async fn an_unauthorized_declared_index_cannot_look_current_via_a_public_fallback() {
+    let private = MockServer::start().await;
+    let public = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/simple/internal/"))
+        .respond_with(ResponseTemplate::new(401))
+        .mount(&private)
+        .await;
+    never_asked(&public, "internal").await;
+    let dir = TempDir::new().unwrap();
+    write_pyproject(
+        &dir,
+        &format!(
+            r#"[project]
+name = "example"
+version = "0.1.0"
+dependencies = ["internal==1.0.0"]
+[[tool.uv.index]]
+name = "private"
+url = "{}/simple"
+"#,
+            private.uri()
+        ),
+    );
+    let output = run(&dir, &public.uri(), &["--no-cache", "--format", "json"]);
+    let report = json_of(&output);
+    assert_eq!(report["summary"]["errors"], 1, "{report}");
+    assert!(!output.status.success());
+    assert!(report.to_string().contains("401"), "{report}");
 }

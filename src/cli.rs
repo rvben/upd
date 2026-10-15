@@ -415,6 +415,12 @@ pub enum Command {
         command: GitlabCommand,
     },
 
+    /// Translate another dependency updater's configuration
+    Migrate {
+        #[command(subcommand)]
+        command: MigrateCommand,
+    },
+
     /// Clear the version cache
     CleanCache,
 
@@ -430,6 +436,16 @@ pub enum Command {
 
     /// Describe offline-safe CLI capabilities
     Capabilities,
+}
+
+#[derive(Subcommand, Clone)]
+pub enum MigrateCommand {
+    /// Translate renovate.json to .updrc.toml, reporting unsupported settings
+    Renovate {
+        /// Repository directory or Renovate JSON file
+        #[arg(default_value = ".")]
+        path: PathBuf,
+    },
 }
 
 #[derive(Subcommand, Clone)]
@@ -495,7 +511,21 @@ pub enum GitlabOrgCommand {
     /// ci/gitlab-organization-update.yml template sets (see docs/gitlab.md).
     /// With --dry-run, reports what each project would get without pushing
     /// or writing to GitLab.
-    Run,
+    Run {
+        /// Only process these full project paths (repeatable)
+        #[arg(long = "project", value_name = "PATH")]
+        projects: Vec<String>,
+        /// Preview projects without requiring their opt-in (requires --dry-run)
+        #[arg(long)]
+        assume_opted_in: bool,
+    },
+
+    /// Open a single opt-in merge request per project; closed requests stay closed
+    Onboard {
+        /// Only onboard these full project paths (repeatable)
+        #[arg(long = "project", value_name = "PATH")]
+        projects: Vec<String>,
+    },
 
     /// Lock mode, planning job: write the child pipeline of lock jobs.
     ///

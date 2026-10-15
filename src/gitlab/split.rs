@@ -88,6 +88,8 @@ struct Plan {
     /// The programs regenerating them needs.
     tools: Vec<String>,
     config: Option<PathBuf>,
+    #[serde(default)]
+    config_content: Option<String>,
     paths: Vec<String>,
     langs: String,
     exclude_langs: String,
@@ -411,7 +413,14 @@ pub async fn prepare(
         planned_sha256: sha256(&planned),
         lockfiles: lockfiles.keys().cloned().collect(),
         tools: tools.into_iter().collect(),
-        config: ordinary.config.clone(),
+        config: ordinary.config.clone().filter(|path| !path.is_absolute()),
+        config_content: ordinary
+            .config
+            .as_ref()
+            .filter(|path| path.is_absolute())
+            .map(std::fs::read_to_string)
+            .transpose()
+            .map_err(|e| Error::Io(e.to_string()))?,
         paths: ordinary.paths.clone(),
         langs: ordinary.langs.clone(),
         exclude_langs: ordinary.exclude_langs.clone(),
@@ -504,11 +513,15 @@ pub async fn lock_worker(dir: &Path, updater: PathBuf, log: &Log) -> Result<Step
         )));
     }
 
-    let settings = lane_settings(
-        worker_settings(&work, plan, checkout.clone(), updater),
-        work.lane,
-    )?;
     run::prepare_artifact_dir(&git, &checkout).await?;
+    let policy_dir = tempfile::tempdir().map_err(|e| Error::Io(e.to_string()))?;
+    let mut worker = worker_settings(&work, plan, checkout.clone(), updater);
+    if let Some(content) = &plan.config_content {
+        let path = policy_dir.path().join("policy.toml");
+        write_file(&path, content.as_bytes())?;
+        worker.config = Some(path);
+    }
+    let settings = lane_settings(worker, work.lane)?;
     let applied = run::apply_changes(&settings, &git, log).await?;
     git.run(["add", "--all"]).await?;
     let patch = git

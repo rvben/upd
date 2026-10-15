@@ -246,6 +246,40 @@ impl PyPiRegistry {
         }
     }
 
+    /// uv names scope credentials to one declared index, never to fallback indexes.
+    pub fn from_named_url(url: &str, name: Option<&str>) -> Self {
+        if let Some(name) = name {
+            let key: String = name
+                .chars()
+                .map(|c| {
+                    if c.is_ascii_alphanumeric() {
+                        c.to_ascii_uppercase()
+                    } else {
+                        '_'
+                    }
+                })
+                .collect();
+            if let (Ok(username), Ok(password)) = (
+                std::env::var(format!("UV_INDEX_{key}_USERNAME")),
+                std::env::var(format!("UV_INDEX_{key}_PASSWORD")),
+            ) {
+                let clean = url::Url::parse(url)
+                    .ok()
+                    .map(|mut parsed| {
+                        let _ = parsed.set_username("");
+                        let _ = parsed.set_password(None);
+                        parsed.to_string()
+                    })
+                    .unwrap_or_else(|| url.to_owned());
+                return Self::with_index_url_and_credentials(
+                    Self::normalize_index_url(&clean),
+                    Some(PyPiCredentials { username, password }),
+                );
+            }
+        }
+        Self::from_url(url)
+    }
+
     /// Get the index URL this registry is configured for
     pub fn index_url(&self) -> &str {
         &self.index_url
@@ -414,7 +448,8 @@ impl PyPiRegistry {
 
         let simple_response = self
             .get_with_retry_and_headers(&simple_url, Some(headers))
-            .await?;
+            .await
+            .map_err(super::RegistryRequestError::new)?;
 
         if simple_response.status().is_success() {
             // Check Content-Type to determine response format
@@ -427,34 +462,58 @@ impl PyPiRegistry {
             if content_type.contains("application/vnd.pypi.simple") && content_type.contains("json")
             {
                 // PEP 691 JSON format
-                let data: SimpleApiResponse = simple_response.json().await?;
+                let data: SimpleApiResponse = simple_response
+                    .json()
+                    .await
+                    .map_err(|error| super::RegistryRequestError::new(error.into()))?;
                 return Ok(PackageResponse::Simple(data));
             } else {
                 // HTML format (standard Simple API or PEP 691 HTML)
-                let html = simple_response.text().await?;
+                let html = simple_response
+                    .text()
+                    .await
+                    .map_err(|error| super::RegistryRequestError::new(error.into()))?;
                 return Ok(PackageResponse::Simple(SimpleApiResponse {
                     files: Self::html_files(&html),
                 }));
             }
         }
 
-        // Simple API failed - try legacy JSON API (PyPI.org style)
+        if !matches!(simple_response.status().as_u16(), 404 | 405 | 406 | 415) {
+            return Err(super::RegistryRequestError::new(anyhow!(http_error_message(
+                simple_response.status(), "Package", package,
+                Some("Check the project's index URL and UV_INDEX_<NAME>_USERNAME / UV_INDEX_<NAME>_PASSWORD credentials")
+            ))).into());
+        }
+
+        // An absent/unsupported Simple endpoint may use the legacy JSON API.
         let json_url = format!("{}/pypi/{}/json", self.index_url, normalized);
-        let response = self.get_with_retry(&json_url).await?;
+        let response = self
+            .get_with_retry(&json_url)
+            .await
+            .map_err(super::RegistryRequestError::new)?;
 
         if response.status().is_success() {
-            let data: PyPiResponse = response.json().await?;
+            let data: PyPiResponse = response
+                .json()
+                .await
+                .map_err(|error| super::RegistryRequestError::new(error.into()))?;
             return Ok(PackageResponse::Legacy(data));
         }
 
-        Err(anyhow!(http_error_message(
+        let error = anyhow!(http_error_message(
             response.status(),
             "Package",
             package,
             Some(
                 "For private PyPI, configure credentials in ~/.netrc or use UV_INDEX_URL with credentials."
             )
-        )))
+        ));
+        Err(if response.status() == reqwest::StatusCode::NOT_FOUND {
+            error
+        } else {
+            super::RegistryRequestError::new(error).into()
+        })
     }
 
     /// Parse JSON API response from PyPI
@@ -715,6 +774,7 @@ impl Registry for MultiPyPiRegistry {
         for registry in &self.registries {
             match registry.python_releases(package).await {
                 Ok(releases) => return Ok(releases),
+                Err(error) if error.is::<super::RegistryRequestError>() => return Err(error),
                 Err(error) => last_error = error,
             }
         }
@@ -733,6 +793,9 @@ impl Registry for MultiPyPiRegistry {
             match registry.get_latest_version(package).await {
                 Ok(version) => return Ok(version),
                 Err(e) => {
+                    if e.is::<super::RegistryRequestError>() {
+                        return Err(e);
+                    }
                     last_error = Some(e);
                 }
             }
@@ -755,6 +818,9 @@ impl Registry for MultiPyPiRegistry {
             {
                 Ok(version) => return Ok(version),
                 Err(e) => {
+                    if e.is::<super::RegistryRequestError>() {
+                        return Err(e);
+                    }
                     last_error = Some(e);
                 }
             }
@@ -781,6 +847,9 @@ impl Registry for MultiPyPiRegistry {
             {
                 Ok(version) => return Ok(version),
                 Err(e) => {
+                    if e.is::<super::RegistryRequestError>() {
+                        return Err(e);
+                    }
                     last_error = Some(e);
                 }
             }

@@ -202,7 +202,10 @@ impl<'a> IndexChain<'a> {
 
         for index in declared {
             let link = match index.source {
-                IndexSource::Url(url) => Link::Index(Arc::new(PyPiRegistry::from_url(&url))),
+                IndexSource::Url(url) => Link::Index(Arc::new(PyPiRegistry::from_named_url(
+                    &url,
+                    index.name.as_deref(),
+                ))),
                 IndexSource::Default => Link::Default(default),
             };
             if let Some(name) = index.name {
@@ -275,6 +278,7 @@ impl<'a> IndexChain<'a> {
         for link in links {
             match query.run(link.registry(), package).await {
                 Ok(version) => return Ok(version),
+                Err(e) if e.is::<super::RegistryRequestError>() => return Err(e),
                 Err(e) => last_error = Some(e),
             }
         }
@@ -303,6 +307,7 @@ impl<'a> IndexChain<'a> {
                 .await
             {
                 Ok(version) => return Ok(version),
+                Err(error) if error.is::<super::RegistryRequestError>() => return Err(error),
                 Err(error) => last_error = Some(error),
             }
         }
@@ -317,6 +322,7 @@ impl Registry for IndexChain<'_> {
         for link in self.links_for(package) {
             match link.registry().python_releases(package).await {
                 Ok(releases) => return Ok(releases),
+                Err(error) if error.is::<super::RegistryRequestError>() => return Err(error),
                 Err(error) => last_error = error,
             }
         }
@@ -396,6 +402,7 @@ impl Registry for IndexChain<'_> {
                         .list_versions_for_cooldown_query(package, true, query, resolved)
                         .await;
                 }
+                Err(error) if error.is::<super::RegistryRequestError>() => return Err(error),
                 Err(error) => last_error = Some(error),
             }
         }
@@ -421,6 +428,7 @@ impl Registry for IndexChain<'_> {
             {
                 Ok(versions) if !versions.is_empty() => return Ok(versions),
                 Ok(_) => {}
+                Err(error) if error.is::<super::RegistryRequestError>() => return Err(error),
                 Err(error) => last_error = Some(error),
             }
         }
@@ -444,6 +452,7 @@ impl Registry for IndexChain<'_> {
             match link.registry().list_ref_names(package).await {
                 Ok(refs) if !refs.is_empty() => return Ok(refs),
                 Ok(_) => {}
+                Err(error) if error.is::<super::RegistryRequestError>() => return Err(error),
                 Err(error) => last_error = Some(error),
             }
         }
@@ -464,6 +473,7 @@ impl Registry for IndexChain<'_> {
                 .await
             {
                 Ok(commit) => return Ok(commit),
+                Err(e) if e.is::<super::RegistryRequestError>() => return Err(e),
                 Err(e) => last_error = Some(e),
             }
         }
@@ -496,6 +506,7 @@ impl Registry for IndexChain<'_> {
                 }
                 Ok(super::TagsAtCommit::NoReleases) => any_answered = true,
                 Ok(super::TagsAtCommit::Unsupported) => {}
+                Err(error) if error.is::<super::RegistryRequestError>() => return Err(error),
                 Err(error) => last_error = Some(error),
             }
         }

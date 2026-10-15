@@ -66,6 +66,8 @@ fn every_release_pin_consumer_matches_the_manifest() {
 
     for (relative, (expected_versions, expected_hashes)) in consumers {
         let content = std::fs::read_to_string(repo_root().join(relative)).unwrap();
+        let expected_versions = expected_versions
+            + usize::from(manifest.get("image").is_some() && relative.starts_with("ci/"));
         assert_eq!(
             content.matches(version).count(),
             expected_versions,

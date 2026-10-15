@@ -80,3 +80,5 @@ pub fn decide_audit_exit_code(vuln_count: usize, error_count: usize, no_fail: bo
         0
     }
 }
+
+pub mod migrate;

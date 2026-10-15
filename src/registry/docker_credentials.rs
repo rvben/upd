@@ -104,11 +104,13 @@ impl Credentials {
 
     async fn read(&self, server: &str) -> Result<Option<Credential>> {
         let Some(path) = &self.path else {
-            return Ok(None);
+            return Ok(ci_registry_credentials(server));
         };
         let bytes = match tokio::fs::read(path).await {
             Ok(bytes) => bytes,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(ci_registry_credentials(server));
+            }
             Err(_) => {
                 bail!("Cannot read Docker config.json; check DOCKER_CONFIG and file permissions")
             }
@@ -129,6 +131,25 @@ impl Credentials {
             .transpose()
             .map(Option::flatten)
     }
+}
+
+// Use only CI's explicit registry credentials and only for the exact registry
+// authority (including port). The API token need not have registry scope.
+fn ci_registry_credentials(server: &str) -> Option<Credential> {
+    ci_registry_credentials_from_lookup(server, |name| std::env::var(name).ok())
+}
+
+fn ci_registry_credentials_from_lookup(
+    server: &str,
+    lookup: impl Fn(&str) -> Option<String>,
+) -> Option<Credential> {
+    let registry = lookup("CI_REGISTRY")?;
+    if server_key(&registry) != server {
+        return None;
+    }
+    let username = lookup("CI_REGISTRY_USER").filter(|v| !v.is_empty())?;
+    let password = lookup("CI_REGISTRY_PASSWORD").filter(|v| !v.is_empty())?;
+    Some(Credential::Basic(username, password))
 }
 
 impl Auth {
@@ -271,6 +292,33 @@ mod tests {
             Credential::Basic(u, p) => (u, p),
             _ => panic!("expected basic credentials"),
         }
+    }
+
+    #[test]
+    fn ci_credentials_are_exact_host_and_port_only() {
+        let lookup = |name: &str| match name {
+            "CI_REGISTRY" => Some("gitlab.example.test:4567".into()),
+            "CI_REGISTRY_USER" => Some("ci-user".into()),
+            "CI_REGISTRY_PASSWORD" => Some("ci-password".into()),
+            _ => None,
+        };
+        assert_eq!(
+            basic(ci_registry_credentials_from_lookup(
+                "gitlab.example.test:4567",
+                lookup
+            )),
+            ("ci-user".into(), "ci-password".into())
+        );
+        for host in [
+            "gitlab.example.test",
+            "other.example.test:4567",
+            "gitlab.example.test:4568",
+        ] {
+            assert!(ci_registry_credentials_from_lookup(host, lookup).is_none());
+        }
+        assert!(
+            ci_registry_credentials_from_lookup("gitlab.example.test:4567", |_| None).is_none()
+        );
     }
 
     #[test]

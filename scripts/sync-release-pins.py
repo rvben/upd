@@ -21,6 +21,10 @@ TARGETS = (
 )
 VERSION_RE = re.compile(r"^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$")
 SHA_RE = re.compile(r"^[0-9a-f]{64}$")
+IMAGE_RE = re.compile(r"^ghcr\.io/[a-z0-9_./-]+:v[0-9]+\.[0-9]+\.[0-9]+@sha256:[0-9a-f]{64}$")
+LEGACY_IMAGE = "debian:bookworm-slim@sha256:abd67ffcfa541b485a3dff59865ab629aa048a6c613e639d36e7456b0b229241"
+IMAGE_CONSUMERS = ("ci/gitlab-dependency-update.yml", "ci/gitlab-organization-update.yml")
+
 COMMIT_RE = re.compile(r"^[0-9a-f]{40}$")
 
 # Exact occurrence counts make replacement fail closed when a consumer changes
@@ -68,6 +72,9 @@ def validate_manifest(manifest: dict[str, Any]) -> None:
     release_commit = manifest.get("release_commit")
     if not isinstance(release_commit, str) or COMMIT_RE.fullmatch(release_commit) is None:
         raise PinError("manifest release_commit must be a lowercase full commit SHA")
+    image = manifest.get("image")
+    if image is not None and (not isinstance(image, str) or IMAGE_RE.fullmatch(image) is None or f":{version}@" not in image):
+        raise PinError("image must be a digest-pinned GHCR image matching the release version")
     assets = manifest.get("assets")
     if not isinstance(assets, dict) or set(assets) != set(TARGETS):
         raise PinError(f"manifest assets must contain exactly: {', '.join(TARGETS)}")
@@ -90,6 +97,10 @@ def version_key(version: str) -> tuple[int, int, int]:
 
 def verify_consumers(root: Path, manifest: dict[str, Any]) -> None:
     version = manifest["version"]
+    for relative in IMAGE_CONSUMERS:
+        content = (root / relative).read_text(encoding="utf-8")
+        if content.count(manifest.get("image", LEGACY_IMAGE)) != 1:
+            raise PinError(f"{relative}: expected exactly one pinned job image")
     for relative, expectations in CONSUMERS.items():
         path = root / relative
         try:
@@ -97,9 +108,10 @@ def verify_consumers(root: Path, manifest: dict[str, Any]) -> None:
         except OSError as error:
             raise PinError(f"cannot read consumer {path}: {error}") from error
         actual_versions = content.count(version)
-        if actual_versions != expectations["version"]:
+        expected_versions = expectations["version"] + int(relative in IMAGE_CONSUMERS and "image" in manifest)
+        if actual_versions != expected_versions:
             raise PinError(
-                f"{relative}: expected {expectations['version']} occurrences of {version}, "
+                f"{relative}: expected {expected_versions} occurrences of {version}, "
                 f"found {actual_versions}"
             )
         for target, expected_count in expectations["hashes"].items():
@@ -147,10 +159,14 @@ def sync_consumers(root: Path, old: dict[str, Any], new: dict[str, Any]) -> bool
     if new == old:
         return False
 
+    if "image" in old and "image" not in new:
+        raise PinError("a release cannot drop its published CI image")
     rendered: dict[Path, str] = {}
     for relative, expectations in CONSUMERS.items():
         path = root / relative
         content = path.read_text(encoding="utf-8")
+        if relative in IMAGE_CONSUMERS and "image" in new:
+            content = replace_exact(content, old.get("image", LEGACY_IMAGE), new["image"], 1, relative)
         content = replace_exact(
             content, old_version, new_version, expectations["version"], relative
         )
@@ -202,6 +218,11 @@ def manifest_from_artifacts(artifacts: Path, version: str, release_commit: str) 
         "release_commit": release_commit,
         "assets": assets,
     }
+    images = list(artifacts.rglob(f"upd-{version}-image.json"))
+    if images:
+        if len(images) != 1:
+            raise PinError("expected exactly one published image digest")
+        manifest["image"] = json.loads(images[0].read_text(encoding="utf-8"))["image"]
     validate_manifest(manifest)
     return manifest
 

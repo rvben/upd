@@ -1,0 +1,73 @@
+# Include in each project that regenerates its own lockfiles. The central org
+# job must use lock: false. Extend .upd-project-lock and supply the project's
+# toolchain image. See docs/gitlab.md#project-owned-lockfile-job.
+spec:
+  inputs:
+    stage:
+      default: test
+    branch:
+      default: automation/upd-dependencies
+    command:
+      description: Project-owned command to regenerate lockfiles
+      default: uv lock
+---
+.upd-project-lock:
+  stage: "$[[ inputs.stage ]]"
+  resource_group: upd-project-lock
+  interruptible: false
+  variables:
+    UPD_LOCK_COMMAND: "$[[ inputs.command ]]"
+    UPD_LOCK_BRANCH: "$[[ inputs.branch ]]"
+  rules:
+    - if: '$CI_COMMIT_MESSAGE == "chore(deps): refresh lockfiles for upd" || $CI_COMMIT_MESSAGE == "chore(deps): refresh lockfiles for upd\n"'
+      when: never
+    - if: '$CI_PIPELINE_SOURCE == "push" && $CI_COMMIT_BRANCH == $UPD_LOCK_BRANCH'
+    - when: never
+  script:
+    - |
+      bash <<'UPD_LOCK_JOB'
+      set -euo pipefail
+      if [ -n "${UPD_GITLAB_TOKEN:-}" ]; then
+        echo "Project lock jobs must not receive UPD_GITLAB_TOKEN; scope it to the central project's environment" >&2
+        exit 2
+      fi
+      : "${UPD_PROJECT_TOKEN:?Set a project access token with write_repository scope}"
+      git checkout --detach "$CI_COMMIT_SHA"
+      bash -euo pipefail -c "$UPD_LOCK_COMMAND"
+      # Only existing, regular lockfiles may be committed. Fail closed if the
+      # command also changes a manifest, adds files, deletes files or changes mode.
+      if [ -n "$(git ls-files --others --exclude-standard)" ]; then
+        echo "Lock command created untracked files; refusing to commit" >&2
+        exit 2
+      fi
+      while IFS= read -r -d '' path; do
+        case "${path##*/}" in
+          uv.lock|poetry.lock|Pipfile.lock|pdm.lock|package-lock.json|npm-shrinkwrap.json|yarn.lock|pnpm-lock.yaml|Cargo.lock|Gemfile.lock|go.sum|packages.lock.json|composer.lock|.terraform.lock.hcl) ;;
+          *) echo "Lock command changed a non-lockfile: $path" >&2; exit 2 ;;
+        esac
+        if [ ! -f "$path" ] || [ -L "$path" ]; then
+          echo "Lock command removed or replaced a lockfile" >&2; exit 2
+        fi
+        git add -- "$path"
+      done < <(git diff HEAD --name-only -z)
+      if git diff --cached --quiet; then exit 0; fi
+      if [ -n "$(git diff --cached --summary)" ]; then
+        echo "Lock command changed file modes; refusing to commit" >&2; exit 2
+      fi
+      git -c user.name='upd project CI' -c user.email='upd-project@noreply.invalid' \
+        -c core.hooksPath=/dev/null -c commit.gpgsign=false \
+        commit -m 'chore(deps): refresh lockfiles for upd'
+      askpass="$(mktemp)"
+      trap 'rm -f "$askpass"' EXIT
+      cat > "$askpass" <<'ASKPASS'
+      #!/bin/sh
+      case "$1" in
+        Username*) printf '%s\n' oauth2 ;;
+        *) printf '%s\n' "$UPD_PROJECT_TOKEN" ;;
+      esac
+      ASKPASS
+      chmod 700 "$askpass"
+      GIT_ASKPASS="$askpass" GIT_TERMINAL_PROMPT=0 git -c credential.helper= push \
+        --force-with-lease="refs/heads/$UPD_LOCK_BRANCH:$CI_COMMIT_SHA" \
+        "${CI_SERVER_URL}/${CI_PROJECT_PATH}.git" "HEAD:refs/heads/$UPD_LOCK_BRANCH"
+      UPD_LOCK_JOB

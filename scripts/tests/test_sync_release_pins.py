@@ -86,3 +86,19 @@ class ReleasePinSynchronizerTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+class ImagePinTest(ReleasePinSynchronizerTest):
+    def test_image_digest_updates_both_templates_across_two_releases(self) -> None:
+        old = PINS.load_manifest(self.root / "release-pins.json")
+        for patch in [1, 2]:
+            version = f"v99.0.{patch}"
+            shutil.rmtree(self.artifacts)
+            self.artifacts.mkdir()
+            self.create_artifacts(version)
+            (self.artifacts / f"upd-{version}-image.json").write_text(json.dumps({"image": f"ghcr.io/rvben/upd:{version}@sha256:" + str(patch) * 64}))
+            new = PINS.manifest_from_artifacts(self.artifacts, version, str(patch) * 40)
+            self.assertTrue(PINS.sync_consumers(self.root, old, new))
+            PINS.verify_consumers(self.root, new)
+            for relative in PINS.IMAGE_CONSUMERS:
+                self.assertIn(new["image"], (self.root / relative).read_text())
+            old = new

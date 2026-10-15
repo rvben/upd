@@ -188,6 +188,71 @@ impl Client {
         }
     }
 
+    /// All states preserve onboarding decisions and skip labels after closure.
+    pub async fn merge_request_history(&self, source: &str) -> Result<Vec<Value>, Error> {
+        let mut url = self.url(&self.merge_requests)?;
+        url.query_pairs_mut()
+            .append_pair("state", "all")
+            .append_pair("source_branch", source);
+        self.every_page(url, "merge request history").await
+    }
+
+    pub async fn branch_head(&self, project: u64, branch: &str) -> Result<String, Error> {
+        let url = self.url(&format!(
+            "{}/projects/{project}/repository/branches/{}",
+            self.api_url,
+            encode_segment(branch)
+        ))?;
+        let response = self.send(Method::GET, url, None).await?;
+        response["commit"]["id"]
+            .as_str()
+            .filter(|s| s.len() == 40 && s.bytes().all(|b| b.is_ascii_hexdigit()))
+            .map(str::to_owned)
+            .ok_or_else(|| Error::Refused("GitLab returned a branch without a commit SHA".into()))
+    }
+
+    pub async fn onboarding_commit(
+        &self,
+        project: u64,
+        branch: &str,
+        base: &str,
+        config: &str,
+        renovate: bool,
+    ) -> Result<(), Error> {
+        // Creating the ref separately fails if it already exists: the commits
+        // endpoint alone could append to a branch someone else created.
+        let branch_url = self.url(&format!(
+            "{}/projects/{project}/repository/branches",
+            self.api_url
+        ))?;
+        self.send(
+            Method::POST,
+            branch_url,
+            Some(&json!({"branch": branch, "ref": base})),
+        )
+        .await?;
+        let url = self.url(&format!(
+            "{}/projects/{project}/repository/commits",
+            self.api_url
+        ))?;
+        let mut actions =
+            vec![json!({"action": "create", "file_path": ".updrc.toml", "content": config})];
+        if renovate {
+            actions.push(json!({"action": "delete", "file_path": "renovate.json"}));
+        }
+        self.send(
+            Method::POST,
+            url,
+            Some(&json!({
+                "branch": branch,
+                "commit_message": "chore(deps): onboard upd dependency updates",
+                "actions": actions
+            })),
+        )
+        .await
+        .map(drop)
+    }
+
     pub async fn create(
         &self,
         source: &str,

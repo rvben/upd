@@ -72,6 +72,16 @@ pub struct OrgSettings {
     pub exclude: Vec<(String, GlobMatcher)>,
     pub updater: PathBuf,
     pub dry_run: bool,
+    /// Exact full paths selected by the operator; empty covers the group.
+    pub projects: Vec<String>,
+    /// Bypass missing consent only for an explicitly targeted dry run.
+    pub assume_opted_in: bool,
+    /// Trusted local preview policy, kept outside every project checkout.
+    pub preview_config: Option<PathBuf>,
+    /// Open opt-in invitations rather than dependency proposals.
+    pub onboard: bool,
+    /// Trusted central TOML content, with project policy applied on top.
+    pub shared_config: Option<String>,
     /// Projects the lock pipeline gave to their own prepare, lock and publish
     /// jobs; this run leaves them alone.
     pub handed_off: BTreeSet<u64>,
@@ -279,6 +289,11 @@ impl OrgSettings {
             exclude,
             updater,
             dry_run,
+            projects: Vec::new(),
+            assume_opted_in: false,
+            preview_config: None,
+            onboard: false,
+            shared_config: value("UPD_SHARED_CONFIG"),
             handed_off,
             shard,
         })
@@ -360,6 +375,9 @@ pub struct ProjectReport {
     pub id: u64,
     pub path: String,
     pub state: State,
+    /// Update counts and package diagnostics, including an incomplete lookup.
+    pub update_report: Option<Value>,
+    pub major_update_report: Option<Value>,
     /// The major lane's result; absent unless both the organization and the
     /// project enabled it.
     pub major: Option<Result<Outcome, Error>>,
@@ -433,8 +451,14 @@ impl State {
 impl ProjectReport {
     fn to_json(&self, branch: &str, major_branch: &str) -> Value {
         let mut value = json!({"id": self.id, "path": self.path, "state": self.state.name()});
+        if let Some(report) = &self.update_report {
+            value["update_report"] = report.clone();
+        }
         if let Some(major) = &self.major {
             value["major"] = run::major_lane_json(major, major_branch);
+            if let Some(report) = &self.major_update_report {
+                value["major"]["update_report"] = report.clone();
+            }
         }
         if let Some(remediation) = &self.remediation {
             value["security_remediation"] = remediation.to_json();
@@ -487,9 +511,13 @@ impl ProjectReport {
         };
         let major = match &self.major {
             Some(major) => format!(
-                "\n{}: major lane: {}",
+                "\n{}: major lane: {}{}",
                 self.path,
-                run::lane_text(major, major_branch)
+                run::lane_text(major, major_branch),
+                self.major_update_report
+                    .as_ref()
+                    .map(report_summary)
+                    .unwrap_or_default()
             ),
             None => String::new(),
         };
@@ -505,7 +533,15 @@ impl ProjectReport {
             }
             Some(Lockfiles::Regenerated) | None => String::new(),
         };
-        format!("{}: {detail}{remediation}{lockfiles}{major}", self.path)
+        let updates = self
+            .update_report
+            .as_ref()
+            .map(report_summary)
+            .unwrap_or_default();
+        format!(
+            "{}: {detail}{updates}{remediation}{lockfiles}{major}",
+            self.path
+        )
     }
 
     /// Whether the project needs someone's attention for the run to count
@@ -519,6 +555,7 @@ impl ProjectReport {
 /// Everything an organization run did, in project-id order.
 #[derive(Debug)]
 pub struct Report {
+    pub onboard: bool,
     pub group: String,
     pub branch: String,
     /// The major lane's branch; absent when the organization did not enable
@@ -570,7 +607,7 @@ impl Report {
             .map(|project| project.to_json(&self.branch, self.major_branch()))
             .collect();
         let mut value = json!({
-            "command": "gitlab org run",
+            "command": if self.onboard { "gitlab org onboard" } else { "gitlab org run" },
             "group": self.group,
             "branch": self.branch,
             "dry_run": self.dry_run,
@@ -628,12 +665,45 @@ impl Report {
 }
 
 pub async fn run(settings: &OrgSettings) -> Result<Report, Error> {
+    if settings.assume_opted_in && (!settings.dry_run || settings.projects.is_empty()) {
+        return Err(Error::Input(
+            "--assume-opted-in requires --dry-run and at least one --project".into(),
+        ));
+    }
+    if settings.preview_config.is_some() && !settings.assume_opted_in {
+        return Err(Error::Input(
+            "--config in organization mode requires --assume-opted-in".into(),
+        ));
+    }
+    if let Some(path) = &settings.preview_config {
+        UpdConfig::load_with_warnings(path).map_err(Error::Input)?;
+    }
     run::check_branch_name(&env::temp_dir(), &settings.branch).await?;
     if settings.major_mr {
         run::check_branch_name(&env::temp_dir(), &settings.major_branch).await?;
     }
     let api = Client::new(&settings.api_url, &settings.token)?;
     let listed = in_shard(settings, api.group_projects(&settings.group).await?);
+    for path in &settings.projects {
+        if !listed
+            .iter()
+            .any(|raw| raw["path_with_namespace"].as_str() == Some(path))
+        {
+            return Err(Error::Input(format!(
+                "selected project {path} was not found in this group/shard"
+            )));
+        }
+    }
+    let listed: Vec<_> = listed
+        .into_iter()
+        .filter(|raw| {
+            settings.projects.is_empty()
+                || settings
+                    .projects
+                    .iter()
+                    .any(|p| raw["path_with_namespace"].as_str() == Some(p))
+        })
+        .collect();
     eprintln!(
         "Found {} projects in {}{}; checking which opted in",
         listed.len(),
@@ -666,6 +736,7 @@ pub async fn run(settings: &OrgSettings) -> Result<Report, Error> {
     projects.sort_by_key(|project| project.id);
 
     Ok(Report {
+        onboard: settings.onboard,
         group: settings.group.clone(),
         branch: settings.branch.clone(),
         major_branch: settings.major_mr.then(|| settings.major_branch.clone()),
@@ -696,6 +767,8 @@ async fn handle(settings: &OrgSettings, api: &Client, raw: Value, log: &Log) -> 
         id,
         path: path.clone(),
         state: handled.state,
+        update_report: handled.update_report,
+        major_update_report: handled.major_update_report,
         major: handled.major,
         remediation: handled.remediation,
         lockfiles: handled.lockfiles,
@@ -707,7 +780,14 @@ async fn handle(settings: &OrgSettings, api: &Client, raw: Value, log: &Log) -> 
     if settings.handed_off.contains(&project.id) {
         return report(Handled::stopped(State::Skipped("handed_off")));
     }
-    match process(settings, api, &project, log).await {
+    let result = if settings.onboard {
+        super::onboard::project(settings, api, &project)
+            .await
+            .map(Handled::stopped)
+    } else {
+        process(settings, api, &project, log).await
+    };
+    match result {
         Ok(handled) => report(handled),
         Err(error) => report(Handled::stopped(State::Failed(error))),
     }
@@ -847,6 +927,8 @@ impl Consent {
 /// What processing a project left to report.
 struct Handled {
     state: State,
+    update_report: Option<Value>,
+    major_update_report: Option<Value>,
     /// The major lane's result, when the project consented to one. The
     /// major lane runs even when the ordinary lane failed.
     major: Option<Result<Outcome, Error>>,
@@ -861,6 +943,8 @@ impl Handled {
     fn stopped(state: State) -> Self {
         Self {
             state,
+            update_report: None,
+            major_update_report: None,
             major: None,
             remediation: None,
             lockfiles: None,
@@ -927,13 +1011,56 @@ pub(super) async fn open_project<'a>(
     // opted in. Anything else goes on to the clone, whose own copy of the
     // file decides: the API follows no symbolic link and answers with the
     // link's target path, so only the tree can say what is wrong with it.
-    if let Consent::No(reason) = api_consent(api, project).await? {
+    if let Consent::No(reason) = api_consent(api, project).await?
+        && !settings.assume_opted_in
+    {
         return Ok(Opened::Stopped(State::NotOptedIn(reason)));
     }
 
     let (work, dir) = empty_checkout().await?;
     let mut session = Session::open(settings.for_project(project, dir), log).await?;
-    match tree_consent(&session.git, &session.default_ref, log).await? {
+    let mut consent = tree_consent(&session.git, &session.default_ref, log).await?;
+    if settings.assume_opted_in && matches!(consent, Consent::No(_)) {
+        // The preview policy lives outside the checkout, so it cannot become a proposed edit.
+        let path = work.path().join("preview.toml");
+        let content = match &settings.preview_config {
+            Some(path) => std::fs::read_to_string(path)
+                .map_err(|e| Error::Input(format!("cannot read preview config: {e}")))?,
+            None => {
+                let mut content = String::new();
+                for name in CONFIG_FILE_NAMES {
+                    if !session
+                        .git
+                        .read(["ls-tree", "-z", &session.default_ref, "--", name])
+                        .await?
+                        .is_empty()
+                    {
+                        content = session
+                            .git
+                            .read(["show", &format!("{}:{name}", session.default_ref)])
+                            .await?;
+                        break;
+                    }
+                }
+                content
+            }
+        };
+        let (config, warnings) =
+            UpdConfig::parse_for_automation(&content, "preview config").map_err(Error::Input)?;
+        for warning in warnings {
+            log.line(warning);
+        }
+        std::fs::write(&path, content).map_err(|e| Error::Io(e.to_string()))?;
+        consent = Consent::Yes {
+            config: path.to_string_lossy().into_owned(),
+            auto_merge: false,
+            major_mr: config.automation.major_mr == Some(true),
+            security_remediation: config.automation.security_remediation == Some(true),
+            lock: false,
+            lock_build: false,
+        };
+    }
+    match consent {
         Consent::No(reason) => Ok(Opened::Stopped(State::NotOptedIn(reason))),
         Consent::Invalid { config, message } => {
             Ok(Opened::Stopped(State::ConfigInvalid { config, message }))
@@ -976,7 +1103,51 @@ pub(super) async fn open_project<'a>(
             } else {
                 None
             };
-            session.settings.config = Some(PathBuf::from(config));
+            session.settings.config = Some(PathBuf::from(&config));
+            let mut skips = BTreeSet::new();
+            for branch in [&settings.branch, &settings.major_branch] {
+                // Each lane has an independent set of skip labels; their union
+                // also keeps security remediation from reintroducing a skip.
+                for mr in api
+                    .for_project(project.id)
+                    .merge_request_history(branch)
+                    .await?
+                {
+                    if let Some(labels) = mr["labels"].as_array() {
+                        for label in labels.iter().filter_map(Value::as_str) {
+                            if let Some(package) = label.strip_prefix("upd:skip:") {
+                                if package.is_empty() || package.chars().any(char::is_whitespace) {
+                                    return Err(Error::Input(format!(
+                                        "invalid skip label {label}"
+                                    )));
+                                }
+                                skips.insert(package.to_owned());
+                            }
+                        }
+                    }
+                }
+            }
+            if settings.shared_config.is_some() || !skips.is_empty() {
+                let content = if PathBuf::from(&config).is_absolute() {
+                    std::fs::read_to_string(&config).map_err(|e| Error::Io(e.to_string()))?
+                } else {
+                    session
+                        .git
+                        .read(["show", &format!("{}:{config}", session.default_ref)])
+                        .await?
+                };
+                let effective =
+                    effective_policy(settings.shared_config.as_deref(), &content, &skips)?;
+                let path = work.path().join("effective.toml");
+                std::fs::write(&path, effective).map_err(|e| Error::Io(e.to_string()))?;
+                session.settings.config = Some(path);
+                if !skips.is_empty() {
+                    log.line(format!(
+                        "MR skip labels: {}",
+                        skips.into_iter().collect::<Vec<_>>().join(", ")
+                    ));
+                }
+            }
             Ok(Opened::Consented(Box::new(Consented {
                 session,
                 remediation,
@@ -1023,20 +1194,142 @@ async fn process(
     // The major lane reads the same configuration and consent the ordinary
     // lane was given, from the same checkout.
     let major = session.settings.major_lane();
+    let report_path = session.settings.project_dir.join(".upd-ci/upd-report.json");
     let state = match session.propose().await {
         Ok(proposal) => State::Processed(proposal.outcome),
         Err(error) => State::Failed(error),
     };
+    let update_report = std::fs::read(&report_path)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok());
+    if major.is_some() {
+        let _ = std::fs::remove_file(&report_path);
+    }
     let major = match major {
         Some(major) => Some(run::propose_major(major, log).await),
         None => None,
     };
+    let major_update_report = major
+        .as_ref()
+        .and_then(|_| std::fs::read(&report_path).ok())
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok());
     Ok(Handled {
         state,
+        update_report,
+        major_update_report,
         major,
         remediation: Some(remediation),
         lockfiles,
     })
+}
+
+/// Shared arrays are additive; project scalar/table leaves override the base.
+/// Consent is read separately from the project's own default-branch file.
+fn effective_policy(
+    base: Option<&str>,
+    project: &str,
+    skips: &BTreeSet<String>,
+) -> Result<String, Error> {
+    fn merge(base: &mut toml::Value, project: toml::Value) {
+        match (base, project) {
+            (toml::Value::Table(base), toml::Value::Table(project)) => {
+                for (key, value) in project {
+                    if let Some(old) = base.get_mut(&key) {
+                        merge(old, value);
+                    } else {
+                        base.insert(key, value);
+                    }
+                }
+            }
+            (toml::Value::Array(base), toml::Value::Array(project)) => {
+                for item in project {
+                    if !base.contains(&item) {
+                        base.push(item);
+                    }
+                }
+            }
+            (base, project) => *base = project,
+        }
+    }
+    let base = base.unwrap_or("");
+    let (_, warnings) =
+        UpdConfig::parse_for_automation(base, "UPD_SHARED_CONFIG").map_err(Error::Input)?;
+    if !warnings.is_empty() {
+        return Err(Error::Input(warnings.join("; ")));
+    }
+    let mut value: toml::Value = toml::from_str(base).map_err(|e| Error::Input(e.to_string()))?;
+    merge(
+        &mut value,
+        toml::from_str(project).map_err(|e| Error::Input(e.to_string()))?,
+    );
+    let ignore = value
+        .as_table_mut()
+        .unwrap()
+        .entry("ignore")
+        .or_insert_with(|| toml::Value::Array(Vec::new()))
+        .as_array_mut()
+        .ok_or_else(|| Error::Input("ignore must be an array".into()))?;
+    for package in skips {
+        ignore.push(toml::Value::String(package.clone()));
+    }
+    toml::to_string_pretty(&value).map_err(|e| Error::Io(e.to_string()))
+}
+
+/// Keep counts and actual package failures together so an incomplete lookup is
+/// never presented as an up-to-date project.
+fn report_summary(report: &Value) -> String {
+    let number = |key| report["summary"][key].as_u64().unwrap_or(0);
+    let mut line = format!(
+        " [updates: {}, held back: {}, ignored: {}, warnings: {}, errors: {}]",
+        number("updates_total"),
+        number("held_back"),
+        number("ignored"),
+        number("warnings"),
+        number("errors")
+    );
+    if let Some(files) = report["files"].as_array() {
+        let clean = |text: &str| {
+            text.chars()
+                .filter(|c| !c.is_control())
+                .take(300)
+                .collect::<String>()
+        };
+        for key in ["held_back", "ignored", "skipped_by_cooldown"] {
+            let names: BTreeSet<_> = files
+                .iter()
+                .filter_map(|file| file[key].as_array())
+                .flatten()
+                .filter_map(|entry| entry["package"].as_str())
+                .collect();
+            if !names.is_empty() {
+                let shown: Vec<_> = names.iter().take(12).map(|name| clean(name)).collect();
+                line.push_str(&format!(
+                    "; {key}: {}{}",
+                    shown.join(", "),
+                    if names.len() > shown.len() {
+                        format!(" (+{} more)", names.len() - shown.len())
+                    } else {
+                        String::new()
+                    }
+                ));
+            }
+        }
+        for file in files {
+            for key in ["errors", "warnings"] {
+                if let Some(messages) = file[key].as_array() {
+                    for message in messages {
+                        let text = message
+                            .as_str()
+                            .or_else(|| message["message"].as_str())
+                            .map(str::to_owned)
+                            .unwrap_or_else(|| message.to_string());
+                        line.push_str(&format!("; {key}: {}", clean(&text)));
+                    }
+                }
+            }
+        }
+    }
+    line
 }
 
 /// Whether the tree at `default_ref` tracks a file named as a lockfile of

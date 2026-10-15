@@ -226,6 +226,21 @@ impl Org {
                 .await;
         }
         for id in self.remotes.keys() {
+            let head = isolated::command("git")
+                .arg(format!("--git-dir={}", self.remotes[id].display()))
+                .args(["rev-parse", "refs/heads/main"])
+                .output()
+                .unwrap();
+            let sha = String::from_utf8(head.stdout).unwrap().trim().to_owned();
+            Mock::given(method("GET"))
+                .and(path(format!(
+                    "/api/v4/projects/{id}/repository/branches/main"
+                )))
+                .respond_with(
+                    ResponseTemplate::new(200).set_body_json(json!({"commit":{"id":sha}})),
+                )
+                .mount(&self.server)
+                .await;
             let merge_requests = format!("/api/v4/projects/{id}/merge_requests");
             Mock::given(method("GET"))
                 .and(path(merge_requests.as_str()))
@@ -2386,7 +2401,13 @@ async fn a_lock_run_leaves_handed_off_and_newly_consenting_projects_to_lock_jobs
     for (id, path) in [(74, "acme/handed"), (75, "acme/newly")] {
         assert_eq!(org.updater_args(path), None, "{path} was updated");
         assert_eq!(org.branch_file(id), None, "{path} got a branch");
-        assert!(org.merge_request_calls(id).await.is_empty(), "{path}");
+        assert!(
+            org.merge_request_calls(id)
+                .await
+                .iter()
+                .all(|call| call.starts_with("GET ")),
+            "{path}"
+        );
     }
     let unlocked = project(&report, "acme/unlocked");
     assert_eq!(unlocked["state"], "processed", "{report:#}");
@@ -3344,4 +3365,199 @@ async fn the_child_runs_with_the_planned_settings_whatever_the_project_variables
         "{report:#}"
     );
     assert!(org.file_on(82, BRANCH, "pyproject.toml").is_some());
+}
+
+#[tokio::test]
+async fn selected_unconsented_projects_can_be_previewed_without_publishing() {
+    let mut org = Org::new().await;
+    org.project(11, "acme/preview", &[]);
+    org.project(12, "acme/other", &[Entry::File(".updrc.toml", OPTED_IN)]);
+    org.serve().await;
+    let (code, report, stderr) = org.run(
+        &[],
+        &[
+            "--dry-run",
+            "--project",
+            "acme/preview",
+            "--assume-opted-in",
+        ],
+    );
+    assert_eq!(code, 0, "{stderr}");
+    assert_eq!(report["projects"].as_array().unwrap().len(), 1);
+    assert_eq!(report["projects"][0]["outcome"], "would_publish");
+    assert_eq!(
+        report["projects"][0]["update_report"]["summary"]["updates_total"],
+        1
+    );
+    assert!(org.updater_args("acme/other").is_none());
+    assert!(org.branch_file(11).is_none());
+    assert!(
+        org.merge_request_calls(11)
+            .await
+            .iter()
+            .all(|call| call.starts_with("GET "))
+    );
+    assert!(stderr.contains("updates: 1"));
+}
+
+#[tokio::test]
+async fn assume_opted_in_requires_a_targeted_dry_run() {
+    let org = Org::new().await;
+    for args in [
+        vec!["--assume-opted-in"],
+        vec!["--assume-opted-in", "--project", "acme/app"],
+        vec!["--assume-opted-in", "--dry-run"],
+    ] {
+        let output = org
+            .command(env!("CARGO_BIN_EXE_upd"), &[])
+            .args(["gitlab", "org", "run"])
+            .args(args)
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(4));
+        assert!(String::from_utf8_lossy(&output.stderr).contains("requires --dry-run"));
+    }
+}
+
+#[tokio::test]
+async fn onboarding_preserves_migrated_policy_and_never_reopens_a_closed_invitation() {
+    use wiremock::matchers::body_partial_json;
+    let mut org = Org::new().await;
+    org.project(
+        11,
+        "acme/new",
+        &[Entry::File(
+            "renovate.json",
+            r#"{"packageRules":[{"matchPackageNames":["numpy"],"enabled":false}]}"#,
+        )],
+    );
+    org.project(12, "acme/declined", &[]);
+    org.serve().await;
+    Mock::given(method("GET"))
+        .and(path("/api/v4/projects/12/merge_requests"))
+        .and(query_param("state", "all"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(
+                json!([{"state":"closed","web_url":"https://example.test/declined"}]),
+            ),
+        )
+        .with_priority(1)
+        .mount(&org.server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/api/v4/projects/11/repository/branches"))
+        .respond_with(ResponseTemplate::new(201).set_body_json(json!({})))
+        .expect(1)
+        .mount(&org.server)
+        .await;
+    Mock::given(method("POST")).and(path("/api/v4/projects/11/repository/commits"))
+        .and(body_partial_json(json!({"branch":"automation/upd-onboarding","actions":[
+            {"action":"create","file_path":".updrc.toml","content":"ignore = [\"numpy\"]\n\n[automation]\ndependency_updates = true\n"},
+            {"action":"delete","file_path":"renovate.json"}
+        ]})))
+        .respond_with(ResponseTemplate::new(201).set_body_json(json!({"id":"commit"}))).expect(1).mount(&org.server).await;
+    let output = org
+        .command(env!("CARGO_BIN_EXE_upd"), &[])
+        .args(["gitlab", "org", "onboard", "--output", "json"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["projects"][0]["reason"], "invitation opened");
+    assert_eq!(report["projects"][1]["reason"], "invitation already closed");
+    assert!(
+        org.merge_request_calls(12)
+            .await
+            .iter()
+            .all(|call| call.starts_with("GET "))
+    );
+    assert!(org.updater_args("acme/new").is_none());
+}
+
+#[tokio::test]
+async fn unresolved_packages_survive_in_the_org_report_and_final_summary() {
+    let mut org = Org::with_updater(r#"#!/bin/sh
+printf '%s\n' '{"files":[{"path":"pyproject.toml","errors":[{"message":"internal-library: index authentication failed"}],"warnings":[]}],"summary":{"errors":1,"updates_total":0}}'
+exit 2
+"#).await;
+    org.project(11, "acme/private", &[Entry::File(".updrc.toml", OPTED_IN)]);
+    org.serve().await;
+    let (code, report, stderr) = org.run(&[], &["--dry-run"]);
+    assert_eq!(code, 2);
+    assert_eq!(report["projects"][0]["state"], "failed");
+    assert_eq!(
+        report["projects"][0]["update_report"]["summary"]["errors"],
+        1
+    );
+    assert!(stderr.contains("internal-library: index authentication failed"));
+}
+
+#[tokio::test]
+async fn shared_settings_and_mr_skip_labels_reach_the_updater_without_changing_project_config() {
+    let script = FAKE_UPDATER.replace(
+        "name=\"$(cat project.txt)\"",
+        r#"name="$(cat project.txt)"
+previous=""
+for argument in "$@"; do
+  if [ "$previous" = --config ]; then cp "$argument" "$FAKE_LOG/$name.policy"; fi
+  previous="$argument"
+done"#,
+    );
+    let mut org = Org::with_updater(&script).await;
+    org.project(11, "acme/policy", &[Entry::File(".updrc.toml", "ignore = [\"numpy\"]\n[cooldown]\ndefault = \"14d\"\n[automation]\ndependency_updates = true\n")]);
+    org.serve().await;
+    let (code, _, stderr) = org.run(&[], &[]);
+    assert_eq!(code, 0, "{stderr}");
+    Mock::given(method("GET")).and(path("/api/v4/projects/11/merge_requests"))
+        .and(query_param("source_branch", BRANCH))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([{"iid":11,"web_url":"https://example.test/mr","labels":["upd:skip:example-sdk"]}])))
+        .with_priority(1)
+        .mount(&org.server).await;
+    let (code, _, stderr) = org.run(&[("UPD_SHARED_CONFIG", "ignore = [\"example-deployer\"]\n[cooldown]\ndefault = \"7d\"\n[automation]\nauto_merge = true\n")], &["--dry-run"]);
+    assert_eq!(code, 0, "{stderr}");
+    let content = fs::read_to_string(org.log.join("acme-policy.policy")).unwrap();
+    let (config, _) = upd::config::UpdConfig::parse_for_automation(&content, "test").unwrap();
+    assert_eq!(config.ignore, ["example-deployer", "numpy", "example-sdk"]);
+    assert_eq!(config.cooldown.unwrap().default.as_deref(), Some("14d"));
+    assert_eq!(org.branch_file(11).as_deref(), Some("new\n"));
+}
+
+#[tokio::test]
+async fn shared_policy_is_sealed_into_work_and_needs_no_central_file_in_the_worker() {
+    let (mut org, toolbox) = Org::locking().await;
+    uv_project(&mut org, 81, "acme/shared-lock", LOCK_OPTED_IN, "uv");
+    org.serve().await;
+    let (code, report, stderr) = org.job(
+        "prepare",
+        81,
+        "ordinary",
+        &[("UPD_SHARED_CONFIG", "ignore = [\"numpy\"]\n")],
+    );
+    assert_eq!(code, 0, "{report}\n{stderr}");
+    assert_eq!(report["step"], "locking");
+    let work: Value =
+        serde_json::from_slice(&fs::read(org.job_dir(81, "ordinary").join("work.json")).unwrap())
+            .unwrap();
+    assert!(work["plan"]["config"].is_null());
+    assert!(
+        work["plan"]["config_content"]
+            .as_str()
+            .unwrap()
+            .contains("numpy")
+    );
+    let (code, report, stderr) =
+        org.lock_worker(81, "ordinary", &[&toolbox.lock_tools, &toolbox.base]);
+    assert_eq!(code, 0, "{report}\n{stderr}");
+    assert_eq!(report["step"], "locked");
+    let (code, report, stderr) = org.publish(81, "ordinary");
+    assert_eq!(code, 0, "{report}\n{stderr}");
+    assert!(
+        org.file_on(81, BRANCH, "uv.lock")
+            .unwrap()
+            .contains("1.1.0")
+    );
 }

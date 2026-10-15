@@ -8,6 +8,7 @@
 
 mod api;
 mod git;
+mod onboard;
 pub mod org;
 mod patch;
 pub mod plan;

@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Conservative Renovate migration and GitLab organization onboarding, with persistent declined invitations and manual review for unsupported settings.
+- Targeted organization dry-run previews before project opt-in, central shared policy, temporary package skips through MR labels, and readable per-project diagnostics.
+- A project-owned lockfile CI template using a project-scoped token, alongside the existing isolated lock runners.
+- Named uv index credentials and GitLab CI registry credential fallback scoped to the instance registry.
+- Release automation for multi-platform CI images and verified image digest pins in GitLab templates after publication.
+
+### Fixed
+
+- Stop private Python index authentication and request failures from silently falling through to a public index.
+
 ## [0.16.0](https://github.com/rvben/upd/compare/v0.15.1...v0.16.0) - 2026-10-06
 
 ### Added

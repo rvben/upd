@@ -392,12 +392,36 @@ fn build_schema() -> Value {
                 ]
             },
             {
+                "name": "migrate renovate",
+                "description": "Conservatively translate Renovate JSON to .updrc.toml. Reports every unsupported rule; preserves the source and refuses existing upd policy. --dry-run previews without writing.",
+                "effects": "non_idempotent",
+                "mutating": true,
+                "cardinality": "single",
+                "args": [{"name": "path", "type": "path", "required": false, "default": "."}],
+                "output_fields": [
+                    {"name": "config", "type": "string", "description": "Translated TOML policy"},
+                    {"name": "warnings", "type": "array", "items": {"type": "string"}, "description": "Rules and settings requiring manual translation"}
+                ]
+            },
+            {
+                "name": "gitlab org onboard",
+                "description": "Open one opt-in invitation per group project without upd config. Migrates supported Renovate JSON and refuses untranslated policy. Closed/merged invitations stay closed; existing branches are never overwritten. --dry-run previews without external writes.",
+                "effects": "non_idempotent",
+                "mutating": true,
+                "cardinality": "single",
+                "args": [{"name": "project", "type": "string[]", "required": false, "description": "Full project paths; repeatable"}],
+                "output_fields": [{"name": "projects", "type": "array", "items": {"type": "object"}, "description": "Per-project onboarding outcomes, MR links and failures"}]
+            },
+            {
                 "name": "gitlab org run",
                 "description": "Run the GitLab dependency update for every project in a group that opted in, from one central CI job. Lists the group's projects (subgroups included), skips (with reason) the central project itself, projects matching UPD_EXCLUDE, and archived, pending-deletion, empty, repository-disabled and branchless projects, and processes a project only when the configuration file on its default branch commit sets [automation] dependency_updates = true; each such project then gets the same rolling branch and merge request as gitlab run. Auto-merge is enabled only when both UPD_AUTO_MERGE and the project's [automation] auto_merge allow it. The ecosystem nix is always left out, and cannot be selected through UPD_LANGS. Configured by the environment: requires UPD_GITLAB_TOKEN, CI_SERVER_URL and UPD_GROUP; reads CI_API_V4_URL, CI_PROJECT_ID (the central project, which is skipped), UPD_EXCLUDE (space-separated path globs), UPD_LANGS, UPD_MIN_AGE (a floor under each project's configured cooldown), UPD_MAX_BUMP, UPD_BRANCH, UPD_COMMIT_MESSAGE, UPD_GIT_NAME, UPD_GIT_EMAIL, UPD_AUTO_MERGE, UPD_MAJOR_MR, UPD_MAJOR_BRANCH, UPD_MAJOR_COMMIT_MESSAGE, UPD_CONCURRENCY (1 to 16, default 4), UPD_SHARD (k/n: only the projects whose id modulo n is k-1, so n jobs with shards 1/n to n/n cover the group once) and UPD_LOCK_HANDED_OFF (comma-separated ids the lock pipeline gave to their own jobs, skipped with reason handed_off; set by gitlab org plan's child pipeline and needs UPD_LOCK=true). A project gets the gitlab run major lane only when both UPD_MAJOR_MR and the project's [automation] major_mr allow it; the lane runs even when the project's ordinary lane failed. The token is never passed to the updater. A project that fails is reported and the others still run; the command then exits 2. With --dry-run nothing is pushed and nothing is written to GitLab. Progress goes to stderr, and in JSON mode a one-line summary is written to stderr before the report",
                 "effects": "non_idempotent",
                 "mutating": true,
                 "cardinality": "single",
-                "args": [],
+                "args": [
+                    {"name": "project", "type": "string[]", "required": false, "description": "Only these exact full project paths; repeatable"},
+                    {"name": "assume-opted-in", "type": "boolean", "description": "Requires --dry-run and --project; preview without consent. --config may supply the preview policy."}
+                ],
                 "output_fields": [
                     {"name": "command", "type": "string", "description": "Always \"gitlab org run\""},
                     {"name": "group", "type": "string", "description": "The group that was listed"},

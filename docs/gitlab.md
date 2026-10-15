@@ -712,3 +712,198 @@ outcome in its own log.
 This integration intentionally produces one policy-constrained rolling merge
 request, plus the optional major-upgrade merge request. It does not provide Renovate-style per-package branches, dependency
 dashboards, reviewer assignment, conflict resolution, or automatic rebasing.
+
+## Migrating and onboarding
+
+Start with a local migration:
+
+```sh
+upd migrate renovate /path/to/project --dry-run --output text
+upd migrate renovate /path/to/project
+```
+
+This writes `.updrc.toml` beside `renovate.json`, refuses existing upd configs,
+and leaves Renovate's file in place for review. Unconditional
+`packageRules` with `enabled: false` and exact `matchPackageNames` become
+`ignore`; top-level boolean `automerge` becomes `[automation] auto_merge`, and
+`lockFileMaintenance.enabled` becomes `[automation] lock`. Patterns,
+conditional rules, inherited presets, JSON5 and other settings require manual
+review. Every unsupported rule or setting is reported. Migration alone does
+not opt a repository in.
+
+With the organization environment configured, preview onboarding first:
+
+```sh
+upd gitlab org onboard --project my-org/example --dry-run --output text
+upd gitlab org onboard --project my-org/example
+```
+
+Omit `--project` to consider the whole group. Onboarding opens
+`automation/upd-onboarding` with an opt-in config, removing `renovate.json`
+only when all its settings translated. Existing upd configs are left for
+manual review. Any unsupported Renovate rule blocks that project's invitation
+and appears in its report. Merge the invitation to opt in, or close it to
+decline: closed and merged invitations are never reopened. The check includes
+all MR states and pages. Project code never runs during onboarding.
+
+Onboarding reads one default-branch commit and creates a new branch from that
+exact commit. It refuses an existing onboarding branch. If an API failure
+interrupts the operation after branch creation but before MR creation, inspect
+that branch and open its MR manually; upd does not overwrite it on retry.
+
+## Preview before opting in
+
+```sh
+upd gitlab org run --project my-org/application --project my-org/common \
+  --assume-opted-in --dry-run --config ./preview.toml --output text
+```
+
+`--project` is repeatable and matches full paths exactly. An unknown project
+fails the run instead of silently widening its scope. `--assume-opted-in`
+requires both `--dry-run` and at least one project. It previews projects whose
+root config is absent or has not opted in. A malformed config still fails.
+`--config` supplies the preview policy for those projects; existing opt-ins
+retain their own policy. No opt-in file is committed, branch pushed, or MR
+written during the preview.
+
+## Project-owned lockfile job
+
+Groups without reserved lock runners can keep the central job in manifest-only
+mode (`lock: false`) and include `ci/gitlab-project-lock.yml` in each project.
+The lock job runs under that project's CI configuration, with its toolchain
+and a project access token. It never receives the central group token.
+
+```yaml
+include:
+  - project: infrastructure/upd-mirror
+    ref: '<reviewed-upd-commit>'
+    file: /ci/gitlab-project-lock.yml
+    inputs:
+      command: uv lock
+
+upd-project-lock:
+  extends: .upd-project-lock
+  image: '<your-project-toolchain-image>@sha256:<digest>'
+```
+
+The image needs Bash, Git and the project's lock tools. Set masked
+`UPD_PROJECT_TOKEN` to a **project** access token with `write_repository` scope
+and permission to push the automation branch. Scope the central
+`UPD_GITLAB_TOKEN` variable to its central environment, not to every project:
+the lock job refuses it. See GitLab's
+[project access token documentation](https://docs.gitlab.com/user/project/settings/project_access_tokens/).
+
+The template runs on push pipelines for `automation/upd-dependencies` and
+serializes lock jobs. Ensure the project's `workflow: rules` permits these
+branch pipelines. Configure required tests to run again on the lock commit,
+and require a successful pipeline before merging. Do not skip CI on the lock
+push. A project token push starts that new pipeline; unlike
+[job-token pushes](https://docs.gitlab.com/ci/jobs/ci_job_token/), it does not
+suppress pipeline creation. The lock job itself skips its own follow-up commit
+to avoid a loop. The push uses the original commit as a lease, so a concurrent
+central update cannot be overwritten.
+
+Only modifications to existing regular lockfiles can be committed. Unexpected
+manifest edits, file additions, deletions and mode changes fail the job.
+upd recognizes exactly one `chore(deps): refresh lockfiles for upd` commit on
+its generated manifest commit as project CI work. Other commits still pause
+the rolling branch. For a major lane, add a second job extending `.upd-project-lock` and override
+its `UPD_LOCK_BRANCH` variable with the major branch (or keep majors manual). This alternative does not require Maintainer
+access to the central project or dedicated runners.
+
+## Private indexes and registry credentials
+
+Organization updates use each checked-out project's `pyproject.toml`, including
+`[[tool.uv.index]]`, explicit/default indexes and `[tool.uv.sources]` index
+pins. They do not inherit a developer workstation's pip configuration. Supply
+credentials in the **central job's** CI environment, for example:
+
+```toml
+[[tool.uv.index]]
+name = "internal-proxy"
+url = "https://packages.example.test/simple"
+explicit = true
+
+[tool.uv.sources]
+internal-library = { index = "internal-proxy" }
+```
+
+Set masked `UV_INDEX_INTERNAL_PROXY_USERNAME` and
+`UV_INDEX_INTERNAL_PROXY_PASSWORD`. The index name is uppercased and its
+non-alphanumeric characters become underscores, following
+[uv's credential variable convention](https://docs.astral.sh/uv/concepts/indexes/).
+These named credentials apply only to that index. Existing URL, netrc and
+global index credential configuration remains supported. For isolated lock
+mode, provide the index credentials separately to its lock jobs as well;
+project-owned lock jobs use their own project's variables.
+
+A failed or unauthorized package lookup is an error, not evidence that a
+package is current. The org report retains the updater's package diagnostics
+and counts under `projects[].update_report`, even when the updater exits with
+an error. The final job summary includes those failures next to the project.
+The project fails and upd does not publish a partial update.
+
+Docker credentials normally come from `DOCKER_CONFIG/config.json` or
+`~/.docker/config.json`, including configured credential helpers. When that
+file is absent, upd uses `CI_REGISTRY_USER` / `CI_REGISTRY_PASSWORD` only for
+the exact `CI_REGISTRY` authority, including its port. It never sends those
+credentials to other registries or assumes the group API token grants
+registry access. GitLab's built-in registry credentials may only have access
+to the running project's registry; for other private projects, supply a Docker
+config with the needed registry scope. Registry lookup failures likewise
+appear as unchecked errors, not an up-to-date result.
+
+## Shared organization policy and temporary skips
+
+Keep common settings in the central checkout and pass their TOML content as
+`UPD_SHARED_CONFIG`, for example in the central job before invoking upd:
+
+```sh
+export UPD_SHARED_CONFIG="$(cat policy/upd.toml)"
+upd gitlab org run --output json > .upd-ci/upd-org-report.json
+```
+
+This deliberately uses a trusted central file rather than following arbitrary
+URLs supplied by projects. Project scalar and table values override the base;
+arrays such as `ignore` are combined without duplicates. Common ignores thus
+remain in force while projects can add their own, and project cooldowns can
+override the shared value (subject to `UPD_MIN_AGE`). Only each project's own
+root file can grant automation consent. A shared `[automation]` table cannot
+opt projects in or enable auto-merge, major MRs or lock execution for them.
+Lock mode forwards the shared settings to preparation and seals the effective
+policy into the work sent to the token-free worker.
+
+To temporarily omit a package, add `upd:skip:<package>` to an open rolling MR,
+for example `upd:skip:numpy`. The next run adds that exact package to its
+effective ignores, including security remediation, and rebuilds from the
+default branch. Labels on the ordinary and major MRs apply to both lanes.
+Remove the label to consider the package again. No default-branch config
+commit is needed. If the MR becomes empty it can be closed as obsolete;
+upd also reads labels on closed MRs for those branches, so the package stays
+skipped until the label is removed from that MR. Use `ignore` for durable
+exclusions.
+
+## CI images and readable reports
+
+The release workflow builds Linux amd64 and arm64 job images containing upd,
+Git, curl, CA certificates, Bash, coreutils and tar. It publishes the
+multi-platform `ghcr.io/rvben/upd:<release-tag>` image and attaches
+`upd-<release-tag>-image.json` with the exact digest to the release. The release
+pin synchronizer records that digest in `release-pins.json` and switches both
+CI templates to it. Templates use the matching embedded upd binary without a
+runtime download. Custom images without that version retain checksum-verified
+archive installation.
+
+The current defaults remain on the existing base image until the first image
+has actually been published and its digest verified; no digest is invented
+for an unpublished image. Mirror a published image with
+`docker pull <release-image>@sha256:<digest>`, tag it for your internal
+registry, then `docker push <mirror-tag>`. For both architectures, use a
+registry tool that copies the complete manifest list. Pin the mirror's digest
+in the template's `image` input.
+
+The final job log now repeats a per-project summary even with JSON output:
+outcome, MR URL when present, update/held-back/ignored counts, warnings and
+errors. The JSON artifact remains the complete machine-readable record. A
+central dashboard issue is optional future work; this implementation writes
+no issue.

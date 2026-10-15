@@ -1697,6 +1697,22 @@ async fn run() -> Result<()> {
     }
 
     // Annotation inputs are validated before any optional registry construction.
+    if let Some(Command::Migrate {
+        command: upd::cli::MigrateCommand::Renovate { path },
+    }) = &cli.command
+    {
+        let migration = upd::migrate::migrate_path(path, cli.dry_run)?;
+        for warning in &migration.warnings {
+            eprintln!("warning: {warning}");
+        }
+        if effective_json_mode(&cli) {
+            println!("{}", serde_json::to_string_pretty(&migration)?);
+        } else {
+            print!("{}", migration.config);
+        }
+        return Ok(());
+    }
+
     if let Some(Command::Annotations { command }) = &cli.command {
         let code = run_annotations(&cli, command).await?;
         if code != 0 {
@@ -1820,7 +1836,13 @@ async fn run() -> Result<()> {
         Some(Command::Gitlab {
             command: upd::cli::GitlabCommand::Org { command },
         }) => match command {
-            upd::cli::GitlabOrgCommand::Run => run_gitlab_org(&cli).await?,
+            upd::cli::GitlabOrgCommand::Run {
+                projects,
+                assume_opted_in,
+            } => run_gitlab_org(&cli, projects, *assume_opted_in, false).await?,
+            upd::cli::GitlabOrgCommand::Onboard { projects } => {
+                run_gitlab_org(&cli, projects, false, true).await?
+            }
             upd::cli::GitlabOrgCommand::Plan => run_gitlab_org_plan(&cli).await?,
             step => run_gitlab_org_step(&cli, step).await?,
         },
@@ -1828,7 +1850,9 @@ async fn run() -> Result<()> {
             // Already handled above before show_config check.
             unreachable!("Schema handled earlier");
         }
-        Some(Command::Annotations { .. }) => unreachable!("handled before registry setup"),
+        Some(Command::Migrate { .. }) | Some(Command::Annotations { .. }) => {
+            unreachable!("handled before registry setup")
+        }
         Some(Command::Capabilities) => {
             unreachable!("Capabilities handled earlier");
         }
@@ -1925,7 +1949,7 @@ async fn run_gitlab_org_step(cli: &Cli, command: &upd::cli::GitlabOrgCommand) ->
             ));
         }
         match command {
-            GitlabOrgCommand::Run | GitlabOrgCommand::Plan => {
+            GitlabOrgCommand::Run { .. } | GitlabOrgCommand::Onboard { .. } | GitlabOrgCommand::Plan => {
                 unreachable!("gitlab org run and plan are dispatched separately")
             }
             GitlabOrgCommand::Prepare(args) => {
@@ -2017,19 +2041,30 @@ async fn run_gitlab_org_plan(cli: &Cli) -> Result<()> {
     }
 }
 
-async fn run_gitlab_org(cli: &Cli) -> Result<()> {
+async fn run_gitlab_org(
+    cli: &Cli,
+    projects: &[String],
+    assume_opted_in: bool,
+    onboard: bool,
+) -> Result<()> {
     use upd::gitlab::org;
 
     init_tls(cli)?;
     let result = match org::OrgSettings::from_env(cli.dry_run) {
-        Ok(settings) => org::run(&settings).await,
+        Ok(mut settings) => {
+            settings.projects = projects.to_vec();
+            settings.assume_opted_in = assume_opted_in;
+            settings.preview_config = cli.config.clone();
+            settings.onboard = onboard;
+            org::run(&settings).await
+        }
         Err(error) => Err(error),
     };
     match result {
         Ok(report) => {
             if effective_json_mode(cli) {
                 // The job log shows stderr; the JSON goes to a report file.
-                eprintln!("{}", report.summary());
+                eprintln!("{}", report.render_text());
                 println!("{}", serde_json::to_string_pretty(&report.to_json())?);
             } else {
                 println!("{}", report.render_text());
