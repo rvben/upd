@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.17.1](https://github.com/rvben/upd/compare/v0.17.0...v0.17.1) - 2026-10-16
+
+### Added
+
+- **pre-commit / prek**: Maintain existing `# frozen: <tag>` SHA pins in YAML and TOML. Verify the original pin before updating the SHA and tag comment together, preserving formatting and respecting cooldown and update limits. ([e5a6035](https://github.com/rvben/upd/commit/e5a603585b1805842616df70258dbd64bf6e846a))
+
+### Fixed
+
+- **GitHub**: Honor GitHub's prerelease flag when stable-release discovery falls back to tags, while keeping support for repositories that publish tags without releases. Refresh old cached selections and avoid downgrading existing pins. ([39ccc05](https://github.com/rvben/upd/commit/39ccc050a3dd17271a2eade28aca5e17c3dc4fee))
+
 ## [0.17.0](https://github.com/rvben/upd/compare/v0.16.0...v0.17.0) - 2026-10-15
 
 ### Added
