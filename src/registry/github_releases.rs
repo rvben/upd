@@ -10,7 +10,7 @@ use reqwest::Client;
 use reqwest::header::{ACCEPT, AUTHORIZATION, HeaderMap, HeaderValue};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 use tokio::sync::{Mutex, OnceCell};
@@ -20,6 +20,8 @@ type ReleaseCache = HashMap<(String, String), Arc<OnceCell<ReleaseAssets>>>;
 type AssetCache = HashMap<(String, String, String), Arc<OnceCell<Arc<Vec<u8>>>>>;
 type RepoTags = Arc<Vec<TagResponse>>;
 type TagCache = HashMap<(String, String), Arc<OnceCell<RepoTags>>>;
+type RepoReleases = Arc<Vec<ReleaseListEntry>>;
+type ReleaseListCache = HashMap<(String, String), Arc<OnceCell<RepoReleases>>>;
 
 pub struct GitHubReleasesRegistry {
     client: Client,
@@ -27,6 +29,7 @@ pub struct GitHubReleasesRegistry {
     release_assets: Mutex<ReleaseCache>,
     asset_bytes: Mutex<AssetCache>,
     tags: Mutex<TagCache>,
+    releases: Mutex<ReleaseListCache>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -303,6 +306,7 @@ impl GitHubReleasesRegistry {
             release_assets: Default::default(),
             asset_bytes: Default::default(),
             tags: Default::default(),
+            releases: Default::default(),
         }
     }
 
@@ -416,6 +420,27 @@ impl GitHubReleasesRegistry {
             .iter()
             .map(|t| t.name.clone())
             .collect())
+    }
+
+    /// Share the complete release metadata between stable tag selection and
+    /// cooldown. Only a first-page 404 means no releases; partial lists and
+    /// failed requests are errors and are not cached.
+    async fn all_releases(&self, owner: &str, repo: &str) -> Result<RepoReleases> {
+        let key = (owner.to_string(), repo.to_string());
+        let cell = self.releases.lock().await.entry(key).or_default().clone();
+        let releases = cell
+            .get_or_try_init(|| async {
+                let url = format!(
+                    "{}/repos/{}/{}/releases?per_page={}",
+                    self.api_url, owner, repo, PAGE_SIZE
+                );
+                let items = self
+                    .get_all_pages::<ReleaseListEntry>(url, &format!("{owner}/{repo}"), "releases")
+                    .await?;
+                Ok::<_, anyhow::Error>(Arc::new(items.unwrap_or_default()))
+            })
+            .await?;
+        Ok(Arc::clone(releases))
     }
 
     /// Collect every tag naming `commit`, walking the paginated tag list.
@@ -970,6 +995,11 @@ impl Registry for GitHubReleasesRegistry {
         "github-releases"
     }
 
+    fn cache_revision(&self) -> u32 {
+        // Older stable answers could include a GitHub-marked prerelease.
+        1
+    }
+
     async fn get_latest_version(&self, package: &str) -> Result<String> {
         let (owner, repo) = Self::extract_owner_repo(package)?;
 
@@ -992,7 +1022,6 @@ impl Registry for GitHubReleasesRegistry {
                 return Ok(release.tag_name);
             }
         } else if status.as_u16() != 404 {
-            // On 404 (no releases published), fall back to the tags endpoint.
             let hint = match status.as_u16() {
                 403 | 429 => Some("Set GITHUB_TOKEN to increase the API rate limit."),
                 _ => None,
@@ -1005,10 +1034,21 @@ impl Registry for GitHubReleasesRegistry {
             )));
         }
 
+        // A 404 can mean no releases or only prereleases. An unparseable latest
+        // tag also sends us here. A tag can look stable while its release is
+        // marked as a prerelease. Read all release pages before treating any tag
+        // as stable; tags with no published release remain supported.
+        let releases = self.all_releases(owner, repo).await?;
+        let prerelease_tags: HashSet<_> = releases
+            .iter()
+            .filter(|r| !r.draft && r.prerelease)
+            .map(|r| r.tag_name.as_str())
+            .collect();
         let tags = self.fetch_tags(owner, repo).await?;
 
         let mut stable: Vec<_> = tags
             .iter()
+            .filter(|t| !prerelease_tags.contains(t.as_str()))
             .filter_map(|t| TagVersion::parse(t).map(|v| (v, t.clone())))
             .filter(|(v, _)| !v.is_prerelease())
             .collect();
@@ -1126,24 +1166,7 @@ impl Registry for GitHubReleasesRegistry {
         strict: bool,
     ) -> Result<Vec<VersionMeta>> {
         let (owner, repo) = Self::extract_owner_repo(package)?;
-        let url = format!(
-            "{}/repos/{}/{}/releases?per_page={}",
-            self.api_url, owner, repo, PAGE_SIZE
-        );
-
-        // Only a first page answering 404 says the repository has no release
-        // list; a later page failing says nothing about the releases already
-        // read, and the walk reports it as an error.
-        let Some(items) = self
-            .get_all_pages::<ReleaseListEntry>(url, &format!("{owner}/{repo}"), "releases")
-            .await?
-        else {
-            return if strict {
-                Ok(Vec::new())
-            } else {
-                self.tag_versions(owner, repo).await
-            };
-        };
+        let items = self.all_releases(owner, repo).await?;
 
         // A release tag that is not a version names no release of the package:
         // github/codeql-action publishes CodeQL bundles as releases beside its
@@ -1151,11 +1174,11 @@ impl Registry for GitHubReleasesRegistry {
         // its leading letters above every number, so it would outrank the
         // real releases. `get_latest_version` filters the same way.
         let releases: Vec<VersionMeta> = items
-            .into_iter()
+            .iter()
             .filter(|r| !r.draft)
             .filter(|r| TagVersion::parse(&r.tag_name).is_some())
             .map(|r| VersionMeta {
-                version: r.tag_name,
+                version: r.tag_name.clone(),
                 published_at: r.published_at.as_deref().and_then(timestamp),
                 yanked: false,
                 prerelease: r.prerelease,
@@ -1823,6 +1846,12 @@ mod tests {
     async fn test_get_latest_version_from_releases() {
         let server = MockServer::start().await;
 
+        Mock::given(path("/repos/actions/checkout/releases"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("[]"))
+            .expect(0)
+            .mount(&server)
+            .await;
+
         Mock::given(method("GET"))
             .and(path("/repos/actions/checkout/releases/latest"))
             .respond_with(
@@ -1949,6 +1978,225 @@ mod tests {
     async fn test_registry_name() {
         let server = MockServer::start().await;
         assert_eq!(registry(&server).name(), "github-releases");
+    }
+
+    #[tokio::test]
+    async fn stable_tag_fallback_excludes_github_marked_prereleases() {
+        for latest in [
+            ResponseTemplate::new(404),
+            ResponseTemplate::new(200).set_body_string(r#"{"tag_name":"nightly"}"#),
+        ] {
+            let server = MockServer::start().await;
+            Mock::given(path("/repos/acme/hook/releases/latest"))
+                .respond_with(latest)
+                .mount(&server)
+                .await;
+            Mock::given(path("/repos/acme/hook/releases"))
+                .and(query_param("per_page", "100"))
+                .respond_with(
+                    ResponseTemplate::new(200).set_body_string(
+                        r#"[{"tag_name":"v2.0.0","prerelease":true,"draft":false}]"#,
+                    ),
+                )
+                .expect(1)
+                .mount(&server)
+                .await;
+            Mock::given(path("/repos/acme/hook/tags"))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .set_body_string(r#"[{"name":"v2.0.0"},{"name":"v1.0.0"}]"#),
+                )
+                .expect(1)
+                .mount(&server)
+                .await;
+            let registry = registry(&server);
+            assert_eq!(
+                registry.get_latest_version("acme/hook").await.unwrap(),
+                "v1.0.0"
+            );
+            // Explicit prerelease selection still accepts the same tag.
+            assert_eq!(
+                registry
+                    .get_latest_version_including_prereleases("acme/hook")
+                    .await
+                    .unwrap(),
+                "v2.0.0"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn only_github_marked_prereleases_means_no_stable_version() {
+        let server = MockServer::start().await;
+        Mock::given(path("/repos/acme/hook/releases/latest"))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&server)
+            .await;
+        Mock::given(path("/repos/acme/hook/releases"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string(r#"[{"tag_name":"v2.0.0","prerelease":true}]"#),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(path("/repos/acme/hook/tags"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(r#"[{"name":"v2.0.0"}]"#))
+            .mount(&server)
+            .await;
+        let error = registry(&server)
+            .get_latest_version("acme/hook")
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("no stable"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn tag_fallback_preserves_tags_without_published_prereleases() {
+        for releases in [
+            ResponseTemplate::new(404),
+            ResponseTemplate::new(200).set_body_string("[]"),
+            ResponseTemplate::new(200)
+                .set_body_string(r#"[{"tag_name":"v2.0.0","prerelease":true,"draft":true}]"#),
+            ResponseTemplate::new(200)
+                .set_body_string(r#"[{"tag_name":"v2.0.0","prerelease":false}]"#),
+        ] {
+            let server = MockServer::start().await;
+            Mock::given(path("/repos/acme/hook/releases/latest"))
+                .respond_with(ResponseTemplate::new(404))
+                .mount(&server)
+                .await;
+            Mock::given(path("/repos/acme/hook/releases"))
+                .respond_with(releases)
+                .mount(&server)
+                .await;
+            Mock::given(path("/repos/acme/hook/tags"))
+                .respond_with(ResponseTemplate::new(200).set_body_string(
+                    r#"[{"name":"v3.0.0-rc.1"},{"name":"v2.0.0"},{"name":"v1.0.0"}]"#,
+                ))
+                .mount(&server)
+                .await;
+            assert_eq!(
+                registry(&server)
+                    .get_latest_version("acme/hook")
+                    .await
+                    .unwrap(),
+                "v2.0.0"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn stable_fallback_and_cooldown_share_all_release_pages() {
+        let server = MockServer::start().await;
+        Mock::given(path("/repos/acme/hook/releases/latest"))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&server)
+            .await;
+        first_page(&server, "releases", r#"[{"tag_name":"nightly"}]"#, 1).await;
+        second_page("releases", ResponseTemplate::new(200).set_body_string(
+            r#"[{"tag_name":"v2.0.0","prerelease":true,"published_at":"2026-01-01T00:00:00Z"}]"#,
+        ))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(path("/repos/acme/hook/tags"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string(r#"[{"name":"v2.0.0"},{"name":"v1.0.0"}]"#),
+            )
+            .mount(&server)
+            .await;
+        let registry = registry(&server);
+        let (stable, cooldown) = tokio::join!(
+            registry.get_latest_version("acme/hook/first"),
+            registry.list_versions_for_cooldown("acme/hook/second", true),
+        );
+        assert_eq!(stable.unwrap(), "v1.0.0");
+        let versions = cooldown.unwrap();
+        assert_eq!(versions.len(), 1);
+        assert_eq!(versions[0].version, "v2.0.0");
+        assert!(versions[0].prerelease);
+        assert!(versions[0].published_at.is_some());
+    }
+
+    #[tokio::test]
+    async fn unreadable_release_metadata_fails_stable_fallback_and_can_be_retried() {
+        for response in [
+            ResponseTemplate::new(403),
+            ResponseTemplate::new(200).set_body_string("not json"),
+            ResponseTemplate::new(200)
+                .insert_header("link", r#"<https://other.example/releases>; rel="next""#)
+                .set_body_string("[]"),
+        ] {
+            let server = MockServer::start().await;
+            Mock::given(path("/repos/acme/hook/releases/latest"))
+                .respond_with(ResponseTemplate::new(404))
+                .mount(&server)
+                .await;
+            Mock::given(path("/repos/acme/hook/tags"))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .set_body_string(r#"[{"name":"v2.0.0"},{"name":"v1.0.0"}]"#),
+                )
+                .expect(1)
+                .mount(&server)
+                .await;
+            let failure = Mock::given(path("/repos/acme/hook/releases"))
+                .respond_with(response)
+                .expect(1)
+                .mount_as_scoped(&server)
+                .await;
+            let registry = registry(&server);
+            assert!(registry.get_latest_version("acme/hook").await.is_err());
+            drop(failure);
+            Mock::given(path("/repos/acme/hook/releases"))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .set_body_string(r#"[{"tag_name":"v2.0.0","prerelease":true}]"#),
+                )
+                .mount(&server)
+                .await;
+            assert_eq!(
+                registry.get_latest_version("acme/hook").await.unwrap(),
+                "v1.0.0"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_failed_later_release_page_cannot_offer_a_prerelease_tag() {
+        let server = MockServer::start().await;
+        let failure = second_page("releases", ResponseTemplate::new(404))
+            .expect(1)
+            .mount_as_scoped(&server)
+            .await;
+        Mock::given(path("/repos/acme/hook/releases/latest"))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&server)
+            .await;
+        first_page(&server, "releases", "[]", 2).await;
+        Mock::given(path("/repos/acme/hook/tags"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string(r#"[{"name":"v2.0.0"},{"name":"v1.0.0"}]"#),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        let registry = registry(&server);
+        assert!(registry.get_latest_version("acme/hook").await.is_err());
+        drop(failure);
+        second_page(
+            "releases",
+            ResponseTemplate::new(200)
+                .set_body_string(r#"[{"tag_name":"v2.0.0","prerelease":true}]"#),
+        )
+        .mount(&server)
+        .await;
+        assert_eq!(
+            registry.get_latest_version("acme/hook").await.unwrap(),
+            "v1.0.0"
+        );
     }
 
     #[tokio::test]

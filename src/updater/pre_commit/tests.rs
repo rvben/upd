@@ -76,6 +76,79 @@ fn frozen_fixture(name: &str, tag: &str) -> String {
 }
 
 #[tokio::test]
+async fn github_marked_prereleases_are_not_selected_or_rolled_back() {
+    let server = MockServer::start().await;
+    Mock::given(path("/repos/owner/repo/releases/latest"))
+        .respond_with(ResponseTemplate::new(404))
+        .mount(&server)
+        .await;
+    Mock::given(path("/repos/owner/repo/releases"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_string(r#"[{"tag_name":"v2.0.0","prerelease":true}]"#),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(path("/repos/owner/repo/tags"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_string(r#"[{"name":"v2.0.0"},{"name":"v1.0.0"}]"#),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    for (tag, sha) in [
+        ("v0.5.0", OLD_SHA),
+        ("v1.0.0", NEW_SHA),
+        ("v2.0.0", OLD_SHA),
+    ] {
+        Mock::given(path(format!("/repos/owner/repo/git/ref/tags/{tag}")))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"object": {"type": "commit", "sha": sha}})),
+            )
+            .mount(&server)
+            .await;
+    }
+    let registry = GitHubReleasesRegistry::with_api_url(server.uri());
+    for name in [".pre-commit-config.yaml", "prek.toml"] {
+        for current in ["v0.5.0", "v2.0.0"] {
+            let tagged = if name.ends_with(".toml") {
+                format!(
+                    "[[repos]]\nrepo = 'https://github.com/owner/repo'\nrev = '{current}'\nhooks = []\n"
+                )
+            } else {
+                format!(
+                    "repos:\n- repo: https://github.com/owner/repo\n  rev: '{current}'\n  hooks: []\n"
+                )
+            };
+            for original in [tagged, frozen_fixture(name, current)] {
+                let (result, written) =
+                    run_with_registry(name, &original, UpdateOptions::new(false, false), &registry)
+                        .await;
+                assert!(result.errors.is_empty(), "{result:?}");
+                if current == "v0.5.0" {
+                    assert_eq!(result.updated.len(), 1, "{result:?}");
+                    assert_eq!(result.updated[0].2, "v1.0.0");
+                    assert_eq!(
+                        written,
+                        original
+                            .replace(current, "v1.0.0")
+                            .replace(OLD_SHA, NEW_SHA)
+                    );
+                } else {
+                    assert!(result.updated.is_empty(), "{result:?}");
+                    assert_eq!(
+                        written, original,
+                        "an existing prerelease must never be downgraded"
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[tokio::test]
 async fn frozen_pins_verify_and_update_sha_and_exact_tag_together_in_both_formats() {
     // No precision truncation: two- and four-component release tags are refs,
     // not a formatting template for the selected release.

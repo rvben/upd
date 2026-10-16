@@ -269,10 +269,14 @@ impl<R: Registry> CachedRegistry<R> {
     }
 
     fn scoped_key(&self, key: &str) -> String {
-        self.namespace.as_ref().map_or_else(
+        let key = self.namespace.as_ref().map_or_else(
             || key.to_string(),
             |namespace| format!("{namespace}\u{1f}{key}"),
-        )
+        );
+        match self.inner.cache_revision() {
+            0 => key,
+            revision => format!("v{revision}\u{1f}{key}"),
+        }
     }
 
     /// Get from cache (returns None if disabled, expired, or missing)
@@ -495,6 +499,10 @@ impl<R: Registry> Registry for CachedRegistry<R> {
 
     fn name(&self) -> &'static str {
         self.inner.name()
+    }
+
+    fn cache_revision(&self) -> u32 {
+        self.inner.cache_revision()
     }
 
     async fn pre_commit_manifest(&self, package: &str, reference: &str) -> Result<String> {
@@ -871,6 +879,102 @@ mod tests {
         // Should return cached value without hitting registry
         let version = cached.get_latest_version("requests").await.unwrap();
         assert_eq!(version, "2.31.0");
+    }
+
+    #[tokio::test]
+    async fn github_release_policy_refreshes_legacy_cache_without_mixing_queries() {
+        use crate::registry::{GitHubReleasesRegistry, MockRegistry};
+        use wiremock::{Mock, MockServer, ResponseTemplate, matchers::path};
+
+        for namespace in [None, Some("enterprise")] {
+            let server = MockServer::start().await;
+            Mock::given(path("/repos/acme/hook/releases/latest"))
+                .respond_with(ResponseTemplate::new(404))
+                .expect(1)
+                .mount(&server)
+                .await;
+            Mock::given(path("/repos/acme/hook/releases"))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .set_body_string(r#"[{"tag_name":"v2.0.0","prerelease":true}]"#),
+                )
+                .expect(1)
+                .mount(&server)
+                .await;
+            Mock::given(path("/repos/acme/hook/tags"))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .set_body_string(r#"[{"name":"v2.0.0"},{"name":"v1.0.0"}]"#),
+                )
+                .expect(1)
+                .mount(&server)
+                .await;
+
+            let mut legacy = Cache::default();
+            let key = namespace.map_or_else(
+                || "acme/hook".to_string(),
+                |namespace| format!("{namespace}\u{1f}acme/hook"),
+            );
+            legacy.set("github-releases", &key, "v2.0.0".into());
+            legacy.set("pypi", "unrelated", "1.2.3".into());
+            // Exercise the format written by previous upd versions.
+            let cache = Arc::new(Mutex::new(
+                serde_json::from_slice::<Cache>(&serde_json::to_vec(&legacy).unwrap()).unwrap(),
+            ));
+            let wrap = |cache| {
+                let inner = GitHubReleasesRegistry::with_api_url(server.uri());
+                match namespace {
+                    Some(namespace) => {
+                        CachedRegistry::with_namespace(inner, cache, true, namespace)
+                    }
+                    None => CachedRegistry::new(inner, cache, true),
+                }
+            };
+            let cached = wrap(Arc::clone(&cache));
+            assert_eq!(
+                cached.get_latest_version("acme/hook").await.unwrap(),
+                "v1.0.0"
+            );
+            assert_eq!(
+                cached
+                    .get_latest_version_including_prereleases("acme/hook")
+                    .await
+                    .unwrap(),
+                "v2.0.0"
+            );
+            assert_eq!(
+                cached
+                    .revalidate_version("acme/hook", VersionQuery::Stable, "v2.0.0")
+                    .await
+                    .unwrap(),
+                "v1.0.0"
+            );
+
+            // A new registry instance must reuse the corrected persisted answer.
+            let persisted = Arc::new(Mutex::new(
+                serde_json::from_slice::<Cache>(
+                    &serde_json::to_vec(&*cache.lock().unwrap()).unwrap(),
+                )
+                .unwrap(),
+            ));
+            let fresh = wrap(Arc::clone(&persisted));
+            assert_eq!(
+                fresh.get_latest_version("acme/hook").await.unwrap(),
+                "v1.0.0"
+            );
+            assert_eq!(
+                fresh
+                    .get_latest_version_including_prereleases("acme/hook")
+                    .await
+                    .unwrap(),
+                "v2.0.0"
+            );
+            let unrelated = CachedRegistry::new(MockRegistry::new("pypi"), persisted, true);
+            assert_eq!(
+                unrelated.get_latest_version("unrelated").await.unwrap(),
+                "1.2.3"
+            );
+        }
     }
 
     #[tokio::test]

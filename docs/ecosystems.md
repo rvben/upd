@@ -542,6 +542,14 @@ ecosystem with `nix = "7d"` under `[cooldown.ecosystem]`.
 SHA pinning, the safety rules around rewriting a commit pin, and the reusable
 pull-request workflow are covered in [GitHub Actions](github-actions.md).
 
+Stable GitHub version lookups use the latest release, falling back to version
+tags when that endpoint has no version to offer. The fallback excludes both
+prerelease version spellings and tags whose published GitHub release is marked
+as a prerelease. Tags without a published release remain eligible. An unreadable
+release list fails the lookup rather than treating those tags as stable.
+This selection also applies to other `github-releases` consumers, including
+pre-commit hooks, mise tools, and annotated versions.
+
 ## Pre-commit
 
 - `.pre-commit-config.yaml` and `prek.toml`

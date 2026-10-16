@@ -620,6 +620,13 @@ pub trait Registry: Send + Sync {
 
     /// Registry name for display
     fn name(&self) -> &'static str;
+
+    /// Revision of persisted version-selection answers. Bump when a selection
+    /// rule changes so answers cached by older versions cannot bypass it.
+    /// Zero preserves the original cache keys. Decorators must forward this method.
+    fn cache_revision(&self) -> u32 {
+        0
+    }
 }
 
 #[cfg(test)]
