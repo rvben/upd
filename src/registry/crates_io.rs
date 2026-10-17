@@ -285,11 +285,7 @@ impl CratesIoRegistry {
             Client::builder()
                 .gzip(true)
                 // crates.io requires a descriptive User-Agent
-                .user_agent(concat!(
-                    "upd/",
-                    env!("CARGO_PKG_VERSION"),
-                    " (https://github.com/rvben/upd)"
-                ))
+                .user_agent(concat!("upd/", env!("CARGO_PKG_VERSION")))
                 .timeout(Duration::from_secs(30))
                 .connect_timeout(Duration::from_secs(10))
                 .default_headers(headers),
@@ -772,13 +768,17 @@ mod tests {
 
     #[tokio::test]
     async fn test_crates_io_list_versions_returns_publish_dates() {
-        use wiremock::matchers::{method, path};
+        use wiremock::matchers::{header, method, path};
         use wiremock::{Mock, MockServer, ResponseTemplate};
 
         let mock_server = MockServer::start().await;
 
         Mock::given(method("GET"))
             .and(path("/serde"))
+            .and(header(
+                "user-agent",
+                concat!("upd/", env!("CARGO_PKG_VERSION")),
+            ))
             .respond_with(ResponseTemplate::new(200).set_body_string(
                 r#"{
               "crate": {"max_stable_version": "1.0.200"},
