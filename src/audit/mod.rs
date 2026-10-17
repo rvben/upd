@@ -3,6 +3,9 @@
 pub mod cache;
 pub mod cvss;
 
+#[cfg(test)]
+mod concurrency_tests;
+
 use anyhow::Result;
 use futures::stream::{self, StreamExt};
 use reqwest::Client;
@@ -18,8 +21,11 @@ const DEFAULT_OSV_API_URL: &str = "https://api.osv.dev/v1";
 /// Maximum packages per batch request (OSV limit)
 const BATCH_SIZE: usize = 1000;
 
-/// Maximum concurrent requests for fetching vulnerability details
+/// Maximum in-flight detail requests across all packages and calls on one client
 const MAX_CONCURRENT_REQUESTS: usize = 20;
+
+/// Bound package futures separately from their shared HTTP request budget.
+const MAX_CONCURRENT_PACKAGES: usize = 20;
 
 /// Cap for how many bytes of a non-success OSV response body we surface in
 /// an error message. A proxy or CDN can return arbitrarily large HTML error
@@ -226,6 +232,7 @@ pub(crate) fn severity_sort_key(severity: Option<&str>) -> u8 {
 pub struct OsvClient {
     client: Client,
     base_url: String,
+    detail_permits: tokio::sync::Semaphore,
 }
 
 impl OsvClient {
@@ -244,6 +251,7 @@ impl OsvClient {
             .build()
             .expect("Failed to create HTTP client. This usually indicates a TLS/SSL configuration issue on your system."),
             base_url,
+            detail_permits: tokio::sync::Semaphore::new(MAX_CONCURRENT_REQUESTS),
         }
     }
 
@@ -390,21 +398,32 @@ impl OsvClient {
 
         let batch_response: OsvBatchResponse = response.json().await?;
 
-        // Map results back to packages
-        let mut results = Vec::new();
-        for (i, osv_result) in batch_response.results.into_iter().enumerate() {
-            if i >= packages.len() {
-                break;
-            }
-
-            let package = packages[i].clone();
-            let vulns = self
-                .fetch_vulnerability_details(&osv_result.vulns, &package)
-                .await?;
-            results.push((package, vulns));
-        }
-
-        Ok(results)
+        // Overlap packages without multiplying the detail request limit. Do not
+        // let a slow early package prevent later packages from starting, but
+        // restore input order before returning results to the cache/report path.
+        let jobs = batch_response
+            .results
+            .into_iter()
+            .take(packages.len())
+            .enumerate();
+        let mut results: Vec<_> = stream::iter(jobs)
+            .map(|(i, osv_result)| {
+                let package = packages[i].clone();
+                async move {
+                    let vulns = self
+                        .fetch_vulnerability_details(&osv_result.vulns, &package)
+                        .await;
+                    (i, package, vulns)
+                }
+            })
+            .buffer_unordered(MAX_CONCURRENT_PACKAGES)
+            .collect()
+            .await;
+        results.sort_unstable_by_key(|(i, _, _)| *i);
+        Ok(results
+            .into_iter()
+            .map(|(_, package, vulns)| (package, vulns))
+            .collect())
     }
 
     /// Fetch full vulnerability details for a list of vulnerability IDs (in parallel)
@@ -412,21 +431,26 @@ impl OsvClient {
         &self,
         vuln_refs: &[OsvVulnRef],
         package: &Package,
-    ) -> Result<Vec<Vulnerability>> {
-        let vulnerabilities: Vec<Vulnerability> = stream::iter(vuln_refs)
-            .map(|vuln_ref| async move {
-                match self.fetch_vuln_by_id(&vuln_ref.id, package).await {
+    ) -> Vec<Vulnerability> {
+        // Owned IDs keep the nested request stream Send for spawned callers.
+        let ids: Vec<_> = vuln_refs
+            .iter()
+            .map(|vuln_ref| vuln_ref.id.clone())
+            .collect();
+        stream::iter(ids)
+            .map(|id| async move {
+                match self.fetch_vuln_by_id(&id, package).await {
                     Ok(vuln) => vuln,
                     Err(_) => {
                         // If we can't fetch details, create a minimal entry
                         Vulnerability {
-                            id: vuln_ref.id.clone(),
+                            id: id.clone(),
                             summary: None,
                             severity: None,
-                            url: Some(format!("https://osv.dev/vulnerability/{}", vuln_ref.id)),
+                            url: Some(format!("https://osv.dev/vulnerability/{}", id)),
                             fixed_version: None,
                             aliases: Vec::new(),
-                            source: advisory_source(&vuln_ref.id),
+                            source: advisory_source(&id),
                             affected: Vec::new(),
                         }
                     }
@@ -434,13 +458,12 @@ impl OsvClient {
             })
             .buffer_unordered(MAX_CONCURRENT_REQUESTS)
             .collect()
-            .await;
-
-        Ok(vulnerabilities)
+            .await
     }
 
     /// Fetch vulnerability details by ID
     async fn fetch_vuln_by_id(&self, id: &str, package: &Package) -> Result<Vulnerability> {
+        let _permit = self.detail_permits.acquire().await?;
         let url = format!("{}/vulns/{}", self.base_url, id);
         let response = self
             .client
