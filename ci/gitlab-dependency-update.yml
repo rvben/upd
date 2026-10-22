@@ -9,10 +9,10 @@ spec:
       default: test
     image:
       description: Compatible Linux job image; pin custom images by digest
-      default: "ghcr.io/rvben/upd:v0.17.3@sha256:22e3c591d0be52ddc32ec60192af89d819ef415fcd313383a5a798f514b28682"
+      default: "ghcr.io/rvben/upd:v0.17.4@sha256:7073c4fbef5e747586cef6ecfb8968169973fd7787b154fa3e2eacc8e4b08cf6"
     upd_version:
       description: Exact released upd version
-      default: "v0.17.3"
+      default: "v0.17.4"
       regex: '^v[0-9]+\.[0-9]+\.[0-9]+([+-][0-9A-Za-z.-]+)?$'
     upd_sha256:
       description: Archive digest; required when overriding upd_version or upd_target
@@ -166,16 +166,16 @@ spec:
         fi
 
         expected_sha="${UPD_SHA256}"
-        if [ -z "$expected_sha" ] && [ "$version" = "v0.17.3" ]; then
+        if [ -z "$expected_sha" ] && [ "$version" = "v0.17.4" ]; then
           case "$target" in
             x86_64-unknown-linux-gnu)
-              expected_sha="4e07259d84d9121e86ac63ae8a0ec3285da499f07c21d59479fcda88979a73b8"
+              expected_sha="c23862ce3739bd478c9cf0ed57f3235494eef62ffac533cd5c119d2ae54788c0"
               ;;
             x86_64-unknown-linux-musl)
-              expected_sha="bd870f7890d690439aeffdb2c4959c9f63ca746ef5ea2cffc040d179b1078a9e"
+              expected_sha="9c36e79e85789e23d55a2ec27a4a923757f1833abc3d1ae6107f1c6eaa1b1ed7"
               ;;
             aarch64-unknown-linux-gnu)
-              expected_sha="0a397b1ec78f37889f02390017b1d9a463d46c895198d4157a98eab75eff6685"
+              expected_sha="ae152bb013e44efd1ad70db9c8bf03f4131af31883444608d8f9cef42920da22"
               ;;
           esac
         fi
