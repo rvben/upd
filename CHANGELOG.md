@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.17.4](https://github.com/rvben/upd/compare/v0.17.3...v0.17.4) - 2026-10-22
+
+### Fixed
+
+- **ci**: reconcile transient GitHub pull request failures ([80813b8](https://github.com/rvben/upd/commit/80813b861ddaab56ec42ecd5a8e4c0a437c11fdd))
+
 ## [0.17.3](https://github.com/rvben/upd/compare/v0.17.2...v0.17.3) - 2026-10-17
 
 ### Fixed
