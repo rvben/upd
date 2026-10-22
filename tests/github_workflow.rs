@@ -121,17 +121,41 @@ state="$GH_STATE_DIR/pr-state"
 auto="$GH_STATE_DIR/auto-merge"
 case "${1:-}:${2:-}" in
   pr:list)
-    if [[ -f "$state" && "$(cat "$state")" == open ]]; then
+    if [[ -f "$GH_STATE_DIR/fail-list-once" ]]; then
+      rm "$GH_STATE_DIR/fail-list-once"
+      echo 'partial failed response'
+      echo 'HTTP 503 Service Unavailable' >&2
+      exit 1
+    fi
+    if [[ -f "$state" && "$(cat "$state")" == open && -f "$GH_STATE_DIR/visibility-lag-once" ]]; then
+      rm "$GH_STATE_DIR/visibility-lag-once"
+      printf '%s\n' '[]'
+    elif [[ -f "$state" && "$(cat "$state")" == open ]]; then
       printf '%s\n' '[{"number":7,"url":"https://github.example.test/project/pull/7"}]'
     else
       printf '%s\n' '[]'
     fi
     ;;
   pr:create)
+    if [[ -f "$GH_STATE_DIR/create-failure-once" ]]; then
+      rm "$GH_STATE_DIR/create-failure-once"
+      echo 'HTTP 504 Gateway Timeout' >&2
+      exit 1
+    fi
     printf '%s\n' open > "$state"
+    if [[ -f "$GH_STATE_DIR/create-timeout-once" ]]; then
+      rm "$GH_STATE_DIR/create-timeout-once"
+      echo 'non-200 OK status code: 504 Gateway Timeout' >&2
+      exit 1
+    fi
     printf '%s\n' 'https://github.example.test/project/pull/7'
     ;;
   pr:edit)
+    if [[ -f "$GH_STATE_DIR/fail-edit-once" ]]; then
+      rm "$GH_STATE_DIR/fail-edit-once"
+      echo 'non-200 OK status code: 504 Gateway Timeout' >&2
+      exit 1
+    fi
     ;;
   pr:close)
     printf '%s\n' closed > "$state"
@@ -1849,4 +1873,104 @@ fn repository_dependency_jobs_share_the_hardened_workflow() {
     assert!(!DEPENDENCIES_WORKFLOW.contains("UPD_BROKER_URL"));
     assert!(!DEPENDENCIES_WORKFLOW.contains("git push"));
     assert!(!DEPENDENCIES_WORKFLOW.contains("upd-version:"));
+}
+
+#[test]
+fn publisher_retries_transient_pr_reads_and_edits() {
+    let fixture = Fixture::new();
+    fs::write(fixture.state.join("fail-list-once"), "").unwrap();
+    fixture.run_publish(true, "first", false);
+    fs::write(fixture.state.join("fail-edit-once"), "").unwrap();
+    fixture.run_publish(true, "second", false);
+    assert_eq!(fixture.branch_file().as_deref(), Some("second\n"));
+    assert_eq!(fixture.branch_commit_count(), 1);
+    assert_eq!(
+        fixture
+            .log()
+            .lines()
+            .filter(|line| line.starts_with("pr edit "))
+            .count(),
+        2
+    );
+}
+
+#[test]
+fn publisher_reconciles_a_timed_out_create_without_creating_twice() {
+    let fixture = Fixture::new();
+    fs::write(fixture.state.join("create-timeout-once"), "").unwrap();
+    fixture.run_publish(true, "first", false);
+    assert_eq!(fixture.branch_file().as_deref(), Some("first\n"));
+    assert_eq!(
+        fixture
+            .log()
+            .lines()
+            .filter(|line| line.starts_with("pr create "))
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn publisher_bounds_transient_retries_and_fails_fast_on_permission_errors() {
+    let script = workflow_script("Publish rolling pull request");
+    let start = script.find("transient_github_error() {").unwrap();
+    let end = script.find("find_open_prs() {").unwrap();
+    for (message, expected_attempts) in [("HTTP 504 Gateway Timeout", 3), ("HTTP 403 Forbidden", 1)]
+    {
+        let temp = TempDir::new().unwrap();
+        let check = format!(
+            "set -euo pipefail\n{}\nfail() {{ echo attempt >> \"$RUNNER_TEMP/attempts\"; echo \"$MESSAGE\" >&2; return 7; }}\ngithub_retry fail",
+            &script[start..end]
+        );
+        let output = isolated::command("bash")
+            .args(["-c", &check])
+            .env("RUNNER_TEMP", temp.path())
+            .env("MESSAGE", message)
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(7));
+        assert_eq!(
+            fs::read_to_string(temp.path().join("attempts"))
+                .unwrap()
+                .lines()
+                .count(),
+            expected_attempts
+        );
+        assert_eq!(
+            fs::read_dir(temp.path()).unwrap().count(),
+            1,
+            "temporary error files were removed"
+        );
+    }
+}
+
+#[test]
+fn publisher_retries_a_create_that_failed_without_creating_a_pr() {
+    let fixture = Fixture::new();
+    fs::write(fixture.state.join("create-failure-once"), "").unwrap();
+    fixture.run_publish(true, "first", false);
+    assert_eq!(fixture.branch_file().as_deref(), Some("first\n"));
+    assert_eq!(
+        fixture
+            .log()
+            .lines()
+            .filter(|line| line.starts_with("pr create "))
+            .count(),
+        2
+    );
+}
+
+#[test]
+fn publisher_waits_for_visibility_after_a_successful_create_without_recreating() {
+    let fixture = Fixture::new();
+    fs::write(fixture.state.join("visibility-lag-once"), "").unwrap();
+    fixture.run_publish(true, "first", false);
+    assert_eq!(
+        fixture
+            .log()
+            .lines()
+            .filter(|line| line.starts_with("pr create "))
+            .count(),
+        1
+    );
 }

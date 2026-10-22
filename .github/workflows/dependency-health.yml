@@ -1006,8 +1006,32 @@ jobs:
             pr_title="$(jq --raw-output '.title' "$PRESENTATION")"
           fi
 
+          transient_github_error() {
+            grep -Eqi 'HTTP 50[0234]|status code: 50[0234]|status: 50[0234]|TLS handshake timeout|connection reset|timed out|unexpected EOF' "$1"
+          }
+          github_retry() {
+            local attempt status error output
+            error="$(mktemp "${RUNNER_TEMP}/upd-gh-error.XXXXXX")"
+            output="$(mktemp "${RUNNER_TEMP}/upd-gh-output.XXXXXX")"
+            for attempt in 1 2 3; do
+              if "$@" >"$output" 2>"$error"; then
+                cat "$output"
+                cat "$error" >&2
+                rm -f "$error" "$output"
+                return 0
+              else
+                status=$?
+              fi
+              cat "$error" >&2
+              if [[ "$attempt" -eq 3 ]] || ! transient_github_error "$error"; then
+                rm -f "$error" "$output"
+                return "$status"
+              fi
+              sleep "$attempt"
+            done
+          }
           find_open_prs() {
-            gh pr list --head "$BRANCH" --base "$BASE_BRANCH" --state open \
+            github_retry gh pr list --head "$BRANCH" --base "$BASE_BRANCH" --state open \
               --limit 100 --json number,url
           }
           require_unambiguous_pr() {
@@ -1175,17 +1199,41 @@ jobs:
           ' "$PRESENTATION" > "$body_file"
 
           if [[ "$(jq 'length' <<< "$pr_list")" -eq 0 ]]; then
-            gh pr create --base "$BASE_BRANCH" --head "$BRANCH" \
-              --title "$pr_title" --body-file "$body_file" >/dev/null
-            pr_list="$(find_open_prs)"
-            require_unambiguous_pr "$pr_list"
-            if [[ "$(jq 'length' <<< "$pr_list")" -ne 1 ]]; then
-              echo "GitHub did not return the newly created pull request" >&2
-              exit 2
-            fi
+            # A timed-out create may already have succeeded. Reconcile before
+            # another create so a transient response cannot duplicate a PR.
+            create_error="$(mktemp "${RUNNER_TEMP}/upd-gh-create.XXXXXX")"
+            for attempt in 1 2 3; do
+              if gh pr create --base "$BASE_BRANCH" --head "$BRANCH" \
+                --title "$pr_title" --body-file "$body_file" > /dev/null 2>"$create_error"; then
+                create_status=0
+              else
+                create_status=$?
+              fi
+              cat "$create_error" >&2
+              # A successful create can briefly be absent from PR search.
+              # Retry visibility only; never create again after a success.
+              for visibility_attempt in 1 2 3; do
+                pr_list="$(find_open_prs)"
+                require_unambiguous_pr "$pr_list"
+                if [[ "$(jq 'length' <<< "$pr_list")" -eq 1 || "$create_status" -ne 0 || "$visibility_attempt" -eq 3 ]]; then
+                  break
+                fi
+                sleep "$visibility_attempt"
+              done
+              if [[ "$(jq 'length' <<< "$pr_list")" -eq 1 ]]; then
+                break
+              fi
+              if [[ "$create_status" -eq 0 || "$attempt" -eq 3 ]] || ! transient_github_error "$create_error"; then
+                echo "GitHub did not return the newly created pull request" >&2
+                rm -f "$create_error"
+                exit 2
+              fi
+              sleep "$attempt"
+            done
+            rm -f "$create_error"
           else
             pr_number="$(jq --raw-output '.[0].number' <<< "$pr_list")"
-            gh pr edit "$pr_number" --title "$pr_title" --body-file "$body_file" >/dev/null
+            github_retry gh pr edit "$pr_number" --title "$pr_title" --body-file "$body_file" >/dev/null
           fi
 
           pr_number="$(jq --raw-output '.[0].number' <<< "$pr_list")"
