@@ -124,6 +124,12 @@ references and leave a parseable result. See the
 
 ## Installation
 
+### Homebrew
+
+```sh
+brew install rvben/tap/upd
+```
+
 ### From crates.io
 
 ```bash
