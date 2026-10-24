@@ -1,20 +1,20 @@
 {
   "assets": {
     "aarch64-unknown-linux-gnu": {
-      "name": "upd-v0.17.4-aarch64-unknown-linux-gnu.tar.gz",
-      "sha256": "ae152bb013e44efd1ad70db9c8bf03f4131af31883444608d8f9cef42920da22"
+      "name": "upd-v0.17.5-aarch64-unknown-linux-gnu.tar.gz",
+      "sha256": "1bb1291787f535c9db200548cb6867b96deff9016b3d68bc59469d1036b75934"
     },
     "x86_64-unknown-linux-gnu": {
-      "name": "upd-v0.17.4-x86_64-unknown-linux-gnu.tar.gz",
-      "sha256": "c23862ce3739bd478c9cf0ed57f3235494eef62ffac533cd5c119d2ae54788c0"
+      "name": "upd-v0.17.5-x86_64-unknown-linux-gnu.tar.gz",
+      "sha256": "42d7a24a33330e9cbfc2da2f95e57ffbfa029e620e609db075b84135d8762c86"
     },
     "x86_64-unknown-linux-musl": {
-      "name": "upd-v0.17.4-x86_64-unknown-linux-musl.tar.gz",
-      "sha256": "9c36e79e85789e23d55a2ec27a4a923757f1833abc3d1ae6107f1c6eaa1b1ed7"
+      "name": "upd-v0.17.5-x86_64-unknown-linux-musl.tar.gz",
+      "sha256": "0abfba0387032bbf7dbe7df28a4cb6148977e75096774cf48ff539c155ea40f0"
     }
   },
-  "image": "ghcr.io/rvben/upd:v0.17.4@sha256:7073c4fbef5e747586cef6ecfb8968169973fd7787b154fa3e2eacc8e4b08cf6",
-  "release_commit": "3ac75317a6e12eb5e51f8da659e3fde44c907f07",
+  "image": "ghcr.io/rvben/upd:v0.17.5@sha256:7e8b6661d8a1d80754d9f31b3a18d5fc31de713eb4b8c45894851aa340c18796",
+  "release_commit": "c8f0ee7f17260119fbfb9c1e7c4b9e6bdbca3840",
   "schema": 1,
-  "version": "v0.17.4"
+  "version": "v0.17.5"
 }
