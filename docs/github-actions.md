@@ -491,7 +491,8 @@ The reusable workflow:
 - refuses to publish any changed proposal without an App or PAT whose pull
   requests can start checks automatically;
 - transfers the validated one-commit proposal across an artifact boundary into
-  a separate publication job that never executes repository code;
+  a separate publication job on a fresh GitHub-hosted runner that never executes
+  repository code; custom runner labels apply only to preparation and validation;
 - keeps the publication credential out of checkout, preparation, package
   managers, validation, and process command lines;
 - requests the App's Workflows write permission only when the proposal actually

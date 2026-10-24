@@ -1974,3 +1974,41 @@ fn publisher_waits_for_visibility_after_a_successful_create_without_recreating()
         1
     );
 }
+
+#[test]
+fn publisher_credentials_are_isolated_on_fresh_hosted_runners() {
+    let remediation = include_str!("../.github/workflows/dependency-remediation.yml");
+    for workflow in [WORKFLOW, remediation] {
+        let (preamble, body) = workflow.split_once("\njobs:\n").unwrap();
+        assert!(!preamble.contains("id-token: write"));
+        let mut jobs: Vec<(&str, String)> = Vec::new();
+        for line in body.lines() {
+            if line.starts_with("  ") && !line.starts_with("   ") && line.ends_with(':') {
+                jobs.push((line.trim().trim_end_matches(':'), String::new()));
+            } else if let Some((_, job)) = jobs.last_mut() {
+                job.push_str(line);
+                job.push('\n');
+            }
+        }
+        assert!(jobs.iter().any(|(name, _)| *name == "publish"));
+        for (name, job) in jobs {
+            if name != "publish" {
+                assert!(
+                    !job.contains("id-token: write"),
+                    "job {name} must not mint publication credentials"
+                );
+                continue;
+            }
+            let header = job.split_once("    steps:\n").unwrap().0;
+            assert!(
+                header
+                    .lines()
+                    .any(|line| line.trim() == "runs-on: ubuntu-24.04"),
+                "publisher must not reuse a self-hosted runner that executed dependency code"
+            );
+            assert!(header.contains("id-token: write"));
+            assert!(!header.contains("contents: write"));
+            assert!(!header.contains("pull-requests: write"));
+        }
+    }
+}

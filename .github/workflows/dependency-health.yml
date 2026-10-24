@@ -4,7 +4,7 @@ on:
   workflow_call:
     inputs:
       runner:
-        description: Linux runner label
+        description: Linux runner label for repository preparation and validation; publication uses a fresh hosted runner
         type: string
         default: ubuntu-24.04
       upd-version:
@@ -823,7 +823,9 @@ jobs:
 
   publish:
     needs: update
-    runs-on: ${{ inputs.runner }}
+    # Fresh hosted infrastructure keeps dependency code persisted on a custom
+    # build runner away from OIDC and the App installation token.
+    runs-on: ubuntu-24.04
     timeout-minutes: 10
     permissions:
       contents: read
