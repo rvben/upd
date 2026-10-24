@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.18.0](https://github.com/rvben/upd/compare/v0.17.6...v0.18.0) - 2026-10-24
+
 ### Changed
 
 - **Breaking:** dependency-health publication now requires caller-approved
