@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.17.6](https://github.com/rvben/upd/compare/v0.17.5...v0.17.6) - 2026-10-24
+
+### Fixed
+
+- **deps**: resolve Tokio and ctutils security advisories ([41f8b1d](https://github.com/rvben/upd/commit/41f8b1dd168f2a58460f00774ba8058bcb4e0dd8))
+
 ## [0.17.5](https://github.com/rvben/upd/compare/v0.17.4...v0.17.5) - 2026-10-24
 
 ### Fixed
