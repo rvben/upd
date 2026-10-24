@@ -138,12 +138,16 @@ jobs:
     with:
       runner: ubuntu-24.04
       langs: ""
+      allowed-paths: >-
+        package.json package-lock.json Cargo.toml Cargo.lock
+        .github/workflows/*.yml .github/workflows/*.yaml
       lock: true
       prepare-command: corepack enable
       validation-command: make test
 ```
 
-An empty `langs` includes Actions, so this configuration also needs a
+List every intended manifest and lockfile in `allowed-paths`; the publisher
+refuses changes elsewhere. An empty `langs` includes Actions, so this configuration also needs a
 credential that may write workflow files.
 
 Lockfile regeneration requires the ecosystem tools used by the repository.
@@ -249,7 +253,8 @@ before it reaches GitHub-flavored Markdown.
 | Input | Default | Purpose |
 |-------|---------|---------|
 | `publish` | `false` | Publish or clean up the rolling pull request; false performs a credential-free dry run. Scheduled runs also require `automation.security_remediation = true` |
-| `runner` | `ubuntu-24.04` | Linux runner label |
+| `runner` | `ubuntu-24.04` | Linux runner label for preparation and validation |
+| `publisher-runner` | `ubuntu-24.04` | Independent publication runner; custom values require disposable guests with admission before job initialization |
 | `upd-version` | current verified manifest | Exact released `upd` version |
 | `upd-sha256` | manifest checksum | Archive digest; required for a version outside the release manifest |
 | `upd-target` | detected | Linux release target |
@@ -272,7 +277,9 @@ only Contents and Pull requests write for the target repository.
 
 | Input | Default | Purpose |
 |-------|---------|---------|
-| `runner` | `ubuntu-24.04` | Linux runner label |
+| `runner` | `ubuntu-24.04` | Linux runner label for preparation and validation |
+| `allowed-paths` | `.github/workflows/*.yml .github/workflows/*.yaml` | Publisher-enforced file patterns; explicitly opt in dependency manifests and lockfiles for other ecosystems |
+| `publisher-runner` | `ubuntu-24.04` | Independent publication runner; custom values require disposable guests with admission before job initialization |
 | `upd-version` | current verified manifest | Exact released `upd` version; empty follows the canonical release manifest |
 | `upd-sha256` | manifest checksum | Exact archive checksum; required when the selected version is absent from the manifest |
 | `upd-target` | detected | Release target; Linux x86-64 and ARM64 GNU are detected |
@@ -491,8 +498,9 @@ The reusable workflow:
 - refuses to publish any changed proposal without an App or PAT whose pull
   requests can start checks automatically;
 - transfers the validated one-commit proposal across an artifact boundary into
-  a separate publication job on a fresh GitHub-hosted runner that never executes
-  repository code; custom runner labels apply only to preparation and validation;
+  a separate publication job on a fresh runner that never executes repository
+  code; `runner` selects preparation and validation, while `publisher-runner`
+  independently selects publication and defaults to GitHub-hosted;
 - keeps the publication credential out of checkout, preparation, package
   managers, validation, and process command lines;
 - requests the App's Workflows write permission only when the proposal actually
@@ -507,6 +515,34 @@ The reusable workflow:
 - creates or updates the automation-owned title and detailed description; and
 - closes the obsolete pull request and deletes its branch when no eligible
   updates remain.
+
+A custom `publisher-runner` is a security boundary, not a general build runner.
+Use a fresh VM for each job, with no reusable workspace or host credentials.
+Authenticate signed GitHub OIDC claims before downloading actions or initializing
+any job steps, including `always()` and post steps. Job-start hooks alone do not
+provide this guarantee. Pin the reusable workflow commit, repository and owner
+IDs, private visibility, default branch and allowed events. Only publisher jobs
+receive `id-token: write`; preserve that invariant when editing these workflows.
+Keep publisher and build runner identities separate, deny access from publisher
+guests to the host/LAN, and discard each VM after completion or cancellation.
+
+The health publisher independently enforces `allowed-paths` before requesting a
+write credential. Its default permits existing workflow files, and workflow
+changes may only replace action refs with immutable SHAs or update their version
+comments while keeping the action path and YAML structure. Each new SHA and
+version comment must match the same upstream tag (annotated tags are peeled);
+commits found only in fork/pull refs are refused. It rejects workflow
+creation, deletion, renaming, mode changes and edits to commands or permissions.
+For other ecosystems, explicitly allow their manifests/lockfiles in the caller.
+Those files remain build-produced proposals: path approval does not establish
+semantic correctness or make arbitrary dependency scripts trustworthy. Review
+and required checks still govern their integration. Security remediation cannot
+publish workflow files.
+
+Broker installation tokens are revoked in an `always()` cleanup step. Git
+askpass files are removed on both successful and failed pushes. Revocation cannot
+run after abrupt VM loss, so token lifetime and VM disposal remain necessary.
+Personal access tokens are not revoked by this workflow.
 
 Treat the configured branch, generated commit, title, and description as
 automation-owned. Later successful runs replace them.

@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **Breaking:** dependency-health publication now requires caller-approved
+  `allowed-paths` (default: existing workflow YAML files). Cargo, npm and other
+  manifest/lockfile callers must explicitly list their intended files.
+- Publication uses an independent `publisher-runner` input, with hosted runners
+  remaining the default; disposable homelab publishers require admission before
+  job initialization.
+
+### Fixed
+
+- Reject build-selected publication bases, staged validation mutations and
+  workflow edits beyond action refs matching an upstream release tag.
+- Isolate downloaded evidence and revoke broker tokens after publication.
+
 ## [0.17.6](https://github.com/rvben/upd/compare/v0.17.5...v0.17.6) - 2026-10-24
 
 ### Fixed

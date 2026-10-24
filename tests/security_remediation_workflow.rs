@@ -736,6 +736,24 @@ fn presentation_keeps_no_change_states_truthful() {
             &fs::read_to_string(report_dir.join("presentation.json")).unwrap(),
         )
         .unwrap();
+        let base = fixture.base_sha();
+        assert!(
+            fs::read_to_string(&fixture.output)
+                .unwrap()
+                .contains(&format!("base-sha={base}"))
+        );
+        assert!(WORKFLOW.contains("base-sha: ${{ steps.classify.outputs.base-sha }}"));
+        let base_check = isolated::command("bash")
+            .arg("-c")
+            .arg(workflow_script("Verify publication base identity"))
+            .env("BASE_SHA", &base)
+            .env("EXPECTED_BASE_SHA", &base)
+            .output()
+            .unwrap();
+        assert!(
+            base_check.status.success(),
+            "no-change classification must retain its publication base"
+        );
         assert_eq!(presentation["disposition"], expected_disposition);
         let body = fs::read_to_string(report_dir.join("pull-request.md")).unwrap();
         assert!(body.contains(expected_copy), "body:\n{body}");

@@ -4,13 +4,17 @@ on:
   workflow_call:
     inputs:
       runner:
-        description: Linux runner label for repository preparation and validation; publication uses a fresh hosted runner
+        description: Linux runner label for repository preparation and validation
         type: string
         default: ubuntu-24.04
       publish:
         description: Publish or clean up the rolling remediation pull request
         type: boolean
         default: false
+      publisher-runner:
+        description: Fresh isolated publication runner; self-hosted runners require disposable guests and administrator-enforced admission
+        type: string
+        default: ubuntu-24.04
       upd-version:
         description: Exact released upd version; empty follows the verified release manifest
         type: string
@@ -687,9 +691,9 @@ jobs:
       (needs.generate.outputs.disposition == 'clean_changed' ||
        needs.generate.outputs.disposition == 'partial_changed' ||
        needs.generate.outputs.disposition == 'clean_no_change')
-    # Fresh hosted infrastructure keeps dependency code persisted on a custom
-    # build runner away from OIDC and the App installation token.
-    runs-on: ubuntu-24.04
+    # This input is independent of the build runner and build-controlled outputs.
+    # Custom publishers must enforce admission and discard their guest per job.
+    runs-on: ${{ inputs.publisher-runner }}
     timeout-minutes: 10
     permissions:
       actions: read
@@ -710,6 +714,17 @@ jobs:
         with:
           name: upd-security-remediation-${{ github.run_id }}
           path: ${{ runner.temp }}/upd-security-remediation
+
+      - name: Verify publication base identity
+        env:
+          BASE_SHA: ${{ needs.generate.outputs.base-sha }}
+          EXPECTED_BASE_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          if [[ "$BASE_SHA" != "$EXPECTED_BASE_SHA" ]]; then
+            echo "Build proposal base differs from the signed caller commit; retry on the current default branch" >&2
+            exit 2
+          fi
 
       - name: Verify and stage the proposal
         env:
@@ -753,6 +768,10 @@ jobs:
               exit 2
             fi
             for path in "${paths[@]}"; do
+              if [[ "$path" == .github/workflows/* ]]; then
+                echo "Security remediation cannot publish workflow source" >&2
+                exit 2
+              fi
               if [[ -z "${allowlist[$path]:-}" ]]; then
                 echo "Unexpected staged path: $path" >&2
                 exit 2
@@ -799,17 +818,17 @@ jobs:
           broker_request="$RUNNER_TEMP/upd-broker-request.json"
           broker_response="$RUNNER_TEMP/upd-broker-response.json"
           trap 'rm -f "$oidc_response" "$broker_request" "$broker_response"' EXIT
-          curl --silent --show-error --fail --get \
-            --header "Authorization: Bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+          printf 'Authorization: Bearer %s\n' "$ACTIONS_ID_TOKEN_REQUEST_TOKEN" | \
+            curl --silent --show-error --fail --get \
+            --header @- \
             --data-urlencode "audience=$BROKER_AUDIENCE" \
             --output "$oidc_response" \
             "$ACTIONS_ID_TOKEN_REQUEST_URL"
           oidc_token="$(jq --exit-status --raw-output '.value | strings | select(length > 0)' "$oidc_response")"
           echo "::add-mask::$oidc_token"
-          jq --null-input \
-            --arg oidc_token "$oidc_token" \
+          OIDC_TOKEN="$oidc_token" jq --null-input \
             '{
-              oidc_token: $oidc_token,
+              oidc_token: env.OIDC_TOKEN,
               permissions: {contents: "write", pull_requests: "write"}
             }' > "$broker_request"
           status="$(curl --silent --show-error \
@@ -981,6 +1000,19 @@ jobs:
           echo "url=$pr_url" >> "$output_file"
           echo "Security remediation pull request: $pr_url" >> "$summary_file"
           echo "Published commit: $commit_sha" >> "$summary_file"
+
+      - name: Revoke publication token
+        if: ${{ always() && steps.broker-token.outputs.token != '' }}
+        env:
+          GH_TOKEN: ${{ steps.broker-token.outputs.token }}
+        run: |
+          set -euo pipefail
+          printf 'Authorization: Bearer %s\n' "$GH_TOKEN" | \
+            curl --silent --show-error --fail --retry 3 \
+            --request DELETE \
+            --header @- \
+            --header "Accept: application/vnd.github+json" \
+            --output /dev/null https://api.github.com/installation/token
 
   enforce:
     name: Enforce remediation outcome

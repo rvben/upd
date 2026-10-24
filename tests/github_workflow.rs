@@ -1665,6 +1665,7 @@ fn validated_proposal_crosses_the_job_boundary_as_one_commit() {
     let restore = isolated::command("bash")
         .arg("-c")
         .arg(workflow_script("Restore validated proposal"))
+        .env("PROPOSAL_DIR", &fixture.runner_temp)
         .current_dir(&fixture.checkout)
         .env("BASE_SHA", &base)
         .env("BRANCH", BRANCH)
@@ -1743,6 +1744,7 @@ fn isolated_publisher_rejects_a_merge_commit_bundle() {
     let restore = isolated::command("bash")
         .arg("-c")
         .arg(workflow_script("Restore validated proposal"))
+        .env("PROPOSAL_DIR", &fixture.runner_temp)
         .current_dir(&fixture.checkout)
         .env("BASE_SHA", &base)
         .env("BRANCH", BRANCH)
@@ -1976,11 +1978,22 @@ fn publisher_waits_for_visibility_after_a_successful_create_without_recreating()
 }
 
 #[test]
-fn publisher_credentials_are_isolated_on_fresh_hosted_runners() {
+fn publisher_credentials_are_isolated_from_dependency_runners() {
     let remediation = include_str!("../.github/workflows/dependency-remediation.yml");
     for workflow in [WORKFLOW, remediation] {
         let (preamble, body) = workflow.split_once("\njobs:\n").unwrap();
         assert!(!preamble.contains("id-token: write"));
+        assert!(preamble.contains("      publisher-runner:\n"));
+        let publisher_input = preamble.split_once("      publisher-runner:\n").unwrap().1;
+        assert!(
+            publisher_input
+                .split_once("      upd-version:")
+                .unwrap()
+                .0
+                .contains("default: ubuntu-24.04")
+        );
+        assert!(workflow.contains("if: ${{ always() && steps.broker-token.outputs.token != '' }}"));
+        assert!(workflow.contains("https://api.github.com/installation/token"));
         let mut jobs: Vec<(&str, String)> = Vec::new();
         for line in body.lines() {
             if line.starts_with("  ") && !line.starts_with("   ") && line.ends_with(':') {
@@ -2003,12 +2016,205 @@ fn publisher_credentials_are_isolated_on_fresh_hosted_runners() {
             assert!(
                 header
                     .lines()
-                    .any(|line| line.trim() == "runs-on: ubuntu-24.04"),
-                "publisher must not reuse a self-hosted runner that executed dependency code"
+                    .any(|line| line.trim() == "runs-on: ${{ inputs.publisher-runner }}"),
+                "publisher routing must use only the dedicated caller input"
             );
             assert!(header.contains("id-token: write"));
             assert!(!header.contains("contents: write"));
             assert!(!header.contains("pull-requests: write"));
         }
     }
+}
+
+#[test]
+fn publisher_askpass_is_removed_when_push_fails_and_control_detects_missing_trap() {
+    let script = workflow_script("Publish rolling pull request");
+    let start = script.find("git_push() (").unwrap();
+    let end = script[start..].find("\n)\n").unwrap() + start + 2;
+    let function = &script[start..end];
+    for (mutated, push_status) in [(false, 0), (false, 1), (true, 1)] {
+        let temp = TempDir::new().unwrap();
+        let bin = temp.path().join("bin");
+        fs::create_dir(&bin).unwrap();
+        write_executable(
+            &bin.join("git"),
+            &format!("#!/bin/sh\nexit {push_status}\n"),
+        );
+        let function = if mutated {
+            function.replace("  trap 'rm -f \"$askpass\"' EXIT\n", "")
+        } else {
+            function.to_string()
+        };
+        let output = isolated::command("bash")
+            .arg("-c")
+            .arg(format!(
+                "set -euo pipefail\n{function}\ngit_push origin test\n"
+            ))
+            .env("RUNNER_TEMP", temp.path())
+            .env("GH_TOKEN", "fixture-token")
+            .env(
+                "PATH",
+                format!("{}:{}", bin.display(), std::env::var("PATH").unwrap()),
+            )
+            .output()
+            .unwrap();
+        assert_eq!(output.status.success(), push_status == 0);
+        assert_eq!(
+            temp.path().join("upd-write-askpass").exists(),
+            mutated,
+            "cleanup control must detect a removed EXIT trap"
+        );
+    }
+}
+
+#[test]
+fn publisher_revocation_propagates_failures_without_printing_the_token() {
+    let script = workflow_script("Revoke publication token");
+    let remediation = include_str!("../.github/workflows/dependency-remediation.yml");
+    let cleanup = remediation
+        .split_once("      - name: Revoke publication token\n")
+        .unwrap()
+        .1
+        .split_once("        run: |\n")
+        .unwrap()
+        .1
+        .split_once("\n  enforce:")
+        .unwrap()
+        .0;
+    let cleanup = cleanup
+        .lines()
+        .map(|line| line.strip_prefix("          ").unwrap_or(line))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert_eq!(
+        cleanup.trim_end(),
+        script.trim_end(),
+        "both publisher jobs must revoke identically"
+    );
+    for status in [0, 22] {
+        let temp = TempDir::new().unwrap();
+        let bin = temp.path().join("bin");
+        fs::create_dir(&bin).unwrap();
+        write_executable(
+            &bin.join("curl"),
+            &format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$RUNNER_TEMP/request\"\ncat > \"$RUNNER_TEMP/headers\"\nexit {status}\n"
+            ),
+        );
+        let output = isolated::command("bash")
+            .arg("-c")
+            .arg(&script)
+            .env("GH_TOKEN", "fixture-token")
+            .env("RUNNER_TEMP", temp.path())
+            .env(
+                "PATH",
+                format!("{}:{}", bin.display(), std::env::var("PATH").unwrap()),
+            )
+            .output()
+            .unwrap();
+        assert_eq!(output.status.success(), status == 0);
+        let request = fs::read_to_string(temp.path().join("request")).unwrap();
+        assert!(request.contains("DELETE"));
+        assert!(request.contains("https://api.github.com/installation/token"));
+        assert!(!request.contains("fixture-token"));
+        assert!(request.contains("@-"));
+        assert!(
+            fs::read_to_string(temp.path().join("headers"))
+                .unwrap()
+                .contains("Authorization: Bearer fixture-token")
+        );
+        assert!(!String::from_utf8_lossy(&output.stdout).contains("fixture-token"));
+        assert!(!String::from_utf8_lossy(&output.stderr).contains("fixture-token"));
+    }
+}
+
+#[test]
+fn publisher_enforces_caller_paths_and_action_reference_only_workflow_changes() {
+    let output = isolated::command("python3")
+        .arg(Path::new(env!("CARGO_MANIFEST_DIR")).join("scripts/test_publication_policy.py"))
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn publisher_rejects_a_build_selected_base_outside_the_caller_commit() {
+    let script = workflow_script("Verify publication base identity");
+    for (base, accepted) in [("a", true), ("b", false)] {
+        let output = isolated::command("bash")
+            .arg("-c")
+            .arg(&script)
+            .env("BASE_SHA", base)
+            .env("EXPECTED_BASE_SHA", "a")
+            .output()
+            .unwrap();
+        assert_eq!(output.status.success(), accepted);
+    }
+    let remediation = include_str!("../.github/workflows/dependency-remediation.yml");
+    assert!(remediation.contains("EXPECTED_BASE_SHA: ${{ github.sha }}"));
+    assert!(remediation.contains("if [[ \"$BASE_SHA\" != \"$EXPECTED_BASE_SHA\" ]]"));
+}
+
+#[test]
+fn dependency_validation_cannot_hide_an_edit_in_the_index() {
+    let fixture = Fixture::new();
+    let record = isolated::command("bash")
+        .arg("-c")
+        .arg(workflow_script(
+            "Record proposal before repository validation",
+        ))
+        .current_dir(&fixture.checkout)
+        .env("RUNNER_TEMP", &fixture.runner_temp)
+        .output()
+        .unwrap();
+    assert!(record.status.success());
+    fs::write(
+        fixture.checkout.join("injected.txt"),
+        "validation staged this\n",
+    )
+    .unwrap();
+    git(&fixture.checkout, &["add", "injected.txt"]);
+    let check = isolated::command("bash")
+        .arg("-c")
+        .arg(workflow_script(
+            "Verify validation did not mutate the proposal",
+        ))
+        .current_dir(&fixture.checkout)
+        .env("RUNNER_TEMP", &fixture.runner_temp)
+        .output()
+        .unwrap();
+    assert!(!check.status.success());
+    assert!(
+        String::from_utf8_lossy(&check.stderr).contains("Validation changed the proposal or index")
+    );
+}
+
+#[test]
+fn no_change_dependency_run_still_records_its_publication_base() {
+    let fixture = Fixture::new();
+    let output = fixture.runner_temp.join("base-output");
+    let record = isolated::command("bash")
+        .arg("-c")
+        .arg(workflow_script(
+            "Rebuild rolling branch from the default branch",
+        ))
+        .current_dir(&fixture.checkout)
+        .env("RUNNER_TEMP", &fixture.runner_temp)
+        .env("GITHUB_OUTPUT", &output)
+        .env("BASE_BRANCH", "main")
+        .env("BRANCH", BRANCH)
+        .env("READ_TOKEN", "fixture-token")
+        .output()
+        .unwrap();
+    assert!(
+        record.status.success(),
+        "{}",
+        String::from_utf8_lossy(&record.stderr)
+    );
+    assert!(fs::read_to_string(output).unwrap().contains("base-sha="));
+    assert!(WORKFLOW.contains("base-sha: ${{ steps.branch.outputs.base-sha }}"));
 }
