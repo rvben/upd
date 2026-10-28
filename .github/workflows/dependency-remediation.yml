@@ -813,35 +813,57 @@ jobs:
         run: |
           set -euo pipefail
           set +x
+          if [[ "$BROKER_URL" != https://* || -z "$BROKER_AUDIENCE" ]]; then
+            echo "The hosted broker URL must be HTTPS and its audience must not be empty" >&2
+            exit 4
+          fi
           umask 077
           oidc_response="$RUNNER_TEMP/upd-oidc-response.json"
           broker_request="$RUNNER_TEMP/upd-broker-request.json"
           broker_response="$RUNNER_TEMP/upd-broker-response.json"
           trap 'rm -f "$oidc_response" "$broker_request" "$broker_response"' EXIT
-          printf 'Authorization: Bearer %s\n' "$ACTIONS_ID_TOKEN_REQUEST_TOKEN" | \
-            curl --silent --show-error --fail --get \
-            --header @- \
-            --data-urlencode "audience=$BROKER_AUDIENCE" \
-            --output "$oidc_response" \
-            "$ACTIONS_ID_TOKEN_REQUEST_URL"
-          oidc_token="$(jq --exit-status --raw-output '.value | strings | select(length > 0)' "$oidc_response")"
-          echo "::add-mask::$oidc_token"
-          OIDC_TOKEN="$oidc_token" jq --null-input \
-            '{
-              oidc_token: env.OIDC_TOKEN,
-              permissions: {contents: "write", pull_requests: "write"}
-            }' > "$broker_request"
-          status="$(curl --silent --show-error \
-            --request POST \
-            --header 'Content-Type: application/json' \
-            --data-binary "@$broker_request" \
-            --output "$broker_response" \
-            --write-out '%{http_code}' \
-            "$BROKER_URL")"
-          if [[ "$status" != 200 ]]; then
-            echo "The upd token broker rejected the request (HTTP $status)" >&2
-            exit 4
-          fi
+          # The broker consumes each OIDC jti once, including failed upstream
+          # requests. Never retry a POST with the same identity token.
+          for attempt in 1 2 3; do
+            printf 'Authorization: Bearer %s\n' "$ACTIONS_ID_TOKEN_REQUEST_TOKEN" | \
+              curl --silent --show-error --fail --get \
+              --connect-timeout 10 --max-time 30 --retry 2 --retry-max-time 60 \
+              --header @- \
+              --data-urlencode "audience=$BROKER_AUDIENCE" \
+              --output "$oidc_response" \
+              "$ACTIONS_ID_TOKEN_REQUEST_URL"
+            oidc_token="$(jq --exit-status --raw-output '.value | strings | select(length > 0)' "$oidc_response")"
+            echo "::add-mask::$oidc_token"
+            OIDC_TOKEN="$oidc_token" jq --null-input \
+              '{
+                oidc_token: env.OIDC_TOKEN,
+                permissions: {contents: "write", pull_requests: "write"}
+              }' > "$broker_request"
+            curl_status=0
+            status="$(curl --silent --show-error \
+              --connect-timeout 10 --max-time 45 \
+              --request POST \
+              --header 'Content-Type: application/json' \
+              --data-binary "@$broker_request" \
+              --output "$broker_response" \
+              --write-out '%{http_code}' \
+              "$BROKER_URL")" || curl_status=$?
+            if [[ "$curl_status" -eq 0 && "$status" == 200 ]]; then
+              break
+            fi
+            retryable=false
+            if [[ "$curl_status" -eq 0 ]]; then
+              case "$status" in 429|500|502|503|504) retryable=true ;; esac
+            else
+              case "$curl_status" in 6|7|18|28|52|55|56) retryable=true ;; esac
+            fi
+            if [[ "$retryable" != true || "$attempt" -eq 3 ]]; then
+              echo "The upd token broker request failed (HTTP $status, curl $curl_status)" >&2
+              exit 4
+            fi
+            echo "Transient token broker failure (HTTP $status, curl $curl_status); retrying with fresh identity" >&2
+            sleep "$((attempt * 2))"
+          done
           token="$(jq --exit-status --raw-output '.token | strings | select(length > 0)' "$broker_response")"
           echo "::add-mask::$token"
           echo "token=$token" >> "$GITHUB_OUTPUT"
