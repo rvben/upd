@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.18.1](https://github.com/rvben/upd/compare/v0.18.0...v0.18.1) - 2026-10-28
+
+### Fixed
+
+- **ci**: retry transient broker failures with fresh identity tokens ([192f1b1](https://github.com/rvben/upd/commit/192f1b14b02429530cb668b7e9311ec90d810d61))
+
 ## [0.18.0](https://github.com/rvben/upd/compare/v0.17.6...v0.18.0) - 2026-10-24
 
 ### Changed
