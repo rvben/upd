@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.18.2](https://github.com/rvben/upd/compare/v0.18.1...v0.18.2) - 2026-11-02
+
+### Added
+
+- **gitlab**: add opt-in merge request approval overrides ([ff85f96](https://github.com/rvben/upd/commit/ff85f9620807157a10740608a34d34020b7650ee))
+
+### Fixed
+
+- **ci**: require manual review for breaking dependency updates ([153d3cb](https://github.com/rvben/upd/commit/153d3cb5f3911522fab45f7f115e11190df31046))
+- **deps**: remediate vulnerable Rust dependencies with upd (#46) ([c5f6c7d](https://github.com/rvben/upd/commit/c5f6c7d44473fb3470347ee79664a66e856fc45d))
+
 ## [0.18.1](https://github.com/rvben/upd/compare/v0.18.0...v0.18.1) - 2026-10-28
 
 ### Fixed
