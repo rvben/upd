@@ -45,7 +45,7 @@ const WORK_DIR: &str = "work";
 /// get it at all. `UPD_EXECUTABLE` stays with the runner's own environment,
 /// since it names a program on the machine that runs the job, and
 /// `UPD_LOCK_HANDED_OFF` is set on the one job that reads it.
-const FORWARDED: [&str; 18] = [
+const FORWARDED: [&str; 19] = [
     "UPD_GROUP",
     "UPD_BRANCH",
     "UPD_COMMIT_MESSAGE",
@@ -57,6 +57,7 @@ const FORWARDED: [&str; 18] = [
     "UPD_EXCLUDE",
     "UPD_SHARED_CONFIG",
     "UPD_AUTO_MERGE",
+    "UPD_IGNORE_APPROVALS",
     "UPD_MAJOR_MR",
     "UPD_SECURITY_REMEDIATION",
     "UPD_LOCK",

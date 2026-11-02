@@ -14,6 +14,23 @@ use tempfile::TempDir;
 use wiremock::matchers::{body_partial_json, method, path, path_regex, query_param};
 use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
 
+async fn test_server() -> MockServer {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path_regex(r"/merge_requests/\d+/notes$"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([])))
+        .with_priority(255)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api/v4/projects/1/merge_requests"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([])))
+        .with_priority(255)
+        .mount(&server)
+        .await;
+    server
+}
+
 const TEMPLATE: &str = include_str!("../ci/gitlab-dependency-update.yml");
 const RELEASE_PINS: &str = include_str!("../release-pins.json");
 const BRANCH: &str = "automation/upd-dependencies";
@@ -97,6 +114,7 @@ struct Run {
     /// Exit status the fake updater fails with, before writing anything.
     upd_exit: Option<i32>,
     auto_merge: bool,
+    ignore_approvals: bool,
     lock: String,
     min_age: String,
     max_bump: String,
@@ -150,6 +168,7 @@ impl Default for Run {
             report: String::new(),
             upd_exit: None,
             auto_merge: false,
+            ignore_approvals: false,
             lock: "false".to_string(),
             min_age: "7d".to_string(),
             max_bump: "minor".to_string(),
@@ -410,6 +429,7 @@ fi
             .env("UPD_GIT_NAME", &run.git_name)
             .env("UPD_GIT_EMAIL", &run.git_email)
             .env("UPD_AUTO_MERGE", run.auto_merge.to_string())
+            .env("UPD_IGNORE_APPROVALS", run.ignore_approvals.to_string())
             .env("UPD_EXECUTABLE", &self.updater)
             .env("REAL_UPD", env!("CARGO_BIN_EXE_upd"))
             .env("FAKE_UPD_CHANGE", run.change.to_string())
@@ -564,6 +584,10 @@ impl Respond for MergeRequestHeads {
         let mut body = mr_response(iid, false);
         body["sha"] = json!(remote_tip(&self.0, branch));
         body["detailed_merge_status"] = json!("mergeable");
+        body["source_branch"] = json!(branch);
+        body["source_project_id"] = json!(1);
+        body["target_project_id"] = json!(1);
+        body["author"] = json!({"id": 42});
         ResponseTemplate::new(200).set_body_json(body)
     }
 }
@@ -604,12 +628,12 @@ fn list_mock_for(branch: &str, response: serde_json::Value) -> Mock {
         .and(query_param("source_branch", branch))
         .and(query_param("target_branch", "main"))
         .respond_with(ResponseTemplate::new(200).set_body_json(response))
-        .expect(1)
+        .expect(1..)
 }
 
 #[tokio::test]
 async fn template_creates_a_single_commit_rolling_merge_request() {
-    let server = MockServer::start().await;
+    let server = test_server().await;
     let fixture = Fixture::new();
     list_mock(json!([])).mount(&server).await;
     Mock::given(method("POST"))
@@ -642,7 +666,7 @@ async fn template_creates_a_single_commit_rolling_merge_request() {
 
 #[tokio::test]
 async fn gitlab_presentation_matches_the_contract_and_escapes_untrusted_text() {
-    let server = MockServer::start().await;
+    let server = test_server().await;
     let fixture = Fixture::new();
     list_mock(json!([])).mount(&server).await;
     Mock::given(method("POST"))
@@ -688,7 +712,7 @@ async fn gitlab_presentation_matches_the_contract_and_escapes_untrusted_text() {
 
 #[tokio::test]
 async fn gitlab_presentation_reports_normalized_specifiers_as_changes() {
-    let server = MockServer::start().await;
+    let server = test_server().await;
     let fixture = Fixture::new();
     list_mock(json!([])).mount(&server).await;
     Mock::given(method("POST"))
@@ -734,7 +758,7 @@ async fn gitlab_presentation_reports_normalized_specifiers_as_changes() {
 
 #[tokio::test]
 async fn gitlab_presentation_prioritizes_review_worthy_updates() {
-    let server = MockServer::start().await;
+    let server = test_server().await;
     let fixture = Fixture::new();
     list_mock(json!([])).mount(&server).await;
     Mock::given(method("POST"))
@@ -777,7 +801,7 @@ async fn gitlab_presentation_prioritizes_review_worthy_updates() {
 
 #[tokio::test]
 async fn gitlab_presentation_keeps_unvalidated_patch_updates_truthful() {
-    let server = MockServer::start().await;
+    let server = test_server().await;
     let fixture = Fixture::new();
     list_mock(json!([])).mount(&server).await;
     Mock::given(method("POST"))
@@ -806,7 +830,7 @@ async fn gitlab_presentation_keeps_unvalidated_patch_updates_truthful() {
 
 #[tokio::test]
 async fn gitlab_large_body_fallback_preserves_risk_state() {
-    let server = MockServer::start().await;
+    let server = test_server().await;
     let fixture = Fixture::new();
     list_mock(json!([])).mount(&server).await;
     Mock::given(method("POST"))
@@ -864,7 +888,7 @@ async fn gitlab_large_body_fallback_preserves_risk_state() {
 
 #[tokio::test]
 async fn template_updates_the_rolling_branch_and_enables_sha_bound_automerge() {
-    let create_server = MockServer::start().await;
+    let create_server = test_server().await;
     let fixture = Fixture::new();
     list_mock(json!([])).mount(&create_server).await;
     Mock::given(method("POST"))
@@ -874,7 +898,7 @@ async fn template_updates_the_rolling_branch_and_enables_sha_bound_automerge() {
         .await;
     fixture.run_template(&create_server, true, "first", false);
 
-    let update_server = MockServer::start().await;
+    let update_server = test_server().await;
     list_mock(mr_list_response(7, false))
         .mount(&update_server)
         .await;
@@ -900,7 +924,7 @@ async fn template_updates_the_rolling_branch_and_enables_sha_bound_automerge() {
 
 #[tokio::test]
 async fn template_closes_an_obsolete_merge_request_and_deletes_its_branch() {
-    let create_server = MockServer::start().await;
+    let create_server = test_server().await;
     let fixture = Fixture::new();
     list_mock(json!([])).mount(&create_server).await;
     Mock::given(method("POST"))
@@ -910,7 +934,7 @@ async fn template_closes_an_obsolete_merge_request_and_deletes_its_branch() {
         .await;
     fixture.run_template(&create_server, true, "new", false);
 
-    let cleanup_server = MockServer::start().await;
+    let cleanup_server = test_server().await;
     list_mock(mr_list_response(7, false))
         .mount(&cleanup_server)
         .await;
@@ -928,7 +952,7 @@ async fn template_closes_an_obsolete_merge_request_and_deletes_its_branch() {
 
 #[tokio::test]
 async fn template_preserves_human_commits_even_when_no_updates_remain() {
-    let create_server = MockServer::start().await;
+    let create_server = test_server().await;
     let fixture = Fixture::new();
     list_mock(json!([])).mount(&create_server).await;
     Mock::given(method("POST"))
@@ -955,7 +979,7 @@ async fn template_preserves_human_commits_even_when_no_updates_remain() {
         .trim()
         .to_string();
 
-    let paused_server = MockServer::start().await;
+    let paused_server = test_server().await;
     let mut existing = mr_list_response(7, false);
     existing[0]["description"] = json!("Existing review evidence");
     list_mock(existing).mount(&paused_server).await;
@@ -968,7 +992,7 @@ async fn template_preserves_human_commits_even_when_no_updates_remain() {
 
     fixture.run_template(&paused_server, true, "second", false);
 
-    let cleanup_server = MockServer::start().await;
+    let cleanup_server = test_server().await;
     let mut paused_mr = mr_list_response(7, false);
     paused_mr[0]["description"] = json!(
         "Existing review evidence\n\n<!-- upd-human-commit-pause -->\n> **Automation paused**"
@@ -1011,7 +1035,7 @@ async fn template_does_not_adopt_a_single_human_commit_as_its_own() {
         .trim()
         .to_string();
 
-    let server = MockServer::start().await;
+    let server = test_server().await;
     let mut existing = mr_list_response(7, false);
     existing[0]["description"] = json!("Human review work");
     list_mock(existing).mount(&server).await;
@@ -1108,7 +1132,7 @@ async fn assert_lane_matches_golden(case: &str, run: Run, major: bool) -> String
     } else {
         (BRANCH, "upd-")
     };
-    let server = MockServer::start().await;
+    let server = test_server().await;
     let fixture = Fixture::new();
     list_mock(json!([])).mount(&server).await;
     Mock::given(method("POST"))
@@ -1271,7 +1295,7 @@ async fn golden_annotations_only() {
 
 #[tokio::test]
 async fn template_publishes_an_annotation_only_change() {
-    let server = MockServer::start().await;
+    let server = test_server().await;
     let fixture = Fixture::new();
     list_mock(json!([])).mount(&server).await;
     Mock::given(method("POST"))
@@ -1469,7 +1493,7 @@ fn describe(output: &Output) -> String {
 }
 
 async fn create_rolling_branch(fixture: &Fixture, content: &str) {
-    let server = MockServer::start().await;
+    let server = test_server().await;
     list_mock(json!([])).mount(&server).await;
     Mock::given(method("POST"))
         .and(path("/api/v4/projects/1/merge_requests"))
@@ -1543,7 +1567,7 @@ async fn template_commits_as_the_automation_identity() {
 
 #[tokio::test]
 async fn template_does_nothing_when_clean_and_no_branch_exists() {
-    let server = MockServer::start().await;
+    let server = test_server().await;
     let fixture = Fixture::new();
     list_mock(json!([])).mount(&server).await;
 
@@ -1561,7 +1585,7 @@ async fn template_does_nothing_when_clean_and_no_branch_exists() {
 
 #[tokio::test]
 async fn template_refuses_duplicate_merge_requests_when_publishing() {
-    let server = MockServer::start().await;
+    let server = test_server().await;
     let fixture = Fixture::new();
     let mut duplicates = mr_list_response(7, false);
     duplicates
@@ -1581,7 +1605,7 @@ async fn template_refuses_duplicate_merge_requests_when_cleaning_up() {
     let fixture = Fixture::new();
     create_rolling_branch(&fixture, "new").await;
     let tip = fixture.remote_tip();
-    let server = MockServer::start().await;
+    let server = test_server().await;
     let mut duplicates = mr_list_response(7, false);
     duplicates
         .as_array_mut()
@@ -1613,6 +1637,9 @@ struct PushWhileListing {
 
 impl wiremock::Respond for PushWhileListing {
     fn respond(&self, _: &wiremock::Request) -> ResponseTemplate {
+        if self.racer.exists() {
+            return ResponseTemplate::new(200).set_body_json(self.response.clone());
+        }
         git(
             self.remote.parent().unwrap(),
             &[
@@ -1649,7 +1676,7 @@ async fn cleanup_leaves_the_merge_request_open_when_a_human_pushes_first() {
     let fixture = Fixture::new();
     create_rolling_branch(&fixture, "new").await;
     let racer = fixture._temp.path().join("racer");
-    let server = MockServer::start().await;
+    let server = test_server().await;
     Mock::given(method("GET"))
         .and(path("/api/v4/projects/1/merge_requests"))
         .respond_with(PushWhileListing {
@@ -1683,7 +1710,7 @@ async fn cleanup_leaves_the_merge_request_open_when_a_human_pushes_first() {
 async fn assert_cancels_previous_auto_merge(existing: serde_json::Value) {
     let fixture = Fixture::new();
     create_rolling_branch(&fixture, "first").await;
-    let server = MockServer::start().await;
+    let server = test_server().await;
     list_mock(json!([existing.clone()])).mount(&server).await;
     Mock::given(method("PUT"))
         .and(path("/api/v4/projects/1/merge_requests/7"))
@@ -1724,9 +1751,466 @@ async fn template_cancels_auto_merge_reported_by_the_current_field() {
     .await;
 }
 
+/// A stateful approval API: reads reflect writes, including the durable journal.
+#[derive(Clone)]
+struct ApprovalApi(
+    std::sync::Arc<std::sync::Mutex<(serde_json::Value, Vec<serde_json::Value>)>>,
+    bool,
+);
+
+impl ApprovalApi {
+    fn new(recovery: bool) -> Self {
+        let rule = json!({"id":9,"name":"any approver","rule_type":"any_approver",
+            "approvals_required":if recovery {0} else {2},"users":[],"groups":[],
+            "contains_hidden_groups":false,"source_rule":null});
+        let notes = if recovery {
+            vec![
+                json!({"id":1,"author":{"id":42},"body":format!("upd approval override recovery v1\n{}",json!({
+                "project":1,"iid":7,"branch":BRANCH,"actor":42,"active":true,"native_before":false,
+                "rules":[{"id":9,"name":"any approver","rule_type":"any_approver","approvals_required":2,
+                    "user_ids":[],"group_ids":[],"source_required":null,"project_rule_id":null}]}))}),
+            ]
+        } else {
+            Vec::new()
+        };
+        Self(
+            std::sync::Arc::new(std::sync::Mutex::new((rule, notes))),
+            false,
+        )
+    }
+    async fn mount(&self, server: &MockServer) {
+        Mock::given(path_regex(r"^/api/v4/(user$|projects/1/approvals$|projects/1/merge_requests/7/(notes|approval_rules|approval_state|cancel_merge_when_pipeline_succeeds))"))
+            .respond_with(self.clone()).with_priority(1).mount(server).await;
+    }
+}
+
+impl Respond for ApprovalApi {
+    fn respond(&self, request: &Request) -> ResponseTemplate {
+        let mut state = self.0.lock().unwrap();
+        let path = request.url.path();
+        let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap_or_default();
+        let ok = |value| ResponseTemplate::new(200).set_body_json(value);
+        if request.method == "GET" {
+            if path == "/api/v4/user" {
+                return ok(json!({"id":42}));
+            }
+            if path.ends_with("/approvals") {
+                return ok(json!({"disable_overriding_approvers_per_merge_request":self.1}));
+            }
+            if path.ends_with("/approval_state") {
+                return ok(json!({"approval_rules_overwritten":!self.1,"rules":[state.0]}));
+            }
+            if path.ends_with("/approval_rules") {
+                return ok(json!([state.0]));
+            }
+            if path.ends_with("/notes") {
+                return ok(json!(state.1));
+            }
+            if path.contains("/notes/") {
+                return ok(state.1[0].clone());
+            }
+        }
+        if request.method == "POST" && path.ends_with("/notes") {
+            let note = json!({"id":state.1.len()+1,"author":{"id":42},"body":body["body"]});
+            state.1.push(note.clone());
+            return ok(note);
+        }
+        if request.method == "PUT" && path.contains("/notes/") {
+            state.1[0]["body"] = body["body"].clone();
+            return ok(state.1[0].clone());
+        }
+        if request.method == "PUT" && path.ends_with("/approval_rules/9") {
+            state.0["approvals_required"] = body["approvals_required"].clone();
+            return ok(state.0.clone());
+        }
+        if request.method == "POST" && path.ends_with("/cancel_merge_when_pipeline_succeeds") {
+            return ok(json!({}));
+        }
+        ResponseTemplate::new(404)
+    }
+}
+
+#[tokio::test]
+async fn template_lowers_approvals_before_arming_auto_merge() {
+    let server = test_server().await;
+    let approvals = ApprovalApi::new(false);
+    approvals.mount(&server).await;
+    let fixture = Fixture::new();
+    fs::write(
+        fixture.checkout.join(".updrc.toml"),
+        "[automation]\nauto_merge = true\nignore_approvals = true\n",
+    )
+    .unwrap();
+    git(&fixture.checkout, &["add", ".updrc.toml"]);
+    git(
+        &fixture.checkout,
+        &["commit", "-m", "test: consent to approval override"],
+    );
+    git(&fixture.checkout, &["push", "origin", "main"]);
+    list_mock(json!([])).mount(&server).await;
+    Mock::given(method("POST"))
+        .and(path("/api/v4/projects/1/merge_requests"))
+        .respond_with(ResponseTemplate::new(201).set_body_json(mr_response(7, false)))
+        .mount(&server)
+        .await;
+    serve_merge_request_heads(&server, &fixture).await;
+    Mock::given(method("PUT"))
+        .and(path("/api/v4/projects/1/merge_requests/7/merge"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(mr_response(7, true)))
+        .expect(1)
+        .mount(&server)
+        .await;
+    fixture.run(
+        &server,
+        &Run {
+            auto_merge: true,
+            ignore_approvals: true,
+            ..Run::default()
+        },
+    );
+    assert_eq!(approvals.0.lock().unwrap().0["approvals_required"], 0);
+    let requests = server.received_requests().await.unwrap();
+    let position = |method: &str, path: &str| {
+        requests
+            .iter()
+            .position(|r| r.method == method && r.url.path() == path)
+            .unwrap()
+    };
+    assert!(
+        position("GET", "/api/v4/projects/1/merge_requests/7")
+            < position("POST", "/api/v4/projects/1/merge_requests/7/notes")
+    );
+    assert!(
+        position("POST", "/api/v4/projects/1/merge_requests/7/notes")
+            < position(
+                "PUT",
+                "/api/v4/projects/1/merge_requests/7/approval_rules/9"
+            )
+    );
+    assert!(
+        position(
+            "PUT",
+            "/api/v4/projects/1/merge_requests/7/approval_rules/9"
+        ) < position("PUT", "/api/v4/projects/1/merge_requests/7/merge")
+    );
+    // A second identical run must preserve the existing episode and merge train.
+    let before = requests.len();
+    let mut existing = listed(
+        fixture.presentation()["title"].as_str().unwrap(),
+        &fixture.description(),
+        true,
+    );
+    existing[0]["author"] = json!({"id":42});
+    existing[0]["source_branch"] = json!(BRANCH);
+    existing[0]["source_project_id"] = json!(1);
+    existing[0]["target_project_id"] = json!(1);
+    Mock::given(method("GET"))
+        .and(path("/api/v4/projects/1/merge_requests"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(existing))
+        .with_priority(1)
+        .mount(&server)
+        .await;
+    let mut head = mr_response(7, true);
+    head["sha"] = json!(fixture.remote_tip().unwrap());
+    head["detailed_merge_status"] = json!("mergeable");
+    head["author"] = json!({"id":42});
+    head["source_branch"] = json!(BRANCH);
+    head["source_project_id"] = json!(1);
+    head["target_project_id"] = json!(1);
+    head["should_remove_source_branch"] = json!(true);
+    Mock::given(method("GET"))
+        .and(path("/api/v4/projects/1/merge_requests/7"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(head))
+        .with_priority(1)
+        .mount(&server)
+        .await;
+    fixture.run(
+        &server,
+        &Run {
+            auto_merge: true,
+            ignore_approvals: true,
+            ..Run::default()
+        },
+    );
+    assert_eq!(approvals.0.lock().unwrap().1.len(), 1);
+    let after = server.received_requests().await.unwrap();
+    assert!(
+        only_reads(&after[before..]),
+        "an unchanged override wrote to GitLab: {:?}",
+        writes(&after[before..])
+    );
+    // The unchanged run leaves the already-proposed update staged locally.
+    git(&fixture.checkout, &["reset", "--hard", "--quiet"]);
+    Mock::given(method("PUT"))
+        .and(path("/api/v4/projects/1/merge_requests/7"))
+        .and(body_partial_json(json!({"state_event":"close"})))
+        .respond_with(ResponseTemplate::new(200).set_body_json(mr_response(7, false)))
+        .expect(1)
+        .mount(&server)
+        .await;
+    fixture.run(
+        &server,
+        &Run {
+            change: false,
+            auto_merge: true,
+            ignore_approvals: true,
+            ..Run::default()
+        },
+    );
+    {
+        let state = approvals.0.lock().unwrap();
+        assert_eq!(state.0["approvals_required"], 2);
+        assert!(
+            state.1[0]["body"]
+                .as_str()
+                .unwrap()
+                .contains("\"active\":false")
+        );
+    }
+    assert!(fixture.remote_tip().is_none());
+    let requests = server.received_requests().await.unwrap();
+    let restored = requests
+        .iter()
+        .rposition(|request| {
+            request.method == "PUT"
+                && request.url.path().ends_with("/approval_rules/9")
+                && request.body_json::<serde_json::Value>().unwrap()["approvals_required"] == 2
+        })
+        .unwrap();
+    let closed = requests
+        .iter()
+        .position(|request| {
+            request.method == "PUT"
+                && request.url.path().ends_with("/merge_requests/7")
+                && request.body_json::<serde_json::Value>().unwrap()["state_event"] == "close"
+        })
+        .unwrap();
+    assert!(restored < closed, "restore approvals before closing the MR");
+}
+
+#[tokio::test]
+async fn template_recovers_before_updater_or_validation_failure_and_on_paused_branches() {
+    for (paused, auto_merge, updater_failure, validation_failure) in [
+        (false, false, false, false),
+        (false, true, false, false),
+        (true, true, false, false),
+        (false, true, true, false),
+        (false, true, false, true),
+    ] {
+        let server = test_server().await;
+        let approvals = ApprovalApi::new(true);
+        approvals.mount(&server).await;
+        let fixture = Fixture::new();
+        let human_tip = if paused {
+            create_rolling_branch(&fixture, "first").await;
+            Some(push_human_commit(&fixture))
+        } else {
+            None
+        };
+        let mut existing = mr_response(7, true);
+        existing["description"] = json!("Reviewer replaced the entire description");
+        existing["source_branch"] = json!(BRANCH);
+        existing["source_project_id"] = json!(1);
+        existing["target_project_id"] = json!(1);
+        existing["author"] = json!({"id":42});
+        list_mock(json!([existing])).mount(&server).await;
+        Mock::given(method("PUT"))
+            .and(path("/api/v4/projects/1/merge_requests/7"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(mr_response(7, true)))
+            .mount(&server)
+            .await;
+        if auto_merge && !paused && !updater_failure && !validation_failure {
+            serve_merge_request_heads(&server, &fixture).await;
+            Mock::given(method("PUT"))
+                .and(path("/api/v4/projects/1/merge_requests/7/merge"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(mr_response(7, true)))
+                .expect(1)
+                .mount(&server)
+                .await;
+        }
+        let output = fixture.execute(
+            &server,
+            &Run {
+                auto_merge,
+                upd_exit: updater_failure.then_some(1),
+                validation_command: if validation_failure {
+                    "exit 1".into()
+                } else {
+                    String::new()
+                },
+                ..Run::default()
+            },
+        );
+        assert_eq!(
+            output.status.success(),
+            !updater_failure && !validation_failure,
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        {
+            let state = approvals.0.lock().unwrap();
+            assert_eq!(state.0["approvals_required"], 2);
+            assert!(
+                state.1[0]["body"]
+                    .as_str()
+                    .unwrap()
+                    .contains("\"active\":false")
+            );
+        }
+        let requests = server.received_requests().await.unwrap();
+        let cancelled = requests
+            .iter()
+            .position(|r| {
+                r.url
+                    .path()
+                    .ends_with("/cancel_merge_when_pipeline_succeeds")
+            })
+            .unwrap();
+        let restored = requests
+            .iter()
+            .position(|r| r.method == "PUT" && r.url.path().ends_with("/approval_rules/9"))
+            .unwrap();
+        assert!(cancelled < restored);
+        if let Some(armed) = requests
+            .iter()
+            .position(|r| r.url.path().ends_with("/merge"))
+        {
+            assert!(restored < armed);
+        }
+        if paused {
+            assert_eq!(fixture.remote_tip(), human_tip);
+        }
+    }
+}
+
+#[tokio::test]
+async fn an_unavailable_or_unneeded_override_does_not_rearm_an_unchanged_merge_request() {
+    for (kind, count, status) in [
+        ("code_owner", 2, "policy_denied"),
+        ("any_approver", 0, "already_zero"),
+    ] {
+        let server = test_server().await;
+        let approvals = ApprovalApi::new(false);
+        {
+            let mut state = approvals.0.lock().unwrap();
+            state.0["rule_type"] = json!(kind);
+            state.0["approvals_required"] = json!(count);
+        }
+        approvals.mount(&server).await;
+        let fixture = Fixture::new();
+        fs::write(
+            fixture.checkout.join(".updrc.toml"),
+            "[automation]\nauto_merge = true\nignore_approvals = true\n",
+        )
+        .unwrap();
+        git(&fixture.checkout, &["add", ".updrc.toml"]);
+        git(
+            &fixture.checkout,
+            &["commit", "-m", "test: approval consent"],
+        );
+        git(&fixture.checkout, &["push", "origin", "main"]);
+        list_mock(json!([])).mount(&server).await;
+        Mock::given(method("POST"))
+            .and(path("/api/v4/projects/1/merge_requests"))
+            .respond_with(ResponseTemplate::new(201).set_body_json(mr_response(7, false)))
+            .expect(1)
+            .mount(&server)
+            .await;
+        serve_merge_request_heads(&server, &fixture).await;
+        Mock::given(method("PUT"))
+            .and(path("/api/v4/projects/1/merge_requests/7/merge"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(mr_response(7, true)))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let run = Run {
+            auto_merge: true,
+            ignore_approvals: true,
+            ..Run::default()
+        };
+        let first = fixture.execute_upd(&server, &run, &["--output", "json"]);
+        assert_eq!(outcome_of(&first)["approvals"]["status"], status);
+        let before = server.received_requests().await.unwrap().len();
+        let mut existing = listed(
+            fixture.presentation()["title"].as_str().unwrap(),
+            &fixture.description(),
+            true,
+        );
+        existing[0]["author"] = json!({"id":42});
+        existing[0]["source_branch"] = json!(BRANCH);
+        existing[0]["source_project_id"] = json!(1);
+        existing[0]["target_project_id"] = json!(1);
+        Mock::given(method("GET"))
+            .and(path("/api/v4/projects/1/merge_requests"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(existing))
+            .with_priority(1)
+            .mount(&server)
+            .await;
+        fixture.run(&server, &run);
+        let after = server.received_requests().await.unwrap();
+        assert!(
+            only_reads(&after[before..]),
+            "unnecessary writes: {:?}",
+            writes(&after[before..])
+        );
+        assert_eq!(
+            after
+                .iter()
+                .filter(|r| r.method == "PUT" && r.url.path().ends_with("/merge"))
+                .count(),
+            1
+        );
+        assert!(approvals.0.lock().unwrap().1.is_empty());
+    }
+}
+
+#[tokio::test]
+async fn a_project_lock_with_pending_recovery_never_rearms_auto_merge() {
+    let server = test_server().await;
+    let mut approvals = ApprovalApi::new(true);
+    approvals.1 = true;
+    approvals.mount(&server).await;
+    let fixture = Fixture::new();
+    let mut existing = mr_response(7, true);
+    existing["source_branch"] = json!(BRANCH);
+    existing["source_project_id"] = json!(1);
+    existing["target_project_id"] = json!(1);
+    existing["author"] = json!({"id":42});
+    list_mock(json!([existing])).mount(&server).await;
+    Mock::given(method("PUT"))
+        .and(path("/api/v4/projects/1/merge_requests/7"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(mr_response(7, true)))
+        .mount(&server)
+        .await;
+    let output = fixture.execute_upd(
+        &server,
+        &Run {
+            auto_merge: true,
+            ..Run::default()
+        },
+        &["--output", "json"],
+    );
+    let outcome = outcome_of(&output);
+    assert_eq!(outcome["auto_merge"], "disabled");
+    assert_eq!(outcome["approvals"]["status"], "recovery_pending");
+    let requests = server.received_requests().await.unwrap();
+    assert!(requests.iter().any(|r| {
+        r.url
+            .path()
+            .ends_with("/cancel_merge_when_pipeline_succeeds")
+    }));
+    assert!(!requests.iter().any(|r| r.url.path().ends_with("/merge")));
+    assert!(
+        approvals.0.lock().unwrap().1[0]["body"]
+            .as_str()
+            .unwrap()
+            .contains("\"active\":true")
+    );
+}
+
 #[tokio::test]
 async fn template_binds_auto_merge_to_the_pushed_commit() {
-    let server = MockServer::start().await;
+    let server = test_server().await;
     let fixture = Fixture::new();
     list_mock(json!([])).mount(&server).await;
     Mock::given(method("POST"))
@@ -1766,7 +2250,7 @@ async fn template_binds_auto_merge_to_the_pushed_commit() {
 #[tokio::test]
 async fn template_recovers_when_the_push_succeeded_but_merge_request_creation_failed() {
     let fixture = Fixture::new();
-    let failing = MockServer::start().await;
+    let failing = test_server().await;
     list_mock(json!([])).mount(&failing).await;
     Mock::given(method("POST"))
         .and(path("/api/v4/projects/1/merge_requests"))
@@ -1779,7 +2263,7 @@ async fn template_recovers_when_the_push_succeeded_but_merge_request_creation_fa
     assert!(!output.status.success(), "{}", describe(&output));
     assert!(fixture.remote_tip().is_some());
 
-    let retry = MockServer::start().await;
+    let retry = test_server().await;
     list_mock(json!([])).mount(&retry).await;
     Mock::given(method("POST"))
         .and(path("/api/v4/projects/1/merge_requests"))
@@ -1804,7 +2288,7 @@ async fn assert_lease_rejects_a_racing_push(existing_branch: bool, content: &str
     if existing_branch {
         create_rolling_branch(&fixture, "first").await;
     }
-    let server = MockServer::start().await;
+    let server = test_server().await;
 
     let output = fixture.execute(
         &server,
@@ -1821,7 +2305,7 @@ async fn assert_lease_rejects_a_racing_push(existing_branch: bool, content: &str
         .trim()
         .to_string();
     assert_eq!(fixture.remote_tip(), Some(racer_tip));
-    assert!(server.received_requests().await.unwrap().is_empty());
+    assert!(only_reads(&server.received_requests().await.unwrap()));
 }
 
 #[tokio::test]
@@ -1841,7 +2325,7 @@ async fn template_lease_rejects_a_push_racing_branch_creation() {
 
 #[tokio::test]
 async fn template_refuses_to_publish_a_report_with_errors() {
-    let server = MockServer::start().await;
+    let server = test_server().await;
     let fixture = Fixture::new();
     let report = r#"{"command":"update","mode":"applied",
       "files":[{"path":"dependency.txt","file_type":"test","lang":"test",
@@ -1859,12 +2343,12 @@ async fn template_refuses_to_publish_a_report_with_errors() {
 
     assert!(failed_with(&output, 2), "{}", describe(&output));
     assert_eq!(fixture.remote_tip(), None);
-    assert!(server.received_requests().await.unwrap().is_empty());
+    assert!(only_reads(&server.received_requests().await.unwrap()));
 }
 
 #[tokio::test]
 async fn template_stops_when_upd_fails() {
-    let server = MockServer::start().await;
+    let server = test_server().await;
     let fixture = Fixture::new();
 
     let output = fixture.execute(
@@ -1882,12 +2366,12 @@ async fn template_stops_when_upd_fails() {
         describe(&output)
     );
     assert_eq!(fixture.remote_tip(), None);
-    assert!(server.received_requests().await.unwrap().is_empty());
+    assert!(only_reads(&server.received_requests().await.unwrap()));
 }
 
 #[tokio::test]
 async fn template_refuses_a_prepare_command_that_changes_repository_files() {
-    let server = MockServer::start().await;
+    let server = test_server().await;
     let fixture = Fixture::new();
 
     let output = fixture.execute(
@@ -1900,11 +2384,11 @@ async fn template_refuses_a_prepare_command_that_changes_repository_files() {
 
     assert!(failed_with(&output, 2), "{}", describe(&output));
     assert_eq!(fixture.remote_tip(), None);
-    assert!(server.received_requests().await.unwrap().is_empty());
+    assert!(only_reads(&server.received_requests().await.unwrap()));
 }
 
 async fn assert_refuses_dirty_validation(command: &str) {
-    let server = MockServer::start().await;
+    let server = test_server().await;
     let fixture = Fixture::new();
 
     let output = fixture.execute(
@@ -1917,7 +2401,7 @@ async fn assert_refuses_dirty_validation(command: &str) {
 
     assert!(failed_with(&output, 2), "{}", describe(&output));
     assert_eq!(fixture.remote_tip(), None);
-    assert!(server.received_requests().await.unwrap().is_empty());
+    assert!(only_reads(&server.received_requests().await.unwrap()));
 }
 
 #[tokio::test]
@@ -1935,7 +2419,7 @@ async fn template_pause_requires_exactly_one_open_merge_request() {
     let fixture = Fixture::new();
     create_rolling_branch(&fixture, "first").await;
     let human_tip = push_human_commit(&fixture);
-    let server = MockServer::start().await;
+    let server = test_server().await;
     list_mock(json!([])).mount(&server).await;
 
     let output = fixture.execute(&server, &Run::default());
@@ -1950,7 +2434,7 @@ async fn template_pause_refuses_to_overwrite_an_unreadable_description() {
     let fixture = Fixture::new();
     create_rolling_branch(&fixture, "first").await;
     let human_tip = push_human_commit(&fixture);
-    let server = MockServer::start().await;
+    let server = test_server().await;
     let mut existing = mr_list_response(7, false);
     existing[0]["description"] = serde_json::Value::Null;
     list_mock(existing).mount(&server).await;
@@ -1967,7 +2451,7 @@ async fn template_pause_notice_is_published_once() {
     let fixture = Fixture::new();
     create_rolling_branch(&fixture, "first").await;
     let human_tip = push_human_commit(&fixture);
-    let server = MockServer::start().await;
+    let server = test_server().await;
     let mut existing = mr_list_response(7, false);
     existing[0]["description"] =
         json!("Review notes\n\n<!-- upd-human-commit-pause -->\n> **Automation paused**");
@@ -1984,7 +2468,7 @@ async fn template_pause_notice_appends_to_the_existing_description() {
     let fixture = Fixture::new();
     create_rolling_branch(&fixture, "first").await;
     push_human_commit(&fixture);
-    let server = MockServer::start().await;
+    let server = test_server().await;
     let mut existing = mr_list_response(7, false);
     existing[0]["description"] = json!("Review notes");
     list_mock(existing).mount(&server).await;
@@ -2011,14 +2495,14 @@ async fn template_pause_notice_appends_to_the_existing_description() {
 }
 
 async fn assert_rejects_input(run: Run) {
-    let server = MockServer::start().await;
+    let server = test_server().await;
     let fixture = Fixture::new();
 
     let output = fixture.execute(&server, &run);
 
     assert!(failed_with(&output, 4), "{}", describe(&output));
     assert_eq!(fixture.remote_tip(), None);
-    assert!(server.received_requests().await.unwrap().is_empty());
+    assert!(only_reads(&server.received_requests().await.unwrap()));
 }
 
 #[tokio::test]
@@ -2057,7 +2541,7 @@ const TOKEN_ABSENT: &str =
 #[tokio::test]
 async fn repository_commands_and_the_updater_never_see_the_token() {
     let fixture = Fixture::new();
-    let server = MockServer::start().await;
+    let server = test_server().await;
     list_mock(json!([])).mount(&server).await;
     Mock::given(method("POST"))
         .and(path("/api/v4/projects/1/merge_requests"))
@@ -2082,7 +2566,7 @@ async fn repository_commands_and_the_updater_never_see_the_token() {
 #[tokio::test]
 async fn run_reports_its_outcome_as_json() {
     let fixture = Fixture::new();
-    let server = MockServer::start().await;
+    let server = test_server().await;
     list_mock(json!([])).mount(&server).await;
     Mock::given(method("POST"))
         .and(path("/api/v4/projects/1/merge_requests"))
@@ -2122,7 +2606,7 @@ async fn run_reports_its_outcome_as_json() {
 #[tokio::test]
 async fn a_dry_run_reports_the_proposal_without_publishing_it() {
     let fixture = Fixture::new();
-    let server = MockServer::start().await;
+    let server = test_server().await;
     Mock::given(method("GET"))
         .and(path("/api/v4/projects/1/merge_requests"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!([])))
@@ -2148,7 +2632,7 @@ async fn a_dry_run_reports_the_proposal_without_publishing_it() {
 
 #[tokio::test]
 async fn a_dry_run_names_the_cleanup_it_would_do_without_doing_it() {
-    let create_server = MockServer::start().await;
+    let create_server = test_server().await;
     let fixture = Fixture::new();
     list_mock(json!([])).mount(&create_server).await;
     Mock::given(method("POST"))
@@ -2161,7 +2645,7 @@ async fn a_dry_run_names_the_cleanup_it_would_do_without_doing_it() {
         .remote_tip()
         .expect("the first run pushed the branch");
 
-    let server = MockServer::start().await;
+    let server = test_server().await;
     list_mock(mr_list_response(7, false)).mount(&server).await;
     let output = fixture.execute_upd(
         &server,
@@ -2199,7 +2683,7 @@ async fn a_dry_run_names_the_cleanup_it_would_do_without_doing_it() {
 #[tokio::test]
 async fn run_reports_a_missing_setting_as_a_json_input_error() {
     let fixture = Fixture::new();
-    let server = MockServer::start().await;
+    let server = test_server().await;
 
     let mut command = Command::new(env!("CARGO_BIN_EXE_upd"));
     command.args(["gitlab", "run", "--output", "json"]);
@@ -2217,7 +2701,7 @@ async fn run_reports_a_missing_setting_as_a_json_input_error() {
             .contains("UPD_GITLAB_TOKEN"),
         "{error}"
     );
-    assert!(server.received_requests().await.unwrap().is_empty());
+    assert!(only_reads(&server.received_requests().await.unwrap()));
 }
 
 #[tokio::test]
@@ -2237,7 +2721,7 @@ async fn an_unrelated_commit_with_the_automation_identity_pauses() {
     git(&fixture.checkout, &["switch", "main"]);
     let orphan_tip = fixture.remote_tip().unwrap();
 
-    let server = MockServer::start().await;
+    let server = test_server().await;
     let mut existing = mr_list_response(7, false);
     existing[0]["description"] = json!("Review notes");
     list_mock(existing).mount(&server).await;
@@ -2260,7 +2744,7 @@ async fn an_unrelated_commit_with_the_automation_identity_pauses() {
 #[tokio::test]
 async fn changed_paths_are_reported_as_written() {
     let fixture = Fixture::new();
-    let server = MockServer::start().await;
+    let server = test_server().await;
     list_mock(json!([])).mount(&server).await;
     Mock::given(method("POST"))
         .and(path("/api/v4/projects/1/merge_requests"))
@@ -2289,7 +2773,7 @@ async fn the_artifact_directory_is_excluded_once() {
     let exclude = fixture.checkout.join(".git/info/exclude");
     fs::write(&exclude, "# existing rule without a trailing newline").unwrap();
     for _ in 0..2 {
-        let server = MockServer::start().await;
+        let server = test_server().await;
         list_mock(json!([])).mount(&server).await;
         fixture.run(
             &server,
@@ -2315,7 +2799,7 @@ struct Published {
 
 /// Publishes `run` to a fresh branch and merge request 7.
 async fn publish(fixture: &Fixture, run: &Run) -> Published {
-    let server = MockServer::start().await;
+    let server = test_server().await;
     list_mock(json!([])).mount(&server).await;
     Mock::given(method("POST"))
         .and(path("/api/v4/projects/1/merge_requests"))
@@ -2377,7 +2861,7 @@ async fn rerunning_an_unchanged_update_leaves_branch_and_merge_request_alone() {
     // rewritten branch visible even to a run that pushes an identical tree.
     std::thread::sleep(std::time::Duration::from_millis(1100));
 
-    let server = MockServer::start().await;
+    let server = test_server().await;
     list_mock(listed(&first.title, &first.description, false))
         .mount(&server)
         .await;
@@ -2423,7 +2907,7 @@ async fn an_unchanged_update_still_refreshes_a_stale_description() {
     let fixture = Fixture::new();
     let first = publish(&fixture, &Run::default()).await;
 
-    let server = MockServer::start().await;
+    let server = test_server().await;
     list_mock(listed(&first.title, "edited by hand", false))
         .mount(&server)
         .await;
@@ -2455,7 +2939,7 @@ async fn an_unchanged_branch_without_a_merge_request_gets_one_without_a_push() {
     let fixture = Fixture::new();
     let first = publish(&fixture, &Run::default()).await;
 
-    let server = MockServer::start().await;
+    let server = test_server().await;
     list_mock(json!([])).mount(&server).await;
     Mock::given(method("POST"))
         .and(path("/api/v4/projects/1/merge_requests"))
@@ -2481,7 +2965,7 @@ async fn an_unchanged_update_keeps_an_armed_auto_merge() {
     };
     let first = publish(&fixture, &run).await;
 
-    let server = MockServer::start().await;
+    let server = test_server().await;
     list_mock(listed(&first.title, &first.description, true))
         .mount(&server)
         .await;
@@ -2506,7 +2990,7 @@ async fn an_unchanged_update_rearms_auto_merge_that_keeps_the_source_branch() {
     // Someone re-armed auto-merge by hand without removing the source branch.
     let mut merge_request = listed(&first.title, &first.description, true);
     merge_request[0]["should_remove_source_branch"] = json!(false);
-    let server = MockServer::start().await;
+    let server = test_server().await;
     list_mock(merge_request).mount(&server).await;
     serve_merge_request_heads(&server, &fixture).await;
     Mock::given(method("PUT"))
@@ -2536,7 +3020,7 @@ async fn an_unchanged_update_arms_auto_merge_on_the_existing_commit() {
 
     // Auto-merge armed earlier was cancelled since, e.g. by a failed pipeline.
 
-    let server = MockServer::start().await;
+    let server = test_server().await;
     list_mock(listed(&first.title, &first.description, false))
         .mount(&server)
         .await;
@@ -2572,7 +3056,7 @@ async fn an_advanced_default_branch_is_built_on_even_without_new_updates() {
     );
     git(&fixture.checkout, &["push", "origin", "main"]);
 
-    let server = MockServer::start().await;
+    let server = test_server().await;
     list_mock(listed(&first.title, &first.description, false))
         .mount(&server)
         .await;
@@ -2595,7 +3079,7 @@ async fn a_changed_automation_name_rewrites_the_commit() {
     let first = publish(&fixture, &Run::default()).await;
 
     // The name is no part of ownership, so no recorded commit is needed.
-    let server = MockServer::start().await;
+    let server = test_server().await;
     list_mock(listed(&first.title, "Review notes", false))
         .mount(&server)
         .await;
@@ -2619,7 +3103,7 @@ async fn a_dry_run_says_when_the_branch_is_already_up_to_date() {
     let fixture = Fixture::new();
     let first = publish(&fixture, &Run::default()).await;
 
-    let server = MockServer::start().await;
+    let server = test_server().await;
     Mock::given(method("GET"))
         .and(path("/api/v4/projects/1/merge_requests"))
         .respond_with(ResponseTemplate::new(200).set_body_json(listed(
@@ -2659,7 +3143,7 @@ async fn a_multi_line_commit_message_keeps_the_branch_owned() {
 
     // With no merge request left to consult, only the commit itself can say
     // that automation wrote it.
-    let server = MockServer::start().await;
+    let server = test_server().await;
     list_mock(json!([])).mount(&server).await;
     Mock::given(method("POST"))
         .and(path("/api/v4/projects/1/merge_requests"))
@@ -2713,7 +3197,7 @@ async fn assert_rewrites_the_recorded_commit(changed: Run, author: &str) {
         first.description
     );
 
-    let server = MockServer::start().await;
+    let server = test_server().await;
     serve_merge_request(&server, listed(&first.title, &first.description, false)).await;
     let output = fixture.execute_upd(&server, &changed, &["--output", "json"]);
 
@@ -2785,7 +3269,7 @@ async fn a_changed_automation_email_rewrites_the_commit_its_merge_request_record
 /// Runs `run` against merge request 7 described as `description` and
 /// requires it to pause, leaving the branch at `tip`.
 async fn assert_pauses(fixture: &Fixture, run: &Run, description: &str, tip: &str) {
-    let server = MockServer::start().await;
+    let server = test_server().await;
     let mut existing = mr_list_response(7, false);
     existing[0]["description"] = json!(description);
     list_mock(existing).mount(&server).await;
@@ -2891,7 +3375,7 @@ async fn a_recorded_commit_off_the_default_branch_history_still_pauses() {
 async fn a_dry_run_reports_a_recorded_commit_as_rewritten() {
     let fixture = Fixture::new();
     let first = publish(&fixture, &Run::default()).await;
-    let server = MockServer::start().await;
+    let server = test_server().await;
     serve_merge_request(&server, listed(&first.title, &first.description, false)).await;
     let changed = Run {
         commit_message: "build(deps): refresh with upd".to_string(),
@@ -2947,7 +3431,7 @@ fn major_run() -> Run {
 
 #[tokio::test]
 async fn the_major_lane_proposes_its_own_merge_request_that_upd_never_merges() {
-    let server = MockServer::start().await;
+    let server = test_server().await;
     let fixture = Fixture::new();
     serve_both_lanes(&server).await;
     serve_merge_request_heads(&server, &fixture).await;
@@ -3030,7 +3514,7 @@ async fn the_major_lane_proposes_its_own_merge_request_that_upd_never_merges() {
 
 #[tokio::test]
 async fn the_major_lane_asks_the_updater_for_major_upgrades_alone() {
-    let server = MockServer::start().await;
+    let server = test_server().await;
     let fixture = Fixture::new();
     serve_both_lanes(&server).await;
 
@@ -3058,7 +3542,7 @@ async fn the_major_lane_asks_the_updater_for_major_upgrades_alone() {
 
 #[tokio::test]
 async fn without_the_major_lane_the_major_branch_is_never_touched() {
-    let server = MockServer::start().await;
+    let server = test_server().await;
     let fixture = Fixture::new();
     list_mock(json!([])).mount(&server).await;
     Mock::given(method("POST"))
@@ -3101,12 +3585,12 @@ async fn without_the_major_lane_the_major_branch_is_never_touched() {
 /// branch's tip before the rerun.
 async fn rerun_against_an_armed_major_merge_request(major_content: &str) -> (Fixture, String) {
     let fixture = Fixture::new();
-    let first = MockServer::start().await;
+    let first = test_server().await;
     serve_both_lanes(&first).await;
     fixture.run(&first, &major_run());
     let first_tip = fixture.tip_of(MAJOR_BRANCH).expect("major branch");
 
-    let server = MockServer::start().await;
+    let server = test_server().await;
     list_mock(mr_list_response(7, false)).mount(&server).await;
     list_mock_for(MAJOR_BRANCH, mr_list_response(8, true))
         .mount(&server)
@@ -3177,12 +3661,12 @@ async fn the_major_lane_cancels_an_armed_auto_merge_with_nothing_to_push() {
 #[tokio::test]
 async fn the_major_lane_closes_its_merge_request_once_no_major_upgrade_remains() {
     let fixture = Fixture::new();
-    let first = MockServer::start().await;
+    let first = test_server().await;
     serve_both_lanes(&first).await;
     fixture.run(&first, &major_run());
     let ordinary_tip = fixture.tip_of(BRANCH).expect("ordinary branch");
 
-    let server = MockServer::start().await;
+    let server = test_server().await;
     list_mock(mr_list_response(7, false)).mount(&server).await;
     list_mock_for(MAJOR_BRANCH, mr_list_response(8, false))
         .mount(&server)
@@ -3218,7 +3702,7 @@ async fn the_major_lane_closes_its_merge_request_once_no_major_upgrade_remains()
 #[tokio::test]
 async fn a_human_commit_pauses_only_the_lane_it_landed_on() {
     let fixture = Fixture::new();
-    let first = MockServer::start().await;
+    let first = test_server().await;
     serve_both_lanes(&first).await;
     fixture.run(&first, &major_run());
 
@@ -3251,7 +3735,7 @@ async fn a_human_commit_pauses_only_the_lane_it_landed_on() {
         .to_string();
     git(&fixture.checkout, &["switch", "main"]);
 
-    let server = MockServer::start().await;
+    let server = test_server().await;
     list_mock(mr_list_response(7, false)).mount(&server).await;
     let mut major = mr_list_response(8, false);
     major[0]["description"] = json!("Major review work");
@@ -3303,7 +3787,7 @@ async fn a_human_commit_pauses_only_the_lane_it_landed_on() {
 
 #[tokio::test]
 async fn a_failed_major_lane_fails_the_job_after_the_ordinary_lane_published() {
-    let server = MockServer::start().await;
+    let server = test_server().await;
     let fixture = Fixture::new();
     list_mock(json!([])).mount(&server).await;
     Mock::given(method("POST"))
@@ -3339,7 +3823,7 @@ async fn a_failed_major_lane_fails_the_job_after_the_ordinary_lane_published() {
 
 #[tokio::test]
 async fn a_failed_ordinary_lane_still_lets_the_major_lane_publish() {
-    let server = MockServer::start().await;
+    let server = test_server().await;
     let fixture = Fixture::new();
     list_mock_for(MAJOR_BRANCH, json!([])).mount(&server).await;
     Mock::given(method("POST"))
@@ -3378,7 +3862,7 @@ async fn a_major_lane_that_would_repeat_the_ordinary_one_is_refused_before_any_w
         ("minor", BRANCH),
         ("minor", "main"),
     ] {
-        let server = MockServer::start().await;
+        let server = test_server().await;
         let fixture = Fixture::new();
         let output = fixture.execute(
             &server,
@@ -3394,7 +3878,7 @@ async fn a_major_lane_that_would_repeat_the_ordinary_one_is_refused_before_any_w
             describe(&output)
         );
         assert!(fixture.updater_invocations().is_empty());
-        assert!(server.received_requests().await.unwrap().is_empty());
+        assert!(only_reads(&server.received_requests().await.unwrap()));
     }
 }
 
@@ -3478,7 +3962,7 @@ async fn golden_ordinary_lane_under_a_patch_ceiling_keeps_its_minor_hold() {
 
 #[tokio::test]
 async fn the_major_lane_starts_clean_after_the_ordinary_lane_stopped_midway() {
-    let server = MockServer::start().await;
+    let server = test_server().await;
     let fixture = Fixture::new();
     list_mock_for(MAJOR_BRANCH, json!([])).mount(&server).await;
     Mock::given(method("POST"))
@@ -3518,7 +4002,7 @@ async fn the_major_lane_starts_clean_after_the_ordinary_lane_stopped_midway() {
 
 #[tokio::test]
 async fn a_checkout_with_local_changes_is_refused_before_either_lane_touches_it() {
-    let server = MockServer::start().await;
+    let server = test_server().await;
     let fixture = Fixture::new();
     fs::write(fixture.checkout.join("dependency.txt"), "edited by hand\n").unwrap();
     fs::write(fixture.checkout.join("notes.txt"), "not committed yet\n").unwrap();
@@ -3545,7 +4029,7 @@ async fn a_checkout_with_local_changes_is_refused_before_either_lane_touches_it(
     }
     assert_eq!(fixture.tip_of(BRANCH), None);
     assert_eq!(fixture.tip_of(MAJOR_BRANCH), None);
-    assert!(server.received_requests().await.unwrap().is_empty());
+    assert!(only_reads(&server.received_requests().await.unwrap()));
 }
 
 // Lane separation with the real updater: the ordinary lane carries every
@@ -3585,7 +4069,7 @@ impl Respond for NoAdvisories {
 /// Serves `packages` as an npm registry, which also answers OSV batch
 /// queries with no advisories.
 async fn npm_registry(packages: &[(&str, &[&str])]) -> MockServer {
-    let registry = MockServer::start().await;
+    let registry = test_server().await;
     Mock::given(method("POST"))
         .and(path("/querybatch"))
         .respond_with(NoAdvisories)
@@ -3635,7 +4119,7 @@ async fn a_configured_pin_alone_reaches_only_the_ordinary_lane() {
         ("pinned", &["1.0.0", "1.2.0", "1.3.0"]),
     ])
     .await;
-    let server = MockServer::start().await;
+    let server = test_server().await;
     let fixture = Fixture::new();
     commit_pinned_project(&fixture);
     list_mock(json!([])).mount(&server).await;
@@ -3676,7 +4160,7 @@ async fn the_major_lane_carries_the_held_major_and_nothing_else() {
         ("pinned", &["1.0.0", "1.2.0", "1.3.0"]),
     ])
     .await;
-    let server = MockServer::start().await;
+    let server = test_server().await;
     let fixture = Fixture::new();
     commit_pinned_project(&fixture);
     serve_both_lanes(&server).await;
@@ -3796,7 +4280,7 @@ async fn serve_ordinary_lane(server: &MockServer) {
 
 #[tokio::test]
 async fn security_fixes_run_before_the_update_and_without_its_policy() {
-    let server = MockServer::start().await;
+    let server = test_server().await;
     let fixture = Fixture::new();
     serve_ordinary_lane(&server).await;
 
@@ -3830,7 +4314,7 @@ async fn security_fixes_run_before_the_update_and_without_its_policy() {
 
 #[tokio::test]
 async fn security_fixes_relock_when_lockfile_regeneration_is_on() {
-    let server = MockServer::start().await;
+    let server = test_server().await;
     let fixture = Fixture::new();
     serve_ordinary_lane(&server).await;
 
@@ -3855,7 +4339,7 @@ async fn security_fixes_relock_when_lockfile_regeneration_is_on() {
 
 #[tokio::test]
 async fn disabled_security_remediation_never_audits() {
-    let server = MockServer::start().await;
+    let server = test_server().await;
     let fixture = Fixture::new();
     serve_ordinary_lane(&server).await;
 
@@ -3887,7 +4371,7 @@ async fn template_rejects_a_non_boolean_security_remediation_input() {
 
 #[tokio::test]
 async fn a_security_fix_alone_is_published_as_a_fix() {
-    let server = MockServer::start().await;
+    let server = test_server().await;
     let fixture = Fixture::new();
     serve_ordinary_lane(&server).await;
 
@@ -3930,7 +4414,7 @@ async fn a_security_fix_alone_is_published_as_a_fix() {
 
 #[tokio::test]
 async fn a_dry_run_applies_security_fixes_and_names_them_in_the_title() {
-    let server = MockServer::start().await;
+    let server = test_server().await;
     let fixture = Fixture::new();
     Mock::given(method("GET"))
         .and(path("/api/v4/projects/1/merge_requests"))
@@ -3957,7 +4441,7 @@ async fn a_dry_run_applies_security_fixes_and_names_them_in_the_title() {
 
 #[tokio::test]
 async fn the_security_report_is_kept_as_a_pipeline_artifact() {
-    let server = MockServer::start().await;
+    let server = test_server().await;
     let fixture = Fixture::new();
     serve_ordinary_lane(&server).await;
     let run = security_fix_run();
@@ -3972,7 +4456,7 @@ async fn the_security_report_is_kept_as_a_pipeline_artifact() {
 
 #[tokio::test]
 async fn a_blocked_security_fix_publishes_the_rest_and_says_what_needs_attention() {
-    let server = MockServer::start().await;
+    let server = test_server().await;
     let fixture = Fixture::new();
     serve_ordinary_lane(&server).await;
     let report = audit_report(
@@ -4030,7 +4514,7 @@ async fn a_blocked_security_fix_publishes_the_rest_and_says_what_needs_attention
 
 #[tokio::test]
 async fn a_failed_security_fix_stops_the_run_before_the_update() {
-    let server = MockServer::start().await;
+    let server = test_server().await;
     let fixture = Fixture::new();
     let report = audit_report(
         json!([advisory("lodash", "4.17.20", "GHSA-35jh-r3h4-6jhm", "High")]),
@@ -4055,7 +4539,7 @@ async fn a_failed_security_fix_stops_the_run_before_the_update() {
     let invocations = fixture.updater_invocations();
     assert_eq!(invocations.len(), 1, "{invocations:?}");
     assert_eq!(fixture.remote_tip(), None);
-    assert!(server.received_requests().await.unwrap().is_empty());
+    assert!(only_reads(&server.received_requests().await.unwrap()));
     // What the updater reported is kept for diagnosis all the same.
     assert!(
         fixture
@@ -4066,7 +4550,7 @@ async fn a_failed_security_fix_stops_the_run_before_the_update() {
 
 #[tokio::test]
 async fn a_security_step_that_cannot_reach_its_advisories_is_a_network_failure() {
-    let server = MockServer::start().await;
+    let server = test_server().await;
     let fixture = Fixture::new();
 
     let output = fixture.execute(
@@ -4080,12 +4564,12 @@ async fn a_security_step_that_cannot_reach_its_advisories_is_a_network_failure()
     assert!(failed_with(&output, 3), "{}", describe(&output));
     assert_eq!(fixture.updater_invocations().len(), 1);
     assert_eq!(fixture.remote_tip(), None);
-    assert!(server.received_requests().await.unwrap().is_empty());
+    assert!(only_reads(&server.received_requests().await.unwrap()));
 }
 
 #[tokio::test]
 async fn a_security_report_with_errors_is_refused() {
-    let server = MockServer::start().await;
+    let server = test_server().await;
     let fixture = Fixture::new();
     // Partial advisory data: the fix that did apply cannot be trusted to be
     // the whole story, and the exit status alone does not say so.
@@ -4114,12 +4598,12 @@ async fn a_security_report_with_errors_is_refused() {
     );
     assert_eq!(fixture.updater_invocations().len(), 1);
     assert_eq!(fixture.remote_tip(), None);
-    assert!(server.received_requests().await.unwrap().is_empty());
+    assert!(only_reads(&server.received_requests().await.unwrap()));
 }
 
 #[tokio::test]
 async fn a_security_report_that_is_not_json_is_refused() {
-    let server = MockServer::start().await;
+    let server = test_server().await;
     let fixture = Fixture::new();
 
     let output = fixture.execute(
@@ -4137,7 +4621,7 @@ async fn a_security_report_that_is_not_json_is_refused() {
 
 #[tokio::test]
 async fn the_major_lane_never_applies_security_fixes() {
-    let server = MockServer::start().await;
+    let server = test_server().await;
     let fixture = Fixture::new();
     serve_both_lanes(&server).await;
 
@@ -4214,7 +4698,7 @@ const RECHECK_INVOCATION: &str = "audit --format json .";
 
 #[tokio::test]
 async fn an_update_that_moves_a_fixed_dependency_back_to_a_vulnerable_release_is_flagged() {
-    let server = MockServer::start().await;
+    let server = test_server().await;
     let fixture = Fixture::new();
     serve_ordinary_lane(&server).await;
     let recheck = audit_report(
@@ -4273,7 +4757,7 @@ async fn an_update_that_moves_a_fixed_dependency_back_to_a_vulnerable_release_is
 
 #[tokio::test]
 async fn an_update_that_keeps_a_fixed_dependency_safe_leaves_its_advisories_resolved() {
-    let server = MockServer::start().await;
+    let server = test_server().await;
     let fixture = Fixture::new();
     serve_ordinary_lane(&server).await;
 
@@ -4300,7 +4784,7 @@ async fn an_update_that_keeps_a_fixed_dependency_safe_leaves_its_advisories_reso
 
 #[tokio::test]
 async fn an_update_that_changes_nothing_is_not_audited_again() {
-    let server = MockServer::start().await;
+    let server = test_server().await;
     let fixture = Fixture::new();
     serve_ordinary_lane(&server).await;
     let vulnerable = audit_report(
@@ -4332,7 +4816,7 @@ async fn an_update_that_changes_nothing_is_not_audited_again() {
 
 #[tokio::test]
 async fn a_fix_awaiting_a_relock_is_not_undone_by_its_stale_lockfile() {
-    let server = MockServer::start().await;
+    let server = test_server().await;
     let fixture = Fixture::new();
     serve_ordinary_lane(&server).await;
     // Until a relock the lockfile still records the vulnerable version the
@@ -4368,7 +4852,7 @@ async fn a_fix_awaiting_a_relock_is_not_undone_by_its_stale_lockfile() {
 
 #[tokio::test]
 async fn an_audit_of_the_updated_tree_with_errors_is_refused() {
-    let server = MockServer::start().await;
+    let server = test_server().await;
     let fixture = Fixture::new();
 
     let output = fixture.execute(&server, &recheck_run(audit_report(json!([]), json!([]), 1)));
@@ -4424,7 +4908,7 @@ fn warned_run() -> Run {
 
 #[tokio::test]
 async fn what_the_security_audits_could_not_check_is_logged_and_listed_for_review() {
-    let server = MockServer::start().await;
+    let server = test_server().await;
     let fixture = Fixture::new();
     serve_ordinary_lane(&server).await;
 
@@ -4545,7 +5029,7 @@ impl Respond for AdvisoryFor {
 #[tokio::test(flavor = "multi_thread")]
 async fn the_real_updater_applies_a_security_fix_the_cooldown_would_hold_back() {
     let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
-    let registry = MockServer::start().await;
+    let registry = test_server().await;
     Mock::given(method("GET"))
         .and(path("/vulnerable"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
@@ -4559,7 +5043,7 @@ async fn the_real_updater_applies_a_security_fix_the_cooldown_would_hold_back() 
         })))
         .mount(&registry)
         .await;
-    let osv = MockServer::start().await;
+    let osv = test_server().await;
     Mock::given(method("POST"))
         .and(path("/querybatch"))
         .respond_with(AdvisoryFor {
@@ -4581,7 +5065,7 @@ async fn the_real_updater_applies_a_security_fix_the_cooldown_would_hold_back() 
         })))
         .mount(&osv)
         .await;
-    let server = MockServer::start().await;
+    let server = test_server().await;
     let fixture = Fixture::new();
     fs::write(
         fixture.checkout.join("package.json"),
@@ -4650,7 +5134,7 @@ async fn project_owned_lock_job_pushes_only_lockfiles_and_the_next_run_still_own
     git(&fixture.checkout, &["add", "uv.lock"]);
     git(&fixture.checkout, &["commit", "-m", "test: add lockfile"]);
     git(&fixture.checkout, &["push", "origin", "main"]);
-    let server = MockServer::start().await;
+    let server = test_server().await;
     serve_project_lock_mr(&server).await;
     fixture.run_template(&server, true, "first", false);
     let tip = fixture.remote_tip().unwrap();
@@ -4705,7 +5189,7 @@ async fn project_owned_lock_job_pushes_only_lockfiles_and_the_next_run_still_own
 #[tokio::test]
 async fn a_fake_project_lock_commit_that_changes_a_manifest_still_pauses() {
     let fixture = Fixture::new();
-    let server = MockServer::start().await;
+    let server = test_server().await;
     serve_project_lock_mr(&server).await;
     fixture.run_template(&server, true, "first", false);
     fs::write(fixture.checkout.join("dependency.txt"), "human work").unwrap();

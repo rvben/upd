@@ -52,6 +52,7 @@ pub struct Settings {
     /// source; sets `UV_NO_BUILD` for every updater command.
     pub no_build: bool,
     pub auto_merge: bool,
+    pub ignore_approvals: bool,
     /// Whether the ordinary lane first fixes every dependency with a
     /// published advisory, outside the update policy.
     pub security_remediation: bool,
@@ -142,6 +143,7 @@ impl Settings {
             lock: flag("UPD_LOCK")?,
             no_build: false,
             auto_merge: flag("UPD_AUTO_MERGE")?,
+            ignore_approvals: flag("UPD_IGNORE_APPROVALS")?,
             security_remediation: match lookup("UPD_SECURITY_REMEDIATION").as_deref() {
                 None | Some("") => true,
                 _ => flag("UPD_SECURITY_REMEDIATION")?,
@@ -199,6 +201,7 @@ impl Settings {
             mr_title: String::new(),
             max_bump: String::new(),
             auto_merge: false,
+            ignore_approvals: false,
             security_remediation: false,
             lane: Lane::Major,
             ..self.clone()
@@ -295,6 +298,8 @@ pub enum Outcome {
         pushed: bool,
         commit: String,
         auto_merge: AutoMerge,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        approvals: Option<super::api::ApprovalStatus>,
     },
     /// The branch holds commits automation did not write; it was left alone.
     Paused {
@@ -366,6 +371,7 @@ impl Outcome {
                 pushed,
                 commit,
                 auto_merge,
+                approvals,
             } => {
                 let commit = commit.get(..12).unwrap_or(commit);
                 let auto_merge = match auto_merge {
@@ -373,7 +379,7 @@ impl Outcome {
                     AutoMerge::Disabled => "disabled",
                     AutoMerge::Off => "off",
                 };
-                match (created, pushed) {
+                let summary = match (created, pushed) {
                     (true, true) => format!(
                         "Created {merge_request} for {commit} on {branch}; auto-merge {auto_merge}."
                     ),
@@ -386,6 +392,10 @@ impl Outcome {
                     (false, false) => format!(
                         "{merge_request} already proposes {commit} on {branch}; nothing pushed; auto-merge {auto_merge}."
                     ),
+                };
+                match approvals {
+                    Some(status) => format!("{summary} approvals: {status}."),
+                    None => summary,
                 }
             }
             Self::Paused {
@@ -524,6 +534,7 @@ pub struct Session<'a> {
     pub default_ref: String,
     /// The remote automation branch tip, empty when the branch is absent.
     expected_remote_sha: String,
+    approval_recovery: Option<super::api::ApprovalStatus>,
 }
 
 /// What each lane of a run did. A lane that failed does not stop the other.
@@ -709,7 +720,7 @@ impl<'a> Session<'a> {
         } else {
             String::new()
         };
-        Ok(Self {
+        let mut session = Self {
             settings,
             git,
             log,
@@ -717,7 +728,57 @@ impl<'a> Session<'a> {
             url,
             default_ref,
             expected_remote_sha,
-        })
+            approval_recovery: None,
+        };
+        if session.settings.ignore_approvals {
+            // Read consent from the fetched default branch, never a shared or
+            // generated updater configuration or the rolling branch.
+            let mut consent = false;
+            for name in crate::config::CONFIG_FILE_NAMES {
+                let spec = format!("{}:{name}", session.default_ref);
+                if session.git.test(["cat-file", "-e", &spec]).await? {
+                    let content = session.git.read(["show", &spec]).await?;
+                    match crate::config::UpdConfig::parse_for_automation(&content, name) {
+                        Ok((config, _)) => {
+                            consent =
+                                config.ignore_approvals_enabled() && config.auto_merge_enabled()
+                        }
+                        Err(_) => consent = false,
+                    }
+                    break;
+                }
+            }
+            session.settings.ignore_approvals =
+                consent && session.settings.auto_merge && session.settings.lane == Lane::Ordinary;
+        }
+        // Consent parsing reads fetched git objects and executes no repository code.
+        // Keep a verified override only while consent and branch ownership hold.
+        if session.settings.lane == Lane::Ordinary
+            && !session.settings.dry_run
+            && let Some(mr) = single_open_merge_request(&session.api, &session.settings).await?
+        {
+            let keep = session.settings.ignore_approvals
+                && !session.expected_remote_sha.is_empty()
+                && matches!(
+                    claim(
+                        &session.git,
+                        &session.api,
+                        &session.settings,
+                        &session.default_ref,
+                        &session.expected_remote_sha
+                    )
+                    .await,
+                    Ok(Claim::Written | Claim::Recorded)
+                );
+            session.approval_recovery = session
+                .api
+                .reconcile_approvals(&mr, &session.settings.branch, keep)
+                .await?;
+            if let Some(status) = &session.approval_recovery {
+                log.line(format_args!("approvals: {status}"));
+            }
+        }
+        Ok(session)
     }
 
     /// Rebuilds the automation branch from the default branch, runs the
@@ -735,6 +796,40 @@ impl<'a> Session<'a> {
             outcome,
             security: security.map(|security| security.counts),
         })
+    }
+
+    pub(super) async fn restore_pending_approvals(&mut self) -> Result<(), Error> {
+        if self.settings.lane == Lane::Ordinary
+            && !self.settings.dry_run
+            && let Some(mr) = single_open_merge_request(&self.api, &self.settings).await?
+        {
+            self.approval_recovery = self
+                .api
+                .recover_approvals(&mr, &self.settings.branch)
+                .await?;
+            if let Some(status) = &self.approval_recovery {
+                self.log.line(format_args!("approvals: {status}"));
+            }
+        }
+        Ok(())
+    }
+
+    async fn approvals_at_publish(&self) -> Result<Option<super::api::ApprovalStatus>, Error> {
+        let mut approval_recovery = self.approval_recovery.clone();
+        if approval_recovery.as_ref().is_some_and(|s| s.armed())
+            && !(self.settings.ignore_approvals && self.settings.auto_merge)
+            && !self.settings.dry_run
+            && let Some(mr) = single_open_merge_request(&self.api, &self.settings).await?
+        {
+            approval_recovery = self
+                .api
+                .recover_approvals(&mr, &self.settings.branch)
+                .await?;
+            if let Some(status) = &approval_recovery {
+                self.log.line(format_args!("approvals: {status}"));
+            }
+        }
+        Ok(approval_recovery)
     }
 
     /// The remote automation branch tip this session inspected, empty when
@@ -874,6 +969,7 @@ impl<'a> Session<'a> {
             expected_remote_sha,
             ..
         } = self;
+        let approval_recovery = self.approvals_at_publish().await?;
         if !changed {
             return close_obsolete(api, git, settings, log, url, expected_remote_sha).await;
         }
@@ -949,18 +1045,47 @@ impl<'a> Session<'a> {
         };
         log.line(format_args!("Merge request: {}", merge_request.web_url));
 
-        let auto_merge = if settings.auto_merge {
+        if !settings.auto_merge && merge_request.auto_merge_enabled() {
+            api.cancel_auto_merge(merge_request.iid).await?;
+        }
+        let approvals = if approval_recovery
+            .as_ref()
+            .is_some_and(|s| s.recovery_pending())
+        {
+            approval_recovery.clone()
+        } else if settings.lane == Lane::Ordinary
+            && settings.ignore_approvals
+            && settings.auto_merge
+        {
+            Some(
+                api.override_approvals(merge_request.iid, &commit, &settings.branch, pushed)
+                    .await?,
+            )
+        } else {
+            approval_recovery.clone()
+        };
+        if let Some(status) = &approvals {
+            log.line(format_args!("approvals: {status}"));
+        }
+        let auto_merge = if approvals.as_ref().is_some_and(|s| s.recovery_pending()) {
+            AutoMerge::Disabled
+        } else if settings.auto_merge {
             // Auto-merge armed earlier is bound to this same commit when
             // nothing was pushed; arming it again would be a no-op write,
             // unless it no longer removes the branch once merged.
             let armed = merge_request.auto_merge_enabled()
                 && merge_request.raw["should_remove_source_branch"] == true;
-            if pushed || !armed {
+            let approval_armed = approvals.as_ref().is_some_and(|status| status.armed());
+            if !approval_armed
+                && (pushed
+                    || !armed
+                    || approval_recovery.as_ref().is_some_and(|s| s.needs_rearm())
+                    || approvals.as_ref().is_some_and(|s| s.needs_rearm()))
+            {
                 api.enable_auto_merge(merge_request.iid, &commit).await?;
             }
             AutoMerge::Enabled
         } else if merge_request.auto_merge_enabled() {
-            api.cancel_auto_merge(merge_request.iid).await?;
             log.line(match settings.lane {
                 Lane::Ordinary => format!(
                     "Cancelled auto-merge on {}: auto-merge is off",
@@ -982,6 +1107,7 @@ impl<'a> Session<'a> {
             pushed,
             commit,
             auto_merge,
+            approvals,
         })
     }
 }
@@ -1415,6 +1541,14 @@ async fn pause(
         ));
     };
     let merge_request = MergeRequest::from_response(&open[0])?;
+    if settings.lane == Lane::Ordinary
+        && let Some(status) = api
+            .recover_approvals(&merge_request, &settings.branch)
+            .await?
+    {
+        log.line(format_args!("approvals: {status}"));
+    }
+
     if description.contains(PAUSE_MARKER) {
         return Ok(Outcome::Paused {
             merge_request: merge_request.web_url,
@@ -1675,6 +1809,12 @@ async fn close_obsolete(
             }
         });
     }
+    if settings.lane == Lane::Ordinary
+        && let Some(mr) = &existing
+        && let Some(status) = api.recover_approvals(mr, &settings.branch).await?
+    {
+        log.line(format_args!("approvals: {status}"));
+    }
     if branch_deleted {
         if let Push::Stale(detail) = git
             .push_with_lease(url, &settings.branch, expected_remote_sha, "")
@@ -1767,7 +1907,7 @@ mod tests {
         );
         assert_eq!(settings.git_email, "upd-automation@noreply.invalid");
         assert_eq!(settings.paths, vec!["."]);
-        assert!(!settings.lock && !settings.auto_merge);
+        assert!(!settings.lock && !settings.auto_merge && !settings.ignore_approvals);
         assert_eq!(
             settings.git_url(),
             "https://gitlab.example.test/group/project.git"
@@ -1837,6 +1977,20 @@ mod tests {
         let on = settings(&[("UPD_MAJOR_MR", "true"), ("UPD_MAX_BUMP", "minor")]).unwrap();
         assert!(on.security_remediation);
         assert!(!on.major_lane().unwrap().security_remediation);
+    }
+
+    #[test]
+    fn approval_override_is_boolean_and_excluded_from_major_lane() {
+        assert!(settings(&[("UPD_IGNORE_APPROVALS", "yes")]).is_err());
+        let on = settings(&[
+            ("UPD_IGNORE_APPROVALS", "true"),
+            ("UPD_AUTO_MERGE", "true"),
+            ("UPD_MAJOR_MR", "true"),
+            ("UPD_MAX_BUMP", "minor"),
+        ])
+        .unwrap();
+        assert!(on.ignore_approvals);
+        assert!(!on.major_lane().unwrap().ignore_approvals);
     }
 
     #[test]
@@ -1965,6 +2119,7 @@ mod tests {
             pushed,
             commit: "0123456789abcdef".to_string(),
             auto_merge: AutoMerge::Enabled,
+            approvals: None,
         };
         assert_eq!(
             published(true, true).render_text(branch),
@@ -2008,6 +2163,7 @@ mod tests {
             pushed: true,
             commit: "abc".to_string(),
             auto_merge: AutoMerge::Off,
+            approvals: None,
         };
         assert_eq!(
             outcome.to_json("automation/upd-dependencies"),
@@ -2022,5 +2178,52 @@ mod tests {
                 "auto_merge": "off",
             })
         );
+    }
+    #[tokio::test]
+    async fn consent_lowered_after_open_restores_retained_overrides_before_publish() {
+        use super::super::api::{approval_fixture, approval_rule, approval_snapshot};
+        const SHA: &str = "1111111111111111111111111111111111111111";
+        for (auto_merge, ignore_approvals) in [(true, true), (false, true), (true, false)] {
+            let (_server, api, state) = approval_fixture(vec![approval_rule(9, 2)]).await;
+            let retained = api
+                .override_approvals(7, SHA, "automation/upd-dependencies", false)
+                .await
+                .unwrap();
+            let dir = tempfile::tempdir().unwrap();
+            let mut settings = settings(&[]).unwrap();
+            settings.project_id = "1".into();
+            settings.auto_merge = auto_merge;
+            settings.ignore_approvals = ignore_approvals;
+            let log = Log::buffered();
+            let session = Session {
+                git: Git::new(dir.path(), "test-token").unwrap(),
+                settings,
+                log: &log,
+                api,
+                url: String::new(),
+                default_ref: String::new(),
+                expected_remote_sha: SHA.into(),
+                approval_recovery: Some(retained),
+            };
+            let before = approval_snapshot(&state)["calls"].as_array().unwrap().len();
+            let status = session.approvals_at_publish().await.unwrap().unwrap();
+            let after = approval_snapshot(&state);
+            if auto_merge && ignore_approvals {
+                assert!(status.armed());
+                assert_eq!(after["rules"][0]["approvals_required"], 0);
+                assert_eq!(after["armed"], true);
+                assert_eq!(after["calls"].as_array().unwrap().len(), before);
+            } else {
+                assert!(status.needs_rearm());
+                assert_eq!(after["rules"][0]["approvals_required"], 2);
+                assert_eq!(after["armed"], false);
+                assert!(
+                    after["notes"][0]["body"]
+                        .as_str()
+                        .unwrap()
+                        .contains("\"active\":false")
+                );
+            }
+        }
     }
 }

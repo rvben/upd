@@ -118,6 +118,9 @@ pub struct AutomationConfig {
     /// to merge its dependency merge request once the pipeline passes.
     #[serde(default)]
     pub auto_merge: Option<bool>,
+    /// Consent to lowering approvals on the ordinary auto-merged GitLab MR.
+    #[serde(default)]
+    pub ignore_approvals: Option<bool>,
     /// Whether this repository consents to the organization run keeping a
     /// separate merge request for major-version upgrades open.
     #[serde(default)]
@@ -138,6 +141,7 @@ const AUTOMATION_KEYS: &[&str] = &[
     "security_remediation",
     "dependency_updates",
     "auto_merge",
+    "ignore_approvals",
     "major_mr",
     "lock",
     "lock_build",
@@ -613,6 +617,8 @@ security_remediation = false
 dependency_updates = false
 # The organization run may ask GitLab to auto-merge that merge request.
 auto_merge = false
+# With central consent and auto-merge, lower approvals on the ordinary GitLab MR.
+ignore_approvals = false
 # The organization run may keep a separate major-upgrade merge request open.
 major_mr = false
 # The organization run may relock lockfiles in a job without the group token.
@@ -722,6 +728,7 @@ lock_build = false
             || self.automation.security_remediation.is_some()
             || self.automation.dependency_updates.is_some()
             || self.automation.auto_merge.is_some()
+            || self.automation.ignore_approvals.is_some()
             || self.automation.major_mr.is_some()
             || self.automation.lock.is_some()
             || self.automation.lock_build.is_some()
@@ -782,6 +789,9 @@ lock_build = false
         if other.automation.auto_merge.is_some() {
             self.automation.auto_merge = other.automation.auto_merge;
         }
+        if other.automation.ignore_approvals.is_some() {
+            self.automation.ignore_approvals = other.automation.ignore_approvals;
+        }
         if other.automation.major_mr.is_some() {
             self.automation.major_mr = other.automation.major_mr;
         }
@@ -816,6 +826,11 @@ lock_build = false
     /// Whether an organization run may maintain a dependency merge request.
     pub fn dependency_updates_enabled(&self) -> bool {
         self.automation.dependency_updates.unwrap_or(false)
+    }
+
+    /// Whether the repository consents to approval overrides on its rolling MR.
+    pub fn ignore_approvals_enabled(&self) -> bool {
+        self.automation.ignore_approvals.unwrap_or(false)
     }
 
     /// Whether the repository consents to auto-merge by an organization run.
@@ -1041,6 +1056,10 @@ impl EffectiveConfig<'_> {
             "  auto_merge: {}\n",
             self.config.auto_merge_enabled()
         ));
+        out.push_str(&format!(
+            "  ignore_approvals: {}\n",
+            self.config.ignore_approvals_enabled()
+        ));
         out.push_str(&format!("  major_mr: {}\n", self.config.major_mr_enabled()));
         out.push_str(&format!("  lock: {}\n", self.config.lock_enabled()));
         out.push_str(&format!(
@@ -1097,6 +1116,7 @@ impl EffectiveConfig<'_> {
                 "security_remediation": self.config.security_remediation_enabled(),
                 "dependency_updates": self.config.dependency_updates_enabled(),
                 "auto_merge": self.config.auto_merge_enabled(),
+                "ignore_approvals": self.config.ignore_approvals_enabled(),
                 "major_mr": self.config.major_mr_enabled(),
                 "lock": self.config.lock_enabled(),
                 "lock_build": self.config.lock_build_enabled(),
@@ -1820,6 +1840,27 @@ update_action_shas = true
             "update_action_shas is a known key; got: {warnings:?}"
         );
         assert_eq!(config.update_action_shas, Some(true));
+    }
+
+    #[test]
+    fn approval_consent_defaults_off_and_merges_explicit_values() {
+        let (mut config, _) = UpdConfig::parse_with_warnings("", "t").unwrap();
+        assert!(!config.ignore_approvals_enabled());
+        for enabled in [true, false] {
+            let (child, warnings) = UpdConfig::parse_with_warnings(
+                &format!("[automation]\nignore_approvals = {enabled}\n"),
+                "t",
+            )
+            .unwrap();
+            assert!(warnings.is_empty());
+            assert!(child.has_config());
+            config.merge(child);
+            assert_eq!(config.ignore_approvals_enabled(), enabled);
+        }
+        assert!(
+            UpdConfig::parse_with_warnings("[automation]\nignore_approvals = \"true\"\n", "t")
+                .is_err()
+        );
     }
 
     #[test]

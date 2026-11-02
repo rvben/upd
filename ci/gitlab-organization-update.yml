@@ -53,6 +53,10 @@ spec:
       description: Allow auto-merge in projects that also set [automation] auto_merge = true
       type: boolean
       default: false
+    ignore_approvals:
+      description: Allow zero approvals on the ordinary auto-merged MR when the project also consents
+      type: boolean
+      default: false
     major_mr:
       description: Also propose major-version upgrades, in projects that also set [automation] major_mr = true, on a second merge request upd never merges
       type: boolean
@@ -134,6 +138,7 @@ spec:
     UPD_GIT_NAME: "upd automation"
     UPD_GIT_EMAIL: "upd-automation@noreply.invalid"
     UPD_AUTO_MERGE: "$[[ inputs.auto_merge ]]"
+    UPD_IGNORE_APPROVALS: "$[[ inputs.ignore_approvals ]]"
     UPD_MAJOR_MR: "$[[ inputs.major_mr ]]"
     UPD_SECURITY_REMEDIATION: "$[[ inputs.security_remediation ]]"
     UPD_MAJOR_BRANCH: "$[[ inputs.major_branch ]]"

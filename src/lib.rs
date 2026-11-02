@@ -1,3 +1,5 @@
+#![recursion_limit = "256"]
+
 pub mod align;
 pub mod annotation;
 pub mod annotation_tools;

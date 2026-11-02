@@ -51,6 +51,7 @@ pub struct OrgSettings {
     pub max_bump: String,
     /// Whether auto-merge is allowed at all; each project must also consent.
     pub auto_merge: bool,
+    pub ignore_approvals: bool,
     /// Whether a major-upgrade merge request is allowed at all; each project
     /// must also consent.
     pub major_mr: bool,
@@ -156,6 +157,7 @@ impl OrgSettings {
             Some(_) => Err(Error::Input(format!("{name} must be true or false"))),
         };
         let auto_merge = flag("UPD_AUTO_MERGE")?;
+        let ignore_approvals = flag("UPD_IGNORE_APPROVALS")?;
         let major_mr = flag("UPD_MAJOR_MR")?;
         let lock = flag("UPD_LOCK")?;
         // Unlike the other switches this one is on unless turned off: it
@@ -275,6 +277,7 @@ impl OrgSettings {
             min_age_floor,
             max_bump,
             auto_merge,
+            ignore_approvals,
             major_mr,
             security_remediation,
             lock,
@@ -326,7 +329,8 @@ impl OrgSettings {
             max_bump: self.max_bump.clone(),
             lock: false,
             no_build: false,
-            auto_merge: false,
+            auto_merge: self.auto_merge,
+            ignore_approvals: self.ignore_approvals,
             security_remediation: false,
             prepare_command: String::new(),
             validation_command: String::new(),
@@ -880,6 +884,7 @@ pub(super) enum Consent {
     Yes {
         config: String,
         auto_merge: bool,
+        ignore_approvals: bool,
         major_mr: bool,
         security_remediation: bool,
         lock: bool,
@@ -902,6 +907,7 @@ impl Consent {
                     Self::Yes {
                         config: config.to_string(),
                         auto_merge: parsed.auto_merge_enabled(),
+                        ignore_approvals: parsed.ignore_approvals_enabled(),
                         major_mr: parsed.major_mr_enabled(),
                         security_remediation: parsed.security_remediation_enabled(),
                         lock: parsed.lock_enabled(),
@@ -1014,6 +1020,26 @@ pub(super) async fn open_project<'a>(
     if let Consent::No(reason) = api_consent(api, project).await?
         && !settings.assume_opted_in
     {
+        if !settings.dry_run {
+            let project_api = api.for_project(project.id);
+            let requests = project_api
+                .recovery_merge_requests(&settings.branch, &project.default_branch)
+                .await?
+                .into_iter()
+                .filter(|mr| mr["source_project_id"].as_u64() == Some(project.id))
+                .collect::<Vec<_>>();
+            if requests.len() > 1 {
+                return Err(Error::Refused(
+                    "Multiple rolling merge requests prevent approval recovery".into(),
+                ));
+            }
+            if let Some(raw) = requests.first() {
+                let mr = super::api::MergeRequest::from_response(raw)?;
+                if let Some(status) = project_api.recover_approvals(&mr, &settings.branch).await? {
+                    log.line(format_args!("approvals: {status}"));
+                }
+            }
+        }
         return Ok(Opened::Stopped(State::NotOptedIn(reason)));
     }
 
@@ -1054,6 +1080,7 @@ pub(super) async fn open_project<'a>(
         consent = Consent::Yes {
             config: path.to_string_lossy().into_owned(),
             auto_merge: false,
+            ignore_approvals: false,
             major_mr: config.automation.major_mr == Some(true),
             security_remediation: config.automation.security_remediation == Some(true),
             lock: false,
@@ -1061,19 +1088,26 @@ pub(super) async fn open_project<'a>(
         };
     }
     match consent {
-        Consent::No(reason) => Ok(Opened::Stopped(State::NotOptedIn(reason))),
+        Consent::No(reason) => {
+            session.restore_pending_approvals().await?;
+            Ok(Opened::Stopped(State::NotOptedIn(reason)))
+        }
         Consent::Invalid { config, message } => {
+            session.restore_pending_approvals().await?;
             Ok(Opened::Stopped(State::ConfigInvalid { config, message }))
         }
         Consent::Yes {
             config,
             auto_merge,
+            ignore_approvals,
             major_mr,
             security_remediation,
             lock,
             lock_build,
         } => {
             session.settings.auto_merge = settings.auto_merge && auto_merge;
+            session.settings.ignore_approvals &=
+                settings.ignore_approvals && ignore_approvals && session.settings.auto_merge;
             session.settings.major_mr = settings.major_mr && major_mr;
             session.settings.security_remediation =
                 settings.security_remediation && security_remediation;

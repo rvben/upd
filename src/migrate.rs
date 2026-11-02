@@ -29,6 +29,12 @@ pub fn renovate(content: &str) -> Result<Migration> {
                     toml::Value::Boolean(value.as_bool().unwrap()),
                 );
             }
+            "gitLabIgnoreApprovals" if value.is_boolean() => {
+                automation.insert(
+                    "ignore_approvals".into(),
+                    toml::Value::Boolean(value.as_bool().unwrap()),
+                );
+            }
             "lockFileMaintenance"
                 if value.as_object().is_some_and(|o| {
                     o.len() == 1 && o.get("enabled").is_some_and(Value::is_boolean)
@@ -115,6 +121,18 @@ pub fn migrate_path(path: &Path, dry_run: bool) -> Result<Migration> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn migrates_approval_consent_without_granting_auto_merge() {
+        for enabled in [true, false] {
+            let migration = renovate(&format!(r#"{{"gitLabIgnoreApprovals":{enabled}}}"#)).unwrap();
+            let (config, _) =
+                crate::config::UpdConfig::parse_with_warnings(&migration.config, "t").unwrap();
+            assert_eq!(config.automation.ignore_approvals, Some(enabled));
+            assert!(!config.auto_merge_enabled());
+            assert!(migration.warnings.is_empty());
+        }
+    }
+
     #[test]
     fn migrates_exact_ignores_and_boolean_automation() {
         let migration = renovate(r#"{"packageRules":[{"matchPackageNames":["numpy","example-sdk","example-deployer"],"enabled":false}],"automerge":true,"lockFileMaintenance":{"enabled":true}}"#).unwrap();

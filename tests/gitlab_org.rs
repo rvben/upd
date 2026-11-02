@@ -118,7 +118,16 @@ impl Org {
         fs::create_dir(&log).unwrap();
         Self {
             temp,
-            server: MockServer::start().await,
+            server: {
+                let server = MockServer::start().await;
+                Mock::given(method("GET"))
+                    .and(path_regex(r"/merge_requests/\d+/notes$"))
+                    .respond_with(ResponseTemplate::new(200).set_body_json(json!([])))
+                    .with_priority(255)
+                    .mount(&server)
+                    .await;
+                server
+            },
             updater,
             log,
             listing: Vec::new(),
@@ -589,6 +598,10 @@ impl Respond for MergeRequestHeads {
             "web_url": format!("https://gitlab.example.test/{id}/-/merge_requests/{id}"),
             "sha": String::from_utf8(output.stdout).unwrap().trim(),
             "detailed_merge_status": "mergeable",
+            "source_branch": "automation/upd-dependencies",
+            "source_project_id": id,
+            "target_project_id": id,
+            "author": {"id": 42},
         }))
     }
 }
@@ -668,7 +681,10 @@ async fn only_projects_that_opted_in_are_updated() {
         assert_eq!(org.updater_args(path), None, "{path} was updated");
         assert_eq!(org.branch_file(id), None, "{path} got a branch");
         assert!(
-            org.merge_request_calls(id).await.is_empty(),
+            org.merge_request_calls(id)
+                .await
+                .iter()
+                .all(|call| call.starts_with("GET ")),
             "{path} saw merge request calls"
         );
     }
@@ -717,6 +733,217 @@ async fn auto_merge_needs_both_the_group_and_the_project_to_allow_it() {
             .any(|call| call.starts_with("PUT")),
         "the group did not allow auto-merge"
     );
+}
+
+#[tokio::test]
+async fn invalid_approval_consent_keeps_the_config_invalid_report() {
+    let mut org = Org::new().await;
+    org.project(
+        24,
+        "acme/invalid",
+        &[Entry::File(
+            ".updrc.toml",
+            "[automation]\ndependency_updates = true\nignore_approvals = \"yes\"\n",
+        )],
+    );
+    org.project(25, "acme/valid", &[Entry::File(".updrc.toml", OPTED_IN)]);
+    org.serve().await;
+    let (code, report, stderr) = org.run(
+        &[("UPD_AUTO_MERGE", "true"), ("UPD_IGNORE_APPROVALS", "true")],
+        &[],
+    );
+    assert_eq!(code, 2, "{report:#}\n{stderr}");
+    assert_eq!(project(&report, "acme/invalid")["state"], "config_invalid");
+    assert_eq!(project(&report, "acme/valid")["state"], "processed");
+    assert!(org.updater_args("acme/invalid").is_none());
+}
+
+#[tokio::test]
+async fn an_unconsented_project_with_disabled_merge_requests_remains_a_skip() {
+    for status in [403, 404] {
+        let mut org = Org::new().await;
+        org.project(24, "acme/no-mrs", &[]);
+        org.serve().await;
+        Mock::given(method("GET"))
+            .and(path("/api/v4/projects/24/merge_requests"))
+            .respond_with(ResponseTemplate::new(status))
+            .with_priority(1)
+            .expect(1)
+            .mount(&org.server)
+            .await;
+        let (code, report, stderr) = org.run(&[], &[]);
+        assert_eq!(code, 0, "{report:#}\n{stderr}");
+        assert_eq!(project(&report, "acme/no-mrs")["state"], "not_opted_in");
+        assert!(
+            org.merge_request_calls(24)
+                .await
+                .iter()
+                .all(|s| s.starts_with("GET"))
+        );
+    }
+}
+
+#[tokio::test]
+async fn withdrawing_overall_automation_consent_still_recovers_an_existing_override() {
+    let mut org = Org::new().await;
+    org.project(
+        24,
+        "acme/withdrawn",
+        &[Entry::File(
+            ".updrc.toml",
+            "[automation]\ndependency_updates = false\n",
+        )],
+    );
+    org.serve().await;
+    let journal = json!({"project":24,"iid":24,"branch":BRANCH,"actor":42,"active":true,"native_before":false,
+        "rules":[{"id":9,"name":"any approver","rule_type":"any_approver","approvals_required":2,
+            "user_ids":[],"group_ids":[],"source_required":null,"project_rule_id":null}]});
+    let note = json!({"id":1,"author":{"id":42},"body":format!("upd approval override recovery v1\n{journal}")});
+    let rule = json!({"id":9,"name":"any approver","rule_type":"any_approver","approvals_required":0,
+        "users":[],"groups":[],"contains_hidden_groups":false,"source_rule":null});
+    for (url, response) in [
+        ("/api/v4/user", json!({"id":42})),
+        (
+            "/api/v4/projects/24/approvals",
+            json!({"disable_overriding_approvers_per_merge_request":false}),
+        ),
+        (
+            "/api/v4/projects/24/merge_requests",
+            json!([{"iid":24,"web_url":"https://gitlab.test/24",
+            "source_branch":BRANCH,"source_project_id":24,"target_project_id":24,"author":{"id":42}}]),
+        ),
+        ("/api/v4/projects/24/merge_requests/24/notes", json!([note])),
+        (
+            "/api/v4/projects/24/merge_requests/24/approval_rules",
+            json!([rule]),
+        ),
+    ] {
+        Mock::given(method("GET"))
+            .and(path(url))
+            .respond_with(ResponseTemplate::new(200).set_body_json(response))
+            .with_priority(1)
+            .mount(&org.server)
+            .await;
+    }
+    Mock::given(method("POST"))
+        .and(path(
+            "/api/v4/projects/24/merge_requests/24/cancel_merge_when_pipeline_succeeds",
+        ))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+        .expect(1)
+        .mount(&org.server)
+        .await;
+    let mut restored = rule.clone();
+    restored["approvals_required"] = json!(2);
+    Mock::given(method("PUT"))
+        .and(path(
+            "/api/v4/projects/24/merge_requests/24/approval_rules/9",
+        ))
+        .respond_with(ResponseTemplate::new(200).set_body_json(restored))
+        .expect(1)
+        .mount(&org.server)
+        .await;
+    Mock::given(method("PUT"))
+        .and(path("/api/v4/projects/24/merge_requests/24/notes/1"))
+        .respond_with(|request: &Request| {
+            let body: Value = serde_json::from_slice(&request.body).unwrap();
+            assert!(body["body"].as_str().unwrap().contains("\"active\":false"));
+            ResponseTemplate::new(200)
+                .set_body_json(json!({"id":1,"author":{"id":42},"body":body["body"]}))
+        })
+        .expect(1)
+        .mount(&org.server)
+        .await;
+    let (code, report, stderr) = org.run(&[], &[]);
+    assert_eq!(code, 0, "{report:#}\n{stderr}");
+    assert_eq!(project(&report, "acme/withdrawn")["state"], "not_opted_in");
+    assert!(stderr.contains("approvals: restored before update"));
+    assert!(org.updater_args("acme/withdrawn").is_none());
+    assert!(
+        org.server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .all(|r| !r.url.path().ends_with("/merge"))
+    );
+}
+
+#[tokio::test]
+async fn approval_override_needs_all_consents_and_still_arms_when_policy_denies_it() {
+    for (central, auto_merge) in [("true", "true"), ("false", "true"), ("true", "false")] {
+        let mut org = Org::new().await;
+        for (id, path, consent) in [
+            (
+                21,
+                "acme/both",
+                "[automation]\ndependency_updates = true\nauto_merge = true\nignore_approvals = true\n",
+            ),
+            (
+                22,
+                "acme/no-approval-consent",
+                "[automation]\ndependency_updates = true\nauto_merge = true\n",
+            ),
+            (
+                23,
+                "acme/no-auto-merge",
+                "[automation]\ndependency_updates = true\nignore_approvals = true\n",
+            ),
+        ] {
+            org.project(id, path, &[Entry::File(".updrc.toml", consent)]);
+        }
+        org.serve().await;
+        Mock::given(method("GET"))
+            .and(path("/api/v4/user"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"id": 42})))
+            .mount(&org.server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/v4/projects/21/approvals"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "disable_overriding_approvers_per_merge_request": true
+            })))
+            .mount(&org.server)
+            .await;
+        let (code, report, stderr) = org.run(
+            &[
+                ("UPD_IGNORE_APPROVALS", central),
+                ("UPD_AUTO_MERGE", auto_merge),
+                (
+                    "UPD_SHARED_CONFIG",
+                    "[automation]\nignore_approvals = true\nauto_merge = true\n",
+                ),
+            ],
+            &[],
+        );
+        assert_eq!(code, 0, "{report:#}\n{stderr}");
+        let calls = org.server.received_requests().await.unwrap();
+        let approval_calls: Vec<_> = calls
+            .iter()
+            .filter(|r| r.url.path().ends_with("/approvals"))
+            .collect();
+        if central == "true" && auto_merge == "true" {
+            assert_eq!(approval_calls.len(), 1);
+            assert_eq!(
+                approval_calls[0].url.path(),
+                "/api/v4/projects/21/approvals"
+            );
+            assert_eq!(
+                project(&report, "acme/both")["approvals"]["detail"],
+                "override not permitted by project policy"
+            );
+            assert!(stderr.contains("approvals: override not permitted by project policy"));
+        } else {
+            assert!(approval_calls.is_empty());
+        }
+        assert_eq!(
+            calls
+                .iter()
+                .filter(|r| r.url.path().ends_with("/merge"))
+                .count(),
+            if auto_merge == "true" { 2 } else { 0 }
+        );
+    }
 }
 
 const REMEDIATION_OPTED_IN: &str =
@@ -847,7 +1074,13 @@ async fn the_fetched_commit_decides_consent_not_the_file_api() {
     for (id, path) in [(31, "acme/withdrawn"), (32, "acme/linked")] {
         assert_eq!(org.updater_args(path), None, "{path} was updated");
         assert_eq!(org.branch_file(id), None, "{path} got a branch");
-        assert!(org.merge_request_calls(id).await.is_empty(), "{path}");
+        assert!(
+            org.merge_request_calls(id)
+                .await
+                .iter()
+                .all(|call| call.starts_with("GET ")),
+            "{path}"
+        );
     }
 }
 
@@ -877,7 +1110,12 @@ async fn a_linked_configuration_is_reported_as_a_link_not_as_bad_toml() {
     );
     assert_eq!(org.updater_args("acme/linked"), None);
     assert_eq!(org.branch_file(33), None);
-    assert!(org.merge_request_calls(33).await.is_empty());
+    assert!(
+        org.merge_request_calls(33)
+            .await
+            .iter()
+            .all(|call| call.starts_with("GET "))
+    );
 }
 
 #[tokio::test]

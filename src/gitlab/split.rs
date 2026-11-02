@@ -97,6 +97,8 @@ struct Plan {
     max_bump: String,
     /// The ordinary lane's consents; the major lane derives its own.
     auto_merge: bool,
+    #[serde(default)]
+    ignore_approvals: bool,
     major_mr: bool,
     security_remediation: bool,
     lock_build: bool,
@@ -427,6 +429,7 @@ pub async fn prepare(
         min_age_floor: ordinary.min_age_floor.clone(),
         max_bump: ordinary.max_bump.clone(),
         auto_merge: ordinary.auto_merge,
+        ignore_approvals: ordinary.ignore_approvals,
         major_mr: ordinary.major_mr,
         security_remediation: ordinary.security_remediation,
         lock_build,
@@ -624,6 +627,7 @@ pub async fn publish(
     let (_work_dir, checkout) = org::empty_checkout().await?;
     let mut ordinary = settings.for_project(&project, checkout);
     ordinary.auto_merge = plan.auto_merge;
+    ordinary.ignore_approvals = plan.ignore_approvals;
     ordinary.major_mr = plan.major_mr;
     ordinary.security_remediation = plan.security_remediation;
     ordinary.config = plan.config.clone();
@@ -984,6 +988,7 @@ fn worker_settings(work: &Work, plan: &Plan, checkout: PathBuf, updater: PathBuf
         lock: true,
         no_build: !plan.lock_build,
         auto_merge: plan.auto_merge,
+        ignore_approvals: plan.ignore_approvals,
         security_remediation: plan.security_remediation,
         prepare_command: String::new(),
         validation_command: String::new(),

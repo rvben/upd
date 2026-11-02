@@ -109,6 +109,7 @@ but must leave the repository clean; dependency updates belong exclusively to
 | `commit_message` | `chore(deps): update dependencies with upd` | Generated commit message |
 | `mr_title` | derived from update evidence | Optional merge-request title override |
 | `auto_merge` | `false` | Ask GitLab to merge after project checks pass |
+| `ignore_approvals` | `false` | Allow zero approvals on the ordinary auto-merged MR when the project also consents |
 | `major_mr` | `false` | Keep a second rolling merge request for the major-version upgrades `max_bump` holds back (see [Major upgrades](#major-upgrades)) |
 | `major_branch` | `automation/upd-dependencies-major` | Automation-owned rolling branch of the major merge request |
 | `major_commit_message` | `chore(deps): update major dependencies with upd` | Generated commit message of the major merge request |
@@ -274,7 +275,8 @@ upd-dependency-update:
 
 The template sends GitLab the exact source commit SHA. GitLab still enforces
 required pipelines, approvals, resolved discussions, protected branches, and
-merge trains; the job never bypasses those controls. Turning `auto_merge` off
+merge trains. Approval requirements remain unchanged unless both sides explicitly
+enable the [approval override](#approval-overrides). Turning `auto_merge` off
 cancels auto-merge if this job previously enabled it.
 
 GitLab records a push and rechecks the merge request in background jobs, so
@@ -287,6 +289,106 @@ picks up where it stopped.
 
 The `auto_merge` API option requires GitLab 17.11 or newer. Creating and updating
 merge requests works on older supported versions without that option.
+
+## Approval overrides
+
+To migrate Renovate's `gitLabIgnoreApprovals`, enable `ignore_approvals: true`
+in the central template (or `UPD_IGNORE_APPROVALS=true`) and commit this to the
+project's own default-branch configuration:
+
+```toml
+[automation]
+auto_merge = true
+ignore_approvals = true
+```
+
+Both flags default to false. The effective override requires central consent,
+project consent, and effective auto-merge. `UPD_SHARED_CONFIG` cannot supply
+project consent. The setting affects only upd's ordinary rolling merge request,
+never its major-upgrade proposal or other merge requests. The MR must originate
+in the same project and be authored by the token user. Dry runs do not edit rules.
+
+After GitLab reports the pushed SHA and finishes checking it, upd sets editable
+`any_approver` and `regular` merge-request approval rules to zero, preserving their
+approvers and hidden groups, then arms auto-merge for that SHA. Project-wide rules
+are never edited. Pair this with **Pipelines must succeed** so unattended merges
+remain gated by CI. Resetting approvals on push still works with zero required
+approvals.
+
+The token needs permission to edit merge-request approval rules, in addition to
+the existing auto-merge role and branch permissions. GitLab Premium/Ultimate
+provides the [approval rules API](https://docs.gitlab.com/api/merge_request_approvals/).
+The author must be allowed to override rules; a stronger token does not grant
+consent to bypass policy. With **Prevent editing approval rules in merge requests**,
+Code Owner requirements, or policy-generated requirements, upd leaves those rules
+alone and still requests auto-merge. Logs and the published JSON `approvals` field
+report why an override was unavailable. Network and unexpected API failures fail
+the run rather than silently claiming success.
+
+Before changing rules, upd saves a recovery journal in an internal note authored
+by the token user, bound to the numeric project ID, MR, branch, and bot identity.
+Keep these notes until recovery completes; replacing the MR description is safe.
+The token must be able to create and edit its own MR notes as well as edit rules.
+An API failure after a partial override triggers rollback and leaves the journal
+active if recovery cannot complete. Unexpected failures fail the run and report
+both the original failure and any recovery failure.
+
+At the start of each run, upd reads consent from the fetched default branch before
+executing repository commands. When consent and branch ownership still hold and
+the journal and zero requirements verify, upd retains the existing override.
+Unchanged runs do not create another journal or cancel and requeue auto-merge or
+a merge train. An updater failure can leave that already-consented MR armed.
+
+If consent is withdrawn, the branch is paused, or the override no longer verifies,
+upd cancels auto-merge and restores the pending override before repository
+commands execute. Organization runs also recover an existing rolling MR after the
+project withdraws overall automation consent. Recovery is limited to the configured
+rolling branch; keep that branch and the bot identity unchanged until recovery
+completes. Consent withdrawal takes effect when upd next runs; it cannot revoke an
+already completed merge. Dry runs do not perform recovery.
+
+For a set of purely inherited rules, restoration removes the journaled MR copies
+and verifies GitLab has returned to live project inheritance, including rules
+added while the override was active. MR-only rules retain their original counts
+and approvers. Independently strengthened or edited rules are preserved; conflicts
+require manual reconciliation and leave auto-merge cancelled. Mixed inherited and
+MR-only rules, hidden approvers, or ambiguous source rules are conservatively
+reported as unsupported before any override is attempted. If an administrator
+locks per-MR overrides while a journal is active, upd verifies that project
+inheritance is effective and retains the journal until the lock is lifted.
+Auto-merge stays cancelled while recovery is pending, so unlocking the project
+cannot reactivate dormant zero requirements under an armed merge.
+
+Before excluding a project from the central run, disabling the job, or renaming
+the rolling branch, turn off the override and complete one recovery run. Excluded
+projects and previous branch names are not visited. If a permanent project lock
+prevents recovery, cancel auto-merge and close the affected MR. After preserving
+any human work, delete its rolling branch; the next run creates a fresh MR with
+current project rules. Keep the old journal and do not reopen that old MR until
+its rules have been reconciled.
+
+For manual reconciliation, first cancel auto-merge and restore the appropriate
+requirements through GitLab, including current project policies and any human
+edits. Then delete only the bot's active recovery note to acknowledge completion;
+use the note author or an administrator with access to delete the note, subject
+to [GitLab's note permissions][note-permissions]. Do not delete the note while
+zero requirements still need recovery. After changing bot identity, use the old bot
+identity to recover first, or follow this manual procedure. upd will not treat
+another user's note as recovery authority.
+
+The optional published JSON `approvals` object has a stable `status` and a
+human-readable `detail`. Status values are `overridden`, `retained`, `already_zero`,
+`policy_denied`, `unavailable`, `rolled_back`, `restored`, and `recovery_pending`.
+
+GitLab has no atomic transaction for multiple approval rules. Run only one upd
+writer for each target project. The supplied templates serialize runs through
+`resource_group`; do not run separate central pipelines, templates, or CLI
+processes concurrently against the same rolling branch. The journal is checked
+again before arming auto-merge, but it does not replace this serialization.
+Existing MRs are checked for recovery notes even when the flag is off; projects
+without pending journals receive no approval-rule mutations.
+
+[note-permissions]: https://gitlab.com/gitlab-org/gitlab/-/blob/master/app/policies/note_policy.rb
 
 ## Major upgrades
 
@@ -420,6 +522,7 @@ default branch says so:
 [automation]
 dependency_updates = true
 auto_merge = true            # optional; the central job must allow it too
+ignore_approvals = true      # optional; both sides and auto-merge must allow it
 major_mr = true              # optional; the central job must enable it too
 security_remediation = true  # optional; the central job allows it unless turned off
 ```
@@ -442,9 +545,11 @@ existing merge request is left open for the project to close.
 Create a group access token (or, on GitLab.com Free, a personal access token of
 a dedicated service user) with `api` and `write_repository` scopes and a role
 that can push branches and create merge requests in every project of the group,
-normally **Developer**. When auto-merge is used, the role must also be allowed to
-merge into the protected target branches. Store it as the masked, protected
-`UPD_GITLAB_TOKEN` variable of the central project. GitLab grants a new or
+normally **Developer**. [Approval overrides](#approval-overrides) additionally
+need permission to edit the token user's own MR approval rules. When auto-merge
+is used, the role must also be allowed to merge into the protected target branches.
+Store it as the masked, protected `UPD_GITLAB_TOKEN` variable of the central
+project. GitLab grants a new or
 rotated token its access to the group's projects in the background, so for up
 to a few minutes it can list only some of them; the first run after creating
 or rotating the token may report fewer projects than the group holds.
@@ -479,6 +584,7 @@ release: `upd_version` must name a release that provides `upd gitlab org run`.
 | `max_bump` | `minor` | Highest applied bump; empty uses each project's configuration |
 | `branch`, `commit_message` | as above | Rolling branch and generated commit message in every project |
 | `auto_merge` | `false` | Allow auto-merge in projects that also set `auto_merge = true` |
+| `ignore_approvals` | `false` | Allow the [approval override](#approval-overrides) in projects that also consent; requires effective auto-merge |
 | `major_mr` | `false` | Keep a [major-upgrade merge request](#major-upgrades) in projects that also set `major_mr = true`; needs `max_bump` set to `minor` or `patch` |
 | `security_remediation` | `true` | Apply [security fixes](#security-fixes) in projects that also set `security_remediation = true`; `false` turns them off everywhere |
 | `major_branch`, `major_commit_message` | as above | Rolling branch and generated commit message of the major merge request in every project |
@@ -725,7 +831,8 @@ upd migrate renovate /path/to/project
 This writes `.updrc.toml` beside `renovate.json`, refuses existing upd configs,
 and leaves Renovate's file in place for review. Unconditional
 `packageRules` with `enabled: false` and exact `matchPackageNames` become
-`ignore`; top-level boolean `automerge` becomes `[automation] auto_merge`, and
+`ignore`; top-level boolean `automerge` becomes `[automation] auto_merge`,
+`gitLabIgnoreApprovals` becomes `[automation] ignore_approvals`, and
 `lockFileMaintenance.enabled` becomes `[automation] lock`. Patterns,
 conditional rules, inherited presets, JSON5 and other settings require manual
 review. Every unsupported rule or setting is reported. Migration alone does

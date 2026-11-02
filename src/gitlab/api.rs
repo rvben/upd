@@ -29,6 +29,14 @@ pub struct MergeRequest {
     pub raw: Value,
 }
 
+#[path = "approvals.rs"]
+mod approvals;
+pub use approvals::ApprovalStatus;
+#[cfg(test)]
+pub(crate) use approvals::tests::{
+    fixture as approval_fixture, rule as approval_rule, snapshot as approval_snapshot,
+};
+
 /// How often and how long to wait when GitLab or the network cannot answer.
 ///
 /// Rate limits (429) are retried for every method, because GitLab refuses
@@ -188,6 +196,26 @@ impl Client {
         }
     }
 
+    pub(super) async fn recovery_merge_requests(
+        &self,
+        source: &str,
+        target: &str,
+    ) -> Result<Vec<Value>, Error> {
+        let mut url = self.url(&self.merge_requests)?;
+        url.query_pairs_mut()
+            .append_pair("state", "opened")
+            .append_pair("source_branch", source)
+            .append_pair("target_branch", target);
+        let answer = self.execute(Method::GET, url, None, MAX_ANSWER).await?;
+        if matches!(answer.status, StatusCode::FORBIDDEN | StatusCode::NOT_FOUND) {
+            return Ok(Vec::new());
+        }
+        let value = parse_json(answer)?;
+        value.as_array().cloned().ok_or_else(|| {
+            Error::Refused("GitLab recovery merge-request list is not a list".into())
+        })
+    }
+
     /// All states preserve onboarding decisions and skip labels after closure.
     pub async fn merge_request_history(&self, source: &str) -> Result<Vec<Value>, Error> {
         let mut url = self.url(&self.merge_requests)?;
@@ -314,14 +342,14 @@ impl Client {
         self.send(Method::PUT, url, Some(&body)).await.map(drop)
     }
 
-    async fn wait_until_checked(&self, iid: u64, sha: &str) -> Result<(), Error> {
+    async fn wait_until_checked(&self, iid: u64, sha: &str) -> Result<Value, Error> {
         let url = self.merge_request_url(&iid.to_string())?;
         let mut attempt = 0;
         loop {
             attempt += 1;
             let merge_request = self.send(Method::GET, url.clone(), None).await?;
             let Some(pending) = unsettled(&merge_request, sha) else {
-                return Ok(());
+                return Ok(merge_request);
             };
             if attempt >= self.settle.attempts {
                 return Err(Error::Network(format!(
@@ -339,9 +367,68 @@ impl Client {
         }
     }
 
+    async fn approval_request(
+        &self,
+        method: Method,
+        url: Url,
+        body: Option<&Value>,
+    ) -> Result<Option<Value>, Error> {
+        let answer = self.execute(method, url, body, MAX_ANSWER).await?;
+        let message = String::from_utf8_lossy(&answer.body).to_ascii_lowercase();
+        let policy_validation = matches!(
+            answer.status,
+            StatusCode::BAD_REQUEST | StatusCode::UNPROCESSABLE_ENTITY
+        ) && [
+            "not allowed",
+            "not permitted",
+            "cannot be modified",
+            "not editable",
+            "overriding",
+            "can't be less than",
+            "cannot be less than",
+        ]
+        .iter()
+        .any(|phrase| message.contains(phrase));
+        if matches!(answer.status, StatusCode::FORBIDDEN | StatusCode::NOT_FOUND)
+            || policy_validation
+        {
+            return Ok(None);
+        }
+        parse_json(answer).map(Some)
+    }
+
     pub async fn cancel_auto_merge(&self, iid: u64) -> Result<(), Error> {
         let url = self.merge_request_url(&format!("{iid}/cancel_merge_when_pipeline_succeeds"))?;
-        self.send(Method::POST, url, None).await.map(drop)
+        let answer = self.execute(Method::POST, url, None, MAX_ANSWER).await?;
+        let unarmed = answer.status == StatusCode::NOT_ACCEPTABLE;
+        let value = if unarmed {
+            Value::Null
+        } else {
+            parse_json(answer)?
+        };
+        // GitLab's legacy endpoint returns HTTP 201, status:error and
+        // http_status:406 when already unarmed. Confirm the actual MR state.
+        if unarmed || (value["status"] == "error" && value["http_status"] == 406) {
+            let raw = self
+                .send(Method::GET, self.merge_request_url(&iid.to_string())?, None)
+                .await?;
+            let mr = MergeRequest::from_response(&raw)?;
+            if mr.auto_merge_enabled()
+                || !["auto_merge_enabled", "merge_when_pipeline_succeeds"]
+                    .iter()
+                    .any(|key| raw[*key] == false)
+            {
+                return Err(Error::Refused(
+                    "GitLab did not confirm that auto-merge is cancelled".into(),
+                ));
+            }
+        } else if value["status"] == "error" {
+            return Err(Error::Refused(format!(
+                "GitLab refused auto-merge cancellation: {}",
+                excerpt(&value.to_string())
+            )));
+        }
+        Ok(())
     }
 
     /// Every project in `group` and its subgroups that is not archived,
@@ -1092,6 +1179,16 @@ mod tests {
             let mut body = state.clone();
             body["iid"] = json!(7);
             body["web_url"] = json!("u");
+            for (key, value) in [
+                ("source_branch", json!("automation/upd-dependencies")),
+                ("source_project_id", json!(1)),
+                ("target_project_id", json!(1)),
+                ("author", json!({"id": 42})),
+            ] {
+                if body[key].is_null() {
+                    body[key] = value;
+                }
+            }
             let mock = Mock::given(method("GET"))
                 .and(path(MR_7))
                 .respond_with(ResponseTemplate::new(200).set_body_json(body))
