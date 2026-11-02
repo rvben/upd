@@ -2218,3 +2218,118 @@ fn no_change_dependency_run_still_records_its_publication_base() {
     assert!(fs::read_to_string(output).unwrap().contains("base-sha="));
     assert!(WORKFLOW.contains("base-sha: ${{ steps.branch.outputs.base-sha }}"));
 }
+
+#[test]
+fn auto_merge_requires_compatible_updates_including_the_upd_self_pin() {
+    for bump in ["major", "unknown", "revision"] {
+        let fixture = Fixture::new();
+        let report = serde_json::json!({"files":[{"path":"dependency.txt","updates":[
+            {"package":"rvben/upd","current":"v0.14.3","latest":"v0.18.0","bump":bump}
+        ]}],"summary":{}});
+        fixture.run_publish_with_report(true, "new", true, &report.to_string());
+        assert!(
+            !fixture.log().contains("--auto "),
+            "{bump}: {}",
+            fixture.log()
+        );
+        assert_eq!(fixture.presentation()["auto_merge_eligible"], false);
+        assert!(fixture.body().contains("require manual review"));
+        assert!(fixture.summary().contains("Auto-merge withheld"));
+        assert!(fixture.log().contains("pr create"));
+    }
+    for bump in ["minor", "patch"] {
+        let fixture = Fixture::new();
+        let report = serde_json::json!({"files":[{"path":"dependency.txt","updates":[
+            {"package":"example","current":"1.0.0","latest":"1.1.0","bump":bump}
+        ]}],"summary":{}});
+        fixture.run_publish_with_report(true, "new", true, &report.to_string());
+        assert!(
+            fixture
+                .log()
+                .contains("--auto --squash --match-head-commit")
+        );
+    }
+}
+
+#[test]
+fn breaking_update_revokes_an_existing_auto_merge_request_before_push() {
+    let fixture = Fixture::new();
+    fixture.run_publish(true, "compatible", true);
+    assert_eq!(
+        fs::read_to_string(fixture.state.join("auto-merge"))
+            .unwrap()
+            .trim(),
+        "true"
+    );
+    // Make revocation fail if it happens after the breaking proposal is pushed.
+    let gh = fixture.fake_bin.join("gh");
+    let script = fs::read_to_string(&gh).unwrap().replace(
+        "pr:merge)\n",
+        &format!("pr:merge)\n    if [[ \" $* \" == *' --disable-auto '* ]]; then test \"$(git --git-dir={} show refs/heads/{BRANCH}:dependency.txt)\" = compatible; fi\n", fixture.remote.display()),
+    );
+    write_executable(&gh, &script);
+    fixture.run_publish_with_report(true, "breaking", true,
+        r#"{"files":[{"path":"dependency.txt","updates":[{"package":"example","current":"1","latest":"2","bump":"major"}]}],"summary":{}}"#);
+    assert_eq!(
+        fs::read_to_string(fixture.state.join("auto-merge"))
+            .unwrap()
+            .trim(),
+        "false"
+    );
+    assert_eq!(fixture.branch_file().as_deref(), Some("breaking\n"));
+}
+
+#[test]
+fn security_fixes_use_a_conservative_compatibility_guard_in_both_workflows() {
+    let other = include_str!("../.github/workflows/dependency-remediation.yml");
+    let helper = |workflow: &str| {
+        workflow
+            .split_once("            def release_parts:")
+            .unwrap()
+            .1
+            .split_once("                end;\n")
+            .unwrap()
+            .0
+            .to_string()
+    };
+    assert_eq!(helper(WORKFLOW), helper(other));
+    // Exercise the full presentation and publishing path, including security-only
+    // changes. Unknown or missing versions/ecosystems must never disappear from
+    // the all() predicate and accidentally permit auto-merge.
+    for (ecosystem, from, to, eligible) in [
+        ("crates.io", "0.23.43", "0.23.45", true),
+        ("crates.io", "0.23.43", "0.24.0", false),
+        ("npm", "1.0.0", "2.0.0", false),
+        ("npm", "0.0.3", "0.0.4", false),
+        ("npm", "1.0.0", "1.2.0", true),
+        ("Go", "v1.2.0", "v1.3.0", true),
+        ("PyPI", "0.2.0", "0.3.0", true),
+        ("PyPI", "1.2.0", "2.0.0", false),
+        ("PyPI", "1!1.0", "2!1.0", false),
+        ("npm", "unknown", "1.2.0", false),
+        ("npm", "1.2.0", "resolved lockfile floor", false),
+        ("npm", "1.2.0", "1.1.0", false),
+        ("unknown", "1.2.0", "1.3.0", false),
+    ] {
+        let fixture = Fixture::new();
+        let security = serde_json::json!({"fixes":[{"package":"example","ecosystem":ecosystem,
+            "from_version":from,"to_version":to,"path":"Cargo.lock","status":"applied"}],"summary":{"vulnerabilities":1}});
+        fixture.run_publish_with_security_report(
+            true,
+            "security fix",
+            true,
+            r#"{"files":[],"summary":{}}"#,
+            &security.to_string(),
+        );
+        assert_eq!(
+            fixture.presentation()["auto_merge_eligible"],
+            eligible,
+            "{ecosystem} {from} -> {to}"
+        );
+        assert_eq!(
+            fixture.log().contains("--auto --squash"),
+            eligible,
+            "{ecosystem} {from} -> {to}"
+        );
+    }
+}

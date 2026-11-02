@@ -266,7 +266,7 @@ before it reaches GitHub-flavored Markdown.
 | `branch` | `security/upd` | Automation-owned rolling branch |
 | `commit-message` | `fix(deps): remediate vulnerable dependencies with upd` | Generated Conventional Commit message |
 | `pull-request-title` | derived from audit evidence | Optional rolling pull-request title override |
-| `auto-merge` | `false` | Ask GitHub to auto-merge only a complete, clean remediation |
+| `auto-merge` | `false` | Ask GitHub to auto-merge only a complete, clean remediation with compatible fixes |
 | `merge-method` | `squash` | Auto-merge strategy: `squash`, `merge`, or `rebase` |
 
 Remediation accepts no publishing secret or PAT fallback. The broker issues an
@@ -297,7 +297,7 @@ only Contents and Pull requests write for the target repository.
 | `branch` | `automation/upd-github-actions` | Automation-owned rolling branch |
 | `commit-message` | `ci(deps): update dependencies with upd` | Generated commit message |
 | `pull-request-title` | derived from update evidence | Optional pull-request title override |
-| `auto-merge` | `false` | Ask GitHub to merge after repository checks pass |
+| `auto-merge` | `false` | Ask GitHub to merge compatible updates after repository checks pass |
 | `merge-method` | `squash` | Auto-merge strategy: `squash`, `merge`, or `rebase` |
 
 ## Secrets
@@ -598,6 +598,17 @@ The workflow gives GitHub the exact generated commit SHA through
 conversations, branch protection, rulesets, and merge queues. The workflow never
 uses administrator bypass. Turning `auto-merge` off disables auto-merge if this
 workflow previously enabled it.
+
+Auto-merge is limited to changes whose compatibility can be established. Major
+updates (including pre-1.0 breaking boundaries), upd self-upgrades across those
+boundaries, and unclassified updates require manual review even with
+`auto-merge: true`. Security fixes are checked separately using their concrete
+before/after versions; unknown versions or ecosystems also require review.
+Python fixes use release-component bump levels, consistent with the CLI.
+A stale auto-merge request is disabled **before** a proposal requiring review is
+pushed to the rolling branch. The PR and run summary explain why it was withheld.
+The update itself is still proposed; this guard does not change bump selection
+or the exemption that keeps upd itself current.
 
 The repository must allow the chosen merge method and have auto-merge enabled.
 

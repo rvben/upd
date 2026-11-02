@@ -60,7 +60,7 @@ on:
         type: string
         default: ""
       auto-merge:
-        description: Ask GitHub to merge a complete remediation after repository requirements pass
+        description: Auto-merge complete, compatible fixes after repository requirements pass; breaking or unclassified fixes require review
         type: boolean
         default: false
       merge-method:
@@ -445,6 +445,23 @@ jobs:
               | gsub("[[:space:]]+"; " ")
               | sub("^ "; "") | sub(" $"; "")
               | .[0:$limit];
+            # Keep this policy identical in both reusable workflows. Unknown
+            # versions require review; Python uses release-component bump levels,
+            # while the other audited ecosystems treat 0.x as major-sensitive.
+            def release_parts:
+              if type != "string" then null
+              else (try (capture("^[vV]?(?<major>[0-9]+)(?:\\.(?<minor>[0-9]+))?(?:\\.(?<patch>[0-9]+))?(?:[+][0-9A-Za-z.-]+)?$")
+                | [.major, (.minor // "0"), (.patch // "0")] | map(tonumber)) catch null) // null end;
+            def compatible_fix:
+              . as $fix
+              | (.from_version | release_parts) as $from
+              | (.to_version | release_parts) as $to
+              | if $from == null or $to == null then false
+                elif (["PyPI", "npm", "crates.io", "Go", "RubyGems", "NuGet", "Maven"] | index($fix.ecosystem)) == null then false
+                else $to >= $from and $to[0] == $from[0]
+                  and ($fix.ecosystem == "PyPI" or $from[0] != 0
+                    or ($to[1] == $from[1] and ($from[1] != 0 or $to[2] == $from[2])))
+                end;
             def ids:
               [(.id? // empty), (.aliases[]? // empty)]
               | map(select(type == "string") | clean(80) | ascii_upcase | select(length > 0))
@@ -512,6 +529,11 @@ jobs:
                 schema: 1,
                 disposition: $disposition,
                 auto_merge_requested: $auto_merge,
+                auto_merge_eligible: (
+                  $disposition == "clean_changed"
+                  and all(($pre.fixes // [])[]
+                    | select(.status == "applied" or .status == "already_satisfied" or .status == "pending_relock"); compatible_fix)
+                ),
                 raw_advisory_records_before: ($pre.summary.vulnerabilities // 0),
                 raw_advisory_records_after: ($post[0].summary.vulnerabilities // 0),
                 packages_checked: ($pre.summary.packages_checked // 0),
@@ -613,7 +635,7 @@ jobs:
               "| **Result** | \(if .disposition == "partial_changed" then "Partial remediation; manual follow-up required" elif .disposition == "residual_no_change" then "Finding remains; no safe automated change" elif .disposition == "clean_no_change" then "Already clean; no repository change" else "Complete remediation; fresh audit clean" end) |\n" +
               "| **Scope** | \(path_scope) |\n" +
               "| **Validation** | Repository command passed · diff check passed · fresh uncached audit complete |\n" +
-              "| **Merge** | \(if (.auto_merge_requested and .disposition == "clean_changed") then "Auto-merge requested · repository requirements still control readiness" else "Auto-merge off · repository checks still control readiness" end) |";
+              "| **Merge** | \(if (.auto_merge_requested and .auto_merge_eligible) then "Auto-merge requested · repository requirements still control readiness" elif .auto_merge_requested and .disposition == "clean_changed" then "Auto-merge off · potentially breaking or unclassified changes require manual review" else "Auto-merge off · repository checks still control readiness" end) |";
             def why:
               "### Why this matters\n\n" +
               (if (.issues | length) == 0 then "No advisory details were present in the complete audit."
@@ -969,6 +991,21 @@ jobs:
             fi
           fi
 
+          auto_merge_eligible="$(jq --raw-output '.auto_merge_eligible == true' "$(dirname "$BODY_FILE")/presentation.json")"
+          if [[ "$AUTO_MERGE" != true || "$DISPOSITION" != clean_changed || "$auto_merge_eligible" != true ]]; then
+            if [[ "$(jq 'length' <<< "$pr_list")" -eq 1 ]]; then
+              pr_number="$(jq --raw-output '.[0].number' <<< "$pr_list")"
+              if [[ "$(gh pr view "$pr_number" --repo "$GITHUB_REPOSITORY" \
+                --json autoMergeRequest --jq '.autoMergeRequest != null')" == true ]]; then
+                gh pr merge "$pr_number" --repo "$GITHUB_REPOSITORY" --disable-auto
+                echo "Disabled auto-merge for the rolling security pull request" >> "$summary_file"
+              fi
+            fi
+            if [[ "$AUTO_MERGE" == true && "$DISPOSITION" == clean_changed ]]; then
+              echo "Auto-merge withheld: potentially breaking or unclassified changes require manual review." >> "$summary_file"
+            fi
+          fi
+
           if [[ "$proposal_unchanged" != true ]]; then
             git commit --message "$COMMIT_MESSAGE"
             commit_sha="$(git rev-parse HEAD)"
@@ -1006,17 +1043,13 @@ jobs:
             echo "GitHub returned an invalid pull-request response" >&2
             exit 2
           fi
-          if [[ "$AUTO_MERGE" == true && "$DISPOSITION" == clean_changed ]]; then
+          if [[ "$AUTO_MERGE" == true && "$DISPOSITION" == clean_changed && "$auto_merge_eligible" == true ]]; then
             gh pr merge "$pr_number" \
               --repo "$GITHUB_REPOSITORY" \
               --auto \
               "--${MERGE_METHOD}" \
               --match-head-commit "$commit_sha"
             echo "Requested GitHub auto-merge for $pr_url after repository requirements pass" >> "$summary_file"
-          elif [[ "$(gh pr view "$pr_number" --repo "$GITHUB_REPOSITORY" \
-            --json autoMergeRequest --jq '.autoMergeRequest != null')" == true ]]; then
-              gh pr merge "$pr_number" --repo "$GITHUB_REPOSITORY" --disable-auto
-              echo "Disabled auto-merge for $pr_url" >> "$summary_file"
           fi
 
           echo "url=$pr_url" >> "$output_file"

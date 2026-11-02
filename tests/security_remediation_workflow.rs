@@ -90,6 +90,11 @@ impl Fixture {
         fs::create_dir(&state).unwrap();
         fs::create_dir(&fake_bin).unwrap();
         fs::write(&body, "Validated security remediation.\n").unwrap();
+        fs::write(
+            body.parent().unwrap().join("presentation.json"),
+            r#"{"auto_merge_eligible":true}"#,
+        )
+        .unwrap();
         fs::write(&output, "").unwrap();
         fs::write(&summary, "").unwrap();
 
@@ -126,8 +131,14 @@ case "${1:-}:${2:-}" in
   pr:create) printf '%s\n' open > "$state" ;;
   pr:edit) ;;
   pr:close) printf '%s\n' closed > "$state" ;;
-  pr:view) printf '%s\n' false ;;
-  pr:merge) ;;
+  pr:view) cat "$GH_STATE_DIR/auto-merge" 2>/dev/null || printf '%s\n' false ;;
+  pr:merge)
+    if [[ " $* " == *' --disable-auto '* ]]; then
+      printf '%s\n' false > "$GH_STATE_DIR/auto-merge"
+    else
+      printf '%s\n' true > "$GH_STATE_DIR/auto-merge"
+    fi
+    ;;
   *) echo "Unexpected gh invocation: $*" >&2; exit 2 ;;
 esac
 "#,
@@ -825,4 +836,119 @@ fn publisher_refuses_stale_bases_and_duplicate_pull_requests() {
         String::from_utf8_lossy(&duplicate.stderr)
             .contains("More than one open remediation pull request")
     );
+}
+
+#[test]
+fn security_publisher_withholds_auto_merge_when_the_classifier_requires_review() {
+    for presentation in [r#"{"auto_merge_eligible":false}"#, "{}"] {
+        let fixture = Fixture::new();
+        fs::write(
+            fixture.body.parent().unwrap().join("presentation.json"),
+            presentation,
+        )
+        .unwrap();
+        let base = fixture.base_sha();
+        fixture.stage_change("2.0.0");
+        let output = fixture.run_publish_with_auto_merge("clean_changed", &base, true, "squash");
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(!fixture.log().contains("--auto "));
+        assert!(
+            fs::read_to_string(&fixture.summary)
+                .unwrap()
+                .contains("require manual review")
+        );
+    }
+}
+
+#[test]
+fn security_classifier_applies_the_compatibility_guard_to_clean_fixes() {
+    for (from, to, eligible) in [
+        ("0.11.14", "0.11.15", true),
+        ("0.11.14", "0.12.0", false),
+        ("1.0.0", "unknown", false),
+    ] {
+        let fixture = Fixture::new();
+        fixture.stage_change(to);
+        let report_dir = fixture.state.join("reports");
+        fs::create_dir(&report_dir).unwrap();
+        let pre = serde_json::json!({"summary":{"packages_checked":1,"vulnerabilities":1},
+            "vulnerabilities":[{"package":"example","ecosystem":"crates.io","version":from,"id":"GHSA-example"}],
+            "fixes":[{"package":"example","ecosystem":"crates.io","from_version":from,"to_version":to,"status":"applied"}]});
+        fs::write(report_dir.join("pre-fix.json"), pre.to_string()).unwrap();
+        fs::write(
+            report_dir.join("post-fix.json"),
+            r#"{"summary":{"vulnerabilities":0},"vulnerabilities":[]}"#,
+        )
+        .unwrap();
+        let output = isolated::command("bash")
+            .arg("-c")
+            .arg(workflow_script("Classify the validated result"))
+            .current_dir(&fixture.checkout)
+            .env("ALLOWED_PATHS", "Cargo.toml")
+            .env("AUTO_MERGE", "true")
+            .env("GITHUB_OUTPUT", &fixture.output)
+            .env("GITHUB_STEP_SUMMARY", &fixture.summary)
+            .env("REPORT_DIR", &report_dir)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let presentation: serde_json::Value = serde_json::from_str(
+            &fs::read_to_string(report_dir.join("presentation.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            presentation["auto_merge_eligible"], eligible,
+            "{from} -> {to}"
+        );
+        let body = fs::read_to_string(report_dir.join("pull-request.md")).unwrap();
+        assert_eq!(body.contains("Auto-merge requested"), eligible);
+        assert_eq!(body.contains("require manual review"), !eligible);
+    }
+}
+
+#[test]
+fn security_publisher_revokes_stale_auto_merge_before_pushing_a_breaking_fix() {
+    let fixture = Fixture::new();
+    let base = fixture.base_sha();
+    fixture.stage_change("1.0.1");
+    let first = fixture.run_publish_with_auto_merge("clean_changed", &base, true, "squash");
+    assert!(first.status.success());
+    fixture.reset_to_main();
+    fixture.stage_change("2.0.0");
+    fs::write(
+        fixture.body.parent().unwrap().join("presentation.json"),
+        r#"{"auto_merge_eligible":false}"#,
+    )
+    .unwrap();
+    let gh = fixture.fake_bin.join("gh");
+    let script = fs::read_to_string(&gh).unwrap().replace(
+        "pr:merge)\n",
+        &format!("pr:merge)\n    if [[ \" $* \" == *' --disable-auto '* ]]; then test \"$(git --git-dir={} show refs/heads/{BRANCH}:Cargo.toml)\" = 'version = \"1.0.1\"'; fi\n", fixture.remote.display()),
+    );
+    write_executable(&gh, &script);
+    let second = fixture.run_publish_with_auto_merge("clean_changed", &base, true, "squash");
+    assert!(
+        second.status.success(),
+        "{}",
+        String::from_utf8_lossy(&second.stderr)
+    );
+    assert_eq!(
+        fs::read_to_string(fixture.state.join("auto-merge"))
+            .unwrap()
+            .trim(),
+        "false"
+    );
+    let updated = git(
+        &fixture.checkout,
+        &["show", &format!("refs/remotes/origin/{BRANCH}:Cargo.toml")],
+    );
+    assert!(String::from_utf8(updated.stdout).unwrap().contains("2.0.0"));
 }

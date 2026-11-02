@@ -91,7 +91,7 @@ on:
         type: string
         default: ""
       auto-merge:
-        description: Ask GitHub to merge after all repository checks pass
+        description: Auto-merge compatible updates after repository checks pass; breaking or unclassified changes require review
         type: boolean
         default: false
       merge-method:
@@ -440,6 +440,23 @@ jobs:
               | gsub("[[:space:]]+"; " ")
               | sub("^ "; "") | sub(" $"; "")
               | .[0:$limit];
+            # Keep this policy identical in both reusable workflows. Unknown
+            # versions require review; Python uses release-component bump levels,
+            # while the other audited ecosystems treat 0.x as major-sensitive.
+            def release_parts:
+              if type != "string" then null
+              else (try (capture("^[vV]?(?<major>[0-9]+)(?:\\.(?<minor>[0-9]+))?(?:\\.(?<patch>[0-9]+))?(?:[+][0-9A-Za-z.-]+)?$")
+                | [.major, (.minor // "0"), (.patch // "0")] | map(tonumber)) catch null) // null end;
+            def compatible_fix:
+              . as $fix
+              | (.from_version | release_parts) as $from
+              | (.to_version | release_parts) as $to
+              | if $from == null or $to == null then false
+                elif (["PyPI", "npm", "crates.io", "Go", "RubyGems", "NuGet", "Maven"] | index($fix.ecosystem)) == null then false
+                else $to >= $from and $to[0] == $from[0]
+                  and ($fix.ecosystem == "PyPI" or $from[0] != 0
+                    or ($to[1] == $from[1] and ($from[1] != 0 or $to[2] == $from[2])))
+                end;
             def update_rows:
               [.files[]? as $file
                | $file.updates[]?
@@ -592,7 +609,12 @@ jobs:
                   lockfile_regeneration: $lock
                 },
                 validation: {repository_command_configured: $validation_configured, proposal_integrity_passed: true},
-                auto_merge_requested: $auto_merge
+                auto_merge_requested: $auto_merge,
+                auto_merge_eligible: (
+                  all($updates[]; (.bump | ascii_downcase) == "minor" or (.bump | ascii_downcase) == "patch")
+                  and all(($security.fixes // [])[]
+                    | select(.status == "applied" or .status == "already_satisfied" or .status == "pending_relock"); compatible_fix)
+                )
               }
             | (.changed_paths as $paths
                | (($paths | length) > 0 and all($paths[]; startswith(".github/workflows/")))) as $workflow_only
@@ -1249,6 +1271,23 @@ jobs:
             exit 0
           fi
 
+          # Revoke an earlier request before pushing a proposal that now needs
+          # review, so the rolling branch cannot inherit stale auto-merge.
+          auto_merge_eligible="$(jq --raw-output '.auto_merge_eligible == true' "$PRESENTATION")"
+          if [[ "$AUTO_MERGE" != true || "$auto_merge_eligible" != true ]]; then
+            if [[ "$(jq 'length' <<< "$pr_list")" -eq 1 ]]; then
+              pr_number="$(jq --raw-output '.[0].number' <<< "$pr_list")"
+              if [[ "$(gh pr view "$pr_number" --json autoMergeRequest \
+                --jq '.autoMergeRequest != null')" == true ]]; then
+                gh pr merge "$pr_number" --disable-auto
+                echo "GitHub auto-merge disabled for the rolling pull request" >> "$GITHUB_STEP_SUMMARY"
+              fi
+            fi
+            if [[ "$AUTO_MERGE" == true ]]; then
+              echo "Auto-merge withheld: potentially breaking or unclassified changes require manual review." >> "$GITHUB_STEP_SUMMARY"
+            fi
+          fi
+
           commit_sha="$(git rev-parse HEAD)"
           git_push \
             --force-with-lease="refs/heads/${BRANCH}:${EXPECTED_REMOTE_SHA}" \
@@ -1353,8 +1392,10 @@ jobs:
                 "**Proposal integrity passed.** No repository-specific validation command was configured."
               end;
             def merge_intent:
-              if .auto_merge_requested then
+              if .auto_merge_requested and .auto_merge_eligible then
                 "Auto-merge is requested; repository rules still control readiness."
+              elif .auto_merge_requested then
+                "Auto-merge is off: potentially breaking or unclassified changes require manual review."
               else "Auto-merge is off."
               end;
             "<p><a href=\"https://github.com/rvben/upd\"><img src=\"https://raw.githubusercontent.com/rvben/upd/84109eaf36c739dc11af0452c6218abb7e47a8e3/assets/logo-wide.svg\" alt=\"upd\" width=\"96\"></a></p>" +
@@ -1413,14 +1454,10 @@ jobs:
           echo "url=$pr_url" >> "$GITHUB_OUTPUT"
           echo "Pull request: $pr_url" >> "$GITHUB_STEP_SUMMARY"
 
-          if [[ "$AUTO_MERGE" == true ]]; then
+          if [[ "$AUTO_MERGE" == true && "$auto_merge_eligible" == true ]]; then
             gh pr merge "$pr_number" --auto "--${MERGE_METHOD}" \
               --match-head-commit "$commit_sha"
             echo "GitHub auto-merge enabled for $pr_url" >> "$GITHUB_STEP_SUMMARY"
-          elif [[ "$(gh pr view "$pr_number" --json autoMergeRequest \
-            --jq '.autoMergeRequest != null')" == true ]]; then
-            gh pr merge "$pr_number" --disable-auto
-            echo "GitHub auto-merge disabled for $pr_url" >> "$GITHUB_STEP_SUMMARY"
           fi
 
       - name: Revoke publication token
