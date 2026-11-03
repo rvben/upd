@@ -635,6 +635,57 @@ GitHub may merge an eligible pull request immediately. The safe rollout order is
 4. Set `auto-merge: true`, then verify a fresh canary waits for the required
    checks and uses the exact generated head commit.
 
+## Automatic reviews for protected branches
+
+Repositories that require an approving review can opt into the reusable
+`review-dependencies.yml` workflow. Enable **Allow GitHub Actions to create and
+approve pull requests** in the repository's Actions settings, then add this
+caller on the default branch (replace the placeholder with a published upd
+release's full commit SHA):
+
+```yaml
+name: Review upd proposal
+on:
+  workflow_run:
+    workflows: [Dependency health]
+    types: [completed]
+permissions:
+  actions: read
+  contents: read
+  pull-requests: write
+jobs:
+  review:
+    uses: rvben/upd/.github/workflows/review-dependencies.yml@<release-commit-sha>
+    with:
+      publisher-bot-id: 123456789 # Numeric user ID of your publishing App bot
+      allowed-paths: >-
+        .github/workflows/*.yml
+        .github/workflows/*.yaml
+        Cargo.toml
+        Cargo.lock
+```
+
+The updater caller must be `.github/workflows/dependencies.yml`, named
+`Dependency health`, with the reusable dependency-health job named `update`.
+Its `auto-merge` input must be enabled. The reviewer accepts the initial guarded
+workflow and newer stable published releases pinned by full SHA. The review
+allowlist should be no broader than the publisher's explicit dependency paths.
+
+The reviewer runs without checkout, repository commands, or dependency installs.
+It verifies successful isolated publication, GitHub artifact digests, proposal
+checksum and parent, allowed files, compatibility eligibility, and an App-armed
+squash auto-merge request. It independently reads the exact GitHub commit's
+before/after files and checks conservative compatibility rules for existing
+GitHub workflow references, Cargo manifests/locks, npm manifests/locks, and Go
+modules/checksums. New files, unsupported formats, ambiguous version changes,
+new npm overrides, and lockfile graph changes outside those rules retain manual
+review. Repository-controlled reports alone cannot authorize an approval.
+
+Approvals bind to the exact proposal commit. Keep stale-review dismissal and
+strict required CI checks enabled. Required CI, code-owner approvals, and all
+other repository protections still apply; this workflow supplies an ordinary
+approval and does not bypass them.
+
 ## Migrating off Dependabot
 
 For an existing fleet, keep overlapping Dependabot updates enabled for four
