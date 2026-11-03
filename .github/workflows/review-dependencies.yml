@@ -17,6 +17,11 @@ permissions:
   contents: read
   pull-requests: write
 
+# Serialize with the trusted publisher so it cannot replace deps/upd mid-review.
+concurrency:
+  group: upd-dependency-writes-${{ github.repository }}
+  cancel-in-progress: false
+
 jobs:
   review:
     if: github.event_name == 'workflow_run' && github.event.workflow_run.conclusion == 'success'
@@ -44,6 +49,7 @@ jobs:
           import re
           import subprocess
           import zipfile
+          from urllib.parse import quote
 
           TRUSTED_UPD_SHA = "b183939ff7dc62539afb00b3c555ffbfe3c5d58b"
           UPD_BOT_ID = int(os.environ.get('UPD_PUBLISHER_BOT_ID', '322216747'))
@@ -255,7 +261,7 @@ jobs:
                   if file['status'] != 'modified':
                       raise ValueError('new dependency files require manual review')
                   def read(ref):
-                      blob = get(f"repos/{repo}/contents/{path}?ref={ref}")
+                      blob = get(f"repos/{repo}/contents/{quote(path, safe='/')}?ref={ref}")
                       if blob.get('encoding') != 'base64' or blob.get('size', MAX_ARCHIVE + 1) > MAX_ARCHIVE:
                           raise ValueError('unsupported or oversized GitHub blob')
                       return base64.b64decode(blob['content'], validate=False).decode('utf-8')
@@ -294,6 +300,52 @@ jobs:
               return False
 
 
+          def dismiss_stale(get, repo, branch):
+              prs = get(f"repos/{repo}/pulls?state=open&head={repo.split('/')[0]}:deps/upd&base={branch}&per_page=100")
+              for pr in prs:
+                  if pr.get('user', {}).get('id') != UPD_BOT_ID:
+                      continue
+                  for page in range(1, 101):
+                      reviews = get(f"repos/{repo}/pulls/{pr['number']}/reviews?per_page=100&page={page}")
+                      for item in reviews:
+                          if ((item.get('user') or {}).get('login') == 'github-actions[bot]'
+                                  and item.get('state') == 'APPROVED'
+                                  and item.get('commit_id') != pr['head']['sha']):
+                              get(f"repos/{repo}/pulls/{pr['number']}/reviews/{item['id']}/dismissals", {
+                                  'message': 'Withdrawing approval of an older rolling proposal.'
+                              }, method='PUT')
+                      if len(reviews) < 100:
+                          break
+                  else:
+                      raise ValueError('review history exceeds safety bound')
+
+
+          def verify_merge_scope(get, repo, branch, base, head, number, files):
+              rules = get(f"repos/{repo}/rules/branches/{quote(branch, safe='')}")
+              if not any(r['type'] == 'pull_request'
+                         and r.get('parameters', {}).get('dismiss_stale_reviews_on_push') is True
+                         and r.get('parameters', {}).get('required_approving_review_count', 0) >= 1 for r in rules):
+                  raise ValueError('automatic approval requires a stale-dismissal review ruleset')
+              if not any(r['type'] == 'required_status_checks'
+                         and r.get('parameters', {}).get('strict_required_status_checks_policy') is True
+                         and r.get('parameters', {}).get('required_status_checks')
+                         and all(isinstance(c.get('integration_id'), int) and c['integration_id'] > 0
+                                 for c in r['parameters']['required_status_checks']) for r in rules):
+                  raise ValueError('automatic approval requires strict required CI checks')
+              # A dispatch on a tag named like the default branch must not introduce an
+              # unreviewed parent. Bind to the actual branch ref, not its ambiguous name.
+              tip = get(f"repos/{repo}/git/ref/heads/{quote(branch, safe='')}")['object']['sha']
+              if get(f"repos/{repo}/compare/{base}...{tip}")['status'] not in {'identical', 'ahead'}:
+                  raise ValueError('triggering base is not on the protected default branch')
+              comparison = get(f"repos/{repo}/compare/{tip}...{head}")
+              if comparison.get('merge_base_commit', {}).get('sha') != base:
+                  raise ValueError('pull request merge base differs from the validated base')
+              actual = get(f"repos/{repo}/pulls/{number}/files?per_page=100")
+              identity = lambda rows: sorted((f['filename'], f['status'], f['sha']) for f in rows)
+              if len(actual) >= 100 or identity(actual) != identity(files):
+                  raise ValueError('pull request diff differs from the validated proposal')
+
+
           def review(repo, run_id, get=api, download=archive):
               if not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repo) or not str(run_id).isdigit():
                   raise ValueError("invalid repository or run")
@@ -301,6 +353,7 @@ jobs:
                   raise ValueError("repository has not opted in to this review policy")
               metadata = get(f"repos/{repo}")
               branch = metadata["default_branch"]
+              dismiss_stale(get, repo, branch)
               run = get(f"repos/{repo}/actions/runs/{run_id}")
               if (run["status"] != "completed" or run["conclusion"] != "success"
                       or run["event"] not in {"schedule", "workflow_dispatch"}
@@ -368,6 +421,7 @@ jobs:
               current = get(f"repos/{repo}/pulls/{number}")
               if not candidate(current, repo, branch, proposal):
                   raise ValueError("pull request changed before review")
+              verify_merge_scope(get, repo, branch, base, proposal, number, files)
               posted = get(f"repos/{repo}/pulls/{number}/reviews", {
                   "commit_id": proposal, "event": "APPROVE",
                   "body": "Validated the exact proposal from the trusted upd run: compatible update, isolated publication policy passed. Required CI and code-owner rules still apply."
@@ -376,11 +430,17 @@ jobs:
               if after.get("merged") and after.get("head", {}).get("sha") == proposal:
                   print(f"The approved proposal in PR #{number} has already merged.")
                   return
-              if not candidate(after, repo, branch, proposal):
+              try:
+                  if posted.get('commit_id') != proposal or posted.get('state') != 'APPROVED':
+                      raise ValueError('GitHub review response does not identify the approved proposal')
+                  if not candidate(after, repo, branch, proposal):
+                      raise ValueError('proposal changed during review')
+                  verify_merge_scope(get, repo, branch, base, proposal, number, files)
+              except Exception as problem:
                   get(f"repos/{repo}/pulls/{number}/reviews/{posted['id']}/dismissals", {
-                      "message": "Proposal changed while approval was being submitted; discarding this stale approval."
+                      "message": "Proposal or protections changed during approval; discarding this review."
                   }, method="PUT")
-                  raise ValueError("proposal changed during review; approval dismissed")
+                  raise ValueError("proposal changed during review; approval dismissed") from problem
               print(f"Approved the validated proposal in PR #{number} at {proposal}.")
 
 

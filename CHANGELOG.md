@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.18.3](https://github.com/rvben/upd/compare/v0.18.2...v0.18.3) - 2026-11-03
+
+### Added
+
+- **ci**: review verified compatible dependency proposals ([39cae8c](https://github.com/rvben/upd/commit/39cae8cb0c42f4066a36231b3094ce8d7c6f975b))
+
 ## [0.18.2](https://github.com/rvben/upd/compare/v0.18.1...v0.18.2) - 2026-11-02
 
 ### Added

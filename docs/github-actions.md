@@ -681,8 +681,12 @@ modules/checksums. New files, unsupported formats, ambiguous version changes,
 new npm overrides, and lockfile graph changes outside those rules retain manual
 review. Repository-controlled reports alone cannot authorize an approval.
 
-Approvals bind to the exact proposal commit. Keep stale-review dismissal and
-strict required CI checks enabled. Required CI, code-owner approvals, and all
+Approvals bind to the exact proposal commit. The reviewer and publisher share
+one concurrency group, preventing the publisher from replacing the head during
+review. Configure an active pull-request ruleset with at least one required
+approval and stale-review dismissal, plus strict required CI checks pinned to
+their issuing App. The reviewer verifies those rules through GitHub before
+approving; classic branch protections can remain layered on top. Required CI, code-owner approvals, and all
 other repository protections still apply; this workflow supplies an ordinary
 approval and does not bypass them.
 

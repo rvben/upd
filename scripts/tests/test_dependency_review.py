@@ -29,7 +29,11 @@ class ReviewPolicy(unittest.TestCase):
         self.dismissals = []
         self.changed_after_approval = False
         self.parents = [self.base]
-        self.files = [{'filename': 'Cargo.lock', 'status': 'modified'}]
+        self.files = [{'filename': 'Cargo.lock', 'status': 'modified', 'sha': 'd' * 40}]
+        self.pr_files = self.files
+        self.base_on_main = True
+        self.stale_dismissal = True
+        self.old_reviews = []
         self.publisher_ok, self.changed = True, False
         self.contents = {self.base: 'version = 4\n[[package]]\nname = "test"\nversion = "1.0.0"\nchecksum = "old"\n', self.head: 'version = 4\n[[package]]\nname = "test"\nversion = "1.0.1"\nchecksum = "new"\n'}
 
@@ -39,10 +43,20 @@ class ReviewPolicy(unittest.TestCase):
                 self.dismissals.append(payload)
             else:
                 self.approvals.append(payload)
-            return {'id': 123}
+            return {'id': 123, 'commit_id': self.head, 'state': 'APPROVED'}
         suffix = path.removeprefix('repos/' + self.repo)
         if not suffix:
             return {'default_branch': 'main'}
+        if suffix.startswith('/rules/branches/'):
+            return [{'type': 'pull_request', 'parameters': {'dismiss_stale_reviews_on_push': self.stale_dismissal, 'required_approving_review_count': 1}}, {'type': 'required_status_checks', 'parameters': {'strict_required_status_checks_policy': True, 'required_status_checks': [{'context': 'test', 'integration_id': 15368}]}}]
+        if suffix == '/git/ref/heads/main':
+            return {'object': {'sha': self.base}}
+        if suffix.startswith('/compare/'):
+            return {'status': 'identical' if self.base_on_main else 'diverged', 'merge_base_commit': {'sha': self.base}}
+        if suffix == '/pulls/1/files?per_page=100':
+            return self.pr_files
+        if suffix.startswith('/pulls/1/reviews?'):
+            return self.old_reviews
         if suffix.startswith('/contents/'):
             value = self.contents[suffix.split('?ref=')[1]].encode()
             return {'encoding': 'base64', 'size': len(value), 'content': base64.b64encode(value).decode()}
@@ -72,6 +86,30 @@ class ReviewPolicy(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.review()
         self.assertEqual(self.approvals, [])
+
+    def test_reviewer_serializes_with_the_dependency_publisher(self):
+        publisher = WORKFLOW.with_name('dependency-health.yml').read_text()
+        group = '  group: upd-dependency-writes-${{ github.repository }}'
+        self.assertIn(group, publisher)
+        self.assertIn(group, WORKFLOW.read_text())
+
+    def test_tag_named_main_cannot_smuggle_an_unreviewed_parent(self):
+        self.base_on_main = False
+        self.reject()
+
+    def test_pull_request_must_contain_only_the_validated_diff(self):
+        self.pr_files = self.files + [{'filename': 'src/attack.rs', 'status': 'added', 'sha': 'e' * 40}]
+        self.reject()
+
+    def test_stale_review_dismissal_is_required(self):
+        self.stale_dismissal = False
+        self.reject()
+
+    def test_older_approval_is_withdrawn_even_when_new_report_is_ineligible(self):
+        self.old_reviews = [{'id': 123, 'user': {'login': 'github-actions[bot]'}, 'state': 'APPROVED', 'commit_id': 'c' * 40}]
+        self.presentation['auto_merge_eligible'] = False
+        self.reject()
+        self.assertEqual(len(self.dismissals), 1)
 
     def test_forged_eligibility_cannot_approve_actual_breaking_files(self):
         self.contents[self.head] = self.contents[self.head].replace('1.0.1', '2.0.0')
