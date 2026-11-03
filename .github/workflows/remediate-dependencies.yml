@@ -17,7 +17,7 @@ permissions:
 
 jobs:
   remediate:
-    uses: rvben/upd/.github/workflows/dependency-remediation.yml@c3215394f3c07a0252e9c759eb23c8b83072f7b2 # v0.16.0
+    uses: rvben/upd/.github/workflows/dependency-remediation.yml@b183939ff7dc62539afb00b3c555ffbfe3c5d58b # v0.18.2
     with:
       publish: >-
         ${{ github.event_name == 'schedule' ||
@@ -28,3 +28,5 @@ jobs:
       validation-command: make check
       branch: security/upd
       commit-message: "fix(deps): remediate vulnerable Rust dependencies with upd"
+      auto-merge: true
+      merge-method: squash
