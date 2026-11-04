@@ -34,10 +34,13 @@ changed manifest is rewritten only under `--lock`, by the project's own
 package manager; the complete commands are listed under
 [Commands run by `--lock`](stability.md#commands-run-by---lock).
 
-`audit` does read lockfiles. The lockfile beside a manifest is scanned for
-the resolved versions it records, including transitive packages the manifest
-never names, so advisories are matched against what the project installs
-rather than against the ranges it declares. See [Audit](audit.md).
+`audit` does read lockfiles: `uv.lock`, `poetry.lock`, `package-lock.json`,
+`npm-shrinkwrap.json`, `Cargo.lock` and Gradle lockfiles. Such a lockfile
+beside a manifest is scanned for the resolved versions it records, including
+transitive packages the manifest never names, so advisories are matched
+against what the project installs rather than against the ranges it declares.
+Other lockfiles are not read, and those projects are audited from what their
+manifests declare. See [Audit](audit.md).
 
 ## Python
 
@@ -155,7 +158,49 @@ Use `--lock` to have the package manager validate the resulting dependency set.
 
 ## Node.js
 
-- `package.json` (`dependencies` and `devDependencies`)
+- `package.json` (`dependencies`, `devDependencies`, `peerDependencies` and
+  `optionalDependencies`)
+- Versions come from the npm registry, or from the registry `NPM_REGISTRY` or
+  `.npmrc` names, including per-scope registries; see
+  [Private registries](private-registries.md#npm--private-registry)
+- Lockfiles of npm, pnpm, Yarn and Bun beside the `package.json`: refreshed by
+  that package manager under `--lock`
+
+| Package manager | Lockfile | Read by `audit` |
+| --- | --- | --- |
+| npm | `npm-shrinkwrap.json`, otherwise `package-lock.json` | yes, including transitive packages |
+| pnpm | `pnpm-lock.yaml` | no |
+| Yarn 2 or newer | `yarn.lock` | no |
+| Bun | `bun.lock`, otherwise the binary `bun.lockb` | no |
+
+The `package.json` is the same file whichever package manager locks it, so Bun
+projects are updated, selected (`--lang node`) and given cooldowns (the `node`
+ecosystem key) exactly like npm ones. When one directory holds the lockfiles of
+more than one package manager, for example during a migration, the manifest is
+updated once and every lockfile is refreshed. Where a package manager reads
+only one of two lockfiles, only that one is refreshed: npm ignores
+`package-lock.json` when `npm-shrinkwrap.json` exists, and Bun ignores
+`bun.lockb` when `bun.lock` exists. The exact refresh commands are under
+[Commands run by `--lock`](stability.md#commands-run-by---lock), and how a
+cooldown reaches each lockfile is under [Lockfiles](configuration.md#lockfiles).
+
+`audit` reads only npm's lockfiles. In a pnpm, Yarn or Bun project it checks
+the dependencies `package.json` declares, and the transitive packages the
+lockfile resolves are not audited.
+
+Version specifiers keep their shape when updated:
+
+- Exact pins (`1.2.3`) and caret or tilde ranges (`^1.2.3`, `~1.2.3`) move to
+  the new version with the same operator.
+- Ranges with an independent ceiling (`>=1.0.0 <2.0.0`, `1.2.3 - 2.0.0`) have
+  their lower bound raised to a release inside the range, so the ceiling stays.
+- Ranges with open components (`1.2.x`, `1.x`, `^1.2`) move as a whole:
+  `1.2.x` becomes `1.3.x`, never a full version.
+- Alternations (`^1 || ^2`), upper-only bounds (`<3`) and exclusive lower bounds
+  (`>1.2.3`) are evaluated but never rewritten; a newer release outside one is
+  reported as a warning.
+- Specifiers that name no registry version (`*`, `latest`, `workspace:*`,
+  `file:../local`, `github:owner/repo`, Git URLs) are skipped.
 
 ## Rust
 
