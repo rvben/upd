@@ -220,11 +220,25 @@ alone.
 `deno.jsonc` comments and formatting survive updates: the write rewrites only
 the matched specifier inside the original text. A standalone
 `import_map.json` referenced by `"importMap"` has the same shape but is not
-discovered. `deno.lock` is read for audit-free lock refreshing only — it is
-never hand-edited; `--lock` runs the package manager (see
+discovered. `deno.lock` is never hand-edited; `--lock` runs the package manager (see
 [Commands run by `--lock`](stability.md#commands-run-by---lock)). The
 `JSR_REGISTRY` environment variable points jsr resolution at another
 JSR-compatible registry, the way `NPM_REGISTRY` does for npm.
+
+Only the top-level `"imports"` map is read and written. A `"scopes"` entry
+with the same key is left as it is, and URL imports (`https://...`) are not
+updated: they name no registry version upd can resolve.
+
+In a Deno workspace (`"workspace": ["./a", "./b"]` or
+`"workspace": {"members": [...]}` in the root `deno.json`, globs accepted),
+each member's `deno.json` is updated in place and the single `deno.lock` at
+the workspace root is refreshed once, from the root. A `package.json` is
+handled by the Node.js updater; a `deno.lock` beside one with no `deno.json`
+is not refreshed.
+
+`align` compares a package across `deno.json` files, whatever key each
+imports it under. It does not compare an `npm:` specifier with the same
+package in a `package.json`.
 
 `audit` covers the `npm:` specifiers of a deno.json: they are real npm
 names, and OSV advisories index them exactly as package.json's entries. The

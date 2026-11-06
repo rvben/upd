@@ -7,10 +7,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Added
-
-- **deno**: `deno.json`/`deno.jsonc` import maps are a dependency ecosystem: `jsr:` specifiers resolve through the JSR registry, `npm:` through the shared npm client, `deno.jsonc` comments survive writes, and `--lock` refreshes `deno.lock` with `deno install --lockfile-only`. `audit` checks the `npm:` specifiers and reports the `jsr:` ones as not audited
-
 ## [0.18.3](https://github.com/rvben/upd/compare/v0.18.2...v0.18.3) - 2026-11-03
 
 ### Added
