@@ -982,8 +982,12 @@ impl RegistryRoute {
     }
 }
 
-/// A parsed dependency from a file (for alignment purposes)
-#[derive(Debug, Clone, Default)]
+/// A parsed dependency from a file (for alignment purposes).
+///
+/// Built through [`ParsedDependency::new`] and its builders; there is no
+/// `Default`, whose `is_bumpable: false` would silently describe every
+/// dependency as unbumpable.
+#[derive(Debug, Clone)]
 pub struct ParsedDependency {
     /// Package name
     pub name: String,
@@ -1003,7 +1007,7 @@ pub struct ParsedDependency {
     /// The registry the dependency resolves through, when its file routes
     /// entries between several registries; `None` on a single-registry file.
     ///
-    /// Audit routes on the distinction — an npm route names a package OSV's
+    /// Audit routes on the distinction: an npm route names a package OSV's
     /// npm index covers, while a JSR route names a package no OSV ecosystem
     /// covers and is reported as not audited.
     pub registry: Option<RegistryRoute>,
@@ -1021,8 +1025,9 @@ impl ParsedDependency {
             name: name.into(),
             version: version.into(),
             line_number,
+            has_upper_bound: false,
             is_bumpable: true,
-            ..Self::default()
+            registry: None,
         }
     }
 
