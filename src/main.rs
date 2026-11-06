@@ -1600,7 +1600,7 @@ fn go_mod_coverage_warnings(files: &[(std::path::PathBuf, FileType)]) -> Vec<Str
 /// An import map mixes `jsr:` and `npm:` specifiers. The `npm:` ones audit
 /// as npm: they are real npm names, and OSV advisories index them exactly
 /// as package.json's entries. A `jsr:` one names a package only JSR serves,
-/// and OSV indexes neither JSR packages nor npm packages under JSR names —
+/// and OSV indexes neither JSR packages nor npm packages under JSR names:
 /// querying the npm index with one would match whatever npm package shares
 /// the name. `build_audit_packages` therefore skips them, and this warning
 /// says so rather than letting the file pass silently unaudited.
@@ -6496,8 +6496,11 @@ fn apply_deno_version(
     update: &VersionEdit<'_>,
     target_version: &str,
 ) -> bool {
+    // The import key is an alias the author chose, so the match anchors on
+    // the specifier the version belongs to: scheme, package, `@`, the range
+    // operator, then the exact old version ending at a subpath or the quote.
     let pattern = format!(
-        r#"("{}"\s*:\s*"[^"]*@[^""]*){}(")"#,
+        r#"("(?:jsr|npm):/?{}@[^"0-9]*){}((?:/[^"]*)?")"#,
         regex::escape(update.package),
         regex::escape(update.old_version)
     );

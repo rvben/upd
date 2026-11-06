@@ -9,7 +9,7 @@
 //!   ([`crate::registry::JsrRegistry`] in the binary), whose metadata endpoint
 //!   lists every published release with its publish time.
 //! * `npm:` ranges resolve through the registry the caller passes to
-//!   [`Updater::update`] — the same client the Node.js updater uses, so
+//!   [`Updater::update`], the same client the Node.js updater uses, so
 //!   credentials and scoped-registry configuration in `.npmrc` apply unchanged.
 //! * Range grammar is npm's in both cases (JSR adopted it for `jsr:` too), so
 //!   [`crate::npm_range`] decides what a specifier admits and where its floor
@@ -207,17 +207,21 @@ fn imports_of(json: &Value) -> Vec<(String, String)> {
 
 /// The line an import is written on, found by its key in the raw content.
 ///
-/// The match is anchored to a JSON key shape — optional indent, the quoted
-/// key, a colon — so the same string inside a comment's prose does not match.
-/// The first match wins, which is what the line index in `package_json.rs`
-/// does for duplicate keys too.
+/// The search covers only the top-level `"imports"` object, the map the entry
+/// was read from: a `"scopes"` map can carry the same key. Within it the match
+/// is anchored to a JSON key shape (optional indent, the quoted key, a colon),
+/// so the same string inside a comment's prose does not match. The first
+/// match wins, which is what the line index in `package_json.rs` does for
+/// duplicate keys too.
 fn line_for_import(content: &str, key: &str) -> Option<usize> {
+    let span = crate::jsonc::object_span(content, "imports")?;
     let pattern = format!(r#"^\s*"{}"\s*:"#, regex::escape(key));
     let re = Regex::new(&pattern).ok()?;
-    content
+    let lines_before = content[..span.start].matches('\n').count();
+    content[span]
         .lines()
         .position(|line| re.is_match(line))
-        .map(|idx| idx + 1)
+        .map(|idx| lines_before + idx + 1)
 }
 
 impl DenoUpdater {
@@ -226,7 +230,7 @@ impl DenoUpdater {
     }
 
     /// An updater that can read a file but not resolve anything in it, for
-    /// callers that only ever call `parse_dependencies` — the pattern
+    /// callers that only ever call `parse_dependencies`. This is the pattern
     /// [`crate::updater::MiseUpdater::new_parse_only`] follows for the same
     /// reason: alignment never resolves, so building a live registry client
     /// there would only be a request waiting to happen.
@@ -248,8 +252,9 @@ impl DenoUpdater {
 
     /// Rewrite one import value in the original content, comments intact.
     ///
-    /// The pattern anchors on the quoted key and the exact old value, so an
-    /// edit cannot reach past the entry it was decided for.
+    /// The edit is confined to the top-level `"imports"` object and anchors
+    /// on the quoted key and the exact old value, so it cannot reach past the
+    /// entry it was decided for, including a `"scopes"` entry of the same key.
     fn update_specifier_in_content(
         &self,
         content: &str,
@@ -264,7 +269,16 @@ impl DenoUpdater {
         );
         let re = Regex::new(&pattern).expect("Invalid pattern");
         let replacement = format!(r#"${{1}}{new_value}${{2}}"#);
-        re.replace(content, replacement.as_str()).to_string()
+        let Some(span) = crate::jsonc::object_span(content, "imports") else {
+            return content.to_string();
+        };
+        let section = re.replace(&content[span.clone()], replacement.as_str());
+        format!(
+            "{}{}{}",
+            &content[..span.start],
+            section,
+            &content[span.end..]
+        )
     }
 
     /// Shared in-memory update path over the `"imports"` map.
@@ -590,6 +604,25 @@ enum Routed {
     Error(String),
 }
 
+/// The release a specifier is measured from: the version an exact pin or a
+/// caret/tilde range names after its operator, otherwise the completed floor
+/// of a range that states one.
+///
+/// Parsing and cooldown share it, so a specifier audit and align can see is
+/// also one cooldown can age, and the reverse. `None` means the specifier
+/// names no single complete release.
+fn current_version(range: &str, shape: SpecShape) -> Option<String> {
+    let version = match shape {
+        SpecShape::ExactPin | SpecShape::CaretOrTilde => {
+            let start = range.find(|c: char| c.is_ascii_digit())?;
+            range[start..].trim().to_string()
+        }
+        _ => lower_bound_anchor(range)?,
+    };
+    semver::Version::parse(&version).ok()?;
+    Some(version)
+}
+
 /// Decide what one looked-up release means for one specifier.
 ///
 /// Exact pins and caret/tilde ranges keep their operator and precision, the
@@ -618,13 +651,9 @@ async fn route_update(
     };
     let shape = classify(range);
 
-    // Cooldown needs a current version to measure an age from. A pin has the
-    // version itself; a range has its floor, completed where the file wrote it
-    // partially. Ranges without a floor skip cooldown, like package_json.rs.
-    let anchor = match shape {
-        SpecShape::ExactPin => Some(range.to_string()),
-        _ => lower_bound_anchor(range),
-    };
+    // Cooldown needs a current version to measure an age from. Specifiers
+    // naming no single release skip cooldown, like package_json.rs.
+    let anchor = current_version(range, shape);
     let current_is_pre = anchor.as_deref().map(is_prerelease_semver).unwrap_or(false);
 
     let (effective, held_back) = if let Some(anchor) = &anchor {
@@ -809,16 +838,12 @@ impl Updater for DenoUpdater {
             let Some(range) = spec.range else {
                 continue;
             };
-            // A specifier without a readable floor names no release, so
-            // alignment has nothing to line up; a readable one is reported at
-            // its completed floor, the same spelling every other ecosystem's
-            // parser hands to align.
-            let Some(anchor) = lower_bound_anchor(&range) else {
+            // A specifier naming no single release has nothing for audit or
+            // align to line up; one that does is reported at that release,
+            // the same spelling every other ecosystem's parser hands them.
+            let Some(anchor) = current_version(&range, classify(&range)) else {
                 continue;
             };
-            if semver::Version::parse(&anchor).is_err() {
-                continue;
-            }
             // The registry the specifier resolves through. Audit routes on
             // it: `npm:` specifiers are real npm names OSV indexes, `jsr:`
             // ones name packages no OSV ecosystem covers.
@@ -828,8 +853,8 @@ impl Updater for DenoUpdater {
             };
             deps.push(
                 // Alignment groups by the package the specifier resolves, so
-                // the same package is comparable across deno.json and
-                // package.json.
+                // the same package is comparable across deno.json files
+                // whatever key each imports it under.
                 ParsedDependency::new(spec.package, anchor, line_for_import(&content, &key))
                     .with_registry(registry),
             );
@@ -978,8 +1003,6 @@ mod tests {
         // never depends on which constructor the caller picked.
         let dir = tempdir().unwrap();
         let path = dir.path().join("deno.json");
-        // Alignment reports a specifier at its floor, so the fixture uses
-        // ranges that state one (see parse_dependencies).
         let content = r#"{
   "imports": {
     "@std/path": "jsr:@std/path@>=1.0.0",
@@ -1024,7 +1047,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_parse_only_updater_resolves_nothing_and_says_so() {
-        // The npm registry still answers — parse-only withholds the updater's
+        // The npm registry still answers: parse-only withholds the updater's
         // own JSR client, not the caller's registry.
         let npm = MockRegistry::new("npm-test").with_version("chalk", "5.6.2");
 
@@ -1233,5 +1256,152 @@ mod tests {
         let content = "// \"chalk\": \"npm:chalk@1.0.0\" prose\n{\n  \"imports\": {\n    \"chalk\": \"npm:chalk@^5.0.0\"\n  }\n}\n";
         assert_eq!(line_for_import(content, "chalk"), Some(4));
         assert_eq!(line_for_import(content, "missing"), None);
+    }
+
+    #[test]
+    fn exact_pins_and_caret_tilde_ranges_are_parsed_at_their_version() {
+        // Audit and align see a deno.json only through parse_dependencies, so
+        // the specifier shapes most manifests use must reach them.
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("deno.json");
+        let content = r#"{
+  "imports": {
+    "@std/path": "jsr:@std/path@^1.0.0",
+    "@std/fmt": "jsr:@std/fmt@~1.2.3",
+    "lodash": "npm:lodash@4.17.15",
+    "chalk": "npm:chalk@^5"
+  }
+}
+"#;
+        std::fs::write(&path, content).unwrap();
+
+        let mut deps: Vec<(String, String, Option<RegistryRoute>)> = DenoUpdater::new_parse_only()
+            .parse_dependencies(&path)
+            .unwrap()
+            .into_iter()
+            .map(|d| (d.name, d.version, d.registry))
+            .collect();
+        deps.sort();
+        assert_eq!(
+            deps,
+            vec![
+                (
+                    "@std/fmt".to_string(),
+                    "1.2.3".to_string(),
+                    Some(RegistryRoute::Jsr)
+                ),
+                (
+                    "@std/path".to_string(),
+                    "1.0.0".to_string(),
+                    Some(RegistryRoute::Jsr)
+                ),
+                (
+                    "chalk".to_string(),
+                    "5.0.0".to_string(),
+                    Some(RegistryRoute::Npm)
+                ),
+                (
+                    "lodash".to_string(),
+                    "4.17.15".to_string(),
+                    Some(RegistryRoute::Npm)
+                ),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_caret_range_holds_a_release_inside_the_cooldown_window() {
+        use crate::cooldown::CooldownPolicy;
+        use chrono::{Duration, Utc};
+
+        let now = Utc::now();
+        let content = "{\n  \"imports\": {\n    \"chalk\": \"npm:chalk@^5.0.0\"\n  }\n}\n";
+        let npm = MockRegistry::new("npm-test")
+            .with_version("chalk", "5.6.2")
+            .with_version_meta(
+                "chalk",
+                "5.0.0",
+                Some(now - Duration::days(400)),
+                false,
+                false,
+            )
+            .with_version_meta(
+                "chalk",
+                "5.6.1",
+                Some(now - Duration::days(30)),
+                false,
+                false,
+            )
+            .with_version_meta(
+                "chalk",
+                "5.6.2",
+                Some(now - Duration::days(1)),
+                false,
+                false,
+            );
+        let policy = CooldownPolicy {
+            default: Duration::days(7),
+            per_ecosystem: std::collections::HashMap::new(),
+            strict: false,
+            force_override: None,
+        };
+        let options = UpdateOptions::new(false, false).with_cooldown_policy(policy, now);
+
+        let (result, new_content) = update_with(content, jsr_mock(&[]), npm, options).await;
+
+        assert!(
+            new_content.contains("npm:chalk@^5.6.1"),
+            "the newest release outside the window must be chosen, got: {new_content}"
+        );
+        assert_eq!(
+            result.held_back.len(),
+            1,
+            "held_back: {:?}",
+            result.held_back
+        );
+        assert_eq!(result.held_back[0].0, "chalk");
+        assert_eq!(
+            result.held_back[0].3, "5.6.2",
+            "held_back: {:?}",
+            result.held_back
+        );
+    }
+
+    #[tokio::test]
+    async fn a_scopes_entry_with_the_same_key_is_left_alone() {
+        // Deno resolves "scopes" per directory; only the top-level "imports"
+        // map is what this updater read and decided for.
+        let jsr = jsr_mock(&[("@std/path", "1.2.0")]);
+        let npm = MockRegistry::new("npm-test");
+        let content = r#"{
+  "scopes": {
+    "./vendor/": {
+      "@std/path": "jsr:@std/path@^1.0.0"
+    }
+  },
+  "imports": {
+    "@std/path": "jsr:@std/path@^1.0.0"
+  }
+}
+"#;
+
+        let (result, new_content) =
+            update_with(content, jsr, npm, UpdateOptions::new(false, false)).await;
+
+        assert_eq!(result.updated.len(), 1, "{:?}", result.updated);
+        assert_eq!(
+            result.updated[0].3,
+            Some(8),
+            "reported line: {:?}",
+            result.updated
+        );
+        assert_eq!(
+            new_content,
+            content.replacen(
+                "  \"imports\": {\n    \"@std/path\": \"jsr:@std/path@^1.0.0\"",
+                "  \"imports\": {\n    \"@std/path\": \"jsr:@std/path@^1.2.0\"",
+                1
+            )
+        );
     }
 }

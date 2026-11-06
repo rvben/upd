@@ -266,3 +266,55 @@ async fn lang_filters_select_deno_files_like_any_ecosystem() {
         "--lang node must not open a deno.json: {stdout}"
     );
 }
+
+/// Align reads each deno.json at the release its specifiers name and writes
+/// the highest one back into the import that carries it, aliased or not, and
+/// never into a `"scopes"` entry of the same key.
+#[tokio::test]
+async fn align_lines_deno_imports_up_across_manifests() {
+    let registries = start_registries().await;
+    let dir = TempDir::new().unwrap();
+    let behind = r#"{
+  "scopes": {
+    "./vendor/": {
+      "chalk": "npm:chalk@^5.0.0"
+    }
+  },
+  "imports": {
+    "chalk": "npm:chalk@^5.0.0",
+    "colors": "npm:lodash@4.17.15"
+  }
+}
+"#;
+    let ahead = r#"{
+  "imports": {
+    "chalk": "npm:chalk@^5.6.0",
+    "lodash": "npm:lodash@4.17.21"
+  }
+}
+"#;
+    for (member, manifest) in [("behind", behind), ("ahead", ahead)] {
+        fs::create_dir(dir.path().join(member)).unwrap();
+        fs::write(dir.path().join(member).join("deno.json"), manifest).unwrap();
+    }
+
+    let (stdout, stderr, code) = run_upd(&["align", "--apply", "."], dir.path(), &registries);
+    assert_eq!(code, 0, "stdout: {stdout}\nstderr: {stderr}");
+
+    let written = fs::read_to_string(dir.path().join("behind/deno.json")).unwrap();
+    assert_eq!(
+        written,
+        behind
+            .replacen(
+                "\"chalk\": \"npm:chalk@^5.0.0\",",
+                "\"chalk\": \"npm:chalk@^5.6.0\",",
+                1
+            )
+            .replace("npm:lodash@4.17.15", "npm:lodash@4.17.21"),
+        "stdout: {stdout}\nstderr: {stderr}"
+    );
+    assert_eq!(
+        fs::read_to_string(dir.path().join("ahead/deno.json")).unwrap(),
+        ahead
+    );
+}
