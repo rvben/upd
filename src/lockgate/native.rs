@@ -31,27 +31,28 @@ pub(crate) fn plan(
     gate: ReleaseAgeGate,
 ) -> Plan {
     let query = |cmd: &str, args: &[&str]| run_query(dir, cmd, args);
-    plan_with(
-        lockfile_type,
-        version,
-        gate,
-        &query,
-        &bunfig_paths(dir, &|key| std::env::var_os(key)),
-    )
+    let configs = match lockfile_type {
+        LockfileType::DenoLock => deno_configs(dir),
+        _ => bunfig_paths(dir, &|key| std::env::var_os(key)),
+    };
+    plan_with(lockfile_type, version, gate, &query, &configs)
 }
 
+/// `configs` are the configuration files the tool reads its setting from,
+/// in the order it reads them.
 fn plan_with(
     lockfile_type: LockfileType,
     version: Option<&str>,
     gate: ReleaseAgeGate,
     query: Query<'_>,
-    bunfigs: &[PathBuf],
+    configs: &[PathBuf],
 ) -> Plan {
     match lockfile_type {
         LockfileType::PackageLockJson | LockfileType::NpmShrinkwrap => plan_npm(gate, query),
         LockfileType::PnpmLock => plan_pnpm(version, gate, query),
         LockfileType::YarnLock => plan_yarn(version, gate, query),
-        LockfileType::BunLock | LockfileType::BunLockb => plan_bun(version, gate, bunfigs),
+        LockfileType::BunLock | LockfileType::BunLockb => plan_bun(version, gate, configs),
+        LockfileType::DenoLock => plan_deno(gate, query, configs),
         other => {
             let (tool, _) = other.command(&[]);
             Err(format!("{tool} has no release-age setting"))
@@ -239,6 +240,125 @@ fn plan_bun(version: Option<&str>, gate: ReleaseAgeGate, bunfigs: &[PathBuf]) ->
         extra_args: vec!["--minimum-release-age".to_string(), ours.to_string()],
         env: Vec::new(),
     }))
+}
+
+/// The configuration a `deno.lock` beside it resolves under: Deno reads
+/// `deno.json` ahead of `deno.jsonc`.
+fn deno_configs(dir: &Path) -> Vec<PathBuf> {
+    vec![dir.join("deno.json"), dir.join("deno.jsonc")]
+}
+
+/// Deno gates `npm:` and `jsr:` resolution alike with `--min-dep-age` (still
+/// marked unstable, so support is read from the help rather than inferred
+/// from a version), and with `minimumDependencyAge` in its configuration.
+/// The flag replaces the configured setting outright, `exclude` list
+/// included, so it is passed only when the run's cutoff is the stricter one;
+/// a project already at least as strict keeps its own setting untouched.
+fn plan_deno(gate: ReleaseAgeGate, query: Query<'_>, configs: &[PathBuf]) -> Plan {
+    let help = query("deno", &["install", "--help"])
+        .map_err(|e| format!("deno's options could not be read ({e})"))?;
+    if !help.contains("--min-dep-age") {
+        return Err("this deno has no --min-dep-age option".to_string());
+    }
+    for path in configs {
+        let text = match std::fs::read_to_string(path) {
+            Ok(text) => text,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => return Err(format!("{} could not be read ({e})", path.display())),
+        };
+        let doc = crate::jsonc::parse(&text)
+            .map_err(|e| format!("{} could not be parsed ({e})", path.display()))?;
+        if let Some(value) = doc.get("minimumDependencyAge") {
+            let configured = deno_configured_cutoff(value, gate.now()).ok_or_else(|| {
+                format!(
+                    "minimumDependencyAge {value} in {} is not a setting upd can compare",
+                    path.display()
+                )
+            })?;
+            if configured.is_some_and(|configured| configured <= gate.cutoff()) {
+                return Ok(None);
+            }
+        }
+        break;
+    }
+    Ok(Some(GatedInvocation {
+        extra_args: vec!["--min-dep-age".to_string(), format_instant(gate.cutoff())],
+        env: Vec::new(),
+    }))
+}
+
+/// The cutoff a `minimumDependencyAge` value sets: `Some(None)` when it
+/// disables the gate, `None` when the value is not one this reads.
+///
+/// Deno accepts minutes (as a number or a numeric string), an RFC 3339 time
+/// or date, an ISO 8601 duration, or an object carrying one of those as
+/// `age`. Durations in years or months have no fixed length, so they are not
+/// read rather than guessed at.
+fn deno_configured_cutoff(
+    value: &serde_json::Value,
+    now: DateTime<Utc>,
+) -> Option<Option<DateTime<Utc>>> {
+    let minutes = |minutes: i64| match minutes {
+        0 => Some(None),
+        m if m > 0 => Some(Some(now - Duration::minutes(m))),
+        _ => None,
+    };
+    match value {
+        serde_json::Value::Object(object) => deno_configured_cutoff(object.get("age")?, now),
+        serde_json::Value::Number(number) => minutes(number.as_i64()?),
+        serde_json::Value::String(text) => {
+            let text = text.trim();
+            if let Ok(m) = text.parse::<i64>() {
+                minutes(m)
+            } else if let Some(duration) = text.strip_prefix('P') {
+                Some(Some(now - parse_iso_duration(duration)?))
+            } else {
+                Some(Some(parse_npm_date(text)?))
+            }
+        }
+        _ => None,
+    }
+}
+
+/// An ISO 8601 duration after its `P`, in weeks, days, hours, minutes and
+/// whole seconds.
+fn parse_iso_duration(text: &str) -> Option<Duration> {
+    let (date, time) = match text.split_once('T') {
+        Some((date, time)) if !time.is_empty() => (date, Some(time)),
+        Some(_) => return None,
+        None => (text, None),
+    };
+    let mut total = Duration::zero();
+    let mut any = false;
+    let mut read = |part: &str, units: &[(char, Duration)]| -> Option<()> {
+        let mut number = String::new();
+        let mut next = 0;
+        for c in part.chars() {
+            if c.is_ascii_digit() {
+                number.push(c);
+                continue;
+            }
+            let position = units[next..].iter().position(|(unit, _)| *unit == c)?;
+            let value: i32 = number.parse().ok()?;
+            total += units[next + position].1 * value;
+            next += position + 1;
+            number.clear();
+            any = true;
+        }
+        number.is_empty().then_some(())
+    };
+    read(date, &[('W', Duration::weeks(1)), ('D', Duration::days(1))])?;
+    if let Some(time) = time {
+        read(
+            time,
+            &[
+                ('H', Duration::hours(1)),
+                ('M', Duration::minutes(1)),
+                ('S', Duration::seconds(1)),
+            ],
+        )?;
+    }
+    any.then_some(total)
 }
 
 #[cfg(test)]
@@ -590,10 +710,133 @@ mod tests {
             (LockfileType::GemfileLock, "bundle"),
             (LockfileType::PackagesLockJson, "dotnet"),
             (LockfileType::TerraformLock, "terraform"),
+            (LockfileType::GoSum, "go"),
         ] {
             let reason =
                 plan_with(lockfile, None, gate(Duration::days(7)), &query, &[]).unwrap_err();
             assert_eq!(reason, format!("{tool} has no release-age setting"));
         }
+    }
+
+    const DENO_HELP: &str = "      --lockfile-only     Install only updating the lockfile\n      --min-dep-age <VALUE>  (Unstable) The age in minutes, ...\n";
+
+    /// Plan a deno.lock gate against a project whose deno.json holds `config`.
+    fn plan_deno_with(config: Option<&str>, help: Result<&str, &str>) -> (Plan, Asked) {
+        let dir = tempfile::tempdir().unwrap();
+        if let Some(config) = config {
+            std::fs::write(dir.path().join("deno.json"), config).unwrap();
+        }
+        let (query, asked) = answering(help);
+        let plan = plan_with(
+            LockfileType::DenoLock,
+            Some("deno 2.9.7 (stable, release, aarch64-apple-darwin)"),
+            gate(Duration::days(7)),
+            &query,
+            &deno_configs(dir.path()),
+        );
+        (plan, asked)
+    }
+
+    #[test]
+    fn deno_passes_the_cutoff_when_the_project_sets_nothing() {
+        let (plan, asked) = plan_deno_with(Some(r#"{ "imports": {} }"#), Ok(DENO_HELP));
+        assert_eq!(args(plan), ["--min-dep-age", "2026-09-08T12:00:00Z"]);
+        assert_eq!(asked.borrow().as_slice(), ["deno install --help"]);
+
+        let (plan, _) = plan_deno_with(None, Ok(DENO_HELP));
+        assert_eq!(args(plan), ["--min-dep-age", "2026-09-08T12:00:00Z"]);
+    }
+
+    #[test]
+    fn deno_passes_the_cutoff_over_a_looser_project_setting() {
+        // The flag replaces the project's setting, so it is passed only when
+        // it is the stricter of the two.
+        for looser in [
+            r#""P3D""#,
+            r#""PT72H""#,
+            "4320",
+            r#""4320""#,
+            r#""2026-09-10""#,
+            r#""2026-09-10T00:00:00Z""#,
+            r#"{ "age": "P6D", "exclude": ["npm:chalk"] }"#,
+            "0",
+            r#""0""#,
+        ] {
+            let config = format!(r#"{{ "minimumDependencyAge": {looser} }}"#);
+            let (plan, _) = plan_deno_with(Some(&config), Ok(DENO_HELP));
+            assert_eq!(
+                args(plan),
+                ["--min-dep-age", "2026-09-08T12:00:00Z"],
+                "{looser}"
+            );
+        }
+    }
+
+    #[test]
+    fn deno_leaves_a_stricter_project_setting_alone() {
+        // Passing the flag would replace it, exclusions and all.
+        for stricter in [
+            r#""P8D""#,
+            r#""P2W""#,
+            r#""PT200H""#,
+            "20160",
+            r#""2026-09-01""#,
+            r#"{ "age": "2026-01-01T00:00:00+00:00", "exclude": ["npm:chalk"] }"#,
+            r#""P7D""#,
+        ] {
+            let config = format!(r#"{{ "minimumDependencyAge": {stricter} }}"#);
+            let (plan, _) = plan_deno_with(Some(&config), Ok(DENO_HELP));
+            assert_eq!(plan, Ok(None), "{stricter}");
+        }
+    }
+
+    #[test]
+    fn deno_reads_a_jsonc_config_with_comments() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("deno.jsonc"),
+            "{\n  // strict\n  \"minimumDependencyAge\": \"P30D\",\n}\n",
+        )
+        .unwrap();
+        let (query, _) = answering(Ok(DENO_HELP));
+        let plan = plan_with(
+            LockfileType::DenoLock,
+            None,
+            gate(Duration::days(7)),
+            &query,
+            &deno_configs(dir.path()),
+        );
+        assert_eq!(plan, Ok(None));
+    }
+
+    #[test]
+    fn deno_without_the_flag_or_a_readable_setting_is_unenforced() {
+        let (plan, _) = plan_deno_with(
+            None,
+            Ok("      --lockfile-only  Install only updating the lockfile\n"),
+        );
+        assert!(plan.unwrap_err().contains("--min-dep-age"));
+
+        let (plan, _) = plan_deno_with(None, Err("`deno install --help` could not run"));
+        assert!(plan.unwrap_err().contains("could not run"));
+
+        for unreadable in [
+            r#""P1Y""#,
+            r#""P1M""#,
+            r#""garbage""#,
+            "-5",
+            "true",
+            r#"{ "exclude": [] }"#,
+        ] {
+            let config = format!(r#"{{ "minimumDependencyAge": {unreadable} }}"#);
+            let (plan, _) = plan_deno_with(Some(&config), Ok(DENO_HELP));
+            assert!(
+                plan.as_ref().unwrap_err().contains("minimumDependencyAge"),
+                "{unreadable}: {plan:?}"
+            );
+        }
+
+        let (plan, _) = plan_deno_with(Some("{ not json"), Ok(DENO_HELP));
+        assert!(plan.unwrap_err().contains("deno.json"));
     }
 }

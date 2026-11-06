@@ -354,6 +354,7 @@ reported; the fixes never are.
 | `pnpm-lock.yaml` | `--config.minimum-release-age` (pnpm 10.16 or newer) |
 | `yarn.lock` (Berry) | `YARN_NPM_MINIMAL_AGE_GATE` (Yarn 4.10 or newer); `.yarnrc.yml` is not touched |
 | `bun.lock` | `--minimum-release-age` (bun 1.3 or newer) |
+| `deno.lock` | `deno install --min-dep-age` (a deno whose `install` has the flag), only when stricter than the project's `minimumDependencyAge`, since the flag replaces that setting's `exclude` list |
 | `uv.lock` | `uv lock --exclude-newer`, see below (a uv with `--exclude-newer-package`) |
 | `Cargo.lock` | young crates.io entries are moved back with `cargo update --precise` |
 | `poetry.lock`, `Gemfile.lock` | not gated, only checked |
