@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.18.4](https://github.com/rvben/upd/compare/v0.18.3...v0.18.4) - 2026-11-06
+
+### Added
+
+- **deno**: gate deno.lock refreshes on the cooldown with --min-dep-age ([2627aef](https://github.com/rvben/upd/commit/2627aef00a001284e6dbb10a4e595119b0e79617))
+- **deno**: add deno.json/deno.jsonc as a dependency ecosystem ([7fb3c6f](https://github.com/rvben/upd/commit/7fb3c6fbdd027623ca340f00a1e359f96b433e35))
+
 ## [0.18.3](https://github.com/rvben/upd/compare/v0.18.2...v0.18.3) - 2026-11-03
 
 ### Added
