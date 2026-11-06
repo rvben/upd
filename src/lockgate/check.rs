@@ -139,6 +139,7 @@ impl Source {
             | LockfileType::PnpmLock
             | LockfileType::BunLock
             | LockfileType::BunLockb
+            | LockfileType::DenoLock
             | LockfileType::GoSum
             | LockfileType::PackagesLockJson
             | LockfileType::TerraformLock => None,

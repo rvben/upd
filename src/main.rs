@@ -6,7 +6,7 @@ use colored::Colorize;
 use futures::stream::{self, StreamExt};
 
 use std::cmp::Ordering;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -42,16 +42,16 @@ use upd::package_filter::PackageFilter;
 use upd::path_display::display_path;
 use upd::registry::{
     CratesIoRegistry, DockerRegistry, GitHubReleasesRegistry, GoProxyRegistry, GradleRegistry,
-    MultiPyPiRegistry, NpmRegistry, NuGetRegistry, PyPiRegistry, RubyGemsRegistry,
+    JsrRegistry, MultiPyPiRegistry, NpmRegistry, NuGetRegistry, PyPiRegistry, RubyGemsRegistry,
     TerraformRegistry,
 };
 use upd::updater::{
     ActionShaUpdate, AnnotatedUpdater, BumpFilter, BumpKind, CargoTomlUpdater, CsprojUpdater,
-    DEFAULT_UPDATE_ACTION_SHAS, DiscoverOptions, DockerUpdater, FileType, FlakeLockUpdater,
-    GemfileUpdater, GithubActionsUpdater, GoModUpdater, GradleUpdater, HeldWrite, Lang,
-    MiseUpdater, PackageJsonUpdater, ParseWarnings, PreCommitUpdater, PyProjectUpdater,
-    RegistrySet, RequirementsUpdater, SkipStatus, SkippedUpdate, TerraformUpdater, UpdateOptions,
-    UpdateResult, Updater, classify_bump, discover_files_with, read_file_safe,
+    DEFAULT_UPDATE_ACTION_SHAS, DenoUpdater, DiscoverOptions, DockerUpdater, FileType,
+    FlakeLockUpdater, GemfileUpdater, GithubActionsUpdater, GoModUpdater, GradleUpdater, HeldWrite,
+    Lang, MiseUpdater, PackageJsonUpdater, ParseWarnings, PreCommitUpdater, PyProjectUpdater,
+    RegistryRoute, RegistrySet, RequirementsUpdater, SkipStatus, SkippedUpdate, TerraformUpdater,
+    UpdateOptions, UpdateResult, Updater, classify_bump, discover_files_with, read_file_safe,
     update_with_annotations, write_file_atomic,
 };
 use upd::version::{compare_versions, written_version};
@@ -1594,6 +1594,39 @@ fn go_mod_coverage_warnings(files: &[(std::path::PathBuf, FileType)]) -> Vec<Str
     warnings
 }
 
+/// The jsr: specifiers a deno.json import map carries, reported as not
+/// audited.
+///
+/// An import map mixes `jsr:` and `npm:` specifiers. The `npm:` ones audit
+/// as npm: they are real npm names, and OSV advisories index them exactly
+/// as package.json's entries. A `jsr:` one names a package only JSR serves,
+/// and OSV indexes neither JSR packages nor npm packages under JSR names —
+/// querying the npm index with one would match whatever npm package shares
+/// the name. `build_audit_packages` therefore skips them, and this warning
+/// says so rather than letting the file pass silently unaudited.
+fn jsr_not_audited_warnings(
+    packages: &HashMap<(String, Lang), Vec<PackageOccurrence>>,
+) -> Vec<String> {
+    let mut names: BTreeSet<&str> = BTreeSet::new();
+    for ((_, lang), occurrences) in packages {
+        if *lang != Lang::Deno {
+            continue;
+        }
+        for occurrence in occurrences {
+            if occurrence.registry != Some(RegistryRoute::Npm) {
+                names.insert(occurrence.original_name.as_str());
+            }
+        }
+    }
+    if names.is_empty() {
+        return Vec::new();
+    }
+    let listed = names.into_iter().collect::<Vec<_>>().join(", ");
+    vec![format!(
+        "jsr: specifiers are not audited: OSV indexes no JSR ecosystem ({listed})"
+    )]
+}
+
 /// Classify an anyhow error into a clispec structured error kind and exit code.
 /// Levenshtein edit distance between two ASCII-ish strings.
 fn levenshtein(a: &str, b: &str) -> usize {
@@ -2447,6 +2480,14 @@ async fn run_update_with_github(
     let docker_registry = DockerRegistry::new();
     let docker = CachedRegistry::new(docker_registry, Arc::clone(&cache), cache_enabled);
 
+    // JSR answers for the `jsr:` specifiers a deno.json import map carries;
+    // `npm:` ones go through the npm registry built above.
+    let jsr = Arc::new(CachedRegistry::new(
+        JsrRegistry::new(),
+        Arc::clone(&cache),
+        cache_enabled,
+    ));
+
     // Create updaters wrapped in Arc for parallel processing
     let requirements_updater = Arc::new(RequirementsUpdater::new());
     let pyproject_updater = Arc::new(PyProjectUpdater::new());
@@ -2458,6 +2499,9 @@ async fn run_update_with_github(
     let terraform_updater = Arc::new(TerraformUpdater::new());
     let csproj_updater = Arc::new(CsprojUpdater::new());
     let docker_updater = Arc::new(DockerUpdater::new().with_verbose(cli.verbose));
+    let deno_updater = Arc::new(DenoUpdater::new(
+        Arc::clone(&jsr) as Arc<dyn upd::registry::Registry>
+    ));
 
     // Wrap registries in Arc for parallel processing
     let pypi = Arc::new(pypi);
@@ -2519,6 +2563,7 @@ async fn run_update_with_github(
             &terraform_updater,
             &csproj_updater,
             &docker_updater,
+            &deno_updater,
             &annotated_updater,
             &cache,
             cache_enabled,
@@ -2605,6 +2650,7 @@ async fn run_update_with_github(
             let csproj_updater = Arc::clone(&csproj_updater);
             let terraform_updater = Arc::clone(&terraform_updater);
             let docker_updater = Arc::clone(&docker_updater);
+            let deno_updater = Arc::clone(&deno_updater);
             let annotated_updater = Arc::clone(&annotated_updater);
 
             async move {
@@ -2621,6 +2667,11 @@ async fn run_update_with_github(
                     }
                     FileType::PackageJson => {
                         package_json_updater
+                            .update(&path, npm.as_ref(), update_options.clone())
+                            .await
+                    }
+                    FileType::DenoJson => {
+                        deno_updater
                             .update(&path, npm.as_ref(), update_options.clone())
                             .await
                     }
@@ -3879,6 +3930,7 @@ async fn run_interactive_update(
     terraform_updater: &Arc<TerraformUpdater>,
     csproj_updater: &Arc<CsprojUpdater>,
     docker_updater: &Arc<DockerUpdater>,
+    deno_updater: &Arc<DenoUpdater>,
     annotated_updater: &Arc<AnnotatedUpdater>,
     cache: &Arc<std::sync::Mutex<Cache>>,
     cache_enabled: bool,
@@ -3963,6 +4015,11 @@ async fn run_interactive_update(
             }
             FileType::PackageJson => {
                 package_json_updater
+                    .update(path, npm.as_ref(), dry_run_options.clone())
+                    .await
+            }
+            FileType::DenoJson => {
+                deno_updater
                     .update(path, npm.as_ref(), dry_run_options.clone())
                     .await
             }
@@ -4836,6 +4893,10 @@ pub(crate) fn build_audit_packages(
         let ecosystem = match lang {
             Lang::Python => Ecosystem::PyPI,
             Lang::Node => Ecosystem::Npm,
+            // A deno.json's `npm:` specifiers are real npm names OSV indexes,
+            // so they audit as npm. Its `jsr:` ones are filtered out below
+            // and reported as not audited (see `jsr_not_audited_warnings`).
+            Lang::Deno => Ecosystem::Npm,
             Lang::Rust => Ecosystem::CratesIo,
             Lang::Go => Ecosystem::Go,
             Lang::Ruby => Ecosystem::RubyGems,
@@ -4865,6 +4926,13 @@ pub(crate) fn build_audit_packages(
         }
 
         for occurrence in occurrences {
+            // A `jsr:` specifier names a package only JSR serves. Querying
+            // OSV's npm index with one would match whatever npm package
+            // shares the name, so the entry is left out of the audit and
+            // reported as not audited instead.
+            if *lang == Lang::Deno && occurrence.registry != Some(RegistryRoute::Npm) {
+                continue;
+            }
             let key = (
                 key_name.clone(),
                 occurrence.version.clone(),
@@ -5029,6 +5097,10 @@ async fn run_audit(cli: &Cli) -> Result<()> {
             return Err(e);
         }
     };
+    // A deno.json's jsr: specifiers cannot reach OSV; say so instead of
+    // leaving them out silently (build_audit_packages audits only the npm:
+    // half of an import map).
+    coverage_warnings.extend(jsr_not_audited_warnings(&packages));
 
     // Convert to audit packages (deduplicate by name+version+ecosystem)
     let package_filter = PackageFilter::new(cli.packages.clone()).map_err(anyhow::Error::msg)?;
@@ -5658,6 +5730,9 @@ fn build_sarif_occurrences(
         let ecosystem = match lang {
             Lang::Python => Ecosystem::PyPI,
             Lang::Node => Ecosystem::Npm,
+            // As in `build_audit_packages`: a deno.json's `npm:` specifiers
+            // audit as npm, its `jsr:` ones are not audited at all.
+            Lang::Deno => Ecosystem::Npm,
             Lang::Rust => Ecosystem::CratesIo,
             Lang::Go => Ecosystem::Go,
             Lang::Ruby => Ecosystem::RubyGems,
@@ -5676,6 +5751,11 @@ fn build_sarif_occurrences(
         };
 
         for occ in occurrences {
+            // jsr: specifiers are not audited, so a SARIF occurrence would
+            // anchor a finding that can never exist.
+            if *lang == Lang::Deno && occ.registry != Some(RegistryRoute::Npm) {
+                continue;
+            }
             let key = (
                 occ.original_name.clone(),
                 occ.version.clone(),
@@ -5804,6 +5884,7 @@ fn print_alignment(alignment: &PackageAlignment, _dry_run: bool) {
     let lang_indicator = match alignment.lang {
         Lang::Python => "",
         Lang::Node => " (npm)",
+        Lang::Deno => " (deno)",
         Lang::Rust => " (cargo)",
         Lang::Go => " (go)",
         Lang::Ruby => " (rubygems)",
@@ -6169,6 +6250,7 @@ fn apply_version_updates_with_checksums(
             FileType::PackageJson => {
                 apply_package_json_version(&mut document, update, &target_version)
             }
+            FileType::DenoJson => apply_deno_version(&mut document, update, &target_version),
             FileType::CargoToml => apply_cargo_toml_version(&mut document, update, &target_version),
             FileType::GoMod => apply_go_mod_version(&mut document, update, &target_version),
             FileType::Gemfile => apply_gemfile_version(&mut document, update, &target_version),
@@ -6399,6 +6481,31 @@ fn apply_pyproject_version(
     let poetry_inline_replacement = format!("${{1}}{}", target_version);
     apply_line_replacement(document, update.line_num, |line| {
         replace_first_match(line, &poetry_inline_re, &poetry_inline_replacement)
+    })
+}
+
+/// Rewrite a `deno.json`/`deno.jsonc` import specifier in place.
+///
+/// Alignment and the interactive path hand over the package the specifier
+/// resolves and the version it was found at; the rewrite anchors on the key
+/// and the version token behind the scheme's `@`, so the scheme spelling and
+/// any subpath survive. A key that does not spell the package name fails to
+/// apply and is reported, never guessed around.
+fn apply_deno_version(
+    document: &mut TextDocument,
+    update: &VersionEdit<'_>,
+    target_version: &str,
+) -> bool {
+    let pattern = format!(
+        r#"("{}"\s*:\s*"[^"]*@[^""]*){}(")"#,
+        regex::escape(update.package),
+        regex::escape(update.old_version)
+    );
+    let re = regex::Regex::new(&pattern).unwrap();
+    let replacement = format!(r#"${{1}}{}${{2}}"#, target_version);
+
+    apply_line_replacement(document, update.line_num, |line| {
+        replace_first_match(line, &re, &replacement)
     })
 }
 
@@ -7881,6 +7988,7 @@ mod tests {
                 has_upper_bound: false,
                 original_name: "lockonly".to_string(),
                 is_bumpable: true,
+                ..Default::default()
             }],
         );
         assert!(!is_lock_only_package(&locked, &manifest_with_occurrence));
@@ -9549,6 +9657,7 @@ serde = "1.0.1"
                     has_upper_bound: false,
                     original_name: "foo".into(),
                     is_bumpable: true,
+                    ..Default::default()
                 }
             };
             let bare = manifest("bare", "1.0.0");
@@ -9618,6 +9727,7 @@ serde = "1.0.1"
                     has_upper_bound: false,
                     original_name: "toml_edit".into(),
                     is_bumpable: true,
+                    ..Default::default()
                 }
             };
             let built = manifest("built", "0.25.13+spec-1.1.0");
@@ -9677,6 +9787,7 @@ serde = "1.0.1"
                 has_upper_bound: false,
                 original_name: "PackageB".into(),
                 is_bumpable: true,
+                ..Default::default()
             }],
             lang: Lang::DotNet,
             full_precision: false,
@@ -9715,6 +9826,7 @@ serde = "1.0.1"
             has_upper_bound: false,
             original_name: "Newtonsoft.Json".to_string(),
             is_bumpable: true,
+            ..Default::default()
         }];
 
         let mut packages = HashMap::new();
@@ -9749,6 +9861,7 @@ serde = "1.0.1"
             has_upper_bound: false,
             original_name: "golang.org/x/crypto".to_string(),
             is_bumpable: false,
+            ..Default::default()
         }];
 
         let mut packages = HashMap::new();
@@ -9770,6 +9883,60 @@ serde = "1.0.1"
             audit_pkgs[0].ecosystem,
             upd::audit::Ecosystem::Go,
             "ecosystem must be Go"
+        );
+    }
+
+    /// A deno.json's `npm:` specifiers are real npm names OSV indexes, so they
+    /// audit as npm; its `jsr:` ones name packages no OSV ecosystem covers and
+    /// are left out, with the audit's warnings reporting them as not audited.
+    #[test]
+    fn test_build_audit_packages_audits_deno_npm_and_reports_jsr_not_audited() {
+        use std::path::PathBuf;
+
+        let npm_entry = PackageOccurrence {
+            file_path: PathBuf::from("deno.json"),
+            file_type: FileType::DenoJson,
+            version: "5.0.0".to_string(),
+            line_number: Some(3),
+            has_upper_bound: false,
+            original_name: "chalk".to_string(),
+            is_bumpable: true,
+            registry: Some(RegistryRoute::Npm),
+        };
+        let jsr_entry = PackageOccurrence {
+            file_path: PathBuf::from("deno.json"),
+            file_type: FileType::DenoJson,
+            version: "1.0.0".to_string(),
+            line_number: Some(2),
+            has_upper_bound: false,
+            original_name: "@std/path".to_string(),
+            is_bumpable: true,
+            registry: Some(RegistryRoute::Jsr),
+        };
+        let packages = HashMap::from([(
+            ("deno deps".to_string(), Lang::Deno),
+            vec![npm_entry, jsr_entry],
+        )]);
+
+        let audit_pkgs = build_audit_packages(&packages, &[]);
+
+        assert_eq!(
+            audit_pkgs.len(),
+            1,
+            "only the npm: specifier reaches OSV: {audit_pkgs:?}"
+        );
+        assert_eq!(audit_pkgs[0].name, "chalk");
+        assert_eq!(audit_pkgs[0].ecosystem, upd::audit::Ecosystem::Npm);
+
+        let warnings = jsr_not_audited_warnings(&packages);
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(
+            warnings[0].contains("@std/path") && warnings[0].contains("not audited"),
+            "the warning names the jsr: package: {warnings:?}"
+        );
+        assert!(
+            !warnings[0].contains("chalk"),
+            "the npm: specifier is audited and never listed: {warnings:?}"
         );
     }
 

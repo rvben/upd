@@ -12,6 +12,7 @@ pub mod fix;
 pub mod gitlab;
 pub mod http;
 pub mod interactive;
+pub mod jsonc;
 pub mod lockfile;
 pub mod lockgate;
 pub mod lockscan;
@@ -37,8 +38,8 @@ pub use lockfile::{
     tool_available,
 };
 pub use registry::{
-    GitHubReleasesRegistry, GradleRegistry, NpmRegistry, NuGetRegistry, PyPiRegistry, Registry,
-    RubyGemsRegistry, TerraformRegistry, VersionMeta,
+    GitHubReleasesRegistry, GradleRegistry, JsrRegistry, NpmRegistry, NuGetRegistry, PyPiRegistry,
+    Registry, RubyGemsRegistry, TerraformRegistry, VersionMeta,
 };
 pub use updater::{
     DiscoverOptions, FileType, Lang, UpdateResult, Updater, discover_files, discover_files_with,

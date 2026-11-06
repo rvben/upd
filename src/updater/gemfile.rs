@@ -631,13 +631,12 @@ impl Updater for GemfileUpdater {
 
         for (line_idx, line) in content.lines().enumerate() {
             if let Some(parsed) = self.parse_line(line) {
-                deps.push(ParsedDependency {
-                    version: parsed.anchor_version().to_string(),
-                    has_upper_bound: parsed.caps_from_above(),
-                    name: parsed.name,
-                    line_number: Some(line_idx + 1),
-                    is_bumpable: true,
-                });
+                let version = parsed.anchor_version().to_string();
+                let has_upper_bound = parsed.caps_from_above();
+                deps.push(
+                    ParsedDependency::new(parsed.name, version, Some(line_idx + 1))
+                        .with_upper_bound(has_upper_bound),
+                );
             }
         }
 

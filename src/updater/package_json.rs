@@ -899,13 +899,12 @@ impl Updater for PackageJsonUpdater {
                         }
 
                         let line_num = line_index.line_for(section, package);
-                        deps.push(ParsedDependency {
-                            name: package.clone(),
-                            version: current_version,
-                            line_number: line_num,
-                            has_upper_bound: false, // npm versions don't have explicit upper bounds like Python
-                            is_bumpable: true,
-                        });
+                        // npm versions have no Python-style upper-bound syntax.
+                        deps.push(ParsedDependency::new(
+                            package.clone(),
+                            current_version,
+                            line_num,
+                        ));
                     }
                 }
             }

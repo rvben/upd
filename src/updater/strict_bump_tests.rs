@@ -173,6 +173,32 @@ async fn case(file_type: FileType, with_major: bool) -> Case {
             _servers: Vec::new(),
             _temp_dirs: Vec::new(),
         },
+        FileType::DenoJson => Case {
+            file_name: "deno.json",
+            content: "{\n  \"imports\": {\n    \
+                      \"big\": \"jsr:@t/big@^1.2.0\",\n    \
+                      \"small\": \"jsr:@t/small@^1.2.0\",\n    \
+                      \"pinned\": \"jsr:@t/pinned@^1.2.0\"\n  }\n}\n"
+                .to_string(),
+            config: "[pin]\n\"@t/pinned\" = \"1.2.5\"\n",
+            runner: Runner::Plain(Box::new(DenoUpdater::new(Arc::new(
+                MockRegistry::new("jsr")
+                    .with_version("@t/big", if with_major { "2.0.0" } else { "1.2.0" })
+                    .with_version("@t/small", "1.3.0")
+                    .with_version("@t/pinned", "3.0.0"),
+            )))),
+            // jsr: entries resolve through the updater's own registry; the
+            // npm registry the caller passes is never asked about them.
+            registry: Box::new(MockRegistry::new("npm")),
+            major: Some("@t/big"),
+            extras: vec![Extra {
+                package: "@t/pinned",
+                kind: HeldWrite::Pin,
+            }],
+            sha_updates: false,
+            _servers: Vec::new(),
+            _temp_dirs: Vec::new(),
+        },
         FileType::GoMod => Case {
             file_name: "go.mod",
             content: "module example.com/fixture\n\nrequire (\n\t\
@@ -670,6 +696,7 @@ every_file_type!(
     Requirements,
     PyProject,
     PackageJson,
+    DenoJson,
     CargoToml,
     GoMod,
     Gemfile,

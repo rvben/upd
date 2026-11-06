@@ -5,6 +5,7 @@ mod github_releases;
 mod go_proxy;
 mod gradle;
 mod index_chain;
+mod jsr;
 #[cfg(test)]
 pub mod mock;
 mod npm;
@@ -23,6 +24,7 @@ pub use github_releases::GitHubReleasesRegistry;
 pub use go_proxy::{GoCredentials, GoPrivateConfig, GoProxyRegistry, read_go_private_config};
 pub use gradle::GradleRegistry;
 pub use index_chain::{DeclaredIndex, IndexChain, IndexSource};
+pub use jsr::JsrRegistry;
 #[cfg(test)]
 pub use mock::MockRegistry;
 pub use npm::{NpmCredentials, NpmRegistry, NpmrcConfig, read_npmrc_config};

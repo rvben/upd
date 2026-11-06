@@ -2528,16 +2528,14 @@ impl Updater for PyProjectUpdater {
                     {
                         let has_upper_bound = !Self::is_simple_constraint(&parsed.full_constraint);
                         let line_num = line_index.line_for("project.dependencies", &parsed.package);
-                        deps.push(ParsedDependency {
-                            name: parsed.package,
-                            version: parsed.version,
-                            line_number: line_num,
-                            has_upper_bound,
-                            // Alignment writes the highest version it found over
-                            // every other occurrence, so a specifier with no floor
-                            // to raise is no more alignable than it is updatable.
-                            is_bumpable: parsed.raisable,
-                        });
+                        // Alignment writes the highest version it found over
+                        // every other occurrence, so a specifier with no floor
+                        // to raise is no more alignable than it is updatable.
+                        deps.push(
+                            ParsedDependency::new(parsed.package, parsed.version, line_num)
+                                .with_upper_bound(has_upper_bound)
+                                .with_bumpable(parsed.raisable),
+                        );
                     }
                 }
             }
@@ -2556,13 +2554,11 @@ impl Updater for PyProjectUpdater {
                                     &format!("project.optional-dependencies.{}", group_name),
                                     &parsed.package,
                                 );
-                                deps.push(ParsedDependency {
-                                    name: parsed.package,
-                                    version: parsed.version,
-                                    line_number: line_num,
-                                    has_upper_bound,
-                                    is_bumpable: parsed.raisable,
-                                });
+                                deps.push(
+                                    ParsedDependency::new(parsed.package, parsed.version, line_num)
+                                        .with_upper_bound(has_upper_bound)
+                                        .with_bumpable(parsed.raisable),
+                                );
                             }
                         }
                     }
@@ -2578,13 +2574,12 @@ impl Updater for PyProjectUpdater {
                     if let Some(parsed) = self.parse_dependency(value) {
                         let line_number =
                             line_index.line_for(&format!("tool.uv.{key}"), &parsed.package);
-                        deps.push(ParsedDependency {
-                            name: parsed.package,
-                            version: parsed.version,
-                            line_number,
-                            has_upper_bound: !Self::is_simple_constraint(&parsed.full_constraint),
-                            is_bumpable: parsed.raisable,
-                        });
+                        let has_upper_bound = !Self::is_simple_constraint(&parsed.full_constraint);
+                        deps.push(
+                            ParsedDependency::new(parsed.package, parsed.version, line_number)
+                                .with_upper_bound(has_upper_bound)
+                                .with_bumpable(parsed.raisable),
+                        );
                     }
                 }
             }
@@ -2615,13 +2610,10 @@ impl Updater for PyProjectUpdater {
                             // whole string, and neither names a release
                             // alignment could carry to another file.
                             let is_bumpable = is_pep440_version(&version);
-                            deps.push(ParsedDependency {
-                                name: key.to_string(),
-                                version,
-                                line_number: line_num,
-                                has_upper_bound: false,
-                                is_bumpable,
-                            });
+                            deps.push(
+                                ParsedDependency::new(key.to_string(), version, line_num)
+                                    .with_bumpable(is_bumpable),
+                            );
                         }
                     }
                 }

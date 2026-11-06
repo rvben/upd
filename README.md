@@ -106,8 +106,8 @@ references and leave a parseable result. See the
 
 ## Features
 
-- **Multi-ecosystem**: Python, Node.js (npm, pnpm, Yarn and Bun lockfiles), Rust, Go, Ruby, .NET, Gradle,
-  Docker, Terraform, Nix flakes, GitHub Actions, pre-commit, Mise/asdf
+- **Multi-ecosystem**: Python, Node.js (npm, pnpm, Yarn and Bun lockfiles), Deno, Rust, Go, Ruby, .NET,
+  Gradle, Docker, Terraform, Nix flakes, GitHub Actions, pre-commit, Mise/asdf
 - **Dry-run by default**: nothing is written without `--apply`
 - **Fast**: parallel registry requests, with a 24-hour version cache
 - **Constraint-aware**: respects `>=2.0,<3` (Python), `~> 7.1` (Ruby), and `^2.0.0` / `~2.0.0` (npm, Cargo)

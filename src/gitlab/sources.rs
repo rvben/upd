@@ -81,6 +81,7 @@ fn format(kind: LockfileType) -> Option<Format> {
         | LockfileType::PnpmLock
         | LockfileType::BunLock
         | LockfileType::BunLockb
+        | LockfileType::DenoLock
         | LockfileType::GoSum
         | LockfileType::GemfileLock
         | LockfileType::PackagesLockJson

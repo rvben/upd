@@ -1830,6 +1830,7 @@ mod tests {
                     has_upper_bound: false,
                     original_name: "react".into(),
                     is_bumpable: true,
+                    ..Default::default()
                 },
                 PackageOccurrence {
                     file_path: PathBuf::from("api/package.json"),
@@ -1839,6 +1840,7 @@ mod tests {
                     has_upper_bound: false,
                     original_name: "react".into(),
                     is_bumpable: true,
+                    ..Default::default()
                 },
                 PackageOccurrence {
                     file_path: PathBuf::from("legacy/package.json"),
@@ -1848,6 +1850,7 @@ mod tests {
                     has_upper_bound: true,
                     original_name: "react".into(),
                     is_bumpable: true,
+                    ..Default::default()
                 },
             ],
         };
@@ -1875,6 +1878,7 @@ mod tests {
             has_upper_bound: false,
             original_name: "foo".into(),
             is_bumpable: true,
+            ..Default::default()
         };
         let alignment = PackageAlignment {
             package_name: "foo".into(),

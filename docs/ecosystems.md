@@ -202,6 +202,36 @@ Version specifiers keep their shape when updated:
 - Specifiers that name no registry version (`*`, `latest`, `workspace:*`,
   `file:../local`, `github:owner/repo`, Git URLs) are skipped.
 
+## Deno
+
+- `deno.json`, `deno.jsonc`: the top-level `"imports"` import map, the
+  project's dependency manifest
+
+Import values with `jsr:` and `npm:` specifiers are updated in place:
+`"jsr:@std/path@^1.0.0"` and `"npm:chalk@^5.0.0"`, scoped names and subpaths
+included. `jsr:` ranges resolve through the JSR registry's package metadata
+endpoint and `npm:` ranges through the same npm registry the Node.js updater
+uses, so `.npmrc` credentials and scoped registries apply unchanged. Range
+grammar is npm's for both schemes: pins, carets, tildes, wildcards and
+bounded ranges move the way the Node.js section describes, and a specifier
+with no version (`jsr:@std/path`) means "latest at resolve time" and is left
+alone.
+
+`deno.jsonc` comments and formatting survive updates: the write rewrites only
+the matched specifier inside the original text. A standalone
+`import_map.json` referenced by `"importMap"` has the same shape but is not
+discovered. `deno.lock` is read for audit-free lock refreshing only — it is
+never hand-edited; `--lock` runs the package manager (see
+[Commands run by `--lock`](stability.md#commands-run-by---lock)). The
+`JSR_REGISTRY` environment variable points jsr resolution at another
+JSR-compatible registry, the way `NPM_REGISTRY` does for npm.
+
+`audit` covers the `npm:` specifiers of a deno.json: they are real npm
+names, and OSV advisories index them exactly as package.json's entries. The
+`jsr:` specifiers are reported as not audited: OSV indexes no JSR ecosystem,
+and querying the npm index with a JSR name would match whatever npm package
+shares it, so upd skips them and says so in the audit's warnings.
+
 ## Rust
 
 - `Cargo.toml` (`[dependencies]`, `[dev-dependencies]`, `[build-dependencies]`)

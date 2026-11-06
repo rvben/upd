@@ -1,6 +1,7 @@
 mod annotated;
 mod cargo_toml;
 mod csproj;
+mod deno;
 mod docker;
 mod flake_lock;
 mod gemfile;
@@ -21,6 +22,7 @@ pub use annotated::validate_annotations;
 pub use annotated::{AnnotatedUpdater, ParseWarnings, RegistrySet, selection_reaches_annotations};
 pub use cargo_toml::CargoTomlUpdater;
 pub use csproj::CsprojUpdater;
+pub use deno::DenoUpdater;
 pub use docker::DockerUpdater;
 pub use flake_lock::FlakeLockUpdater;
 pub use gemfile::GemfileUpdater;
@@ -958,8 +960,30 @@ impl UpdateOptions {
     }
 }
 
+/// The registry a dependency resolves through, for files that mix registries.
+///
+/// Only `deno.json`/`deno.jsonc` sets it today: an import map mixes `jsr:`
+/// specifiers, resolved through JSR, with `npm:` ones, resolved through npm.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum RegistryRoute {
+    /// A real npm package name, covered by OSV's npm index.
+    Npm,
+    /// A package only JSR serves, which OSV does not index.
+    Jsr,
+}
+
+impl RegistryRoute {
+    /// The scheme the specifier is written with.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Npm => "npm",
+            Self::Jsr => "jsr",
+        }
+    }
+}
+
 /// A parsed dependency from a file (for alignment purposes)
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct ParsedDependency {
     /// Package name
     pub name: String,
@@ -976,6 +1000,49 @@ pub struct ParsedDependency {
     /// Such entries are still included so that audit paths can see them, but the
     /// update path and alignment logic must not attempt to bump them.
     pub is_bumpable: bool,
+    /// The registry the dependency resolves through, when its file routes
+    /// entries between several registries; `None` on a single-registry file.
+    ///
+    /// Audit routes on the distinction — an npm route names a package OSV's
+    /// npm index covers, while a JSR route names a package no OSV ecosystem
+    /// covers and is reported as not audited.
+    pub registry: Option<RegistryRoute>,
+}
+
+impl ParsedDependency {
+    /// A bumpable dependency with no upper bound, as most single-registry
+    /// files describe one. Files that mix registries set `registry` after.
+    pub fn new(
+        name: impl Into<String>,
+        version: impl Into<String>,
+        line_number: Option<usize>,
+    ) -> Self {
+        Self {
+            name: name.into(),
+            version: version.into(),
+            line_number,
+            is_bumpable: true,
+            ..Self::default()
+        }
+    }
+
+    /// Mark whether the declaration caps the version from above.
+    pub fn with_upper_bound(mut self, has_upper_bound: bool) -> Self {
+        self.has_upper_bound = has_upper_bound;
+        self
+    }
+
+    /// Mark whether the declaration names a release the updater may bump.
+    pub fn with_bumpable(mut self, is_bumpable: bool) -> Self {
+        self.is_bumpable = is_bumpable;
+        self
+    }
+
+    /// Record the registry the specifier resolves through.
+    pub fn with_registry(mut self, registry: RegistryRoute) -> Self {
+        self.registry = Some(registry);
+        self
+    }
 }
 
 /// A cooldown hold: package, current release, chosen release, skipped release,
@@ -1336,6 +1403,9 @@ pub(crate) enum PendingVersion {
 pub enum Lang {
     Python,
     Node,
+    /// A `deno.json`/`deno.jsonc` import map: `jsr:` specifiers resolve
+    /// through JSR and `npm:` ones through npm.
+    Deno,
     Rust,
     Go,
     Ruby,
@@ -1365,6 +1435,7 @@ impl Lang {
         match self {
             Lang::Python => "python",
             Lang::Node => "node",
+            Lang::Deno => "deno",
             Lang::Rust => "rust",
             Lang::Go => "go",
             Lang::Ruby => "ruby",
@@ -1392,6 +1463,7 @@ impl Lang {
         Some(match self {
             Lang::Python => "pypi",
             Lang::Node => "npm",
+            Lang::Deno => "jsr",
             Lang::Rust => "crates.io",
             Lang::Go => "go-proxy",
             Lang::Ruby => "rubygems",
@@ -1412,6 +1484,7 @@ impl Lang {
         match self {
             Lang::Python => "python",
             Lang::Node => "node",
+            Lang::Deno => "deno",
             Lang::Rust => "rust",
             Lang::Go => "go",
             Lang::Ruby => "ruby",
@@ -1435,6 +1508,9 @@ pub enum FileType {
     Requirements,
     PyProject,
     PackageJson,
+    /// A `deno.json` or `deno.jsonc` configuration file, whose `imports` map
+    /// is the project's dependency manifest.
+    DenoJson,
     CargoToml,
     GoMod,
     Gemfile,
@@ -1462,6 +1538,7 @@ impl FileType {
         match self {
             FileType::Requirements | FileType::PyProject => Lang::Python,
             FileType::PackageJson => Lang::Node,
+            FileType::DenoJson => Lang::Deno,
             FileType::CargoToml => Lang::Rust,
             FileType::GoMod => Lang::Go,
             FileType::Gemfile => Lang::Ruby,
@@ -1501,6 +1578,7 @@ impl FileType {
             FileType::Requirements => "requirements",
             FileType::PyProject => "pyproject",
             FileType::PackageJson => "package_json",
+            FileType::DenoJson => "deno_json",
             FileType::CargoToml => "cargo_toml",
             FileType::GoMod => "go_mod",
             FileType::Gemfile => "gemfile",
@@ -1577,6 +1655,10 @@ impl FileType {
 
         if file_name == "pyproject.toml" {
             return Some(FileType::PyProject);
+        }
+
+        if file_name == "deno.json" || file_name == "deno.jsonc" {
+            return Some(FileType::DenoJson);
         }
 
         if file_name == "package.json" {
@@ -4331,6 +4413,7 @@ mod tests {
         FileType::Requirements,
         FileType::PyProject,
         FileType::PackageJson,
+        FileType::DenoJson,
         FileType::CargoToml,
         FileType::GoMod,
         FileType::Gemfile,
@@ -4356,6 +4439,7 @@ mod tests {
                 FileType::Requirements
                 | FileType::PyProject
                 | FileType::PackageJson
+                | FileType::DenoJson
                 | FileType::CargoToml
                 | FileType::GoMod
                 | FileType::Gemfile

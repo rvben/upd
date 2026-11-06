@@ -6,8 +6,8 @@
 use crate::updater::{
     AnnotatedUpdater, CargoTomlUpdater, CsprojUpdater, DockerUpdater, FileType, GemfileUpdater,
     GithubActionsUpdater, GoModUpdater, Lang, MiseUpdater, PackageJsonUpdater, ParseWarnings,
-    ParsedDependency, PreCommitUpdater, PyProjectUpdater, RequirementsUpdater, TerraformUpdater,
-    Updater,
+    ParsedDependency, PreCommitUpdater, PyProjectUpdater, RegistryRoute, RequirementsUpdater,
+    TerraformUpdater, Updater,
 };
 use crate::version::{TagVersion, is_stable_pep440};
 use anyhow::Result;
@@ -40,6 +40,30 @@ pub struct PackageOccurrence {
     /// are still included so the audit path can inspect them, but they must not
     /// participate in alignment comparisons or update attempts.
     pub is_bumpable: bool,
+    /// The registry the occurrence resolves through, when its file routes
+    /// entries between several registries; `None` on a single-registry file.
+    ///
+    /// Carried over from [`ParsedDependency::registry`]. Audit routes on it:
+    /// a deno.json's `npm:` specifiers audit as npm, its `jsr:` ones name
+    /// packages no OSV ecosystem covers and are reported as not audited.
+    pub registry: Option<RegistryRoute>,
+}
+
+impl Default for PackageOccurrence {
+    fn default() -> Self {
+        // Only a base for struct-update syntax in tests; `file_type` has no
+        // meaningful default and is always stated at a real construction.
+        Self {
+            file_path: PathBuf::new(),
+            file_type: FileType::Requirements,
+            version: String::new(),
+            line_number: None,
+            has_upper_bound: false,
+            original_name: String::new(),
+            is_bumpable: true,
+            registry: None,
+        }
+    }
 }
 
 /// Result of alignment analysis for a single package
@@ -116,6 +140,9 @@ fn get_updater(file_type: FileType, warnings: ParseWarnings) -> Box<dyn Updater>
         FileType::Requirements => Box::new(RequirementsUpdater::new()),
         FileType::PyProject => Box::new(PyProjectUpdater::new()),
         FileType::PackageJson => Box::new(PackageJsonUpdater::new()),
+        // Parse-only: alignment never resolves, so no JSR client is built
+        // here — the pattern MiseUpdater::new_parse_only() follows.
+        FileType::DenoJson => Box::new(crate::updater::DenoUpdater::new_parse_only()),
         FileType::CargoToml => Box::new(CargoTomlUpdater::new()),
         FileType::GoMod => Box::new(GoModUpdater::new()),
         FileType::Gemfile => Box::new(GemfileUpdater::new()),
@@ -143,6 +170,7 @@ fn to_occurrence(dep: &ParsedDependency, path: &Path, file_type: FileType) -> Pa
         has_upper_bound: dep.has_upper_bound,
         original_name: dep.name.clone(),
         is_bumpable: dep.is_bumpable,
+        registry: dep.registry,
     }
 }
 
@@ -256,7 +284,7 @@ pub(crate) fn is_stable_version(version: &str, lang: Lang) -> bool {
     match lang {
         Lang::Python => is_stable_pep440(version),
         Lang::Gradle => !crate::version::gradle::is_prerelease(version),
-        Lang::Node | Lang::Rust | Lang::Go | Lang::DotNet => {
+        Lang::Node | Lang::Deno | Lang::Rust | Lang::Go | Lang::DotNet => {
             // Semver pre-release indicator: a hyphen before any build
             // metadata, which may itself contain hyphens (`+spec-1.1.0`)
             !crate::version::without_build_metadata(version).contains('-')
@@ -299,7 +327,7 @@ pub(crate) fn compare_versions(a: &str, b: &str, lang: Lang) -> std::cmp::Orderi
     match lang {
         Lang::Python => compare_pep440(a, b),
         Lang::Gradle => crate::version::gradle::compare(a, b),
-        Lang::Node | Lang::Rust | Lang::Ruby | Lang::DotNet => compare_semver(a, b),
+        Lang::Node | Lang::Deno | Lang::Rust | Lang::Ruby | Lang::DotNet => compare_semver(a, b),
         Lang::Go => compare_go_version(a, b),
         // Commits carry no order of their own.
         Lang::Nix => std::cmp::Ordering::Equal,
@@ -491,6 +519,7 @@ mod tests {
             has_upper_bound: false,
             original_name: "serde".into(),
             is_bumpable: true,
+            ..Default::default()
         };
         let highest = |occurrences: Vec<PackageOccurrence>| {
             find_alignments(
@@ -540,6 +569,7 @@ mod tests {
             has_upper_bound: false,
             original_name: "torch".into(),
             is_bumpable: true,
+            ..Default::default()
         };
         let result = find_alignments(
             HashMap::from([(
@@ -598,6 +628,7 @@ mod tests {
             has_upper_bound: false,
             original_name: "toml_edit".into(),
             is_bumpable: true,
+            ..Default::default()
         };
         let occurrences = [occurrence("0.25.10"), occurrence("0.25.13+spec-1.1.0")];
         for lang in [Lang::Rust, Lang::Node] {
@@ -633,6 +664,7 @@ mod tests {
             has_upper_bound: false,
             original_name: "github:bell-sw/Liberica".into(),
             is_bumpable: true,
+            ..Default::default()
         };
         let occurrences = [occurrence("23+38"), occurrence("23+25-ea-leyden")];
         assert_eq!(
@@ -667,6 +699,7 @@ mod tests {
                     has_upper_bound: false,
                     original_name: "requests".to_string(),
                     is_bumpable: true,
+                    ..Default::default()
                 },
                 PackageOccurrence {
                     file_path: PathBuf::from("requirements-dev.txt"),
@@ -676,6 +709,7 @@ mod tests {
                     has_upper_bound: false,
                     original_name: "requests".to_string(),
                     is_bumpable: true,
+                    ..Default::default()
                 },
             ],
         };
@@ -700,6 +734,7 @@ mod tests {
                     has_upper_bound: true, // Has constraint, should be skipped
                     original_name: "django".to_string(),
                     is_bumpable: true,
+                    ..Default::default()
                 },
                 PackageOccurrence {
                     file_path: PathBuf::from("requirements-dev.txt"),
@@ -709,6 +744,7 @@ mod tests {
                     has_upper_bound: false,
                     original_name: "django".to_string(),
                     is_bumpable: true,
+                    ..Default::default()
                 },
             ],
         };
@@ -1044,6 +1080,7 @@ click = "^8.1.0"
             has_upper_bound: false,
             original_name: "foo".to_string(),
             is_bumpable: true,
+            ..Default::default()
         }
     }
 

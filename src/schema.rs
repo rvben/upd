@@ -14,7 +14,7 @@ fn build_schema() -> Value {
         "clispec": "0.3",
         "name": "upd",
         "version": env!("CARGO_PKG_VERSION"),
-        "description": "A fast dependency updater for Python, Node.js, Rust, Go, Ruby, .NET, Docker, Terraform, Nix flakes, GitHub Actions, pre-commit, and Mise/asdf projects",
+        "description": "A fast dependency updater for Python, Node.js, Deno, Rust, Go, Ruby, .NET, Docker, Terraform, Nix flakes, GitHub Actions, pre-commit, and Mise/asdf projects",
         "output": {"tty": "text", "piped": "json"},
         "global_args": [
             {
@@ -79,13 +79,13 @@ fn build_schema() -> Value {
                 "short": "-l",
                 "description": "Filter by language/ecosystem (repeatable or comma-separated)",
                 "type": "string[]",
-                "enum": ["python", "node", "rust", "go", "ruby", "dotnet", "gradle", "actions", "pre-commit", "mise", "terraform", "docker", "nix", "github-releases", "annotated"]
+                "enum": ["python", "node", "deno", "rust", "go", "ruby", "dotnet", "gradle", "actions", "pre-commit", "mise", "terraform", "docker", "nix", "github-releases", "annotated"]
             },
             {
                 "name": "exclude-lang",
                 "description": "Leave ecosystems out after --lang and the [ecosystems] configuration, annotated lines included (repeatable or comma-separated)",
                 "type": "string[]",
-                "enum": ["python", "node", "rust", "go", "ruby", "dotnet", "gradle", "actions", "pre-commit", "mise", "terraform", "docker", "nix", "github-releases", "annotated"]
+                "enum": ["python", "node", "deno", "rust", "go", "ruby", "dotnet", "gradle", "actions", "pre-commit", "mise", "terraform", "docker", "nix", "github-releases", "annotated"]
             },
             {
                 "name": "limit",

@@ -190,13 +190,7 @@ fn resolvable(entries: Vec<MiseEntry>) -> Vec<ParsedDependency> {
     entries
         .into_iter()
         .filter(|entry| matches!(entry.resolution, Resolution::Registry(..)))
-        .map(|entry| ParsedDependency {
-            name: entry.key,
-            version: entry.version,
-            line_number: Some(entry.line_number),
-            has_upper_bound: false,
-            is_bumpable: true,
-        })
+        .map(|entry| ParsedDependency::new(entry.key, entry.version, Some(entry.line_number)))
         .collect()
 }
 

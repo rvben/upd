@@ -404,13 +404,10 @@ impl PreCommitUpdater {
                 let name = Self::extract_github_owner_repo(repo.text("repo")?)?;
                 let rev = repo.get("rev")?.scalar()?;
                 rev.span.as_ref()?;
-                Some(ParsedDependency {
-                    name,
-                    version: rev.value.clone(),
-                    line_number: rev.line(content),
-                    has_upper_bound: false,
-                    is_bumpable: unreadable_rev(&rev.value).is_none(),
-                })
+                Some(
+                    ParsedDependency::new(name, rev.value.clone(), rev.line(content))
+                        .with_bumpable(unreadable_rev(&rev.value).is_none()),
+                )
             })
             .collect()
     }

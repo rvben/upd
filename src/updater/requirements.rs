@@ -648,13 +648,11 @@ impl Updater for RequirementsUpdater {
         for (line_idx, line) in content.lines().enumerate() {
             if let Some(parsed) = self.parse_line(line) {
                 let has_upper_bound = !Self::is_simple_constraint(&parsed.full_constraint);
-                deps.push(ParsedDependency {
-                    name: parsed.package,
-                    version: parsed.first_version,
-                    line_number: Some(line_idx + 1),
-                    has_upper_bound,
-                    is_bumpable: parsed.raisable,
-                });
+                deps.push(
+                    ParsedDependency::new(parsed.package, parsed.first_version, Some(line_idx + 1))
+                        .with_upper_bound(has_upper_bound)
+                        .with_bumpable(parsed.raisable),
+                );
             }
         }
 

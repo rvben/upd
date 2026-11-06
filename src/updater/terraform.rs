@@ -769,12 +769,11 @@ impl Updater for TerraformUpdater {
         Ok(parsed
             .into_iter()
             .filter(|dep| !dep.clauses.is_empty())
-            .map(|dep| ParsedDependency {
-                version: dep.anchor_version().to_string(),
-                has_upper_bound: dep.caps_from_above(),
-                line_number: Some(dep.version_line_idx + 1),
-                name: dep.source,
-                is_bumpable: true,
+            .map(|dep| {
+                let version = dep.anchor_version().to_string();
+                let has_upper_bound = dep.caps_from_above();
+                ParsedDependency::new(dep.source, version, Some(dep.version_line_idx + 1))
+                    .with_upper_bound(has_upper_bound)
             })
             .collect())
     }

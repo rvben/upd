@@ -452,14 +452,12 @@ impl Updater for AnnotatedUpdater {
         Ok(scan
             .lines
             .into_iter()
-            .map(|line| ParsedDependency {
-                line_number: Some(line.line_idx + 1),
+            .map(|line| {
+                let is_bumpable = !(line.source == AnnotationSource::Go
+                    && GoModUpdater::is_pseudo_version(&line.version));
                 // An annotated pin is a single value, never a range.
-                has_upper_bound: false,
-                is_bumpable: !(line.source == AnnotationSource::Go
-                    && GoModUpdater::is_pseudo_version(&line.version)),
-                name: line.package,
-                version: line.version,
+                ParsedDependency::new(line.package, line.version, Some(line.line_idx + 1))
+                    .with_bumpable(is_bumpable)
             })
             .collect())
     }

@@ -551,13 +551,10 @@ impl Updater for CsprojUpdater {
                     let has_range = version.starts_with('[')
                         || version.starts_with('(')
                         || version.contains(',');
-                    deps.push(ParsedDependency {
-                        name: tag_name.clone(),
-                        version,
-                        line_number: Some(tag_line_idx + 1),
-                        has_upper_bound: has_range,
-                        is_bumpable: true,
-                    });
+                    deps.push(
+                        ParsedDependency::new(tag_name.clone(), version, Some(tag_line_idx + 1))
+                            .with_upper_bound(has_range),
+                    );
                     pending_tag = None;
                     continue;
                 }
@@ -568,13 +565,10 @@ impl Updater for CsprojUpdater {
             }
 
             if let Some(parsed) = self.parse_inline(line) {
-                deps.push(ParsedDependency {
-                    name: parsed.name,
-                    version: parsed.version,
-                    line_number: Some(line_idx + 1),
-                    has_upper_bound: parsed.has_range_constraint,
-                    is_bumpable: true,
-                });
+                deps.push(
+                    ParsedDependency::new(parsed.name, parsed.version, Some(line_idx + 1))
+                        .with_upper_bound(parsed.has_range_constraint),
+                );
                 continue;
             }
 

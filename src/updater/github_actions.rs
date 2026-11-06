@@ -650,13 +650,11 @@ impl GithubActionsUpdater {
 
                 let owner_repo = Self::extract_owner_repo(action);
 
-                deps.push(ParsedDependency {
-                    name: owner_repo.to_string(),
-                    version: version_ref.to_string(),
-                    line_number: Some(line_idx + 1),
-                    has_upper_bound: false,
-                    is_bumpable: true,
-                });
+                deps.push(ParsedDependency::new(
+                    owner_repo.to_string(),
+                    version_ref.to_string(),
+                    Some(line_idx + 1),
+                ));
             }
         }
 

@@ -799,13 +799,12 @@ impl Updater for DockerUpdater {
             .map(|dependency| {
                 let is_bumpable =
                     !dependency.digest_pinned && Self::numeric_segments(&dependency.tag).is_some();
-                ParsedDependency {
-                    name: dependency.image,
-                    version: dependency.tag,
-                    line_number: Some(dependency.line_idx + 1),
-                    has_upper_bound: false,
-                    is_bumpable,
-                }
+                ParsedDependency::new(
+                    dependency.image,
+                    dependency.tag,
+                    Some(dependency.line_idx + 1),
+                )
+                .with_bumpable(is_bumpable)
             })
             .collect())
     }

@@ -1487,6 +1487,7 @@ mod tests {
             has_upper_bound: false,
             original_name: original_name.to_string(),
             is_bumpable,
+            ..Default::default()
         }
     }
 

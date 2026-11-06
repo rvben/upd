@@ -69,6 +69,7 @@ to name, described below the table.
 | Node      | `yarn.lock`             | `yarn install --mode update-lockfile` (Yarn 2+)                  | whole manifest; writes the lockfile, no `node_modules`   |
 | Node      | `pnpm-lock.yaml`        | `pnpm install --lockfile-only`                                   | whole manifest; writes the lockfile, no `node_modules`   |
 | Node      | `bun.lock`, `bun.lockb` | `bun install --lockfile-only`                                    | whole manifest; writes the lockfile, no `node_modules` from bun 1.1.43 (older bun installs, see below) |
+| Deno      | `deno.lock`             | `deno install --lockfile-only`                                   | whole manifest; updates the lockfile without installing into `node_modules` |
 | Rust      | `Cargo.lock`            | `cargo update -p <changed> -p <changed> …`                       | the changed packages only                                |
 | Go        | `go.sum`                | `go mod tidy`                                                    | whole manifest; no targeted form                         |
 | Ruby      | `Gemfile.lock`          | `bundle lock --update <changed> …`                               | the changed packages only                                |

@@ -1,0 +1,9 @@
+{
+  // A Deno project whose import map is out of date: @std/path has 1.1.6 on
+  // the registry the test points at, chalk 5.6.2 on npm.
+  "lock": false,
+  "imports": {
+    "@std/path": "jsr:@std/path@^1.0.0",
+    "chalk": "npm:chalk@^5.0.0"
+  }
+}

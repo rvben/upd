@@ -71,6 +71,9 @@ pub enum LockfileType {
     /// bun's binary lockfile from before 1.2, still read when no `bun.lock`
     /// sits beside it.
     BunLockb,
+    /// deno's lockfile, written by `deno install --lockfile-only` for a
+    /// `deno.json`/`deno.jsonc` manifest.
+    DenoLock,
     CargoLock,
     GoSum,
     GemfileLock,
@@ -80,7 +83,7 @@ pub enum LockfileType {
 
 impl LockfileType {
     /// Every lockfile format upd knows.
-    pub const ALL: [LockfileType; 13] = [
+    pub const ALL: [LockfileType; 14] = [
         LockfileType::PoetryLock,
         LockfileType::UvLock,
         LockfileType::PackageLockJson,
@@ -89,6 +92,7 @@ impl LockfileType {
         LockfileType::PnpmLock,
         LockfileType::BunLock,
         LockfileType::BunLockb,
+        LockfileType::DenoLock,
         LockfileType::CargoLock,
         LockfileType::GoSum,
         LockfileType::GemfileLock,
@@ -113,6 +117,7 @@ impl LockfileType {
             LockfileType::PnpmLock => "pnpm-lock.yaml",
             LockfileType::BunLock => "bun.lock",
             LockfileType::BunLockb => "bun.lockb",
+            LockfileType::DenoLock => "deno.lock",
             LockfileType::CargoLock => "Cargo.lock",
             LockfileType::GoSum => "go.sum",
             LockfileType::GemfileLock => "Gemfile.lock",
@@ -189,6 +194,10 @@ impl LockfileType {
                 "bun",
                 vec!["install".to_string(), "--lockfile-only".to_string()],
             ),
+            LockfileType::DenoLock => (
+                "deno",
+                vec!["install".to_string(), "--lockfile-only".to_string()],
+            ),
             LockfileType::CargoLock => {
                 if changed.is_empty() {
                     (
@@ -232,6 +241,7 @@ impl LockfileType {
             | LockfileType::PnpmLock
             | LockfileType::BunLock
             | LockfileType::BunLockb => "package.json",
+            LockfileType::DenoLock => "deno.json",
             LockfileType::CargoLock => "Cargo.toml",
             LockfileType::GoSum => "go.mod",
             LockfileType::GemfileLock => "Gemfile",
@@ -408,6 +418,19 @@ pub fn detect_lockfiles(manifest_path: &Path) -> Vec<LockfileType> {
         } else if dir.join("bun.lockb").exists() {
             lockfiles.push(LockfileType::BunLockb);
         }
+    }
+
+    // Deno's lockfile, only beside a deno.json/deno.jsonc manifest. Deno
+    // reads the lockfile it finds there; there is exactly one format.
+    if matches!(
+        manifest_path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .as_deref(),
+        Some("deno.json") | Some("deno.jsonc")
+    ) && dir.join("deno.lock").exists()
+    {
+        lockfiles.push(LockfileType::DenoLock);
     }
 
     // Check for Rust lockfile (only if manifest is Cargo.toml)
@@ -1583,11 +1606,12 @@ mod tests {
             | LockfileType::PnpmLock
             | LockfileType::BunLock
             | LockfileType::BunLockb
+            | LockfileType::DenoLock
             | LockfileType::CargoLock
             | LockfileType::GoSum
             | LockfileType::GemfileLock
             | LockfileType::PackagesLockJson
-            | LockfileType::TerraformLock => 13,
+            | LockfileType::TerraformLock => 14,
         };
         let distinct: std::collections::HashSet<_> = LockfileType::ALL.into_iter().collect();
         assert_eq!(distinct.len(), listed(LockfileType::UvLock));

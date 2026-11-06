@@ -105,14 +105,9 @@ impl AuditCache {
     /// Look up a cache entry. Returns `None` when missing or expired.
     pub fn get(&self, key: &AuditKey) -> Option<&AuditCacheEntry> {
         let k = Self::map_key(key);
-        self.entries.get(&k).and_then(|entry| {
-            if Self::is_expired(entry.fetched_at)
-                || entry.schema_version != AUDIT_CACHE_SCHEMA_VERSION
-            {
-                None
-            } else {
-                Some(entry)
-            }
+        self.entries.get(&k).filter(|entry| {
+            !Self::is_expired(entry.fetched_at)
+                && entry.schema_version == AUDIT_CACHE_SCHEMA_VERSION
         })
     }
 

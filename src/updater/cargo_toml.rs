@@ -904,13 +904,8 @@ impl Updater for CargoTomlUpdater {
                         let version = ReqSpec::parse(&version_req).version().to_string();
                         let line_num = line_index.line_for(section_path, key);
                         let name = Self::get_package_name(item).unwrap_or_else(|| key.to_string());
-                        deps.push(ParsedDependency {
-                            name,
-                            version,
-                            line_number: line_num,
-                            has_upper_bound: false, // Cargo.toml doesn't use same constraint syntax as Python
-                            is_bumpable: true,
-                        });
+                        // Cargo.toml has no Python-style upper-bound syntax.
+                        deps.push(ParsedDependency::new(name, version, line_num));
                     }
                 }
             };

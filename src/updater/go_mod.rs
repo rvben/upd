@@ -547,13 +547,14 @@ impl Updater for GoModUpdater {
                 // that the audit path can see them, but they must not be bumped.
                 let is_bumpable = !Self::is_pseudo_version(current_version);
 
-                deps.push(ParsedDependency {
-                    name: module.to_string(),
-                    version: current_version.to_string(),
-                    line_number: Some(line_idx + 1),
-                    has_upper_bound: false, // Go doesn't have explicit upper bounds
-                    is_bumpable,
-                });
+                deps.push(
+                    ParsedDependency::new(
+                        module.to_string(),
+                        current_version.to_string(),
+                        Some(line_idx + 1),
+                    )
+                    .with_bumpable(is_bumpable),
+                );
             }
         }
 
