@@ -1026,8 +1026,14 @@ fn plan_lock_groups(files: &[(PathBuf, FileType)]) -> Result<Vec<LockGroup>> {
                 index
             });
         let group = &mut groups[index];
+        // A uv workspace owner snapshots every declared member alongside the
+        // lockfile. A Deno workspace refresh rewrites only deno.lock, which
+        // the group already snapshots.
         if group.manifests.is_empty()
             && let Some(owner) = &owner
+            && group
+                .lockfiles
+                .contains(&upd::lockfile::LockfileType::UvLock)
         {
             let mut members: Vec<_> = upd::lockscan::discover::uv_workspace_manifests(owner)
                 .map_err(anyhow::Error::msg)?

@@ -278,12 +278,21 @@ pub fn containing_dir(path: &Path) -> &Path {
     }
 }
 
-/// The lockfiles a lock refresh after editing `manifest` rewrites. A uv
-/// workspace member's lockfile is its workspace root's, so for a member the
-/// root manifest is returned too, and nothing when the root has no uv.lock.
+/// The lockfiles a lock refresh after editing `manifest` rewrites. A uv or
+/// Deno workspace member's lockfile is its workspace root's, so for a member
+/// the root manifest is returned too, and nothing when the root has no
+/// lockfile.
 pub fn refreshed_lockfiles(
     manifest: &Path,
 ) -> anyhow::Result<(Option<PathBuf>, Vec<LockfileType>)> {
+    if let Some(owner) = deno_workspace_root(manifest)? {
+        return Ok(if containing_dir(&owner).join("deno.lock").exists() {
+            let lockfiles = detect_lockfiles(&owner);
+            (Some(owner), lockfiles)
+        } else {
+            (None, Vec::new())
+        });
+    }
     match uv_workspace_root(manifest)? {
         Some(root) => {
             let owner = root.join("pyproject.toml");
@@ -365,6 +374,89 @@ pub fn uv_workspace_root(manifest: &Path) -> anyhow::Result<Option<PathBuf>> {
                     || (members.is_match(&relative) && !exclude.is_match(&relative)))
                 .then(|| root.to_path_buf()));
             }
+        }
+        if root.join(".git").exists() {
+            break;
+        }
+    }
+    Ok(None)
+}
+
+/// The root `deno.json`/`deno.jsonc` of the Deno workspace that declares this
+/// manifest's directory a member, or `None` when no ancestor does.
+///
+/// Deno reads one lockfile per workspace, beside the root config, so this is
+/// what a member's lock refresh runs against. Membership is what the root's
+/// `"workspace"` list (or its `"members"` object form) says, globs included;
+/// a workspace root itself is not its own member and is found the ordinary
+/// way. The search stops at the first workspace declaration it meets and at
+/// a repository boundary.
+pub fn deno_workspace_root(manifest: &Path) -> anyhow::Result<Option<PathBuf>> {
+    use anyhow::{Context, anyhow};
+    const NAMES: [&str; 2] = ["deno.json", "deno.jsonc"];
+    if manifest
+        .file_name()
+        .is_none_or(|name| !NAMES.iter().any(|n| name == *n))
+    {
+        return Ok(None);
+    }
+    let manifest = std::fs::canonicalize(manifest).with_context(|| {
+        format!(
+            "Cannot locate {} before lockfile refresh",
+            manifest.display()
+        )
+    })?;
+    let directory = containing_dir(&manifest);
+    if directory.join(".git").exists() {
+        return Ok(None);
+    }
+    for root in directory.ancestors().skip(1) {
+        for name in NAMES {
+            let candidate = root.join(name);
+            if !candidate.try_exists()? {
+                continue;
+            }
+            let text = std::fs::read_to_string(&candidate)?;
+            let doc = crate::jsonc::parse(&text).with_context(|| {
+                format!(
+                    "Cannot determine workspace ownership from {}",
+                    candidate.display()
+                )
+            })?;
+            let Some(workspace) = doc.get("workspace") else {
+                continue;
+            };
+            let members = workspace
+                .as_array()
+                .or_else(|| workspace.get("members").and_then(|m| m.as_array()))
+                .ok_or_else(|| {
+                    anyhow!(
+                        "\"workspace\" must be a list of members in {}",
+                        candidate.display()
+                    )
+                })?
+                .iter()
+                .map(|m| {
+                    m.as_str().map(ToOwned::to_owned).ok_or_else(|| {
+                        anyhow!(
+                            "\"workspace\" members must be strings in {}",
+                            candidate.display()
+                        )
+                    })
+                })
+                .collect::<anyhow::Result<Vec<String>>>()?;
+            let members =
+                crate::lockscan::discover::workspace_globs(&members, "members").map_err(|_| {
+                    anyhow!(
+                        "Cannot read the \"workspace\" members of {}",
+                        candidate.display()
+                    )
+                })?;
+            let relative = directory
+                .strip_prefix(root)?
+                .to_string_lossy()
+                .replace(std::path::MAIN_SEPARATOR, "/");
+            return Ok(members.is_match(&relative).then_some(candidate));
         }
         if root.join(".git").exists() {
             break;
@@ -2763,5 +2855,104 @@ mod uv_workspace_tests {
         // A directory cannot be captured as file bytes on any supported OS.
         let snapshot = Snapshot::capture(&[temp.path().to_path_buf()]);
         assert!(snapshot.ensure_restorable().is_err());
+    }
+}
+
+#[cfg(test)]
+mod deno_workspace_tests {
+    use super::*;
+
+    fn write(path: &Path, text: &str) {
+        std::fs::create_dir_all(containing_dir(path)).unwrap();
+        std::fs::write(path, text).unwrap();
+    }
+
+    #[test]
+    fn a_member_refreshes_its_workspace_roots_lockfile() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(temp.path()).unwrap();
+        write(
+            &root.join("deno.jsonc"),
+            "{\n  // a comment\n  \"workspace\": [\"./listed\", \"./globbed/*\"]\n}\n",
+        );
+        write(&root.join("deno.lock"), "{}");
+        for member in ["listed/deno.json", "globbed/one/deno.jsonc"] {
+            write(&root.join(member), "{ \"imports\": {} }");
+            assert_eq!(
+                refreshed_lockfiles(&root.join(member)).unwrap(),
+                (Some(root.join("deno.jsonc")), vec![LockfileType::DenoLock]),
+                "{member}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_members_object_declares_a_workspace_too() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(temp.path()).unwrap();
+        write(
+            &root.join("deno.json"),
+            r#"{ "workspace": { "members": ["./pkg/"] } }"#,
+        );
+        write(&root.join("deno.lock"), "{}");
+        write(&root.join("pkg/deno.json"), "{}");
+        assert_eq!(
+            refreshed_lockfiles(&root.join("pkg/deno.json")).unwrap(),
+            (Some(root.join("deno.json")), vec![LockfileType::DenoLock])
+        );
+    }
+
+    #[test]
+    fn only_declared_members_belong_to_the_workspace() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(temp.path()).unwrap();
+        write(&root.join("deno.json"), r#"{ "workspace": ["./listed"] }"#);
+        write(&root.join("deno.lock"), "{}");
+        write(&root.join("unlisted/deno.json"), "{}");
+        write(&root.join("unlisted/deno.lock"), "{}");
+        write(&root.join("listed/nested/deno.json"), "{}");
+        // An undeclared directory keeps its own lockfile, or none.
+        assert_eq!(
+            refreshed_lockfiles(&root.join("unlisted/deno.json")).unwrap(),
+            (None, vec![LockfileType::DenoLock])
+        );
+        assert_eq!(
+            refreshed_lockfiles(&root.join("listed/nested/deno.json")).unwrap(),
+            (None, Vec::new())
+        );
+        // The root itself is found the ordinary way.
+        assert_eq!(
+            refreshed_lockfiles(&root.join("deno.json")).unwrap(),
+            (None, vec![LockfileType::DenoLock])
+        );
+    }
+
+    #[test]
+    fn a_member_of_a_workspace_without_a_lockfile_refreshes_nothing() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(temp.path()).unwrap();
+        write(&root.join("deno.json"), r#"{ "workspace": ["./a"] }"#);
+        write(&root.join("a/deno.json"), "{}");
+        // Deno reads only the root lockfile, so a stray one in the member
+        // is not what a refresh would rewrite.
+        write(&root.join("a/deno.lock"), "{}");
+        assert_eq!(
+            refreshed_lockfiles(&root.join("a/deno.json")).unwrap(),
+            (None, Vec::new())
+        );
+    }
+
+    #[test]
+    fn the_search_stops_at_a_repository_boundary() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(temp.path()).unwrap();
+        write(&root.join("deno.json"), r#"{ "workspace": ["./inner"] }"#);
+        write(&root.join("deno.lock"), "{}");
+        std::fs::create_dir_all(root.join("inner/.git")).unwrap();
+        write(&root.join("inner/deno.json"), "{}");
+        assert_eq!(
+            refreshed_lockfiles(&root.join("inner/deno.json")).unwrap(),
+            (None, Vec::new())
+        );
     }
 }

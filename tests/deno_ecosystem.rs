@@ -318,3 +318,64 @@ async fn align_lines_deno_imports_up_across_manifests() {
         ahead
     );
 }
+
+/// A workspace member's edit refreshes the one lockfile Deno reads, beside
+/// the workspace root's config, by running the refresh there.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_workspace_member_refreshes_the_root_lockfile() {
+    let registries = start_registries().await;
+    let dir = TempDir::new().unwrap();
+    let root = fs::canonicalize(dir.path()).unwrap();
+    fs::write(root.join("deno.json"), r#"{ "workspace": ["./member"] }"#).unwrap();
+    fs::write(root.join("deno.lock"), FIXTURE_LOCK).unwrap();
+    fs::create_dir(root.join("member")).unwrap();
+    fs::write(root.join("member/deno.json"), FIXTURE_MANIFEST).unwrap();
+
+    let bin_dir = TempDir::new().unwrap();
+    let marker = root.join("deno-invocations");
+    fs::write(
+        bin_dir.path().join("deno"),
+        format!(
+            "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then echo \"deno 2.9.8 (fake)\"; exit 0; fi\necho \"$(pwd -P) $@\" >> {}\nexit 0\n",
+            marker.display()
+        ),
+    )
+    .unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(
+        bin_dir.path().join("deno"),
+        fs::Permissions::from_mode(0o755),
+    )
+    .unwrap();
+    let path = format!(
+        "{}:{}",
+        bin_dir.path().display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+
+    let output = Command::new(upd_bin())
+        .args(["--apply", "--lock", "--no-cache", "--output", "json", "."])
+        .current_dir(&root)
+        .env("NO_COLOR", "1")
+        .env("JSR_REGISTRY", &registries.jsr)
+        .env("NPM_REGISTRY", &registries.npm)
+        .env("UPD_CACHE_DIR", root.join("upd-cache"))
+        .env("PATH", &path)
+        .output()
+        .expect("upd ran");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "upd failed: {stdout}\n{stderr}");
+
+    let invocations = fs::read_to_string(&marker).unwrap_or_default();
+    assert_eq!(
+        invocations.trim(),
+        format!("{} install --lockfile-only", root.display()),
+        "stdout: {stdout}\nstderr: {stderr}"
+    );
+    assert!(
+        fs::read_to_string(root.join("member/deno.json"))
+            .unwrap()
+            .contains("jsr:@std/path@^1.1.6")
+    );
+}
