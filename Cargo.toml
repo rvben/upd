@@ -55,8 +55,8 @@ html-escape = "0.2"
 semver = "1.0.28"
 
 # File handling
-ignore = "0.4.33"
-globset = "0.4.20"
+ignore = "0.4.34"
+globset = "0.4.21"
 directories = "6.0.0"
 tempfile = "3.27.0"
 
@@ -78,7 +78,7 @@ jiff = "0.2"
 saphyr-parser = "0.0.12"
 hmac = "0.13"
 sha2 = "0.11"
-zip = { version = "9.1.2", default-features = false, features = ["deflate-flate2-zlib-rs"] }
+zip = { version = "9.2.2", default-features = false, features = ["deflate-flate2-zlib-rs"] }
 
 [dev-dependencies]
 wiremock = "0.6"
