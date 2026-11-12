@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.18.5](https://github.com/rvben/upd/compare/v0.18.4...v0.18.5) - 2026-11-12
+
 ### Added
 
 - **migrate**: translate common Renovate configs with explicit translated,
@@ -22,6 +24,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **migrate**: refuse unsupported policy with exit code 2 before writing a
   partial config; keep conflicting merge permissions and unsupported nested
   settings blocking.
+
+- **deps**: remediate vulnerable Rust dependencies with upd (#50) ([69ace50](https://github.com/rvben/upd/commit/69ace5038ae87cf135a26a09d6d210cf02842f5b))
+- **deps**: update hyper to 1.12.0, dropping unmaintained pin-utils ([e974ecf](https://github.com/rvben/upd/commit/e974ecf384d6daeed69e36f8f4dba7647ba7abd2))
 
 ## [0.18.4](https://github.com/rvben/upd/compare/v0.18.3...v0.18.4) - 2026-11-06
 
