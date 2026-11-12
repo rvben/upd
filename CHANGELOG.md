@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **migrate**: translate common Renovate configs with explicit translated,
+  dropped and blocking diagnostics; include migration reports in GitLab
+  onboarding previews and invitations, with `--allow-dropped=false` strict mode.
+
+### Changed
+
+- Migration JSON now exposes structured `diagnostics` instead of `warnings`.
+
+### Fixed
+
+- **migrate**: refuse unsupported policy with exit code 2 before writing a
+  partial config; keep conflicting merge permissions and unsupported nested
+  settings blocking.
+
 ## [0.18.4](https://github.com/rvben/upd/compare/v0.18.3...v0.18.4) - 2026-11-06
 
 ### Added

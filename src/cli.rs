@@ -445,6 +445,9 @@ pub enum MigrateCommand {
         /// Repository directory or Renovate JSON file
         #[arg(default_value = ".")]
         path: PathBuf,
+        /// Permit reported policy losses; false requires every setting to translate
+        #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+        allow_dropped: bool,
     },
 }
 
@@ -525,6 +528,9 @@ pub enum GitlabOrgCommand {
         /// Only onboard these full project paths (repeatable)
         #[arg(long = "project", value_name = "PATH")]
         projects: Vec<String>,
+        /// Permit reported migration losses; false requires every setting to translate
+        #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+        allow_dropped: bool,
     },
 
     /// Lock mode, planning job: write the child pipeline of lock jobs.

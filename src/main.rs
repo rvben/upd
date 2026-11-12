@@ -1737,17 +1737,32 @@ async fn run() -> Result<()> {
 
     // Annotation inputs are validated before any optional registry construction.
     if let Some(Command::Migrate {
-        command: upd::cli::MigrateCommand::Renovate { path },
+        command:
+            upd::cli::MigrateCommand::Renovate {
+                path,
+                allow_dropped,
+            },
     }) = &cli.command
     {
-        let migration = upd::migrate::migrate_path(path, cli.dry_run)?;
-        for warning in &migration.warnings {
-            eprintln!("warning: {warning}");
-        }
+        let migration = upd::migrate::migrate_path_with_options(path, cli.dry_run, *allow_dropped)?;
         if effective_json_mode(&cli) {
             println!("{}", serde_json::to_string_pretty(&migration)?);
         } else {
             print!("{}", migration.config);
+            for line in migration.report().lines() {
+                println!("# {line}");
+            }
+        }
+        if !migration.allowed(*allow_dropped) {
+            eprintln!(
+                "migration refused: review blocking settings{}; no config written",
+                if *allow_dropped {
+                    ""
+                } else {
+                    " and dropped settings (--allow-dropped=false)"
+                }
+            );
+            std::process::exit(2);
         }
         return Ok(());
     }
@@ -1878,10 +1893,11 @@ async fn run() -> Result<()> {
             upd::cli::GitlabOrgCommand::Run {
                 projects,
                 assume_opted_in,
-            } => run_gitlab_org(&cli, projects, *assume_opted_in, false).await?,
-            upd::cli::GitlabOrgCommand::Onboard { projects } => {
-                run_gitlab_org(&cli, projects, false, true).await?
-            }
+            } => run_gitlab_org(&cli, projects, *assume_opted_in, false, true).await?,
+            upd::cli::GitlabOrgCommand::Onboard {
+                projects,
+                allow_dropped,
+            } => run_gitlab_org(&cli, projects, false, true, *allow_dropped).await?,
             upd::cli::GitlabOrgCommand::Plan => run_gitlab_org_plan(&cli).await?,
             step => run_gitlab_org_step(&cli, step).await?,
         },
@@ -2085,6 +2101,7 @@ async fn run_gitlab_org(
     projects: &[String],
     assume_opted_in: bool,
     onboard: bool,
+    allow_dropped: bool,
 ) -> Result<()> {
     use upd::gitlab::org;
 
@@ -2095,6 +2112,7 @@ async fn run_gitlab_org(
             settings.assume_opted_in = assume_opted_in;
             settings.preview_config = cli.config.clone();
             settings.onboard = onboard;
+            settings.allow_dropped = allow_dropped;
             org::run(&settings).await
         }
         Err(error) => Err(error),

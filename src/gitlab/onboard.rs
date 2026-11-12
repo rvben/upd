@@ -41,12 +41,18 @@ pub(super) async fn project(
     // Avoid deleting a configuration when another Renovate config or a preset could
     // still carry policy that this translator does not understand.
     for name in [
+        "renovate.jsonc",
         "renovate.json5",
         ".renovaterc",
         ".renovaterc.json",
+        ".renovaterc.jsonc",
         ".renovaterc.json5",
         ".github/renovate.json",
+        ".github/renovate.jsonc",
+        ".github/renovate.json5",
         ".gitlab/renovate.json",
+        ".gitlab/renovate.jsonc",
+        ".gitlab/renovate.json5",
     ] {
         if api.raw_file(project.id, name, &base).await?.is_some() {
             return Err(Error::Refused(format!(
@@ -54,13 +60,30 @@ pub(super) async fn project(
             )));
         }
     }
+    if let Some(package) = api.raw_file(project.id, "package.json", &base).await? {
+        let package: serde_json::Value = serde_json::from_str(&package).map_err(|_| {
+            Error::Refused(
+                "cannot inspect invalid package.json for embedded Renovate policy".into(),
+            )
+        })?;
+        if package.get("renovate").is_some() {
+            return Err(Error::Refused(
+                "package.json renovate settings need manual migration before onboarding".into(),
+            ));
+        }
+    }
     let source = api.raw_file(project.id, "renovate.json", &base).await?;
     let mut migration = crate::migrate::renovate(source.as_deref().unwrap_or("{}"))
         .map_err(|e| Error::Input(e.to_string()))?;
-    if !migration.warnings.is_empty() {
+    if !migration.allowed(settings.allow_dropped) {
         return Err(Error::Refused(format!(
-            "migration needs manual review: {}",
-            migration.warnings.join("; ")
+            "migration needs manual review{}:\n{}",
+            if settings.allow_dropped {
+                ""
+            } else {
+                " (--allow-dropped=false disallows policy losses)"
+            },
+            migration.report()
         )));
     }
     let mut config: toml::Value =
@@ -73,16 +96,26 @@ pub(super) async fn project(
         .unwrap()
         .insert("dependency_updates".into(), toml::Value::Boolean(true));
     migration.config = toml::to_string_pretty(&config).map_err(|e| Error::Io(e.to_string()))?;
+    let migration_report = if migration.diagnostics.is_empty() {
+        if source.is_some() {
+            "Renovate configuration contains no settings; nothing was migrated.\n".into()
+        } else {
+            "No Renovate configuration was found; nothing was migrated.\n".into()
+        }
+    } else {
+        migration.report()
+    };
     if settings.dry_run {
         return Ok(done(
             format!(
-                "would open invitation with .updrc.toml{}\n{}",
+                "would open invitation with .updrc.toml{}\n{}\n{}",
                 if source.is_some() {
                     " and remove renovate.json"
                 } else {
                     ""
                 },
-                migration.config
+                migration.config,
+                migration_report
             ),
             None,
         ));
@@ -95,8 +128,29 @@ pub(super) async fn project(
         source.is_some(),
     )
     .await?;
-    let mr = api.create(BRANCH, &project.default_branch, "chore(deps): opt in to upd dependency updates",
-        "Opt this project in to organization dependency updates. Review the migrated ignores and automation settings before merging. Close this invitation to decline; upd will not reopen it. Lockfile regeneration needs the project CI template or the organization's isolated lock jobs.\n\nNo project code ran during onboarding.").await?;
+    // Indented Markdown code keeps source-controlled setting paths inert in the MR.
+    let report = if migration.diagnostics.is_empty() {
+        migration_report
+    } else {
+        let indented = migration_report
+            .lines()
+            .map(|line| format!("    {line}\n"))
+            .collect::<String>();
+        format!(
+            "Migration report (dropped settings adopt upd behaviour and may change policy):\n\n{indented}"
+        )
+    };
+    let description = format!(
+        "Opt this project in to organization dependency updates. Review the migrated ignores and automation settings before merging. Close this invitation to decline; upd will not reopen it. Lockfile regeneration needs the project CI template or the organization's isolated lock jobs.\n\nNo project code ran during onboarding.\n\n{report}"
+    );
+    let mr = api
+        .create(
+            BRANCH,
+            &project.default_branch,
+            "chore(deps): opt in to upd dependency updates",
+            &description,
+        )
+        .await?;
     Ok(done(
         "invitation opened".into(),
         mr["web_url"].as_str().map(str::to_owned),

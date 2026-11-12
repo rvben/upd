@@ -394,23 +394,29 @@ fn build_schema() -> Value {
             },
             {
                 "name": "migrate renovate",
-                "description": "Conservatively translate Renovate JSON to .updrc.toml. Reports every unsupported rule; preserves the source and refuses existing upd policy. --dry-run previews without writing.",
+                "description": "Translate Renovate JSON to .updrc.toml with translated, dropped and blocking diagnostics. Blocking items exit 2 without writing; --allow-dropped=false also refuses reported policy losses. Preserves the source and refuses existing upd policy. --dry-run previews without writing. Migration alone does not opt a project in.",
                 "effects": "non_idempotent",
                 "mutating": true,
                 "cardinality": "single",
-                "args": [{"name": "path", "type": "path", "required": false, "default": "."}],
+                "args": [
+                    {"name": "path", "type": "path", "required": false, "default": "."},
+                    {"name": "allow-dropped", "type": "boolean", "required": false, "default": true}
+                ],
                 "output_fields": [
-                    {"name": "config", "type": "string", "description": "Translated TOML policy"},
-                    {"name": "warnings", "type": "array", "items": {"type": "string"}, "description": "Rules and settings requiring manual translation"}
+                    {"name": "config", "type": "string", "description": "Proposed TOML policy; not written when migration is refused"},
+                    {"name": "diagnostics", "type": "array", "items": {"type": "object"}, "description": "Each item has path, classification (translated, dropped or blocking), and explanation"}
                 ]
             },
             {
                 "name": "gitlab org onboard",
-                "description": "Open one opt-in invitation per group project without upd config. Migrates supported Renovate JSON and refuses untranslated policy. Closed/merged invitations stay closed; existing branches are never overwritten. --dry-run previews without external writes.",
+                "description": "Open one opt-in invitation per group project without upd config. Reports translated settings and dropped policy in the invitation; refuses blocking Renovate settings. --allow-dropped=false also refuses policy losses. Closed/merged invitations stay closed; existing branches are never overwritten. --dry-run previews without external writes.",
                 "effects": "non_idempotent",
                 "mutating": true,
                 "cardinality": "single",
-                "args": [{"name": "project", "type": "string[]", "required": false, "description": "Full project paths; repeatable"}],
+                "args": [
+                    {"name": "project", "type": "string[]", "required": false, "description": "Full project paths; repeatable"},
+                    {"name": "allow-dropped", "type": "boolean", "required": false, "default": true}
+                ],
                 "output_fields": [{"name": "projects", "type": "array", "items": {"type": "object"}, "description": "Per-project onboarding outcomes, MR links and failures"}]
             },
             {

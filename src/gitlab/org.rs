@@ -81,6 +81,8 @@ pub struct OrgSettings {
     pub preview_config: Option<PathBuf>,
     /// Open opt-in invitations rather than dependency proposals.
     pub onboard: bool,
+    /// Permit explicitly reported migration losses in invitations.
+    pub allow_dropped: bool,
     /// Trusted central TOML content, with project policy applied on top.
     pub shared_config: Option<String>,
     /// Projects the lock pipeline gave to their own prepare, lock and publish
@@ -296,6 +298,7 @@ impl OrgSettings {
             assume_opted_in: false,
             preview_config: None,
             onboard: false,
+            allow_dropped: true,
             shared_config: value("UPD_SHARED_CONFIG"),
             handed_off,
             shard,

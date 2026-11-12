@@ -388,7 +388,8 @@ impl Respond for RawFiles {
     fn respond(&self, request: &Request) -> ResponseTemplate {
         let segments: Vec<&str> = request.url.path().split('/').collect();
         let id: u64 = segments[4].parse().unwrap();
-        let name = segments[7];
+        // GitLab decodes the slash in nested repository-file paths.
+        let name = segments[7].replace("%2F", "/").replace("%2f", "/");
         let reference = request
             .url
             .query_pairs()
@@ -3803,4 +3804,306 @@ async fn shared_policy_is_sealed_into_work_and_needs_no_central_file_in_the_work
             .unwrap()
             .contains("1.1.0")
     );
+}
+
+#[tokio::test]
+async fn onboarding_common_template_reports_losses_in_preview_and_invitation() {
+    use wiremock::matchers::body_partial_json;
+    let mut org = Org::new().await;
+    org.project(
+        11,
+        "acme/new",
+        &[Entry::File(
+            "renovate.json",
+            include_str!("fixtures/renovate-common.json"),
+        )],
+    );
+    org.serve().await;
+    let migration = upd::migrate::renovate(include_str!("fixtures/renovate-common.json")).unwrap();
+    let output = org
+        .command(env!("CARGO_BIN_EXE_upd"), &[])
+        .args(["gitlab", "org", "onboard", "--dry-run", "--output", "json"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    let reason = report["projects"][0]["reason"].as_str().unwrap();
+    assert!(reason.contains("dependency_updates = true"));
+    assert!(reason.contains(&migration.report()));
+    assert!(
+        org.server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .all(|request| request.method.as_str() == "GET")
+    );
+
+    Mock::given(method("POST"))
+        .and(path("/api/v4/projects/11/repository/branches"))
+        .respond_with(ResponseTemplate::new(201).set_body_json(json!({})))
+        .expect(1)
+        .mount(&org.server)
+        .await;
+    let mut config: toml::Value = toml::from_str(&migration.config).unwrap();
+    config["automation"]
+        .as_table_mut()
+        .unwrap()
+        .insert("dependency_updates".into(), toml::Value::Boolean(true));
+    let expected_actions = json!([
+        {"action":"create","file_path":".updrc.toml","content":toml::to_string_pretty(&config).unwrap()},
+        {"action":"delete","file_path":"renovate.json"}
+    ]);
+    Mock::given(method("POST"))
+        .and(path("/api/v4/projects/11/repository/commits"))
+        .and(body_partial_json(
+            json!({"actions":expected_actions.clone()}),
+        ))
+        .respond_with(ResponseTemplate::new(201).set_body_json(json!({"id":"commit"})))
+        .expect(1)
+        .mount(&org.server)
+        .await;
+    let output = org
+        .command(env!("CARGO_BIN_EXE_upd"), &[])
+        .args(["gitlab", "org", "onboard", "--output", "json"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let requests = org.server.received_requests().await.unwrap();
+    let commit = requests
+        .iter()
+        .find(|request| {
+            request.method.as_str() == "POST"
+                && request.url.path() == "/api/v4/projects/11/repository/commits"
+        })
+        .unwrap();
+    let commit: Value = serde_json::from_slice(&commit.body).unwrap();
+    assert_eq!(commit["actions"], expected_actions);
+    let mr = requests
+        .iter()
+        .find(|r| {
+            r.method.as_str() == "POST" && r.url.path() == "/api/v4/projects/11/merge_requests"
+        })
+        .unwrap();
+    let body: Value = serde_json::from_slice(&mr.body).unwrap();
+    let description = body["description"].as_str().unwrap();
+    for line in migration.report().lines() {
+        assert!(
+            description.contains(&format!("    {line}\n")),
+            "{description}"
+        );
+    }
+    assert!(org.updater_args("acme/new").is_none());
+}
+
+#[tokio::test]
+async fn onboarding_refusals_never_mutate_gitlab() {
+    for (source, strict) in [
+        (
+            r#"{"packageRules":[{"matchPackagePatterns":["^@scope/"],"enabled":false}]}"#,
+            false,
+        ),
+        (
+            r#"{"lockFileMaintenance":{"enabled":true,"schedule":["weekends"]}}"#,
+            false,
+        ),
+        (
+            r#"{"automerge":true,"lockFileMaintenance":{"enabled":true,"automerge":false}}"#,
+            false,
+        ),
+        (r#"{"extends":["local>acme/custom"]}"#, false),
+        (include_str!("fixtures/renovate-common.json"), true),
+    ] {
+        let mut org = Org::new().await;
+        org.project(11, "acme/refused", &[Entry::File("renovate.json", source)]);
+        org.serve().await;
+        let mut command = org.command(env!("CARGO_BIN_EXE_upd"), &[]);
+        command.args(["gitlab", "org", "onboard", "--output", "json"]);
+        if strict {
+            command.arg("--allow-dropped=false");
+        }
+        let output = command.output().unwrap();
+        assert_eq!(
+            output.status.code(),
+            Some(2),
+            "{source}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert!(
+            report
+                .to_string()
+                .contains(if strict { "dropped:" } else { "blocking:" })
+        );
+        assert!(
+            org.server
+                .received_requests()
+                .await
+                .unwrap()
+                .iter()
+                .all(|r| r.method.as_str() == "GET")
+        );
+        assert!(org.updater_args("acme/refused").is_none());
+    }
+}
+
+#[tokio::test]
+async fn onboarding_refuses_alternative_files_and_embedded_policy_without_writes() {
+    for (name, source) in [
+        ("renovate.jsonc", "{}"),
+        ("renovate.json5", "{}"),
+        (".renovaterc", "{}"),
+        (".renovaterc.json", "{}"),
+        (".renovaterc.jsonc", "{}"),
+        (".renovaterc.json5", "{}"),
+        (".github/renovate.json", "{}"),
+        (".github/renovate.jsonc", "{}"),
+        (".github/renovate.json5", "{}"),
+        (".gitlab/renovate.json", "{}"),
+        (".gitlab/renovate.jsonc", "{}"),
+        (".gitlab/renovate.json5", "{}"),
+        ("package.json", r#"{"renovate":{"automerge":false}}"#),
+        ("package.json", "{invalid"),
+    ] {
+        let mut org = Org::new().await;
+        org.project(11, "acme/manual", &[Entry::File(name, source)]);
+        org.serve().await;
+        let output = org
+            .command(env!("CARGO_BIN_EXE_upd"), &[])
+            .args(["gitlab", "org", "onboard", "--output", "json"])
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(2), "{name}");
+        let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert!(report.to_string().contains(name), "{report}");
+        assert!(
+            org.server
+                .received_requests()
+                .await
+                .unwrap()
+                .iter()
+                .all(|r| r.method.as_str() == "GET")
+        );
+    }
+}
+
+#[tokio::test]
+async fn onboarding_empty_migrations_report_explicitly_without_granting_auto_merge() {
+    use wiremock::matchers::body_partial_json;
+    for (entries, explanation, remove_source) in [
+        (
+            vec![Entry::File("package.json", r#"{"name":"example"}"#)],
+            "No Renovate configuration was found; nothing was migrated.",
+            false,
+        ),
+        (
+            vec![Entry::File("renovate.json", "{}")],
+            "Renovate configuration contains no settings; nothing was migrated.",
+            true,
+        ),
+    ] {
+        let mut org = Org::new().await;
+        org.project(11, "acme/new", &entries);
+        org.serve().await;
+        let output = org
+            .command(env!("CARGO_BIN_EXE_upd"), &[])
+            .args([
+                "gitlab",
+                "org",
+                "onboard",
+                "--allow-dropped=false",
+                "--dry-run",
+                "--output",
+                "json",
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let preview: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert!(
+            preview["projects"][0]["reason"]
+                .as_str()
+                .unwrap()
+                .contains(explanation)
+        );
+        assert!(
+            org.server
+                .received_requests()
+                .await
+                .unwrap()
+                .iter()
+                .all(|request| request.method.as_str() == "GET")
+        );
+
+        Mock::given(method("POST"))
+            .and(path("/api/v4/projects/11/repository/branches"))
+            .respond_with(ResponseTemplate::new(201).set_body_json(json!({})))
+            .expect(1)
+            .mount(&org.server)
+            .await;
+        let mut actions = vec![
+            json!({"action":"create","file_path":".updrc.toml","content":"ignore = []\n\n[automation]\ndependency_updates = true\n"}),
+        ];
+        if remove_source {
+            actions.push(json!({"action":"delete","file_path":"renovate.json"}));
+        }
+        Mock::given(method("POST"))
+            .and(path("/api/v4/projects/11/repository/commits"))
+            .and(body_partial_json(json!({"actions":actions.clone()})))
+            .respond_with(ResponseTemplate::new(201).set_body_json(json!({"id":"commit"})))
+            .expect(1)
+            .mount(&org.server)
+            .await;
+        let output = org
+            .command(env!("CARGO_BIN_EXE_upd"), &[])
+            .args([
+                "gitlab",
+                "org",
+                "onboard",
+                "--allow-dropped=false",
+                "--output",
+                "json",
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let requests = org.server.received_requests().await.unwrap();
+        let commit = requests
+            .iter()
+            .find(|request| {
+                request.method.as_str() == "POST"
+                    && request.url.path() == "/api/v4/projects/11/repository/commits"
+            })
+            .unwrap();
+        let commit: Value = serde_json::from_slice(&commit.body).unwrap();
+        assert_eq!(commit["actions"], json!(actions));
+        let mr = requests
+            .iter()
+            .find(|request| {
+                request.method.as_str() == "POST"
+                    && request.url.path() == "/api/v4/projects/11/merge_requests"
+            })
+            .unwrap();
+        let body: Value = serde_json::from_slice(&mr.body).unwrap();
+        let description = body["description"].as_str().unwrap();
+        assert!(description.contains(explanation), "{description}");
+        assert!(!description.contains("Migration report"), "{description}");
+        assert!(org.updater_args("acme/new").is_none());
+    }
 }

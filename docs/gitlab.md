@@ -828,15 +828,55 @@ upd migrate renovate /path/to/project --dry-run --output text
 upd migrate renovate /path/to/project
 ```
 
-This writes `.updrc.toml` beside `renovate.json`, refuses existing upd configs,
-and leaves Renovate's file in place for review. Unconditional
-`packageRules` with `enabled: false` and exact `matchPackageNames` become
-`ignore`; top-level boolean `automerge` becomes `[automation] auto_merge`,
-`gitLabIgnoreApprovals` becomes `[automation] ignore_approvals`, and
-`lockFileMaintenance.enabled` becomes `[automation] lock`. Patterns,
-conditional rules, inherited presets, JSON5 and other settings require manual
-review. Every unsupported rule or setting is reported. Migration alone does
-not opt a repository in.
+Migration prints proposed TOML followed by comment lines classifying each setting
+as `translated`, `dropped` or `blocking`. JSON output has `config` and
+`diagnostics`; each diagnostic contains `path`, `classification` and
+`explanation`. A successful migration writes `.updrc.toml` beside
+`renovate.json` (at the repository root for an explicit
+`.github/renovate.json` or `.gitlab/renovate.json` path), refuses existing upd
+configs, and leaves Renovate's file in place. Blocking settings exit 2 without writing a config, including during
+`--dry-run`. Migration alone does not opt a repository in.
+
+Unconditional `packageRules` with `enabled: false` and exact
+`matchPackageNames` become `ignore`. Legacy `matchPackagePatterns` containing
+only plain names (`A-Z`, `a-z`, digits, `.`, `_`, `-`, starting and ending
+with a letter or digit) also become named ignores, with a **dropped**
+diagnostic: regex substring and wildcard semantics are lost. For example, `numpy` no longer ignores `numpy-financial`, and a `.`
+becomes a literal name character instead of a regex wildcard. upd normalizes
+case and runs of `.`, `_` and `-` in ignore comparisons. Other regexes remain
+blocking, and additional selectors or unsupported actions block the entire
+rule without adding any of its ignores.
+
+Top-level boolean `automerge` becomes `[automation] auto_merge`,
+`gitLabIgnoreApprovals` becomes `[automation] ignore_approvals`, and boolean
+`lockFileMaintenance.enabled` becomes `[automation] lock`. Organization
+settings must also permit these actions. Lock regeneration requires project
+CI or isolated organization lock jobs; Renovate's maintenance schedule is not
+preserved. Nested lock-maintenance `automerge` is dropped only when it agrees
+with the global value (false when absent); conflicting merge permissions and
+other nested keys remain blocking.
+
+The standard `config:base`, `config:recommended` and `config:best-practices`
+presets are dropped with explicit policy-loss notes, rather than expanded or
+claimed to be equivalent to upd defaults. Custom presets remain blocking.
+Schema metadata, `automergeType: "pr"`, boolean `platformAutomerge` and
+`separateMinorPatch`, and recognized `rebaseWhen` values are dropped with an
+explanation of upd's behaviour. Other automerge modes remain blocking. Rules
+containing only `matchUpdateTypes` / `matchCurrentVersion` selectors and
+`rebaseWhen` or redundant `automerge` actions can also be dropped; conflicting
+automerge remains blocking. Schedules, grouping, registry overrides, version
+constraints, JSON5 and unknown settings still require manual translation.
+
+Use `--allow-dropped=false` on either migration or onboarding to require every
+setting to translate. Strict mode also refuses metadata and redundant settings
+classified as dropped, including the loss of standalone scheduled lock
+maintenance when `lockFileMaintenance.enabled` is true. It exits 2 and does
+not write policy or open invitations for refused projects:
+
+```sh
+upd migrate renovate /path/to/project --allow-dropped=false --dry-run
+upd gitlab org onboard --project my-org/example --allow-dropped=false --dry-run
+```
 
 With the organization environment configured, preview onboarding first:
 
@@ -847,11 +887,15 @@ upd gitlab org onboard --project my-org/example
 
 Omit `--project` to consider the whole group. Onboarding opens
 `automation/upd-onboarding` with an opt-in config, removing `renovate.json`
-only when all its settings translated. Existing upd configs are left for
-manual review. Any unsupported Renovate rule blocks that project's invitation
-and appears in its report. Merge the invitation to opt in, or close it to
-decline: closed and merged invitations are never reopened. The check includes
-all MR states and pages. Project code never runs during onboarding.
+only when the migration has no blocking settings (and no dropped settings in
+strict mode). The same migration report appears in the dry-run preview and MR
+description so reviewers can assess every reported policy loss. Existing upd
+configs are left for manual review. Alternative Renovate config files and
+embedded `package.json` Renovate settings require manual migration. Any
+blocking Renovate rule prevents that project's invitation and appears in its
+report. Merge the invitation to opt in, or close it to decline: closed and merged invitations are never reopened. The
+check includes all MR states and pages. Project code never runs during
+onboarding.
 
 Onboarding reads one default-branch commit and creates a new branch from that
 exact commit. It refuses an existing onboarding branch. If an API failure
