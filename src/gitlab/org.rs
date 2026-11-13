@@ -500,6 +500,17 @@ impl ProjectReport {
                     "message": error.message(),
                     "exit_code": error.exit_code(),
                 });
+                if let Error::MigrationRefused { diagnostics, .. } = error {
+                    value["error"]["diagnostics"] = json!(diagnostics);
+                    value["error"]["blocking"] = json!(
+                        diagnostics
+                            .iter()
+                            .filter(|item| item.classification
+                                == crate::migrate::Classification::Blocking)
+                            .map(|item| &item.path)
+                            .collect::<Vec<_>>()
+                    );
+                }
             }
         }
         value
@@ -636,7 +647,14 @@ impl Report {
             .projects
             .iter()
             .filter(|project| !matches!(project.state, State::Skipped(_)))
-            .map(|project| project.render_text(&self.branch, self.major_branch()))
+            .map(|project| {
+                let rendered = project.render_text(&self.branch, self.major_branch());
+                if self.onboard {
+                    rendered.lines().next().unwrap_or_default().to_owned()
+                } else {
+                    rendered
+                }
+            })
             .collect();
         lines.push(self.summary());
         lines.join("\n")
@@ -726,6 +744,13 @@ pub async fn run(settings: &OrgSettings) -> Result<Report, Error> {
         async move {
             let log = Log::buffered();
             let report = handle(settings, api, raw, &log).await;
+            if let State::Failed(Error::MigrationRefused { diagnostics, .. }) = &report.state {
+                let migration = crate::migrate::Migration {
+                    config: String::new(),
+                    diagnostics: diagnostics.clone(),
+                };
+                log.line(migration.report());
+            }
             let buffered = log.take();
             if !buffered.is_empty() || !matches!(report.state, State::Skipped(_)) {
                 eprint!(
@@ -788,7 +813,7 @@ async fn handle(settings: &OrgSettings, api: &Client, raw: Value, log: &Log) -> 
         return report(Handled::stopped(State::Skipped("handed_off")));
     }
     let result = if settings.onboard {
-        super::onboard::project(settings, api, &project)
+        super::onboard::project(settings, api, &project, log)
             .await
             .map(Handled::stopped)
     } else {
@@ -1128,11 +1153,11 @@ pub(super) async fn open_project<'a>(
             let lockfiles = if tracks_lockfile(&session.git, &session.default_ref).await? {
                 Some(if !settings.lock {
                     Lockfiles::Kept(format!(
-                        "the organization run does not regenerate lockfiles; turn its lock input on and set lock = true in {config}, or run {SINGLE_PROJECT_TEMPLATE} with lock: true in this project"
+                        "the organization run does not regenerate lockfiles; turn its lock input on and set lock = true in {config}, or configure ci/gitlab-project-lock.yml in this project (the standalone alternative is {SINGLE_PROJECT_TEMPLATE} with lock: true)"
                     ))
                 } else if !lock {
                     Lockfiles::Kept(format!(
-                        "{config} does not set lock = true in [automation]; set it, or run {SINGLE_PROJECT_TEMPLATE} with lock: true in this project"
+                        "{config} does not set lock = true in [automation]; set it, or configure ci/gitlab-project-lock.yml in this project (the standalone alternative is {SINGLE_PROJECT_TEMPLATE} with lock: true)"
                     ))
                 } else {
                     Lockfiles::Regenerated

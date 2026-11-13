@@ -34,6 +34,9 @@ spec:
     exclude:
       description: Whitespace-separated globs of project paths to leave alone
       default: ""
+    shared_config:
+      description: TOML policy file relative to the central checkout; cannot be combined with UPD_SHARED_CONFIG
+      default: ""
     langs:
       description: Comma-separated ecosystem filter applied to every project
       default: ""
@@ -130,6 +133,7 @@ spec:
     UPD_TARGET: "$[[ inputs.upd_target ]]"
     UPD_GROUP: "$[[ inputs.group ]]"
     UPD_EXCLUDE: "$[[ inputs.exclude ]]"
+    UPD_SHARED_CONFIG_FILE: "$[[ inputs.shared_config ]]"
     UPD_LANGS: "$[[ inputs.langs ]]"
     UPD_MIN_AGE: "$[[ inputs.min_age ]]"
     UPD_MAX_BUMP: "$[[ inputs.max_bump ]]"
@@ -161,7 +165,7 @@ spec:
   before_script:
     - |
       missing=""
-      for tool in bash curl cut git grep mktemp sha256sum tar tr uname; do
+      for tool in bash cat curl cut git grep mktemp realpath sha256sum tar tr uname; do
         command -v "$tool" >/dev/null 2>&1 || missing="$missing $tool"
       done
       if [ -n "$missing" ]; then
@@ -180,6 +184,38 @@ spec:
     - |
       bash <<'UPD_JOB'
       set -euo pipefail
+
+      if [ -n "${UPD_SHARED_CONFIG_FILE:-}" ]; then
+        if [ -n "${UPD_SHARED_CONFIG:-}" ]; then
+          echo "Set either shared_config or UPD_SHARED_CONFIG, not both" >&2
+          exit 4
+        fi
+        case "$UPD_SHARED_CONFIG_FILE" in
+          /*) echo "shared_config must be relative to the central checkout" >&2; exit 4 ;;
+        esac
+        if ! policy_root="$(realpath "${CI_PROJECT_DIR:-$PWD}")"; then
+          echo "Cannot resolve the central checkout for shared_config" >&2
+          exit 4
+        fi
+        if [ ! -f "$policy_root/$UPD_SHARED_CONFIG_FILE" ] || [ ! -r "$policy_root/$UPD_SHARED_CONFIG_FILE" ]; then
+          echo "shared_config must be a readable regular file" >&2
+          exit 4
+        fi
+        if ! policy_file="$(realpath "$policy_root/$UPD_SHARED_CONFIG_FILE")"; then
+          echo "Cannot resolve shared_config file" >&2
+          exit 4
+        fi
+        case "$policy_file" in
+          "$policy_root"/*) ;;
+          *) echo "shared_config must stay within the central checkout" >&2; exit 4 ;;
+        esac
+        if [ ! -f "$policy_file" ] || [ ! -r "$policy_file" ]; then
+          echo "shared_config must be a readable regular file" >&2
+          exit 4
+        fi
+        UPD_SHARED_CONFIG="$(cat -- "$policy_file")"
+        export UPD_SHARED_CONFIG
+      fi
 
       work_dir="$(mktemp -d)"
       trap 'rm -rf "$work_dir"' EXIT

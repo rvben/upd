@@ -26,6 +26,11 @@ pub enum Error {
     Input(String),
     /// The run found a state it must not act on, and left it untouched.
     Refused(String),
+    /// Migration refusal with a concise outcome and separately rendered diagnostics.
+    MigrationRefused {
+        message: String,
+        diagnostics: Vec<crate::migrate::Diagnostic>,
+    },
     /// GitLab rejected a request.
     Api(String),
     /// GitLab or the network could not answer; a later run may succeed.
@@ -40,7 +45,7 @@ impl Error {
     pub fn kind(&self) -> &'static str {
         match self {
             Self::Input(_) => "parse_error",
-            Self::Refused(_) => "refused",
+            Self::Refused(_) | Self::MigrationRefused { .. } => "refused",
             Self::Api(_) => "api_error",
             Self::Network(_) => "network_error",
             Self::Io(_) => "io_error",
@@ -53,7 +58,7 @@ impl Error {
             Self::Input(_) => 4,
             Self::Network(_) => 3,
             Self::Conflict(_) => 5,
-            Self::Refused(_) | Self::Api(_) | Self::Io(_) => 2,
+            Self::Refused(_) | Self::MigrationRefused { .. } | Self::Api(_) | Self::Io(_) => 2,
         }
     }
 
@@ -64,7 +69,8 @@ impl Error {
             | Self::Api(message)
             | Self::Network(message)
             | Self::Io(message)
-            | Self::Conflict(message) => message,
+            | Self::Conflict(message)
+            | Self::MigrationRefused { message, .. } => message,
         }
     }
 }

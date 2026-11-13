@@ -553,6 +553,42 @@ impl Client {
         Ok(answer)
     }
 
+    /// Regular file paths at one immutable repository commit, including nested files.
+    pub async fn repository_files(
+        &self,
+        project: u64,
+        reference: &str,
+    ) -> Result<Vec<String>, Error> {
+        let mut url = self.url(&format!(
+            "{}/projects/{project}/repository/tree",
+            self.api_url
+        ))?;
+        url.query_pairs_mut()
+            .append_pair("ref", reference)
+            .append_pair("recursive", "true");
+        let mut files = Vec::new();
+        for entry in self.every_page(url, "repository tree entries").await? {
+            if entry["type"] == "blob"
+                && matches!(entry["mode"].as_str(), Some("100644" | "100755"))
+            {
+                let path = entry["path"]
+                    .as_str()
+                    .filter(|p| {
+                        !p.is_empty()
+                            && !p.starts_with('/')
+                            && p.split('/').all(|part| !matches!(part, "" | "." | ".."))
+                    })
+                    .ok_or_else(|| {
+                        Error::Refused("GitLab returned an invalid repository file path".into())
+                    })?;
+                files.push(path.to_owned());
+            }
+        }
+        files.sort();
+        files.dedup();
+        Ok(files)
+    }
+
     /// The content of `path` at `reference` in `project_id`, or `None` when
     /// the file does not exist there.
     pub async fn raw_file(
@@ -1535,6 +1571,73 @@ mod tests {
             .map(|job| job["id"].as_u64().unwrap())
             .collect();
         assert_eq!(ids, [1, 2, 3, 4]);
+    }
+
+    #[tokio::test]
+    async fn repository_files_follow_pages_at_the_same_commit_and_exclude_links() {
+        let server = MockServer::start().await;
+        for (page, entries, next) in [
+            (
+                "1",
+                json!([
+                    {"path":"uv.lock","type":"blob","mode":"100644"},
+                    {"path":"pyproject.toml","type":"blob","mode":"120000"},
+                    {"path":"nested","type":"tree","mode":"040000"}
+                ]),
+                "2",
+            ),
+            (
+                "2",
+                json!([
+                    {"path":"nested/Cargo.toml","type":"blob","mode":"100755"},
+                    {"path":"nested/Cargo.lock","type":"blob","mode":"100644"}
+                ]),
+                "",
+            ),
+        ] {
+            Mock::given(method("GET"))
+                .and(path("/api/v4/projects/7/repository/tree"))
+                .and(query_param("page", page))
+                .and(query_param("ref", "pinned-sha"))
+                .and(query_param("recursive", "true"))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .set_body_json(entries)
+                        .insert_header("X-Next-Page", next),
+                )
+                .expect(1)
+                .mount(&server)
+                .await;
+        }
+        let client = Client::new(&format!("{}/api/v4", server.uri()), "group-token")
+            .unwrap()
+            .with_retry(FAST);
+        assert_eq!(
+            client.repository_files(7, "pinned-sha").await.unwrap(),
+            ["nested/Cargo.lock", "nested/Cargo.toml", "uv.lock"]
+        );
+    }
+
+    #[tokio::test]
+    async fn repository_file_inspection_does_not_treat_errors_as_absence() {
+        for (status, body) in [
+            (403, json!({"message":"denied"})),
+            (
+                200,
+                json!([{"path":"../uv.lock","type":"blob","mode":"100644"}]),
+            ),
+        ] {
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path("/api/v4/projects/7/repository/tree"))
+                .respond_with(ResponseTemplate::new(status).set_body_json(body))
+                .mount(&server)
+                .await;
+            let client = Client::new(&format!("{}/api/v4", server.uri()), "group-token")
+                .unwrap()
+                .with_retry(FAST);
+            assert!(client.repository_files(7, "pinned-sha").await.is_err());
+        }
     }
 
     #[tokio::test]

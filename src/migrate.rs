@@ -11,9 +11,10 @@ pub enum Classification {
     Translated,
     Dropped,
     Blocking,
+    Added,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct Diagnostic {
     pub path: String,
     pub classification: Classification,
@@ -31,7 +32,7 @@ impl Migration {
         self.diagnostics
             .iter()
             .all(|item| match item.classification {
-                Classification::Translated => true,
+                Classification::Translated | Classification::Added => true,
                 Classification::Dropped => allow_dropped,
                 Classification::Blocking => false,
             })
@@ -39,13 +40,21 @@ impl Migration {
 
     /// Plain text, also embedded as indented code in onboarding invitations.
     pub fn report(&self) -> String {
-        self.diagnostics
-            .iter()
+        let mut diagnostics: Vec<_> = self.diagnostics.iter().collect();
+        diagnostics.sort_by_key(|item| match item.classification {
+            Classification::Blocking => 0,
+            Classification::Dropped => 1,
+            Classification::Translated => 2,
+            Classification::Added => 3,
+        });
+        diagnostics
+            .into_iter()
             .map(|item| {
                 let kind = match item.classification {
                     Classification::Translated => "translated",
                     Classification::Dropped => "dropped",
                     Classification::Blocking => "blocking",
+                    Classification::Added => "added",
                 };
                 format!(
                     "{kind}: {}: {}\n",
@@ -182,16 +191,22 @@ pub fn renovate(content: &str) -> Result<Migration> {
                     let path = format!("{key}.{field}");
                     match field.as_str() {
                         "enabled" if value.is_boolean() => {
-                            automation.insert(
-                                "lock".into(),
-                                toml::Value::Boolean(value.as_bool().unwrap()),
-                            );
-                            note(
-                                &mut diagnostics,
-                                &path,
-                                Translated,
-                                "automation.lock controls lock regeneration; requires project CI or isolated organization lock jobs",
-                            );
+                            if value.as_bool() == Some(true) {
+                                automation.insert("lock".into(), toml::Value::Boolean(true));
+                                note(
+                                    &mut diagnostics,
+                                    &path,
+                                    Translated,
+                                    "automation.lock controls lock regeneration; requires project CI or isolated organization lock jobs",
+                                );
+                            } else {
+                                note(
+                                    &mut diagnostics,
+                                    &path,
+                                    Dropped,
+                                    "disables Renovate's standalone maintenance, not lock updates alongside manifest changes; does not disable upd lock regeneration",
+                                );
+                            }
                             if value.as_bool() == Some(true) {
                                 note(
                                     &mut diagnostics,
@@ -213,6 +228,45 @@ pub fn renovate(content: &str) -> Result<Migration> {
                             Blocking,
                             "unsupported lock-maintenance setting or conflicting merge permission needs manual translation",
                         ),
+                    }
+                }
+            }
+            "pep621" if value.is_object() => {
+                if value.as_object().unwrap().is_empty() {
+                    note(
+                        &mut diagnostics,
+                        key,
+                        Dropped,
+                        "empty manager settings have no effect",
+                    );
+                }
+                for (field, value) in value.as_object().unwrap() {
+                    let path = format!("pep621.{field}");
+                    if field == "fileMatch"
+                        && value.as_array().is_some_and(|patterns| {
+                            !patterns.is_empty()
+                                && patterns.iter().all(|pattern| {
+                                    pattern.as_str() == Some(r"(^|/)pyproject\.toml$")
+                                })
+                        })
+                    {
+                        note(
+                            &mut diagnostics,
+                            &path,
+                            Dropped,
+                            "default pyproject.toml discovery is already supported; upd's language filters, ignores and excludes still apply",
+                        );
+                    } else {
+                        note(
+                            &mut diagnostics,
+                            &path,
+                            Blocking,
+                            if field == "fileMatch" {
+                                "custom fileMatch needs manual review; upd discovers pyproject.toml files, subject to language filters, ignores and excludes; custom regex coverage is not inferred"
+                            } else {
+                                "unsupported pep621 setting needs manual translation"
+                            },
+                        );
                     }
                 }
             }
@@ -548,7 +602,7 @@ mod tests {
             let (config, _) =
                 crate::config::UpdConfig::parse_for_automation(&migration.config, "migration")
                     .unwrap();
-            assert_eq!(config.automation.lock, Some(enabled));
+            assert_eq!(config.automation.lock, enabled.then_some(true));
             assert!(!config.auto_merge_enabled());
         }
     }
@@ -662,6 +716,45 @@ mod tests {
                 .contains("standalone scheduled maintenance is not preserved")
         );
     }
+    #[test]
+    fn disabled_standalone_maintenance_does_not_disable_dependency_lock_updates() {
+        let migration = renovate(r#"{"lockFileMaintenance":{"enabled":false}}"#).unwrap();
+        assert!(migration.allowed(true));
+        assert!(!migration.allowed(false));
+        assert!(!migration.config.contains("lock = false"));
+        assert!(
+            migration
+                .report()
+                .contains("dropped: lockFileMaintenance.enabled:")
+        );
+    }
+
+    #[test]
+    fn pep621_only_drops_exact_default_patterns_and_reports_custom_paths() {
+        let source = json!({"pep621":{"fileMatch":[r"(^|/)pyproject\.toml$"]}});
+        let migration = renovate(&source.to_string()).unwrap();
+        assert!(migration.allowed(true));
+        assert!(!migration.allowed(false));
+        assert!(migration.report().contains("dropped: pep621.fileMatch:"));
+        for value in [
+            json!([]),
+            json!(["custom.toml"]),
+            json!([r"(^|/)pyproject\.toml$", "nested/pyproject.toml"]),
+            json!("anything"),
+            json!([null]),
+        ] {
+            let migration = renovate(&json!({"pep621":{"fileMatch":value}}).to_string()).unwrap();
+            assert!(!migration.allowed(true));
+            assert!(migration.report().contains("blocking: pep621.fileMatch:"));
+        }
+        let migration = renovate(
+            &json!({"pep621":{"fileMatch":[r"(^|/)pyproject\.toml$"],"enabled":false}}).to_string(),
+        )
+        .unwrap();
+        assert!(!migration.allowed(true));
+        assert!(migration.report().starts_with("blocking: pep621.enabled:"));
+    }
+
     #[test]
     fn setting_paths_cannot_inject_report_lines() {
         let migration = renovate(&json!({"unknown\ntranslated: fake":true}).to_string()).unwrap();

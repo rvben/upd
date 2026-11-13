@@ -202,6 +202,11 @@ impl Org {
             .mount(&self.server)
             .await;
         Mock::given(method("GET"))
+            .and(path_regex(r"^/api/v4/projects/\d+/repository/tree$"))
+            .respond_with(RepositoryTree(Arc::new(self.remotes.clone())))
+            .mount(&self.server)
+            .await;
+        Mock::given(method("GET"))
             .and(path_regex(r"^/api/v4/projects/\d+/merge_requests/\d+$"))
             .respond_with(MergeRequestHeads(Arc::new(self.remotes.clone())))
             .mount(&self.server)
@@ -409,6 +414,50 @@ impl Respond for RawFiles {
         } else {
             ResponseTemplate::new(404)
         }
+    }
+}
+
+/// Tree API backed by the exact requested commit, including Unix file modes.
+struct RepositoryTree(Arc<HashMap<u64, PathBuf>>);
+impl Respond for RepositoryTree {
+    fn respond(&self, request: &Request) -> ResponseTemplate {
+        let id: u64 = request
+            .url
+            .path()
+            .split('/')
+            .nth(4)
+            .unwrap()
+            .parse()
+            .unwrap();
+        let reference = request
+            .url
+            .query_pairs()
+            .find(|(key, _)| key == "ref")
+            .unwrap()
+            .1
+            .into_owned();
+        assert_eq!(
+            reference.len(),
+            40,
+            "tree inspection must use the pinned commit"
+        );
+        let output = isolated::command("git")
+            .arg(format!("--git-dir={}", self.0[&id].display()))
+            .args(["ls-tree", "-r", "-z", &reference])
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        let entries: Vec<Value> = String::from_utf8(output.stdout)
+            .unwrap()
+            .split('\0')
+            .filter(|line| !line.is_empty())
+            .map(|line| {
+                let (metadata, path) = line.split_once('\t').unwrap();
+                let mut fields = metadata.split_whitespace();
+                json!({"mode":fields.next().unwrap(), "type":fields.next().unwrap(), "path":path})
+            })
+            .collect();
+        ResponseTemplate::new(200).set_body_json(entries)
     }
 }
 
@@ -2598,7 +2647,7 @@ async fn a_project_whose_lockfiles_stay_stale_is_told_why_and_how_to_fix_it() {
         );
         assert!(
             reason.ends_with(
-                "or run ci/gitlab-dependency-update.yml with lock: true in this project"
+                "or configure ci/gitlab-project-lock.yml in this project (the standalone alternative is ci/gitlab-dependency-update.yml with lock: true)"
             ),
             "{reason}"
         );
@@ -2657,7 +2706,7 @@ async fn a_lock_run_leaves_handed_off_and_newly_consenting_projects_to_lock_jobs
     assert_eq!(unlocked["state"], "processed", "{report:#}");
     assert_eq!(
         unlocked["lockfiles"],
-        json!({"regenerated": false, "reason": ".updrc.toml does not set lock = true in [automation]; set it, or run ci/gitlab-dependency-update.yml with lock: true in this project"}),
+        json!({"regenerated": false, "reason": ".updrc.toml does not set lock = true in [automation]; set it, or configure ci/gitlab-project-lock.yml in this project (the standalone alternative is ci/gitlab-dependency-update.yml with lock: true)"}),
         "{report:#}"
     );
     assert_eq!(org.branch_file(76).as_deref(), Some("new\n"));
@@ -2912,6 +2961,11 @@ fn run_lock_pipeline(
 ) -> (Value, Value, HashMap<String, ChildJob>) {
     let parent = org.temp.path().join("parent");
     fs::create_dir(&parent).unwrap();
+    if let Some((_, policy)) = inputs.iter().find(|(name, _)| *name == "shared_config") {
+        let destination = parent.join(policy);
+        fs::create_dir_all(destination.parent().unwrap()).unwrap();
+        fs::copy(org.temp.path().join(policy), destination).unwrap();
+    }
     let mut command = org.command("bash", &[]);
     for name in [
         "UPD_GROUP",
@@ -3105,12 +3159,19 @@ async fn the_template_regenerates_lockfiles_in_a_child_pipeline_without_the_toke
     uv_project(&mut org, 81, "acme/python", LOCK_OPTED_IN, "uv");
     uv_project(&mut org, 82, "acme/unlocked", OPTED_IN, "uv");
     org.serve().await;
+    fs::create_dir(org.temp.path().join("policy")).unwrap();
+    fs::write(
+        org.temp.path().join("policy/upd.toml"),
+        "ignore = ['numpy']\n",
+    )
+    .unwrap();
 
     let (plan, pipeline, jobs) = run_lock_pipeline(
         &org,
         &toolbox,
         &[
             ("group", "acme"),
+            ("shared_config", "policy/upd.toml"),
             ("lock", "true"),
             ("lock_runner_tags", "upd-lock"),
         ],
@@ -3151,6 +3212,31 @@ async fn the_template_regenerates_lockfiles_in_a_child_pipeline_without_the_toke
     assert!(
         settings.contains("export UPD_MAX_BUMP='minor'\n"),
         "{settings}"
+    );
+
+    assert!(settings.contains("export UPD_SHARED_CONFIG="), "{settings}");
+    let work_path = org
+        .temp
+        .path()
+        .join("child/prepare-81")
+        .join(
+            pipeline["prepare-81"]["artifacts"]["paths"][0]
+                .as_str()
+                .unwrap(),
+        )
+        .join("work.json");
+    let work: Value = serde_json::from_slice(&fs::read(work_path).unwrap()).unwrap();
+    assert!(
+        work["plan"]["config_content"]
+            .as_str()
+            .unwrap()
+            .contains("numpy")
+    );
+    assert!(
+        !org.temp
+            .path()
+            .join("child/lock-81/policy/upd.toml")
+            .exists()
     );
 
     let lock: Value = serde_json::from_str(&jobs["lock-81"].stdout).unwrap();
@@ -3921,6 +4007,7 @@ async fn onboarding_refusals_never_mutate_gitlab() {
         ),
         (r#"{"extends":["local>acme/custom"]}"#, false),
         (include_str!("fixtures/renovate-common.json"), true),
+        (r#"{"lockFileMaintenance":{"enabled":false}}"#, true),
     ] {
         let mut org = Org::new().await;
         org.project(11, "acme/refused", &[Entry::File("renovate.json", source)]);
@@ -4106,4 +4193,287 @@ async fn onboarding_empty_migrations_report_explicitly_without_granting_auto_mer
         assert!(!description.contains("Migration report"), "{description}");
         assert!(org.updater_args("acme/new").is_none());
     }
+}
+
+#[tokio::test]
+async fn onboarding_proposes_lock_consent_and_keeps_empty_package_warnings_in_the_invitation() {
+    for central_lock in ["false", "true"] {
+        let mut org = Org::new().await;
+        org.project(
+            11,
+            "acme/locked",
+            &[
+                Entry::File("package.json", "\u{feff} \n\t"),
+                Entry::File("pyproject.toml", "[project]\nname = 'example'\n"),
+                Entry::File("uv.lock", "version = 1"),
+                Entry::File("nested/Cargo.toml", "[workspace]"),
+                Entry::File("nested/Cargo.lock", "version = 3"),
+                Entry::File(
+                    "renovate.json",
+                    r#"{"lockFileMaintenance":{"enabled":false}}"#,
+                ),
+            ],
+        );
+        org.serve().await;
+        let args = ["gitlab", "org", "onboard", "--output", "json"];
+        let preview = org
+            .command(env!("CARGO_BIN_EXE_upd"), &[("UPD_LOCK", central_lock)])
+            .args(args)
+            .arg("--dry-run")
+            .output()
+            .unwrap();
+        assert!(
+            preview.status.success(),
+            "{}",
+            String::from_utf8_lossy(&preview.stderr)
+        );
+        let report: Value = serde_json::from_slice(&preview.stdout).unwrap();
+        let reason = report["projects"][0]["reason"].as_str().unwrap();
+        assert!(reason.contains("lock = true"));
+        assert!(reason.contains(
+            "added: automation.lock: proposed lock regeneration for nested/Cargo.lock, uv.lock"
+        ));
+        assert!(reason.contains("warning: package.json is empty"));
+        assert!(reason.contains("consents to running project code"));
+        assert!(!reason.contains("auto_merge = true"));
+        assert!(!reason.contains("ignore_approvals = true"));
+        assert!(
+            org.server
+                .received_requests()
+                .await
+                .unwrap()
+                .iter()
+                .all(|r| r.method.as_str() == "GET")
+        );
+
+        let text_preview = org
+            .command(env!("CARGO_BIN_EXE_upd"), &[("UPD_LOCK", central_lock)])
+            .args(["gitlab", "org", "onboard", "--dry-run", "--output", "text"])
+            .output()
+            .unwrap();
+        assert!(text_preview.status.success());
+        let log = String::from_utf8_lossy(&text_preview.stderr);
+        assert!(log.contains("added: automation.lock:"), "{log}");
+        assert!(log.contains("consents to running project code"), "{log}");
+        assert!(log.contains("lock = true"), "{log}");
+        assert_eq!(
+            String::from_utf8_lossy(&text_preview.stdout)
+                .lines()
+                .count(),
+            2
+        );
+
+        for endpoint in ["branches", "commits"] {
+            Mock::given(method("POST"))
+                .and(path(format!("/api/v4/projects/11/repository/{endpoint}")))
+                .respond_with(ResponseTemplate::new(201).set_body_json(json!({"id":"commit"})))
+                .expect(1)
+                .mount(&org.server)
+                .await;
+        }
+        let result = org
+            .command(env!("CARGO_BIN_EXE_upd"), &[("UPD_LOCK", central_lock)])
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            result.status.success(),
+            "{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        let requests = org.server.received_requests().await.unwrap();
+        let commit = requests
+            .iter()
+            .find(|r| r.method.as_str() == "POST" && r.url.path().ends_with("/commits"))
+            .unwrap();
+        let body: Value = serde_json::from_slice(&commit.body).unwrap();
+        let policy: toml::Value =
+            toml::from_str(body["actions"][0]["content"].as_str().unwrap()).unwrap();
+        assert_eq!(policy["automation"]["lock"].as_bool(), Some(true));
+        let mr = requests
+            .iter()
+            .find(|r| r.method.as_str() == "POST" && r.url.path().ends_with("/merge_requests"))
+            .unwrap();
+        let body: Value = serde_json::from_slice(&mr.body).unwrap();
+        let description = body["description"].as_str().unwrap();
+        for text in [
+            "added: automation.lock",
+            "warning: package.json is empty",
+            "consents to running project code",
+            "ci/gitlab-project-lock.yml",
+            "ci/gitlab-organization-update.yml",
+        ] {
+            assert!(description.contains(text), "{description}");
+        }
+        assert!(org.updater_args("acme/locked").is_none());
+    }
+}
+
+#[tokio::test]
+async fn onboarding_does_not_infer_lock_execution_from_symlinks_or_orphan_locks() {
+    let mut org = Org::new().await;
+    org.project(
+        11,
+        "acme/orphan",
+        &[
+            Entry::File("uv.lock", "version = 1"),
+            Entry::File("nested/Cargo.toml", "[workspace]"),
+            Entry::Link("nested/Cargo.lock", "../uv.lock"),
+            Entry::File("elsewhere/package.json", "{}"),
+            Entry::File("package-lock.json", "{}"),
+        ],
+    );
+    org.serve().await;
+    let result = org
+        .command(env!("CARGO_BIN_EXE_upd"), &[])
+        .args(["gitlab", "org", "onboard", "--dry-run", "--output", "json"])
+        .output()
+        .unwrap();
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let report: Value = serde_json::from_slice(&result.stdout).unwrap();
+    let reason = report["projects"][0]["reason"].as_str().unwrap();
+    assert!(!reason.contains("lock = true"), "{reason}");
+    assert!(!reason.contains("added:"));
+}
+
+#[tokio::test]
+async fn onboarding_refusal_summary_is_single_line_and_json_retains_diagnostics() {
+    for strict in [false, true] {
+        let source = if strict {
+            r#"{"extends":["config:recommended"]}"#
+        } else {
+            r#"{"automerge":true,"extends":["config:recommended"],"lockFileMaintenance":{"automerge":false}}"#
+        };
+        let mut org = Org::new().await;
+        org.project(11, "acme/refused", &[Entry::File("renovate.json", source)]);
+        org.serve().await;
+        for format in ["text", "json"] {
+            let mut command = org.command(env!("CARGO_BIN_EXE_upd"), &[]);
+            command.args(["gitlab", "org", "onboard", "--output", format]);
+            if strict {
+                command.arg("--allow-dropped=false");
+            }
+            let result = command.output().unwrap();
+            assert_eq!(result.status.code(), Some(2));
+            let reason = if strict {
+                "dropped: extends[0] (--allow-dropped=false)"
+            } else {
+                "blocking: lockFileMaintenance.automerge"
+            };
+            if format == "text" {
+                let stdout = String::from_utf8(result.stdout).unwrap();
+                assert!(
+                    stdout.contains(&format!("acme/refused: failed (refused): {reason}")),
+                    "{stdout}"
+                );
+                assert_eq!(stdout.lines().count(), 2, "{stdout}");
+                assert!(!stdout.contains("translated:"));
+            } else {
+                let report: Value = serde_json::from_slice(&result.stdout).unwrap();
+                let error = &report["projects"][0]["error"];
+                assert_eq!(error["message"], reason);
+                assert!(!error["diagnostics"].as_array().unwrap().is_empty());
+                assert_eq!(
+                    error["blocking"],
+                    if strict {
+                        json!([])
+                    } else {
+                        json!(["lockFileMaintenance.automerge"])
+                    }
+                );
+            }
+            let stderr = String::from_utf8(result.stderr).unwrap();
+            assert!(
+                stderr.contains(if strict {
+                    "dropped: extends[0]:"
+                } else {
+                    "blocking: lockFileMaintenance.automerge:"
+                }),
+                "{stderr}"
+            );
+            if !strict {
+                assert!(stderr.find("blocking:").unwrap() < stderr.find("dropped:").unwrap());
+            }
+        }
+        assert!(
+            org.server
+                .received_requests()
+                .await
+                .unwrap()
+                .iter()
+                .all(|r| r.method.as_str() == "GET")
+        );
+    }
+}
+
+#[tokio::test]
+async fn template_loads_shared_policy_from_the_central_checkout_and_refuses_ambiguous_paths() {
+    let script = FAKE_UPDATER.replace(
+        "name=\"$(cat project.txt)\"",
+        r#"name="$(cat project.txt)"
+previous=""
+for argument in "$@"; do
+  if [ "$previous" = --config ]; then cp "$argument" "$FAKE_LOG/$name.policy"; fi
+  previous="$argument"
+done"#,
+    );
+    let mut org = Org::with_updater(&script).await;
+    org.project(11, "acme/app", &[Entry::File(".updrc.toml", OPTED_IN)]);
+    org.serve().await;
+    fs::create_dir(org.temp.path().join("policy")).unwrap();
+    fs::write(
+        org.temp.path().join("policy/upd.toml"),
+        "ignore = ['example']\n",
+    )
+    .unwrap();
+    let outside = tempfile::NamedTempFile::new().unwrap();
+    std::os::unix::fs::symlink(outside.path(), org.temp.path().join("policy/escape.toml")).unwrap();
+    for (file, inline, expected) in [
+        ("policy/upd.toml", "", 0),
+        ("policy/missing.toml", "", 4),
+        ("policy", "", 4),
+        ("policy/escape.toml", "", 4),
+        ("/etc/hosts", "", 4),
+        ("policy/upd.toml", "ignore = []", 4),
+    ] {
+        let output = org
+            .command(
+                "bash",
+                &[
+                    ("UPD_SHARED_CONFIG_FILE", file),
+                    ("UPD_SHARED_CONFIG", inline),
+                    ("UPD_DRY_RUN", "true"),
+                    ("UPD_LOCK", "false"),
+                    ("UPD_VERSION", "v0.0.0"),
+                ],
+            )
+            .env_remove("CI_PROJECT_DIR")
+            .args(["-c", &embedded_script()])
+            .output()
+            .unwrap();
+        assert_eq!(
+            output.status.code(),
+            Some(expected),
+            "{file}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    let policy = fs::read_to_string(org.log.join("acme-app.policy")).unwrap();
+    let policy: toml::Value = toml::from_str(&policy).unwrap();
+    assert_eq!(
+        policy["ignore"],
+        toml::Value::Array(vec![toml::Value::String("example".into())])
+    );
+    assert_eq!(
+        template_variables(&[("group", "acme"), ("shared_config", "policy/upd.toml")])
+            .into_iter()
+            .find(|(name, _)| name == "UPD_SHARED_CONFIG_FILE")
+            .unwrap()
+            .1,
+        "policy/upd.toml"
+    );
 }

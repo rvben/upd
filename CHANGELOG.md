@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **gitlab**: propose lock regeneration consent for supported lockfiles during
+  onboarding, with explicit diagnostics and execution consent in invitations.
+- **gitlab**: load shared organization policy from a `shared_config` template
+  input relative to the central checkout.
+
+### Fixed
+
+- **gitlab**: allow empty `package.json` files during onboarding with a warning;
+  keep malformed non-empty files and embedded Renovate policy blocking.
+- **gitlab**: summarize refusal reasons on one line, retain full structured
+  migration diagnostics, and name both organization and project lock workflows.
+- **migrate**: avoid translating disabled standalone Renovate maintenance into
+  disabled dependency lock updates; strict mode now refuses this dropped setting.
+  Recognize the exact default Python file pattern.
+- **docs**: explain retiring Renovate safely before merging onboarding invitations.
+
 ## [0.18.5](https://github.com/rvben/upd/compare/v0.18.4...v0.18.5) - 2026-11-12
 
 ### Added

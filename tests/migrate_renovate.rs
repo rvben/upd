@@ -101,6 +101,11 @@ fn refused_migrations_return_a_json_preview_without_writing_policy() {
             "blocking",
         ),
         (
+            r#"{"lockFileMaintenance":{"enabled":false}}"#,
+            vec!["--allow-dropped=false"],
+            "dropped",
+        ),
+        (
             include_str!("fixtures/renovate-common.json"),
             vec!["--allow-dropped=false"],
             "dropped",
@@ -142,7 +147,7 @@ fn strict_mode_still_accepts_exact_translations() {
     let dir = tempfile::tempdir().unwrap();
     fs::write(
         dir.path().join("renovate.json"),
-        r#"{"automerge":false,"lockFileMaintenance":{"enabled":false}}"#,
+        r#"{"automerge":false,"gitLabIgnoreApprovals":false}"#,
     )
     .unwrap();
     let output = Command::new(env!("CARGO_BIN_EXE_upd"))

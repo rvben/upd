@@ -849,8 +849,10 @@ rule without adding any of its ignores.
 
 Top-level boolean `automerge` becomes `[automation] auto_merge`,
 `gitLabIgnoreApprovals` becomes `[automation] ignore_approvals`, and boolean
-`lockFileMaintenance.enabled` becomes `[automation] lock`. Organization
-settings must also permit these actions. Lock regeneration requires project
+`lockFileMaintenance.enabled: true` becomes `[automation] lock = true`.
+`enabled: false` is dropped with a note: it disables Renovate's standalone
+maintenance, not lock updates alongside dependency changes, so it does not
+become `lock = false`. Organization settings must also permit these actions. Lock regeneration requires project
 CI or isolated organization lock jobs; Renovate's maintenance schedule is not
 preserved. Nested lock-maintenance `automerge` is dropped only when it agrees
 with the global value (false when absent); conflicting merge permissions and
@@ -867,6 +869,11 @@ containing only `matchUpdateTypes` / `matchCurrentVersion` selectors and
 automerge remains blocking. Schedules, grouping, registry overrides, version
 constraints, JSON5 and unknown settings still require manual translation.
 
+The exact default `pep621.fileMatch` pattern `(^|/)pyproject\.toml$` is
+dropped with a note because upd already discovers `pyproject.toml`. Language
+filters, ignores and exclusions still apply. Custom patterns remain blocking;
+upd does not infer regex equivalence or silently broaden file discovery.
+
 Use `--allow-dropped=false` on either migration or onboarding to require every
 setting to translate. Strict mode also refuses metadata and redundant settings
 classified as dropped, including the loss of standalone scheduled lock
@@ -877,6 +884,19 @@ not write policy or open invitations for refused projects:
 upd migrate renovate /path/to/project --allow-dropped=false --dry-run
 upd gitlab org onboard --project my-org/example --allow-dropped=false --dry-run
 ```
+
+Before merging the first invitation, plan how Renovate stops processing the
+migrated projects. Otherwise, removing `renovate.json` can cause Renovate to
+open a new "Configure Renovate" MR. On a shared instance, adjust the explicit
+repository list or scoped autodiscovery filters for the projects being
+migrated. Keep projects that decline the invitation under Renovate if desired.
+For an instance dedicated to this migration, setting `onboarding: false` and
+`requireConfig: "required"` skips repositories without Renovate config;
+**these settings affect the entire instance**. Alternatively, stop a dedicated
+instance once its projects have migrated. See
+[Renovate's requireConfig/onboarding combinations](https://docs.renovatebot.com/self-hosted-configuration/#requireconfig).
+Review and close obsolete Renovate MRs, branches and Dependency Dashboard issues
+as projects switch, so both tools do not keep proposing updates.
 
 With the organization environment configured, preview onboarding first:
 
@@ -891,14 +911,36 @@ only when the migration has no blocking settings (and no dropped settings in
 strict mode). The same migration report appears in the dry-run preview and MR
 description so reviewers can assess every reported policy loss. Existing upd
 configs are left for manual review. Alternative Renovate config files and
-embedded `package.json` Renovate settings require manual migration. Any
-blocking Renovate rule prevents that project's invitation and appears in its
-report. Merge the invitation to opt in, or close it to decline: closed and merged invitations are never reopened. The
+embedded `package.json` Renovate settings require manual migration. Empty or
+whitespace-only `package.json` files are allowed with a warning (including an
+otherwise empty file with a UTF-8 BOM); malformed non-empty files still refuse
+onboarding. Any blocking Renovate rule prevents that project's invitation and
+appears in its report. Merge the invitation to opt in, or close it to decline: closed and merged invitations are never reopened. The
 check includes all MR states and pages. Project code never runs during
 onboarding.
 
+When a supported lockfile has a corresponding manifest beside it in the
+default-branch tree, onboarding proposes `automation.lock = true` if migration
+has not supplied that key. This includes nested projects and workspace roots;
+symlinks and unsupported or orphan lockfiles do not grant consent. An `added`
+diagnostic names the lockfiles. The proposal is independent of central lock
+mode, because a project can use `ci/gitlab-project-lock.yml` instead. Reviewers
+can remove or set `lock = false` in the proposed upd config before merging.
+Merging `lock = true` consents to running project code during lock regeneration;
+configure either the project lock job or isolated organization lock jobs before
+relying on it. Onboarding itself only inspects repository metadata and files.
+
+Refusal outcome lines name blocking setting paths; strict mode also names
+dropped settings. The job log lists full diagnostics with blockers first;
+text previews and their proposed TOML remain in the job log (stderr), while
+the closing stdout summary contains one outcome line per project. JSON retains
+the full preview in `reason`, full `error.diagnostics`, and a list of setting
+paths in `error.blocking`.
+
 Onboarding reads one default-branch commit and creates a new branch from that
-exact commit. It refuses an existing onboarding branch. If an API failure
+exact commit. Lock inference lists that commit's repository tree, following up
+to 1,000 pages of 100 entries. An inspection error or page-limit refusal stops
+the invitation rather than silently omitting a lock proposal. It refuses an existing onboarding branch. If an API failure
 interrupts the operation after branch creation but before MR creation, inspect
 that branch and open its MR manually; upd does not overwrite it on retry.
 
@@ -1006,8 +1048,20 @@ appear as unchecked errors, not an up-to-date result.
 
 ## Shared organization policy and temporary skips
 
-Keep common settings in the central checkout and pass their TOML content as
-`UPD_SHARED_CONFIG`, for example in the central job before invoking upd:
+Keep common settings in the central checkout. The organization template's
+`shared_config` input takes a relative path, for example:
+
+```yaml
+inputs:
+  group: my-org
+  shared_config: policy/upd.toml
+```
+
+The template reads the file into `UPD_SHARED_CONFIG` before either an ordinary
+run or lock planning. Missing, unreadable and non-file paths fail the job;
+absolute paths and symlinks escaping the central checkout are refused. Do not
+combine this input with non-empty `UPD_SHARED_CONFIG`; that is an error.
+Direct CLI callers can still pass TOML content as `UPD_SHARED_CONFIG`:
 
 ```sh
 export UPD_SHARED_CONFIG="$(cat policy/upd.toml)"
