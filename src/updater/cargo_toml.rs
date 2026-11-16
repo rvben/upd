@@ -23,8 +23,14 @@ struct CargoTomlLineIndex {
     lines_by_section: HashMap<String, HashMap<String, usize>>,
 }
 
-/// (package, requirement, current_version, optional registry name, source line).
-type DependencyLookup = (String, ReqSpec, String, Option<String>, Option<usize>);
+struct DependencyLookup {
+    key: String,
+    package: String,
+    req: ReqSpec,
+    current_version: String,
+    registry_name: Option<String>,
+    line_num: Option<usize>,
+}
 
 /// A Cargo version requirement, with the position of the version its floor
 /// sits at.
@@ -239,6 +245,54 @@ impl CargoTomlUpdater {
         }
     }
 
+    /// Resolve a registry dependency's local keys and one-based source lines.
+    /// Parse the complete document so multiline values retain their meaning.
+    pub fn dependency_keys(content: &str, package: &str) -> Vec<(String, usize)> {
+        fn find(
+            table: &Table,
+            section: &str,
+            index: &CargoTomlLineIndex,
+            package: &str,
+            found: &mut Vec<(String, usize)>,
+        ) {
+            if CargoTomlUpdater::is_dependency_section_path(section) {
+                for (key, item) in table.iter() {
+                    let name =
+                        CargoTomlUpdater::get_package_name(item).unwrap_or_else(|| key.to_string());
+                    if name == package
+                        && CargoTomlUpdater::get_version(item).is_some()
+                        && let Some(line) = index.line_for(section, key)
+                    {
+                        found.push((key.to_string(), line));
+                    }
+                }
+                return;
+            }
+            for (key, item) in table.iter() {
+                if let Some(table) = item.as_table() {
+                    let path = if section.is_empty() {
+                        key.to_string()
+                    } else {
+                        format!("{section}.{key}")
+                    };
+                    find(table, &path, index, package, found);
+                }
+            }
+        }
+        let Ok(doc) = content.parse::<DocumentMut>() else {
+            return Vec::new();
+        };
+        let mut found = Vec::new();
+        find(
+            doc.as_table(),
+            "",
+            &CargoTomlLineIndex::from_content(content),
+            package,
+            &mut found,
+        );
+        found
+    }
+
     /// Set version on a dependency item, preserving structure
     fn set_version(item: &mut Item, new_version: &str) {
         match item {
@@ -315,7 +369,7 @@ impl CargoTomlUpdater {
     ) {
         // First pass: collect dependencies and separate by config status
         let mut ignored_deps: Vec<(String, String, Option<usize>)> = Vec::new();
-        let mut pinned_deps: Vec<(String, ReqSpec, String, String, Option<usize>)> = Vec::new();
+        let mut pinned_deps: Vec<(DependencyLookup, String)> = Vec::new();
         let mut deps_to_check: Vec<DependencyLookup> = Vec::new();
 
         for (key, item) in table.iter() {
@@ -338,33 +392,47 @@ impl CargoTomlUpdater {
             let registry_name = Self::get_registry_name(item);
             let req = ReqSpec::parse(&version_req);
             let current_version = req.version().to_string();
-            let package = key.to_string();
-            let line_num = line_index.line_for(section_path, &package);
+            let package = Self::get_package_name(item).unwrap_or_else(|| key.to_string());
+            let line_num = line_index.line_for(section_path, key);
 
-            if options.is_package_filtered_out(&package) {
+            if options.is_package_filtered_out(&package) && options.is_package_filtered_out(key) {
                 result.unchanged += 1;
                 continue;
             }
 
             // Check if package should be ignored
-            if options.should_ignore(&package) {
+            if options.should_ignore(&package) || options.should_ignore(key) {
                 ignored_deps.push((package, current_version, line_num));
                 continue;
             }
 
             // Check if package has a pinned version
-            if let Some(pinned_version) = options.get_pinned_version(&package) {
+            if let Some(pinned_version) = options
+                .get_pinned_version(key)
+                .or_else(|| options.get_pinned_version(&package))
+            {
                 pinned_deps.push((
-                    package,
-                    req,
-                    current_version,
+                    DependencyLookup {
+                        key: key.to_string(),
+                        package,
+                        req,
+                        current_version,
+                        registry_name,
+                        line_num,
+                    },
                     pinned_version.to_string(),
-                    line_num,
                 ));
                 continue;
             }
 
-            deps_to_check.push((package, req, current_version, registry_name, line_num));
+            deps_to_check.push(DependencyLookup {
+                key: key.to_string(),
+                package,
+                req,
+                current_version,
+                registry_name,
+                line_num,
+            });
         }
 
         // Record ignored packages
@@ -373,7 +441,18 @@ impl CargoTomlUpdater {
         }
 
         // Process pinned packages (no registry fetch needed)
-        for (key, req, current_version, pinned_version, line_num) in pinned_deps {
+        for (
+            DependencyLookup {
+                key,
+                package,
+                req,
+                current_version,
+                line_num,
+                ..
+            },
+            pinned_version,
+        ) in pinned_deps
+        {
             let current_release = without_build_metadata(&current_version);
             let pinned_release = without_build_metadata(&pinned_version);
             let matched_version = if options.full_precision {
@@ -386,7 +465,7 @@ impl CargoTomlUpdater {
                 result.unchanged += 1;
             } else if result.hold_strict_pin(
                 options,
-                &key,
+                &package,
                 &current_version,
                 &matched_version,
                 line_num,
@@ -397,20 +476,20 @@ impl CargoTomlUpdater {
                 }
                 result
                     .pinned
-                    .push((key.clone(), current_version, matched_version, line_num));
+                    .push((package.clone(), current_version, matched_version, line_num));
             } else {
                 // The pin was configured and cannot be written, so the manifest
                 // does not say what the config says it should. That is a failed
                 // instruction, not a note.
                 result
                     .errors
-                    .push(unpinnable_error(&key, &pinned_version, &req.text));
+                    .push(unpinnable_error(&package, &pinned_version, &req.text));
             }
         }
 
         // Ensure custom registries are created and cached
-        for (_, _, _, registry_name, _) in &deps_to_check {
-            if let Some(name) = registry_name
+        for dep in &deps_to_check {
+            if let Some(name) = &dep.registry_name
                 && !registry_cache.contains_key(name)
                 && let Some(reg) = Self::create_registry_for_name(name, cargo_toml_registries)
             {
@@ -421,46 +500,63 @@ impl CargoTomlUpdater {
         // Fetch all versions in parallel for non-ignored, non-pinned packages
         let version_futures: Vec<_> = deps_to_check
             .iter()
-            .map(|(key, req, current_version, registry_name, _)| {
-                let effective_registry: &dyn Registry = if let Some(name) = registry_name {
-                    registry_cache
-                        .get(name)
-                        .map(|r| r.as_ref())
-                        .unwrap_or(default_registry)
-                } else {
-                    default_registry
-                };
-
-                async move {
-                    if !req.raisable {
-                        // Nothing here can be rewritten, so the only question
-                        // left is whether the newest release is one this
-                        // requirement already admits. Asking for the newest
-                        // release *matching* it would answer that with itself.
-                        effective_registry.get_latest_version(key).await
-                    } else if !is_stable_semver(current_version) {
-                        effective_registry
-                            .get_latest_version_including_prereleases(key)
-                            .await
-                    } else if req.bounds_above() {
-                        // Honor an explicit ceiling: select the highest version
-                        // satisfying the original requirement, never crossing
-                        // the range the author asked for.
-                        effective_registry
-                            .get_latest_version_matching(key, &req.text)
-                            .await
+            .map(
+                |DependencyLookup {
+                     package,
+                     req,
+                     current_version,
+                     registry_name,
+                     ..
+                 }| {
+                    let effective_registry: &dyn Registry = if let Some(name) = registry_name {
+                        registry_cache
+                            .get(name)
+                            .map(|r| r.as_ref())
+                            .unwrap_or(default_registry)
                     } else {
-                        effective_registry.get_latest_version(key).await
+                        default_registry
+                    };
+
+                    async move {
+                        if !req.raisable {
+                            // Nothing here can be rewritten, so the only question
+                            // left is whether the newest release is one this
+                            // requirement already admits. Asking for the newest
+                            // release *matching* it would answer that with itself.
+                            effective_registry.get_latest_version(package).await
+                        } else if !is_stable_semver(current_version) {
+                            effective_registry
+                                .get_latest_version_including_prereleases(package)
+                                .await
+                        } else if req.bounds_above() {
+                            // Honor an explicit ceiling: select the highest version
+                            // satisfying the original requirement, never crossing
+                            // the range the author asked for.
+                            effective_registry
+                                .get_latest_version_matching(package, &req.text)
+                                .await
+                        } else {
+                            effective_registry.get_latest_version(package).await
+                        }
                     }
-                }
-            })
+                },
+            )
             .collect();
 
         let version_results = join_all(version_futures).await;
 
         // Process results
-        for ((key, req, current_version, registry_name, line_num), version_result) in
-            deps_to_check.into_iter().zip(version_results)
+        for (
+            DependencyLookup {
+                key,
+                package,
+                req,
+                current_version,
+                registry_name,
+                line_num,
+            },
+            version_result,
+        ) in deps_to_check.into_iter().zip(version_results)
         {
             let effective_registry: &dyn Registry = if let Some(ref name) = registry_name {
                 registry_cache
@@ -480,11 +576,11 @@ impl CargoTomlUpdater {
                     match cargo_admits(&req.text, &latest_version) {
                         Some(true) => result.unchanged += 1,
                         Some(false) => result.warnings.push(unrewritable_warning(
-                            &key,
+                            &package,
                             &latest_version,
                             &req.text,
                         )),
-                        None => result.errors.push(unreadable_error(&key, &req.text)),
+                        None => result.errors.push(unreadable_error(&package, &req.text)),
                     }
                 }
                 Ok(latest_version) => {
@@ -509,7 +605,7 @@ impl CargoTomlUpdater {
 
                     let (outcome, note) = crate::updater::apply_cooldown(
                         effective_registry,
-                        &key,
+                        &package,
                         &current_version,
                         &latest_version,
                         None,
@@ -530,7 +626,7 @@ impl CargoTomlUpdater {
                             skipped_published_at,
                         } if without_build_metadata(&chosen) == current_release => {
                             result.skipped_by_cooldown.push((
-                                key,
+                                package,
                                 current_version,
                                 skipped_version,
                                 skipped_published_at,
@@ -551,7 +647,7 @@ impl CargoTomlUpdater {
                             skipped_published_at,
                         } => {
                             result.skipped_by_cooldown.push((
-                                key,
+                                package,
                                 current_version,
                                 skipped_version,
                                 skipped_published_at,
@@ -573,7 +669,7 @@ impl CargoTomlUpdater {
                             != std::cmp::Ordering::Greater
                         {
                             result.warnings.push(downgrade_warning(
-                                &key,
+                                &package,
                                 &matched_version,
                                 &current_version,
                             ));
@@ -583,7 +679,7 @@ impl CargoTomlUpdater {
                             // leave the dependency untouched, and record that a
                             // newer release is waiting on a human.
                             result.record_capped(
-                                &key,
+                                &package,
                                 &current_version,
                                 &matched_version,
                                 line_num,
@@ -593,7 +689,7 @@ impl CargoTomlUpdater {
                                 Self::set_version(item, &new_version_req);
                             }
                             result.updated.push((
-                                key.clone(),
+                                package.clone(),
                                 current_version.clone(),
                                 matched_version.clone(),
                                 line_num,
@@ -601,7 +697,7 @@ impl CargoTomlUpdater {
                             if let Some((skipped_version, skipped_published_at)) = held_back_record
                             {
                                 result.held_back.push((
-                                    key,
+                                    package,
                                     current_version,
                                     matched_version,
                                     skipped_version,
@@ -613,7 +709,7 @@ impl CargoTomlUpdater {
                             // rewrite refused it, so the two disagree about it
                             // and neither reading can be trusted.
                             result.errors.push(format!(
-                                "{key}: '{}' was read as a requirement with a floor to raise, but it has none",
+                                "{package}: '{}' was read as a requirement with a floor to raise, but it has none",
                                 req.text
                             ));
                         }
@@ -622,7 +718,7 @@ impl CargoTomlUpdater {
                     }
                 }
                 Err(e) => {
-                    result.errors.push(format!("{}: {}", key, e));
+                    result.errors.push(format!("{}: {}", package, e));
                 }
             }
         }
@@ -1086,6 +1182,126 @@ old_serde = { package = "serde", version = "1.0" }
             "renamed dep must be reported under its real package name, got {names:?}"
         );
         assert!(!names.contains(&"old_serde"));
+    }
+
+    #[tokio::test]
+    async fn renamed_dependencies_use_registry_names_and_keep_local_keys() {
+        for declaration in [
+            "[dev-dependencies]\ncriterion = { package = \"codspeed-criterion-compat\", version = \"5.0.2\", features = [\"html_reports\"] }\n",
+            "[dependencies.criterion]\npackage = \"codspeed-criterion-compat\"\nversion = \"5.0.2\"\n",
+            "[workspace.dependencies]\ncriterion = { version = \"5.0.2\", package = \"codspeed-criterion-compat\" }\n",
+            "[target.'cfg(unix)'.build-dependencies]\ncriterion = { package = \"codspeed-criterion-compat\", version = \"5.0.2\" }\n",
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("Cargo.toml");
+            fs::write(&path, declaration).unwrap();
+            let registry = MockRegistry::new("crates.io")
+                .with_version("criterion", "0.8.2")
+                .with_version("codspeed-criterion-compat", "6.0.0");
+            let result = CargoTomlUpdater::new()
+                .update(&path, &registry, UpdateOptions::new(false, false))
+                .await
+                .unwrap();
+            assert!(result.errors.is_empty(), "{:?}", result.errors);
+            assert!(result.warnings.is_empty(), "{:?}", result.warnings);
+            assert_eq!(result.updated.len(), 1, "{declaration}");
+            assert_eq!(result.updated[0].0, "codspeed-criterion-compat");
+            assert_eq!(result.updated[0].2, "6.0.0");
+            assert_eq!(
+                fs::read_to_string(&path).unwrap(),
+                declaration.replace("5.0.2", "6.0.0")
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn renamed_dependencies_accept_real_names_and_local_keys_for_policies() {
+        for (pinned, selector) in [
+            (false, "real-crate"),
+            (true, "real-crate"),
+            (false, "local"),
+            (true, "local"),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("Cargo.toml");
+            let original =
+                "[dependencies]\nlocal = { package = \"real-crate\", version = \"1.0.0\" }\n";
+            fs::write(&path, original).unwrap();
+            let config = if pinned {
+                crate::config::UpdConfig {
+                    pin: HashMap::from([(selector.to_string(), "1.2.0".to_string())]),
+                    ..Default::default()
+                }
+            } else {
+                crate::config::UpdConfig {
+                    ignore: vec![selector.to_string()],
+                    ..Default::default()
+                }
+            };
+            let result = CargoTomlUpdater::new()
+                .update(
+                    &path,
+                    &MockRegistry::new("crates.io"),
+                    UpdateOptions::new(false, false).with_config(Arc::new(config)),
+                )
+                .await
+                .unwrap();
+            assert!(result.errors.is_empty(), "{:?}", result.errors);
+            if pinned {
+                assert_eq!(result.pinned[0].0, "real-crate");
+                assert_eq!(
+                    fs::read_to_string(&path).unwrap(),
+                    original.replace("1.0.0", "1.2.0")
+                );
+            } else {
+                assert_eq!(result.ignored[0].0, "real-crate");
+                assert_eq!(fs::read_to_string(&path).unwrap(), original);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn renamed_dependencies_apply_cooldown_to_the_registry_package() {
+        use chrono::{Duration, TimeZone, Utc};
+        let now = Utc.with_ymd_and_hms(2026, 11, 16, 12, 0, 0).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("Cargo.toml");
+        let original = "[dev-dependencies]\ncriterion = { package = \"codspeed-criterion-compat\", version = \"5.0.2\" }\n";
+        fs::write(&path, original).unwrap();
+        let registry = MockRegistry::new("crates.io")
+            .with_version("codspeed-criterion-compat", "6.0.0")
+            .with_version_meta(
+                "codspeed-criterion-compat",
+                "5.0.2",
+                Some(now - Duration::days(30)),
+                false,
+                false,
+            )
+            .with_version_meta(
+                "codspeed-criterion-compat",
+                "6.0.0",
+                Some(now - Duration::days(1)),
+                false,
+                false,
+            );
+        let policy = crate::cooldown::CooldownPolicy {
+            default: Duration::days(7),
+            per_ecosystem: HashMap::new(),
+            strict: true,
+            force_override: None,
+        };
+        let result = CargoTomlUpdater::new()
+            .update(
+                &path,
+                &registry,
+                UpdateOptions::new(false, false).with_cooldown_policy(policy, now),
+            )
+            .await
+            .unwrap();
+        assert!(result.errors.is_empty(), "{:?}", result.errors);
+        assert_eq!(result.skipped_by_cooldown.len(), 1);
+        assert_eq!(result.skipped_by_cooldown[0].0, "codspeed-criterion-compat");
+        assert_eq!(fs::read_to_string(path).unwrap(), original);
     }
 
     #[tokio::test]

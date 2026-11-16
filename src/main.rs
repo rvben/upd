@@ -6387,12 +6387,12 @@ where
 {
     let mut candidate: Option<(usize, String)> = None;
 
-    for idx in 0..document.lines.len() {
+    for (idx, line) in document.lines.iter().enumerate() {
         if Some(idx) == skip_idx {
             continue;
         }
 
-        if let Some(updated) = replacer(&document.lines[idx]) {
+        if let Some(updated) = replacer(line) {
             if candidate.is_some() {
                 return false;
             }
@@ -6611,13 +6611,13 @@ fn replace_cargo_version_in_following_table(
     old_version: &str,
     new_version: &str,
 ) -> Option<(usize, String)> {
-    for idx in start_idx + 1..document.lines.len() {
-        if document.lines[idx].trim().starts_with('[') {
+    for (idx, line) in document.lines.iter().enumerate().skip(start_idx + 1) {
+        if line.trim().starts_with('[') {
             break;
         }
 
         if let Some(updated) =
-            replace_cargo_table_version_assignment(&document.lines[idx], old_version, new_version)
+            replace_cargo_table_version_assignment(line, old_version, new_version)
         {
             return Some((idx, updated));
         }
@@ -6631,21 +6631,26 @@ fn cargo_replacement_candidate(
     start_idx: usize,
     update: &VersionEdit<'_>,
     target_version: &str,
+    declarations: &[(String, usize)],
 ) -> Option<(usize, String)> {
     if start_idx >= document.lines.len() {
         return None;
     }
 
+    let (key, _) = declarations
+        .iter()
+        .find(|(_, line)| *line == start_idx + 1)?;
+
     if let Some(updated) = replace_cargo_inline_dependency_version(
         &document.lines[start_idx],
-        update.package,
+        key,
         update.old_version,
         target_version,
     ) {
         return Some((start_idx, updated));
     }
 
-    if is_cargo_dependency_header(&document.lines[start_idx], update.package) {
+    if is_cargo_dependency_header(&document.lines[start_idx], key) {
         return replace_cargo_version_in_following_table(
             document,
             start_idx,
@@ -6662,6 +6667,7 @@ fn apply_unique_cargo_replacement(
     skip_idx: Option<usize>,
     update: &VersionEdit<'_>,
     target_version: &str,
+    declarations: &[(String, usize)],
 ) -> bool {
     let mut candidate: Option<(usize, String)> = None;
 
@@ -6671,7 +6677,7 @@ fn apply_unique_cargo_replacement(
         }
 
         if let Some(found) =
-            cargo_replacement_candidate(document, start_idx, update, target_version)
+            cargo_replacement_candidate(document, start_idx, update, target_version, declarations)
         {
             if candidate.is_some() {
                 return false;
@@ -6694,9 +6700,11 @@ fn apply_cargo_toml_version(
     update: &VersionEdit<'_>,
     target_version: &str,
 ) -> bool {
+    let declarations =
+        CargoTomlUpdater::dependency_keys(&document.clone().into_content(), update.package);
     if let Some(idx) = line_index(update.line_num) {
         if let Some((line_idx, updated)) =
-            cargo_replacement_candidate(document, idx, update, target_version)
+            cargo_replacement_candidate(document, idx, update, target_version, &declarations)
         {
             document.lines[line_idx] = updated;
             return true;
@@ -6707,12 +6715,13 @@ fn apply_cargo_toml_version(
             (idx < document.lines.len()).then_some(idx),
             update,
             target_version,
+            &declarations,
         );
     }
 
     for idx in 0..document.lines.len() {
         if let Some((line_idx, updated)) =
-            cargo_replacement_candidate(document, idx, update, target_version)
+            cargo_replacement_candidate(document, idx, update, target_version, &declarations)
         {
             document.lines[line_idx] = updated;
             return true;
@@ -9306,6 +9315,51 @@ mod tests {
             error.contains("Failed to apply 1 version edit"),
             "a fix that cannot reach the requested version must fail loudly rather than report success: {error}"
         );
+    }
+
+    #[test]
+    fn apply_cargo_updates_resolves_renamed_packages_without_rewriting_other_crates() {
+        for content in [
+            "[dev-dependencies]\ncriterion = { package = \"codspeed-criterion-compat\", version = \"5.0.2\", features = [\n    \"html_reports\",\n] }\n",
+            "[workspace.dependencies]\ncriterion = { package = \"codspeed-criterion-compat\", version = \"5.0.2\" }\n",
+            "[workspace.dependencies]\ncodspeed-criterion-compat = \"5.0.2\"\n",
+            "[target.'cfg(unix)'.dependencies]\ncriterion = { package = \"codspeed-criterion-compat\", version = \"5.0.2\" }\n",
+            "[target.'cfg(unix)'.dependencies]\ncodspeed-criterion-compat = \"5.0.2\"\n",
+            "[dev-dependencies]\ncriterion = { package = \"codspeed-criterion-compat\", version = \"5.0.2\" }\nother = \"5.0.2\"\n",
+            "[dev-dependencies.criterion]\nversion = \"5.0.2\"\npackage = \"codspeed-criterion-compat\"\n",
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("Cargo.toml");
+            std::fs::write(&path, content).unwrap();
+            let dependencies = CargoTomlUpdater::new().parse_dependencies(&path).unwrap();
+            let dependency = dependencies
+                .iter()
+                .find(|dep| dep.name == "codspeed-criterion-compat")
+                .unwrap();
+            let edits = [VersionEdit {
+                package: "codspeed-criterion-compat",
+                old_version: "5.0.2",
+                new_version: "6.0.0",
+                line_num: dependency.line_number,
+                expected_source: None,
+                sha_pin: None,
+            }];
+            let applied =
+                apply_version_updates(content, &edits, FileType::CargoToml, false).unwrap();
+            assert_eq!(applied.applied_count(), 1);
+            assert_eq!(applied.content, content.replacen("5.0.2", "6.0.0", 1));
+        }
+        let content =
+            "[dependencies]\ncriterion = { package = \"another-crate\", version = \"5.0.2\" }\n";
+        let edits = [VersionEdit {
+            package: "criterion",
+            old_version: "5.0.2",
+            new_version: "6.0.0",
+            line_num: Some(2),
+            expected_source: None,
+            sha_pin: None,
+        }];
+        assert!(apply_version_updates(content, &edits, FileType::CargoToml, false).is_err());
     }
 
     /// The other half of the same guard. A target equal to what the file

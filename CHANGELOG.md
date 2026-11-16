@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Resolve renamed Cargo dependencies by their `package` name for registry
+  lookups, update policies and targeted lockfile refreshes. Preserve the local
+  dependency key when applying updates, including approved interactive edits.
+  Update reports now identify the real package; alias-based selectors, ignores
+  and pins remain supported, with local-key pins taking precedence.
+
 ## [0.18.6](https://github.com/rvben/upd/compare/v0.18.5...v0.18.6) - 2026-11-13
 
 ### Added

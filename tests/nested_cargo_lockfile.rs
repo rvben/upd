@@ -183,3 +183,57 @@ async fn a_root_bump_syncs_the_nested_fuzz_workspace_and_reports_it() {
         "the second invocation must have run inside fuzz/: {invocations}"
     );
 }
+
+#[tokio::test]
+async fn a_renamed_dependency_refreshes_the_real_package_in_the_lockfile() {
+    let server = wiremock::MockServer::start().await;
+    mount_crates_latest(&server, "dupcrate", "2.0.1").await;
+    let tmp = tempfile::tempdir().unwrap();
+    let original = ROOT_CARGO_TOML.replace(
+        "dupcrate = \"1.2.3\"",
+        "local_name = { package = \"dupcrate\", version = \"1.2.3\" }",
+    );
+    fs::write(tmp.path().join("Cargo.toml"), &original).unwrap();
+    fs::write(tmp.path().join("Cargo.lock"), ROOT_CARGO_LOCK).unwrap();
+    let bin_dir = tmp.path().join("fakebin");
+    fs::create_dir(&bin_dir).unwrap();
+    let log = tmp.path().join("cargo-invocations.log");
+    write_fake_tool(&bin_dir, "cargo", FAKE_CARGO);
+    let (stdout, stderr, code) = run_with_env(
+        &[
+            "update",
+            "--package",
+            "dupcrate",
+            "--apply",
+            "--lock",
+            "--format",
+            "json",
+            "--no-cache",
+            "Cargo.toml",
+        ],
+        tmp.path(),
+        &[
+            ("CARGO_REGISTRIES_CRATES_IO_INDEX", &server.uri()),
+            ("PATH", &path_with(&bin_dir)),
+            ("FAKE_LOG", &log.display().to_string()),
+        ],
+    );
+    assert_eq!(code, 0, "stdout: {stdout}\nstderr: {stderr}");
+    assert_eq!(
+        fs::read_to_string(tmp.path().join("Cargo.toml")).unwrap(),
+        original.replace("1.2.3", "2.0.1")
+    );
+    let invocations = fs::read_to_string(log).unwrap();
+    assert!(
+        invocations
+            .lines()
+            .any(|line| line.ends_with(" update -p dupcrate")),
+        "{invocations}"
+    );
+    assert!(!invocations.contains("local_name"), "{invocations}");
+    assert!(
+        fs::read_to_string(tmp.path().join("Cargo.lock"))
+            .unwrap()
+            .contains("2.0.1")
+    );
+}
