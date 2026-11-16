@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.18.7](https://github.com/rvben/upd/compare/v0.18.6...v0.18.7) - 2026-11-16
+
 ### Fixed
 
 - Resolve renamed Cargo dependencies by their `package` name for registry
