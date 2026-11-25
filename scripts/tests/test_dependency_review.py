@@ -93,6 +93,26 @@ class ReviewPolicy(unittest.TestCase):
         self.assertIn(group, publisher)
         self.assertIn(group, WORKFLOW.read_text())
 
+    def test_validation_only_keeps_reports_and_skips_publication(self):
+        publisher = WORKFLOW.with_name('dependency-health.yml').read_text()
+        inputs, jobs = publisher.split('\njobs:\n', 1)
+        self.assertRegex(inputs, r'(?m)^      publish:\n        description: [^\n]+\n'
+                                 r'        type: boolean\n        default: true$')
+        update, publish = jobs.split('\n  publish:\n', 1)
+        self.assertRegex(inputs, r'(?m)^permissions:\n  contents: read\n'
+                                 r'  packages: read\n  pull-requests: read\n')
+        self.assertNotIn('id-token: write', inputs)
+        self.assertNotRegex(update, r'(?m)^    permissions:')
+        header = publish.split('    steps:\n', 1)[0]
+        self.assertRegex(header, r'(?m)^    if: inputs\.publish$')
+        self.assertRegex(header, r'(?m)^    needs: update$')
+        for name in ('Package validated proposal', 'Transfer validated proposal to isolated publisher'):
+            with self.subTest(step=name):
+                self.assertIn(f"      - name: {name}\n"
+                              "        if: inputs.publish && steps.update.outputs.changed == 'true'\n", update)
+        self.assertIn('      - name: Retain machine-readable report\n'
+                      '        id: report\n        if: always()\n', update)
+
     def test_tag_named_main_cannot_smuggle_an_unreviewed_parent(self):
         self.base_on_main = False
         self.reject()

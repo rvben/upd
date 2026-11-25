@@ -275,8 +275,15 @@ only Contents and Pull requests write for the target repository.
 
 ## Inputs
 
+Set `publish: false` to run dependency discovery, remediation, updates, and
+validation while producing only the normal report and job summary. The
+publication job and proposal bundle are skipped. Keep the reusable workflow's
+declared caller permissions, including `id-token: write` for the publisher.
+The update job cannot request an OIDC token.
+
 | Input | Default | Purpose |
 |-------|---------|---------|
+| `publish` | `true` | Enable the isolated publisher and its rolling pull request updates |
 | `runner` | `ubuntu-24.04` | Linux runner label for preparation and validation |
 | `allowed-paths` | `.github/workflows/*.yml .github/workflows/*.yaml` | Publisher-enforced file patterns; explicitly opt in dependency manifests and lockfiles for other ecosystems |
 | `publisher-runner` | `ubuntu-24.04` | Independent publication runner; custom values require disposable guests with admission before job initialization |

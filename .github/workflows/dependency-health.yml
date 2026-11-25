@@ -3,6 +3,10 @@ name: Dependency health with upd
 on:
   workflow_call:
     inputs:
+      publish:
+        description: Publish or clean up the rolling pull request after validation
+        type: boolean
+        default: true
       runner:
         description: Linux runner label for repository preparation and validation
         type: string
@@ -660,7 +664,7 @@ jobs:
           ' "$REPORT" > "$PRESENTATION"
 
       - name: Package validated proposal
-        if: steps.update.outputs.changed == 'true'
+        if: inputs.publish && steps.update.outputs.changed == 'true'
         env:
           BASE_SHA: ${{ steps.branch.outputs.base-sha }}
           COMMIT_MESSAGE: ${{ inputs.commit-message }}
@@ -852,7 +856,7 @@ jobs:
           fi
 
       - name: Transfer validated proposal to isolated publisher
-        if: steps.update.outputs.changed == 'true'
+        if: inputs.publish && steps.update.outputs.changed == 'true'
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: upd-proposal
@@ -864,6 +868,7 @@ jobs:
 
   publish:
     needs: update
+    if: inputs.publish
     # This input is independent of the build runner and build-controlled outputs.
     # Custom publishers must enforce admission and discard their guest per job.
     runs-on: ${{ inputs.publisher-runner }}
