@@ -111,12 +111,18 @@ jobs:
 
           # Independent, deliberately conservative checks on GitHub's stored blobs. Reports
           # from a job that runs dependency code are evidence, never the sole authority.
-          def compatible(before, after):
-              pattern = r'([~^=]?)[vV]?(\d+)\.(\d+)\.(\d+)(?:\+[0-9A-Za-z.-]+)?'
-              left, right = re.fullmatch(pattern, before), re.fullmatch(pattern, after)
+          def compatible(before, after, allow_equal=False):
+              """Whether `after` is a newer version of the same compatibility line. Equal
+              versions only pass when the caller compares everything else itself, since a
+              pin that changes while its version stays put is not a version bump. Build
+              metadata is not accepted: it would let a different artifact keep its version."""
+              pattern = r'([~^=]?)[vV]?([0-9]+)\.([0-9]+)\.([0-9]+)'
+              left, right = re.fullmatch(pattern, before, re.ASCII), re.fullmatch(pattern, after, re.ASCII)
               if not left or not right or left[1] != right[1]:
                   return False
               a, b = tuple(map(int, left.groups()[1:])), tuple(map(int, right.groups()[1:]))
+              if a == b and not allow_equal:
+                  return False
               return b >= a and a[0] == b[0] and (a[0] != 0 or (a[1] == b[1] and (a[1] != 0 or a[2] == b[2])))
 
 
@@ -272,7 +278,7 @@ jobs:
               if same(left, right):
                   return True
               av, bv = left.get('version'), right.get('version')
-              if not isinstance(av, str) or not isinstance(bv, str) or not compatible(av, bv):
+              if not isinstance(av, str) or not isinstance(bv, str) or not compatible(av, bv, allow_equal=True):
                   return False
               for field in ['resolved', 'integrity']:
                   if left.get(field) != right.get(field) and av == bv:
@@ -327,7 +333,7 @@ jobs:
                   inside_old, inside_new = block_scalar_lines(old), block_scalar_lines(new)
                   if inside_old is None or inside_new is None:
                       return False
-                  action = re.compile(r'(\s*(?:-\s*)?uses:\s*)([A-Za-z0-9_.-]+/[A-Za-z0-9_./-]+)@([a-f0-9]{40})[ \t]+#[ \t]*(v\d+\.\d+\.\d+)[ \t]*')
+                  action = re.compile(r'(\s*(?:-\s*)?uses:\s*)([A-Za-z0-9_.-]+/[A-Za-z0-9_./-]+)@([a-f0-9]{40})[ \t]+#[ \t]*(v[0-9]+\.[0-9]+\.[0-9]+)[ \t]*', re.ASCII)
                   for number, (a, b) in enumerate(zip(old, new)):
                       if a == b:
                           continue
@@ -391,13 +397,13 @@ jobs:
                   if not same(a, b) or not ap or len(ap) != len(bp):
                       return False
                   # Stable sorting pairs multiple installed versions of the same crate.
-                  order = lambda p: (p['name'], p.get('source', ''), tuple(map(int, re.match(r'^(\d+)\.(\d+)\.(\d+)', p['version']).groups())) + (p['version'],))
+                  order = lambda p: (p['name'], p.get('source', ''), tuple(map(int, re.match(r'^([0-9]+)\.([0-9]+)\.([0-9]+)', p['version'], re.ASCII).groups())) + (p['version'],))
                   for x, y in zip(sorted(ap, key=order), sorted(bp, key=order)):
                       left, right = dict(x), dict(y)
                       if same(left, right):
                           continue
                       av, bv = left['version'], right['version']
-                      if not compatible(av, bv) or (av == bv and left.get('checksum') != right.get('checksum')):
+                      if not compatible(av, bv, allow_equal=True) or (av == bv and left.get('checksum') != right.get('checksum')):
                           return False
                       for field in ['version', 'checksum']:
                           left.pop(field, None)
@@ -417,7 +423,7 @@ jobs:
                       return False
                   # The module path before the version and the whole tail after it, a
                   # comment included, must stay byte-identical; only the version token changes.
-                  require = re.compile(r'(\s*(?:require\s+)?[A-Za-z0-9._~/-]+\s+)(v\d+\.\d+\.\d+)(\+incompatible)?([ \t\r]*(?://.*)?)')
+                  require = re.compile(r'(\s*(?:require\s+)?[A-Za-z0-9._~/-]+\s+)(v[0-9]+\.[0-9]+\.[0-9]+)(\+incompatible)?([ \t\r]*(?://.*)?)', re.ASCII)
                   for (verb, role, a), (_, _, b) in zip(old, new):
                       if a == b:
                           continue
@@ -562,7 +568,7 @@ jobs:
 
 
           def semver_key(version):
-              match = re.fullmatch(r'v(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-([0-9A-Za-z.-]+))?(?:\+[0-9A-Za-z.-]+)?', version)
+              match = re.fullmatch(r'v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(?:-([0-9A-Za-z.-]+))?(?:\+[0-9A-Za-z.-]+)?', version, re.ASCII)
               if not match:
                   raise ValueError(f'not a semantic version: {version}')
               pre = match[4]
@@ -645,7 +651,7 @@ jobs:
               # Future stable releases must be published by the same upstream and resolve
               # to this exact commit. Branch refs, prereleases, and older guards are denied.
               for tag in get("repos/rvben/upd/tags?per_page=100"):
-                  version = re.fullmatch(r"v(\d+)\.(\d+)\.(\d+)", tag["name"])
+                  version = re.fullmatch(r"v([0-9]+)\.([0-9]+)\.([0-9]+)", tag["name"], re.ASCII)
                   if (version and tuple(map(int, version.groups())) >= (0, 18, 2)
                           and tag["commit"]["sha"] == match[1]):
                       release = get("repos/rvben/upd/releases/tags/" + tag["name"])

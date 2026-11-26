@@ -469,6 +469,30 @@ class ReviewPolicy(unittest.TestCase):
         self.assertTrue(check(path, crlf('a', 0), crlf('b', 1)))
         self.assertFalse(check(path, crlf('a', 0), crlf('b', 1).replace('\r\n', '\n')))
 
+    def test_a_pin_change_needs_a_strictly_newer_version_written_in_ascii(self):
+        check = ns['content_compatible']
+        compatible = ns['compatible']
+        path = '.github/workflows/ci.yml'
+        pin = lambda sha, version: 'steps:\n  - uses: example/action@%s # %s\n' % (sha * 40, version)
+        self.assertTrue(check(path, pin('a', 'v1.0.0'), pin('b', 'v1.0.1')))
+        # A new commit under the same version comment is not a version bump.
+        self.assertFalse(check(path, pin('a', 'v1.0.0'), pin('b', 'v1.0.0')))
+        self.assertFalse(check(path, pin('a', 'v1.0.1'), pin('b', 'v1.0.0')))
+        self.assertTrue(compatible('1.0.0', '1.0.1'))
+        self.assertTrue(compatible('1.0.0', '1.0.0', allow_equal=True))
+        self.assertFalse(compatible('1.0.0', '1.0.0'))
+        # Build metadata and non-ASCII digits never make a version string acceptable.
+        for old, new in [('1.0.0', '1.0.0+evil'), ('1.0.0+a', '1.0.1+a'), ('1.0.0', '1.0.\uff11'), ('1.0.0', '1.0.\u0661'), ('\u0661.0.0', '\u0661.0.1')]:
+            self.assertFalse(compatible(old, new), (old, new))
+        lock = lambda version: json.dumps({'lockfileVersion': 3, 'packages': {'': {}, 'node_modules/a': {
+            'version': version, 'resolved': 'https://registry.npmjs.org/a/-/a-1.0.0.tgz', 'integrity': 'sha512-x'}}})
+        self.assertFalse(check('package-lock.json', lock('1.0.0'), lock('1.0.0+evil')))
+        manifest = lambda version: json.dumps({'name': 'x', 'dependencies': {'a': version}})
+        self.assertTrue(check('package.json', manifest('^1.0.0'), manifest('^1.0.1')))
+        self.assertFalse(check('package.json', manifest('^1.0.0'), manifest('^1.0.0+evil')))
+        cargo = lambda version: '[package]\nname = "x"\n[dependencies]\na = "%s"\n' % version
+        self.assertFalse(check('Cargo.toml', cargo('1.0.0'), cargo('1.0.0+evil')))
+
     def test_multiline_flow_collections_do_not_block_unrelated_action_bumps(self):
         check = ns['content_compatible']
         path = '.github/workflows/ci.yml'
