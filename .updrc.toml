@@ -5,3 +5,12 @@ exclude = ["benchmarks/fixtures/vendor/**"]
 
 [automation]
 security_remediation = true
+
+# chrono is a direct dependency (about 90 call sites) and RUSTSEC-2026-0543
+# reports it unmaintained with no patched release. A migration to jiff is not
+# scheduled yet, so the audit accepts the notice until the date below; once it
+# passes the audit fails again and this entry has to be renewed or removed.
+[audit]
+ignore-advisories = [
+  { id = "RUSTSEC-2026-0543", reason = "chrono is unmaintained with no patched or successor release; migrating to jiff is not yet scheduled", expires = "2027-05-31" },
+]
