@@ -688,6 +688,11 @@ modules/checksums. New files, unsupported formats, ambiguous version changes,
 new npm overrides, and lockfile graph changes outside those rules retain manual
 review. Repository-controlled reports alone cannot authorize an approval.
 
+When a proposal needs manual review, the reviewer exits successfully with a
+notice and a step summary instead of failing, since no approval was withheld
+for a defect. Integrity problems (a failed publication, digest or checksum
+mismatch, a disallowed file, a changed parent) still fail the job.
+
 Approvals bind to the exact proposal commit. The reviewer and publisher share
 one concurrency group, preventing the publisher from replacing the head during
 review. Configure an active pull-request ruleset with at least one required

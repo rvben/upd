@@ -178,6 +178,24 @@ upd --verbose
 # pyproject.toml:13: Skipped internal-utils 1.0.0 (ignored)
 ```
 
+### Accepting audit advisories
+
+`[audit] ignore-advisories` accepts known advisories that have no fix. Each
+entry needs an `id` (an advisory id or alias) and a `reason`; `expires`
+(`YYYY-MM-DD`, the last day it applies) is optional. After the expiry the
+advisory fails `upd audit` again and upd warns that the suppression expired.
+Accepted advisories are still listed with their reason. A malformed entry is a
+configuration error (exit 4). See [Accepting an advisory](audit.md#accepting-an-advisory).
+
+```toml
+[audit]
+ignore-advisories = [
+  { id = "RUSTSEC-2026-0543", reason = "no successor release", expires = "2027-05-31" },
+]
+```
+
+In a nested configuration, an entry for the same id replaces the parent's.
+
 ## Cooldown (minimum release age)
 
 Hold back updates to versions that have been public for less than N days.

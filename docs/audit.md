@@ -76,7 +76,8 @@ package's releases:
 
 Go modules and the other ecosystems use the advisory's version as named.
 
-`--fix-audit` honors the same [`ignore` and `pin`](configuration.md)
+`--fix-audit` leaves [accepted advisories](#accepting-an-advisory) alone and
+honors the same [`ignore` and `pin`](configuration.md)
 settings as `upd update`, read from the configuration that governs each file.
 An ignored package is left as it is, and so is a package pinned below the
 fix, since the next update would move it back to the pin. Both are reported
@@ -98,6 +99,67 @@ of a fixed package below its fix (Cargo and npm lock semver-incompatible copies
 side by side) is not a fix and is reported like any other release. Nothing is held
 back, since that could undo the fix, and the exit code does not change.
 `--offline` checks nothing and says so in `warnings`.
+
+## Accepting an advisory
+
+Some advisories have no fix to apply: an unmaintained crate with no successor,
+or a finding in a code path the project never reaches. Accept one in the
+configuration instead of letting it fail every run:
+
+```toml
+[audit]
+ignore-advisories = [
+  { id = "RUSTSEC-2026-0543", reason = "chrono is unmaintained with no successor release; migration is not yet scheduled", expires = "2027-05-31" },
+]
+```
+
+- `id` names one advisory by its id or any alias (a `CVE-` or `GHSA-` id works
+  when the report shows another). Matching ignores case. Wildcards and several
+  ids in one entry are rejected.
+- `reason` is required and must not be blank. It is printed next to the
+  advisory in every report.
+- `expires` is optional, `YYYY-MM-DD`, and is the last day the entry applies.
+  The day after, the advisory fails the audit again and upd warns that the
+  suppression expired, so an accepted risk is revisited instead of forgotten.
+- A malformed entry (missing or blank `reason`, a bad date, an unknown key, an
+  id listed twice) is a configuration error: upd exits 4 and suppresses
+  nothing.
+- An entry that matches no advisory in the audited dependencies produces a
+  warning so stale entries get removed. The warning is skipped when the audit
+  did not cover the whole tree (`--lang`, a package filter, or an incomplete
+  run). Run from a subdirectory of a monorepo, an entry for an advisory in
+  another directory is reported as unmatched, because the audit only sees its
+  own tree.
+- Only the configuration governing the scanned path applies. A nested
+  configuration in a subdirectory is not consulted for its own files. With
+  several paths, an advisory is accepted only when every path's configuration
+  lists it under the same id (the earliest expiry wins), so the result does not
+  depend on the order of the paths.
+
+An accepted advisory does not fail `upd audit`, is not fixed or counted as an
+unresolved residual by `--fix-audit`, and is not reported as vulnerable.
+Packages with other advisories still fail. Informational notices such as
+RUSTSEC "unmaintained" advisories use the same mechanism: they have no separate
+severity threshold, because a per-advisory entry with a reason and an expiry
+records the decision where it is made, and a blanket threshold would also hide
+notices nobody has looked at.
+
+Accepted advisories stay visible:
+
+- text output lists them as `Suppressed:` lines with the reason
+  and expiry;
+- JSON adds `suppressed[]` (`id`, `package`, `version`, `ecosystem`,
+  `reason`, `expires`), `summary.suppressed` and, when something needs
+  attention, `suppression_warnings[]`;
+- SARIF leaves accepted findings out of `results`. GitHub code scanning does
+  not document support for `result.suppressions`, and an omitted result closes
+  its alert on upload, which is the behavior wanted. The accepted findings,
+  with their justification, are kept in the run's
+  `properties.suppressedAdvisories` for other SARIF consumers.
+
+The failure message names the unresolved advisories and packages (for example
+`RUSTSEC-2026-0543 (chrono 0.4.44)`), on stderr for SARIF output, so a failed
+CI step says what to look at without opening the report.
 
 ## Example output
 
