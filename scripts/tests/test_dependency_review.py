@@ -554,6 +554,42 @@ class ReviewPolicy(unittest.TestCase):
         self.assertFalse(check('go.sum', row('v1.0.0'), row('v1.0.1') + '\n\n'))
         self.assertFalse(check('go.sum', row('v1.0.0') + '\n', row('v1.0.1')))
 
+    def test_lockfile_v2_dependency_tree_follows_the_same_bump_rules(self):
+        check = ns['content_compatible']
+
+        def tarball(name, version, host='registry.npmjs.org'):
+            return 'https://%s/%s/-/%s-%s.tgz' % (host, name, name, version)
+
+        def lock(lodash, nested, host='registry.npmjs.org', extra=None):
+            record = {'version': lodash, 'resolved': tarball('lodash', lodash, host), 'integrity': 'sha512-' + lodash,
+                      'requires': {'inner': '^' + nested},
+                      'dependencies': {'inner': {'version': nested, 'resolved': tarball('inner', nested), 'integrity': 'sha512-' + nested}}}
+            record.update(extra or {})
+            return json.dumps({'name': 'f', 'lockfileVersion': 2, 'packages': {
+                '': {'name': 'f', 'dependencies': {'lodash': lodash}},
+                'node_modules/lodash': {'version': lodash, 'resolved': tarball('lodash', lodash), 'integrity': 'sha512-' + lodash},
+                'node_modules/lodash/node_modules/inner': {'version': nested, 'resolved': tarball('inner', nested), 'integrity': 'sha512-' + nested},
+            }, 'dependencies': {'lodash': record}})
+
+        path = 'package-lock.json'
+        self.assertTrue(check(path, lock('4.17.20', '1.0.0'), lock('4.17.20', '1.0.0')))
+        self.assertTrue(check(path, lock('4.17.20', '1.0.0'), lock('4.17.21', '1.0.0')))
+        self.assertTrue(check(path, lock('4.17.20', '1.0.0'), lock('4.17.21', '1.1.0')))
+        # The legacy tree is held to the same rules as `packages`.
+        self.assertFalse(check(path, lock('4.17.20', '1.0.0'), lock('4.17.21', '1.0.0', host='evil.example')))
+        self.assertFalse(check(path, lock('4.17.20', '1.0.0'), lock('4.17.21', '2.0.0')))
+        self.assertFalse(check(path, lock('4.17.20', '1.0.0'), lock('4.17.21', '1.0.0', extra={'bin': {'x': 'y'}})))
+        self.assertFalse(check(path, lock('4.17.20', '1.0.0'), lock('4.17.21', '1.0.0', extra={'requires': {'inner': '^1.0.0', 'new': '^1.0.0'}})))
+        # The tree and `packages` must describe the same tarball at every path.
+        diverged = json.loads(lock('4.17.20', '1.0.0'))
+        diverged['dependencies']['lodash']['version'] = '4.17.21'
+        diverged['dependencies']['lodash']['resolved'] = tarball('lodash', '4.17.21')
+        diverged['dependencies']['lodash']['integrity'] = 'sha512-other'
+        self.assertFalse(check(path, lock('4.17.20', '1.0.0'), json.dumps(diverged)))
+        nested = json.loads(lock('4.17.20', '1.0.0'))
+        nested['dependencies']['lodash']['dependencies']['inner'].update(version='1.0.1', resolved=tarball('inner', '1.0.1'), integrity='sha512-1.0.1')
+        self.assertFalse(check(path, lock('4.17.20', '1.0.0'), json.dumps(nested)))
+
     def test_unknown_new_files_and_unsupported_formats_require_review(self):
         self.files[0]['status'] = 'added'
         self.reject()

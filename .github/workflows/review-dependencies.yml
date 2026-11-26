@@ -264,6 +264,52 @@ jobs:
               return old_path[-1].replace(old_version, '{version}') == new_path[-1].replace(new_version, '{version}')
 
 
+          def lock_record(old, new, tree=False):
+              """Compare one lockfile record: only a compatible version bump may differ, with
+              the tarball URL following the version. In a v2 `dependencies` tree the nested
+              records and the `requires` ranges follow the same rules."""
+              left, right = dict(old), dict(new)
+              if same(left, right):
+                  return True
+              av, bv = left.get('version'), right.get('version')
+              if not isinstance(av, str) or not isinstance(bv, str) or not compatible(av, bv):
+                  return False
+              for field in ['resolved', 'integrity']:
+                  if left.get(field) != right.get(field) and av == bv:
+                      return False
+              # Preserve the registry and package identity, allowing only the version
+              # component in the tarball URL to change.
+              if not same_tarball(left.get('resolved', ''), av, right.get('resolved', ''), bv):
+                  return False
+              for field in ['version', 'resolved', 'integrity']:
+                  left.pop(field, None)
+                  right.pop(field, None)
+              if not tree:
+                  return json_manifest(left, right)
+              if not dependency_map(left.pop('requires', {}), right.pop('requires', {})):
+                  return False
+              return lock_tree(left.pop('dependencies', {}), right.pop('dependencies', {})) and same(left, right)
+
+
+          def lock_tree(old, new):
+              return (isinstance(old, dict) and isinstance(new, dict) and old.keys() == new.keys()
+                      and all(isinstance(old[k], dict) and isinstance(new[k], dict)
+                              and lock_record(old[k], new[k], tree=True) for k in old))
+
+
+          def tree_matches_packages(tree, packages, prefix=''):
+              """Every record of a v2 `dependencies` tree must agree with the `packages` record
+              at the same path on version, tarball and integrity."""
+              for name, record in tree.items():
+                  path = prefix + 'node_modules/' + name
+                  entry = packages.get(path)
+                  if not isinstance(entry, dict) or any(entry.get(f) != record.get(f) for f in ('version', 'resolved', 'integrity')):
+                      return False
+                  if not tree_matches_packages(record.get('dependencies', {}), packages, path + '/'):
+                      return False
+              return True
+
+
           def content_compatible(path, before, after):
               if path.startswith('.github/workflows/'):
                   # YAML breaks lines on \n, \r\n and \r only. Every other separator that
@@ -297,32 +343,17 @@ jobs:
               if path.endswith('package-lock.json'):
                   old, new = strict_json(before), strict_json(after)
                   a, b = old.pop('packages', {}), new.pop('packages', {})
+                  # Lockfile v2 repeats every record under a top-level `dependencies` tree.
+                  legacy_a, legacy_b = old.pop('dependencies', {}), new.pop('dependencies', {})
                   if not same(old, new) or not a or a.keys() != b.keys():
                       return False
                   for key, value in a.items():
-                      left, right = dict(value), dict(b[key])
                       if not key:
-                          if not json_manifest(left, right):
+                          if not json_manifest(value, b[key]):
                               return False
-                          continue
-                      if same(left, right):
-                          continue
-                      av, bv = left.get('version'), right.get('version')
-                      if not isinstance(av, str) or not isinstance(bv, str) or not compatible(av, bv):
+                      elif not lock_record(value, b[key]):
                           return False
-                      for field in ['resolved', 'integrity']:
-                          if left.get(field) != right.get(field) and av == bv:
-                              return False
-                      # Preserve the registry and package identity, allowing only the version
-                      # component in the tarball URL to change.
-                      if not same_tarball(left.get('resolved', ''), av, right.get('resolved', ''), bv):
-                          return False
-                      for field in ['version', 'resolved', 'integrity']:
-                          left.pop(field, None)
-                          right.pop(field, None)
-                      if not json_manifest(left, right):
-                          return False
-                  return True
+                  return lock_tree(legacy_a, legacy_b) and tree_matches_packages(legacy_b, b)
               if path.endswith('Cargo.toml'):
                   def deps(a, b):
                       if not isinstance(a, dict) or not isinstance(b, dict) or a.keys() != b.keys():
