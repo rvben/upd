@@ -313,10 +313,10 @@ jobs:
               for field in ['version', 'resolved', 'integrity']:
                   left.pop(field, None)
                   right.pop(field, None)
+              # A record mirrors the published manifest of that exact version, so everything
+              # else in it (dependency ranges, `requires`, engines, bin, ...) stays identical.
               if not tree:
-                  return json_manifest(left, right)
-              if not dependency_map(left.pop('requires', {}), right.pop('requires', {})):
-                  return False
+                  return same(left, right)
               return lock_tree(left.pop('dependencies', {}), right.pop('dependencies', {})) and same(left, right)
 
 

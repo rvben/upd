@@ -664,6 +664,26 @@ class ReviewPolicy(unittest.TestCase):
         self.assertFalse(check('go.sum', row('v2.0.0+incompatible', '1'), row('v2.1.0', '2')))
         self.assertFalse(check('go.sum', row('v1.0.0+a', '1'), row('v1.0.0+b', '1')))
 
+    def test_a_non_root_lockfile_record_keeps_its_dependency_ranges(self):
+        check = ns['content_compatible']
+
+        def lock(version, bar, root='^1.0.0', **extra):
+            foo = {'version': version, 'resolved': 'https://registry.npmjs.org/foo/-/foo-%s.tgz' % version,
+                   'integrity': sri(version), 'dependencies': {'bar': bar}}
+            foo.update(extra)
+            return json.dumps({'lockfileVersion': 3, 'packages': {'': {'dependencies': {'foo': root}}, 'node_modules/foo': foo}})
+
+        path = 'package-lock.json'
+        self.assertTrue(check(path, lock('1.0.0', '^1.0.0'), lock('1.0.1', '^1.0.0')))
+        # The root record keeps its range-bump rule.
+        self.assertTrue(check(path, lock('1.0.0', '^1.0.0'), lock('1.0.1', '^1.0.0', root='^1.1.0')))
+        self.assertFalse(check(path, lock('1.0.0', '^1.0.0'), lock('1.0.0', '^1.5.0')))
+        self.assertFalse(check(path, lock('1.0.0', '^1.0.0'), lock('1.0.1', '^1.5.0')))
+        for field in ['optionalDependencies', 'peerDependencies']:
+            self.assertFalse(check(path, lock('1.0.0', '^1.0.0', **{field: {'x': '^1.0.0'}}),
+                                   lock('1.0.1', '^1.0.0', **{field: {'x': '^1.1.0'}})), field)
+        self.assertFalse(check(path, lock('1.0.0', '^1.0.0', engines={'node': '>=18'}), lock('1.0.1', '^1.0.0', engines={'node': '>=12'})))
+
     def test_lockfile_v2_dependency_tree_follows_the_same_bump_rules(self):
         check = ns['content_compatible']
 
@@ -672,7 +692,7 @@ class ReviewPolicy(unittest.TestCase):
 
         def lock(lodash, nested, host='registry.npmjs.org', extra=None):
             record = {'version': lodash, 'resolved': tarball('lodash', lodash, host), 'integrity': sri(lodash),
-                      'requires': {'inner': '^' + nested},
+                      'requires': {'inner': '^1.0.0'},
                       'dependencies': {'inner': {'version': nested, 'resolved': tarball('inner', nested), 'integrity': sri(nested)}}}
             record.update(extra or {})
             return json.dumps({'name': 'f', 'lockfileVersion': 2, 'packages': {
@@ -685,6 +705,12 @@ class ReviewPolicy(unittest.TestCase):
         self.assertTrue(check(path, lock('4.17.20', '1.0.0'), lock('4.17.20', '1.0.0')))
         self.assertTrue(check(path, lock('4.17.20', '1.0.0'), lock('4.17.21', '1.0.0')))
         self.assertTrue(check(path, lock('4.17.20', '1.0.0'), lock('4.17.21', '1.1.0')))
+        # A record's dependency ranges follow its version, never a bump of their own.
+        tree_range = json.loads(lock('4.17.20', '1.0.0'))
+        tree_range['dependencies']['lodash']['requires']['inner'] = '^1.5.0'
+        self.assertFalse(check(path, lock('4.17.20', '1.0.0'), json.dumps(tree_range)))
+        tree_range['dependencies']['lodash'].update(version='4.17.21', resolved=tarball('lodash', '4.17.21'), integrity=sri('4.17.21'))
+        self.assertFalse(check(path, lock('4.17.20', '1.0.0'), json.dumps(tree_range)))
         # The legacy tree is held to the same rules as `packages`.
         self.assertFalse(check(path, lock('4.17.20', '1.0.0'), lock('4.17.21', '1.0.0', host='evil.example')))
         self.assertFalse(check(path, lock('4.17.20', '1.0.0'), lock('4.17.21', '2.0.0')))
