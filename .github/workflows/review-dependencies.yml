@@ -476,18 +476,22 @@ jobs:
                   if blank(before) != blank(after):
                       return False
                   try:
-                      old, new = Counter(go_sum_records(before)), Counter(go_sum_records(after))
+                      list(go_sum_records(before)), list(go_sum_records(after))
                   except ValueError:
                       return False
-                  # Rows present on both sides are untouched; the rest must pair up
-                  # per module and per /go.mod suffix as version bumps.
+                  # Lines present on both sides are untouched, byte for byte; the rest must
+                  # be canonical rows that pair up per module, /go.mod suffix and
+                  # +incompatible marker as version bumps.
+                  old, new = Counter(before.split('\n')), Counter(after.split('\n'))
                   removed, added = old - new, new - old
 
-                  def grouped(rows):
+                  def grouped(lines):
                       result = {}
-                      for module, version, checksum in rows.elements():
-                          suffix = '/go.mod' if version.endswith('/go.mod') else ''
-                          result.setdefault((module, suffix), []).append((version.removesuffix('/go.mod'), checksum))
+                      for line in lines.elements():
+                          row = GO_SUM_ROW.fullmatch(line)
+                          if not row:
+                              raise ValueError(f'not a canonical go.sum row: {line!r}')
+                          result.setdefault((row[1], row[3], row[4]), []).append((row[2], row[5]))
                       return {k: sorted(v, key=lambda r: (semver_key(r[0]), r[1])) for k, v in result.items()}
                   try:
                       a, b = grouped(removed), grouped(added)
@@ -585,6 +589,11 @@ jobs:
 
           def parse_go_mod(text):
               go_mod_entries(text)
+
+
+          # One go.sum row as `go mod tidy` writes it: single spaces, an optional +incompatible
+          # marker, and an h1 hash of 32 base64-encoded bytes.
+          GO_SUM_ROW = re.compile(r'([A-Za-z0-9._~/-]+) (v[0-9]+\.[0-9]+\.[0-9]+)(\+incompatible)?(/go\.mod)? (h1:[A-Za-z0-9+/]{43}=)', re.ASCII)
 
 
           def go_sum_records(text):

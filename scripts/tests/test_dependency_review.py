@@ -632,6 +632,38 @@ class ReviewPolicy(unittest.TestCase):
             else:
                 self.assertFalse(check(path, old, new), name)
 
+    def test_go_sum_rows_must_be_canonical_and_keep_their_markers(self):
+        check = ns['content_compatible']
+        checksum = lambda seed: 'h1:' + base64.b64encode(hashlib.sha256(seed.encode()).digest()).decode()
+        row = lambda version, seed, module='example.com/a', suffix='': '%s %s%s %s\n' % (module, version, suffix, checksum(seed))
+        keep = row('v1.0.0', 'keep', 'example.com/b')
+        go_sum = lambda *rows: ''.join(rows)
+        self.assertTrue(check('go.sum', go_sum(keep, row('v1.0.0', '1')), go_sum(keep, row('v1.0.1', '2'))))
+        self.assertTrue(check('go.sum', row('v2.0.0+incompatible', '1'), row('v2.1.0+incompatible', '2')))
+        self.assertTrue(check('go.sum', row('v1.0.0', '1', suffix='/go.mod'), row('v1.0.1', '2', suffix='/go.mod')))
+        old = go_sum(keep, row('v1.0.0', '1'))
+        new = go_sum(keep, row('v1.0.1', '2'))
+        refused = {
+            'double space': new.replace(' v1.0.1', '  v1.0.1'),
+            'tab': new.replace(' v1.0.1', '\tv1.0.1'),
+            'CRLF': new.replace('\n', '\r\n'),
+            'trailing space': new.replace('\n', ' \n'),
+            'leading space': ' ' + new,
+            'empty checksum': new.replace(checksum('2'), 'h1:'),
+            'short checksum': new.replace(checksum('2'), checksum('2')[:-5] + '='),
+            'checksum without padding': new.replace(checksum('2'), checksum('2').rstrip('=')),
+            'extra field': new.replace('\n', ' extra\n'),
+        }
+        for name, text in refused.items():
+            self.assertFalse(check('go.sum', old, text), name)
+        # An unchanged row is compared byte for byte, so reformatting it is not a bump.
+        self.assertFalse(check('go.sum', old, new.replace(keep, keep.replace(' v1.0.0', '  v1.0.0'))))
+        self.assertFalse(check('go.sum', old, new.replace(keep, keep.rstrip('\n') + '\r\n')))
+        # The +incompatible marker is part of the identity of a row.
+        self.assertFalse(check('go.sum', row('v2.0.0', '1'), row('v2.1.0+incompatible', '2')))
+        self.assertFalse(check('go.sum', row('v2.0.0+incompatible', '1'), row('v2.1.0', '2')))
+        self.assertFalse(check('go.sum', row('v1.0.0+a', '1'), row('v1.0.0+b', '1')))
+
     def test_lockfile_v2_dependency_tree_follows_the_same_bump_rules(self):
         check = ns['content_compatible']
 
