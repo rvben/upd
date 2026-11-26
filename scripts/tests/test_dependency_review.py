@@ -254,6 +254,111 @@ class ReviewPolicy(unittest.TestCase):
                 self.path_contents[(name, self.head)] = 'name: [broken\n'
                 self.assert_hard_failure()
 
+    def test_go_files_are_parsed_strictly_whatever_their_status(self):
+        for name, bad in [('go.mod', 'module example.com/m\nrequire (\n\texample.com/a v1.0.0\n'),
+                          ('go.mod', 'bogus directive\n'),
+                          ('go.mod', 'module example.org/demo\ngo 1.24 unexpected\n'),
+                          ('go.mod', 'module example.org/demo\ntool example.org/a example.org/b\n'),
+                          ('go.mod', 'module example.org/demo\nrequire example.org/a v1.0.0 extra\n'),
+                          ('go.mod', 'module example.org/demo\ngo (\n\t1.24\n)\n'),
+                          ('go.sum', 'example.com/a v1.0.0 h1:aa=\x0bexample.com/a v1.0.0/go.mod h1:bb=\n'),
+                          ('go.sum', 'example.com/a v1.0.0 notahash\n')]:
+            for status in ['added', 'modified']:
+                with self.subTest(name=name, status=status):
+                    self.approvals = []
+                    self.two_files(name, status)
+                    self.path_contents[(name, self.head)] = bad
+                    self.path_contents[(name, self.base)] = bad
+                    self.assert_hard_failure()
+
+    def test_go_mod_directives_take_the_operands_go_gives_them(self):
+        # Shapes checked against `go mod edit -json` from Go 1.27.
+        parse = ns['parse_document']
+        head = 'module example.org/m\ngo 1.24\n'
+        for valid in ['tool (\n\texample.org/cmd/x\n)\n', 'ignore (\n\t./x\n)\n',
+                      'exclude example.org/a v1.0.0\n', 'retract [v1.0.0, v1.1.0]\n',
+                      'retract (\n\tv1.0.0 // why\n\t[v1.1.0, v1.2.0]\n)\n',
+                      'replace example.org/a v1.0.0 => example.org/b v1.1.0\n', 'replace example.org/a => ../a\n',
+                      'godebug (\n\tx=1\n)\n', 'require "example.org/a" v1.0.0 // indirect\n']:
+            with self.subTest(valid=valid):
+                parse('go.mod', head + valid)
+        for invalid in ['tool a b\n', 'ignore a b\n', 'exclude example.org/a\n', 'retract v1.0.0 v1.1.0\n',
+                        'replace example.org/a =>\n', 'godebug a=1 b=2\n', 'toolchain go1.24.1\ntoolchain go1.24.2\n',
+                        'go 1.25\n', 'require (\n\texample.org/a\n)\n']:
+            with self.subTest(invalid=invalid):
+                with self.assertRaises(ValueError):
+                    parse('go.mod', head + invalid)
+
+    def test_a_valid_go_mod_with_a_tool_block_can_still_be_bumped(self):
+        check = ns['content_compatible']
+        text = 'module m\ngo 1.24\nrequire example.org/a v%s\ntool (\n\texample.org/cmd/x\n)\n'
+        self.assertTrue(check('go.mod', text % '1.0.0', text % '1.0.1'))
+        self.two_files('go.mod', 'modified')
+        self.path_contents[('go.mod', self.base)] = text % '1.0.0'
+        self.path_contents[('go.mod', self.head)] = text % '1.0.1'
+        self.review()
+        self.assertEqual(len(self.approvals), 1)
+
+    def test_go_sum_lines_are_split_on_newlines_only(self):
+        parse = ns['parse_document']
+        parse('go.sum', 'example.com/a v1.0.0 h1:aa=\r\nexample.com/a v1.0.0/go.mod h1:bb=\r\n')
+        for separator in ['\x0b', '\x0c', '\u2028', '\x85', '\xa0']:
+            with self.subTest(separator=repr(separator)):
+                with self.assertRaises(ValueError):
+                    parse('go.sum', f'example.com/a v1.0.0 h1:aa={separator}example.com/a v1.0.0/go.mod h1:bb=\n')
+
+    def test_json_with_non_standard_constants_or_duplicate_keys_fails(self):
+        for bad in ['{"a": NaN}', '{"a": Infinity}', '{"a": -Infinity}', '{"a": 1, "a": 2}']:
+            with self.subTest(bad=bad):
+                self.approvals = []
+                self.two_files('package.json', 'modified')
+                self.path_contents[('package.json', self.base)] = '{"a": 1}'
+                self.path_contents[('package.json', self.head)] = bad
+                self.assert_hard_failure()
+        self.two_files('docs/data.json', 'added')
+        self.path_contents[('docs/data.json', self.head)] = '{"a": NaN}'
+        self.assert_hard_failure()
+
+    def test_a_table_that_only_shares_a_dependency_name_is_not_a_dependency(self):
+        check = ns['content_compatible']
+        old = '[package.metadata.dependencies]\na = "1.0.0"\n'
+        self.assertFalse(check('Cargo.toml', old, old.replace('1.0.0', '1.0.1')))
+        self.assertFalse(check('Cargo.toml', '[package.metadata.dependencies]\na = { version = "1.0.0" }\n',
+                               '[package.metadata.dependencies]\na = { version = "1.0.1" }\n'))
+        real = '[target.\'cfg(unix)\'.dependencies]\na = "1.0.0"\n'
+        self.assertTrue(check('Cargo.toml', real, real.replace('1.0.0', '1.1.0')))
+        ws = '[workspace.dependencies]\na = "1.0.0"\n'
+        self.assertTrue(check('Cargo.toml', ws, ws.replace('1.0.0', '1.1.0')))
+
+    def test_equality_keeps_booleans_apart_from_numbers(self):
+        check = ns['content_compatible']
+        self.assertFalse(check('package.json', '{"private":1,"dependencies":{"a":"^1.0.0"}}',
+                               '{"private":true,"dependencies":{"a":"^1.1.0"}}'))
+        self.assertFalse(check('package.json', '{"private":false,"dependencies":{"a":"^1.0.0"}}',
+                               '{"private":0,"dependencies":{"a":"^1.1.0"}}'))
+        self.assertTrue(check('package.json', '{"private":true,"dependencies":{"a":"^1.0.0"}}',
+                              '{"private":true,"dependencies":{"a":"^1.1.0"}}'))
+        self.assertFalse(check('Cargo.toml', '[package]\nx = 1\n[dependencies]\na = "1.0.0"\n',
+                               '[package]\nx = true\n[dependencies]\na = "1.1.0"\n'))
+
+    def test_the_base_branch_is_url_encoded_in_the_pull_request_lookup(self):
+        seen = []
+        def api(path, payload=None, method="POST"):
+            seen.append(path)
+            if path == 'repos/' + self.repo:
+                return {'default_branch': 'release+stable'}
+            return self.api(path.replace('release%2Bstable', 'main').replace('release+stable', 'main'), payload, method)
+        self.run['head_branch'] = 'release+stable'
+        self.pr['base']['ref'] = 'release+stable'
+        original = ns['review']
+        try:
+            original(self.repo, 7, api, self.download)
+        except Exception:
+            pass
+        lookups = [p for p in seen if '/pulls?' in p]
+        self.assertTrue(lookups, seen)
+        self.assertTrue(all('base=release%2Bstable&' in p for p in lookups), lookups)
+
     def test_reviewer_serializes_with_the_dependency_publisher(self):
         publisher = WORKFLOW.with_name('dependency-health.yml').read_text()
         group = '  group: upd-dependency-writes-${{ github.repository }}'

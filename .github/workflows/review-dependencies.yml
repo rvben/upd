@@ -119,9 +119,31 @@ jobs:
               return b >= a and a[0] == b[0] and (a[0] != 0 or (a[1] == b[1] and (a[1] != 0 or a[2] == b[2])))
 
 
+          def same(a, b):
+              """Structural equality that keeps JSON/TOML types apart (1 is not true)."""
+              if type(a) is not type(b):
+                  return False
+              if isinstance(a, dict):
+                  return a.keys() == b.keys() and all(same(v, b[k]) for k, v in a.items())
+              if isinstance(a, list):
+                  return len(a) == len(b) and all(same(x, y) for x, y in zip(a, b))
+              return a == b
+
+
+          def strict_json(text):
+              def refuse(constant):
+                  raise ValueError(f'non-standard JSON constant: {constant}')
+              def unique(pairs):
+                  keys = [k for k, _ in pairs]
+                  if len(set(keys)) != len(keys):
+                      raise ValueError('duplicate JSON key')
+                  return dict(pairs)
+              return json.loads(text, parse_constant=refuse, object_pairs_hook=unique)
+
+
           def dependency_map(old, new):
               return (isinstance(old, dict) and isinstance(new, dict) and old.keys() == new.keys()
-                      and all(a == new[k] or (isinstance(a, str) and isinstance(new[k], str)
+                      and all(same(a, new[k]) or (isinstance(a, str) and isinstance(new[k], str)
                               and compatible(a, new[k])) for k, a in old.items()))
 
 
@@ -130,7 +152,7 @@ jobs:
               for key in ['dependencies', 'devDependencies', 'peerDependencies', 'optionalDependencies']:
                   if not dependency_map(old.pop(key, {}), new.pop(key, {})):
                       return False
-              return old == new
+              return same(old, new)
 
 
           def content_compatible(path, before, after):
@@ -148,11 +170,11 @@ jobs:
                           return False
                   return True
               if path.endswith('package.json'):
-                  return json_manifest(json.loads(before), json.loads(after))
+                  return json_manifest(strict_json(before), strict_json(after))
               if path.endswith('package-lock.json'):
-                  old, new = json.loads(before), json.loads(after)
+                  old, new = strict_json(before), strict_json(after)
                   a, b = old.pop('packages', {}), new.pop('packages', {})
-                  if old != new or not a or a.keys() != b.keys():
+                  if not same(old, new) or not a or a.keys() != b.keys():
                       return False
                   for key, value in a.items():
                       left, right = dict(value), dict(b[key])
@@ -160,7 +182,7 @@ jobs:
                           if not json_manifest(left, right):
                               return False
                           continue
-                      if left == right:
+                      if same(left, right):
                           continue
                       av, bv = left.get('version'), right.get('version')
                       if not isinstance(av, str) or not isinstance(bv, str) or not compatible(av, bv):
@@ -185,7 +207,7 @@ jobs:
                           return False
                       for key, value in a.items():
                           other = b[key]
-                          if value == other:
+                          if same(value, other):
                               continue
                           if isinstance(value, str) and isinstance(other, str):
                               if not compatible(value, other):
@@ -193,29 +215,33 @@ jobs:
                           elif isinstance(value, dict) and isinstance(other, dict):
                               x, y = dict(value), dict(other)
                               av, bv = x.pop('version', ''), y.pop('version', '')
-                              if x != y or not compatible(av, bv):
+                              if not same(x, y) or not compatible(av, bv):
                                   return False
                           else:
                               return False
                       return True
-                  def manifest(a, b):
-                      if a == b:
+                  def manifest(a, b, path=()):
+                      if same(a, b):
                           return True
                       if not isinstance(a, dict) or not isinstance(b, dict) or a.keys() != b.keys():
                           return False
-                      return all((deps(a[k], b[k]) if k in {'dependencies', 'dev-dependencies', 'build-dependencies'}
-                                  else manifest(a[k], b[k])) for k in a)
+                      # Only real dependency tables are compared as dependencies: the top
+                      # level, [workspace], and [target.<cfg>]. A table that merely shares
+                      # the name (package.metadata.dependencies) must not change at all.
+                      scope = path in {(), ('workspace',)} or (len(path) == 2 and path[0] == 'target')
+                      return all((deps(a[k], b[k]) if scope and k in {'dependencies', 'dev-dependencies', 'build-dependencies'}
+                                  else manifest(a[k], b[k], path + (k,))) for k in a)
                   return manifest(tomllib.loads(before), tomllib.loads(after))
               if path.endswith('Cargo.lock'):
                   a, b = tomllib.loads(before), tomllib.loads(after)
                   ap, bp = a.pop('package', []), b.pop('package', [])
-                  if a != b or not ap or len(ap) != len(bp):
+                  if not same(a, b) or not ap or len(ap) != len(bp):
                       return False
                   # Stable sorting pairs multiple installed versions of the same crate.
                   order = lambda p: (p['name'], p.get('source', ''), tuple(map(int, re.match(r'^(\d+)\.(\d+)\.(\d+)', p['version']).groups())) + (p['version'],))
                   for x, y in zip(sorted(ap, key=order), sorted(bp, key=order)):
                       left, right = dict(x), dict(y)
-                      if left == right:
+                      if same(left, right):
                           continue
                       av, bv = left['version'], right['version']
                       if not compatible(av, bv) or (av == bv and left.get('checksum') != right.get('checksum')):
@@ -226,7 +252,7 @@ jobs:
                       # Cargo may rewire a reference to another already-installed version.
                       # No source, crate identity, metadata, or dependency names can change.
                       ad, bd = left.pop('dependencies', []), right.pop('dependencies', [])
-                      if left != right or [s.split()[0] for s in ad] != [s.split()[0] for s in bd]:
+                      if not same(left, right) or [s.split()[0] for s in ad] != [s.split()[0] for s in bd]:
                           return False
                       known = {(p['name'], p['version']) for p in ap + bp}
                       if any(len(s.split()) > 1 and tuple(s.split()[:2]) not in known for s in bd):
@@ -247,8 +273,7 @@ jobs:
               if path.endswith('go.sum'):
                   def sums(text):
                       result = {}
-                      for line in text.splitlines():
-                          module, version, checksum = line.split()
+                      for module, version, checksum in go_sum_records(text):
                           suffix = '/go.mod' if version.endswith('/go.mod') else ''
                           result.setdefault((module, suffix), []).append((version.removesuffix('/go.mod'), checksum))
                       return {k: sorted(v) for k, v in result.items()}
@@ -259,12 +284,133 @@ jobs:
               return False
 
 
+          GO_TOKEN = re.compile(r'//[^\n]*|"(?:\\.|[^"\\])*"|`[^`]*`|=>|[()\[\],]|(?:(?!//|=>)[^\s()\[\],"`])+')
+          # Operand counts per go.mod directive, as golang.org/x/mod/modfile enforces them.
+          GO_MOD_VERBS = {'module': 1, 'go': 1, 'toolchain': 1, 'godebug': 1, 'tool': 1, 'ignore': 1,
+                          'require': 2, 'exclude': 2, 'replace': None, 'retract': None}
+          GO_MOD_SINGLE = {'module', 'go', 'toolchain'}
+          GO_SPACE = re.compile(r'[\t\n\v\f\r \x85\xa0\u1680\u2000-\u200a\u2028\u2029\u202f\u205f\u3000]+')
+
+
+          def go_mod_tokens(line):
+              tokens, position = [], 0
+              while position < len(line):
+                  if line[position] in ' \t\r':
+                      position += 1
+                      continue
+                  match = GO_TOKEN.match(line, position)
+                  if not match:
+                      raise ValueError('unexpected character')
+                  if match.group().startswith('//'):
+                      break
+                  tokens.append(match.group())
+                  position = match.end()
+              return tokens
+
+
+          def go_mod_arguments_ok(verb, args):
+              if verb == 'replace':
+                  if args.count('=>') != 1:
+                      return False
+                  split = args.index('=>')
+                  left, right = args[:split], args[split + 1:]
+                  return len(left) in {1, 2} and len(right) in {1, 2} and not {'(', ')', ',', '[', ']'} & set(args)
+              if verb == 'retract':
+                  if len(args) == 1:
+                      return args[0] not in {'(', ')', ',', '[', ']', '=>'}
+                  return len(args) == 5 and args[0] == '[' and args[2] == ',' and args[4] == ']'
+              return (len(args) == GO_MOD_VERBS[verb]
+                      and not {'(', ')', ',', '[', ']', '=>'} & set(args))
+
+
+          def go_mod_entries(text):
+              """Parse go.mod as Go does and return (directive, role, line) per physical line.
+
+              The role is stmt, open, member, close or blank, so a caller can tell which
+              directive a block line belongs to. Anything Go would reject raises."""
+              entries, block, seen = [], None, set()
+              for number, line in enumerate(text.split('\n'), 1):
+                  def fail(reason):
+                      return ValueError(f'go.mod line {number}: {reason}')
+                  try:
+                      tokens = go_mod_tokens(line)
+                  except ValueError as problem:
+                      raise fail(str(problem)) from None
+                  if not tokens:
+                      entries.append((block or '', 'blank', line))
+                  elif block:
+                      if tokens == [')']:
+                          entries.append((block, 'close', line))
+                          block = None
+                      elif go_mod_arguments_ok(block, tokens):
+                          entries.append((block, 'member', line))
+                      else:
+                          raise fail(f'malformed {block} entry')
+                  else:
+                      verb, args = tokens[0], tokens[1:]
+                      if verb not in GO_MOD_VERBS:
+                          raise fail('unknown directive')
+                      if args == ['(']:
+                          if verb in {'go', 'toolchain'}:
+                              raise fail(f'{verb} cannot be a block')
+                          block = verb
+                          entries.append((verb, 'open', line))
+                          continue
+                      if not go_mod_arguments_ok(verb, args):
+                          raise fail(f'malformed {verb} directive')
+                      if verb in GO_MOD_SINGLE:
+                          if verb in seen:
+                              raise fail(f'repeated {verb} directive')
+                          seen.add(verb)
+                      entries.append((verb, 'stmt', line))
+              if block:
+                  raise ValueError('go.mod has an unclosed block')
+              return entries
+
+
+          def parse_go_mod(text):
+              go_mod_entries(text)
+
+
+          def go_sum_records(text):
+              """Yield (module, version, checksum) per go.sum line, split as Go splits it:
+              on newlines only, then on Unicode white space."""
+              for number, line in enumerate(text.split('\n'), 1):
+                  fields = [f for f in GO_SPACE.split(line) if f]
+                  if not fields:
+                      continue
+                  if len(fields) != 3 or not fields[1].startswith('v') or not fields[2].startswith('h1:'):
+                      raise ValueError(f'go.sum line {number}: malformed entry')
+                  yield tuple(fields)
+
+
+          def parse_go_sum(text):
+              list(go_sum_records(text))
+
+
+          def semver_key(version):
+              match = re.fullmatch(r'v(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-([0-9A-Za-z.-]+))?(?:\+[0-9A-Za-z.-]+)?', version)
+              if not match:
+                  raise ValueError(f'not a semantic version: {version}')
+              pre = match[4]
+              identifiers = tuple((0, int(i), '') if i.isdigit() else (1, 0, i) for i in pre.split('.')) if pre else ()
+              return (int(match[1]), int(match[2]), int(match[3]), pre is None, identifiers, version)
+
+
           def parse_document(path, text):
-              """Fully parse a changed file whatever its status or classification."""
+              """Fully parse a changed file whatever its status or classification.
+
+              Workflow YAML has no stdlib parser; a modified workflow is held to
+              line-for-line `uses:` replacements by content_compatible, so every other
+              line is byte-identical to a file GitHub already accepted."""
               if path.endswith('.json'):
-                  json.loads(text)
+                  strict_json(text)
               elif path.endswith('.toml') or path.endswith('Cargo.lock'):
                   tomllib.loads(text)
+              elif path.endswith('go.mod'):
+                  parse_go_mod(text)
+              elif path.endswith('go.sum'):
+                  parse_go_sum(text)
 
 
           def verify_contents(get, repo, base, head, files):
@@ -336,7 +482,7 @@ jobs:
 
 
           def dismiss_stale(get, repo, branch):
-              prs = get(f"repos/{repo}/pulls?state=open&head={repo.split('/')[0]}:deps/upd&base={branch}&per_page=100")
+              prs = get(f"repos/{repo}/pulls?state=open&head={repo.split('/')[0]}:deps/upd&base={quote(branch, safe='')}&per_page=100")
               for pr in prs:
                   if pr.get('user', {}).get('id') != UPD_BOT_ID:
                       continue
@@ -459,7 +605,7 @@ jobs:
               if presentation.get("auto_merge_requested") is not True or presentation.get("auto_merge_eligible") is not True:
                   reasons.append("proposal requires manual review")
               reasons += verify_contents(get, repo, base, proposal, files)
-              prs = get(f"repos/{repo}/pulls?state=open&head={repo.split('/')[0]}:deps/upd&base={branch}&per_page=100")
+              prs = get(f"repos/{repo}/pulls?state=open&head={repo.split('/')[0]}:deps/upd&base={quote(branch, safe='')}&per_page=100")
               # The proposal is found by identity alone: the publisher switches auto-merge
               # off for a proposal that needs a person, and a bot-owned PR with it off is
               # still the published proposal whose integrity must be checked. A proposal
