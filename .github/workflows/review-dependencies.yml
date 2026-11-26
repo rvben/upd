@@ -49,7 +49,7 @@ jobs:
           import re
           import subprocess
           import zipfile
-          from urllib.parse import quote
+          from urllib.parse import quote, urlsplit
 
           TRUSTED_UPD_SHA = "b183939ff7dc62539afb00b3c555ffbfe3c5d58b"
           UPD_BOT_ID = int(os.environ.get('UPD_PUBLISHER_BOT_ID', '322216747'))
@@ -247,6 +247,22 @@ jobs:
 
 
 
+          def same_tarball(old_url, old_version, new_url, new_version):
+              """Compare resolved URLs part by part: scheme, host, directories, query and
+              fragment must match, and only the version inside the file name may differ."""
+              if not isinstance(old_url, str) or not isinstance(new_url, str):
+                  return False
+              if not old_url and not new_url:
+                  return True
+              a, b = urlsplit(old_url), urlsplit(new_url)
+              if not a.scheme or not a.netloc or (a.scheme, a.netloc, a.query, a.fragment) != (b.scheme, b.netloc, b.query, b.fragment):
+                  return False
+              old_path, new_path = a.path.split('/'), b.path.split('/')
+              if len(old_path) != len(new_path) or old_path[:-1] != new_path[:-1]:
+                  return False
+              return old_path[-1].replace(old_version, '{version}') == new_path[-1].replace(new_version, '{version}')
+
+
           def content_compatible(path, before, after):
               if path.startswith('.github/workflows/'):
                   # YAML breaks lines on \n, \r\n and \r only. Every other separator that
@@ -298,8 +314,7 @@ jobs:
                               return False
                       # Preserve the registry and package identity, allowing only the version
                       # component in the tarball URL to change.
-                      ar, br = left.get('resolved', ''), right.get('resolved', '')
-                      if ar.replace(av, '{version}') != br.replace(bv, '{version}'):
+                      if not same_tarball(left.get('resolved', ''), av, right.get('resolved', ''), bv):
                           return False
                       for field in ['version', 'resolved', 'integrity']:
                           left.pop(field, None)

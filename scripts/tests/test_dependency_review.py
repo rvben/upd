@@ -482,6 +482,29 @@ class ReviewPolicy(unittest.TestCase):
             new = head % (flow % ('b' * 40, 1) if '%s' in flow else flow)
             self.assertFalse(check(path, old + use % ('a' * 40, 0), new + use % ('b' * 40, 1)), flow)
 
+    def test_lockfile_tarball_urls_may_only_change_the_version_in_the_file_name(self):
+        check = ns['content_compatible']
+
+        def lock(url, version):
+            return json.dumps({'lockfileVersion': 3, 'packages': {'': {}, 'node_modules/a': {
+                'version': version, 'resolved': url, 'integrity': 'sha512-x'}}})
+
+        npm = 'https://registry.npmjs.org/a/-/a-%s.tgz'
+        self.assertTrue(check('package-lock.json', lock(npm % '1.0.0', '1.0.0'), lock(npm % '1.1.0', '1.1.0')))
+        scoped = 'https://registry.npmjs.org/@s/a/-/a-%s.tgz'
+        self.assertTrue(check('package-lock.json', lock(scoped % '1.0.0', '1.0.0'), lock(scoped % '1.1.0', '1.1.0')))
+        # The version also appears in the host or a directory: that is a different source.
+        moved = [
+            ('https://1.0.0.example.com/a/-/a-1.0.0.tgz', 'https://1.1.0.example.com/a/-/a-1.1.0.tgz'),
+            ('https://example.com/a-1.0.0/-/a-1.0.0.tgz', 'https://example.com/a-1.1.0/-/a-1.1.0.tgz'),
+            (npm % '1.0.0', 'http://registry.npmjs.org/a/-/a-1.1.0.tgz'),
+            (npm % '1.0.0', 'https://registry.npmjs.org/a/-/a-1.1.0.tgz?x=1'),
+            (npm % '1.0.0', 'https://registry.npmjs.org:444/a/-/a-1.1.0.tgz'),
+            (npm % '1.0.0', 'https://registry.npmjs.org/b/-/a-1.1.0.tgz'),
+        ]
+        for old, new in moved:
+            self.assertFalse(check('package-lock.json', lock(old, '1.0.0'), lock(new, '1.1.0')), (old, new))
+
     def test_unknown_new_files_and_unsupported_formats_require_review(self):
         self.files[0]['status'] = 'added'
         self.reject()
