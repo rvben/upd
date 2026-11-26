@@ -155,6 +155,8 @@ jobs:
 
 
           def json_manifest(old, new):
+              if not isinstance(old, dict) or not isinstance(new, dict):
+                  return False
               old, new = dict(old), dict(new)
               for key in ['dependencies', 'devDependencies', 'peerDependencies', 'optionalDependencies']:
                   if not dependency_map(old.pop(key, {}), new.pop(key, {})):
@@ -261,7 +263,10 @@ jobs:
                   return False
               if not old_url and not new_url:
                   return True
-              a, b = urlsplit(old_url), urlsplit(new_url)
+              try:
+                  a, b = urlsplit(old_url), urlsplit(new_url)
+              except ValueError:
+                  return False
               if not a.scheme or not a.netloc or (a.scheme, a.netloc, a.query, a.fragment) != (b.scheme, b.netloc, b.query, b.fragment):
                   return False
               old_path, new_path = a.path.split('/'), b.path.split('/')
@@ -284,6 +289,8 @@ jobs:
               """Compare one lockfile record: only a compatible version bump may differ, with
               the tarball URL following the version. In a v2 `dependencies` tree the nested
               records and the `requires` ranges follow the same rules."""
+              if not isinstance(old, dict) or not isinstance(new, dict):
+                  return False
               left, right = dict(old), dict(new)
               if same(left, right):
                   return True
@@ -333,6 +340,15 @@ jobs:
 
 
           def content_compatible(path, before, after):
+              """Whether the edit is a pure compatible bump. A file whose shape the
+              classifier does not expect is not one, so it declines rather than fails."""
+              try:
+                  return classify_content(path, before, after)
+              except (TypeError, AttributeError, KeyError, IndexError, ValueError):
+                  return False
+
+
+          def classify_content(path, before, after):
               if path.startswith('.github/workflows/'):
                   # YAML breaks lines on \n, \r\n and \r only. Every other separator that
                   # str.splitlines() honors may be script text, so it is never split on and
@@ -364,10 +380,14 @@ jobs:
                   return json_manifest(strict_json(before), strict_json(after))
               if path.endswith('package-lock.json'):
                   old, new = strict_json(before), strict_json(after)
+                  if not isinstance(old, dict) or not isinstance(new, dict):
+                      return False
                   a, b = old.pop('packages', {}), new.pop('packages', {})
                   # Lockfile v2 repeats every record under a top-level `dependencies` tree.
                   legacy_a, legacy_b = old.pop('dependencies', {}), new.pop('dependencies', {})
-                  if not same(old, new) or not a or a.keys() != b.keys():
+                  if (not same(old, new) or not isinstance(a, dict) or not isinstance(b, dict)
+                          or not isinstance(legacy_a, dict) or not isinstance(legacy_b, dict)
+                          or not a or a.keys() != b.keys()):
                       return False
                   for key, value in a.items():
                       if not key:

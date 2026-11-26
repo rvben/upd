@@ -498,6 +498,28 @@ class ReviewPolicy(unittest.TestCase):
         cargo = lambda version: '[package]\nname = "x"\n[dependencies]\na = "%s"\n' % version
         self.assertFalse(check('Cargo.toml', cargo('1.0.0'), cargo('1.0.0+evil')))
 
+    def test_unexpected_document_shapes_decline_instead_of_raising(self):
+        check = ns['content_compatible']
+        lock = 'package-lock.json'
+        record = lambda **fields: json.dumps({'packages': {'': {}, 'node_modules/a': fields}})
+        for path, text in [
+            (lock, '[]'), (lock, '1'), ('package.json', '1'), ('package.json', '[]'),
+            (lock, '{"packages": []}'), (lock, '{"packages": 5}'), (lock, '{"packages": {"": null}}'),
+            (lock, '{"packages": {"": {}, "node_modules/a": 5}}'), (lock, '{"packages": {"": {}, "node_modules/a": null}}'),
+            (lock, '{"packages": {"": {}}, "dependencies": []}'), (lock, '{"packages": {"": {}}, "dependencies": {"a": 1}}'),
+            ('package.json', '{"dependencies": []}'),
+            ('Cargo.lock', 'package = [1]'), ('Cargo.lock', '[[package]]\nname = "a"'),
+            ('Cargo.toml', '[dependencies]\na = 1'),
+        ]:
+            if path != 'Cargo.toml':  # an identical manifest is unchanged, whatever its values
+                self.assertFalse(check(path, text, text), (path, text))
+            self.assertFalse(check(path, text, text.replace('1', '2')), (path, text))
+        # An unparsable tarball URL declines like any other URL change.
+        good = record(version='1.0.0', resolved='https://registry.npmjs.org/a/-/a-1.0.0.tgz', integrity=sri('1'))
+        bad = record(version='1.0.1', resolved='http://[bad', integrity=sri('2'))
+        self.assertFalse(check(lock, good, bad))
+        self.assertFalse(check(lock, bad, good))
+
     def test_multiline_flow_collections_do_not_block_unrelated_action_bumps(self):
         check = ns['content_compatible']
         path = '.github/workflows/ci.yml'
