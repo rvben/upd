@@ -57,6 +57,10 @@ jobs:
           REVIEW_PATHS = {os.environ.get('GH_REPO', ''): os.environ.get('UPD_ALLOWED_PATHS', '').split()}
 
 
+          class ManualReview(ValueError):
+              """The proposal is genuine but outside automatic approval; a person decides."""
+
+
           def api(path, payload=None, method="POST"):
               args = ["gh", "api", path]
               if payload is not None:
@@ -255,21 +259,51 @@ jobs:
               return False
 
 
+          def parse_document(path, text):
+              """Fully parse a changed file whatever its status or classification."""
+              if path.endswith('.json'):
+                  json.loads(text)
+              elif path.endswith('.toml') or path.endswith('Cargo.lock'):
+                  tomllib.loads(text)
+
+
           def verify_contents(get, repo, base, head, files):
+              """Read and parse every changed file, then classify it.
+
+              Parsing is unconditional and comes first: a malformed file raises a hard
+              ValueError whatever its status or whatever another file needs. Returns the
+              reasons a person must review."""
+              def read(path, ref):
+                  blob = get(f"repos/{repo}/contents/{quote(path, safe='/')}?ref={ref}")
+                  if blob.get('encoding') != 'base64' or blob.get('size', MAX_ARCHIVE + 1) > MAX_ARCHIVE:
+                      raise ValueError('unsupported or oversized GitHub blob')
+                  return base64.b64decode(blob['content'], validate=False).decode('utf-8')
+              documents = []
               for file in files:
                   path = file['filename']
+                  after = read(path, head)
+                  parse_document(path, after)
+                  if file['status'] == 'added' and path.endswith(('.yml', '.yaml')):
+                      # The standard library cannot parse YAML, so a new YAML file cannot be
+                      # shown well-formed. It is an integrity failure rather than a notice
+                      # for a person, who would have no signal that the file is broken.
+                      raise ValueError(f'added YAML file cannot be validated: {path}')
+                  before = None
+                  if file['status'] == 'modified':
+                      before = read(path, base)
+                      parse_document(path, before)
+                  documents.append((file, before, after))
+              reasons = []
+              for file, before, after in documents:
+                  path = file['filename']
                   if file['status'] != 'modified':
-                      raise ValueError('new dependency files require manual review')
-                  def read(ref):
-                      blob = get(f"repos/{repo}/contents/{quote(path, safe='/')}?ref={ref}")
-                      if blob.get('encoding') != 'base64' or blob.get('size', MAX_ARCHIVE + 1) > MAX_ARCHIVE:
-                          raise ValueError('unsupported or oversized GitHub blob')
-                      return base64.b64decode(blob['content'], validate=False).decode('utf-8')
-                  if not content_compatible(path, read(base), read(head)):
-                      raise ValueError(f'file requires manual compatibility review: {path}')
+                      reasons.append('new dependency files require manual review')
+                  elif not content_compatible(path, before, after):
+                      reasons.append(f'file requires manual compatibility review: {path}')
+              return reasons
 
 
-          def candidate(pr, repo, branch, head):
+          def candidate(pr, repo, branch, head, armed=True):
               return (pr.get("state") == "open" and not pr.get("draft")
                       and pr.get("user", {}).get("id") == UPD_BOT_ID
                       and pr.get("user", {}).get("type") == "Bot"
@@ -278,8 +312,9 @@ jobs:
                       and pr.get("head", {}).get("ref") == "deps/upd"
                       and pr.get("head", {}).get("repo", {}).get("full_name") == repo
                       and pr.get("head", {}).get("sha") == head
-                      and (pr.get("auto_merge") or {}).get("merge_method") == "squash"
-                      and (pr.get("auto_merge") or {}).get("enabled_by", {}).get("id") == UPD_BOT_ID)
+                      and (not armed or (
+                          (pr.get("auto_merge") or {}).get("merge_method") == "squash"
+                          and (pr.get("auto_merge") or {}).get("enabled_by", {}).get("id") == UPD_BOT_ID)))
 
 
           def trusted_revision(get, reference):
@@ -320,7 +355,8 @@ jobs:
                       raise ValueError('review history exceeds safety bound')
 
 
-          def verify_merge_scope(get, repo, branch, base, head, number, files):
+          def verify_rules(get, repo, branch):
+              # Approval prerequisites: only needed when something is going to be approved.
               rules = get(f"repos/{repo}/rules/branches/{quote(branch, safe='')}")
               if not any(r['type'] == 'pull_request'
                          and r.get('parameters', {}).get('dismiss_stale_reviews_on_push') is True
@@ -332,18 +368,29 @@ jobs:
                          and all(isinstance(c.get('integration_id'), int) and c['integration_id'] > 0
                                  for c in r['parameters']['required_status_checks']) for r in rules):
                   raise ValueError('automatic approval requires strict required CI checks')
+
+
+          def verify_lineage(get, repo, branch, base, head):
               # A dispatch on a tag named like the default branch must not introduce an
               # unreviewed parent. Bind to the actual branch ref, not its ambiguous name.
               tip = get(f"repos/{repo}/git/ref/heads/{quote(branch, safe='')}")['object']['sha']
               if get(f"repos/{repo}/compare/{base}...{tip}")['status'] not in {'identical', 'ahead'}:
                   raise ValueError('triggering base is not on the protected default branch')
-              comparison = get(f"repos/{repo}/compare/{tip}...{head}")
-              if comparison.get('merge_base_commit', {}).get('sha') != base:
+              if get(f"repos/{repo}/compare/{tip}...{head}").get('merge_base_commit', {}).get('sha') != base:
                   raise ValueError('pull request merge base differs from the validated base')
+
+
+          def verify_pr_integrity(get, repo, branch, base, head, number, files):
+              verify_lineage(get, repo, branch, base, head)
               actual = get(f"repos/{repo}/pulls/{number}/files?per_page=100")
               identity = lambda rows: sorted((f['filename'], f['status'], f['sha']) for f in rows)
               if len(actual) >= 100 or identity(actual) != identity(files):
                   raise ValueError('pull request diff differs from the validated proposal')
+
+
+          def verify_merge_scope(get, repo, branch, base, head, number, files):
+              verify_rules(get, repo, branch)
+              verify_pr_integrity(get, repo, branch, base, head, number, files)
 
 
           def review(repo, run_id, get=api, download=archive):
@@ -405,12 +452,23 @@ jobs:
                   raise ValueError("GitHub commit is not one scoped proposal on the triggering base")
               report = evidence("upd-report")
               presentation = json.loads(report["upd-presentation.json"])
+              # Every integrity check runs before any manual-review reason may end the
+              # review, so a proposal cannot be declined past a defect it also has.
+              verify_lineage(get, repo, branch, base, proposal)
+              reasons = []
               if presentation.get("auto_merge_requested") is not True or presentation.get("auto_merge_eligible") is not True:
-                  raise ValueError("proposal requires manual review")
-              verify_contents(get, repo, base, proposal, files)
+                  reasons.append("proposal requires manual review")
+              reasons += verify_contents(get, repo, base, proposal, files)
               prs = get(f"repos/{repo}/pulls?state=open&head={repo.split('/')[0]}:deps/upd&base={branch}&per_page=100")
-              matches = [p for p in prs if candidate(p, repo, branch, proposal)]
+              # The proposal is found by identity alone: the publisher switches auto-merge
+              # off for a proposal that needs a person, and a bot-owned PR with it off is
+              # still the published proposal whose integrity must be checked. A proposal
+              # with no open PR (merged, closed or replaced since the run) has nothing to
+              # verify beyond the lineage and contents checked above.
+              matches = [p for p in prs if candidate(p, repo, branch, proposal, armed=False)]
               if not matches:
+                  if reasons:
+                      raise ManualReview("; ".join(dict.fromkeys(reasons)))
                   print("No current eligible proposal to approve.")
                   return
               if len(matches) != 1:
@@ -419,9 +477,17 @@ jobs:
               # Recheck immediately before submission. The approval is attached to the
               # evidence's exact SHA; dismissed stale reviews protect a later replacement.
               current = get(f"repos/{repo}/pulls/{number}")
-              if not candidate(current, repo, branch, proposal):
+              if not candidate(current, repo, branch, proposal, armed=False):
                   raise ValueError("pull request changed before review")
-              verify_merge_scope(get, repo, branch, base, proposal, number, files)
+              # Integrity checks run on every matched pull request before any exit 0;
+              # only then does the decision follow. Approval prerequisites come last.
+              verify_pr_integrity(get, repo, branch, base, proposal, number, files)
+              if reasons:
+                  raise ManualReview("; ".join(dict.fromkeys(reasons)))
+              if not candidate(current, repo, branch, proposal):
+                  print("No current eligible proposal to approve: auto-merge is not armed.")
+                  return
+              verify_rules(get, repo, branch)
               posted = get(f"repos/{repo}/pulls/{number}/reviews", {
                   "commit_id": proposal, "event": "APPROVE",
                   "body": "Validated the exact proposal from the trusted upd run: compatible update, isolated publication policy passed. Required CI and code-owner rules still apply."
@@ -444,6 +510,22 @@ jobs:
               print(f"Approved the validated proposal in PR #{number} at {proposal}.")
 
 
+          def main():
+              # Declining to approve is the policy working, not a failure: the proposal
+              # stays open for a person. Integrity problems (ambiguous evidence, a changed
+              # proposal, an untrusted run) still raise and fail the check.
+              try:
+                  review(os.environ["GH_REPO"], os.environ["UPD_RUN_ID"])
+              except ManualReview as decision:
+                  message = f"Not approved automatically: {decision}. The proposal needs a human review."
+                  annotation = message.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
+                  print(f"::notice title=Manual review required::{annotation}")
+                  summary = os.environ.get("GITHUB_STEP_SUMMARY")
+                  if summary:
+                      with open(summary, "a", encoding="utf-8") as out:
+                          out.write(f"### Manual review required\n\n{message}\n")
+
+
           if __name__ == "__main__":
-              review(os.environ["GH_REPO"], os.environ["UPD_RUN_ID"])
+              main()
           PY_REVIEW

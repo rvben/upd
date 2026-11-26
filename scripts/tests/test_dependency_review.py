@@ -35,6 +35,8 @@ class ReviewPolicy(unittest.TestCase):
         self.stale_dismissal = True
         self.old_reviews = []
         self.publisher_ok, self.changed = True, False
+        self.path_contents = {}
+        self.on_refresh = None
         self.contents = {self.base: 'version = 4\n[[package]]\nname = "test"\nversion = "1.0.0"\nchecksum = "old"\n', self.head: 'version = 4\n[[package]]\nname = "test"\nversion = "1.0.1"\nchecksum = "new"\n'}
 
     def api(self, path, payload=None, method="POST"):
@@ -58,7 +60,8 @@ class ReviewPolicy(unittest.TestCase):
         if suffix.startswith('/pulls/1/reviews?'):
             return self.old_reviews
         if suffix.startswith('/contents/'):
-            value = self.contents[suffix.split('?ref=')[1]].encode()
+            location, ref = suffix.removeprefix('/contents/').split('?ref=')
+            value = self.path_contents.get((location, ref), self.contents[ref]).encode()
             return {'encoding': 'base64', 'size': len(value), 'content': base64.b64encode(value).decode()}
         if suffix.startswith('/commits/'):
             return {'sha': self.head, 'parents': [{'sha': p} for p in self.parents], 'files': self.files}
@@ -71,6 +74,8 @@ class ReviewPolicy(unittest.TestCase):
         if suffix.startswith('/pulls?'):
             return [self.pr]
         if suffix == '/pulls/1':
+            if self.on_refresh:
+                self.on_refresh()
             return {**self.pr, 'head': {**self.pr['head'], 'sha': 'c' * 40}} if self.changed or (self.changed_after_approval and self.approvals) else self.pr
         raise AssertionError(path)
 
@@ -86,6 +91,168 @@ class ReviewPolicy(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.review()
         self.assertEqual(self.approvals, [])
+
+    def decline(self):
+        with self.assertRaises(ns['ManualReview']):
+            self.review()
+        self.assertEqual(self.approvals, [])
+
+    def run_main(self):
+        import os, tempfile
+        summary = tempfile.NamedTemporaryFile('r', suffix='.md')
+        env = {'GH_REPO': self.repo, 'UPD_RUN_ID': '7', 'GITHUB_STEP_SUMMARY': summary.name}
+        old = {k: os.environ.get(k) for k in env}
+        os.environ.update(env)
+        original = ns['review']
+        ns['review'] = lambda repo, run_id: original(repo, run_id, self.api, self.download)
+        try:
+            ns['main']()
+        finally:
+            ns['review'] = original
+            for k, v in old.items():
+                os.environ.pop(k, None) if v is None else os.environ.__setitem__(k, v)
+        try:
+            return summary.read()
+        finally:
+            summary.close()
+
+    def test_proposal_needing_a_person_exits_cleanly_with_a_notice(self):
+        self.presentation['auto_merge_eligible'] = False
+        self.decline()
+        written = self.run_main()
+        self.assertIn('Manual review required', written)
+        self.assertEqual(self.approvals, [])
+
+    def test_new_and_incompatible_files_are_manual_review_not_integrity_failures(self):
+        self.files[0]['status'] = 'added'
+        self.decline()
+        self.files[0]['status'] = 'modified'
+        self.contents[self.head] = self.contents[self.head].replace('1.0.1', '2.0.0')
+        self.decline()
+
+    def test_integrity_problems_still_fail_the_check_rather_than_decline(self):
+        self.changed = True
+        with self.assertRaises(ValueError) as caught:
+            self.run_main()
+        self.assertNotIsInstance(caught.exception, ns['ManualReview'])
+        self.assertEqual(self.approvals, [])
+        self.base_on_main = False
+        self.changed = False
+        with self.assertRaises(ValueError) as caught:
+            self.run_main()
+        self.assertNotIsInstance(caught.exception, ns['ManualReview'])
+
+    def test_a_diverged_base_fails_even_when_the_proposal_needs_a_person(self):
+        self.presentation['auto_merge_eligible'] = False
+        self.base_on_main = False
+        with self.assertRaises(ValueError) as caught:
+            self.review()
+        self.assertNotIsInstance(caught.exception, ns['ManualReview'])
+
+    def test_a_malformed_file_fails_even_after_a_new_file_needs_a_person(self):
+        ns['REVIEW_PATHS'][self.repo] = ['Cargo.lock', 'extra/Cargo.lock']
+        self.files = [{'filename': 'extra/Cargo.lock', 'status': 'added', 'sha': 'e' * 40},
+                      {'filename': 'Cargo.lock', 'status': 'modified', 'sha': 'd' * 40}]
+        self.pr_files = self.files
+        self.contents[self.head] = '[[package]\n'
+        with self.assertRaises(ValueError) as caught:
+            self.review()
+        self.assertNotIsInstance(caught.exception, ns['ManualReview'])
+        self.assertEqual(self.approvals, [])
+
+    def test_every_manual_review_reason_is_reported(self):
+        ns['REVIEW_PATHS'][self.repo] = ['Cargo.lock', 'extra/Cargo.lock']
+        self.files = [{'filename': 'extra/Cargo.lock', 'status': 'added', 'sha': 'e' * 40},
+                      {'filename': 'Cargo.lock', 'status': 'modified', 'sha': 'd' * 40}]
+        self.pr_files = self.files
+        self.contents[self.head] = self.contents[self.head].replace('1.0.1', '2.0.0')
+        with self.assertRaises(ns['ManualReview']) as caught:
+            self.review()
+        self.assertIn('new dependency files', str(caught.exception))
+        self.assertIn('Cargo.lock', str(caught.exception).split(';')[-1])
+
+    def two_files(self, extra, status):
+        ns['REVIEW_PATHS'][self.repo] = ['Cargo.lock', extra]
+        self.files = [{'filename': extra, 'status': status, 'sha': 'e' * 40},
+                      {'filename': 'Cargo.lock', 'status': 'modified', 'sha': 'd' * 40}]
+        self.pr_files = self.files
+
+    def assert_hard_failure(self):
+        with self.assertRaises(ValueError) as caught:
+            self.review()
+        self.assertNotIsInstance(caught.exception, ns['ManualReview'])
+        self.assertEqual(self.approvals, [])
+
+    def test_an_added_malformed_file_fails_instead_of_declining(self):
+        self.two_files('extra/Cargo.lock', 'added')
+        self.path_contents[('extra/Cargo.lock', self.head)] = '[[package]\n'
+        self.assert_hard_failure()
+
+    def test_a_modified_unsupported_malformed_file_fails_instead_of_declining(self):
+        self.two_files('pyproject.toml', 'modified')
+        self.path_contents[('pyproject.toml', self.base)] = '[project]\nname = "a"\n'
+        self.path_contents[('pyproject.toml', self.head)] = '[project\nname = "a"\n'
+        self.assert_hard_failure()
+
+    def test_the_manual_path_rechecks_the_base_after_the_pull_request_refresh(self):
+        self.presentation['auto_merge_eligible'] = False
+        # The base is on main at the early lineage check and moves before the refresh.
+        def refresh():
+            self.base_on_main = False
+        self.on_refresh = refresh
+        self.assert_hard_failure()
+
+    def test_the_manual_path_compares_the_pull_request_file_set(self):
+        self.presentation['auto_merge_eligible'] = False
+        self.pr_files = self.files + [{'filename': 'README.md', 'status': 'modified', 'sha': 'f' * 40}]
+        self.assert_hard_failure()
+
+    def test_every_integrity_check_runs_on_the_manual_path(self):
+        self.presentation['auto_merge_eligible'] = False
+        seen = []
+        for name in ['verify_lineage', 'verify_pr_integrity', 'verify_contents', 'parse_document']:
+            original = ns[name]
+            ns[name] = (lambda original, name: lambda *a, **k: (seen.append(name), original(*a, **k))[1])(original, name)
+            self.addCleanup(ns.__setitem__, name, original)
+        self.decline()
+        self.assertEqual(set(seen), {'verify_lineage', 'verify_pr_integrity', 'verify_contents', 'parse_document'})
+
+    def test_the_manual_path_finds_a_pull_request_whose_auto_merge_is_off(self):
+        # The publisher switches auto-merge off for a proposal that needs a person.
+        self.presentation['auto_merge_eligible'] = False
+        self.pr['auto_merge'] = None
+        self.pr_files = self.files + [{'filename': 'README.md', 'status': 'modified', 'sha': 'f' * 40}]
+        self.assert_hard_failure()
+        self.pr_files = self.files
+        self.decline()
+
+    def test_approval_still_requires_the_armed_auto_merge(self):
+        self.pr['auto_merge'] = None
+        self.review()
+        self.assertEqual(self.approvals, [])
+
+    def test_a_published_pull_request_is_verified_before_any_exit(self):
+        mismatch = self.files + [{'filename': 'README.md', 'status': 'modified', 'sha': 'f' * 40}]
+        for armed in (True, False):
+            for eligible in (True, False):
+                with self.subTest(armed=armed, eligible=eligible):
+                    self.approvals = []
+                    self.pr['auto_merge'] = {'merge_method': 'squash', 'enabled_by': {'id': ns['UPD_BOT_ID']}} if armed else None
+                    self.presentation['auto_merge_eligible'] = eligible
+                    self.pr_files = mismatch
+                    self.assert_hard_failure()
+
+    def test_an_eligible_proposal_without_armed_auto_merge_is_not_approved(self):
+        self.pr['auto_merge'] = None
+        self.review()
+        self.assertEqual(self.approvals, [])
+
+    def test_an_added_yaml_file_is_an_integrity_failure(self):
+        for name in ['.github/actions/setup/action.yml', 'ci/config.yaml']:
+            with self.subTest(name=name):
+                self.two_files(name, 'added')
+                self.path_contents[(name, self.head)] = 'name: [broken\n'
+                self.assert_hard_failure()
 
     def test_reviewer_serializes_with_the_dependency_publisher(self):
         publisher = WORKFLOW.with_name('dependency-health.yml').read_text()
