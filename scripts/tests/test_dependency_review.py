@@ -505,6 +505,26 @@ class ReviewPolicy(unittest.TestCase):
         for old, new in moved:
             self.assertFalse(check('package-lock.json', lock(old, '1.0.0'), lock(new, '1.1.0')), (old, new))
 
+    def test_only_require_directives_are_go_dependency_bumps(self):
+        check = ns['content_compatible']
+        head = 'module example.com/app\n\ngo 1.24\n\n'
+        a, b = 'example.com/m v1.0.0', 'example.com/m v1.1.0'
+        self.assertTrue(check('go.mod', head + 'require ' + a, head + 'require ' + b))
+        self.assertTrue(check('go.mod', head + 'require (\n\t' + a + '\n)', head + 'require (\n\t' + b + '\n)'))
+        self.assertTrue(check('go.mod', head + 'require ' + a + ' // indirect', head + 'require ' + b + ' // indirect'))
+        for directive in ['exclude', 'retract', 'replace example.com/other =>', 'replace example.com/m v1.0.0 =>']:
+            if directive.startswith('replace'):
+                old, new = head + directive + ' example.com/m v1.0.0', head + directive + ' example.com/m v1.1.0'
+            else:
+                old, new = head + directive + ' ' + a.split()[-1], head + directive + ' ' + b.split()[-1]
+                if directive == 'exclude':
+                    old, new = head + 'exclude ' + a, head + 'exclude ' + b
+            self.assertFalse(check('go.mod', old, new), directive)
+        self.assertFalse(check('go.mod', head + 'exclude (\n\t' + a + '\n)', head + 'exclude (\n\t' + b + '\n)'))
+        self.assertFalse(check('go.mod', head + 'replace (\n\texample.com/m => example.com/m v1.0.0\n)', head + 'replace (\n\texample.com/m => example.com/m v1.1.0\n)'))
+        # The directive itself may not change either.
+        self.assertFalse(check('go.mod', head + 'require ' + a, head + 'exclude ' + a))
+
     def test_unknown_new_files_and_unsupported_formats_require_review(self):
         self.files[0]['status'] = 'added'
         self.reject()

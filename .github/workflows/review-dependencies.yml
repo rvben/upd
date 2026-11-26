@@ -380,15 +380,18 @@ jobs:
                           return False
                   return True
               if path.endswith('go.mod'):
-                  old, new = before.splitlines(), after.splitlines()
-                  if len(old) != len(new):
+                  old, new = go_mod_entries(before), go_mod_entries(after)
+                  if [e[:2] for e in old] != [e[:2] for e in new]:
                       return False
                   require = re.compile(r'(\s*(?:require\s+)?[A-Za-z0-9._~/-]+\s+)(v\d+\.\d+\.\d+)(\s*(?:// indirect)?\s*)')
-                  for a, b in zip(old, new):
+                  for (verb, role, a), (_, _, b) in zip(old, new):
                       if a == b:
                           continue
+                      # Only a version in a `require` directive is a dependency bump; every
+                      # other directive (exclude, replace, retract, tool, ...) must not change.
                       left, right = require.fullmatch(a), require.fullmatch(b)
-                      if not left or not right or left.group(1, 3) != right.group(1, 3) or not compatible(left[2], right[2]):
+                      if (verb != 'require' or role not in {'stmt', 'member'} or not left or not right
+                              or left.group(1, 3) != right.group(1, 3) or not compatible(left[2], right[2])):
                           return False
                   return True
               if path.endswith('go.sum'):
