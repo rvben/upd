@@ -424,6 +424,45 @@ fn resolve_root_config(cli: &Cli, paths: &[PathBuf]) -> Result<ResolvedUpdateCon
         }))
 }
 
+/// The advisories every scanned path accepts.
+///
+/// `--config` or a single path has one governing configuration. With several
+/// paths each is governed by its own, and an advisory is accepted only when
+/// every one of them lists it (with the earliest expiry among them), so the
+/// outcome does not depend on which path comes first.
+fn audit_suppressions(
+    cli: &Cli,
+    paths: &[PathBuf],
+    root: &ResolvedUpdateConfig,
+) -> Result<Vec<upd::config::AdvisorySuppression>> {
+    let mut accepted = root.config.audit.ignore_advisories.clone();
+    if cli.config.is_some() {
+        return Ok(accepted);
+    }
+    for path in paths.iter().skip(1) {
+        let other = resolve_root_config(cli, std::slice::from_ref(path))?;
+        accepted.retain_mut(|entry| {
+            match other
+                .config
+                .audit
+                .ignore_advisories
+                .iter()
+                .find(|candidate| candidate.id.trim().eq_ignore_ascii_case(entry.id.trim()))
+            {
+                Some(candidate) => {
+                    entry.expires = match (entry.expires, candidate.expires) {
+                        (Some(a), Some(b)) => Some(a.min(b)),
+                        (a, b) => a.or(b),
+                    };
+                    true
+                }
+                None => false,
+            }
+        });
+    }
+    Ok(accepted)
+}
+
 fn load_update_configs(
     cli: &Cli,
     files: &[(PathBuf, FileType)],
@@ -1673,7 +1712,12 @@ fn suggest_subcommand(input: &str) -> Option<&'static str> {
 
 fn classify_error(e: &anyhow::Error) -> serde_json::Value {
     let msg = e.to_string();
-    let (kind, exit_code) = if msg.contains("No such file")
+    // A configuration error quotes user-written values, so it is recognized
+    // by its own prefix before the keyword search below sees them.
+    let is_config_error = msg.starts_with("Invalid TOML") || msg.starts_with("Invalid [audit]");
+    let (kind, exit_code) = if is_config_error {
+        ("parse_error", 4)
+    } else if msg.contains("No such file")
         || msg.contains("Permission denied")
         || msg.contains("os error")
         || msg.contains("does not exist")
@@ -3198,6 +3242,7 @@ async fn run_update_with_github(
                     safe_count: 0,
                     errors: Vec::new(),
                     warnings: Vec::new(),
+                    ..Default::default()
                 };
                 let routing = upd::fix::route_update_targets(
                     &synthetic_audit,
@@ -3284,6 +3329,7 @@ async fn run_update_with_github(
                 safe_count: 0,
                 errors: Vec::new(),
                 warnings: Vec::new(),
+                ..Default::default()
             };
             let routing = upd::fix::route_update_targets(
                 &capped_audit,
@@ -5062,6 +5108,8 @@ async fn run_audit(cli: &Cli) -> Result<()> {
     // `include`/`exclude` path globs are honored uniformly across subcommands; resolve the
     // root config so audit drops the same files `update`/`align` would.
     let root_config = resolve_root_config(cli, &paths)?;
+    // Every path's configuration is read, and so validated, before any scan.
+    let suppressions = audit_suppressions(cli, &paths, &root_config)?;
     let (resolved_cli, no_ecosystems) = with_ecosystem_config(cli, &root_config.config)?;
     let cli = &resolved_cli;
     let files = if no_ecosystems {
@@ -5205,6 +5253,21 @@ async fn run_audit(cli: &Cli) -> Result<()> {
         .await?;
     audit_result.warnings.extend(coverage_warnings);
 
+    // Accept the advisories the configuration lists. Whether a suppression
+    // that matched nothing is reported depends on the audit having covered
+    // the whole tree: a language or package filter, or an error, leaves that
+    // open.
+    let whole_tree_audited = cli.langs.is_empty()
+        && cli.packages.is_empty()
+        && audit_result.errors.is_empty()
+        && audit_result.warnings.is_empty();
+    upd::audit::suppress::apply_suppressions(
+        &mut audit_result,
+        &suppressions,
+        Utc::now().date_naive(),
+        whole_tree_audited,
+    );
+
     // Persist cache to disk after a successful query.
     if let Some(ref c) = audit_cache {
         // Non-fatal: a save failure should not abort the audit report.
@@ -5249,6 +5312,13 @@ async fn run_audit(cli: &Cli) -> Result<()> {
                     }
                 }
             }
+            let suppressed = suppressed_lines(&audit_result);
+            if !suppressed.is_empty() {
+                println!();
+                for line in suppressed {
+                    println!("{line}");
+                }
+            }
         }
 
         for error in &audit_result.errors {
@@ -5257,6 +5327,7 @@ async fn run_audit(cli: &Cli) -> Result<()> {
         for warning in &audit_result.warnings {
             eprintln!("{} {}", "Warning:".yellow(), warning);
         }
+        print_suppression_warnings(&audit_result);
     } else if sarif_mode {
         // Errors always go to stderr; structured data to stdout.
         for error in &audit_result.errors {
@@ -5264,6 +5335,17 @@ async fn run_audit(cli: &Cli) -> Result<()> {
         }
         for warning in &audit_result.warnings {
             eprintln!("{} {}", "Warning:".yellow(), warning);
+        }
+        print_suppression_warnings(&audit_result);
+        if !cli.quiet {
+            for line in suppressed_lines(&audit_result) {
+                eprintln!("{line}");
+            }
+        }
+        // The SARIF document goes to stdout for upload, so the failing
+        // advisories are named here, where a CI log shows them.
+        if !cli.quiet && !audit_result.vulnerable.is_empty() {
+            eprintln!("{}", failing_advisories_summary(&audit_result));
         }
         // Build the per-package occurrence map from already-scanned data.
         let sarif_occurrences = build_sarif_occurrences(&packages, &lock_scan.packages);
@@ -5276,6 +5358,7 @@ async fn run_audit(cli: &Cli) -> Result<()> {
         for warning in &audit_result.warnings {
             eprintln!("{} {}", "Warning:".yellow(), warning);
         }
+        print_suppression_warnings(&audit_result);
         if !fix_audit {
             emit_audit_json(
                 &audit_result,
@@ -5559,7 +5642,29 @@ fn emit_audit_json(
     let mut report = build_audit_report(audit, 0, status, fixes);
     report.lockfile_cooldown = lock_cooldown.findings;
     report.warnings.extend(lock_cooldown.warnings);
-    let doc = serde_json::to_value(&report)?;
+    let mut doc = serde_json::to_value(&report)?;
+    // The accepted findings are paged like the vulnerabilities, with their own
+    // total so the vulnerabilities' pagination metadata keeps its meaning. This
+    // runs before the field mask so `--fields` decides whether the total shows.
+    let suppressed_total = doc
+        .get("suppressed")
+        .and_then(|v| v.as_array())
+        .map(Vec::len);
+    if let Some(total) = suppressed_total
+        && (bounded.limit.is_some() || bounded.offset > 0)
+    {
+        let start = bounded.offset.min(total);
+        let list = doc["suppressed"].as_array_mut().expect("checked above");
+        let page: Vec<_> = list
+            .drain(start..)
+            .take(bounded.limit.unwrap_or(usize::MAX))
+            .collect();
+        let truncated = page.len() < total;
+        *list = page;
+        if truncated {
+            doc["suppressed_total"] = serde_json::json!(total);
+        }
+    }
     let doc = apply_bounded_output(doc, "vulnerabilities", bounded);
     println!("{}", serde_json::to_string_pretty(&doc)?);
     Ok(())
@@ -5804,6 +5909,54 @@ fn build_sarif_occurrences(
     }
 
     map
+}
+
+/// One line naming every advisory that fails the audit, with its package.
+fn failing_advisories_summary(audit_result: &AuditResult) -> String {
+    let findings: Vec<String> = audit_result
+        .vulnerable
+        .iter()
+        .flat_map(|package| {
+            package.vulnerabilities.iter().map(move |vulnerability| {
+                format!(
+                    "{} ({} {})",
+                    vulnerability.id, package.package.name, package.package.version
+                )
+            })
+        })
+        .collect();
+    format!(
+        "upd audit: {} unresolved vulnerability/ies: {}",
+        findings.len(),
+        findings.join(", ")
+    )
+}
+
+/// One line per finding the configuration accepted, with its reason.
+fn suppressed_lines(audit_result: &AuditResult) -> Vec<String> {
+    audit_result
+        .suppressed
+        .iter()
+        .map(|finding| {
+            let until = finding
+                .expires
+                .map_or(String::new(), |date| format!(", until {date}"));
+            format!(
+                "{} {} accepted by configuration{until}: {}",
+                "Suppressed:".dimmed(),
+                finding.label(),
+                finding.reason
+            )
+        })
+        .collect()
+}
+
+/// Report what is wrong with the configuration's suppressions (expired or
+/// matching nothing) on stderr.
+fn print_suppression_warnings(audit_result: &AuditResult) {
+    for warning in &audit_result.suppression_warnings {
+        eprintln!("{} {}", "Warning:".yellow(), warning);
+    }
 }
 
 fn print_audit_vulnerabilities(audit_result: &AuditResult) {

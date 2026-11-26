@@ -1468,6 +1468,7 @@ mod tests {
             safe_count: 0,
             errors: Vec::new(),
             warnings: Vec::new(),
+            ..Default::default()
         }
     }
 

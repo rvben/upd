@@ -2,6 +2,7 @@
 
 pub mod cache;
 pub mod cvss;
+pub mod suppress;
 
 #[cfg(test)]
 mod concurrency_tests;
@@ -174,6 +175,14 @@ pub struct AuditResult {
     /// covered (e.g. go.mod predating go 1.17). Mark the report incomplete
     /// without failing the run.
     pub warnings: Vec<String>,
+    /// Findings the configuration accepts (`[audit] ignore-advisories`). They
+    /// are not in `vulnerable`, so they neither fail the audit nor count as
+    /// unresolved, and every report still lists them with their reason.
+    pub suppressed: Vec<suppress::SuppressedFinding>,
+    /// Problems with the suppressions themselves: expired entries and entries
+    /// that matched nothing. Kept apart from `warnings`, which mark the audit
+    /// itself incomplete.
+    pub suppression_warnings: Vec<String>,
 }
 
 impl AuditResult {

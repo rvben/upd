@@ -40,6 +40,12 @@
 //! lock = false               # consent to relocking in the organization's lock jobs
 //! lock_build = false         # let those lock jobs build Python sdists
 //!
+//! # Accept a known advisory in `upd audit`, with a reason and an optional expiry
+//! [audit]
+//! ignore-advisories = [
+//!   { id = "RUSTSEC-2026-0543", reason = "no maintained successor release", expires = "2027-05-31" },
+//! ]
+//!
 //! # Pin packages to specific versions or constraints - top-level table
 //! [pin]
 //! requests = "2.28.0"  # Pin to exact version
@@ -80,6 +86,7 @@
 //!
 //! Valid duration units: `s`, `m`, `h`, `d`, `w`. Use `"0"` to disable.
 
+use chrono::NaiveDate;
 use colored::Colorize;
 use serde::Deserialize;
 use std::collections::HashMap;
@@ -97,6 +104,7 @@ const KNOWN_KEYS: &[&str] = &[
     "cooldown",
     "update_action_shas",
     "automation",
+    "audit",
     "normalize",
     "update",
     "ecosystems",
@@ -134,6 +142,101 @@ pub struct AutomationConfig {
     /// runs their build backends; off, uv resolves from wheels only.
     #[serde(default)]
     pub lock_build: Option<bool>,
+}
+
+/// `[audit]`: settings for `upd audit` and `--fix-audit`.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AuditConfig {
+    /// Advisories accepted as known, each with the reason and an optional
+    /// expiry. An entry that cannot be read is a configuration error, never a
+    /// suppression.
+    #[serde(default, rename = "ignore-advisories")]
+    pub ignore_advisories: Vec<AdvisorySuppression>,
+}
+
+/// One accepted advisory under `[audit] ignore-advisories`.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AdvisorySuppression {
+    /// The advisory's id (`RUSTSEC-2026-0543`) or one of its aliases (a CVE or
+    /// GHSA id), matched case-insensitively and exactly.
+    pub id: String,
+    /// Why the advisory is accepted. Required, so the next reader of the
+    /// configuration knows what was decided.
+    pub reason: String,
+    /// Last day the suppression applies, as `YYYY-MM-DD`. From the next day
+    /// the advisory is reported again. Absent means it never expires.
+    #[serde(default, deserialize_with = "deserialize_expiry")]
+    pub expires: Option<NaiveDate>,
+}
+
+/// Read `expires` as a TOML date or a `YYYY-MM-DD` string, and nothing else:
+/// a date-time or another spelling would leave its end of day ambiguous.
+fn deserialize_expiry<'de, D>(deserializer: D) -> Result<Option<NaiveDate>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let text = match toml::Value::deserialize(deserializer)? {
+        toml::Value::String(text) => text,
+        toml::Value::Datetime(date) => date.to_string(),
+        other => {
+            return Err(serde::de::Error::custom(format!(
+                "`expires` must be a date written YYYY-MM-DD, not {}",
+                other.type_str()
+            )));
+        }
+    };
+    // chrono's `%Y`, `%m` and `%d` also accept signs, spaces, unpadded numbers
+    // and expanded years, so the shape is fixed to ASCII digits first.
+    let shaped = text.len() == 10
+        && text.bytes().enumerate().all(|(i, byte)| match i {
+            4 | 7 => byte == b'-',
+            _ => byte.is_ascii_digit(),
+        });
+    match NaiveDate::parse_from_str(&text, "%Y-%m-%d") {
+        Ok(date) if shaped => Ok(Some(date)),
+        _ => Err(serde::de::Error::custom(format!(
+            "`expires` must be a date written YYYY-MM-DD, not `{text}`"
+        ))),
+    }
+}
+
+impl AuditConfig {
+    /// Reject what deserialization accepts but cannot honor: an id that
+    /// cannot name an advisory, a blank reason, or one id given twice.
+    fn validate(&self, source_label: &str) -> Result<(), String> {
+        let mut seen: Vec<String> = Vec::new();
+        for entry in &self.ignore_advisories {
+            let id = entry.id.trim();
+            if id.is_empty()
+                || !id
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | ':'))
+            {
+                return Err(format!(
+                    "Invalid [audit] ignore-advisories entry in config file {source_label}: \
+                     `id` must be one advisory id such as RUSTSEC-2026-0543 (no spaces or wildcards), not `{}`",
+                    entry.id
+                ));
+            }
+            if entry.reason.trim().is_empty() {
+                return Err(format!(
+                    "Invalid [audit] ignore-advisories entry for {id} in config file \
+                     {source_label}: `reason` must say why the advisory is accepted"
+                ));
+            }
+            let key = id.to_ascii_uppercase();
+            if seen.contains(&key) {
+                return Err(format!(
+                    "Invalid [audit] ignore-advisories in config file {source_label}: \
+                     {id} is listed more than once"
+                ));
+            }
+            seen.push(key);
+        }
+        Ok(())
+    }
 }
 
 /// Every key `[automation]` accepts.
@@ -295,6 +398,10 @@ pub struct UpdConfig {
     /// Opt-in specifier normalization. `None` preserves dependency shapes.
     #[serde(default)]
     pub normalize: Option<NormalizeConfig>,
+
+    /// Settings for `upd audit` and `--fix-audit`.
+    #[serde(default)]
+    pub audit: AuditConfig,
 }
 
 impl UpdConfig {
@@ -514,6 +621,7 @@ impl UpdConfig {
             .map_err(|e| format!("Invalid TOML in config file {}:\n  {}", source_label, e))?;
 
         config.selected_ecosystems(&[], &[])?;
+        config.audit.validate(source_label)?;
         Ok((config, warnings))
     }
 
@@ -607,6 +715,19 @@ exact-pins = true
 # dependencies = "at-least"
 # optional-dependencies = "at-least"
 # dependency-groups = "exact"
+
+# audit: settings for `upd audit` and `--fix-audit`.
+# ignore-advisories accepts an advisory instead of failing on it: it is not
+# counted as vulnerable and --fix-audit leaves it alone, but every audit still
+# lists it with its reason. `id` is the advisory id or one of its aliases;
+# `reason` is required; `expires` (YYYY-MM-DD, the last day it applies) is
+# optional, and an expired entry is reported as expired and no longer applies.
+# A malformed entry is a configuration error. An entry that matches nothing in
+# the audited dependencies is reported so it can be removed.
+[audit]
+# ignore-advisories = [
+#   { id = "RUSTSEC-2026-0543", reason = "chrono has no maintained successor release", expires = "2027-05-31" },
+# ]
 
 # automation: opt-in policy for unattended repository writes. Every key is
 # disabled when absent or false.
@@ -733,6 +854,7 @@ lock_build = false
             || self.automation.lock.is_some()
             || self.automation.lock_build.is_some()
             || self.normalize.is_some()
+            || !self.audit.ignore_advisories.is_empty()
             || self.update.pyproject.is_some()
             || self.ecosystems.enable.is_some()
             || self.ecosystems.disable.is_some()
@@ -800,6 +922,18 @@ lock_build = false
         }
         if other.automation.lock_build.is_some() {
             self.automation.lock_build = other.automation.lock_build;
+        }
+        // An advisory the child accepts replaces the parent's entry for it.
+        for entry in other.audit.ignore_advisories {
+            match self
+                .audit
+                .ignore_advisories
+                .iter_mut()
+                .find(|existing| existing.id.eq_ignore_ascii_case(&entry.id))
+            {
+                Some(existing) => *existing = entry,
+                None => self.audit.ignore_advisories.push(entry),
+            }
         }
         if let Some(other_normalize) = other.normalize
             && let Some(other_pyproject) = other_normalize.pyproject
@@ -1043,6 +1177,20 @@ impl EffectiveConfig<'_> {
                 }
             }
         }
+        if self.config.audit.ignore_advisories.is_empty() {
+            out.push_str("audit.ignore-advisories: (none)\n");
+        } else {
+            out.push_str("audit.ignore-advisories:\n");
+            for entry in &self.config.audit.ignore_advisories {
+                let expires = entry
+                    .expires
+                    .map_or("never".to_string(), |date| date.to_string());
+                out.push_str(&format!(
+                    "  {} (expires {expires}): {}\n",
+                    entry.id, entry.reason
+                ));
+            }
+        }
         out.push_str("automation:\n");
         out.push_str(&format!(
             "  security_remediation: {}\n",
@@ -1112,6 +1260,15 @@ impl EffectiveConfig<'_> {
                 }
                 serde_json::json!({ "pyproject": sections })
             }),
+            "audit": {
+                "ignore-advisories": self.config.audit.ignore_advisories.iter().map(|entry| {
+                    serde_json::json!({
+                        "id": entry.id,
+                        "reason": entry.reason,
+                        "expires": entry.expires.map(|date| date.to_string()),
+                    })
+                }).collect::<Vec<_>>(),
+            },
             "automation": {
                 "security_remediation": self.config.security_remediation_enabled(),
                 "dependency_updates": self.config.dependency_updates_enabled(),
@@ -1150,6 +1307,82 @@ mod tests {
     use super::*;
     use std::fs;
     use tempfile::TempDir;
+
+    fn parse_audit(toml: &str) -> Result<UpdConfig, String> {
+        UpdConfig::parse_with_warnings(toml, "test.toml").map(|(config, _)| config)
+    }
+
+    #[test]
+    fn ignore_advisories_parses_reason_and_either_date_form() {
+        let config = parse_audit(
+            r#"
+[audit]
+ignore-advisories = [
+  { id = "RUSTSEC-2026-0543", reason = "no successor", expires = "2027-05-31" },
+  { id = "GHSA-aaaa-bbbb-cccc", reason = "not reachable", expires = 2027-06-30 },
+  { id = "CVE-2026-1", reason = "accepted" },
+]
+"#,
+        )
+        .unwrap();
+        let entries = &config.audit.ignore_advisories;
+        assert_eq!(entries.len(), 3);
+        assert_eq!(
+            entries[0].expires,
+            chrono::NaiveDate::from_ymd_opt(2027, 5, 31)
+        );
+        assert_eq!(
+            entries[1].expires,
+            chrono::NaiveDate::from_ymd_opt(2027, 6, 30)
+        );
+        assert_eq!(entries[2].expires, None);
+    }
+
+    #[test]
+    fn a_child_suppression_replaces_the_parents_entry_for_the_same_advisory() {
+        let mut parent = parse_audit(
+            "[audit]\nignore-advisories = [{ id = \"RUSTSEC-1\", reason = \"old\" }, { id = \"RUSTSEC-2\", reason = \"keep\" }]\n",
+        )
+        .unwrap();
+        let child = parse_audit(
+            "[audit]\nignore-advisories = [{ id = \"rustsec-1\", reason = \"new\" }]\n",
+        )
+        .unwrap();
+        parent.merge(child);
+        let entries = &parent.audit.ignore_advisories;
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].reason, "new");
+        assert_eq!(entries[1].reason, "keep");
+    }
+
+    #[test]
+    fn ignore_advisories_rejects_what_it_cannot_honor() {
+        for bad in [
+            r#"{ id = "RUSTSEC-1" }"#,
+            r#"{ id = "RUSTSEC-1", reason = "" }"#,
+            r#"{ id = "RUSTSEC-1", reason = "   " }"#,
+            r#"{ id = "", reason = "x" }"#,
+            r#"{ id = "RUSTSEC-*", reason = "x" }"#,
+            r#"{ id = "A B", reason = "x" }"#,
+            r#"{ id = "RUSTSEC-1", reason = "x", expires = "soon" }"#,
+            r#"{ id = "RUSTSEC-1", reason = "x", expires = "2027-5-1" }"#,
+            r#"{ id = "RUSTSEC-1", reason = "x", expires = "+2999-1-01" }"#,
+            r#"{ id = "RUSTSEC-1", reason = "x", expires = "2999- 1-01" }"#,
+            r#"{ id = "RUSTSEC-1", reason = "x", expires = "+10000-01-01" }"#,
+            r#"{ id = "RUSTSEC-1", reason = "x", expiry = "2027-05-01" }"#,
+        ] {
+            let toml = format!("[audit]\nignore-advisories = [{bad}]\n");
+            assert!(parse_audit(&toml).is_err(), "must reject {bad}");
+        }
+        let duplicate = r#"[audit]
+ignore-advisories = [{ id = "RUSTSEC-1", reason = "a" }, { id = "rustsec-1", reason = "b" }]
+"#;
+        assert!(
+            parse_audit(duplicate)
+                .unwrap_err()
+                .contains("listed more than once")
+        );
+    }
 
     #[test]
     fn test_load_config_from_toml() {

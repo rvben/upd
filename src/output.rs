@@ -573,8 +573,25 @@ pub struct AuditVulnerability {
 pub struct AuditSummary {
     pub packages_checked: usize,
     pub vulnerable_packages: usize,
+    /// Unresolved findings only: suppressed ones are counted in `suppressed`.
     pub vulnerabilities: usize,
     pub errors: usize,
+    /// Findings the configuration accepts; omitted when there are none.
+    #[serde(skip_serializing_if = "is_zero")]
+    pub suppressed: usize,
+}
+
+/// A finding accepted by `[audit] ignore-advisories`: the vulnerability as
+/// `vulnerabilities[]` names it, plus the reason it was accepted.
+#[derive(Debug, Serialize)]
+pub struct SuppressedVulnerability {
+    #[serde(flatten)]
+    pub vulnerability: AuditVulnerability,
+    pub reason: String,
+    /// Last day the suppression applies (`YYYY-MM-DD`); absent when it never
+    /// expires.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expires: Option<String>,
 }
 
 /// One `--fix-audit` outcome: either an applied/planned/skipped/rolled-back
@@ -606,6 +623,13 @@ pub struct AuditReport {
     /// `"incomplete"` when the audit could not run (e.g. network failure).
     pub status: &'static str,
     pub vulnerabilities: Vec<AuditVulnerability>,
+    /// Findings the configuration accepts; omitted when there are none.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub suppressed: Vec<SuppressedVulnerability>,
+    /// Expired suppressions and suppressions that matched nothing; omitted
+    /// when there are none. They do not make `status` incomplete.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub suppression_warnings: Vec<String>,
     pub errors: Vec<String>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub warnings: Vec<String>,
@@ -1025,6 +1049,31 @@ pub struct SarifLog {
 pub struct SarifRun {
     pub tool: SarifTool,
     pub results: Vec<SarifResult>,
+    /// Run-level metadata; present only when findings were accepted.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub properties: Option<SarifRunProperties>,
+}
+
+/// Run-level properties. GitHub code scanning reads neither these nor a
+/// result's `suppressions`, so accepted findings are kept out of `results`
+/// (their alerts close on upload) and listed here for other SARIF consumers.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SarifRunProperties {
+    pub suppressed_advisories: Vec<SarifSuppressedAdvisory>,
+}
+
+/// One finding accepted by `[audit] ignore-advisories`.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SarifSuppressedAdvisory {
+    pub rule_id: String,
+    pub package: String,
+    pub version: String,
+    pub ecosystem: String,
+    pub justification: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expires: Option<String>,
 }
 
 /// Tool metadata for a SARIF run.
@@ -1247,6 +1296,20 @@ pub fn build_sarif_audit_report(audit: &AuditResult, occurrences: &SarifOccurren
                 },
             },
             results,
+            properties: (!audit.suppressed.is_empty()).then(|| SarifRunProperties {
+                suppressed_advisories: audit
+                    .suppressed
+                    .iter()
+                    .map(|finding| SarifSuppressedAdvisory {
+                        rule_id: finding.vulnerability.id.clone(),
+                        package: finding.package.name.clone(),
+                        version: finding.package.version.clone(),
+                        ecosystem: finding.package.ecosystem.as_str().to_string(),
+                        justification: finding.reason.clone(),
+                        expires: finding.expires.map(|date| date.to_string()),
+                    })
+                    .collect(),
+            }),
         }],
     }
 }
@@ -1277,10 +1340,26 @@ pub fn build_audit_report(
     let packages_checked = audit.vulnerable.len() + audit.safe_count;
     let vulnerability_count = vulnerabilities.len();
 
+    let suppressed: Vec<SuppressedVulnerability> = audit
+        .suppressed
+        .iter()
+        .map(|finding| SuppressedVulnerability {
+            vulnerability: build_vulnerability(
+                &finding.package.name,
+                &finding.package.version,
+                finding.package.ecosystem.as_str(),
+                &finding.vulnerability,
+            ),
+            reason: finding.reason.clone(),
+            expires: finding.expires.map(|date| date.to_string()),
+        })
+        .collect();
+
     AuditReport {
         command: "audit",
         status,
         vulnerabilities,
+        suppression_warnings: audit.suppression_warnings.clone(),
         errors: audit.errors.clone(),
         warnings: audit.warnings.clone(),
         summary: AuditSummary {
@@ -1288,7 +1367,9 @@ pub fn build_audit_report(
             vulnerable_packages: audit.vulnerable.len(),
             vulnerabilities: vulnerability_count,
             errors: audit.errors.len(),
+            suppressed: suppressed.len(),
         },
+        suppressed,
         fixes,
         lockfile_cooldown: Vec::new(),
     }
@@ -1933,6 +2014,7 @@ mod tests {
             safe_count: 5,
             errors: Vec::new(),
             warnings: Vec::new(),
+            ..Default::default()
         };
         let report = build_audit_report(&audit, 2, "complete", Vec::new());
         let json = serde_json::to_value(&report).unwrap();
@@ -1958,6 +2040,7 @@ mod tests {
             safe_count: 0,
             errors: vec!["network error".into()],
             warnings: Vec::new(),
+            ..Default::default()
         };
         let report = build_audit_report(&audit, 0, "incomplete", Vec::new());
         let json = serde_json::to_value(&report).unwrap();
@@ -2004,6 +2087,7 @@ mod tests {
             safe_count: 2,
             errors: Vec::new(),
             warnings: Vec::new(),
+            ..Default::default()
         }
     }
 
@@ -2074,6 +2158,7 @@ mod tests {
             safe_count: 0,
             errors: Vec::new(),
             warnings: Vec::new(),
+            ..Default::default()
         };
 
         let occurrences = std::collections::HashMap::new();
