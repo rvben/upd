@@ -426,6 +426,62 @@ class ReviewPolicy(unittest.TestCase):
         self.assertFalse(check('.github/workflows/ci.yml', a, b + '\n  - run: anything'))
         self.assertFalse(check('.github/workflows/ci.yml', a, b.replace('example/action', 'other/action')))
 
+    def test_uses_text_inside_a_block_scalar_is_not_an_action_bump(self):
+        check = ns['content_compatible']
+        path = '.github/workflows/ci.yml'
+        line = 'example/action@%s # v1.%d.0'
+
+        def workflow(header, body, sha, minor):
+            return 'jobs:\n  build:\n    steps:\n' + header + '\n' + body + 'uses: ' + line % (sha * 40, minor) + '\n      - run: true\n'
+
+        real = lambda sha, minor: 'jobs:\n  build:\n    steps:\n      - uses: ' + line % (sha * 40, minor) + '\n      - run: true\n'
+        self.assertTrue(check(path, real('a', 0), real('b', 1)))
+        for header in ['      - run: |', '      - run: >-', '      - run: |+ # note', '      - name: x\n        run: |2', '      - run: !!str |']:
+            body = '          ' if '\n' not in header or True else ''
+            self.assertFalse(check(path, workflow(header, body, 'a', 0), workflow(header, body, 'b', 1)), header)
+        # A bump next to a block scalar is still a bump.
+        sibling = lambda sha, minor: '    steps:\n      - run: |\n          echo\n      - uses: ' + line % (sha * 40, minor) + '\n'
+        self.assertTrue(check(path, sibling('a', 0), sibling('b', 1)))
+        # Ambiguous layouts fail closed: tabs, multi-line plain and quoted scalars.
+        for text in ['\t- uses: ' + line, '      - run: echo a\n          uses: ' + line, "      - name: 'a\n          uses: " + line]:
+            self.assertFalse(check(path, text % ('a' * 40, 0), text % ('b' * 40, 1)), text)
+
+    def test_a_block_header_alone_on_its_line_makes_the_workflow_ambiguous(self):
+        check = ns['content_compatible']
+        path = '.github/workflows/ci.yml'
+        use = 'uses: example/action@%s # v1.%d.0\n'
+        for head in ['k:\n  |\n  ', 'k:\n  >\n  ', '-\n  |\n  ', 'steps:\n  - run:\n      |\n      ',
+                     'steps:\n  - run: !!str\n      |\n      ']:
+            self.assertFalse(check(path, head + use % ('a' * 40, 0), head + use % ('b' * 40, 1)), head)
+        # A header after a key or a dash on the same line is still understood.
+        fine = 'steps:\n  - run: |\n      echo\n  - '
+        self.assertTrue(check(path, fine + use % ('a' * 40, 0), fine + use % ('b' * 40, 1)))
+
+    def test_line_separators_other_than_newline_do_not_start_a_new_workflow_line(self):
+        check = ns['content_compatible']
+        path = '.github/workflows/ci.yml'
+        use = 'uses: example/action@%s # v1.%d.0'
+        for separator in ['\x85', '\u2028', '\u2029', '\x0b', '\x0c', '\x1c', '\x1d', '\x1e', '\r']:
+            text = 'steps:\n  - run: |\n      echo hi' + separator + use + '\n'
+            self.assertFalse(check(path, text % ('a' * 40, 0), text % ('b' * 40, 1)), repr(separator))
+        # CRLF files keep working when both sides use it.
+        crlf = lambda sha, minor: 'steps:\r\n  - ' + use % (sha * 40, minor) + '\r\n'
+        self.assertTrue(check(path, crlf('a', 0), crlf('b', 1)))
+        self.assertFalse(check(path, crlf('a', 0), crlf('b', 1).replace('\r\n', '\n')))
+
+    def test_multiline_flow_collections_do_not_block_unrelated_action_bumps(self):
+        check = ns['content_compatible']
+        path = '.github/workflows/ci.yml'
+        use = '      - uses: example/action@%s # v1.%d.0\n'
+        head = 'jobs:\n  t:\n    strategy:\n      matrix:\n        node: %s\n    steps:\n'
+        for flow in ['[20,\n          22]', '{a: 1,\n          b: [2,\n            3]}', '[20, # first\n          22]']:
+            self.assertTrue(check(path, head % flow + use % ('a' * 40, 0), head % flow + use % ('b' * 40, 1)), flow)
+        # A changed line inside a flow collection is not a step, and a quote left open is ambiguous.
+        for flow in ['[20,\n          uses: example/action@%s # v1.%d.0]', "['a,\n          b']"]:
+            old = head % (flow % ('a' * 40, 0) if '%s' in flow else flow)
+            new = head % (flow % ('b' * 40, 1) if '%s' in flow else flow)
+            self.assertFalse(check(path, old + use % ('a' * 40, 0), new + use % ('b' * 40, 1)), flow)
+
     def test_unknown_new_files_and_unsupported_formats_require_review(self):
         self.files[0]['status'] = 'added'
         self.reject()

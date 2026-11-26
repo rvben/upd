@@ -155,15 +155,121 @@ jobs:
               return same(old, new)
 
 
+          BLOCK_HEADER = re.compile(r'(?P<lead>[ ]*(?:-[ ]+)*)(?P<key>(?:[^\s#][^#]*?:[ ]+)?)(?:[&!]\S*[ ]+)*[|>][0-9+-]*[ \t]*(?:#.*)?')
+          KEY_LINE = re.compile(r'(?:"(?:[^"\\]|\\.)*"|\'(?:[^\']|\'\')*\'|[^\s:#\'"\[\]{},&*!|>%@`?-][^#]*?):(?:[ ]+(?P<value>.*))?')
+
+
+          def flow_depth(text):
+              """Brackets a line leaves open, ignoring quoted text and comments; None when
+              a quote is left unclosed on the line."""
+              text = re.sub(r'"(?:[^"\\]|\\.)*"|\'(?:[^\']|\'\')*\'', '', text)
+              text = re.sub(r'(^|[ \t])#.*', '', text)
+              if '"' in text or "'" in text:
+                  return None
+              return sum(text.count(c) for c in '[{') - sum(text.count(c) for c in ']}')
+
+
+          def plain_structure(text):
+              """Describe a line that is one complete key, sequence item or comment.
+
+              Returns None when it is not, else a pair: the column a continuation line
+              would have to be indented past (-1 when the line holds no scalar value),
+              and the number of flow brackets the line leaves open."""
+              match = re.fullmatch(r'([ ]*)((?:-[ ]+)*)(.*?)[ \t]*', text)
+              indent, lead, rest = len(match[1]), match[2], match[3]
+              if not rest or rest == '-':
+                  return -1, 0
+              column = indent + len(lead)
+              key = KEY_LINE.fullmatch(rest)
+              if key:
+                  rest = key['value'] or ''
+                  if not rest or rest.startswith('#'):
+                      return -1, 0
+              elif lead:
+                  column = indent + len(lead.rstrip()) - 1
+              else:
+                  return None
+              if rest.startswith('"'):
+                  ok = re.fullmatch(r'"(?:[^"\\]|\\.)*"[ \t]*(?:#.*)?', rest) is not None
+              elif rest.startswith("'"):
+                  ok = re.fullmatch(r"'(?:[^']|'')*'[ \t]*(?:#.*)?", rest) is not None
+              elif rest[:1] in '[{':
+                  depth = flow_depth(rest)
+                  return (column, depth) if depth is not None and depth >= 0 else None
+              else:
+                  ok = True
+              return (column, 0) if ok else None
+
+
+          def block_scalar_lines(lines):
+              """Numbers of the lines inside block scalars, or None when the layout is ambiguous.
+
+              Only lines that are one complete key, sequence item, comment or block scalar
+              are understood, and a flow collection may span lines; a tab in the indentation, a
+              multi-line plain or quoted scalar, or anything else makes the whole document
+              ambiguous."""
+              inside, parent, scalar, flow = set(), None, -1, 0
+              for number, line in enumerate(lines):
+                  if re.match(r'[ ]*\t', line):
+                      return None
+                  stripped = line.strip()
+                  indent = len(line) - len(line.lstrip(' '))
+                  if flow:
+                      change = flow_depth(line)
+                      if change is None or flow + change < 0:
+                          return None
+                      flow += change
+                      inside.add(number)
+                      continue
+                  if parent is not None:
+                      if not stripped or indent > parent:
+                          inside.add(number)
+                          continue
+                      parent = None
+                  if not stripped or stripped.startswith('#') or stripped in ('---', '...'):
+                      continue
+                  if indent > scalar >= 0:
+                      return None
+                  header = BLOCK_HEADER.fullmatch(line)
+                  if header:
+                      # A header alone on its line belongs to a node on an earlier line,
+                      # so where its body starts is not known.
+                      if not header['key'] and '-' not in header['lead']:
+                          return None
+                      parent = len(header['lead']) if header['key'] else indent
+                      scalar = -1
+                  else:
+                      described = plain_structure(line)
+                      if described is None:
+                          return None
+                      scalar, flow = described
+              return inside
+
+
+
           def content_compatible(path, before, after):
               if path.startswith('.github/workflows/'):
-                  old, new = before.splitlines(), after.splitlines()
-                  if len(old) != len(new):
+                  # YAML breaks lines on \n, \r\n and \r only. Every other separator that
+                  # str.splitlines() honors may be script text, so it is never split on and
+                  # makes the file ambiguous.
+                  if re.search('[\x0b\x0c\x1c\x1d\x1e\x85\u2028\u2029]', before + after):
+                      return False
+                  old, new = before.split('\n'), after.split('\n')
+                  if len(old) != len(new) or any('\r' in line[:-1] for line in old + new):
+                      return False
+                  # Both sides must end every line the same way; the \r of a CRLF is then dropped.
+                  if [line.endswith('\r') for line in old] != [line.endswith('\r') for line in new]:
+                      return False
+                  old, new = [line.removesuffix('\r') for line in old], [line.removesuffix('\r') for line in new]
+                  inside_old, inside_new = block_scalar_lines(old), block_scalar_lines(new)
+                  if inside_old is None or inside_new is None:
                       return False
                   action = re.compile(r'(\s*(?:-\s*)?uses:\s*)([A-Za-z0-9_.-]+/[A-Za-z0-9_./-]+)@([a-f0-9]{40})[ \t]+#[ \t]*(v\d+\.\d+\.\d+)[ \t]*')
-                  for a, b in zip(old, new):
+                  for number, (a, b) in enumerate(zip(old, new)):
                       if a == b:
                           continue
+                      if number in inside_old or number in inside_new:
+                          return False
                       left, right = action.fullmatch(a), action.fullmatch(b)
                       if (not left or not right or left.group(1, 2) != right.group(1, 2)
                               or not compatible(left[4], right[4])):
