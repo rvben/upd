@@ -40,6 +40,7 @@ jobs:
         run: |
           python3 - <<'PY_REVIEW'
           import base64
+          from collections import Counter
           import tomllib
           import hashlib
           import io
@@ -395,15 +396,30 @@ jobs:
                           return False
                   return True
               if path.endswith('go.sum'):
-                  def sums(text):
+                  # Blank lines are part of the file's bytes; they are not rows to pair up.
+                  blank = lambda text: sum(1 for line in text.split('\n') if not line.strip())
+                  if blank(before) != blank(after):
+                      return False
+                  try:
+                      old, new = Counter(go_sum_records(before)), Counter(go_sum_records(after))
+                  except ValueError:
+                      return False
+                  # Rows present on both sides are untouched; the rest must pair up
+                  # per module and per /go.mod suffix as version bumps.
+                  removed, added = old - new, new - old
+
+                  def grouped(rows):
                       result = {}
-                      for module, version, checksum in go_sum_records(text):
+                      for module, version, checksum in rows.elements():
                           suffix = '/go.mod' if version.endswith('/go.mod') else ''
                           result.setdefault((module, suffix), []).append((version.removesuffix('/go.mod'), checksum))
-                      return {k: sorted(v) for k, v in result.items()}
-                  a, b = sums(before), sums(after)
+                      return {k: sorted(v, key=lambda r: (semver_key(r[0]), r[1])) for k, v in result.items()}
+                  try:
+                      a, b = grouped(removed), grouped(added)
+                  except ValueError:
+                      return False
                   return a.keys() == b.keys() and all(len(a[k]) == len(b[k]) and all(
-                      x == y or (x[0] != y[0] and compatible(x[0], y[0])) for x, y in zip(a[k], b[k])) for k in a)
+                      x[0] != y[0] and compatible(x[0], y[0]) for x, y in zip(a[k], b[k])) for k in a)
               # Unsupported edits keep their normal human review requirement.
               return False
 

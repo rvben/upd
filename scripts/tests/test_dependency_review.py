@@ -525,6 +525,35 @@ class ReviewPolicy(unittest.TestCase):
         # The directive itself may not change either.
         self.assertFalse(check('go.mod', head + 'require ' + a, head + 'exclude ' + a))
 
+    def test_go_sum_versions_are_compared_by_semantic_order(self):
+        check = ns['content_compatible']
+
+        def records(*versions):
+            return ''.join('example.com/m %s h1:%s=\n' % (v, 'a' * 43) for v in versions)
+
+        self.assertTrue(check('go.sum', records('v1.9.0'), records('v1.10.0')))
+        # Lexically v1.10.0 sorts before v1.8.5, which paired v1.9.0 with v1.8.5.
+        self.assertTrue(check('go.sum', records('v1.8.0', 'v1.9.0'), records('v1.8.5', 'v1.10.0')))
+        self.assertFalse(check('go.sum', records('v1.8.0', 'v1.9.0'), records('v1.8.5', 'v1.8.1')))
+        self.assertFalse(check('go.sum', records('v1.9.0'), records('v2.0.0')))
+        # Rows that are unchanged on both sides do not take part in the pairing.
+        def rows(*pairs):
+            return ''.join('example.com/m %s h1:%s=\n' % (v, c * 43) for v, c in pairs)
+
+        rc = ('v1.1.0-rc.1/go.mod', 'B')
+        self.assertTrue(check('go.sum', rows(('v1.0.0/go.mod', 'A'), rc), rows(rc, ('v1.1.0/go.mod', 'C'))))
+        self.assertTrue(check('go.sum', rows(('v1.0.0/go.mod', 'A'), ('v1.0.0', 'D'), rc), rows(rc, ('v1.1.0/go.mod', 'C'), ('v1.1.0', 'E'))))
+        self.assertFalse(check('go.sum', rows(('v1.0.0/go.mod', 'A'), rc), rows(rc)))
+        self.assertFalse(check('go.sum', rows(rc), rows(rc, ('v1.1.0/go.mod', 'C'))))
+        self.assertFalse(check('go.sum', rows(('v1.0.0/go.mod', 'A'), rc), rows(rc, ('v1.1.0', 'C'))))
+
+    def test_go_sum_blank_lines_are_not_free_to_appear_or_vanish(self):
+        check = ns['content_compatible']
+        row = lambda version: 'example.com/a %s h1:%s=\n' % (version, 'A' * 43)
+        self.assertTrue(check('go.sum', row('v1.0.0'), row('v1.0.1')))
+        self.assertFalse(check('go.sum', row('v1.0.0'), row('v1.0.1') + '\n\n'))
+        self.assertFalse(check('go.sum', row('v1.0.0') + '\n', row('v1.0.1')))
+
     def test_unknown_new_files_and_unsupported_formats_require_review(self):
         self.files[0]['status'] = 'added'
         self.reject()
