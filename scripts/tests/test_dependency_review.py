@@ -11,6 +11,11 @@ ns = {'__name__': 'review_under_test'}
 exec(compile('\n'.join(line[10:] for line in source.splitlines()), str(WORKFLOW), 'exec'), ns)
 
 
+def sri(seed, algorithm='sha512'):
+    """A well-formed integrity string whose digest depends on the seed."""
+    return algorithm + '-' + base64.b64encode(getattr(hashlib, algorithm)(seed.encode()).digest()).decode()
+
+
 class ReviewPolicy(unittest.TestCase):
     def setUp(self):
         self.base, self.head, self.repo = 'a' * 40, 'b' * 40, 'example/widgets'
@@ -578,6 +583,33 @@ class ReviewPolicy(unittest.TestCase):
         self.assertFalse(check('go.sum', row('v1.0.0'), row('v1.0.1') + '\n\n'))
         self.assertFalse(check('go.sum', row('v1.0.0') + '\n', row('v1.0.1')))
 
+    def test_a_lockfile_bump_keeps_a_well_formed_integrity_of_the_same_algorithm(self):
+        check = ns['content_compatible']
+
+        def lock(version, **integrity):
+            record = {'version': version, 'resolved': 'https://registry.npmjs.org/a/-/a-%s.tgz' % version}
+            if integrity:
+                record['integrity'] = integrity['value']
+            return json.dumps({'lockfileVersion': 3, 'packages': {'': {'dependencies': {'a': '^1.0.0'}}, 'node_modules/a': record}})
+
+        path = 'package-lock.json'
+        old = lock('1.0.0', value=sri('1'))
+        self.assertTrue(check(path, old, lock('1.0.1', value=sri('2'))))
+        self.assertTrue(check(path, lock('1.0.0'), lock('1.0.1')))
+        for name, new in {
+            'removed': lock('1.0.1'),
+            'empty': lock('1.0.1', value=''),
+            'weaker algorithm': lock('1.0.1', value=sri('2', 'sha1')),
+            'other algorithm': lock('1.0.1', value=sri('2', 'sha256')),
+            'truncated': lock('1.0.1', value=sri('2')[:-10]),
+            'not a string': lock('1.0.1', value=7),
+            'added': None,
+        }.items():
+            if new is None:
+                self.assertFalse(check(path, lock('1.0.0'), lock('1.0.1', value=sri('2'))), name)
+            else:
+                self.assertFalse(check(path, old, new), name)
+
     def test_lockfile_v2_dependency_tree_follows_the_same_bump_rules(self):
         check = ns['content_compatible']
 
@@ -585,14 +617,14 @@ class ReviewPolicy(unittest.TestCase):
             return 'https://%s/%s/-/%s-%s.tgz' % (host, name, name, version)
 
         def lock(lodash, nested, host='registry.npmjs.org', extra=None):
-            record = {'version': lodash, 'resolved': tarball('lodash', lodash, host), 'integrity': 'sha512-' + lodash,
+            record = {'version': lodash, 'resolved': tarball('lodash', lodash, host), 'integrity': sri(lodash),
                       'requires': {'inner': '^' + nested},
-                      'dependencies': {'inner': {'version': nested, 'resolved': tarball('inner', nested), 'integrity': 'sha512-' + nested}}}
+                      'dependencies': {'inner': {'version': nested, 'resolved': tarball('inner', nested), 'integrity': sri(nested)}}}
             record.update(extra or {})
             return json.dumps({'name': 'f', 'lockfileVersion': 2, 'packages': {
                 '': {'name': 'f', 'dependencies': {'lodash': lodash}},
-                'node_modules/lodash': {'version': lodash, 'resolved': tarball('lodash', lodash), 'integrity': 'sha512-' + lodash},
-                'node_modules/lodash/node_modules/inner': {'version': nested, 'resolved': tarball('inner', nested), 'integrity': 'sha512-' + nested},
+                'node_modules/lodash': {'version': lodash, 'resolved': tarball('lodash', lodash), 'integrity': sri(lodash)},
+                'node_modules/lodash/node_modules/inner': {'version': nested, 'resolved': tarball('inner', nested), 'integrity': sri(nested)},
             }, 'dependencies': {'lodash': record}})
 
         path = 'package-lock.json'
@@ -608,10 +640,10 @@ class ReviewPolicy(unittest.TestCase):
         diverged = json.loads(lock('4.17.20', '1.0.0'))
         diverged['dependencies']['lodash']['version'] = '4.17.21'
         diverged['dependencies']['lodash']['resolved'] = tarball('lodash', '4.17.21')
-        diverged['dependencies']['lodash']['integrity'] = 'sha512-other'
+        diverged['dependencies']['lodash']['integrity'] = sri('other')
         self.assertFalse(check(path, lock('4.17.20', '1.0.0'), json.dumps(diverged)))
         nested = json.loads(lock('4.17.20', '1.0.0'))
-        nested['dependencies']['lodash']['dependencies']['inner'].update(version='1.0.1', resolved=tarball('inner', '1.0.1'), integrity='sha512-1.0.1')
+        nested['dependencies']['lodash']['dependencies']['inner'].update(version='1.0.1', resolved=tarball('inner', '1.0.1'), integrity=sri('1.0.1'))
         self.assertFalse(check(path, lock('4.17.20', '1.0.0'), json.dumps(nested)))
 
     def test_go_mod_bumps_keep_incompatible_markers_and_comments_identical(self):

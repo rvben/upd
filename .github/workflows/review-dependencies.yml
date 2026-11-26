@@ -270,6 +270,16 @@ jobs:
               return old_path[-1].replace(old_version, '{version}') == new_path[-1].replace(new_version, '{version}')
 
 
+          SUBRESOURCE_DIGEST_LENGTHS = {'sha256': 44, 'sha384': 64, 'sha512': 88}
+
+
+          def subresource_algorithm(value):
+              """The algorithm of a single well-formed `<algorithm>-<base64 digest>` integrity
+              string, else None."""
+              match = re.fullmatch(r'(sha256|sha384|sha512)-([A-Za-z0-9+/]+={0,2})', value, re.ASCII) if isinstance(value, str) else None
+              return match[1] if match and len(match[2]) == SUBRESOURCE_DIGEST_LENGTHS[match[1]] else None
+
+
           def lock_record(old, new, tree=False):
               """Compare one lockfile record: only a compatible version bump may differ, with
               the tarball URL following the version. In a v2 `dependencies` tree the nested
@@ -282,6 +292,12 @@ jobs:
                   return False
               for field in ['resolved', 'integrity']:
                   if left.get(field) != right.get(field) and av == bv:
+                      return False
+              # A changed hash must stay a well-formed hash of the same algorithm; it can
+              # be neither dropped nor weakened.
+              if left.get('integrity') != right.get('integrity'):
+                  algorithms = [subresource_algorithm(r.get('integrity')) for r in (left, right)]
+                  if None in algorithms or algorithms[0] != algorithms[1]:
                       return False
               # Preserve the registry and package identity, allowing only the version
               # component in the tarball URL to change.
