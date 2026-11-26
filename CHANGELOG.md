@@ -7,6 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.18.8](https://github.com/rvben/upd/compare/v0.18.7...v0.18.8) - 2026-11-26
+
+### Added
+
+- **audit**: accept advisories with a reason and optional expiry ([9df6534](https://github.com/rvben/upd/commit/9df653433e4c75830f91c49e12bc0af121b08dd9))
+- **actions**: support dependency validation without publication ([8aebdc5](https://github.com/rvben/upd/commit/8aebdc5ab6560caca0f68f95488ddaae432c3d60))
+
+### Fixed
+
+- **actions**: keep a non-root lockfile record's dependency ranges identical ([a6e7fb5](https://github.com/rvben/upd/commit/a6e7fb5248ef80ef39d2688d279f5e9ba1404560))
+- **actions**: accept go.sum bumps only as canonical rows with their markers intact ([46e9a11](https://github.com/rvben/upd/commit/46e9a118179f7c28af05778d4570d7a2a48f8d60))
+- **actions**: decline files whose shape the classifier does not expect ([e20040d](https://github.com/rvben/upd/commit/e20040d519e102f262f4c044f3f200658975b63f))
+- **actions**: keep lockfile integrity present, well formed and of the same algorithm on a bump ([815fba2](https://github.com/rvben/upd/commit/815fba2ae8221a12e7a85d6c4909416fc8a60118))
+- **actions**: require a strictly newer ASCII version for every pin change ([f9d4d7e](https://github.com/rvben/upd/commit/f9d4d7e14f83ea0e35a8ae2a715fde3497a5a355))
+- **actions**: accept go.mod bumps with +incompatible and trailing comments ([32621c9](https://github.com/rvben/upd/commit/32621c97568de1379e459fb1d37b5e4c93086905))
+- **actions**: apply lockfile bump rules to the npm v2 dependency tree ([a5ee178](https://github.com/rvben/upd/commit/a5ee1782dbd3abad55866bed006a834ca748e22e))
+- **actions**: compare go.sum versions by semantic order ([bf58cb8](https://github.com/rvben/upd/commit/bf58cb855a96f4edaebc2f54c8221b89018ec8eb))
+- **actions**: treat only go.mod require lines as dependency bumps ([04d138a](https://github.com/rvben/upd/commit/04d138af5f8860a28e7b616d26df601c86690a84))
+- **actions**: compare lockfile tarball URLs by scheme, host and path ([5d6a048](https://github.com/rvben/upd/commit/5d6a048997b963250d675541e5cb30ae556889f7))
+- **actions**: ignore uses text inside block scalars when classifying workflow edits ([39d289b](https://github.com/rvben/upd/commit/39d289b1f28940ef54b1bca055b98eb075b5f9d5))
+- **actions**: parse every changed file strictly and compare dependency edits by type ([81bd44c](https://github.com/rvben/upd/commit/81bd44c24abbf82ce2650d821fc545c096af3b53))
+- **actions**: exit cleanly when a proposal needs manual review ([514a3c1](https://github.com/rvben/upd/commit/514a3c16a6c839ed92e8ba39a6f35f1acd6fa341))
+
 ## [0.18.7](https://github.com/rvben/upd/compare/v0.18.6...v0.18.7) - 2026-11-16
 
 ### Fixed
