@@ -33,3 +33,10 @@ fn synthetic_vulnerable_fixture_is_excluded_from_repository_scans() {
     assert!(CONFIG.contains("benchmarks/fixtures/vendor/**"));
     assert!(!WORKFLOW.contains("--no-ignore"));
 }
+
+#[test]
+fn security_audit_names_the_failing_advisories() {
+    let enforce = &WORKFLOW[WORKFLOW.find("name: Enforce audit result").unwrap()..];
+    assert!(enforce.contains("upd found vulnerable dependencies: ${findings}"));
+    assert!(enforce.contains("$GITHUB_STEP_SUMMARY"));
+}

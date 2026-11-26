@@ -85,7 +85,12 @@ jobs:
           case "$AUDIT_EXIT" in
             0) exit 0 ;;
             6)
-              echo "upd found vulnerable dependencies; review the uploaded SARIF results." >&2
+              findings="$(jq -r '[.runs[0].results[] | "\(.ruleId) (\(.message.text | split("\n")[0]))"] | join("; ")' upd-audit.sarif)"
+              echo "upd found vulnerable dependencies: ${findings}" >&2
+              {
+                echo "### Unresolved advisories"
+                jq -r '.runs[0].results[] | "- \(.ruleId): \(.message.text | split("\n")[0])"' upd-audit.sarif
+              } >> "$GITHUB_STEP_SUMMARY"
               exit 1
               ;;
             '')
