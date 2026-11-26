@@ -590,6 +590,22 @@ class ReviewPolicy(unittest.TestCase):
         nested['dependencies']['lodash']['dependencies']['inner'].update(version='1.0.1', resolved=tarball('inner', '1.0.1'), integrity='sha512-1.0.1')
         self.assertFalse(check(path, lock('4.17.20', '1.0.0'), json.dumps(nested)))
 
+    def test_go_mod_bumps_keep_incompatible_markers_and_comments_identical(self):
+        check = ns['content_compatible']
+        head = 'module example.com/app\n\n'
+        pair = lambda old, new: check('go.mod', head + old + '\n', head + new + '\n')
+        self.assertTrue(pair('require a/b v2.0.0+incompatible', 'require a/b v2.1.0+incompatible'))
+        self.assertTrue(pair('require (\n\ta/b v1.0.0 // indirect; kept for compat\n)', 'require (\n\ta/b v1.2.0 // indirect; kept for compat\n)'))
+        self.assertTrue(pair('require a/b v1.0.0 // pinned', 'require a/b v1.1.0 // pinned'))
+        self.assertTrue(pair('require a/b v1.0.0\r', 'require a/b v1.1.0\r'))
+        # Anything but the version token changing is not a bump.
+        self.assertFalse(pair('require a/b v2.0.0+incompatible', 'require a/b v2.1.0'))
+        self.assertFalse(pair('require a/b v1.0.0', 'require a/b v1.1.0+incompatible'))
+        self.assertFalse(pair('require a/b v1.0.0 // pinned', 'require a/b v1.1.0 // unpinned'))
+        self.assertFalse(pair('require a/b v1.0.0 // pinned', 'require a/b v1.1.0'))
+        self.assertFalse(pair('require a/b v1.0.0', 'require a/b v1.1.0 // new'))
+        self.assertFalse(pair('require a/b v2.0.0+incompatible', 'require a/b v3.0.0+incompatible'))
+
     def test_unknown_new_files_and_unsupported_formats_require_review(self):
         self.files[0]['status'] = 'added'
         self.reject()
